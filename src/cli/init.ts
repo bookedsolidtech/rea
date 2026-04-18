@@ -6,13 +6,25 @@ import { AutonomyLevel } from '../policy/types.js';
 import { HARD_DEFAULTS, loadProfile, mergeProfiles, type Profile } from '../policy/profiles.js';
 import { copyArtifacts } from './install/copy.js';
 import {
+  canonicalSettingsSubsetHash,
   defaultDesiredHooks,
   mergeSettings,
   readSettings,
   writeSettingsAtomic,
 } from './install/settings-merge.js';
 import { installCommitMsgHook } from './install/commit-msg.js';
-import { writeClaudeMdFragment } from './install/claude-md.js';
+import { buildFragment, writeClaudeMdFragment } from './install/claude-md.js';
+import {
+  CLAUDE_MD_MANIFEST_PATH,
+  SETTINGS_MANIFEST_PATH,
+  enumerateCanonicalFiles,
+} from './install/canonical.js';
+import { writeManifestAtomic } from './install/manifest-io.js';
+import type {
+  InstallManifest,
+  ManifestEntry,
+} from './install/manifest-schema.js';
+import { sha256OfBuffer, sha256OfFile } from './install/sha.js';
 import {
   defaultReagentPath,
   ReagentDroppedFieldsError,
@@ -337,6 +349,51 @@ function writeRegistryYaml(targetDir: string): string {
   return registryPath;
 }
 
+/**
+ * G12 — write `.rea/install-manifest.json` after `runInit` has copied all
+ * artifacts. SHAs are computed from the files on disk (so the manifest
+ * reflects actual state, not canonical-source state) with two synthetic
+ * entries for the rea-owned settings subset and the managed CLAUDE.md
+ * fragment.
+ */
+async function writeInstallManifest(
+  targetDir: string,
+  profile: string,
+  fragmentInput: Parameters<typeof buildFragment>[0],
+): Promise<string> {
+  const canonical = await enumerateCanonicalFiles();
+  const entries: ManifestEntry[] = [];
+  for (const c of canonical) {
+    const dst = path.join(targetDir, c.destRelPath);
+    // A file that was skipped during copy (e.g. --yes over existing) may not
+    // exist if the destination layout diverged — hash whatever is on disk.
+    // If it doesn't exist at all, fall back to hashing the source so the
+    // manifest still has a baseline.
+    const absPath = fs.existsSync(dst) ? dst : c.sourceAbsPath;
+    const sha = await sha256OfFile(absPath);
+    entries.push({ path: c.destRelPath, sha256: sha, source: c.source });
+  }
+  // Synthetic entries.
+  entries.push({
+    path: SETTINGS_MANIFEST_PATH,
+    sha256: canonicalSettingsSubsetHash(defaultDesiredHooks()),
+    source: 'settings',
+  });
+  entries.push({
+    path: CLAUDE_MD_MANIFEST_PATH,
+    sha256: sha256OfBuffer(buildFragment(fragmentInput)),
+    source: 'claude-md',
+  });
+
+  const manifest: InstallManifest = {
+    version: getPkgVersion(),
+    profile,
+    installed_at: new Date().toISOString(),
+    files: entries,
+  };
+  return writeManifestAtomic(targetDir, manifest);
+}
+
 export async function runInit(options: InitOptions): Promise<void> {
   const targetDir = process.cwd();
   const reagentPolicyPath = detectReagentPolicy(targetDir);
@@ -446,14 +503,24 @@ export async function runInit(options: InitOptions): Promise<void> {
 
   const commitMsgResult = await installCommitMsgHook(targetDir);
 
-  const mdResult = await writeClaudeMdFragment(targetDir, {
+  const fragmentInput = {
     policyPath: `.${path.sep}rea${path.sep}policy.yaml`.replace(/\\/g, '/'),
     profile: config.profile,
     autonomyLevel: config.autonomyLevel,
     maxAutonomyLevel: config.maxAutonomyLevel,
     blockedPathsCount: config.blockedPaths.length,
     blockAiAttribution: config.blockAiAttribution,
-  });
+  };
+  const mdResult = await writeClaudeMdFragment(targetDir, fragmentInput);
+
+  // G12 — record the install manifest. SHAs are of the files actually on disk
+  // after the copy pass, so drift detection compares against real state (not
+  // canonical, which may differ if the consumer's copy was aborted mid-run).
+  const manifestPath = await writeInstallManifest(
+    targetDir,
+    config.profile,
+    fragmentInput,
+  );
 
   console.log('');
   log('init complete');
@@ -470,6 +537,7 @@ export async function runInit(options: InitOptions): Promise<void> {
   console.log(
     `  ${mdResult.replaced ? '~' : '+'} ${path.relative(targetDir, mdResult.path)} (fragment ${mdResult.replaced ? 'replaced' : 'written'})`,
   );
+  console.log(`  + ${path.relative(targetDir, manifestPath)}`);
 
   if (mergeResult.warnings.length > 0) {
     console.log('');

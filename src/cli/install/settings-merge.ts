@@ -19,6 +19,7 @@
  * around their structure.
  */
 
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import fsPromises from 'node:fs/promises';
 import path from 'node:path';
@@ -227,6 +228,31 @@ export function readSettings(targetDir: string): {
 }
 
 /**
+ * Stable SHA-256 of the rea-owned "desired hooks" subset. G12 uses this as
+ * the manifest entry for `.claude/settings.json` so drift detection only
+ * flags cases where a consumer deleted one of OUR entries — consumer-added
+ * entries remain invisible.
+ *
+ * Deterministic serialization: property order is fixed in-code (event,
+ * matcher, hooks → type, command, timeout, statusMessage), and the array
+ * order matches `defaultDesiredHooks()`. Any change to the desired set
+ * produces a new hash, which is the correct upgrade signal.
+ */
+export function canonicalSettingsSubsetHash(groups: DesiredHookGroup[]): string {
+  const canonical = groups.map((g) => ({
+    event: g.event,
+    matcher: g.matcher,
+    hooks: g.hooks.map((h) => {
+      const entry: Record<string, unknown> = { type: h.type, command: h.command };
+      if (h.timeout !== undefined) entry.timeout = h.timeout;
+      if (h.statusMessage !== undefined) entry.statusMessage = h.statusMessage;
+      return entry;
+    }),
+  }));
+  return createHash('sha256').update(JSON.stringify(canonical)).digest('hex');
+}
+
+/**
  * Desired hook registrations that `rea init` installs on every run. Mirrors
  * the shape of the `.claude/settings.json` that this repo dogfoods. Keep in
  * lockstep with `hooks/` filenames.
@@ -244,6 +270,7 @@ export function defaultDesiredHooks(): DesiredHookGroup[] {
         { type: 'command', command: `${base}/security-disclosure-gate.sh`, timeout: 5000, statusMessage: 'Checking disclosure policy...' },
         { type: 'command', command: `${base}/pr-issue-link-gate.sh`, timeout: 5000, statusMessage: 'Checking PR for issue reference...' },
         { type: 'command', command: `${base}/attribution-advisory.sh`, timeout: 5000, statusMessage: 'Checking for AI attribution...' },
+        { type: 'command', command: `${base}/push-review-gate.sh`, timeout: 30000, statusMessage: 'Running push review gate...' },
       ],
     },
     {

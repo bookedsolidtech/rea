@@ -1,0 +1,107 @@
+#!/bin/sh
+# .husky/pre-push — rea governance gate for terminal-initiated pushes.
+#
+# Mirrors the logic of `.claude/hooks/push-review-gate.sh` but consumes the
+# git pre-push stdin contract directly (one line per refspec:
+#   <local_ref> <local_sha> <remote_ref> <remote_sha>).
+#
+# Minimum viable check — NOT a full replacement for the Claude Code gate:
+#   1. If `.rea/HALT` exists, block.
+#   2. If the push touches a protected path, require a `codex.review` audit
+#      entry for the HEAD SHA (or a `codex.review.skipped` record + explicit
+#      REA_SKIP_CODEX_REVIEW env var).
+#
+# Escape hatch: REA_SKIP_CODEX_REVIEW=<reason> bypasses the protected-path
+# check. The skip record is appended by `push-review-gate.sh` in the Claude
+# Code path; for terminal pushes, export the variable AND append a skip
+# record manually if you want it in the audit trail.
+#
+# Subshell-safety note: earlier versions piped `echo "$INPUT" | while read`,
+# which ran the loop in a subshell — `exit 1` inside the loop aborted the
+# subshell only, and the script then ran `exit 0` and allowed the push. We
+# now feed the loop with a here-doc so it runs in the main shell, and we
+# track `block_push` in the enclosing scope. Final `exit 1` is reached only
+# if no refspec is blocked; a single blocking refspec propagates correctly.
+
+set -eu
+
+REA_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+
+if [ -f "${REA_ROOT}/.rea/HALT" ]; then
+  # POSIX `head` does not specify `-c`; use awk for the first line. HALT is
+  # a short reason string, so the first line is enough for display.
+  reason=$(awk 'NR==1 { print; exit }' "${REA_ROOT}/.rea/HALT" 2>/dev/null || printf 'unknown')
+  [ -z "${reason:-}" ] && reason='unknown'
+  printf 'REA HALT: %s\nAll push operations suspended. Run: rea unfreeze\n' "$reason" >&2
+  exit 1
+fi
+
+# Read refspec lines from stdin. Each line: <local_ref> <local_sha> <remote_ref> <remote_sha>
+INPUT=$(cat)
+[ -z "$INPUT" ] && exit 0
+
+# Anchor every alternative so a legitimate file like `docs/hooks-guide.md` or
+# `src/thirdparty/src/policy/loader.c` is not mistaken for a protected path.
+# `^\.claude/hooks/` is included so someone editing the consumer install
+# (which ships alongside rea itself) cannot sneak past the gate.
+PROTECTED_RE='^src/gateway/middleware/|^hooks/|^\.claude/hooks/|^src/policy/|^\.github/workflows/'
+AUDIT_LOG="${REA_ROOT}/.rea/audit.jsonl"
+
+block_push=0
+
+# Here-doc feeds the loop without creating a subshell, so `block_push=1`
+# assignments below persist in the enclosing scope and the final `exit`
+# reflects them. A pipeline would run the loop in a subshell and `exit 1`
+# inside it would only abort that subshell — NOT the push — which was a
+# real governance defect in the pre-review version of this file.
+while IFS=' ' read -r local_ref local_sha remote_ref remote_sha; do
+  [ -z "${local_sha:-}" ] && continue
+  # Branch deletion: local_sha is 40 zeros. Skip protected-path check.
+  case "$local_sha" in
+    0000000000000000000000000000000000000000) continue ;;
+  esac
+
+  # Determine merge base. If remote is new (remote_sha is zeros), diff against
+  # the default branch; else against remote_sha.
+  if [ "$remote_sha" = "0000000000000000000000000000000000000000" ]; then
+    default_branch=$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|^origin/||')
+    [ -z "${default_branch:-}" ] && default_branch="main"
+    base=$(git merge-base "$default_branch" "$local_sha" 2>/dev/null || printf '')
+  else
+    base=$(git merge-base "$remote_sha" "$local_sha" 2>/dev/null || printf '')
+  fi
+  [ -z "${base:-}" ] && continue
+
+  # Check if the diff touches protected paths.
+  if git diff --name-only "$base" "$local_sha" 2>/dev/null | grep -qE "$PROTECTED_RE"; then
+    if [ -n "${REA_SKIP_CODEX_REVIEW:-}" ]; then
+      printf 'rea: REA_SKIP_CODEX_REVIEW set (%s) — skipping Codex review requirement for %s\n' \
+        "$REA_SKIP_CODEX_REVIEW" "$local_sha" >&2
+      continue
+    fi
+    if [ ! -f "$AUDIT_LOG" ]; then
+      printf 'PUSH BLOCKED: protected paths changed but no audit log found at %s\n' "$AUDIT_LOG" >&2
+      printf '  Run /codex-review on HEAD %s before pushing.\n' "$local_sha" >&2
+      block_push=1
+      continue
+    fi
+    # Require both (a) a `codex.review` tool_name and (b) the exact head_sha
+    # on the same JSONL line. The `codex.review` pattern ends with a closing
+    # quote, so `codex.review.skipped` never satisfies the gate.
+    if ! grep -E '"tool_name":"codex\.review"' "$AUDIT_LOG" 2>/dev/null | \
+         grep -qF "\"head_sha\":\"$local_sha\""; then
+      printf 'PUSH BLOCKED: protected paths changed — /codex-review required for HEAD %s\n' "$local_sha" >&2
+      printf '  Run /codex-review, or set REA_SKIP_CODEX_REVIEW=<reason> to bypass.\n' >&2
+      block_push=1
+      continue
+    fi
+  fi
+done <<HOOK_INPUT_EOF
+$INPUT
+HOOK_INPUT_EOF
+
+if [ "$block_push" -ne 0 ]; then
+  exit 1
+fi
+
+exit 0

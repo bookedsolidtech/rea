@@ -6,6 +6,7 @@ import { runDoctor } from './doctor.js';
 import { runFreeze, runUnfreeze } from './freeze.js';
 import { runInit } from './init.js';
 import { runServe } from './serve.js';
+import { runUpgrade } from './upgrade.js';
 import { err, getPkgVersion } from './utils.js';
 
 async function main(): Promise<void> {
@@ -57,6 +58,22 @@ async function main(): Promise<void> {
     );
 
   program
+    .command('upgrade')
+    .description(
+      'Sync .claude/, .husky/, and managed fragments with this rea version. Prompts on drift; auto-updates unmodified files.',
+    )
+    .option('--dry-run', 'show what would change; write nothing')
+    .option('-y, --yes', 'non-interactive — keep drifted files, skip removed-upstream')
+    .option('--force', 'non-interactive — overwrite drift, delete removed-upstream')
+    .action(async (opts: { dryRun?: boolean; yes?: boolean; force?: boolean }) => {
+      await runUpgrade({
+        dryRun: opts.dryRun,
+        yes: opts.yes,
+        force: opts.force,
+      });
+    });
+
+  program
     .command('serve')
     .description('Start the MCP gateway (stub — prints status, verifies policy loads).')
     .action(async () => {
@@ -90,9 +107,12 @@ async function main(): Promise<void> {
     .command('doctor')
     .description('Validate the install: policy parses, .rea/ layout, hooks, Codex plugin.')
     .option('--metrics', 'also print a 7-day summary of Codex telemetry (G11.5)')
-    .action(async (opts: { metrics?: boolean }) => {
-      const doctorOpts = opts.metrics === true ? { metrics: true } : {};
-      await runDoctor(doctorOpts);
+    .option('--drift', 'report drift vs. the install manifest (read-only; does not mutate)')
+    .action(async (opts: { metrics?: boolean; drift?: boolean }) => {
+      await runDoctor({
+        ...(opts.metrics === true ? { metrics: true } : {}),
+        ...(opts.drift === true ? { drift: true } : {}),
+      });
     });
 
   await program.parseAsync(process.argv);

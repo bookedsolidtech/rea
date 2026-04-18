@@ -7,7 +7,19 @@ import {
   type CodexProbeState,
 } from '../gateway/observability/codex-probe.js';
 import { summarizeTelemetry } from '../gateway/observability/codex-telemetry.js';
-import { POLICY_FILE, REA_DIR, REGISTRY_FILE, log, reaPath } from './utils.js';
+import {
+  CLAUDE_MD_MANIFEST_PATH,
+  SETTINGS_MANIFEST_PATH,
+  enumerateCanonicalFiles,
+} from './install/canonical.js';
+import { buildFragment } from './install/claude-md.js';
+import {
+  canonicalSettingsSubsetHash,
+  defaultDesiredHooks,
+} from './install/settings-merge.js';
+import { manifestExists, readManifest } from './install/manifest-io.js';
+import { sha256OfBuffer, sha256OfFile } from './install/sha.js';
+import { POLICY_FILE, REA_DIR, REGISTRY_FILE, getPkgVersion, log, reaPath } from './utils.js';
 
 export interface CheckResult {
   label: string;
@@ -337,6 +349,202 @@ export function collectChecks(
 export interface RunDoctorOptions {
   /** When true, print a 7-day telemetry summary after the checks (G11.5). */
   metrics?: boolean;
+  /**
+   * G12 — when true, append a read-only drift report comparing on-disk SHAs
+   * to the install manifest + canonical sources. Never mutates; never fails
+   * the exit code on its own (drift is information, not a hard error — use
+   * `rea upgrade` to reconcile).
+   */
+  drift?: boolean;
+}
+
+export interface DriftRow {
+  path: string;
+  status:
+    | 'unmodified'
+    | 'drifted-from-canonical'
+    | 'drifted-from-manifest'
+    | 'missing'
+    | 'untracked'
+    | 'removed-upstream';
+  detail?: string;
+}
+
+export interface DriftReport {
+  hasManifest: boolean;
+  bootstrap: boolean;
+  manifestVersion: string | null;
+  reaVersion: string;
+  rows: DriftRow[];
+}
+
+/**
+ * Compute drift between the install manifest and the current state of the
+ * consumer's tree. Strictly read-only — no file writes. Synthetic entries
+ * (settings subset, managed CLAUDE.md fragment) are checked by hashing the
+ * computed values against the manifest SHA.
+ */
+export async function collectDriftReport(baseDir: string): Promise<DriftReport> {
+  const reaVersion = getPkgVersion();
+  const rows: DriftRow[] = [];
+
+  if (!manifestExists(baseDir)) {
+    return {
+      hasManifest: false,
+      bootstrap: false,
+      manifestVersion: null,
+      reaVersion,
+      rows,
+    };
+  }
+
+  const manifest = await readManifest(baseDir);
+  if (manifest === null) {
+    return {
+      hasManifest: false,
+      bootstrap: false,
+      manifestVersion: null,
+      reaVersion,
+      rows,
+    };
+  }
+
+  const manifestByPath = new Map(manifest.files.map((e) => [e.path, e]));
+  const canonical = await enumerateCanonicalFiles();
+  const canonicalByPath = new Map(canonical.map((c) => [c.destRelPath, c]));
+
+  // Canonical files: compare on-disk against canonical + manifest.
+  for (const c of canonical) {
+    const abs = path.join(baseDir, c.destRelPath);
+    if (!fs.existsSync(abs)) {
+      rows.push({
+        path: c.destRelPath,
+        status: 'missing',
+        detail: 'file not installed',
+      });
+      continue;
+    }
+    const localSha = await sha256OfFile(abs);
+    const canonicalSha = await sha256OfFile(c.sourceAbsPath);
+    const entry = manifestByPath.get(c.destRelPath);
+    if (localSha === canonicalSha) {
+      rows.push({ path: c.destRelPath, status: 'unmodified' });
+      continue;
+    }
+    if (entry !== undefined && localSha === entry.sha256) {
+      rows.push({
+        path: c.destRelPath,
+        status: 'drifted-from-canonical',
+        detail: `local matches manifest but differs from rea v${reaVersion} canonical — run \`rea upgrade\``,
+      });
+      continue;
+    }
+    rows.push({
+      path: c.destRelPath,
+      status: 'drifted-from-manifest',
+      detail: 'file modified locally since install',
+    });
+  }
+
+  // Manifest entries no longer in canonical (removed upstream), excluding
+  // synthetic entries handled below.
+  for (const entry of manifest.files) {
+    if (
+      entry.path === CLAUDE_MD_MANIFEST_PATH ||
+      entry.path === SETTINGS_MANIFEST_PATH
+    )
+      continue;
+    if (!canonicalByPath.has(entry.path)) {
+      rows.push({
+        path: entry.path,
+        status: 'removed-upstream',
+        detail: 'no longer shipped — run `rea upgrade` to remove',
+      });
+    }
+  }
+
+  // Synthetic: rea-owned settings subset.
+  const settingsEntry = manifestByPath.get(SETTINGS_MANIFEST_PATH);
+  const settingsSha = canonicalSettingsSubsetHash(defaultDesiredHooks());
+  if (settingsEntry === undefined) {
+    rows.push({ path: SETTINGS_MANIFEST_PATH, status: 'untracked' });
+  } else if (settingsEntry.sha256 !== settingsSha) {
+    rows.push({
+      path: SETTINGS_MANIFEST_PATH,
+      status: 'drifted-from-canonical',
+      detail: 'desired-hooks set has changed since install',
+    });
+  } else {
+    rows.push({ path: SETTINGS_MANIFEST_PATH, status: 'unmodified' });
+  }
+
+  // Synthetic: managed CLAUDE.md fragment. Render the fragment from the
+  // current policy and compare. If policy is unreadable, skip gracefully.
+  const mdEntry = manifestByPath.get(CLAUDE_MD_MANIFEST_PATH);
+  try {
+    const policy = loadPolicy(baseDir);
+    const fragment = buildFragment({
+      policyPath: '.rea/policy.yaml',
+      profile: policy.profile,
+      autonomyLevel: policy.autonomy_level,
+      maxAutonomyLevel: policy.max_autonomy_level,
+      blockedPathsCount: policy.blocked_paths.length,
+      blockAiAttribution: policy.block_ai_attribution,
+    });
+    const currentSha = sha256OfBuffer(fragment);
+    if (mdEntry === undefined) {
+      rows.push({ path: CLAUDE_MD_MANIFEST_PATH, status: 'untracked' });
+    } else if (mdEntry.sha256 !== currentSha) {
+      rows.push({
+        path: CLAUDE_MD_MANIFEST_PATH,
+        status: 'drifted-from-canonical',
+        detail: 'policy values or fragment template changed since install',
+      });
+    } else {
+      rows.push({ path: CLAUDE_MD_MANIFEST_PATH, status: 'unmodified' });
+    }
+  } catch {
+    // Policy unreadable — drift of the fragment is meaningless to compute.
+    // The main doctor checks will already surface the policy failure.
+  }
+
+  return {
+    hasManifest: true,
+    bootstrap: manifest.bootstrap === true,
+    manifestVersion: manifest.version,
+    reaVersion,
+    rows,
+  };
+}
+
+function printDriftReport(report: DriftReport): void {
+  console.log('');
+  log('Drift report');
+  if (!report.hasManifest) {
+    console.log(
+      '  no .rea/install-manifest.json — run `rea upgrade` once to bootstrap a manifest.',
+    );
+    console.log('');
+    return;
+  }
+  console.log(
+    `  manifest v${report.manifestVersion ?? '?'} — running rea v${report.reaVersion}${report.bootstrap ? ' (bootstrap)' : ''}`,
+  );
+  console.log('');
+  let clean = 0;
+  for (const row of report.rows) {
+    if (row.status === 'unmodified') {
+      clean += 1;
+      continue;
+    }
+    const detail = row.detail !== undefined ? `  — ${row.detail}` : '';
+    console.log(`  [${row.status}] ${row.path}${detail}`);
+  }
+  console.log('');
+  console.log(
+    `  ${clean} clean, ${report.rows.length - clean} with drift/issues.`,
+  );
+  console.log('');
 }
 
 export async function runDoctor(opts: RunDoctorOptions = {}): Promise<void> {
@@ -374,6 +582,13 @@ export async function runDoctor(opts: RunDoctorOptions = {}): Promise<void> {
   // NEVER contributes to the exit code. Purely observational.
   if (opts.metrics === true) {
     await printTelemetrySummary(baseDir);
+  }
+
+  // G12 — optional drift report. Also purely observational; `rea upgrade`
+  // is the action path.
+  if (opts.drift === true) {
+    const report = await collectDriftReport(baseDir);
+    printDriftReport(report);
   }
 
   console.log('');

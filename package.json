@@ -45,6 +45,7 @@
     "agents/",
     "profiles/",
     "templates/",
+    "scripts/",
     ".husky/",
     "LICENSE",
     "README.md",
@@ -53,6 +54,7 @@
   ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
+    "postinstall": "node scripts/postinstall.mjs",
     "prepublishOnly": "pnpm run build",
     "lint": "pnpm run lint:regex && eslint .",
     "lint:regex": "node scripts/lint-safe-regex.mjs",

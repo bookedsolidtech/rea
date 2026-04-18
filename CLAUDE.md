@@ -195,3 +195,19 @@ Slash commands at `.claude/commands/`:
 - `CONTRIBUTING.md` — contributor guide + DCO
 - `CODE_OF_CONDUCT.md` — Contributor Covenant
 - `CHANGELOG.md` — Changesets-generated history
+
+<!-- rea:managed:start v=1 -->
+
+## REA Governance (managed — do not edit this block)
+
+- **Policy**: `.rea/policy.yaml` — profile `bst-internal`
+- **Autonomy**: `L1` (ceiling `L2`)
+- **Blocked paths**: 8 entries — see the policy file
+- **block_ai_attribution**: `true` (enforced by commit-msg hook)
+
+Protected-path changes (`src/gateway/middleware/`, `hooks/`, `src/policy/`,
+`.github/workflows/`) require a `/codex-review` audit entry before push.
+
+Run `rea doctor` to verify the install. Run `rea check` to inspect state.
+
+<!-- rea:managed:end -->

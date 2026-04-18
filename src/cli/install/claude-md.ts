@@ -34,8 +34,20 @@ export interface ClaudeMdFragmentInput {
   blockAiAttribution: boolean;
 }
 
-const START_MARKER = '<!-- rea:managed:start v=1 -->';
-const END_MARKER = '<!-- rea:managed:end -->';
+export const START_MARKER = '<!-- rea:managed:start v=1 -->';
+export const END_MARKER = '<!-- rea:managed:end -->';
+
+/**
+ * Return the current managed-fragment substring (from START_MARKER to
+ * END_MARKER inclusive) if present in `content`, else `null`. Shared with
+ * `rea upgrade` so both sides use identical boundary semantics.
+ */
+export function extractFragment(content: string): string | null {
+  const s = content.indexOf(START_MARKER);
+  const e = content.indexOf(END_MARKER);
+  if (s === -1 || e === -1 || e < s) return null;
+  return content.slice(s, e + END_MARKER.length);
+}
 
 export function buildFragment(input: ClaudeMdFragmentInput): string {
   const lines = [
