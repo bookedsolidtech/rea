@@ -125,7 +125,7 @@ Project-level instructions for AI agents working in the rea repository.
 - `hooks/` — shipped shell hooks (source of truth — `rea init` copies from here)
 - `agents/` — curated 10-agent roster (source of truth — `rea init` copies from here)
 - `commands/` — 5 slash commands (source of truth — `rea init` copies from here)
-- `profiles/` — layerable profile YAMLs (client-engagement, bst-internal, lit-wc, open-source)
+- `profiles/` — layerable profile YAMLs (client-engagement, bst-internal, bst-internal-no-codex, lit-wc, open-source, open-source-no-codex). The `-no-codex` variants match their parents but cause `rea init` to default `review.codex_required: false`.
 - `.claude/` — **this repo's own install** (dogfood): real copies of agents, commands, hooks, plus settings.json
 - `.rea/` — **this repo's own policy**: `policy.yaml`, `registry.yaml`, audit log (gitignored), HALT (gitignored)
 
