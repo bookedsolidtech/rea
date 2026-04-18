@@ -1,0 +1,25 @@
+{
+  "mcpServers": {
+    "discord-ops": {
+      "command": "npx",
+      "args": ["-y", "discord-ops@latest"],
+      "env": {
+        "BOOKED_DISCORD_BOT_TOKEN": "${BOOKED_DISCORD_BOT_TOKEN}",
+        "CLARITY_DISCORD_BOT_TOKEN": "${CLARITY_DISCORD_BOT_TOKEN}"
+      }
+    },
+    "obsidian": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "obsidian-mcp",
+        "/Volumes/Development/booked/data/bst",
+        "/Volumes/Development/booked/data/the-well",
+        "/Volumes/Development/booked/data/drupal-kb",
+        "/Volumes/Development/booked/data/nextjs-kb",
+        "/Volumes/Development/booked/data/react-kb",
+        "/Volumes/Development/booked/data/web-llm-kb"
+      ]
+    }
+  }
+}

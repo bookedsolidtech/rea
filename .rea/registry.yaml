@@ -1,0 +1,6 @@
+# .rea/registry.yaml — downstream MCP servers proxied through rea serve.
+# rea serve is a stub in 0.1.0; this file is forward-compatible.
+# When the gateway ships, discord-ops and obsidian from .mcp.json will be
+# re-declared here so their tool calls flow through the middleware chain.
+version: "1"
+servers: []
