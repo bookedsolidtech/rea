@@ -18,10 +18,41 @@
  * header of `.husky/commit-msg` for the opt-in check.
  */
 
+import { execFile } from 'node:child_process';
 import fs from 'node:fs';
 import fsPromises from 'node:fs/promises';
 import path from 'node:path';
+import { promisify } from 'node:util';
 import { PKG_ROOT, warn } from '../utils.js';
+
+const execFileAsync = promisify(execFile);
+
+/**
+ * Read `core.hooksPath` via `git config --get`. This is the only correct way
+ * to consult git config: regex-matching `.git/config` (finding #9) is
+ * section-blind and matches `hooksPath = …` inside `[worktree]`, `[alias]`,
+ * `[includeIf]`, or conditional include files — any of which would aim the
+ * installer at the wrong directory.
+ *
+ * We use `execFile` (not `exec`) so there is no shell interpolation of the
+ * target directory. Returns `null` if the key is unset (git exits non-zero),
+ * or if git itself isn't on PATH.
+ */
+async function readHooksPathFromGit(targetDir: string): Promise<string | null> {
+  try {
+    const { stdout } = await execFileAsync(
+      'git',
+      ['-C', targetDir, 'config', '--get', 'core.hooksPath'],
+      { encoding: 'utf8' },
+    );
+    const trimmed = stdout.trim();
+    return trimmed.length > 0 ? trimmed : null;
+  } catch {
+    // Non-zero exit (key not set) or git missing from PATH. Either way we fall
+    // back to the default `.git/hooks/`.
+    return null;
+  }
+}
 
 export interface CommitMsgInstallResult {
   gitHook?: string;
@@ -61,22 +92,17 @@ export async function installCommitMsgHook(
   }
 
   // Determine the true hooks directory; respect core.hooksPath when set.
+  // We defer to `git config --get` rather than regex-matching `.git/config`
+  // so that section-scoped keys (`[worktree]`, `[alias]`, `[includeIf]`,
+  // `[include]` files) are resolved the way git itself resolves them. Any
+  // other approach (finding #9) is section-blind.
   let hooksDir = path.join(gitDir, 'hooks');
-  try {
-    // Read .git/config naively — we only care about `hooksPath` and only when
-    // it's literally set, which is rare in practice.
-    const cfgPath = path.join(gitDir, 'config');
-    if (fs.existsSync(cfgPath)) {
-      const cfg = fs.readFileSync(cfgPath, 'utf8');
-      const match = cfg.match(/^\s*hooksPath\s*=\s*(.+)\s*$/m);
-      if (match?.[1]) {
-        const raw = match[1].trim();
-        hooksDir = path.isAbsolute(raw) ? raw : path.join(targetDir, raw);
-        result.warnings.push(`git core.hooksPath is set — installing to ${hooksDir}`);
-      }
-    }
-  } catch {
-    // Non-fatal — fall back to the default path.
+  const configuredHooksPath = await readHooksPathFromGit(targetDir);
+  if (configuredHooksPath !== null) {
+    hooksDir = path.isAbsolute(configuredHooksPath)
+      ? configuredHooksPath
+      : path.join(targetDir, configuredHooksPath);
+    result.warnings.push(`git core.hooksPath is set — installing to ${hooksDir}`);
   }
 
   const gitHookPath = path.join(hooksDir, 'commit-msg');

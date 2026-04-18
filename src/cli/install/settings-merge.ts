@@ -147,7 +147,24 @@ export function mergeSettings(
   return { merged, warnings, addedCount, skippedCount };
 }
 
-/** Atomic write via tmp-file + rename. */
+/**
+ * Atomic write via tmp-file + rename.
+ *
+ * Portability note (finding #8): POSIX `rename(2)` atomically replaces the
+ * destination if it exists, but Windows `MoveFileEx` without
+ * `MOVEFILE_REPLACE_EXISTING` fails with `EEXIST`/`EPERM` on a non-empty
+ * destination — and Node's `fs.rename` does not pass that flag on Win32. So on
+ * Windows, a straight rename over an existing `settings.json` fails and
+ * `rea init` cannot update consumer settings.
+ *
+ * We handle this inline rather than taking a dependency: try `rename`; if it
+ * fails with `EEXIST` or `EPERM`, `unlink` the destination and retry. This
+ * opens a tiny window where the file is missing between unlink and rename, but
+ * a crash in that window leaves the `.tmp` file on disk as a recoverable
+ * artifact — strictly better than a corrupted merge. We prefer no dependency
+ * over `write-file-atomic`: every dep on a governance tool is a supply-chain
+ * surface, and this shim is small enough to audit here.
+ */
 export async function writeSettingsAtomic(
   settingsPath: string,
   settings: Record<string, unknown>,
@@ -157,7 +174,31 @@ export async function writeSettingsAtomic(
   const tmp = `${settingsPath}.tmp`;
   const serialized = JSON.stringify(settings, null, 2) + '\n';
   await fsPromises.writeFile(tmp, serialized, 'utf8');
-  await fsPromises.rename(tmp, settingsPath);
+  try {
+    await fsPromises.rename(tmp, settingsPath);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code !== 'EEXIST' && code !== 'EPERM') {
+      // Clean up the tmp file on unexpected failure so we don't leave litter.
+      await fsPromises.unlink(tmp).catch(() => {
+        /* best-effort; original error is the one that matters */
+      });
+      throw err;
+    }
+    // Windows: destination exists and rename refuses to replace it. Remove
+    // and retry. If the second rename also fails, propagate — something
+    // stranger is going on (permissions, read-only volume) that the operator
+    // needs to see.
+    await fsPromises.unlink(settingsPath);
+    try {
+      await fsPromises.rename(tmp, settingsPath);
+    } catch (retryErr) {
+      await fsPromises.unlink(tmp).catch(() => {
+        /* best-effort cleanup */
+      });
+      throw retryErr;
+    }
+  }
 }
 
 /**

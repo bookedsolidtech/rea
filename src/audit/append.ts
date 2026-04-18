@@ -61,6 +61,50 @@ export interface AppendAuditInput {
 /** Per-file write queue to preserve linear hash-chain order within a process. */
 const writeQueues = new Map<string, Promise<void>>();
 
+/**
+ * Cache of `baseDir → resolved baseDir` so we pay the realpath cost once per
+ * unique input. Correctness comes from the fact that we always key the write
+ * queue by the resolved path; this map is only here to keep steady-state
+ * appends fast. Invalidated implicitly when the process exits.
+ */
+const resolvedBaseDirCache = new Map<string, string>();
+
+/**
+ * Resolve a baseDir to a stable, process-wide canonical form. Two callers that
+ * pass `'.'` and `process.cwd()` for the same project must land on the same
+ * queue key — otherwise the per-process serialization promise in this module's
+ * header is broken and concurrent appends can interleave, corrupting the hash
+ * chain.
+ *
+ * Strategy:
+ *   1. `path.resolve(baseDir)` — makes relative paths absolute and normalizes.
+ *   2. Best-effort `fs.realpath(resolvedBase)` — unwraps symlinks (e.g. macOS
+ *      `/tmp` → `/private/tmp`). If it throws (directory doesn't exist yet on
+ *      first write, permission error, etc.), fall back to the `path.resolve`
+ *      result. The directory will be created in `doAppend` via `mkdir`.
+ *
+ * Correctness first, caching second: we only cache on successful realpath. If
+ * realpath fails because the dir doesn't exist yet, we don't cache — the next
+ * call gets another chance to canonicalize once the dir exists.
+ */
+async function resolveBaseDir(baseDir: string): Promise<string> {
+  const cached = resolvedBaseDirCache.get(baseDir);
+  if (cached !== undefined) return cached;
+
+  const absolute = path.resolve(baseDir);
+  try {
+    const real = await fs.realpath(absolute);
+    resolvedBaseDirCache.set(baseDir, real);
+    return real;
+  } catch {
+    // Directory doesn't exist yet, or realpath isn't permitted here. Fall back
+    // to the path.resolve'd absolute form — still stable per input, still
+    // collapses `'.' === cwd` via the absolute path. Don't cache: once the
+    // directory exists, a later call should upgrade to the realpath form.
+    return absolute;
+  }
+}
+
 function computeHash(record: Omit<AuditRecord, 'hash'>): string {
   return crypto.createHash('sha256').update(JSON.stringify(record)).digest('hex');
 }
@@ -105,10 +149,10 @@ async function fsyncFile(filePath: string): Promise<void> {
 }
 
 async function doAppend(
-  baseDir: string,
+  resolvedBase: string,
   input: AppendAuditInput,
 ): Promise<AuditRecord> {
-  const reaDir = path.join(baseDir, REA_DIR);
+  const reaDir = path.join(resolvedBase, REA_DIR);
   const auditFile = path.join(reaDir, AUDIT_FILE);
 
   await fs.mkdir(reaDir, { recursive: true });
@@ -155,9 +199,13 @@ export async function appendAuditRecord(
   baseDir: string,
   input: AppendAuditInput,
 ): Promise<AuditRecord> {
-  const reaDir = path.join(baseDir, REA_DIR);
-  const auditFile = path.join(reaDir, AUDIT_FILE);
-  const key = auditFile;
+  // Canonicalize the baseDir so every caller targeting the same on-disk
+  // directory lands on the same queue key, regardless of whether they passed
+  // `'.'`, `process.cwd()`, or a symlinked path. Without this, two callers in
+  // the same process can bypass the serialization promise and interleave
+  // appends — corrupting the hash chain (finding #6).
+  const resolvedBase = await resolveBaseDir(baseDir);
+  const key = path.join(resolvedBase, REA_DIR, AUDIT_FILE);
 
   const prev = writeQueues.get(key) ?? Promise.resolve();
   let record!: AuditRecord;
@@ -166,7 +214,7 @@ export async function appendAuditRecord(
       /* previous write's error is owned by that caller */
     })
     .then(async () => {
-      record = await doAppend(baseDir, input);
+      record = await doAppend(resolvedBase, input);
     });
   writeQueues.set(
     key,

@@ -1,5 +1,13 @@
-import { describe, expect, it } from 'vitest';
-import { mergeSettings, defaultDesiredHooks, type DesiredHookGroup } from './settings-merge.js';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import {
+  mergeSettings,
+  defaultDesiredHooks,
+  writeSettingsAtomic,
+  type DesiredHookGroup,
+} from './settings-merge.js';
 
 describe('mergeSettings', () => {
   it('adds all hooks into an empty settings file without chaining warnings', () => {
@@ -64,5 +72,72 @@ describe('mergeSettings', () => {
     const result = mergeSettings({}, desired);
     expect(result.warnings.some((w) => w.includes('added novel matcher "custom"'))).toBe(true);
     expect(result.addedCount).toBe(1);
+  });
+});
+
+describe('writeSettingsAtomic — cross-platform rename (finding #8)', () => {
+  let dir: string;
+
+  beforeEach(async () => {
+    dir = await fs.mkdtemp(path.join(os.tmpdir(), 'rea-settings-'));
+  });
+
+  afterEach(async () => {
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
+  it('writes a new settings.json when none exists', async () => {
+    const target = path.join(dir, '.claude', 'settings.json');
+    await writeSettingsAtomic(target, { hooks: { PreToolUse: [] } });
+    const written = await fs.readFile(target, 'utf8');
+    expect(JSON.parse(written)).toEqual({ hooks: { PreToolUse: [] } });
+    // Tmp file must not be left behind.
+    await expect(fs.stat(`${target}.tmp`)).rejects.toThrow();
+  });
+
+  it('overwrites an existing settings.json (POSIX atomic-replace semantics)', async () => {
+    const target = path.join(dir, '.claude', 'settings.json');
+    await fs.mkdir(path.dirname(target), { recursive: true });
+    await fs.writeFile(target, '{"stale":true}\n', 'utf8');
+
+    await writeSettingsAtomic(target, { fresh: true });
+    const written = await fs.readFile(target, 'utf8');
+    expect(JSON.parse(written)).toEqual({ fresh: true });
+    await expect(fs.stat(`${target}.tmp`)).rejects.toThrow();
+  });
+
+  it('recovers when rename reports EEXIST (Windows rename-does-not-replace behavior)', async () => {
+    // We can't monkey-patch the ESM namespace of `node:fs/promises` — its
+    // properties are read-only on import. Vitest's `vi.spyOn` takes a
+    // different path (defineProperty on the module record) and does work
+    // here. Simulate the Windows rename-EEXIST on the first attempt; the
+    // fallback unlink + retry should succeed on the second.
+    const target = path.join(dir, '.claude', 'settings.json');
+    await fs.mkdir(path.dirname(target), { recursive: true });
+    await fs.writeFile(target, '{"stale":true}\n', 'utf8');
+
+    const originalRename = fs.rename;
+    let calls = 0;
+    const spy = vi.spyOn(fs, 'rename').mockImplementation(async (oldPath, newPath) => {
+      calls += 1;
+      if (calls === 1 && typeof newPath === 'string' && newPath.endsWith('settings.json')) {
+        const e = new Error('simulated EEXIST') as NodeJS.ErrnoException;
+        e.code = 'EEXIST';
+        throw e;
+      }
+      return originalRename(oldPath, newPath);
+    });
+
+    try {
+      await writeSettingsAtomic(target, { fresh: true });
+    } finally {
+      spy.mockRestore();
+    }
+
+    // First call threw (simulated Windows), second call succeeded.
+    expect(calls).toBeGreaterThanOrEqual(2);
+    const written = await fs.readFile(target, 'utf8');
+    expect(JSON.parse(written)).toEqual({ fresh: true });
+    await expect(fs.stat(`${target}.tmp`)).rejects.toThrow();
   });
 });
