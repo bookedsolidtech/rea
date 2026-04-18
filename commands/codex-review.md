@@ -11,7 +11,7 @@ allowed-tools:
 
 # /codex-review — Adversarial Review via Codex
 
-Invokes the Codex plugin (`/codex adversarial-review`) on the current branch's diff, captures the result, and records it to the REA audit log. Adversarial review by an independent model (GPT-5.4) is a **first-class, non-optional step** in the REA engineering process — it is the counterweight to Opus-authored code.
+Invokes the Codex plugin (`/codex:adversarial-review`) on the current branch's diff, captures the result, and records it to the REA audit log. Adversarial review by an independent model (GPT-5.4) is a **first-class, non-optional step** in the REA engineering process — it is the counterweight to Opus-authored code.
 
 ## Why this exists
 
@@ -52,7 +52,7 @@ Invoke the `codex-adversarial` agent with:
 - The commit log summary
 - The full diff text
 
-The agent wraps `/codex adversarial-review` and returns structured findings.
+The agent wraps `/codex:adversarial-review` and returns structured findings.
 
 ## Step 3 — Record to audit log
 

@@ -65,4 +65,110 @@ describe('policy loader', () => {
   it('throws when policy file is missing', () => {
     expect(() => loadPolicy(baseDir)).toThrow(/Policy file not found/);
   });
+
+  describe('review policy (G11.2)', () => {
+    it('accepts review.codex_required when set', async () => {
+      const yaml = SAMPLE + '\nreview:\n  codex_required: false\n';
+      await fs.writeFile(path.join(baseDir, '.rea', 'policy.yaml'), yaml, 'utf8');
+      const p = loadPolicy(baseDir);
+      expect(p.review?.codex_required).toBe(false);
+    });
+
+    it('leaves review undefined when not set (backwards compatible)', async () => {
+      await fs.writeFile(path.join(baseDir, '.rea', 'policy.yaml'), SAMPLE, 'utf8');
+      const p = loadPolicy(baseDir);
+      expect(p.review).toBeUndefined();
+    });
+
+    it('rejects unknown fields inside review (strict)', async () => {
+      const yaml = SAMPLE + '\nreview:\n  codex_required: true\n  mystery: 1\n';
+      await fs.writeFile(path.join(baseDir, '.rea', 'policy.yaml'), yaml, 'utf8');
+      expect(() => loadPolicy(baseDir)).toThrow(/Invalid policy schema/);
+    });
+  });
+
+  describe('redact policy (G3)', () => {
+    it('accepts redact.match_timeout_ms and redact.patterns when set', async () => {
+      const yaml =
+        SAMPLE +
+        '\nredact:\n' +
+        '  match_timeout_ms: 250\n' +
+        '  patterns:\n' +
+        '    - name: internal-token\n' +
+        '      regex: "MYTOKEN_[A-Z0-9]{12}"\n' +
+        '      flags: g\n';
+      await fs.writeFile(path.join(baseDir, '.rea', 'policy.yaml'), yaml, 'utf8');
+      const p = loadPolicy(baseDir);
+      expect(p.redact?.match_timeout_ms).toBe(250);
+      expect(p.redact?.patterns).toHaveLength(1);
+      expect(p.redact?.patterns?.[0]?.name).toBe('internal-token');
+      expect(p.redact?.patterns?.[0]?.regex).toBe('MYTOKEN_[A-Z0-9]{12}');
+      expect(p.redact?.patterns?.[0]?.flags).toBe('g');
+    });
+
+    it('leaves redact undefined when not set (backwards compatible)', async () => {
+      await fs.writeFile(path.join(baseDir, '.rea', 'policy.yaml'), SAMPLE, 'utf8');
+      const p = loadPolicy(baseDir);
+      expect(p.redact).toBeUndefined();
+    });
+
+    it('rejects a user pattern that safe-regex flags as unsafe', async () => {
+      // Classic catastrophic backtracker — safe-regex marks this unsafe.
+      const yaml =
+        SAMPLE +
+        '\nredact:\n' +
+        '  patterns:\n' +
+        '    - name: catastrophic\n' +
+        '      regex: "(a+)+$"\n';
+      await fs.writeFile(path.join(baseDir, '.rea', 'policy.yaml'), yaml, 'utf8');
+      expect(() => loadPolicy(baseDir)).toThrow(/Unsafe redact pattern "catastrophic"/);
+    });
+
+    it('rejects a user pattern that does not compile', async () => {
+      const yaml =
+        SAMPLE +
+        '\nredact:\n' +
+        '  patterns:\n' +
+        '    - name: bad-regex\n' +
+        '      regex: "("\n';
+      await fs.writeFile(path.join(baseDir, '.rea', 'policy.yaml'), yaml, 'utf8');
+      expect(() => loadPolicy(baseDir)).toThrow(/Invalid redact pattern "bad-regex"/);
+    });
+
+    it('rejects unknown fields inside redact (strict)', async () => {
+      const yaml = SAMPLE + '\nredact:\n  match_timeout_ms: 100\n  mystery: 1\n';
+      await fs.writeFile(path.join(baseDir, '.rea', 'policy.yaml'), yaml, 'utf8');
+      expect(() => loadPolicy(baseDir)).toThrow(/Invalid policy schema/);
+    });
+
+    it('rejects a user pattern with unknown fields (strict)', async () => {
+      const yaml =
+        SAMPLE +
+        '\nredact:\n' +
+        '  patterns:\n' +
+        '    - name: good\n' +
+        '      regex: "A[0-9]{10}"\n' +
+        '      mystery: "x"\n';
+      await fs.writeFile(path.join(baseDir, '.rea', 'policy.yaml'), yaml, 'utf8');
+      expect(() => loadPolicy(baseDir)).toThrow(/Invalid policy schema/);
+    });
+
+    it('accepts a safe user pattern (load + round-trip)', async () => {
+      // Bounded, non-backtracking pattern — safe-regex accepts it.
+      const yaml =
+        SAMPLE +
+        '\nredact:\n' +
+        '  match_timeout_ms: 150\n' +
+        '  patterns:\n' +
+        '    - name: customer-id\n' +
+        '      regex: "CID_[A-Z0-9]{10}"\n' +
+        '      flags: g\n';
+      await fs.writeFile(path.join(baseDir, '.rea', 'policy.yaml'), yaml, 'utf8');
+      const p = loadPolicy(baseDir);
+      expect(p.redact?.patterns?.[0]?.name).toBe('customer-id');
+      // The policy returns the raw pattern spec; the gateway compiles it at
+      // middleware-creation time.
+      expect(p.redact?.patterns?.[0]?.regex).toBe('CID_[A-Z0-9]{10}');
+    });
+  });
 });

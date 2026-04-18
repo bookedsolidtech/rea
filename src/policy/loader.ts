@@ -3,6 +3,7 @@ import fsPromises from 'node:fs/promises';
 import path from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { z } from 'zod';
+import safeRegex from 'safe-regex';
 import { AutonomyLevel } from './types.js';
 import type { Policy } from './types.js';
 
@@ -18,6 +19,40 @@ const ContextProtectionSchema = z.object({
   max_bash_output_lines: z.number().int().positive().optional(),
 });
 
+/**
+ * G11.2: minimal review policy. Only `codex_required` is recognized today;
+ * G11.4 will expand this (profile defaults, reviewer pin, token caps).
+ * Kept strict so a typo (`codex_require`) fails loudly instead of silently
+ * defaulting.
+ */
+const ReviewPolicySchema = z
+  .object({
+    codex_required: z.boolean().optional(),
+  })
+  .strict();
+
+/**
+ * G3: user-supplied redaction pattern. `name` is audit-stable; `regex` is a
+ * raw pattern source (no leading/trailing slashes); `flags` follows JS
+ * RegExp flag semantics. Every pattern is passed through `safe-regex` at
+ * load time — a flagged pattern rejects the entire policy load with an
+ * error that names the offender.
+ */
+const UserRedactPatternSchema = z
+  .object({
+    name: z.string().min(1),
+    regex: z.string().min(1),
+    flags: z.string().optional(),
+  })
+  .strict();
+
+const RedactPolicySchema = z
+  .object({
+    match_timeout_ms: z.number().int().positive().optional(),
+    patterns: z.array(UserRedactPatternSchema).optional(),
+  })
+  .strict();
+
 const PolicySchema = z
   .object({
     version: z.string(),
@@ -32,6 +67,8 @@ const PolicySchema = z
     notification_channel: z.string().default(''),
     injection_detection: z.enum(['block', 'warn']).optional(),
     context_protection: ContextProtectionSchema.optional(),
+    review: ReviewPolicySchema.optional(),
+    redact: RedactPolicySchema.optional(),
   })
   .strict();
 
@@ -75,6 +112,38 @@ function applyMaxCeiling(policy: Policy): Policy {
   return policy;
 }
 
+/**
+ * G3: run every user-supplied redact pattern through `safe-regex`. A flagged
+ * pattern rejects the entire policy load with an error that names the
+ * offender. Also verifies the pattern actually compiles — a malformed regex
+ * source is a clear policy authoring bug and should fail loud.
+ */
+function checkUserRedactPatterns(policy: z.infer<typeof PolicySchema>, policyPath: string): void {
+  const patterns = policy.redact?.patterns;
+  if (!patterns || patterns.length === 0) return;
+
+  for (const entry of patterns) {
+    let compiled: RegExp;
+    try {
+      compiled = new RegExp(entry.regex, entry.flags);
+    } catch (err) {
+      throw new Error(
+        `Invalid redact pattern "${entry.name}" at ${policyPath}: ` +
+          `cannot compile regex ${JSON.stringify(entry.regex)}` +
+          (entry.flags ? ` with flags ${JSON.stringify(entry.flags)}` : '') +
+          ` — ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    if (!safeRegex(compiled)) {
+      throw new Error(
+        `Unsafe redact pattern "${entry.name}" at ${policyPath}: ` +
+          `safe-regex flagged ${JSON.stringify(entry.regex)} as potentially ReDoS-vulnerable. ` +
+          `Rewrite with bounded quantifiers / no nested repetition / no disjoint alternation.`,
+      );
+    }
+  }
+}
+
 function parseRawPolicy(raw: string, policyPath: string): Policy {
   let parsed: unknown;
   try {
@@ -93,6 +162,10 @@ function parseRawPolicy(raw: string, policyPath: string): Policy {
       `Invalid policy schema at ${policyPath}: ${zodErr instanceof Error ? zodErr.message : zodErr}`,
     );
   }
+
+  // G3: reject unsafe user-supplied redaction patterns. This runs BEFORE
+  // stripUndefined so the error references the user-authored field exactly.
+  checkUserRedactPatterns(parsedPolicy, policyPath);
 
   return applyMaxCeiling(stripUndefined(parsedPolicy));
 }

@@ -125,7 +125,7 @@ Project-level instructions for AI agents working in the rea repository.
 - `hooks/` — shipped shell hooks (source of truth — `rea init` copies from here)
 - `agents/` — curated 10-agent roster (source of truth — `rea init` copies from here)
 - `commands/` — 5 slash commands (source of truth — `rea init` copies from here)
-- `profiles/` — layerable profile YAMLs (client-engagement, bst-internal, lit-wc, open-source)
+- `profiles/` — layerable profile YAMLs (client-engagement, bst-internal, bst-internal-no-codex, lit-wc, open-source, open-source-no-codex). The `-no-codex` variants match their parents but cause `rea init` to default `review.codex_required: false`.
 - `.claude/` — **this repo's own install** (dogfood): real copies of agents, commands, hooks, plus settings.json
 - `.rea/` — **this repo's own policy**: `policy.yaml`, `registry.yaml`, audit log (gitignored), HALT (gitignored)
 
@@ -195,3 +195,19 @@ Slash commands at `.claude/commands/`:
 - `CONTRIBUTING.md` — contributor guide + DCO
 - `CODE_OF_CONDUCT.md` — Contributor Covenant
 - `CHANGELOG.md` — Changesets-generated history
+
+<!-- rea:managed:start v=1 -->
+
+## REA Governance (managed — do not edit this block)
+
+- **Policy**: `.rea/policy.yaml` — profile `bst-internal`
+- **Autonomy**: `L1` (ceiling `L2`)
+- **Blocked paths**: 8 entries — see the policy file
+- **block_ai_attribution**: `true` (enforced by commit-msg hook)
+
+Protected-path changes (`src/gateway/middleware/`, `hooks/`, `src/policy/`,
+`.github/workflows/`) require a `/codex-review` audit entry before push.
+
+Run `rea doctor` to verify the install. Run `rea check` to inspect state.
+
+<!-- rea:managed:end -->

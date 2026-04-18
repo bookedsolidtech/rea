@@ -3,6 +3,33 @@ import os from 'node:os';
 import path from 'node:path';
 import * as p from '@clack/prompts';
 import { AutonomyLevel } from '../policy/types.js';
+import { HARD_DEFAULTS, loadProfile, mergeProfiles, type Profile } from '../policy/profiles.js';
+import { copyArtifacts } from './install/copy.js';
+import {
+  canonicalSettingsSubsetHash,
+  defaultDesiredHooks,
+  mergeSettings,
+  readSettings,
+  writeSettingsAtomic,
+} from './install/settings-merge.js';
+import { installCommitMsgHook } from './install/commit-msg.js';
+import { buildFragment, writeClaudeMdFragment } from './install/claude-md.js';
+import {
+  CLAUDE_MD_MANIFEST_PATH,
+  SETTINGS_MANIFEST_PATH,
+  enumerateCanonicalFiles,
+} from './install/canonical.js';
+import { writeManifestAtomic } from './install/manifest-io.js';
+import type {
+  InstallManifest,
+  ManifestEntry,
+} from './install/manifest-schema.js';
+import { sha256OfBuffer, sha256OfFile } from './install/sha.js';
+import {
+  defaultReagentPath,
+  ReagentDroppedFieldsError,
+  translateReagentPolicy,
+} from './install/reagent.js';
 import {
   POLICY_FILE,
   REA_DIR,
@@ -10,23 +37,57 @@ import {
   err,
   getPkgVersion,
   log,
+  warn,
 } from './utils.js';
 
 export interface InitOptions {
   yes?: boolean | undefined;
   fromReagent?: boolean | undefined;
   profile?: string | undefined;
+  force?: boolean | undefined;
+  acceptDroppedFields?: boolean | undefined;
+  /**
+   * G11.4: explicit override for Codex adversarial review. `true` forces
+   * `review.codex_required: true` in the written policy; `false` forces
+   * `false`. Undefined → derive default from the chosen profile name
+   * (profiles whose name ends with `-no-codex` default to no-codex).
+   *
+   * Non-interactive semantics: in `--yes` mode the flag is honored
+   * directly. Interactive mode confirms the flag value as the prompt's
+   * initial value (but still prompts for a final answer).
+   */
+  codex?: boolean | undefined;
 }
 
-type Profile = 'client-engagement' | 'bst-internal' | 'lit-wc' | 'open-source' | 'minimal';
+type ProfileName =
+  | 'client-engagement'
+  | 'bst-internal'
+  | 'bst-internal-no-codex'
+  | 'lit-wc'
+  | 'open-source'
+  | 'open-source-no-codex'
+  | 'minimal';
 
-const PROFILES: Profile[] = [
+const PROFILE_NAMES: ProfileName[] = [
   'minimal',
   'client-engagement',
   'bst-internal',
+  'bst-internal-no-codex',
   'lit-wc',
   'open-source',
+  'open-source-no-codex',
 ];
+
+/**
+ * Default value for the "Use Codex?" decision, derived from the profile
+ * name. Profiles whose name ends in `-no-codex` default to false;
+ * everything else defaults to true. This keeps the wizard aligned with
+ * whatever profile preset the operator picked without hard-coding a
+ * profile-to-bool map.
+ */
+function profileDefaultCodexRequired(profileName: ProfileName): boolean {
+  return !profileName.endsWith('-no-codex');
+}
 
 const AUTONOMY_LEVELS: AutonomyLevel[] = [
   AutonomyLevel.L0,
@@ -36,16 +97,25 @@ const AUTONOMY_LEVELS: AutonomyLevel[] = [
 ];
 
 interface ResolvedConfig {
-  profile: Profile;
+  profile: ProfileName;
   autonomyLevel: AutonomyLevel;
   maxAutonomyLevel: AutonomyLevel;
   blockAiAttribution: boolean;
+  blockedPaths: string[];
+  notificationChannel: string;
+  /**
+   * G11.4: written to `.rea/policy.yaml` as `review.codex_required`. We
+   * always emit the field explicitly — no implicit defaults — so an
+   * operator reading the file sees the choice that was made at init time.
+   */
+  codexRequired: boolean;
   fromReagent: boolean;
   reagentPolicyPath: string | null;
+  reagentNotices: string[];
 }
 
 function detectReagentPolicy(targetDir: string): string | null {
-  const reagentPolicy = path.join(targetDir, '.reagent', 'policy.yaml');
+  const reagentPolicy = defaultReagentPath(targetDir);
   return fs.existsSync(reagentPolicy) ? reagentPolicy : null;
 }
 
@@ -66,8 +136,8 @@ function levelRank(level: AutonomyLevel): number {
   return { L0: 0, L1: 1, L2: 2, L3: 3 }[level];
 }
 
-function isValidProfile(value: string): value is Profile {
-  return (PROFILES as readonly string[]).includes(value);
+function isValidProfile(value: string): value is ProfileName {
+  return (PROFILE_NAMES as readonly string[]).includes(value);
 }
 
 function cancel(message: string): never {
@@ -75,10 +145,31 @@ function cancel(message: string): never {
   process.exit(0);
 }
 
+/**
+ * Build the final layered profile in the documented merge order:
+ *   hardDefaults ← profile ← reagentTranslation ← wizardAnswers
+ */
+function resolveLayered(
+  profileName: ProfileName,
+  reagentTranslated: Profile | null,
+): Profile {
+  const profile = loadProfile(profileName);
+  if (profile === null) {
+    warn(`profile "${profileName}" not found on disk — using hard defaults only`);
+    return { ...HARD_DEFAULTS };
+  }
+  let layered = mergeProfiles(HARD_DEFAULTS, profile);
+  if (reagentTranslated !== null) {
+    layered = mergeProfiles(layered, reagentTranslated);
+  }
+  return layered;
+}
+
 async function runWizard(
   options: InitOptions,
   targetDir: string,
   reagentPolicyPath: string | null,
+  layeredBase: Profile,
 ): Promise<ResolvedConfig> {
   const projectName = detectProjectName(targetDir);
   p.intro(`rea init — ${projectName}`);
@@ -94,40 +185,34 @@ async function runWizard(
   }
 
   // Profile selection
-  let profile: Profile;
+  let profileName: ProfileName;
   if (options.profile !== undefined) {
     if (!isValidProfile(options.profile)) {
-      p.cancel(
-        `Unknown profile: "${options.profile}". Valid: ${PROFILES.join(', ')}`,
-      );
+      p.cancel(`Unknown profile: "${options.profile}". Valid: ${PROFILE_NAMES.join(', ')}`);
       process.exit(1);
     }
-    profile = options.profile;
-    p.log.info(`Profile: ${profile} (from --profile)`);
+    profileName = options.profile;
+    p.log.info(`Profile: ${profileName} (from --profile)`);
   } else {
-    const picked = await p.select<Profile>({
+    const picked = await p.select<ProfileName>({
       message: 'Pick a profile',
       initialValue: 'minimal',
       options: [
         { value: 'minimal', label: 'minimal', hint: 'bare policy, no extras (default)' },
-        {
-          value: 'client-engagement',
-          label: 'client-engagement',
-          hint: 'zero-trust client project',
-        },
+        { value: 'client-engagement', label: 'client-engagement', hint: 'zero-trust client project' },
         { value: 'bst-internal', label: 'bst-internal', hint: 'internal BST projects' },
         { value: 'lit-wc', label: 'lit-wc', hint: 'Lit / web component libraries' },
         { value: 'open-source', label: 'open-source', hint: 'public OSS repos' },
       ],
     });
     if (p.isCancel(picked)) cancel('Init cancelled.');
-    profile = picked;
+    profileName = picked;
   }
 
-  // Autonomy level
+  const autonomyDefault = layeredBase.autonomy_level ?? AutonomyLevel.L1;
   const autonomyPick = await p.select<AutonomyLevel>({
     message: 'Starting autonomy_level',
-    initialValue: AutonomyLevel.L1,
+    initialValue: autonomyDefault,
     options: [
       { value: AutonomyLevel.L0, label: 'L0', hint: 'read-only; every write needs approval' },
       { value: AutonomyLevel.L1, label: 'L1', hint: 'default — writes allowed, destructive gated' },
@@ -138,77 +223,121 @@ async function runWizard(
   if (p.isCancel(autonomyPick)) cancel('Init cancelled.');
   const autonomyLevel = autonomyPick;
 
-  // Max autonomy ceiling — constrain to levels >= autonomy
-  const maxCandidates = AUTONOMY_LEVELS.filter(
-    (lvl) => levelRank(lvl) >= levelRank(autonomyLevel),
-  );
+  const maxCandidates = AUTONOMY_LEVELS.filter((lvl) => levelRank(lvl) >= levelRank(autonomyLevel));
   const defaultMax: AutonomyLevel =
-    maxCandidates.find((l) => l === AutonomyLevel.L2) ?? autonomyLevel;
+    (layeredBase.max_autonomy_level !== undefined &&
+      maxCandidates.includes(layeredBase.max_autonomy_level) &&
+      layeredBase.max_autonomy_level) ||
+    maxCandidates.find((l) => l === AutonomyLevel.L2) ||
+    autonomyLevel;
 
-  const maxOptions = maxCandidates.map((lvl): { value: AutonomyLevel; label: string; hint?: string } => {
-    if (lvl === autonomyLevel) {
-      return { value: lvl, label: lvl, hint: 'same as starting level' };
-    }
-    return { value: lvl, label: lvl };
-  });
+  const maxOptions = maxCandidates.map(
+    (lvl): { value: AutonomyLevel; label: string; hint?: string } => {
+      if (lvl === autonomyLevel) return { value: lvl, label: lvl, hint: 'same as starting level' };
+      return { value: lvl, label: lvl };
+    },
+  );
   const maxPick = await p.select<AutonomyLevel>({
     message: 'max_autonomy_level (ceiling — cannot be exceeded at runtime)',
     initialValue: defaultMax,
-    // Cast: clack's Option type is a discriminated union over the literal values,
-    // but here we build it dynamically from the AutonomyLevel enum.
     options: maxOptions as Parameters<typeof p.select<AutonomyLevel>>[0]['options'],
   });
   if (p.isCancel(maxPick)) cancel('Init cancelled.');
   const maxAutonomyLevel = maxPick;
 
-  // block_ai_attribution
   const attribPick = await p.confirm({
     message: 'Enforce block_ai_attribution (reject AI-authored commit trailers)?',
-    initialValue: true,
+    initialValue: layeredBase.block_ai_attribution ?? true,
   });
   if (p.isCancel(attribPick)) cancel('Init cancelled.');
   const blockAiAttribution = attribPick === true;
 
-  p.outro('Config collected — writing files.');
+  // G11.4: "Use Codex adversarial review?" — the default follows the
+  // chosen profile (any `*-no-codex` profile defaults to No). An explicit
+  // flag on the command line overrides that default for the initial value.
+  const codexInitial =
+    options.codex !== undefined
+      ? options.codex
+      : profileDefaultCodexRequired(profileName);
+  const codexPick = await p.confirm({
+    message:
+      'Use Codex adversarial review? (requires an OpenAI account — can be added later)',
+    initialValue: codexInitial,
+  });
+  if (p.isCancel(codexPick)) cancel('Init cancelled.');
+  const codexRequired = codexPick === true;
+
+  p.outro('Config collected — installing files.');
 
   return {
-    profile,
+    profile: profileName,
     autonomyLevel,
     maxAutonomyLevel,
     blockAiAttribution,
+    blockedPaths: layeredBase.blocked_paths ?? ['.env', '.env.*'],
+    notificationChannel: layeredBase.notification_channel ?? '',
+    codexRequired,
     fromReagent,
     reagentPolicyPath,
+    reagentNotices: [],
   };
 }
 
-function writePolicyYaml(targetDir: string, config: ResolvedConfig): string {
+function writePolicyYaml(targetDir: string, config: ResolvedConfig, layered: Profile): string {
   const policyPath = path.join(targetDir, REA_DIR, POLICY_FILE);
   const installedBy = process.env.USER ?? os.userInfo().username ?? 'unknown';
   const installedAt = new Date().toISOString();
 
-  const lines = [
-    `# .rea/policy.yaml — managed by rea v${getPkgVersion()}`,
-    `# Edit carefully: tightening takes effect on next load; loosening requires human approval.`,
-    `version: "1"`,
-    `profile: ${JSON.stringify(config.profile)}`,
-    `installed_by: ${JSON.stringify(installedBy)}`,
-    `installed_at: ${JSON.stringify(installedAt)}`,
-    `autonomy_level: ${config.autonomyLevel}`,
-    `max_autonomy_level: ${config.maxAutonomyLevel}`,
-    `promotion_requires_human_approval: true`,
-    `block_ai_attribution: ${config.blockAiAttribution ? 'true' : 'false'}`,
-    `blocked_paths:`,
-    `  - ".env"`,
-    `  - ".env.*"`,
-    `notification_channel: ""`,
-    ``,
-  ];
+  const lines: string[] = [];
+  lines.push(`# .rea/policy.yaml — managed by rea v${getPkgVersion()}`);
+  lines.push(`# Edit carefully: tightening takes effect on next load; loosening requires human approval.`);
+  lines.push(`version: "1"`);
+  lines.push(`profile: ${JSON.stringify(config.profile)}`);
+  lines.push(`installed_by: ${JSON.stringify(installedBy)}`);
+  lines.push(`installed_at: ${JSON.stringify(installedAt)}`);
+  lines.push(`autonomy_level: ${config.autonomyLevel}`);
+  lines.push(`max_autonomy_level: ${config.maxAutonomyLevel}`);
+  lines.push(`promotion_requires_human_approval: true`);
+  lines.push(`block_ai_attribution: ${config.blockAiAttribution ? 'true' : 'false'}`);
+  lines.push(`blocked_paths:`);
+  for (const bp of config.blockedPaths) {
+    lines.push(`  - ${JSON.stringify(bp)}`);
+  }
+  lines.push(`notification_channel: ${JSON.stringify(config.notificationChannel)}`);
+
+  // Preserve injection_detection and context_protection if the layered profile
+  // carried them (e.g. bst-internal). These are pass-through fields.
+  if (layered.injection_detection !== undefined) {
+    lines.push(`injection_detection: ${layered.injection_detection}`);
+  }
+  if (layered.context_protection !== undefined) {
+    lines.push(`context_protection:`);
+    const cp = layered.context_protection;
+    if (cp.delegate_to_subagent !== undefined) {
+      lines.push(`  delegate_to_subagent:`);
+      for (const cmd of cp.delegate_to_subagent) {
+        lines.push(`    - ${JSON.stringify(cmd)}`);
+      }
+    }
+    if (cp.max_bash_output_lines !== undefined) {
+      lines.push(`  max_bash_output_lines: ${cp.max_bash_output_lines}`);
+    }
+  }
+
+  // G11.4: always emit the review block explicitly. Making the value
+  // visible in the generated file helps the operator notice what was
+  // chosen at init time and simplifies switching modes later (edit a
+  // single line, no need to understand the default semantics).
+  lines.push(`review:`);
+  lines.push(`  codex_required: ${config.codexRequired ? 'true' : 'false'}`);
+  lines.push(``);
   fs.writeFileSync(policyPath, lines.join('\n'), 'utf8');
   return policyPath;
 }
 
 function writeRegistryYaml(targetDir: string): string {
   const registryPath = path.join(targetDir, REA_DIR, REGISTRY_FILE);
+  if (fs.existsSync(registryPath)) return registryPath;
   const content = [
     `# .rea/registry.yaml — downstream MCP servers proxied through rea serve.`,
     `# Every entry below is subject to the same middleware chain as native tool calls.`,
@@ -220,57 +349,219 @@ function writeRegistryYaml(targetDir: string): string {
   return registryPath;
 }
 
+/**
+ * G12 — write `.rea/install-manifest.json` after `runInit` has copied all
+ * artifacts. SHAs are computed from the files on disk (so the manifest
+ * reflects actual state, not canonical-source state) with two synthetic
+ * entries for the rea-owned settings subset and the managed CLAUDE.md
+ * fragment.
+ */
+async function writeInstallManifest(
+  targetDir: string,
+  profile: string,
+  fragmentInput: Parameters<typeof buildFragment>[0],
+): Promise<string> {
+  const canonical = await enumerateCanonicalFiles();
+  const entries: ManifestEntry[] = [];
+  for (const c of canonical) {
+    const dst = path.join(targetDir, c.destRelPath);
+    // A file that was skipped during copy (e.g. --yes over existing) may not
+    // exist if the destination layout diverged — hash whatever is on disk.
+    // If it doesn't exist at all, fall back to hashing the source so the
+    // manifest still has a baseline.
+    const absPath = fs.existsSync(dst) ? dst : c.sourceAbsPath;
+    const sha = await sha256OfFile(absPath);
+    entries.push({ path: c.destRelPath, sha256: sha, source: c.source });
+  }
+  // Synthetic entries.
+  entries.push({
+    path: SETTINGS_MANIFEST_PATH,
+    sha256: canonicalSettingsSubsetHash(defaultDesiredHooks()),
+    source: 'settings',
+  });
+  entries.push({
+    path: CLAUDE_MD_MANIFEST_PATH,
+    sha256: sha256OfBuffer(buildFragment(fragmentInput)),
+    source: 'claude-md',
+  });
+
+  const manifest: InstallManifest = {
+    version: getPkgVersion(),
+    profile,
+    installed_at: new Date().toISOString(),
+    files: entries,
+  };
+  return writeManifestAtomic(targetDir, manifest);
+}
+
 export async function runInit(options: InitOptions): Promise<void> {
   const targetDir = process.cwd();
   const reagentPolicyPath = detectReagentPolicy(targetDir);
   const reaDir = path.join(targetDir, REA_DIR);
   const policyPath = path.join(reaDir, POLICY_FILE);
 
-  if (fs.existsSync(policyPath) && options.yes !== true) {
+  if (fs.existsSync(policyPath) && options.yes !== true && options.force !== true) {
     err(`.rea/policy.yaml already exists at ${policyPath}`);
     console.error('');
-    console.error('  Refusing to overwrite. Pass --yes to force, or remove the file first.');
+    console.error('  Refusing to overwrite. Pass --force to replace, or --yes to accept current settings.');
     console.error('');
     process.exit(1);
   }
 
+  // Select the profile name up front so we can load it for the layered base.
+  let profileName: ProfileName;
+  if (options.profile !== undefined && isValidProfile(options.profile)) {
+    profileName = options.profile;
+  } else if (options.profile !== undefined) {
+    err(`Unknown profile: "${options.profile}". Valid: ${PROFILE_NAMES.join(', ')}`);
+    process.exit(1);
+  } else {
+    profileName = 'minimal';
+  }
+
+  // Reagent translation, applied to the layered base before the wizard so
+  // defaults reflect the reagent values when the user confirms.
+  let reagentTranslated: Profile | null = null;
+  const reagentNotices: string[] = [];
+  const fromReagent = options.fromReagent === true;
+  if (fromReagent) {
+    if (reagentPolicyPath === null) {
+      err('--from-reagent passed but no .reagent/policy.yaml found');
+      process.exit(1);
+    }
+    const baseProfile = loadProfile(profileName);
+    const profileCeiling =
+      baseProfile?.max_autonomy_level ??
+      HARD_DEFAULTS.max_autonomy_level ??
+      AutonomyLevel.L2;
+    try {
+      const t = translateReagentPolicy(reagentPolicyPath, {
+        profileCeiling,
+        acceptDropped: options.acceptDroppedFields === true,
+      });
+      reagentTranslated = t.translated;
+      reagentNotices.push(...t.notices);
+    } catch (e) {
+      if (e instanceof ReagentDroppedFieldsError) {
+        err(e.message);
+        process.exit(1);
+      }
+      err(e instanceof Error ? e.message : String(e));
+      process.exit(1);
+    }
+  }
+
+  const layeredBase = resolveLayered(profileName, reagentTranslated);
+
   let config: ResolvedConfig;
 
   if (options.yes === true) {
-    const profile: Profile =
-      options.profile !== undefined && isValidProfile(options.profile)
-        ? options.profile
-        : 'minimal';
+    // G11.4 non-interactive codex resolution:
+    //   1. Explicit --codex / --no-codex flag wins.
+    //   2. Otherwise derive from the profile name (`*-no-codex` → false).
+    const codexRequired =
+      options.codex !== undefined
+        ? options.codex
+        : profileDefaultCodexRequired(profileName);
     config = {
-      profile,
-      autonomyLevel: AutonomyLevel.L1,
-      maxAutonomyLevel: AutonomyLevel.L2,
-      blockAiAttribution: true,
-      fromReagent: options.fromReagent === true,
+      profile: profileName,
+      autonomyLevel: layeredBase.autonomy_level ?? AutonomyLevel.L1,
+      maxAutonomyLevel: layeredBase.max_autonomy_level ?? AutonomyLevel.L2,
+      blockAiAttribution: layeredBase.block_ai_attribution ?? true,
+      blockedPaths: layeredBase.blocked_paths ?? ['.env', '.env.*'],
+      notificationChannel: layeredBase.notification_channel ?? '',
+      codexRequired,
+      fromReagent,
       reagentPolicyPath,
+      reagentNotices,
     };
-    log(`Non-interactive init: profile=${profile}, autonomy=L1, max=L2, attribution-block=true`);
+    log(
+      `Non-interactive init: profile=${profileName}, autonomy=${config.autonomyLevel}, max=${config.maxAutonomyLevel}, attribution-block=${config.blockAiAttribution}, codex_required=${config.codexRequired}`,
+    );
   } else {
-    config = await runWizard(options, targetDir, reagentPolicyPath);
+    config = await runWizard(options, targetDir, reagentPolicyPath, layeredBase);
+    config.reagentNotices = reagentNotices;
   }
 
-  if (!fs.existsSync(reaDir)) {
-    fs.mkdirSync(reaDir, { recursive: true });
-  }
+  if (!fs.existsSync(reaDir)) fs.mkdirSync(reaDir, { recursive: true });
 
   const written: string[] = [];
-  written.push(writePolicyYaml(targetDir, config));
+  written.push(writePolicyYaml(targetDir, config, layeredBase));
   written.push(writeRegistryYaml(targetDir));
 
-  // TODO: copy hooks/commands/agents once templates directory ships
-  // TODO: merge .claude/settings.json once hook registration is defined
-  // TODO: install .husky/commit-msg + .git/hooks/commit-msg for block_ai_attribution
+  // Artifact copies + settings merge + commit-msg + CLAUDE.md fragment.
+  const copyOptions = {
+    force: options.force === true,
+    yes: options.yes === true || options.force === true,
+  };
+  const copyResult = await copyArtifacts(targetDir, copyOptions);
+
+  const { settings, settingsPath } = readSettings(targetDir);
+  const desired = defaultDesiredHooks();
+  const mergeResult = mergeSettings(settings, desired);
+  await writeSettingsAtomic(settingsPath, mergeResult.merged);
+
+  const commitMsgResult = await installCommitMsgHook(targetDir);
+
+  const fragmentInput = {
+    policyPath: `.${path.sep}rea${path.sep}policy.yaml`.replace(/\\/g, '/'),
+    profile: config.profile,
+    autonomyLevel: config.autonomyLevel,
+    maxAutonomyLevel: config.maxAutonomyLevel,
+    blockedPathsCount: config.blockedPaths.length,
+    blockAiAttribution: config.blockAiAttribution,
+  };
+  const mdResult = await writeClaudeMdFragment(targetDir, fragmentInput);
+
+  // G12 — record the install manifest. SHAs are of the files actually on disk
+  // after the copy pass, so drift detection compares against real state (not
+  // canonical, which may differ if the consumer's copy was aborted mid-run).
+  const manifestPath = await writeInstallManifest(
+    targetDir,
+    config.profile,
+    fragmentInput,
+  );
 
   console.log('');
   log('init complete');
-  for (const file of written) {
-    console.log(`  + ${path.relative(targetDir, file)}`);
+  for (const file of written) console.log(`  + ${path.relative(targetDir, file)}`);
+  console.log(
+    `  + .claude/ (${copyResult.copied.length} copied, ${copyResult.overwritten.length} overwritten, ${copyResult.skipped.length} skipped)`,
+  );
+  console.log(
+    `  + .claude/settings.json (${mergeResult.addedCount} hook entries added, ${mergeResult.skippedCount} already present)`,
+  );
+  if (commitMsgResult.gitHook) console.log(`  + ${path.relative(targetDir, commitMsgResult.gitHook)}`);
+  if (commitMsgResult.huskyHook)
+    console.log(`  + ${path.relative(targetDir, commitMsgResult.huskyHook)}`);
+  console.log(
+    `  ${mdResult.replaced ? '~' : '+'} ${path.relative(targetDir, mdResult.path)} (fragment ${mdResult.replaced ? 'replaced' : 'written'})`,
+  );
+  console.log(`  + ${path.relative(targetDir, manifestPath)}`);
+
+  if (mergeResult.warnings.length > 0) {
+    console.log('');
+    for (const w of mergeResult.warnings) warn(w);
   }
+  for (const w of commitMsgResult.warnings) warn(w);
+  for (const n of config.reagentNotices) warn(n);
+
+  // G11.4: when Codex review is disabled, print a durable notice. Mentions
+  // the exact edit path so the operator can flip back later without having
+  // to re-run init. (Coupling note: a future G6-style "Codex install
+  // assist" prompt belongs here too, and should short-circuit when
+  // codex_required is false — do not invoke install-assist in no-codex
+  // mode.)
+  if (!config.codexRequired) {
+    console.log('');
+    console.log(
+      'Codex review disabled. ClaudeSelfReviewer will be used.',
+    );
+    console.log(
+      '  Set review.codex_required: true in .rea/policy.yaml to re-enable.',
+    );
+  }
+
   console.log('');
   console.log('Next steps:');
   console.log('  1. Review .rea/policy.yaml and commit it.');
@@ -280,10 +571,8 @@ export async function runInit(options: InitOptions): Promise<void> {
     console.log('');
     console.log('Reagent migration:');
     console.log(`  Source: ${config.reagentPolicyPath ?? '(none)'}`);
-    console.log('  Field-for-field translation is not yet automated — review both files manually.');
+    console.log('  Copied fields were applied per the translator rules.');
     console.log('  Once satisfied, you can remove the .reagent/ directory.');
   }
-  console.log('');
-  console.log('  Hooks, slash commands, and agents are not installed yet — coming in a follow-up.');
   console.log('');
 }

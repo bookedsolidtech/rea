@@ -1,0 +1,23 @@
+# profiles/client-engagement.yaml
+# Zero-trust client projects. Starts at the lowest meaningful autonomy level,
+# max ceiling held at L1 — promotion requires explicit maintainer approval.
+autonomy_level: L0
+max_autonomy_level: L1
+promotion_requires_human_approval: true
+block_ai_attribution: true
+blocked_paths:
+  - .env
+  - .env.*
+  - .rea/policy.yaml
+  - .rea/HALT
+  - CODEOWNERS
+  - SECURITY.md
+  - THREAT_MODEL.md
+  - secrets/
+  - credentials/
+notification_channel: ""
+context_protection:
+  delegate_to_subagent:
+    - pnpm run build
+    - pnpm run test
+  max_bash_output_lines: 100

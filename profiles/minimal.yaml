@@ -1,0 +1,11 @@
+# profiles/minimal.yaml
+# Bare policy defaults — nothing profile-specific. Suitable as a starting point
+# for a project that wants rea's governance but will tune the rest by hand.
+autonomy_level: L1
+max_autonomy_level: L2
+promotion_requires_human_approval: true
+block_ai_attribution: true
+blocked_paths:
+  - .env
+  - .env.*
+notification_channel: ""

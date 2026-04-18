@@ -1,0 +1,23 @@
+# profiles/bst-internal.yaml
+# Booked Solid internal projects. Mirrors the current .rea/policy.yaml in the
+# rea repository itself — this is the canonical dogfood profile.
+autonomy_level: L1
+max_autonomy_level: L2
+promotion_requires_human_approval: true
+block_ai_attribution: true
+blocked_paths:
+  - .env
+  - .env.*
+  - .rea/policy.yaml
+  - .rea/HALT
+  - CODEOWNERS
+  - .github/workflows/release.yml
+  - SECURITY.md
+  - THREAT_MODEL.md
+notification_channel: ""
+context_protection:
+  delegate_to_subagent:
+    - pnpm run build
+    - pnpm run test
+    - pnpm run lint
+  max_bash_output_lines: 100

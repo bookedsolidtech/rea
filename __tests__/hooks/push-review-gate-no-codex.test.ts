@@ -1,0 +1,325 @@
+/**
+ * Integration tests for the G11.4 no-Codex push-gate behavior.
+ *
+ * These tests drive `hooks/push-review-gate.sh` against a scratch repo whose
+ * diff touches a protected path (`hooks/__test__.sh`). We toggle
+ * `.rea/policy.yaml`'s `review.codex_required` field and assert:
+ *
+ *   1. When `codex_required: false` → the Codex audit-record requirement is
+ *      skipped entirely, the push is NOT blocked by the protected-path gate,
+ *      and NO `codex.review.skipped` audit record is written (the skip
+ *      concept only applies when Codex is required).
+ *   2. When `codex_required: true` or the field is absent → existing G11.1
+ *      behavior is preserved (protected-path diff without a `codex.review`
+ *      audit entry blocks the push).
+ *   3. When `codex_required: false` AND `REA_SKIP_CODEX_REVIEW` is set → the
+ *      env var is a no-op; no skip audit record is written.
+ *   4. Malformed policy → fail closed (treat as `codex_required: true`).
+ *
+ * The tests only exercise the fail-closed / no-codex branches — the standard
+ * "REVIEW REQUIRED" downstream gate (section 9 of the hook) still fires on
+ * every diff. That is intentional: `codex_required: false` removes the
+ * protected-path Codex audit requirement, not general push review.
+ */
+
+import { execFileSync, spawnSync } from 'node:child_process';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+
+const REPO_ROOT = path.resolve(__dirname, '..', '..');
+const HOOK_PATH = path.join(REPO_ROOT, 'hooks', 'push-review-gate.sh');
+const DIST_SCRIPT_PATH = path.join(
+  REPO_ROOT,
+  'dist',
+  'scripts',
+  'read-policy-field.js',
+);
+
+function toolInput(command: string): string {
+  return JSON.stringify({ tool_input: { command } });
+}
+
+interface ScratchRepo {
+  dir: string;
+  headSha: string;
+  mergeBaseSha: string;
+}
+
+/**
+ * Create a scratch repo whose feature branch touches a protected path. The
+ * hook's protected-path regex matches `hooks/` so this guarantees the Codex
+ * branch would fire if `codex_required` is not set to false.
+ *
+ * Options:
+ *   - `policyContent`: raw YAML to write to `.rea/policy.yaml`. Omit to skip
+ *     the policy file entirely (field-absent path).
+ *   - `linkDist`: when true (default) symlinks real `dist/audit` AND
+ *     `dist/scripts` from the rea repo into the scratch repo so the hook can
+ *     invoke both the audit helper and the read-policy-field helper.
+ */
+async function makeScratchRepo(opts: {
+  policyContent?: string;
+  linkDist?: boolean;
+}): Promise<ScratchRepo> {
+  const dir = await fs.realpath(
+    await fs.mkdtemp(path.join(os.tmpdir(), 'rea-no-codex-test-')),
+  );
+
+  const git = (...args: string[]): string =>
+    execFileSync('git', args, { cwd: dir, encoding: 'utf8' }).trim();
+
+  git('init', '--initial-branch=main', '--quiet');
+  git('config', 'user.email', 'nocodex@example.test');
+  git('config', 'user.name', 'No Codex');
+  git('config', 'commit.gpgsign', 'false');
+
+  await fs.writeFile(path.join(dir, 'README.md'), '# scratch\n');
+  git('add', 'README.md');
+  git('commit', '-m', 'baseline', '--quiet');
+  const mergeBaseSha = git('rev-parse', 'HEAD');
+
+  git('checkout', '-b', 'feature', '--quiet');
+  await fs.mkdir(path.join(dir, 'hooks'), { recursive: true });
+  await fs.writeFile(
+    path.join(dir, 'hooks', '__test__.sh'),
+    '#!/bin/bash\necho scratch\n',
+  );
+  git('add', 'hooks/__test__.sh');
+  git('commit', '-m', 'touch protected path', '--quiet');
+  const headSha = git('rev-parse', 'HEAD');
+
+  if (opts.linkDist !== false) {
+    await fs.mkdir(path.join(dir, 'dist'), { recursive: true });
+    await fs.symlink(
+      path.join(REPO_ROOT, 'dist', 'audit'),
+      path.join(dir, 'dist', 'audit'),
+    );
+    await fs.symlink(
+      path.join(REPO_ROOT, 'dist', 'scripts'),
+      path.join(dir, 'dist', 'scripts'),
+    );
+    // loadPolicy also pulls in the policy loader module, which lives under
+    // dist/policy/. Link the whole dist tree is overkill; individual symlinks
+    // keep intent obvious.
+    await fs.symlink(
+      path.join(REPO_ROOT, 'dist', 'policy'),
+      path.join(dir, 'dist', 'policy'),
+    );
+  }
+
+  if (opts.policyContent !== undefined) {
+    await fs.mkdir(path.join(dir, '.rea'), { recursive: true });
+    await fs.writeFile(
+      path.join(dir, '.rea', 'policy.yaml'),
+      opts.policyContent,
+    );
+  }
+
+  return { dir, headSha, mergeBaseSha };
+}
+
+interface HookResult {
+  status: number;
+  stdout: string;
+  stderr: string;
+}
+
+function runHook(
+  repo: ScratchRepo,
+  env: NodeJS.ProcessEnv,
+  command = 'git push origin feature:main',
+): HookResult {
+  const res = spawnSync('bash', [HOOK_PATH], {
+    cwd: repo.dir,
+    env: { ...env, CLAUDE_PROJECT_DIR: repo.dir },
+    input: toolInput(command),
+    encoding: 'utf8',
+  });
+  return {
+    status: res.status ?? -1,
+    stdout: res.stdout ?? '',
+    stderr: res.stderr ?? '',
+  };
+}
+
+async function readAuditLines(
+  repoDir: string,
+): Promise<Array<Record<string, unknown>>> {
+  const file = path.join(repoDir, '.rea', 'audit.jsonl');
+  const raw = await fs.readFile(file, 'utf8').catch(() => '');
+  return raw
+    .split('\n')
+    .filter((l) => l.length > 0)
+    .map((l) => JSON.parse(l) as Record<string, unknown>);
+}
+
+function jqExists(): boolean {
+  const res = spawnSync('jq', ['--version'], { encoding: 'utf8' });
+  return res.status === 0;
+}
+
+/**
+ * Minimal valid policy YAML with `review.codex_required` set to the given
+ * value. `codexRequired === undefined` omits the field entirely (absent
+ * case).
+ */
+function policyYaml(codexRequired: boolean | undefined): string {
+  const base = [
+    'version: "1"',
+    'profile: "bst-internal"',
+    'installed_by: "test"',
+    'installed_at: "2026-04-18T00:00:00Z"',
+    'autonomy_level: L1',
+    'max_autonomy_level: L2',
+    'promotion_requires_human_approval: true',
+    'block_ai_attribution: true',
+    'blocked_paths:',
+    '  - .env',
+    'notification_channel: ""',
+  ];
+  if (codexRequired !== undefined) {
+    base.push('review:', `  codex_required: ${codexRequired}`);
+  }
+  base.push('');
+  return base.join('\n');
+}
+
+describe('push-review-gate.sh — G11.4 review.codex_required honored', () => {
+  const dists: string[] = [];
+
+  beforeEach(() => {
+    dists.length = 0;
+  });
+
+  afterEach(async () => {
+    await Promise.all(
+      dists.map((d) => fs.rm(d, { recursive: true, force: true })),
+    );
+  });
+
+  it('dist/scripts/read-policy-field.js is built (sanity)', async () => {
+    const exists = await fs
+      .access(DIST_SCRIPT_PATH)
+      .then(() => true)
+      .catch(() => false);
+    expect(exists).toBe(true);
+  });
+
+  it('codex_required=false: protected path + no Codex record → push NOT blocked by Codex gate', async () => {
+    if (!jqExists()) return;
+
+    const repo = await makeScratchRepo({
+      policyContent: policyYaml(false),
+    });
+    dists.push(repo.dir);
+
+    const res = runHook(repo, { PATH: process.env.PATH ?? '' });
+
+    // The protected-path Codex gate must not fire. The downstream generic
+    // "REVIEW REQUIRED" gate (section 9) still blocks the push, but the
+    // message is DISTINCT from the Codex-required banner.
+    expect(res.stderr).not.toMatch(/protected paths changed/);
+    expect(res.stderr).not.toMatch(/\/codex-review required/);
+    expect(res.stderr).not.toMatch(/CODEX REVIEW SKIPPED/);
+
+    // And no audit skip record was written — a skip is only meaningful when
+    // Codex is required.
+    const lines = await readAuditLines(repo.dir);
+    expect(
+      lines.some((r) => r['tool_name'] === 'codex.review.skipped'),
+    ).toBe(false);
+  });
+
+  it('codex_required=false + REA_SKIP_CODEX_REVIEW set → env var is a no-op (no skip record)', async () => {
+    if (!jqExists()) return;
+
+    const repo = await makeScratchRepo({
+      policyContent: policyYaml(false),
+    });
+    dists.push(repo.dir);
+
+    const res = runHook(repo, {
+      REA_SKIP_CODEX_REVIEW: 'should-be-ignored',
+      PATH: process.env.PATH ?? '',
+    });
+
+    // No Codex banner, no skip banner.
+    expect(res.stderr).not.toMatch(/CODEX REVIEW SKIPPED/);
+    expect(res.stderr).not.toMatch(/protected paths changed/);
+
+    // No skip audit record.
+    const lines = await readAuditLines(repo.dir);
+    expect(
+      lines.some((r) => r['tool_name'] === 'codex.review.skipped'),
+    ).toBe(false);
+  });
+
+  it('codex_required=true: regression — existing behavior unchanged (protected path blocks push)', async () => {
+    if (!jqExists()) return;
+
+    const repo = await makeScratchRepo({
+      policyContent: policyYaml(true),
+    });
+    dists.push(repo.dir);
+
+    const res = runHook(repo, { PATH: process.env.PATH ?? '' });
+
+    expect(res.status).toBe(2);
+    expect(res.stderr).toMatch(/protected paths changed/);
+    expect(res.stderr).toMatch(/codex-review required/);
+  });
+
+  it('review field absent: regression — defaults to codex_required=true (protected path blocks push)', async () => {
+    if (!jqExists()) return;
+
+    const repo = await makeScratchRepo({
+      policyContent: policyYaml(undefined),
+    });
+    dists.push(repo.dir);
+
+    const res = runHook(repo, { PATH: process.env.PATH ?? '' });
+
+    expect(res.status).toBe(2);
+    expect(res.stderr).toMatch(/protected paths changed/);
+  });
+
+  it('no policy file at all: regression — defaults to codex_required=true', async () => {
+    if (!jqExists()) return;
+
+    // Omit policyContent entirely — .rea/policy.yaml does not exist. The
+    // helper exits 1 (missing) and the shell treats this as the default
+    // (codex required).
+    const repo = await makeScratchRepo({});
+    dists.push(repo.dir);
+
+    const res = runHook(repo, { PATH: process.env.PATH ?? '' });
+
+    expect(res.status).toBe(2);
+    expect(res.stderr).toMatch(/protected paths changed/);
+  });
+
+  it('malformed policy: fail closed (treat as codex_required=true)', async () => {
+    if (!jqExists()) return;
+
+    // Policy YAML with an invalid review.codex_required value (string, not
+    // boolean) — zod strict schema rejects, helper exits 2, shell logs a
+    // warning and falls through to codex_required=true.
+    const malformed = policyYaml(true).replace(
+      'codex_required: true',
+      'codex_required: "yes"',
+    );
+
+    const repo = await makeScratchRepo({ policyContent: malformed });
+    dists.push(repo.dir);
+
+    const res = runHook(repo, { PATH: process.env.PATH ?? '' });
+
+    // Fail-closed: Codex gate fires.
+    expect(res.status).toBe(2);
+    expect(res.stderr).toMatch(/protected paths changed/);
+    // And we logged a warning about the malformed helper invocation.
+    expect(res.stderr).toMatch(/review\.codex_required|read-policy-field/);
+  });
+});
