@@ -23,13 +23,19 @@ async function main(): Promise<void> {
     .option('--from-reagent', 'migrate from a .reagent/ directory if present')
     .option(
       '--profile <name>',
-      'profile: minimal | client-engagement | bst-internal | lit-wc | open-source',
+      'profile: minimal | client-engagement | bst-internal | bst-internal-no-codex | lit-wc | open-source | open-source-no-codex',
     )
     .option('--force', 'overwrite existing .claude/ artifacts and .rea/policy.yaml')
     .option(
       '--accept-dropped-fields',
       'allow reagent translation when drop-list fields are present (security-adjacent)',
     )
+    // Commander's boolean-with-negation pair: `--codex` sets codex=true,
+    // `--no-codex` sets codex=false. Leaving both unset produces
+    // `opts.codex === undefined`, and runInit derives the value from the
+    // profile name.
+    .option('--codex', 'require Codex adversarial review (writes review.codex_required: true)')
+    .option('--no-codex', 'disable Codex adversarial review (writes review.codex_required: false)')
     .action(
       async (opts: {
         yes?: boolean;
@@ -37,6 +43,7 @@ async function main(): Promise<void> {
         profile?: string;
         force?: boolean;
         acceptDroppedFields?: boolean;
+        codex?: boolean;
       }) => {
         await runInit({
           yes: opts.yes,
@@ -44,6 +51,7 @@ async function main(): Promise<void> {
           profile: opts.profile,
           force: opts.force,
           acceptDroppedFields: opts.acceptDroppedFields,
+          codex: opts.codex,
         });
       },
     );

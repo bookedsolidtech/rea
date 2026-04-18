@@ -34,17 +34,48 @@ export interface InitOptions {
   profile?: string | undefined;
   force?: boolean | undefined;
   acceptDroppedFields?: boolean | undefined;
+  /**
+   * G11.4: explicit override for Codex adversarial review. `true` forces
+   * `review.codex_required: true` in the written policy; `false` forces
+   * `false`. Undefined → derive default from the chosen profile name
+   * (profiles whose name ends with `-no-codex` default to no-codex).
+   *
+   * Non-interactive semantics: in `--yes` mode the flag is honored
+   * directly. Interactive mode confirms the flag value as the prompt's
+   * initial value (but still prompts for a final answer).
+   */
+  codex?: boolean | undefined;
 }
 
-type ProfileName = 'client-engagement' | 'bst-internal' | 'lit-wc' | 'open-source' | 'minimal';
+type ProfileName =
+  | 'client-engagement'
+  | 'bst-internal'
+  | 'bst-internal-no-codex'
+  | 'lit-wc'
+  | 'open-source'
+  | 'open-source-no-codex'
+  | 'minimal';
 
 const PROFILE_NAMES: ProfileName[] = [
   'minimal',
   'client-engagement',
   'bst-internal',
+  'bst-internal-no-codex',
   'lit-wc',
   'open-source',
+  'open-source-no-codex',
 ];
+
+/**
+ * Default value for the "Use Codex?" decision, derived from the profile
+ * name. Profiles whose name ends in `-no-codex` default to false;
+ * everything else defaults to true. This keeps the wizard aligned with
+ * whatever profile preset the operator picked without hard-coding a
+ * profile-to-bool map.
+ */
+function profileDefaultCodexRequired(profileName: ProfileName): boolean {
+  return !profileName.endsWith('-no-codex');
+}
 
 const AUTONOMY_LEVELS: AutonomyLevel[] = [
   AutonomyLevel.L0,
@@ -60,6 +91,12 @@ interface ResolvedConfig {
   blockAiAttribution: boolean;
   blockedPaths: string[];
   notificationChannel: string;
+  /**
+   * G11.4: written to `.rea/policy.yaml` as `review.codex_required`. We
+   * always emit the field explicitly — no implicit defaults — so an
+   * operator reading the file sees the choice that was made at init time.
+   */
+  codexRequired: boolean;
   fromReagent: boolean;
   reagentPolicyPath: string | null;
   reagentNotices: string[];
@@ -203,6 +240,21 @@ async function runWizard(
   if (p.isCancel(attribPick)) cancel('Init cancelled.');
   const blockAiAttribution = attribPick === true;
 
+  // G11.4: "Use Codex adversarial review?" — the default follows the
+  // chosen profile (any `*-no-codex` profile defaults to No). An explicit
+  // flag on the command line overrides that default for the initial value.
+  const codexInitial =
+    options.codex !== undefined
+      ? options.codex
+      : profileDefaultCodexRequired(profileName);
+  const codexPick = await p.confirm({
+    message:
+      'Use Codex adversarial review? (requires an OpenAI account — can be added later)',
+    initialValue: codexInitial,
+  });
+  if (p.isCancel(codexPick)) cancel('Init cancelled.');
+  const codexRequired = codexPick === true;
+
   p.outro('Config collected — installing files.');
 
   return {
@@ -212,6 +264,7 @@ async function runWizard(
     blockAiAttribution,
     blockedPaths: layeredBase.blocked_paths ?? ['.env', '.env.*'],
     notificationChannel: layeredBase.notification_channel ?? '',
+    codexRequired,
     fromReagent,
     reagentPolicyPath,
     reagentNotices: [],
@@ -258,6 +311,13 @@ function writePolicyYaml(targetDir: string, config: ResolvedConfig, layered: Pro
       lines.push(`  max_bash_output_lines: ${cp.max_bash_output_lines}`);
     }
   }
+
+  // G11.4: always emit the review block explicitly. Making the value
+  // visible in the generated file helps the operator notice what was
+  // chosen at init time and simplifies switching modes later (edit a
+  // single line, no need to understand the default semantics).
+  lines.push(`review:`);
+  lines.push(`  codex_required: ${config.codexRequired ? 'true' : 'false'}`);
   lines.push(``);
   fs.writeFileSync(policyPath, lines.join('\n'), 'utf8');
   return policyPath;
@@ -339,6 +399,13 @@ export async function runInit(options: InitOptions): Promise<void> {
   let config: ResolvedConfig;
 
   if (options.yes === true) {
+    // G11.4 non-interactive codex resolution:
+    //   1. Explicit --codex / --no-codex flag wins.
+    //   2. Otherwise derive from the profile name (`*-no-codex` → false).
+    const codexRequired =
+      options.codex !== undefined
+        ? options.codex
+        : profileDefaultCodexRequired(profileName);
     config = {
       profile: profileName,
       autonomyLevel: layeredBase.autonomy_level ?? AutonomyLevel.L1,
@@ -346,12 +413,13 @@ export async function runInit(options: InitOptions): Promise<void> {
       blockAiAttribution: layeredBase.block_ai_attribution ?? true,
       blockedPaths: layeredBase.blocked_paths ?? ['.env', '.env.*'],
       notificationChannel: layeredBase.notification_channel ?? '',
+      codexRequired,
       fromReagent,
       reagentPolicyPath,
       reagentNotices,
     };
     log(
-      `Non-interactive init: profile=${profileName}, autonomy=${config.autonomyLevel}, max=${config.maxAutonomyLevel}, attribution-block=${config.blockAiAttribution}`,
+      `Non-interactive init: profile=${profileName}, autonomy=${config.autonomyLevel}, max=${config.maxAutonomyLevel}, attribution-block=${config.blockAiAttribution}, codex_required=${config.codexRequired}`,
     );
   } else {
     config = await runWizard(options, targetDir, reagentPolicyPath, layeredBase);
@@ -409,6 +477,22 @@ export async function runInit(options: InitOptions): Promise<void> {
   }
   for (const w of commitMsgResult.warnings) warn(w);
   for (const n of config.reagentNotices) warn(n);
+
+  // G11.4: when Codex review is disabled, print a durable notice. Mentions
+  // the exact edit path so the operator can flip back later without having
+  // to re-run init. (Coupling note: a future G6-style "Codex install
+  // assist" prompt belongs here too, and should short-circuit when
+  // codex_required is false — do not invoke install-assist in no-codex
+  // mode.)
+  if (!config.codexRequired) {
+    console.log('');
+    console.log(
+      'Codex review disabled. ClaudeSelfReviewer will be used.',
+    );
+    console.log(
+      '  Set review.codex_required: true in .rea/policy.yaml to re-enable.',
+    );
+  }
 
   console.log('');
   console.log('Next steps:');
