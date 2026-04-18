@@ -119,6 +119,43 @@ describe('appendAuditRecord — hash-chain normalization (finding #6)', () => {
     }
   });
 
+  it('resolves `.` against the current cwd on every call, not a cached view (finding R2-3)', async () => {
+    // Regression: a prior revision cached `resolvedBaseDirCache.get('.') → /repoA`
+    // keyed by the raw input string. After `process.chdir('/repoB')` a later
+    // `appendAuditRecord('.', ...)` would still land in /repoA's chain —
+    // cross-repo contamination. Re-resolving cwd on every call prevents this.
+    const other = await fs.mkdtemp(path.join(os.tmpdir(), 'rea-audit-other-'));
+    const resolvedOther = await fs.realpath(other);
+
+    try {
+      process.chdir(baseDir);
+      await appendAuditRecord('.', {
+        tool_name: 'in-baseDir',
+        server_name: 'unit',
+        metadata: { where: 'a' },
+      });
+
+      process.chdir(resolvedOther);
+      await appendAuditRecord('.', {
+        tool_name: 'in-other',
+        server_name: 'unit',
+        metadata: { where: 'b' },
+      });
+
+      // baseDir's log must contain ONLY the first record.
+      const aLines = await readAuditLines(baseDir);
+      expect(aLines).toHaveLength(1);
+      expect(aLines[0]!.tool_name).toBe('in-baseDir');
+
+      // The other dir's log must contain ONLY the second record.
+      const bLines = await readAuditLines(resolvedOther);
+      expect(bLines).toHaveLength(1);
+      expect(bLines[0]!.tool_name).toBe('in-other');
+    } finally {
+      await fs.rm(other, { recursive: true, force: true });
+    }
+  });
+
   it('serializes appends across a symlinked baseDir and its real path', async () => {
     // Create a symlink that resolves to baseDir. Callers passing the link and
     // callers passing the real path must share the same queue.

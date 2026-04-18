@@ -62,14 +62,6 @@ export interface AppendAuditInput {
 const writeQueues = new Map<string, Promise<void>>();
 
 /**
- * Cache of `baseDir → resolved baseDir` so we pay the realpath cost once per
- * unique input. Correctness comes from the fact that we always key the write
- * queue by the resolved path; this map is only here to keep steady-state
- * appends fast. Invalidated implicitly when the process exits.
- */
-const resolvedBaseDirCache = new Map<string, string>();
-
-/**
  * Resolve a baseDir to a stable, process-wide canonical form. Two callers that
  * pass `'.'` and `process.cwd()` for the same project must land on the same
  * queue key — otherwise the per-process serialization promise in this module's
@@ -77,30 +69,31 @@ const resolvedBaseDirCache = new Map<string, string>();
  * chain.
  *
  * Strategy:
- *   1. `path.resolve(baseDir)` — makes relative paths absolute and normalizes.
+ *   1. `path.resolve(baseDir)` — makes relative paths absolute against the
+ *      CURRENT `process.cwd()`. This must run every call; caching by the raw
+ *      input key would return a stale absolute path after a `process.chdir()`,
+ *      which is how rea's audit helper gets used across repos in long-lived
+ *      processes. (See finding R2-3.)
  *   2. Best-effort `fs.realpath(resolvedBase)` — unwraps symlinks (e.g. macOS
  *      `/tmp` → `/private/tmp`). If it throws (directory doesn't exist yet on
  *      first write, permission error, etc.), fall back to the `path.resolve`
  *      result. The directory will be created in `doAppend` via `mkdir`.
  *
- * Correctness first, caching second: we only cache on successful realpath. If
- * realpath fails because the dir doesn't exist yet, we don't cache — the next
- * call gets another chance to canonicalize once the dir exists.
+ * NOTE: no caching here. `path.resolve` is microseconds and `fs.realpath` is a
+ * single `lstat` syscall; audit append is not a hot path. A previous revision
+ * keyed a cache by the raw `baseDir` string, which returned stale absolute
+ * paths across `chdir` — a brand-new regression worse than the cost it saved.
+ * If a future profiler demands caching, key it by `path.resolve(baseDir)` and
+ * only cache already-absolute inputs.
  */
 async function resolveBaseDir(baseDir: string): Promise<string> {
-  const cached = resolvedBaseDirCache.get(baseDir);
-  if (cached !== undefined) return cached;
-
   const absolute = path.resolve(baseDir);
   try {
-    const real = await fs.realpath(absolute);
-    resolvedBaseDirCache.set(baseDir, real);
-    return real;
+    return await fs.realpath(absolute);
   } catch {
     // Directory doesn't exist yet, or realpath isn't permitted here. Fall back
     // to the path.resolve'd absolute form — still stable per input, still
-    // collapses `'.' === cwd` via the absolute path. Don't cache: once the
-    // directory exists, a later call should upgrade to the realpath form.
+    // collapses `'.' === cwd` via the absolute path.
     return absolute;
   }
 }

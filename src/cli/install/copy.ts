@@ -20,7 +20,7 @@
  * A prior malicious PR could leave a symlink at a destination path (e.g.
  * `.claude/hooks/secret-scanner.sh` → `/etc/shadow`). Node's `copyFile` and
  * `chmod` follow symlinks, so a subsequent `rea init --force` would overwrite
- * the link target and chmod it 0o755. We defend in three layers:
+ * the link target and chmod it 0o755. We defend in multiple layers:
  *
  *   1. Resolve the install root with `realpath` once per run.
  *   2. Before any write, `lstat` the destination and REFUSE (hard error, named
@@ -29,9 +29,31 @@
  *   3. For every destination path, resolve it and assert containment within the
  *      resolved root. Anything escaping the root is refused.
  *
- * On overwrite, we `unlink` then `copyFile` to defeat TOCTOU (a symlink sneaking
- * in between the lstat check and the copy). On fresh creates we use
- * `COPYFILE_EXCL` for the same reason.
+ * On overwrite we use `openSync(O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW)` and
+ * write the bytes ourselves — `O_EXCL` makes the create race-safe, and
+ * `O_NOFOLLOW` refuses any symlink that sneaks in between the lstat and the
+ * write. On fresh creates we use the same flags for the same reason.
+ *
+ * ## Parent-directory TOCTOU (finding R2-4)
+ *
+ * `assertSafeDirectory` validates a path *string*. A concurrent attacker with
+ * write access under the install tree could swap `.claude/hooks` for a symlink
+ * in the window between validation and the subsequent `copyFile`/`unlink`. To
+ * close this window:
+ *
+ *   1. After validating the install root, snapshot the realpath of every
+ *      ancestor directory between the destination and the root.
+ *   2. Immediately before every mutation (`unlink`, then the file write), we
+ *      re-realpath the same ancestors and refuse if any changed. This closes
+ *      the practical exploit window to sub-millisecond.
+ *   3. `O_NOFOLLOW` on the write call catches a symlink that slips in at the
+ *      leaf between the re-check and the `open` syscall.
+ *
+ * Residual risk: a race that wins between the re-realpath loop and the `open`
+ * syscall on the leaf still exists, but the `O_NOFOLLOW | O_EXCL` open will
+ * refuse any symlink that lands in that micro-window. Fully closing the
+ * ancestor-swap race would require dirfd-relative APIs (`openat`) which Node's
+ * core `fs` module does not expose. Documented; not a code-execution primitive.
  */
 
 import fs from 'node:fs';
@@ -57,17 +79,18 @@ const COPY_DIRS = ['hooks', 'commands', 'agents'] as const;
 type CopyDir = (typeof COPY_DIRS)[number];
 
 /**
- * Thrown when a destination path is a symlink or escapes the install root.
- * Kept as a named class so callers (and tests) can match the shape without
- * scraping the message.
+ * Thrown when a destination path is a symlink, escapes the install root, or a
+ * previously-validated ancestor directory changed shape between validation and
+ * the write (finding R2-4). Kept as a named class so callers (and tests) can
+ * match the shape without scraping the message.
  */
 export class UnsafeInstallPathError extends Error {
-  public readonly kind: 'symlink' | 'escape';
+  public readonly kind: 'symlink' | 'escape' | 'ancestor-changed';
   public readonly targetPath: string;
   public readonly linkTarget?: string;
 
   public constructor(
-    kind: 'symlink' | 'escape',
+    kind: 'symlink' | 'escape' | 'ancestor-changed',
     targetPath: string,
     linkTarget: string | undefined,
     message: string,
@@ -227,6 +250,107 @@ interface WalkContext {
   resolvedRoot: string;
 }
 
+/**
+ * Snapshot the realpath of every ancestor directory between `dstPath` and
+ * `resolvedRoot` (inclusive of the root, exclusive of the leaf). The resulting
+ * map — `absolute ancestor path → realpath at snapshot time` — is later
+ * re-validated by {@link verifyAncestorsUnchanged} immediately before each
+ * mutation. If any entry has changed, the tree was swapped and we refuse.
+ *
+ * We deliberately skip the leaf: the leaf's safety is handled by the
+ * `lstat` check in `assertSafeDestination` and by `O_NOFOLLOW` on the open.
+ */
+async function snapshotAncestors(
+  resolvedRoot: string,
+  dstPath: string,
+): Promise<Map<string, string>> {
+  const snapshot = new Map<string, string>();
+  const leafDir = path.dirname(path.resolve(dstPath));
+  let cursor = leafDir;
+  // Walk up until we pass the root. Every ancestor must resolve to something
+  // inside the root (including the root itself).
+  // path.parse('/').root === '/', so cursor === path.dirname(cursor) only at FS root.
+  while (true) {
+    try {
+      const real = await fsPromises.realpath(cursor);
+      snapshot.set(cursor, real);
+    } catch (err) {
+      // ENOENT is acceptable here only if `ensureDir` has not yet created the
+      // directory. We only snapshot dirs the caller has already ensured exist,
+      // so any error is a real problem — surface it.
+      throw err as NodeJS.ErrnoException;
+    }
+    if (cursor === resolvedRoot) break;
+    const parent = path.dirname(cursor);
+    if (parent === cursor) break; // reached filesystem root without hitting resolvedRoot
+    cursor = parent;
+  }
+  return snapshot;
+}
+
+/**
+ * Re-realpath every ancestor captured in `snapshot` and throw
+ * {@link UnsafeInstallPathError} if any resolution has changed (an intermediate
+ * directory was replaced with a symlink, renamed, etc.) or disappeared.
+ */
+async function verifyAncestorsUnchanged(
+  snapshot: Map<string, string>,
+): Promise<void> {
+  for (const [ancestor, originalReal] of snapshot) {
+    let currentReal: string;
+    try {
+      currentReal = await fsPromises.realpath(ancestor);
+    } catch (err) {
+      throw new UnsafeInstallPathError(
+        'ancestor-changed',
+        ancestor,
+        undefined,
+        `refusing to write: ancestor directory ${ancestor} disappeared or became unreadable between validation and write (${(err as NodeJS.ErrnoException).code ?? 'unknown'})`,
+      );
+    }
+    if (currentReal !== originalReal) {
+      throw new UnsafeInstallPathError(
+        'ancestor-changed',
+        ancestor,
+        currentReal,
+        `refusing to write: ancestor directory ${ancestor} changed between validation and write (was ${originalReal}, now ${currentReal})`,
+      );
+    }
+  }
+}
+
+/**
+ * Write `srcPath`'s bytes to `dstPath` using `openSync(O_WRONLY | O_CREAT |
+ * O_EXCL | O_NOFOLLOW)`. This is the race-safe replacement for `copyFile` —
+ *
+ *   - `O_EXCL`: the open fails with EEXIST if anything appears at the leaf
+ *     between our pre-check and this call, including a symlink or regular file.
+ *   - `O_NOFOLLOW`: the open fails with ELOOP if the leaf itself is a symlink
+ *     that somehow bypassed EXCL (belt-and-suspenders; on most platforms EXCL
+ *     alone is sufficient).
+ *
+ * Reads the source via the fs/promises API so we inherit standard error shapes.
+ * Source-side read follows symlinks, which is fine: `srcPath` is inside PKG_ROOT
+ * and the source tree is trusted.
+ */
+async function writeFileExclusiveNoFollow(
+  srcPath: string,
+  dstPath: string,
+): Promise<void> {
+  const contents = await fsPromises.readFile(srcPath);
+  const flags =
+    fs.constants.O_WRONLY |
+    fs.constants.O_CREAT |
+    fs.constants.O_EXCL |
+    fs.constants.O_NOFOLLOW;
+  const fh = await fsPromises.open(dstPath, flags, 0o644);
+  try {
+    await fh.writeFile(contents);
+  } finally {
+    await fh.close();
+  }
+}
+
 async function walkAndCopy(
   sourceRoot: string,
   destRoot: string,
@@ -295,26 +419,35 @@ async function copyOne(
   // exits non-zero. Recovering silently would defeat the signal.
   const exists = await assertSafeDestination(ctx.resolvedRoot, dstPath);
 
+  // Snapshot every ancestor directory between the destination and the install
+  // root (finding R2-4). We re-verify this snapshot immediately before each
+  // mutation to shrink the parent-directory TOCTOU window to sub-millisecond.
+  const ancestorSnapshot = await snapshotAncestors(ctx.resolvedRoot, dstPath);
+
   if (exists) {
     const decision = await decideConflict(relPath, options);
     if (decision === 'skip') {
       result.skipped.push(relPath);
       return;
     }
-    // Overwrite: unlink first, then copy with COPYFILE_EXCL. This defeats a
-    // TOCTOU where a symlink is planted between our lstat and the copyFile
-    // call — unlink on a symlink removes the link (not the target), and the
-    // subsequent EXCL copy fails if anything reappears at the path.
+    // Overwrite path: re-verify ancestors, then unlink, then re-verify again
+    // before writing. Writes use O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW so
+    // any symlink/file that slips in between the unlink and the open fails
+    // the syscall rather than letting us clobber something we shouldn't.
+    await verifyAncestorsUnchanged(ancestorSnapshot);
     await fsPromises.unlink(dstPath);
-    await fsPromises.copyFile(srcPath, dstPath, fs.constants.COPYFILE_EXCL);
+    await verifyAncestorsUnchanged(ancestorSnapshot);
+    await writeFileExclusiveNoFollow(srcPath, dstPath);
     if (dirName === 'hooks') await fsPromises.chmod(dstPath, 0o755);
     result.overwritten.push(relPath);
     return;
   }
 
-  // Fresh create: EXCL guarantees we fail rather than follow a symlink that
-  // appeared in the window after our lstat.
-  await fsPromises.copyFile(srcPath, dstPath, fs.constants.COPYFILE_EXCL);
+  // Fresh create: re-verify ancestors, then open with EXCL|NOFOLLOW. EXCL
+  // guarantees we fail if something appeared at the leaf; NOFOLLOW guarantees
+  // we fail if the leaf is a symlink.
+  await verifyAncestorsUnchanged(ancestorSnapshot);
+  await writeFileExclusiveNoFollow(srcPath, dstPath);
   if (dirName === 'hooks') await fsPromises.chmod(dstPath, 0o755);
   result.copied.push(relPath);
 }
@@ -349,3 +482,14 @@ export async function copyArtifacts(
   }
   return result;
 }
+
+/**
+ * Internal helpers exposed for unit tests only. Not part of the public API —
+ * do not import from outside `./copy.test.ts`. Grouped under `__internal` so
+ * consumers can grep and stay away.
+ */
+export const __internal = {
+  snapshotAncestors,
+  verifyAncestorsUnchanged,
+  writeFileExclusiveNoFollow,
+} as const;

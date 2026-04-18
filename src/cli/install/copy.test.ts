@@ -2,7 +2,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { copyArtifacts, UnsafeInstallPathError } from './copy.js';
+import { copyArtifacts, UnsafeInstallPathError, __internal } from './copy.js';
 
 describe('copyArtifacts', () => {
   let targetDir: string;
@@ -123,6 +123,92 @@ describe('copyArtifacts', () => {
 
     // Sentinel untouched.
     expect(await fs.readFile(sensitive, 'utf8')).toBe('UNTOUCHED\n');
+  });
+
+  // ---- Finding R2-4: parent-directory TOCTOU ------------------------------
+
+  it('verifyAncestorsUnchanged throws ancestor-changed when an ancestor dir is swapped', async () => {
+    // Build a snapshot of `targetDir/.claude/hooks` ancestors, then swap an
+    // intermediate directory for a symlink to a sibling. The re-verification
+    // must refuse — this is the exact race R2-4 is defending against,
+    // simulated deterministically by doing the swap between snapshot and check.
+    const resolvedRoot = await fs.realpath(targetDir);
+    const claudeDir = path.join(resolvedRoot, '.claude');
+    const hooksDir = path.join(claudeDir, 'hooks');
+    const leaf = path.join(hooksDir, 'probe.sh');
+    await fs.mkdir(hooksDir, { recursive: true });
+
+    const snapshot = await __internal.snapshotAncestors(resolvedRoot, leaf);
+    // Sanity: snapshot covers root, .claude, .claude/hooks.
+    expect(snapshot.size).toBeGreaterThanOrEqual(3);
+    expect(snapshot.has(hooksDir)).toBe(true);
+
+    // Simulate the race: swap .claude/hooks for a symlink to a decoy.
+    const decoy = path.join(resolvedRoot, 'decoy');
+    await fs.mkdir(decoy, { recursive: true });
+    await fs.rm(hooksDir, { recursive: true, force: true });
+    await fs.symlink(decoy, hooksDir);
+
+    let caught: unknown = null;
+    try {
+      await __internal.verifyAncestorsUnchanged(snapshot);
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(UnsafeInstallPathError);
+    const uip = caught as UnsafeInstallPathError;
+    expect(uip.kind).toBe('ancestor-changed');
+    expect(uip.targetPath).toBe(hooksDir);
+  });
+
+  it('verifyAncestorsUnchanged passes when ancestors are stable', async () => {
+    const resolvedRoot = await fs.realpath(targetDir);
+    const claudeDir = path.join(resolvedRoot, '.claude');
+    const hooksDir = path.join(claudeDir, 'hooks');
+    const leaf = path.join(hooksDir, 'probe.sh');
+    await fs.mkdir(hooksDir, { recursive: true });
+
+    const snapshot = await __internal.snapshotAncestors(resolvedRoot, leaf);
+    // No changes — must not throw.
+    await __internal.verifyAncestorsUnchanged(snapshot);
+  });
+
+  it('writeFileExclusiveNoFollow refuses when the leaf is a symlink (O_NOFOLLOW)', async () => {
+    const resolvedRoot = await fs.realpath(targetDir);
+    const src = path.join(resolvedRoot, 'src-file.txt');
+    await fs.writeFile(src, 'hello\n', 'utf8');
+
+    const sensitive = path.join(resolvedRoot, 'sensitive.txt');
+    await fs.writeFile(sensitive, 'SACROSANCT\n', 'utf8');
+
+    const leaf = path.join(resolvedRoot, 'leaf.txt');
+    await fs.symlink(sensitive, leaf);
+
+    let caught: NodeJS.ErrnoException | null = null;
+    try {
+      await __internal.writeFileExclusiveNoFollow(src, leaf);
+    } catch (err) {
+      caught = err as NodeJS.ErrnoException;
+    }
+    expect(caught).not.toBeNull();
+    // Either EEXIST (from O_EXCL, since the link itself exists as an entry) or
+    // ELOOP (from O_NOFOLLOW on platforms where EXCL lets the syscall progress
+    // far enough to hit NOFOLLOW). Both are correct refusals.
+    expect(['EEXIST', 'ELOOP']).toContain(caught!.code);
+
+    // Sensitive target must be untouched.
+    expect(await fs.readFile(sensitive, 'utf8')).toBe('SACROSANCT\n');
+  });
+
+  // Concurrent ancestor-swap during a live install would require spawning a
+  // second process that wins the event-loop race between snapshot/verify and
+  // the subsequent write. Node's single-threaded I/O and vitest's event loop
+  // make that effectively non-deterministic here — we skip the integration
+  // race test and rely on the deterministic helper tests above plus the
+  // O_EXCL | O_NOFOLLOW open in writeFileExclusiveNoFollow. The residual
+  // sub-millisecond race is documented in copy.ts.
+  it.skip('race: concurrent attacker swaps ancestor mid-install (non-deterministic)', () => {
+    // Intentionally not implemented — see comment above.
   });
 
   it('refuses to write when a parent directory under .claude/ is a symlink', async () => {
