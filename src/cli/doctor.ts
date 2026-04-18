@@ -2,6 +2,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { loadPolicy } from '../policy/loader.js';
 import { loadRegistry } from '../registry/loader.js';
+import {
+  CodexProbe,
+  type CodexProbeState,
+} from '../gateway/observability/codex-probe.js';
 import { POLICY_FILE, REA_DIR, REGISTRY_FILE, log, reaPath } from './utils.js';
 
 export interface CheckResult {
@@ -228,6 +232,34 @@ function checkCodexCommand(baseDir: string): CheckResult {
   };
 }
 
+/**
+ * Translate a `CodexProbeState` into two doctor CheckResults: one for
+ * responsiveness (pass/warn) and one informational line about the last
+ * probe time. Extracted so tests can feed a stub state without running
+ * the real probe.
+ */
+export function checksFromProbeState(state: CodexProbeState): CheckResult[] {
+  const responsive: CheckResult = state.cli_responsive
+    ? state.version !== undefined
+      ? {
+          label: 'codex.cli_responsive',
+          status: 'pass',
+          detail: `version: ${state.version}`,
+        }
+      : { label: 'codex.cli_responsive', status: 'pass' }
+    : {
+        label: 'codex.cli_responsive',
+        status: 'warn',
+        detail: state.last_error ?? 'Codex CLI did not respond',
+      };
+  const lastProbe: CheckResult = {
+    label: 'codex.last_probe_at',
+    status: 'info',
+    detail: state.last_probe_at,
+  };
+  return [responsive, lastProbe];
+}
+
 function formatSymbol(status: CheckResult['status']): string {
   if (status === 'pass') return '[ok]  ';
   if (status === 'warn') return '[warn]';
@@ -256,8 +288,16 @@ function codexRequiredFromPolicy(baseDir: string): boolean {
  * Assemble the full checklist for a given baseDir. Exported so tests can
  * exercise the conditional branching without capturing stdout from
  * `runDoctor`.
+ *
+ * `codexProbeState` is consulted ONLY when Codex is required by policy.
+ * Callers that already have a fresh probe state (e.g. `runDoctor`) should
+ * pass it; callers that don't (e.g. unit tests of the existing doctor
+ * surface) can omit it and the probe-derived fields are skipped.
  */
-export function collectChecks(baseDir: string): CheckResult[] {
+export function collectChecks(
+  baseDir: string,
+  codexProbeState?: CodexProbeState,
+): CheckResult[] {
   const policyPath = reaPath(baseDir, POLICY_FILE);
   const registryPath = reaPath(baseDir, REGISTRY_FILE);
   const reaDirPath = path.join(baseDir, REA_DIR);
@@ -274,6 +314,9 @@ export function collectChecks(baseDir: string): CheckResult[] {
 
   if (codexRequiredFromPolicy(baseDir)) {
     checks.push(checkCodexAgent(baseDir), checkCodexCommand(baseDir));
+    if (codexProbeState !== undefined) {
+      checks.push(...checksFromProbeState(codexProbeState));
+    }
   } else {
     // Single informational line replaces the two Codex-specific checks.
     // The `codex-adversarial.md` agent is still expected to be present by
@@ -290,9 +333,25 @@ export function collectChecks(baseDir: string): CheckResult[] {
   return checks;
 }
 
-export function runDoctor(): void {
+export async function runDoctor(): Promise<void> {
   const baseDir = process.cwd();
-  const checks = collectChecks(baseDir);
+
+  // G11.3 — one-shot probe when Codex is required by policy. Doctor may be
+  // invoked without a running gateway, so we don't share state with
+  // `rea serve`; we just run a fresh probe here. Failure is observational —
+  // a warn row, never a hard failure of `rea doctor`.
+  let probeState: CodexProbeState | undefined;
+  if (codexRequiredFromPolicy(baseDir)) {
+    try {
+      probeState = await new CodexProbe().probe();
+    } catch {
+      // `probe()` is documented as never-throws, but belt-and-suspenders:
+      // missing probe data should never crash doctor.
+      probeState = undefined;
+    }
+  }
+
+  const checks = collectChecks(baseDir, probeState);
 
   console.log('');
   log(`Doctor — ${baseDir}`);

@@ -1,6 +1,7 @@
 import { loadPolicy } from '../policy/loader.js';
 import { loadRegistry } from '../registry/loader.js';
 import { createGateway } from '../gateway/server.js';
+import { CodexProbe } from '../gateway/observability/codex-probe.js';
 import {
   POLICY_FILE,
   REGISTRY_FILE,
@@ -8,6 +9,7 @@ import {
   exitWithMissingPolicy,
   log,
   reaPath,
+  warn,
 } from './utils.js';
 
 /**
@@ -54,8 +56,27 @@ export async function runServe(): Promise<void> {
 
   const handle = createGateway({ baseDir, policy, registry });
 
+  // G11.3 — Codex availability probe. Observational only: a failed probe
+  // NEVER fail-closes the gateway at startup. When the policy explicitly
+  // opts out of Codex (`review.codex_required: false`), skip the probe
+  // entirely — there are no Codex calls to observe, so the probe would be
+  // noise on stderr.
+  const codexRequired = policy.review?.codex_required !== false;
+  let codexProbe: CodexProbe | undefined;
+  if (codexRequired) {
+    codexProbe = new CodexProbe();
+    const initialState = await codexProbe.probe();
+    if (!initialState.cli_responsive) {
+      warn(
+        `Codex probe failed — push-gate will use fallback reviewer path if triggered (${initialState.last_error ?? 'no error detail'})`,
+      );
+    }
+    codexProbe.start();
+  }
+
   const shutdown = async (signal: string): Promise<void> => {
     log(`rea serve: received ${signal} — draining and shutting down`);
+    codexProbe?.stop();
     try {
       await handle.stop();
     } catch (e) {

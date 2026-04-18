@@ -89,8 +89,8 @@ async function main(): Promise<void> {
   program
     .command('doctor')
     .description('Validate the install: policy parses, .rea/ layout, hooks, Codex plugin.')
-    .action(() => {
-      runDoctor();
+    .action(async () => {
+      await runDoctor();
     });
 
   await program.parseAsync(process.argv);

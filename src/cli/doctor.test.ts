@@ -11,7 +11,12 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { collectChecks, type CheckResult } from './doctor.js';
+import {
+  checksFromProbeState,
+  collectChecks,
+  type CheckResult,
+} from './doctor.js';
+import type { CodexProbeState } from '../gateway/observability/codex-probe.js';
 
 interface ScratchRepo {
   dir: string;
@@ -117,6 +122,70 @@ describe('rea doctor — collectChecks (G11.4 codex_required)', () => {
     expect(findCheck(checks, 'codex-adversarial agent installed')).toBeDefined();
     expect(findCheck(checks, '/codex-review command installed')).toBeDefined();
     expect(checks.some((c) => c.status === 'info')).toBe(false);
+  });
+
+  it('codex_required=true + probe responsive: adds cli_responsive pass + last_probe_at info', async () => {
+    const repo = await makeScratchRepo({ codexRequired: true });
+    cleanup.push(repo.dir);
+    const probeState: CodexProbeState = {
+      cli_installed: true,
+      cli_authenticated: true,
+      cli_responsive: true,
+      last_probe_at: '2026-04-18T12:00:00.000Z',
+      version: 'codex 1.2.3',
+    };
+    const checks = collectChecks(repo.dir, probeState);
+    const responsive = findCheck(checks, 'codex.cli_responsive');
+    expect(responsive?.status).toBe('pass');
+    expect(responsive?.detail).toMatch(/codex 1\.2\.3/);
+    const lastProbe = findCheck(checks, 'codex.last_probe_at');
+    expect(lastProbe?.status).toBe('info');
+    expect(lastProbe?.detail).toBe('2026-04-18T12:00:00.000Z');
+  });
+
+  it('codex_required=true + probe failed: cli_responsive is warn with error detail', async () => {
+    const repo = await makeScratchRepo({ codexRequired: true });
+    cleanup.push(repo.dir);
+    const probeState: CodexProbeState = {
+      cli_installed: false,
+      cli_authenticated: false,
+      cli_responsive: false,
+      last_probe_at: '2026-04-18T12:00:00.000Z',
+      last_error: 'codex --version: not installed (ENOENT)',
+    };
+    const checks = collectChecks(repo.dir, probeState);
+    const responsive = findCheck(checks, 'codex.cli_responsive');
+    expect(responsive?.status).toBe('warn');
+    expect(responsive?.detail).toMatch(/ENOENT/);
+  });
+
+  it('codex_required=false + probe state provided: probe-derived fields are NOT added', async () => {
+    const repo = await makeScratchRepo({ codexRequired: false });
+    cleanup.push(repo.dir);
+    const probeState: CodexProbeState = {
+      cli_installed: true,
+      cli_authenticated: true,
+      cli_responsive: true,
+      last_probe_at: '2026-04-18T12:00:00.000Z',
+    };
+    const checks = collectChecks(repo.dir, probeState);
+    // Probe-derived lines live under the codex-required branch; in no-
+    // codex mode they must not leak through.
+    expect(findCheck(checks, 'codex.cli_responsive')).toBeUndefined();
+    expect(findCheck(checks, 'codex.last_probe_at')).toBeUndefined();
+  });
+
+  it('checksFromProbeState: pass row and info row', () => {
+    const out = checksFromProbeState({
+      cli_installed: true,
+      cli_authenticated: true,
+      cli_responsive: true,
+      last_probe_at: '2026-04-18T12:00:00.000Z',
+      version: 'codex 1.0.0',
+    });
+    expect(out).toHaveLength(2);
+    expect(out[0]?.status).toBe('pass');
+    expect(out[1]?.status).toBe('info');
   });
 
   it('codex_required=false: absence of the codex agent does not fail the check', async () => {
