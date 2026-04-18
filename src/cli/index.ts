@@ -18,20 +18,35 @@ async function main(): Promise<void> {
 
   program
     .command('init')
-    .description('Interactive wizard — write .rea/policy.yaml and .rea/registry.yaml')
-    .option('-y, --yes', 'non-interactive mode — accept defaults for all prompts')
+    .description('Interactive wizard — write .rea/policy.yaml, install .claude/, commit-msg hook, and CLAUDE.md fragment')
+    .option('-y, --yes', 'non-interactive mode — accept defaults, skip existing files')
     .option('--from-reagent', 'migrate from a .reagent/ directory if present')
     .option(
       '--profile <name>',
       'profile: minimal | client-engagement | bst-internal | lit-wc | open-source',
     )
-    .action(async (opts: { yes?: boolean; fromReagent?: boolean; profile?: string }) => {
-      await runInit({
-        yes: opts.yes,
-        fromReagent: opts.fromReagent,
-        profile: opts.profile,
-      });
-    });
+    .option('--force', 'overwrite existing .claude/ artifacts and .rea/policy.yaml')
+    .option(
+      '--accept-dropped-fields',
+      'allow reagent translation when drop-list fields are present (security-adjacent)',
+    )
+    .action(
+      async (opts: {
+        yes?: boolean;
+        fromReagent?: boolean;
+        profile?: string;
+        force?: boolean;
+        acceptDroppedFields?: boolean;
+      }) => {
+        await runInit({
+          yes: opts.yes,
+          fromReagent: opts.fromReagent,
+          profile: opts.profile,
+          force: opts.force,
+          acceptDroppedFields: opts.acceptDroppedFields,
+        });
+      },
+    );
 
   program
     .command('serve')
