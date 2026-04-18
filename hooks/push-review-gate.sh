@@ -454,6 +454,47 @@ LINE_COUNT=$(printf '%s' "$DIFF_FULL" | grep -cE '^\+[^+]|^-[^-]' 2>/dev/null ||
 # against raw JSON lines are forgeable — the audit-append API accepts arbitrary
 # `metadata`, so a record with `{"metadata":{"note":"tool_name:\"codex.review\""}}`
 # would satisfy two independent greps. Match on the parsed structure instead.
+#
+# ── G11.4: honor review.codex_required ───────────────────────────────────────
+# When policy.review.codex_required is explicitly false, the operator has
+# opted into first-class no-Codex mode. Skip this whole branch — no audit
+# entry is required, the escape-hatch is not relevant, and we fall through
+# to the normal (non-Codex) push validation. The selector in
+# src/gateway/reviewers/select.ts makes the same call for the reviewer pick.
+#
+# Fail-closed: if the helper fails to parse the policy, treat the field as
+# true (safer default) and log a warning. A malformed policy file is an
+# operator problem, not a reason to silently weaken the Codex gate.
+READ_FIELD_JS="${REA_ROOT}/dist/scripts/read-policy-field.js"
+CODEX_REQUIRED="true"
+if [[ -f "$READ_FIELD_JS" ]]; then
+  FIELD_VALUE=$(REA_ROOT="$REA_ROOT" node "$READ_FIELD_JS" review.codex_required 2>/dev/null)
+  FIELD_STATUS=$?
+  case "$FIELD_STATUS" in
+    0)
+      # Field is present and a scalar. Accept only literal `true` / `false`.
+      # Anything else is a malformed scalar; fail closed.
+      if [[ "$FIELD_VALUE" == "false" ]]; then
+        CODEX_REQUIRED="false"
+      elif [[ "$FIELD_VALUE" == "true" ]]; then
+        CODEX_REQUIRED="true"
+      else
+        printf 'REA WARN: review.codex_required resolved to non-boolean %q — treating as true\n' "$FIELD_VALUE" >&2
+        CODEX_REQUIRED="true"
+      fi
+      ;;
+    1)
+      # Field absent (or policy file missing). Documented default is true.
+      CODEX_REQUIRED="true"
+      ;;
+    *)
+      # Malformed policy, unexpected helper exit. Fail closed.
+      printf 'REA WARN: read-policy-field exited %s — treating review.codex_required as true (fail-closed)\n' "$FIELD_STATUS" >&2
+      CODEX_REQUIRED="true"
+      ;;
+  esac
+fi
+
 PROTECTED_RE='(src/gateway/middleware/|hooks/|src/policy/|\.github/workflows/)'
 
 PROTECTED_HITS=$(cd "$REA_ROOT" && git diff --name-status "${MERGE_BASE}...${SOURCE_SHA}" 2>/dev/null)
@@ -467,7 +508,7 @@ if [[ "$PROTECTED_DIFF_STATUS" -ne 0 ]]; then
   exit 2
 fi
 
-if printf '%s\n' "$PROTECTED_HITS" | awk -v re="$PROTECTED_RE" '
+if [[ "$CODEX_REQUIRED" == "true" ]] && printf '%s\n' "$PROTECTED_HITS" | awk -v re="$PROTECTED_RE" '
     # Each line is: STATUS<TAB>PATH1[<TAB>PATH2]
     # Status is one or two letters (single letter for A/M/D/T/U; R/C are
     # followed by a similarity score like R100). We check every PATH column
