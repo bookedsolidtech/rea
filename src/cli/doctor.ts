@@ -4,9 +4,14 @@ import { loadPolicy } from '../policy/loader.js';
 import { loadRegistry } from '../registry/loader.js';
 import { POLICY_FILE, REA_DIR, REGISTRY_FILE, log, reaPath } from './utils.js';
 
-interface CheckResult {
+export interface CheckResult {
   label: string;
-  status: 'pass' | 'fail' | 'warn';
+  /**
+   * `info` is purely informational — not a pass, fail, or warning. Used to
+   * print a one-line note about why a check was skipped (e.g. "codex:
+   * disabled via policy.review.codex_required").
+   */
+  status: 'pass' | 'fail' | 'warn' | 'info';
   detail?: string;
 }
 
@@ -226,11 +231,33 @@ function checkCodexCommand(baseDir: string): CheckResult {
 function formatSymbol(status: CheckResult['status']): string {
   if (status === 'pass') return '[ok]  ';
   if (status === 'warn') return '[warn]';
+  if (status === 'info') return '[info]';
   return '[fail]';
 }
 
-export function runDoctor(): void {
-  const baseDir = process.cwd();
+/**
+ * Return whether Codex adversarial review is required. Read from the parsed
+ * policy; default is `true` when the field is absent. Isolated so tests can
+ * stub a policy without having to touch disk.
+ */
+function codexRequiredFromPolicy(baseDir: string): boolean {
+  try {
+    const policy = loadPolicy(baseDir);
+    return policy.review?.codex_required !== false;
+  } catch {
+    // If the policy itself is unreadable, checkPolicyParses will already
+    // report a fail. Default to "Codex required" so we still run those
+    // checks and surface the full picture.
+    return true;
+  }
+}
+
+/**
+ * Assemble the full checklist for a given baseDir. Exported so tests can
+ * exercise the conditional branching without capturing stdout from
+ * `runDoctor`.
+ */
+export function collectChecks(baseDir: string): CheckResult[] {
   const policyPath = reaPath(baseDir, POLICY_FILE);
   const registryPath = reaPath(baseDir, REGISTRY_FILE);
   const reaDirPath = path.join(baseDir, REA_DIR);
@@ -243,9 +270,29 @@ export function runDoctor(): void {
     checkHooksInstalled(baseDir),
     checkSettingsJson(baseDir),
     checkCommitMsgHook(baseDir),
-    checkCodexAgent(baseDir),
-    checkCodexCommand(baseDir),
   ];
+
+  if (codexRequiredFromPolicy(baseDir)) {
+    checks.push(checkCodexAgent(baseDir), checkCodexCommand(baseDir));
+  } else {
+    // Single informational line replaces the two Codex-specific checks.
+    // The `codex-adversarial.md` agent is still expected to be present by
+    // checkAgentsPresent — that's deliberate; the agent is cheap to ship
+    // and flipping the flag should not require a re-install.
+    checks.push({
+      label: 'codex',
+      status: 'info',
+      detail:
+        'disabled via policy.review.codex_required — skipping Codex-related checks',
+    });
+  }
+
+  return checks;
+}
+
+export function runDoctor(): void {
+  const baseDir = process.cwd();
+  const checks = collectChecks(baseDir);
 
   console.log('');
   log(`Doctor — ${baseDir}`);

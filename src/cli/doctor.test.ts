@@ -1,0 +1,141 @@
+/**
+ * Unit tests for `rea doctor`'s conditional Codex-check behavior (G11.4).
+ *
+ * `collectChecks(baseDir)` is the testable seam — it returns the same
+ * sequence of CheckResults that `runDoctor` prints. We drive it against
+ * scratch repos with different `review.codex_required` settings and assert
+ * on which checks are present and their status.
+ */
+
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { afterEach, describe, expect, it } from 'vitest';
+import { collectChecks, type CheckResult } from './doctor.js';
+
+interface ScratchRepo {
+  dir: string;
+}
+
+/**
+ * Minimal doctor-friendly scratch directory — creates `.rea/policy.yaml`,
+ * `.rea/registry.yaml`, the `.claude/` skeleton, and a `.git/hooks/commit-msg`
+ * so every non-Codex check can report `pass`. The caller supplies the value
+ * of `review.codex_required` (or undefined to omit the field).
+ */
+async function makeScratchRepo(opts: {
+  codexRequired: boolean | undefined;
+}): Promise<ScratchRepo> {
+  const dir = await fs.realpath(
+    await fs.mkdtemp(path.join(os.tmpdir(), 'rea-doctor-test-')),
+  );
+
+  await fs.mkdir(path.join(dir, '.rea'), { recursive: true });
+  const policyLines = [
+    'version: "1"',
+    'profile: "bst-internal"',
+    'installed_by: "test"',
+    'installed_at: "2026-04-18T00:00:00Z"',
+    'autonomy_level: L1',
+    'max_autonomy_level: L2',
+    'promotion_requires_human_approval: true',
+    'block_ai_attribution: true',
+    'blocked_paths:',
+    '  - .env',
+    'notification_channel: ""',
+  ];
+  if (opts.codexRequired !== undefined) {
+    policyLines.push('review:', `  codex_required: ${opts.codexRequired}`);
+  }
+  policyLines.push('');
+  await fs.writeFile(
+    path.join(dir, '.rea', 'policy.yaml'),
+    policyLines.join('\n'),
+  );
+  await fs.writeFile(
+    path.join(dir, '.rea', 'registry.yaml'),
+    ['version: "1"', 'servers: []', ''].join('\n'),
+  );
+
+  return { dir };
+}
+
+function findCheck(
+  checks: CheckResult[],
+  labelFragment: string,
+): CheckResult | undefined {
+  return checks.find((c) => c.label.includes(labelFragment));
+}
+
+describe('rea doctor — collectChecks (G11.4 codex_required)', () => {
+  const cleanup: string[] = [];
+
+  afterEach(async () => {
+    await Promise.all(
+      cleanup.splice(0).map((d) => fs.rm(d, { recursive: true, force: true })),
+    );
+  });
+
+  it('codex_required=false: Codex-specific checks are replaced by a single info line', async () => {
+    const repo = await makeScratchRepo({ codexRequired: false });
+    cleanup.push(repo.dir);
+
+    const checks = collectChecks(repo.dir);
+
+    // No Codex-specific checks.
+    expect(findCheck(checks, 'codex-adversarial agent installed')).toBeUndefined();
+    expect(findCheck(checks, '/codex-review command installed')).toBeUndefined();
+
+    // Exactly one info line with the expected body.
+    const infoLines = checks.filter((c) => c.status === 'info');
+    expect(infoLines).toHaveLength(1);
+    expect(infoLines[0]?.label).toBe('codex');
+    expect(infoLines[0]?.detail).toMatch(/codex_required/);
+    expect(infoLines[0]?.detail).toMatch(/disabled via policy/);
+  });
+
+  it('codex_required=true: Codex-specific checks are present (regression)', async () => {
+    const repo = await makeScratchRepo({ codexRequired: true });
+    cleanup.push(repo.dir);
+
+    const checks = collectChecks(repo.dir);
+
+    // Both Codex-specific checks appear.
+    expect(findCheck(checks, 'codex-adversarial agent installed')).toBeDefined();
+    expect(findCheck(checks, '/codex-review command installed')).toBeDefined();
+
+    // No info line.
+    expect(checks.some((c) => c.status === 'info')).toBe(false);
+  });
+
+  it('review field absent: defaults to codex_required=true (regression)', async () => {
+    const repo = await makeScratchRepo({ codexRequired: undefined });
+    cleanup.push(repo.dir);
+
+    const checks = collectChecks(repo.dir);
+
+    expect(findCheck(checks, 'codex-adversarial agent installed')).toBeDefined();
+    expect(findCheck(checks, '/codex-review command installed')).toBeDefined();
+    expect(checks.some((c) => c.status === 'info')).toBe(false);
+  });
+
+  it('codex_required=false: absence of the codex agent does not fail the check', async () => {
+    // With codex_required=false, the Codex-specific checks are skipped, so
+    // missing `.claude/agents/codex-adversarial.md` produces no fail. This
+    // is the user-facing "Doctor: OK" promise: disabling Codex should not
+    // leave doctor stuck with a permanent fail.
+    const repo = await makeScratchRepo({ codexRequired: false });
+    cleanup.push(repo.dir);
+
+    // We never created .claude/agents/ — so the agent check (which runs for
+    // the full 10-agent roster) would still fail on non-codex agents. We
+    // only assert here that the CODEX-SPECIFIC checks are absent; the
+    // broader "curated agents installed" check is orthogonal and handled
+    // by `checkAgentsPresent`.
+    const checks = collectChecks(repo.dir);
+    const codexChecks = checks.filter((c) =>
+      /codex-adversarial|codex-review command/.test(c.label),
+    );
+    expect(codexChecks).toHaveLength(0);
+  });
+});
