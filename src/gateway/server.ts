@@ -45,7 +45,11 @@ import { createBlockedPathsMiddleware } from './middleware/blocked-paths.js';
 import { createRateLimitMiddleware } from './middleware/rate-limit.js';
 import { createCircuitBreakerMiddleware } from './middleware/circuit-breaker.js';
 import { createInjectionMiddleware } from './middleware/injection.js';
-import { redactMiddleware } from './middleware/redact.js';
+import {
+  createRedactMiddleware,
+  type CompiledSecretPattern,
+} from './middleware/redact.js';
+import { wrapRegex } from './redact-safe/match-timeout.js';
 import { createResultSizeCapMiddleware } from './middleware/result-size-cap.js';
 import { executeChain, type InvocationContext, type Middleware } from './middleware/chain.js';
 import { RateLimiter } from './rate-limiter.js';
@@ -79,8 +83,43 @@ export interface GatewayHandle {
  * "Middleware ordering". The existing unit tests in
  * `src/gateway/middleware/chain.test.ts` encode the semantic contract.
  */
+/**
+ * G3: compile user-supplied redact patterns (already safe-regex-cleared by
+ * the policy loader) into `SafeRegex` instances with the configured timeout.
+ * The loader guarantees the regex source compiles, so we only catch errors
+ * defensively.
+ */
+function compileUserRedactPatterns(
+  policy: Policy,
+  matchTimeoutMs: number,
+): CompiledSecretPattern[] {
+  const entries = policy.redact?.patterns ?? [];
+  const out: CompiledSecretPattern[] = [];
+  for (const entry of entries) {
+    try {
+      const compiled = new RegExp(entry.regex, entry.flags);
+      out.push({
+        name: entry.name,
+        source: 'user',
+        safe: wrapRegex(compiled, { timeoutMs: matchTimeoutMs }),
+      });
+    } catch (err) {
+      // Loader already validated these — warn and drop if an unreachable
+      // corner case ever slips through.
+      log(
+        `[rea] WARN: skipping malformed user redact pattern "${entry.name}": ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+  }
+  return out;
+}
+
 function buildMiddlewareChain(opts: GatewayOptions): Middleware[] {
   const { baseDir, policy } = opts;
+  const matchTimeoutMs = policy.redact?.match_timeout_ms ?? 100;
+  const userPatterns = compileUserRedactPatterns(policy, matchTimeoutMs);
   return [
     createAuditMiddleware(baseDir, policy),
     createKillSwitchMiddleware(baseDir),
@@ -89,8 +128,10 @@ function buildMiddlewareChain(opts: GatewayOptions): Middleware[] {
     createBlockedPathsMiddleware(policy, baseDir),
     createRateLimitMiddleware(new RateLimiter()),
     createCircuitBreakerMiddleware(new CircuitBreaker()),
-    createInjectionMiddleware(policy.injection_detection === 'warn' ? 'warn' : 'block'),
-    redactMiddleware,
+    createInjectionMiddleware(policy.injection_detection === 'warn' ? 'warn' : 'block', {
+      matchTimeoutMs,
+    }),
+    createRedactMiddleware({ matchTimeoutMs, userPatterns }),
     createResultSizeCapMiddleware(),
   ];
 }

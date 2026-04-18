@@ -37,6 +37,30 @@ export interface ReviewPolicy {
   codex_required?: boolean;
 }
 
+/**
+ * User-supplied redaction pattern entry. Each pattern has a stable `name` used
+ * in audit events, a raw `regex` source string, and optional `flags`. The
+ * loader validates every pattern via `safe-regex` at load time (G3) — any
+ * pattern flagged unsafe fails the load with a specific error naming the
+ * offender. The `regex` source is compiled inside a `SafeRegex` timeout
+ * wrapper by the gateway at middleware-creation time.
+ */
+export interface UserRedactPattern {
+  name: string;
+  regex: string;
+  flags?: string;
+}
+
+/**
+ * Redaction policy knobs (G3). `match_timeout_ms` bounds every per-call regex
+ * execution; `patterns` are user-supplied regexes layered on top of the
+ * built-in SECRET_PATTERNS.
+ */
+export interface RedactPolicy {
+  match_timeout_ms?: number;
+  patterns?: UserRedactPattern[];
+}
+
 export interface Policy {
   version: string;
   profile: string;
@@ -51,4 +75,5 @@ export interface Policy {
   injection_detection?: 'block' | 'warn';
   context_protection?: ContextProtection;
   review?: ReviewPolicy;
+  redact?: RedactPolicy;
 }

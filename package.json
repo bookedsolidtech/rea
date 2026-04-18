@@ -54,7 +54,8 @@
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "prepublishOnly": "pnpm run build",
-    "lint": "eslint .",
+    "lint": "pnpm run lint:regex && eslint .",
+    "lint:regex": "node scripts/lint-safe-regex.mjs",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "test": "vitest run",
@@ -89,11 +90,13 @@
   "devDependencies": {
     "@changesets/cli": "^2.30.0",
     "@types/node": "^25.5.2",
+    "@types/safe-regex": "^1.1.6",
     "@typescript-eslint/eslint-plugin": "^8.0.0",
     "@typescript-eslint/parser": "^8.0.0",
     "@vitest/coverage-v8": "^3.2.4",
     "eslint": "^10.2.0",
     "prettier": "^3.8.1",
+    "safe-regex": "^2.1.1",
     "typescript": "^5.8.0",
     "vitest": "^3.1.0"
   },

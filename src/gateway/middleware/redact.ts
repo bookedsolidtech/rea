@@ -23,7 +23,11 @@ export const SECRET_PATTERNS: ReadonlyArray<{ name: string; pattern: RegExp }> =
     pattern: /(?:api[_-]?key|apikey)\s*[:=]\s*["']?[A-Za-z0-9\-_.]{20,}["']?/gi,
   },
   { name: 'Bearer Token', pattern: /bearer\s+[A-Za-z0-9\-_.~+/]+=*/gi },
-  { name: 'Private Key', pattern: /-----BEGIN\s+(?:RSA\s+|EC\s+|DSA\s+)?PRIVATE\s+KEY-----/gi },
+  // PEM armor header — canonical format uses single spaces. Bounded repetition
+  // avoids the nested-`\s+` ReDoS pattern that safe-regex flags on the broader
+  // form (`\s+(?:FOO\s+|BAR\s+)?PRIVATE\s+KEY-----`). PEMs with non-space
+  // separators are non-standard and not in our threat model.
+  { name: 'Private Key', pattern: /-----BEGIN (?:(?:RSA|EC|DSA) )?PRIVATE KEY-----/gi },
   { name: 'Discord Token', pattern: /[MN][A-Za-z\d]{23,}\.[\w-]{6}\.[\w-]{27,}/g },
   // Base64-encoded AWS access key (AKIA... in base64 starts with QUTJQ)
   { name: 'Base64 AWS Key', pattern: /QUtJQ[A-Za-z0-9+/]{17,}={0,2}/g },
