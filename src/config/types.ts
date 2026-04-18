@@ -1,4 +1,4 @@
-import { Tier } from '../policy/types.js';
+import type { Tier } from '../policy/types.js';
 
 export interface ToolOverride {
   tier?: Tier;

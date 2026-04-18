@@ -27,12 +27,32 @@ jobs:
           # Full history so gitleaks can scan commit diffs on PRs
           fetch-depth: 0
 
-      - name: Run gitleaks
-        # pin: gitleaks/gitleaks-action v2.3.7
-        uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITLEAKS_CONFIG: .gitleaks.toml
-          # No org license — rely on the free config path. The action will
-          # refuse to run on private-org repos without a license key; REA is
-          # a public repo so this is fine.
+      - name: Install gitleaks
+        # Pinned version. Install from upstream binary release — the
+        # gitleaks-action GitHub Action requires a paid license for org
+        # repos, so we invoke the OSS binary directly.
+        run: |
+          set -euo pipefail
+          GITLEAKS_VERSION="8.21.2"
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+            | sudo tar -xz -C /usr/local/bin gitleaks
+          gitleaks version
+
+      - name: Scan for secrets (PR)
+        if: github.event_name == 'pull_request'
+        run: |
+          gitleaks detect \
+            --config .gitleaks.toml \
+            --log-opts="${{ github.event.pull_request.base.sha }}..${{ github.sha }}" \
+            --verbose --redact
+
+      - name: Scan for secrets (Push)
+        if: github.event_name == 'push'
+        run: |
+          # On the first push to a new branch, HEAD~1 may not exist — fall
+          # back to a full scan if the parent ref is unavailable.
+          if git rev-parse HEAD~1 >/dev/null 2>&1; then
+            gitleaks detect --config .gitleaks.toml --log-opts="HEAD~1..HEAD" --verbose --redact
+          else
+            gitleaks detect --config .gitleaks.toml --verbose --redact
+          fi
