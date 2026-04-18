@@ -206,15 +206,15 @@ REA ships it out of the box.
 | Phase | Primary model | Codex role | Governance |
 | --- | --- | --- | --- |
 | Plan | Claude Opus | — | Full middleware chain |
-| Pre-implementation review | — | `/codex review` — review the PLAN before code | Audited |
+| Pre-implementation review | — | `/codex:review` — review the PLAN before code | Audited |
 | Build | Claude Opus | — | Full middleware chain |
-| Adversarial review | — | `/codex adversarial-review` on the diff (independent perspective) | Audited, redacted, kill-switched |
-| Pre-merge gate | — | `/codex adversarial-review` re-run; recorded in audit.jsonl | Required status check (recommended) |
+| Adversarial review | — | `/codex:adversarial-review` on the diff (independent perspective) | Audited, redacted, kill-switched |
+| Pre-merge gate | — | `/codex:adversarial-review` re-run; recorded in audit.jsonl | Required status check (recommended) |
 
 Three things make this work:
 
 1. The **`codex-adversarial` agent** in the curated roster wraps
-   `/codex adversarial-review`. The orchestrator delegates to it after
+   `/codex:adversarial-review`. The orchestrator delegates to it after
    any non-trivial change.
 2. The **`/codex-review` slash command** is one of the five shipped
    commands. It produces an audit entry including the request summary,
@@ -260,7 +260,7 @@ disclosure. It is installed as part of the Bash PreToolUse set.
 | --- | --- |
 | `/rea` | Session status — autonomy level, HALT state, last audit entries, next action |
 | `/review` | Invoke the `code-reviewer` agent on current changes |
-| `/codex-review` | Invoke the `codex-adversarial` agent → `/codex adversarial-review` |
+| `/codex-review` | Invoke the `codex-adversarial` agent → `/codex:adversarial-review` |
 | `/freeze` | Prompt for a reason and write `.rea/HALT` |
 | `/halt-check` | Verify every middleware and hook respects HALT |
 
