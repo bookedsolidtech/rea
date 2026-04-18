@@ -65,4 +65,25 @@ describe('policy loader', () => {
   it('throws when policy file is missing', () => {
     expect(() => loadPolicy(baseDir)).toThrow(/Policy file not found/);
   });
+
+  describe('review policy (G11.2)', () => {
+    it('accepts review.codex_required when set', async () => {
+      const yaml = SAMPLE + '\nreview:\n  codex_required: false\n';
+      await fs.writeFile(path.join(baseDir, '.rea', 'policy.yaml'), yaml, 'utf8');
+      const p = loadPolicy(baseDir);
+      expect(p.review?.codex_required).toBe(false);
+    });
+
+    it('leaves review undefined when not set (backwards compatible)', async () => {
+      await fs.writeFile(path.join(baseDir, '.rea', 'policy.yaml'), SAMPLE, 'utf8');
+      const p = loadPolicy(baseDir);
+      expect(p.review).toBeUndefined();
+    });
+
+    it('rejects unknown fields inside review (strict)', async () => {
+      const yaml = SAMPLE + '\nreview:\n  codex_required: true\n  mystery: 1\n';
+      await fs.writeFile(path.join(baseDir, '.rea', 'policy.yaml'), yaml, 'utf8');
+      expect(() => loadPolicy(baseDir)).toThrow(/Invalid policy schema/);
+    });
+  });
 });

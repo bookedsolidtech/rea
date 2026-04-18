@@ -146,4 +146,32 @@ servers:
     const r = loadRegistry(baseDir);
     expect(r.servers[0]?.env_passthrough).toBeUndefined();
   });
+
+  describe('reviewer pin (G11.2)', () => {
+    it('accepts reviewer: codex', async () => {
+      const yaml = `version: "1"\nservers: []\nreviewer: codex\n`;
+      await fs.writeFile(path.join(baseDir, '.rea', 'registry.yaml'), yaml, 'utf8');
+      const r = loadRegistry(baseDir);
+      expect(r.reviewer).toBe('codex');
+    });
+
+    it('accepts reviewer: claude-self', async () => {
+      const yaml = `version: "1"\nservers: []\nreviewer: claude-self\n`;
+      await fs.writeFile(path.join(baseDir, '.rea', 'registry.yaml'), yaml, 'utf8');
+      const r = loadRegistry(baseDir);
+      expect(r.reviewer).toBe('claude-self');
+    });
+
+    it('rejects unknown reviewer values', async () => {
+      const yaml = `version: "1"\nservers: []\nreviewer: grok\n`;
+      await fs.writeFile(path.join(baseDir, '.rea', 'registry.yaml'), yaml, 'utf8');
+      expect(() => loadRegistry(baseDir)).toThrow(/Invalid registry schema/);
+    });
+
+    it('leaves reviewer undefined when not set (backwards compatible)', async () => {
+      await fs.writeFile(path.join(baseDir, '.rea', 'registry.yaml'), ONE_SERVER, 'utf8');
+      const r = loadRegistry(baseDir);
+      expect(r.reviewer).toBeUndefined();
+    });
+  });
 });

@@ -28,7 +28,21 @@ export interface RegistryServer {
   enabled: boolean;
 }
 
+/**
+ * Allowed values for `Registry.reviewer`. Extensions land here — don't
+ * accept unknown strings at parse time. The selector matches on these
+ * exact tokens.
+ */
+export type RegistryReviewer = 'codex' | 'claude-self';
+
 export interface Registry {
   version: '1';
   servers: RegistryServer[];
+  /**
+   * Optional operator pin for the adversarial reviewer. When set, takes
+   * precedence over the default Codex-first selection but yields to the
+   * `REA_REVIEWER` env var. Unknown values are rejected at schema-parse
+   * time. Unset → default selector logic applies.
+   */
+  reviewer?: RegistryReviewer;
 }

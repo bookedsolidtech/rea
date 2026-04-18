@@ -12,7 +12,7 @@ import path from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { z } from 'zod';
 import { Tier } from '../policy/types.js';
-import type { Registry, RegistryServer } from './types.js';
+import type { Registry, RegistryReviewer, RegistryServer } from './types.js';
 
 /**
  * Regex used to refuse passthrough of var names that look like secrets.
@@ -54,10 +54,21 @@ const RegistryServerSchema = z
   })
   .strict();
 
+/**
+ * G11.2: optional `reviewer:` pin at the registry top level. Values are
+ * intentionally constrained to the two reviewers the selector knows how
+ * to dispatch — an unknown string (e.g. a typo'd `claude_self`) is
+ * rejected at parse time, same as `env_passthrough` does for secret-looking
+ * names. If we grow a third reviewer, extend this enum alongside the
+ * RegistryReviewer type.
+ */
+const RegistryReviewerSchema = z.enum(['codex', 'claude-self']);
+
 const RegistrySchema = z
   .object({
     version: z.literal('1'),
     servers: z.array(RegistryServerSchema).default([]),
+    reviewer: RegistryReviewerSchema.optional(),
   })
   .strict();
 
@@ -91,7 +102,9 @@ function stripUndefined(input: z.infer<typeof RegistrySchema>): Registry {
     if (s.tier_overrides !== undefined) out.tier_overrides = s.tier_overrides;
     return out;
   });
-  return { version: input.version, servers };
+  const out: Registry = { version: input.version, servers };
+  if (input.reviewer !== undefined) out.reviewer = input.reviewer as RegistryReviewer;
+  return out;
 }
 
 function parseRaw(raw: string, filePath: string): Registry {

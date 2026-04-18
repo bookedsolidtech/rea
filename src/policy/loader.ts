@@ -18,6 +18,18 @@ const ContextProtectionSchema = z.object({
   max_bash_output_lines: z.number().int().positive().optional(),
 });
 
+/**
+ * G11.2: minimal review policy. Only `codex_required` is recognized today;
+ * G11.4 will expand this (profile defaults, reviewer pin, token caps).
+ * Kept strict so a typo (`codex_require`) fails loudly instead of silently
+ * defaulting.
+ */
+const ReviewPolicySchema = z
+  .object({
+    codex_required: z.boolean().optional(),
+  })
+  .strict();
+
 const PolicySchema = z
   .object({
     version: z.string(),
@@ -32,6 +44,7 @@ const PolicySchema = z
     notification_channel: z.string().default(''),
     injection_detection: z.enum(['block', 'warn']).optional(),
     context_protection: ContextProtectionSchema.optional(),
+    review: ReviewPolicySchema.optional(),
   })
   .strict();
 
