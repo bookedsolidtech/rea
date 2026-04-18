@@ -1,4 +1,4 @@
-import { Tier, InvocationStatus } from '../../policy/types.js';
+import type { Tier, InvocationStatus } from '../../policy/types.js';
 
 export interface AuditRecord {
   timestamp: string;
