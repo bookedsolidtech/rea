@@ -171,4 +171,61 @@ describe('policy loader', () => {
       expect(p.redact?.patterns?.[0]?.regex).toBe('CID_[A-Z0-9]{10}');
     });
   });
+
+  describe('audit policy (G1)', () => {
+    it('accepts audit.rotation.max_bytes and max_age_days', async () => {
+      const yaml =
+        SAMPLE +
+        '\naudit:\n' +
+        '  rotation:\n' +
+        '    max_bytes: 10485760\n' +
+        '    max_age_days: 14\n';
+      await fs.writeFile(path.join(baseDir, '.rea', 'policy.yaml'), yaml, 'utf8');
+      const p = loadPolicy(baseDir);
+      expect(p.audit?.rotation?.max_bytes).toBe(10 * 1024 * 1024);
+      expect(p.audit?.rotation?.max_age_days).toBe(14);
+    });
+
+    it('accepts an empty audit.rotation block (opt-in to defaults)', async () => {
+      const yaml = SAMPLE + '\naudit:\n  rotation: {}\n';
+      await fs.writeFile(path.join(baseDir, '.rea', 'policy.yaml'), yaml, 'utf8');
+      const p = loadPolicy(baseDir);
+      // Schema preserves the empty block; rotator applies defaults at
+      // consumption time, not here.
+      expect(p.audit?.rotation).toBeDefined();
+      expect(p.audit?.rotation?.max_bytes).toBeUndefined();
+      expect(p.audit?.rotation?.max_age_days).toBeUndefined();
+    });
+
+    it('leaves audit undefined when not set (back-compat with 0.2.x)', async () => {
+      await fs.writeFile(path.join(baseDir, '.rea', 'policy.yaml'), SAMPLE, 'utf8');
+      const p = loadPolicy(baseDir);
+      expect(p.audit).toBeUndefined();
+    });
+
+    it('rejects unknown fields inside audit.rotation (strict)', async () => {
+      const yaml =
+        SAMPLE + '\naudit:\n  rotation:\n    max_bytes: 1024\n    mystery: true\n';
+      await fs.writeFile(path.join(baseDir, '.rea', 'policy.yaml'), yaml, 'utf8');
+      expect(() => loadPolicy(baseDir)).toThrow(/Invalid policy schema/);
+    });
+
+    it('rejects unknown fields at the audit.* level (strict)', async () => {
+      const yaml = SAMPLE + '\naudit:\n  rotation: {}\n  mystery: true\n';
+      await fs.writeFile(path.join(baseDir, '.rea', 'policy.yaml'), yaml, 'utf8');
+      expect(() => loadPolicy(baseDir)).toThrow(/Invalid policy schema/);
+    });
+
+    it('rejects non-positive max_bytes', async () => {
+      const yaml = SAMPLE + '\naudit:\n  rotation:\n    max_bytes: 0\n';
+      await fs.writeFile(path.join(baseDir, '.rea', 'policy.yaml'), yaml, 'utf8');
+      expect(() => loadPolicy(baseDir)).toThrow(/Invalid policy schema/);
+    });
+
+    it('rejects non-positive max_age_days', async () => {
+      const yaml = SAMPLE + '\naudit:\n  rotation:\n    max_age_days: -1\n';
+      await fs.writeFile(path.join(baseDir, '.rea', 'policy.yaml'), yaml, 'utf8');
+      expect(() => loadPolicy(baseDir)).toThrow(/Invalid policy schema/);
+    });
+  });
 });
