@@ -28,6 +28,10 @@
     "./middleware": {
       "types": "./dist/gateway/middleware/chain.d.ts",
       "import": "./dist/gateway/middleware/chain.js"
+    },
+    "./audit": {
+      "types": "./dist/audit/append.d.ts",
+      "import": "./dist/audit/append.js"
     }
   },
   "sideEffects": false,
@@ -41,6 +45,7 @@
     "agents/",
     "profiles/",
     "templates/",
+    ".husky/",
     "LICENSE",
     "README.md",
     "SECURITY.md",
