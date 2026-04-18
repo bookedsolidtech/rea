@@ -129,12 +129,27 @@ resolve_argv_refspecs() {
 
   local -a specs
   specs=()
-  local seen_push=0 remote_seen=0 tok
+  local seen_push=0 remote_seen=0 delete_mode=0 tok
   # shellcheck disable=SC2086
   set -- $segment
   for tok in "$@"; do
     case "$tok" in
       git|push) seen_push=1; continue ;;
+      --delete|-d)
+        # Branch deletion. Every subsequent bare refspec is a delete target on
+        # the remote, not a source ref on the local side. We flip delete_mode
+        # so the consumer loop below emits ZERO_SHA|ZERO_SHA records matching
+        # the git pre-push stdin contract for deletions.
+        delete_mode=1
+        continue
+        ;;
+      --delete=*)
+        # `git push --delete=value` is not actually supported by git, but guard
+        # anyway: treat the value as a delete target.
+        delete_mode=1
+        specs+=("${tok#--delete=}")
+        continue
+        ;;
       -*) continue ;;
     esac
     [[ "$seen_push" -eq 0 ]] && continue
@@ -142,7 +157,13 @@ resolve_argv_refspecs() {
       remote_seen=1
       continue
     fi
-    specs+=("$tok")
+    if [[ "$delete_mode" -eq 1 ]]; then
+      # Tag each delete-mode token with a sentinel prefix so the consumer loop
+      # can distinguish it from a normal refspec without another bash array.
+      specs+=("__REA_DELETE__${tok}")
+    else
+      specs+=("$tok")
+    fi
   done
 
   if [[ "${#specs[@]}" -eq 0 ]]; then
@@ -158,8 +179,13 @@ resolve_argv_refspecs() {
     return 0
   fi
 
-  local spec src dst src_sha
+  local spec src dst src_sha is_delete
   for spec in "${specs[@]}"; do
+    is_delete=0
+    if [[ "$spec" == __REA_DELETE__* ]]; then
+      is_delete=1
+      spec="${spec#__REA_DELETE__}"
+    fi
     spec="${spec#+}"
     if [[ "$spec" == *:* ]]; then
       src="${spec%%:*}"
@@ -174,6 +200,20 @@ resolve_argv_refspecs() {
     fi
     dst="${dst#refs/heads/}"
     dst="${dst#refs/for/}"
+    if [[ "$is_delete" -eq 1 ]]; then
+      # `git push --delete origin doomed` — force the record to match the
+      # pre-push stdin contract for deletions: both SHAs zero, local_ref is
+      # the sentinel string "(delete)". The downstream HAS_DELETE branch
+      # fail-closes out of the agent path.
+      if [[ -z "$dst" || "$dst" == "HEAD" ]]; then
+        {
+          printf 'PUSH BLOCKED: --delete refspec resolves to HEAD or empty (from %q)\n' "$spec"
+        } >&2
+        exit 2
+      fi
+      printf '%s|%s|(delete)|refs/heads/%s\n' "$ZERO_SHA" "$ZERO_SHA" "$dst"
+      continue
+    fi
     if [[ "$dst" == "HEAD" || -z "$dst" ]]; then
       {
         printf 'PUSH BLOCKED: refspec resolves to HEAD (from %q)\n' "$spec"
@@ -251,13 +291,45 @@ for rec in "${REFSPEC_RECORDS[@]}"; do
 
   # Merge base: if the remote already has the ref, use remote_sha directly.
   # Otherwise (new branch, remote_sha is zeros), merge-base against the target.
+  #
+  # Critical: when remote_sha is non-zero but NOT in the local object DB
+  # (stale checkout, no recent fetch), older code swallowed `merge-base`
+  # failure with `|| echo "$remote_sha"`, assigning a SHA that would make
+  # every downstream `rev-list`/`diff` fail. Those failures were then
+  # swallowed too, collapsing to an empty DIFF_FULL and fail-open exit 0.
+  #
+  # Probe object presence up front. Missing object → fail closed with a clear
+  # remediation message. No silent fallback.
   if [[ "$remote_sha" != "$ZERO_SHA" ]]; then
-    mb=$(cd "$REA_ROOT" && git merge-base "$remote_sha" "$local_sha" 2>/dev/null || echo "$remote_sha")
+    if ! (cd "$REA_ROOT" && git cat-file -e "${remote_sha}^{commit}" 2>/dev/null); then
+      {
+        printf 'PUSH BLOCKED: remote object %s is not in the local object DB.\n' "$remote_sha"
+        printf '\n'
+        printf '  The gate cannot compute a review diff without it. Fetch the\n'
+        printf '  remote and retry:\n'
+        printf '\n'
+        printf '    git fetch origin\n'
+        printf '    # then retry the push\n'
+        printf '\n'
+      } >&2
+      exit 2
+    fi
+    mb=$(cd "$REA_ROOT" && git merge-base "$remote_sha" "$local_sha" 2>/dev/null)
+    mb_status=$?
+    if [[ "$mb_status" -ne 0 || -z "$mb" ]]; then
+      {
+        printf 'PUSH BLOCKED: no merge-base between remote %s and local %s\n' \
+          "${remote_sha:0:12}" "${local_sha:0:12}"
+        printf '  The two histories are unrelated; refusing to pass without a\n'
+        printf '  reviewable diff.\n'
+      } >&2
+      exit 2
+    fi
   else
     mb=$(cd "$REA_ROOT" && git merge-base "$target" "$local_sha" 2>/dev/null || echo "")
     if [[ -z "$mb" ]]; then
       # New branch whose target has no merge-base locally. Try the default
-      # branch if it exists, otherwise fail-closed.
+      # branch if it exists, otherwise fail-closed (handled below).
       mb=$(cd "$REA_ROOT" && git merge-base main "$local_sha" 2>/dev/null || echo "")
     fi
   fi
@@ -266,8 +338,21 @@ for rec in "${REFSPEC_RECORDS[@]}"; do
   fi
 
   # Pick the refspec whose merge-base is the oldest ancestor of its local_sha
-  # (i.e. the largest diff). Comparing via commit count keeps this simple.
-  count=$(cd "$REA_ROOT" && git rev-list --count "${mb}..${local_sha}" 2>/dev/null || echo "0")
+  # (i.e. the largest diff). Fail closed on rev-list errors rather than
+  # substituting 0 — a failed rev-list means we can't trust the comparison.
+  count=$(cd "$REA_ROOT" && git rev-list --count "${mb}..${local_sha}" 2>/dev/null)
+  count_status=$?
+  if [[ "$count_status" -ne 0 ]]; then
+    {
+      printf 'PUSH BLOCKED: git rev-list --count %s..%s failed (exit %s)\n' \
+        "${mb:0:12}" "${local_sha:0:12}" "$count_status"
+      printf '  Cannot size the diff; refusing to pass.\n'
+    } >&2
+    exit 2
+  fi
+  if [[ -z "$count" ]]; then
+    count=0
+  fi
   if [[ -z "$SOURCE_SHA" ]] || [[ "$count" -gt "${BEST_COUNT:-0}" ]]; then
     SOURCE_SHA="$local_sha"
     MERGE_BASE="$mb"
@@ -297,10 +382,26 @@ if [[ -z "$SOURCE_SHA" || -z "$MERGE_BASE" ]]; then
   exit 2
 fi
 
-DIFF_FULL=$(cd "$REA_ROOT" && git diff "${MERGE_BASE}...${SOURCE_SHA}" 2>/dev/null || echo "")
+# Capture git diff exit status explicitly. The previous `|| echo ""` swallowed
+# real errors (missing objects, invalid refs) and fell through to the empty-diff
+# fail-open below. We now distinguish:
+#   exit 0 + empty output  → legitimate no-op push, allow
+#   exit 0 + non-empty     → proceed to review
+#   exit non-zero          → fail closed, never allow
+DIFF_FULL=$(cd "$REA_ROOT" && git diff "${MERGE_BASE}...${SOURCE_SHA}" 2>/dev/null)
+DIFF_STATUS=$?
+if [[ "$DIFF_STATUS" -ne 0 ]]; then
+  {
+    printf 'PUSH BLOCKED: git diff %s...%s failed (exit %s)\n' \
+      "${MERGE_BASE:0:12}" "${SOURCE_SHA:0:12}" "$DIFF_STATUS"
+    printf '  Cannot compute reviewable diff; refusing to pass.\n'
+  } >&2
+  exit 2
+fi
 
 if [[ -z "$DIFF_FULL" ]]; then
-  # No diff — nothing to review
+  # git exited 0 with no output — legitimate no-op push (e.g. re-push of an
+  # already-remote commit). Allow.
   exit 0
 fi
 
