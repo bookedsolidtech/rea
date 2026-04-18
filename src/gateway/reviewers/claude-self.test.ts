@@ -1,5 +1,8 @@
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 import { APIError } from '@anthropic-ai/sdk';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ClaudeSelfReviewer, type MessagesCreateFn } from './claude-self.js';
 import type { ReviewRequest } from './types.js';
 
@@ -19,6 +22,23 @@ function okCreate(jsonPayload: string): MessagesCreateFn {
 
 describe('ClaudeSelfReviewer', () => {
   const originalEnv = process.env['ANTHROPIC_API_KEY'];
+  const originalCwd = process.cwd();
+  let cwdStash: string;
+
+  beforeAll(async () => {
+    // Redirect process.cwd() to a scratch dir so the reviewer's default
+    // telemetry write lands in a throwaway location instead of polluting
+    // the real `.rea/metrics.jsonl` under the repo root.
+    cwdStash = await fs.realpath(
+      await fs.mkdtemp(path.join(os.tmpdir(), 'rea-claude-self-cwd-')),
+    );
+    process.chdir(cwdStash);
+  });
+
+  afterAll(async () => {
+    process.chdir(originalCwd);
+    await fs.rm(cwdStash, { recursive: true, force: true });
+  });
 
   beforeEach(() => {
     delete process.env['ANTHROPIC_API_KEY'];
@@ -215,6 +235,93 @@ describe('ClaudeSelfReviewer', () => {
       });
       const result = await reviewer.review(REQ);
       expect(result.summary).toBe('ok');
+    });
+  });
+
+  describe('telemetry (G11.5)', () => {
+    it('records invocation_type=adversarial-review on success with exit_code 0', async () => {
+      const recorded: Array<{ baseDir: string; input: Record<string, unknown> }> = [];
+      const reviewer = new ClaudeSelfReviewer({
+        create: okCreate(
+          JSON.stringify({ verdict: 'pass', summary: 'ok', findings: [] }),
+        ),
+        baseDir: '/tmp/telemetry-test',
+        recordTelemetryFn: async (baseDir, input) => {
+          recorded.push({ baseDir, input: input as unknown as Record<string, unknown> });
+        },
+      });
+      await reviewer.review(REQ);
+      // Telemetry is fire-and-forget; give the microtask queue a nudge.
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(recorded).toHaveLength(1);
+      expect(recorded[0]?.baseDir).toBe('/tmp/telemetry-test');
+      expect(recorded[0]?.input['invocation_type']).toBe('adversarial-review');
+      expect(recorded[0]?.input['exit_code']).toBe(0);
+      expect(typeof recorded[0]?.input['duration_ms']).toBe('number');
+    });
+
+    it('records exit_code=1 and stderr on API error', async () => {
+      const recorded: Array<Record<string, unknown>> = [];
+      const rateLimitErr = new APIError(
+        429,
+        { error: { message: 'rate_limit' } },
+        'rate_limit',
+        new Headers(),
+      );
+      const create: MessagesCreateFn = vi.fn().mockRejectedValue(rateLimitErr);
+      const reviewer = new ClaudeSelfReviewer({
+        create,
+        recordTelemetryFn: async (_base, input) => {
+          recorded.push(input as unknown as Record<string, unknown>);
+        },
+      });
+      await reviewer.review(REQ);
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(recorded).toHaveLength(1);
+      expect(recorded[0]?.['exit_code']).toBe(1);
+      expect(String(recorded[0]?.['stderr'])).toMatch(/429/);
+    });
+
+    it('records exit_code=1 on unparseable output', async () => {
+      const recorded: Array<Record<string, unknown>> = [];
+      const reviewer = new ClaudeSelfReviewer({
+        create: okCreate('this is not JSON'),
+        recordTelemetryFn: async (_base, input) => {
+          recorded.push(input as unknown as Record<string, unknown>);
+        },
+      });
+      await reviewer.review(REQ);
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(recorded).toHaveLength(1);
+      expect(recorded[0]?.['exit_code']).toBe(1);
+    });
+
+    it('telemetry write failure does not impact the review result (fail-soft)', async () => {
+      const reviewer = new ClaudeSelfReviewer({
+        create: okCreate(
+          JSON.stringify({ verdict: 'pass', summary: 'ok', findings: [] }),
+        ),
+        // Deliberately throwing telemetry fn; the outer review must still
+        // return a real ReviewResult.
+        recordTelemetryFn: () => {
+          throw new Error('telemetry boom');
+        },
+      });
+      const result = await reviewer.review(REQ);
+      expect(result.verdict).toBe('pass');
+    });
+
+    it('missing API key path is NOT instrumented (no SDK call to measure)', async () => {
+      const recorded: Array<Record<string, unknown>> = [];
+      const reviewer = new ClaudeSelfReviewer({
+        recordTelemetryFn: async (_base, input) => {
+          recorded.push(input as unknown as Record<string, unknown>);
+        },
+      });
+      await reviewer.review(REQ);
+      await new Promise((resolve) => setImmediate(resolve));
+      // No telemetry rows — we short-circuit before hitting the SDK.
+      expect(recorded).toHaveLength(0);
     });
   });
 });

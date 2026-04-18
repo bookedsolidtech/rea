@@ -27,6 +27,7 @@
  */
 
 import Anthropic, { APIError } from '@anthropic-ai/sdk';
+import { recordTelemetry } from '../observability/codex-telemetry.js';
 import type {
   AdversarialReviewer,
   ReviewFinding,
@@ -68,6 +69,18 @@ export interface ClaudeSelfReviewerOptions {
   apiKey?: string;
   model?: string;
   create?: MessagesCreateFn;
+  /**
+   * Repo root used for the telemetry write path (`<baseDir>/.rea/metrics.jsonl`).
+   * Defaults to `process.cwd()`. Tests inject a temp dir so they don't scribble
+   * into the repo's real metrics file.
+   */
+  baseDir?: string;
+  /**
+   * Test seam — override the telemetry-record function so unit tests can
+   * assert on the exact shape without hitting disk. Defaults to the real
+   * `recordTelemetry` helper.
+   */
+  recordTelemetryFn?: typeof recordTelemetry;
 }
 
 const SYSTEM_PROMPT = `You are an adversarial code reviewer. A diff will be provided along with
@@ -222,11 +235,15 @@ export class ClaudeSelfReviewer implements AdversarialReviewer {
 
   private readonly apiKey: string | undefined;
   private readonly createFn: MessagesCreateFn | undefined;
+  private readonly baseDir: string;
+  private readonly recordTelemetryFn: typeof recordTelemetry;
 
   constructor(opts: ClaudeSelfReviewerOptions = {}) {
     this.version = opts.model ?? CLAUDE_MODEL_ID;
     this.apiKey = opts.apiKey ?? process.env['ANTHROPIC_API_KEY'];
     this.createFn = opts.create;
+    this.baseDir = opts.baseDir ?? process.cwd();
+    this.recordTelemetryFn = opts.recordTelemetryFn ?? recordTelemetry;
   }
 
   /**
@@ -257,6 +274,16 @@ export class ClaudeSelfReviewer implements AdversarialReviewer {
       ? req.diff.slice(0, DIFF_TRUNCATE_BYTES)
       : req.diff;
 
+    const userMessage = buildUserMessage(
+      { ...req, diff: effectiveDiff },
+      truncated,
+    );
+
+    // G11.5 — measure the SDK call. The telemetry write is best-effort and
+    // fire-and-forget; it MUST NOT block or fail the review. We call
+    // `recordTelemetryFn` in a fire-and-forget void expression; the helper
+    // itself is already fail-soft (single stderr warn on error).
+    const startedAt = Date.now();
     let response: Awaited<ReturnType<MessagesCreateFn>>;
     try {
       response = await create({
@@ -266,7 +293,7 @@ export class ClaudeSelfReviewer implements AdversarialReviewer {
         messages: [
           {
             role: 'user',
-            content: buildUserMessage({ ...req, diff: effectiveDiff }, truncated),
+            content: userMessage,
           },
         ],
       });
@@ -275,6 +302,14 @@ export class ClaudeSelfReviewer implements AdversarialReviewer {
       // message so operators can act on it; the caller decides whether
       // to retry or abort.
       const message = err instanceof APIError ? `API ${err.status ?? '?'}: ${err.message}` : err instanceof Error ? err.message : String(err);
+      this.emitTelemetry({
+        invocation_type: 'adversarial-review',
+        input_text: userMessage,
+        output_text: '',
+        duration_ms: Date.now() - startedAt,
+        exit_code: 1,
+        stderr: message,
+      });
       return errorResult(message, 'claude-self review failed', '');
     }
 
@@ -285,6 +320,14 @@ export class ClaudeSelfReviewer implements AdversarialReviewer {
 
     const parsed = parseModelJson(text);
     if ('error' in parsed) {
+      this.emitTelemetry({
+        invocation_type: 'adversarial-review',
+        input_text: userMessage,
+        output_text: text,
+        duration_ms: Date.now() - startedAt,
+        exit_code: 1,
+        stderr: parsed.error,
+      });
       return errorResult(parsed.error, 'claude-self produced unparseable output', '');
     }
 
@@ -295,7 +338,32 @@ export class ClaudeSelfReviewer implements AdversarialReviewer {
     // for this reviewer, but this reviewer is the canonical authority on
     // that flag so re-pin it.
     parsed.degraded = true;
+
+    this.emitTelemetry({
+      invocation_type: 'adversarial-review',
+      input_text: userMessage,
+      output_text: text,
+      duration_ms: Date.now() - startedAt,
+      exit_code: 0,
+    });
+
     return parsed;
+  }
+
+  /**
+   * Fire-and-forget telemetry write. The helper itself is fail-soft, but a
+   * misbehaving injected `recordTelemetryFn` (synchronous throw) could
+   * still escape a bare `void fn(...)`. This wrapper catches both sync and
+   * async rejections so a telemetry bug never breaks a review.
+   */
+  private emitTelemetry(input: Parameters<typeof recordTelemetry>[1]): void {
+    try {
+      void Promise.resolve(this.recordTelemetryFn(this.baseDir, input)).catch(() => {
+        /* swallowed — telemetry is observational, never fatal */
+      });
+    } catch {
+      /* same rationale — a sync throw from the injected fn is contained */
+    }
   }
 
   /**

@@ -90,6 +90,12 @@ export class CodexReviewer implements AdversarialReviewer {
    * "CodexReviewer handles mean dispatch to the codex-adversarial agent";
    * if a caller ignores that and awaits this, we throw loudly rather than
    * silently produce a bad `ReviewResult`.
+   *
+   * TODO(0.3.0): when Codex ships a native TS client, this path will
+   * actually run the review. At that point, instrument with
+   * `recordTelemetry` the same way `ClaudeSelfReviewer.review()` does
+   * today (G11.5). The throwing placeholder below is deliberately NOT
+   * instrumented — there is nothing to measure.
    */
   async review(_req: ReviewRequest): Promise<ReviewResult> {
     throw new Error(

@@ -6,6 +6,7 @@ import {
   CodexProbe,
   type CodexProbeState,
 } from '../gateway/observability/codex-probe.js';
+import { summarizeTelemetry } from '../gateway/observability/codex-telemetry.js';
 import { POLICY_FILE, REA_DIR, REGISTRY_FILE, log, reaPath } from './utils.js';
 
 export interface CheckResult {
@@ -333,7 +334,12 @@ export function collectChecks(
   return checks;
 }
 
-export async function runDoctor(): Promise<void> {
+export interface RunDoctorOptions {
+  /** When true, print a 7-day telemetry summary after the checks (G11.5). */
+  metrics?: boolean;
+}
+
+export async function runDoctor(opts: RunDoctorOptions = {}): Promise<void> {
   const baseDir = process.cwd();
 
   // G11.3 — one-shot probe when Codex is required by policy. Doctor may be
@@ -364,6 +370,12 @@ export async function runDoctor(): Promise<void> {
     if (c.status === 'fail') hardFail = true;
   }
 
+  // G11.5 — optional telemetry summary. Prints AFTER the main checks and
+  // NEVER contributes to the exit code. Purely observational.
+  if (opts.metrics === true) {
+    await printTelemetrySummary(baseDir);
+  }
+
   console.log('');
   if (hardFail) {
     log('Doctor: one or more hard checks failed.');
@@ -372,4 +384,22 @@ export async function runDoctor(): Promise<void> {
   }
   log('Doctor: OK (warnings do not fail the check).');
   console.log('');
+}
+
+/**
+ * Render the telemetry summary after the doctor checks. Compact by
+ * design — the exact shape may evolve as G5 formalizes metrics export.
+ */
+async function printTelemetrySummary(baseDir: string): Promise<void> {
+  const summary = await summarizeTelemetry(baseDir);
+  console.log('');
+  log(`Telemetry — last ${summary.window_days} days`);
+  console.log(
+    `  invocations/day:        ${summary.invocations_per_day.join(', ')}`,
+  );
+  console.log(`  total estimated tokens: ${summary.total_estimated_tokens}`);
+  console.log(`  rate-limited responses: ${summary.rate_limited_count}`);
+  console.log(
+    `  avg latency:            ${Math.round(summary.avg_latency_ms)} ms`,
+  );
 }

@@ -89,8 +89,10 @@ async function main(): Promise<void> {
   program
     .command('doctor')
     .description('Validate the install: policy parses, .rea/ layout, hooks, Codex plugin.')
-    .action(async () => {
-      await runDoctor();
+    .option('--metrics', 'also print a 7-day summary of Codex telemetry (G11.5)')
+    .action(async (opts: { metrics?: boolean }) => {
+      const doctorOpts = opts.metrics === true ? { metrics: true } : {};
+      await runDoctor(doctorOpts);
     });
 
   await program.parseAsync(process.argv);
