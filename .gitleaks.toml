@@ -1,0 +1,68 @@
+# Gitleaks configuration for @bookedsolid/rea
+# Governance tool — must never ship with embedded secrets.
+
+[extend]
+useDefault = true
+
+# ── Custom rules ──────────────────────────────────────────────────────────────
+
+[[rules]]
+id          = "npm-token"
+description = "npm publish / automation token"
+regex       = '''(?i)(npm_[A-Za-z0-9]{36}|NPM_TOKEN\s*[=:]\s*["']?[A-Za-z0-9_\-]{36,}["']?)'''
+keywords    = ["npm"]
+
+[[rules]]
+id          = "github-fine-grained-pat"
+description = "GitHub fine-grained personal access token"
+regex       = '''github_pat_[A-Za-z0-9_]{82}'''
+keywords    = ["github_pat"]
+
+[[rules]]
+id          = "anthropic-api-key"
+description = "Anthropic API key"
+regex       = '''sk-ant-[A-Za-z0-9_\-]{90,}'''
+keywords    = ["sk-ant"]
+
+[[rules]]
+id          = "openai-api-key"
+description = "OpenAI API key"
+regex       = '''sk-(proj-)?[A-Za-z0-9_\-]{40,}'''
+keywords    = ["sk-"]
+
+[[rules]]
+id          = "discord-bot-token"
+description = "Discord bot token"
+regex       = '''[MNO][A-Za-z0-9]{23}\.[\w-]{6}\.[\w-]{27,38}'''
+keywords    = ["discord"]
+
+[[rules]]
+id          = "discord-webhook"
+description = "Discord webhook URL"
+regex       = '''https://discord(?:app)?\.com/api/webhooks/\d+/[A-Za-z0-9_\-]{68,}'''
+keywords    = ["discord"]
+
+# ── Global allowlist ──────────────────────────────────────────────────────────
+
+[allowlist]
+description = "Known-safe paths and patterns"
+
+paths = [
+  '''node_modules''',
+  '''pnpm-lock\.yaml''',
+  '''dist/''',
+  '''coverage/''',
+  # Test fixtures must be allowed to contain fake-looking secrets
+  '''__tests__/fixtures/''',
+  '''src/.*\.test\.ts''',
+]
+
+# GitHub Actions expressions like ${{ secrets.FOO }} are NOT real secrets
+regexes = [
+  '''\$\{\{\s*secrets\.[A-Z0-9_]+\s*\}\}''',
+  '''your[-_].*[-_]here''',
+  '''<YOUR[_\-][A-Z_]+>''',
+  '''EXAMPLE_[A-Z_]+''',
+]
+
+commits = []

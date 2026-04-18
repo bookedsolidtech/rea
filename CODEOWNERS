@@ -1,0 +1,21 @@
+# REA — CODEOWNERS
+# Required reviewers for sensitive code paths.
+# See https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+# Default — everything requires Jake's review
+* @himerus
+
+# Security-critical paths — explicit ownership
+/src/gateway/middleware/     @himerus
+/src/policy/                 @himerus
+/hooks/                      @himerus
+/commands/                   @himerus
+/agents/                     @himerus
+/profiles/                   @himerus
+/.github/                    @himerus
+/.github/workflows/          @himerus
+/SECURITY.md                 @himerus
+/THREAT_MODEL.md             @himerus
+/LICENSE                     @himerus
+/CODEOWNERS                  @himerus
+/.gitleaks.toml              @himerus

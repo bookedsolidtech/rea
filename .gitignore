@@ -1,0 +1,35 @@
+# Build artifacts
+dist/
+*.tsbuildinfo
+
+# Dependencies
+node_modules/
+
+# Lockfiles we don't commit (we use pnpm)
+package-lock.json
+yarn.lock
+
+# Test artifacts
+coverage/
+.vitest-cache/
+
+# Environment / secrets — NEVER commit
+.env
+.env.*
+!.env.example
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Runtime / ephemeral state (in consumer projects; ignored here too for safety)
+.rea/audit.jsonl
+.rea/HALT
+
+# Scratch space
+.scratch/
+.tmp/
+*.log

@@ -1,0 +1,70 @@
+name: DCO
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: dco-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  dco-check:
+    name: DCO sign-off
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        # pin: actions/checkout v4.1.7
+        uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332
+        with:
+          # Full history so we can walk every commit in the PR range
+          fetch-depth: 0
+
+      - name: Validate DCO sign-off on every commit
+        # Inline validator — no third-party dependency, one responsibility.
+        # Rejects the PR if any commit in the range is missing a
+        # "Signed-off-by:" trailer. See developercertificate.org for the
+        # certification text.
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          base_sha="${{ github.event.pull_request.base.sha }}"
+          head_sha="${{ github.event.pull_request.head.sha }}"
+
+          if [[ -z "$base_sha" || -z "$head_sha" ]]; then
+            echo "::error::Missing base/head SHA for PR — cannot validate DCO"
+            exit 1
+          fi
+
+          echo "Checking DCO sign-off on commits in range ${base_sha}..${head_sha}"
+
+          missing=()
+          while IFS= read -r sha; do
+            [[ -z "$sha" ]] && continue
+            msg="$(git log -1 --format=%B "$sha")"
+            # Require a line matching: Signed-off-by: Name <email@host>
+            if ! grep -qE '^Signed-off-by: .+ <.+@.+>$' <<<"$msg"; then
+              missing+=("$sha")
+            fi
+          done < <(git log --format=%H "${base_sha}..${head_sha}")
+
+          if (( ${#missing[@]} > 0 )); then
+            echo "::error::The following commits are missing a DCO Signed-off-by trailer:"
+            for sha in "${missing[@]}"; do
+              subject="$(git log -1 --format=%s "$sha")"
+              echo "::error::  $sha  $subject"
+            done
+            echo ""
+            echo "Fix: rebase and re-sign with: git commit --amend -s  (or  git rebase --signoff)"
+            echo "See: https://developercertificate.org/"
+            exit 1
+          fi
+
+          echo "All commits signed off. DCO OK."

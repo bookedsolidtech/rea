@@ -1,0 +1,65 @@
+name: Changeset check
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: changeset-check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  changeset-check:
+    name: Require changeset
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Allow explicit opt-out via the "@changesets/skip" label (docs/test-only changes).
+    if: ${{ !contains(github.event.pull_request.labels.*.name, '@changesets/skip') }}
+    steps:
+      - name: Checkout
+        # pin: actions/checkout v4.1.7
+        uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332
+        with:
+          # Full history so we can diff against the base branch
+          fetch-depth: 0
+
+      - name: Setup pnpm
+        # pin: pnpm/action-setup v4.0.0
+        uses: pnpm/action-setup@fe02b34f77f8bc703788d5817da081398fad5dd2
+        with:
+          version: 9
+
+      - name: Setup Node
+        # pin: actions/setup-node v4.0.3
+        uses: actions/setup-node@1e60f620b9541d16bece96c5465dc8ee9832be0b
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Verify a changeset was added
+        # Inline check — `@changesets/cli` is already a devDependency, so we
+        # use its `status` subcommand. A non-zero exit code from
+        # `changeset status --since=origin/main` means no changeset on the PR.
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          base_ref="${{ github.event.pull_request.base.ref }}"
+          git fetch --no-tags --depth=1 origin "$base_ref"
+
+          if pnpm exec changeset status --since="origin/${base_ref}"; then
+            echo "Changeset present. OK."
+          else
+            echo "::error::No changeset detected for this PR."
+            echo "::error::Run  pnpm changeset  and commit the generated file,"
+            echo "::error::or add the label '@changesets/skip' for docs/test-only PRs."
+            exit 1
+          fi
