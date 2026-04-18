@@ -34,12 +34,27 @@ You may read additional files in the repo if needed for context, but do so read-
 5. **Parse the Codex output** — extract structured findings.
 6. **Classify findings** by category: security, correctness, edge cases, test gaps, API design, performance.
 7. **Assign verdict**: `pass` (no material findings), `concerns` (findings worth addressing but not blocking), `blocking` (findings that must be fixed before merge).
-8. **Emit audit entry** — the middleware records the invocation automatically, but include a structured summary in your return so `.rea/audit.jsonl` gets:
-   - `tool: "codex-adversarial-review"`
-   - `head_sha`, `target`
-   - `finding_count`
-   - `verdict`
-   - `summary` (one sentence)
+8. **Emit audit entry** — after producing the verdict, append a structured record to `.rea/audit.jsonl` via the public `@bookedsolid/rea/audit` helper. This is what the `push-review-gate.sh` hook greps for on protected-path diffs, so the field names must match exactly:
+
+   ```ts
+   import { appendAuditRecord, CODEX_REVIEW_TOOL_NAME, CODEX_REVIEW_SERVER_NAME, Tier, InvocationStatus } from '@bookedsolid/rea/audit';
+
+   await appendAuditRecord(process.cwd(), {
+     tool_name: CODEX_REVIEW_TOOL_NAME,   // "codex.review"
+     server_name: CODEX_REVIEW_SERVER_NAME, // "codex"
+     status: InvocationStatus.Allowed,
+     tier: Tier.Read,
+     metadata: {
+       head_sha: '<git rev-parse HEAD>',
+       target:   '<base ref or SHA diffed against>',
+       finding_count: <total>,
+       verdict:  'pass' | 'concerns' | 'blocking' | 'error',
+       summary:  '<one sentence>',
+     },
+   });
+   ```
+
+   If the Codex plugin call itself flowed through rea middleware (the proxy case), the middleware also writes an envelope record — that is fine, the two are complementary: the agent-emitted record carries the semantic verdict, the middleware record carries the chain integrity proof for the underlying tool call.
 
 ## Finding Shape
 

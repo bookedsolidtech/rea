@@ -76,6 +76,50 @@ fi
 
 LINE_COUNT=$(printf '%s' "$DIFF_FULL" | grep -cE '^\+[^+]|^-[^-]' 2>/dev/null || echo "0")
 
+# ── 7a. Protected-path Codex adversarial review gate ────────────────────────
+# If the diff touches governance-critical directories, require a codex.review
+# audit entry for the current HEAD. This enforces the Plan → Build → Review
+# loop for the very code that enforces it.
+#
+# Rationale for gating at push and NOT at commit: commit-review-gate.sh already
+# performs cache-based review with triage thresholds. Doubling friction at
+# every commit is pointless because nothing lands remote without passing the
+# push gate. Leave commit-review-gate alone; do NOT add a mirror of this check
+# there.
+#
+# Format of the match: grep for the CODEX_REVIEW_TOOL_NAME constant
+# ("codex.review") co-located with the exact head_sha string on a single
+# audit.jsonl line. This is sufficient for MVP — full JSON + chain validation
+# via jq is a later pass (noted in src/audit/codex-event.ts).
+PROTECTED_RE='(src/gateway/middleware/|hooks/|src/policy/|\.github/workflows/)'
+if printf '%s' "$DIFF_FULL" | grep -qE "^\+\+\+ .*${PROTECTED_RE}"; then
+  HEAD_SHA=$(cd "$REA_ROOT" && git rev-parse HEAD 2>/dev/null || echo "")
+  AUDIT="${REA_ROOT}/.rea/audit.jsonl"
+  CODEX_OK=0
+  if [ -n "$HEAD_SHA" ] && [ -f "$AUDIT" ]; then
+    if grep -F "\"head_sha\":\"${HEAD_SHA}\"" "$AUDIT" 2>/dev/null \
+      | grep -q '"tool_name":"codex.review"'; then
+      CODEX_OK=1
+    fi
+  fi
+  if [ "$CODEX_OK" -eq 0 ]; then
+    {
+      printf 'PUSH BLOCKED: protected paths changed — /codex-review required for HEAD %s\n' "$HEAD_SHA"
+      printf '\n'
+      printf '  Diff touches one of:\n'
+      printf '    - src/gateway/middleware/\n'
+      printf '    - hooks/\n'
+      printf '    - src/policy/\n'
+      printf '    - .github/workflows/\n'
+      printf '\n'
+      printf '  Run /codex-review against HEAD, then retry the push.\n'
+      printf '  The codex-adversarial agent emits the required audit entry.\n'
+      printf '\n'
+    } >&2
+    exit 2
+  fi
+fi
+
 # ── 8. Check review cache ────────────────────────────────────────────────────
 PUSH_SHA=$(printf '%s' "$DIFF_FULL" | shasum -a 256 | cut -d' ' -f1 2>/dev/null || echo "")
 
