@@ -5,14 +5,30 @@
  * `StdioClientTransport` pair. The gateway spawns one of these per entry in
  * `.rea/registry.yaml`.
  *
+ * ## Environment inheritance
+ *
+ * Children do NOT inherit the operator's full `process.env`. Every child gets:
+ *
+ *   1. A fixed allowlist of neutral OS/runtime vars (`PATH`, `HOME`, `TZ`, …).
+ *   2. Any names the registry opts into via `env_passthrough: [...]`. The
+ *      schema refuses secret-looking names (TOKEN/KEY/SECRET/…) — the operator
+ *      must type secrets explicitly via `env:` so the decision is conscious.
+ *   3. Values from the registry's `env:` mapping. Takes precedence over 1 and 2.
+ *
+ * Rationale: the registry is a plain YAML file — an attacker who can write to
+ * `.rea/` (or who lands a malicious template via `rea init`) should not be
+ * able to exfiltrate `OPENAI_API_KEY`, `GITHUB_TOKEN`, or customer secrets by
+ * spawning a child that reads `process.env`.
+ *
  * ## Health / reconnect
  *
- * On an unclean exit from the child (transport error, non-zero exit, SIGPIPE),
- * we attempt exactly ONE reconnect. If that fails we mark the connection
- * unhealthy and every subsequent `callTool` raises an error that the
- * circuit-breaker middleware will pick up. Retries beyond that are the
- * circuit-breaker's responsibility, not ours — the pool does not spin
- * children in a tight loop.
+ * On a transport-layer failure we attempt exactly ONE reconnect per failure
+ * episode. After a successful reconnect + retry the attempt flag resets so a
+ * later, unrelated transport error (e.g. an idle socket closed by the OS after
+ * hours) also gets one reconnect. A flapping guard refuses the second
+ * reconnect if it lands within `RECONNECT_FLAP_WINDOW_MS` of the previous
+ * successful reconnect — in that case we mark the connection unhealthy and
+ * let the circuit breaker take over.
  *
  * ## Why not request-level retries
  *
@@ -32,9 +48,82 @@ export interface DownstreamToolInfo {
 
 type Health = 'healthy' | 'degraded' | 'unhealthy';
 
+/**
+ * Neutral env vars every child inherits. These are the ones shells/toolchains
+ * need to function but carry no secrets in a well-configured environment.
+ * Covers macOS, Linux, and Windows-relevant names.
+ */
+const DEFAULT_ENV_ALLOWLIST: readonly string[] = [
+  'PATH',
+  'HOME',
+  'USER',
+  'LOGNAME',
+  'LANG',
+  'LC_ALL',
+  'LC_CTYPE',
+  'LC_MESSAGES',
+  'TZ',
+  'NODE_ENV',
+  'NODE_OPTIONS',
+  'NODE_EXTRA_CA_CERTS',
+  'TMPDIR',
+  'TEMP',
+  'TMP',
+];
+
+/**
+ * Flapping window. If a transport error arrives within this many ms of the
+ * previous successful reconnect, we refuse to reconnect again — the underlying
+ * child is clearly unhealthy and the circuit breaker is a better place to
+ * handle it.
+ */
+const RECONNECT_FLAP_WINDOW_MS = 30_000;
+
+/**
+ * Build the child env by layering:
+ *   allowlist → registry env_passthrough → registry env.
+ * Later entries win. Missing host values are skipped so `process.env[name]`
+ * being undefined does not serialize as the literal string "undefined".
+ *
+ * Exported for testing.
+ */
+export function buildChildEnv(
+  config: RegistryServer,
+  hostEnv: NodeJS.ProcessEnv = process.env,
+): Record<string, string> {
+  const out: Record<string, string> = {};
+
+  for (const name of DEFAULT_ENV_ALLOWLIST) {
+    const v = hostEnv[name];
+    if (typeof v === 'string') out[name] = v;
+  }
+
+  if (config.env_passthrough !== undefined) {
+    for (const name of config.env_passthrough) {
+      const v = hostEnv[name];
+      if (typeof v === 'string') out[name] = v;
+    }
+  }
+
+  // Explicit config.env wins — operator typed these values deliberately.
+  for (const [k, v] of Object.entries(config.env)) {
+    out[k] = v;
+  }
+
+  return out;
+}
+
 export class DownstreamConnection {
   private client: Client | null = null;
+  /**
+   * Whether a reconnect has already been attempted in the CURRENT failure
+   * episode. Resets to `false` after a reconnect succeeds (so a later,
+   * unrelated failure also gets one shot). A flapping guard prevents this
+   * from turning into a reconnect loop.
+   */
   private reconnectAttempted = false;
+  /** Epoch ms of the last successful reconnect. Used by the flapping guard. */
+  private lastReconnectAt = 0;
   private health: Health = 'healthy';
 
   constructor(private readonly config: RegistryServer) {}
@@ -52,7 +141,7 @@ export class DownstreamConnection {
     const transport = new StdioClientTransport({
       command: this.config.command,
       args: this.config.args,
-      env: { ...process.env, ...this.config.env } as Record<string, string>,
+      env: buildChildEnv(this.config),
     });
     const client = new Client(
       { name: `rea-gateway-client:${this.config.name}`, version: '0.2.0' },
@@ -78,7 +167,10 @@ export class DownstreamConnection {
 
   /**
    * Forward a tool call to the child process. On transport failure, attempt
-   * exactly one reconnect, then bubble the error up to the middleware chain.
+   * at most ONE reconnect per failure episode. After a successful reconnect
+   * the episode ends and future unrelated failures will be retried again;
+   * rapid back-to-back failures within the flap window are refused to avoid
+   * a reconnect loop (the circuit breaker takes over in that case).
    */
   async callTool(toolName: string, args: Record<string, unknown>): Promise<unknown> {
     if (this.client === null) {
@@ -88,13 +180,22 @@ export class DownstreamConnection {
       return await this.client!.callTool({ name: toolName, arguments: args });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      if (!this.reconnectAttempted) {
+      const withinFlapWindow =
+        this.lastReconnectAt !== 0 &&
+        Date.now() - this.lastReconnectAt < RECONNECT_FLAP_WINDOW_MS;
+
+      if (!this.reconnectAttempted && !withinFlapWindow) {
         this.reconnectAttempted = true;
         this.health = 'degraded';
         try {
           await this.close();
           await this.connect();
-          return await this.client!.callTool({ name: toolName, arguments: args });
+          const result = await this.client!.callTool({ name: toolName, arguments: args });
+          // Success: episode closed. Reset for the NEXT unrelated failure and
+          // stamp the reconnect time so flap-guard can refuse rapid repeats.
+          this.reconnectAttempted = false;
+          this.lastReconnectAt = Date.now();
+          return result;
         } catch (reconnectErr) {
           this.health = 'unhealthy';
           throw new Error(

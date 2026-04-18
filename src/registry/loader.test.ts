@@ -85,4 +85,65 @@ servers:
   it('throws when file is missing', () => {
     expect(() => loadRegistry(baseDir)).toThrow(/Registry file not found/);
   });
+
+  it('accepts env_passthrough with non-secret names', async () => {
+    const yaml = `version: "1"
+servers:
+  - name: mock
+    command: node
+    env_passthrough:
+      - MY_DEBUG
+      - HTTP_PROXY
+`;
+    await fs.writeFile(path.join(baseDir, '.rea', 'registry.yaml'), yaml, 'utf8');
+    const r = loadRegistry(baseDir);
+    expect(r.servers[0]?.env_passthrough).toEqual(['MY_DEBUG', 'HTTP_PROXY']);
+  });
+
+  it('rejects env_passthrough with secret-looking names (TOKEN)', async () => {
+    const yaml = `version: "1"
+servers:
+  - name: mock
+    command: node
+    env_passthrough:
+      - GITHUB_TOKEN
+`;
+    await fs.writeFile(path.join(baseDir, '.rea', 'registry.yaml'), yaml, 'utf8');
+    expect(() => loadRegistry(baseDir)).toThrow(/Invalid registry schema/);
+  });
+
+  it('rejects env_passthrough with secret-looking names (KEY / SECRET / PASSWORD / CREDENTIAL)', async () => {
+    for (const badName of ['OPENAI_API_KEY', 'CLIENT_SECRET', 'DB_PASSWORD', 'AWS_CREDENTIAL']) {
+      const yaml = `version: "1"
+servers:
+  - name: mock
+    command: node
+    env_passthrough:
+      - ${badName}
+`;
+      await fs.writeFile(path.join(baseDir, '.rea', 'registry.yaml'), yaml, 'utf8');
+      invalidateRegistryCache();
+      expect(() => loadRegistry(baseDir)).toThrow(/Invalid registry schema/);
+    }
+  });
+
+  it('explicit env: mapping can set secret-looking names (escape hatch)', async () => {
+    // The operator typed the value themselves — they have authorized the transfer.
+    const yaml = `version: "1"
+servers:
+  - name: mock
+    command: node
+    env:
+      GITHUB_TOKEN: ghp_operator_typed_this
+`;
+    await fs.writeFile(path.join(baseDir, '.rea', 'registry.yaml'), yaml, 'utf8');
+    const r = loadRegistry(baseDir);
+    expect(r.servers[0]?.env).toEqual({ GITHUB_TOKEN: 'ghp_operator_typed_this' });
+  });
+
+  it('existing registries without env_passthrough continue to load (backwards compatible)', async () => {
+    await fs.writeFile(path.join(baseDir, '.rea', 'registry.yaml'), ONE_SERVER, 'utf8');
+    const r = loadRegistry(baseDir);
+    expect(r.servers[0]?.env_passthrough).toBeUndefined();
+  });
 });

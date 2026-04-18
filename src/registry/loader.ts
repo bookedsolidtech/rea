@@ -14,6 +14,14 @@ import { z } from 'zod';
 import { Tier } from '../policy/types.js';
 import type { Registry, RegistryServer } from './types.js';
 
+/**
+ * Regex used to refuse passthrough of var names that look like secrets.
+ * Explicit `env:` mapping is the escape hatch — if a user types the value into
+ * the registry, the operator has consciously authorized it. Passthrough pulls
+ * from the host environment silently, so we refuse secret-looking names there.
+ */
+const SECRET_NAME_HEURISTIC = /(TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL)/i;
+
 const RegistryServerSchema = z
   .object({
     name: z
@@ -25,6 +33,22 @@ const RegistryServerSchema = z
     command: z.string().min(1),
     args: z.array(z.string()).default([]),
     env: z.record(z.string()).default({}),
+    env_passthrough: z
+      .array(
+        z
+          .string()
+          .regex(
+            /^[A-Za-z_][A-Za-z0-9_]*$/,
+            'env var name must match POSIX identifier syntax',
+          )
+          .refine(
+            (name) => !SECRET_NAME_HEURISTIC.test(name),
+            (name) => ({
+              message: `env_passthrough refuses secret-looking name "${name}" — use an explicit env: mapping instead`,
+            }),
+          ),
+      )
+      .optional(),
     tier_overrides: z.record(z.nativeEnum(Tier)).optional(),
     enabled: z.boolean().default(true),
   })
@@ -63,6 +87,7 @@ function stripUndefined(input: z.infer<typeof RegistrySchema>): Registry {
       env: s.env,
       enabled: s.enabled,
     };
+    if (s.env_passthrough !== undefined) out.env_passthrough = s.env_passthrough;
     if (s.tier_overrides !== undefined) out.tier_overrides = s.tier_overrides;
     return out;
   });

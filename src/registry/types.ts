@@ -15,6 +15,13 @@ export interface RegistryServer {
   args: string[];
   /** Environment variables merged onto the child process env. */
   env: Record<string, string>;
+  /**
+   * Optional opt-in list of operator-env var names to forward into the child.
+   * Names matching the secret-name heuristic (TOKEN/KEY/SECRET/PASSWORD/CREDENTIAL)
+   * are REFUSED at schema-parse time — use explicit `env:` mapping for those so
+   * the operator is making the decision consciously.
+   */
+  env_passthrough?: string[];
   /** Optional per-tool tier pins. Supplied verbatim to the tier middleware. */
   tier_overrides?: Record<string, Tier>;
   /** Set to `false` to keep the entry in the file but skip spawning. */
