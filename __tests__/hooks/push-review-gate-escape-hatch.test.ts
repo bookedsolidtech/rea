@@ -60,14 +60,13 @@ async function makeScratchRepo(opts: {
 
   git('init', '--initial-branch=main', '--quiet');
 
-  // Identity. Setting to empty strings is rejected by git, so we delete the
-  // local value when the caller passes null.
-  if (opts.userEmail !== null) {
-    git('config', 'user.email', opts.userEmail ?? 'test@example.test');
-  }
-  if (opts.userName !== null) {
-    git('config', 'user.name', opts.userName ?? 'REA Test');
-  }
+  // Identity. CI runners have no global user.email/user.name, so we always
+  // set a baseline identity for the initial commits — otherwise `git commit`
+  // aborts with "Author identity unknown". The caller-requested identity
+  // state (including `null` = missing) is applied AFTER the baseline commits
+  // so the hook-under-test reads the intended value via `git config`.
+  git('config', 'user.email', 'test@example.test');
+  git('config', 'user.name', 'REA Test');
   git('config', 'commit.gpgsign', 'false');
 
   // Commit 1: baseline on `main` — this is the merge-base.
@@ -87,6 +86,20 @@ async function makeScratchRepo(opts: {
   git('add', 'hooks/__test__.sh');
   git('commit', '-m', 'touch protected path', '--quiet');
   const headSha = git('rev-parse', 'HEAD');
+
+  // Apply the caller's identity state AFTER both commits. `null` means the
+  // test wants the hook to see a missing identity (fail-closed path);
+  // `undefined` means leave the baseline identity in place.
+  if (opts.userEmail === null) {
+    spawnSync('git', ['config', '--unset', 'user.email'], { cwd: dir });
+  } else if (opts.userEmail !== undefined) {
+    git('config', 'user.email', opts.userEmail);
+  }
+  if (opts.userName === null) {
+    spawnSync('git', ['config', '--unset', 'user.name'], { cwd: dir });
+  } else if (opts.userName !== undefined) {
+    git('config', 'user.name', opts.userName);
+  }
 
   // Stage dist/ so the audit helper is reachable at $REA_ROOT/dist/audit/append.js
   if (opts.linkDist !== false) {
