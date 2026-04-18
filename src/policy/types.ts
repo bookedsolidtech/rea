@@ -61,6 +61,31 @@ export interface RedactPolicy {
   patterns?: UserRedactPattern[];
 }
 
+/**
+ * Audit rotation knobs (G1). Both thresholds are optional; absence of the
+ * block leaves rotation inactive (back-compat with 0.2.x behavior).
+ *
+ * `max_bytes` — when `.rea/audit.jsonl` crosses this size the next append
+ * triggers a rotation (size-based). Typical operator setting: 50 MiB.
+ *
+ * `max_age_days` — when the current `audit.jsonl`'s oldest record is older
+ * than this many days, the next append triggers a rotation (age-based). Both
+ * triggers are evaluated independently; either crossing threshold rotates.
+ *
+ * Rotation renames the current file to `audit-YYYYMMDD-HHMMSS.jsonl` in the
+ * same directory and seeds a fresh `audit.jsonl` with a single rotation
+ * marker record whose `prev_hash` equals the SHA-256 of the last record in
+ * the rotated file — preserving hash-chain continuity across the boundary.
+ */
+export interface AuditRotationPolicy {
+  max_bytes?: number;
+  max_age_days?: number;
+}
+
+export interface AuditPolicy {
+  rotation?: AuditRotationPolicy;
+}
+
 export interface Policy {
   version: string;
   profile: string;
@@ -76,4 +101,5 @@ export interface Policy {
   context_protection?: ContextProtection;
   review?: ReviewPolicy;
   redact?: RedactPolicy;
+  audit?: AuditPolicy;
 }

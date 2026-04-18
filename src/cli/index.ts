@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { Command } from 'commander';
+import { runAuditRotate, runAuditVerify } from './audit.js';
 import { runCheck } from './check.js';
 import { runDoctor } from './doctor.js';
 import { runFreeze, runUnfreeze } from './freeze.js';
@@ -101,6 +102,28 @@ async function main(): Promise<void> {
     .description('Read-only status — autonomy, HALT, profile, recent audit entries.')
     .action(() => {
       runCheck();
+    });
+
+  const audit = program
+    .command('audit')
+    .description('Audit log operations — rotate and verify .rea/audit.jsonl (G1).');
+
+  audit
+    .command('rotate')
+    .description('Force-rotate .rea/audit.jsonl now. Preserves hash-chain via a marker record.')
+    .action(async () => {
+      await runAuditRotate({});
+    });
+
+  audit
+    .command('verify')
+    .description('Re-hash the audit chain; exit 0 on clean, 1 on the first tampered record.')
+    .option(
+      '--since <file>',
+      'verify starting at a rotated file (e.g. audit-YYYYMMDD-HHMMSS.jsonl), walking forward through the chain',
+    )
+    .action(async (opts: { since?: string }) => {
+      await runAuditVerify({ ...(opts.since !== undefined ? { since: opts.since } : {}) });
     });
 
   program

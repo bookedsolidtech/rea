@@ -53,6 +53,26 @@ const RedactPolicySchema = z
   })
   .strict();
 
+/**
+ * G1: audit rotation thresholds. Both knobs optional; a policy that omits the
+ * `audit` block (or the `audit.rotation` sub-block) retains 0.2.x behavior
+ * with no rotation. Defaults are NOT baked into the schema — the rotator
+ * resolves them at consumption time so absence remains distinguishable from
+ * an explicit value.
+ */
+const AuditRotationPolicySchema = z
+  .object({
+    max_bytes: z.number().int().positive().optional(),
+    max_age_days: z.number().int().positive().optional(),
+  })
+  .strict();
+
+const AuditPolicySchema = z
+  .object({
+    rotation: AuditRotationPolicySchema.optional(),
+  })
+  .strict();
+
 const PolicySchema = z
   .object({
     version: z.string(),
@@ -69,6 +89,7 @@ const PolicySchema = z
     context_protection: ContextProtectionSchema.optional(),
     review: ReviewPolicySchema.optional(),
     redact: RedactPolicySchema.optional(),
+    audit: AuditPolicySchema.optional(),
   })
   .strict();
 

@@ -15,26 +15,38 @@
  * - Never throws on stat/missing-file conditions; only throws on write failure
  *   (the caller decides how to react).
  *
- * ## Concurrency
+ * ## Concurrency (G1)
  *
- * The helper serializes writes per-process via a module-scoped queue keyed by
- * the resolved audit-file path. Cross-process concurrency on the same file is
- * NOT handled here — writers in separate processes can interleave and break
- * the chain. The current deployment targets (rea's own governance hooks, the
- * Codex agent, Helix) all funnel through a single process at a time. If that
- * changes, add an exclusive-lock file (`audit.jsonl.lock`) before lifting this
- * restriction. Documented risk; do not silently expand the guarantee.
+ * Writes are serialized two ways:
+ *
+ *   1. Per-process: a module-scoped queue keyed by the canonical path
+ *      preserves linear ordering within a single Node process.
+ *   2. Cross-process: each `doAppend` call is wrapped in a `proper-lockfile`
+ *      lock on `.rea/`. Stale locks are reclaimed after 10s. Two processes
+ *      appending concurrently serialize cleanly; the hash chain stays linear.
+ *
+ * Rotation (`maybeRotate`) runs BEFORE the append lock is taken, so a full
+ * audit file is rotated out of the way transparently. The rotation marker
+ * record preserves hash-chain continuity across the boundary.
  *
  * @see {@link file://./codex-event.ts} for the canonical `codex.review` shape.
+ * @see {@link file://../gateway/audit/rotator.ts} for rotation semantics.
  */
 
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import crypto from 'node:crypto';
 import { Tier, InvocationStatus } from '../policy/types.js';
+import type { Policy } from '../policy/types.js';
 import type { AuditRecord } from '../gateway/middleware/audit-types.js';
+import {
+  GENESIS_HASH,
+  computeHash,
+  fsyncFile,
+  readLastRecord,
+  withAuditLock,
+} from './fs.js';
+import { maybeRotate } from '../gateway/audit/rotator.js';
 
-const GENESIS_HASH = '0'.repeat(64);
 const REA_DIR = '.rea';
 const AUDIT_FILE = 'audit.jsonl';
 
@@ -56,6 +68,13 @@ export interface AppendAuditInput {
   metadata?: Record<string, unknown>;
   /** ISO-8601 timestamp; defaults to `new Date().toISOString()` */
   timestamp?: string;
+  /**
+   * Optional policy for rotation decisions. When absent, rotation is
+   * disabled (back-compat). Callers that want rotation pass the already-
+   * loaded policy; the helper does not re-read `.rea/policy.yaml` on every
+   * append — that would be a surprise cost for consumers.
+   */
+  policy?: Policy;
 }
 
 /** Per-file write queue to preserve linear hash-chain order within a process. */
@@ -98,49 +117,6 @@ async function resolveBaseDir(baseDir: string): Promise<string> {
   }
 }
 
-function computeHash(record: Omit<AuditRecord, 'hash'>): string {
-  return crypto.createHash('sha256').update(JSON.stringify(record)).digest('hex');
-}
-
-async function readLastHash(auditFile: string): Promise<string> {
-  let data: string;
-  try {
-    data = await fs.readFile(auditFile, 'utf8');
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return GENESIS_HASH;
-    throw err;
-  }
-  // Walk the file backwards by newline — the last non-empty line is the tail.
-  const trimmed = data.replace(/\n+$/, '');
-  if (trimmed.length === 0) return GENESIS_HASH;
-  const lastNewline = trimmed.lastIndexOf('\n');
-  const lastLine = lastNewline === -1 ? trimmed : trimmed.slice(lastNewline + 1);
-  try {
-    const parsed = JSON.parse(lastLine) as Partial<AuditRecord>;
-    if (typeof parsed.hash === 'string' && parsed.hash.length === 64) {
-      return parsed.hash;
-    }
-  } catch {
-    // Corrupt tail line — fall through to genesis. The operator will see this
-    // because the chain verify tool (future) will flag the break point. We do
-    // not throw: refusing to append would mask every subsequent event.
-  }
-  return GENESIS_HASH;
-}
-
-async function fsyncFile(filePath: string): Promise<void> {
-  let fh: fs.FileHandle | undefined;
-  try {
-    fh = await fs.open(filePath, 'r');
-    await fh.sync();
-  } catch {
-    // fsync failure is not fatal — durability is best-effort here; the write
-    // itself already succeeded.
-  } finally {
-    if (fh) await fh.close();
-  }
-}
-
 async function doAppend(
   resolvedBase: string,
   input: AppendAuditInput,
@@ -150,34 +126,42 @@ async function doAppend(
 
   await fs.mkdir(reaDir, { recursive: true });
 
-  const prevHash = await readLastHash(auditFile);
-  const now = input.timestamp ?? new Date().toISOString();
+  // Rotate BEFORE acquiring our append lock. maybeRotate takes its own lock
+  // internally and is idempotent; callers that race simply observe a fresh
+  // file with the rotation marker as their chain anchor.
+  await maybeRotate(auditFile, input.policy);
 
-  const recordBase: Omit<AuditRecord, 'hash'> = {
-    timestamp: now,
-    session_id: input.session_id ?? 'external',
-    tool_name: input.tool_name,
-    server_name: input.server_name,
-    tier: input.tier ?? Tier.Read,
-    status: input.status ?? InvocationStatus.Allowed,
-    autonomy_level: input.autonomy_level ?? 'unknown',
-    duration_ms: input.duration_ms ?? 0,
-    prev_hash: prevHash,
-  };
-  if (input.error) recordBase.error = input.error;
-  if (input.redacted_fields?.length) recordBase.redacted_fields = input.redacted_fields;
-  if (input.metadata && Object.keys(input.metadata).length > 0) {
-    recordBase.metadata = input.metadata;
-  }
+  return withAuditLock(auditFile, async () => {
+    const { hash: prevHash } = await readLastRecord(auditFile);
+    const effectivePrev = prevHash || GENESIS_HASH;
+    const now = input.timestamp ?? new Date().toISOString();
 
-  const hash = computeHash(recordBase);
-  const record: AuditRecord = { ...recordBase, hash };
-  const line = JSON.stringify(record) + '\n';
+    const recordBase: Omit<AuditRecord, 'hash'> = {
+      timestamp: now,
+      session_id: input.session_id ?? 'external',
+      tool_name: input.tool_name,
+      server_name: input.server_name,
+      tier: input.tier ?? Tier.Read,
+      status: input.status ?? InvocationStatus.Allowed,
+      autonomy_level: input.autonomy_level ?? 'unknown',
+      duration_ms: input.duration_ms ?? 0,
+      prev_hash: effectivePrev,
+    };
+    if (input.error) recordBase.error = input.error;
+    if (input.redacted_fields?.length) recordBase.redacted_fields = input.redacted_fields;
+    if (input.metadata && Object.keys(input.metadata).length > 0) {
+      recordBase.metadata = input.metadata;
+    }
 
-  await fs.appendFile(auditFile, line);
-  await fsyncFile(auditFile);
+    const hash = computeHash(recordBase);
+    const record: AuditRecord = { ...recordBase, hash };
+    const line = JSON.stringify(record) + '\n';
 
-  return record;
+    await fs.appendFile(auditFile, line);
+    await fsyncFile(auditFile);
+
+    return record;
+  });
 }
 
 /**
