@@ -1,0 +1,17 @@
+# profiles/lit-wc.yaml
+# Lit / web component libraries. Typical dev ergonomics; protects publish paths
+# and the design-system contract files.
+autonomy_level: L1
+max_autonomy_level: L2
+promotion_requires_human_approval: true
+block_ai_attribution: true
+blocked_paths:
+  - .env
+  - .env.*
+  - .rea/policy.yaml
+  - .rea/HALT
+  - CODEOWNERS
+  - .github/workflows/release.yml
+  - .github/workflows/publish.yml
+  - tokens/
+notification_channel: ""
