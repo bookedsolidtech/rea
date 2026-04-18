@@ -54,6 +54,21 @@
  * refuse any symlink that lands in that micro-window. Fully closing the
  * ancestor-swap race would require dirfd-relative APIs (`openat`) which Node's
  * core `fs` module does not expose. Documented; not a code-execution primitive.
+ *
+ * ## Ancestor baseline integrity (finding R3-1)
+ *
+ * `O_NOFOLLOW` only protects the leaf component of the open syscall — an
+ * attacker who swaps an intermediate directory for a symlink pointing outside
+ * the install root between `assertSafeDirectory` and the per-file `copyOne`
+ * call would otherwise get the snapshot to record the attacker's state as
+ * baseline. `verifyAncestorsUnchanged` would then pass (the symlink is
+ * stable) and the write would land wherever the symlink points.
+ *
+ * `snapshotAncestors` closes that primitive by (a) refusing any ancestor that
+ * is itself a symlink (`lstat`), (b) re-asserting containment via `realpath`
+ * at every level, and (c) requiring the walk to terminate at `resolvedRoot`.
+ * Those checks run before any write-side syscall; an escape attempt surfaces
+ * as `UnsafeInstallPathError` with `kind: 'symlink'` or `'escape'`.
  */
 
 import fs from 'node:fs';
@@ -259,31 +274,110 @@ interface WalkContext {
  *
  * We deliberately skip the leaf: the leaf's safety is handled by the
  * `lstat` check in `assertSafeDestination` and by `O_NOFOLLOW` on the open.
+ *
+ * ## Defense against ancestor escape (finding R3-1)
+ *
+ * The snapshot itself must not be allowed to record an attacker-controlled
+ * baseline. Without the checks below, an attacker who swaps an intermediate
+ * directory for a symlink to `/tmp/decoy` between `assertSafeDirectory` and
+ * `copyOne` could get the snapshot to record `.claude/hooks → /tmp/decoy` as
+ * the trusted state — {@link verifyAncestorsUnchanged} would then pass, and
+ * `writeFileExclusiveNoFollow` would land the payload outside the install
+ * root (O_NOFOLLOW only guards the leaf, not ancestor components).
+ *
+ * To close that primitive, for every ancestor we:
+ *
+ *   1. `lstat` the component. If it is a symbolic link, refuse — ancestor
+ *      symlinks inside the install tree are never legitimate for us to walk
+ *      through, regardless of where they point.
+ *   2. `realpath` the component and assert containment within `resolvedRoot`.
+ *      Anything pointing outside is an attempted escape.
+ *   3. Require the walk to terminate at `resolvedRoot`. If the cursor reaches
+ *      the filesystem root without passing through `resolvedRoot`, the
+ *      destination was never under the install root to begin with — that
+ *      means `assertSafeDestination` was bypassed and we refuse loudly.
  */
 async function snapshotAncestors(
   resolvedRoot: string,
   dstPath: string,
 ): Promise<Map<string, string>> {
   const snapshot = new Map<string, string>();
+  const rootWithSep = resolvedRoot.endsWith(path.sep)
+    ? resolvedRoot
+    : resolvedRoot + path.sep;
   const leafDir = path.dirname(path.resolve(dstPath));
   let cursor = leafDir;
+  let reachedRoot = false;
   // Walk up until we pass the root. Every ancestor must resolve to something
   // inside the root (including the root itself).
   // path.parse('/').root === '/', so cursor === path.dirname(cursor) only at FS root.
   while (true) {
+    // (1) Ancestor must not itself be a symbolic link. An attacker-planted
+    // symlink in the middle of the install tree is refused at snapshot time
+    // rather than accepted as baseline.
+    let lstat: fs.Stats;
     try {
-      const real = await fsPromises.realpath(cursor);
-      snapshot.set(cursor, real);
+      lstat = await fsPromises.lstat(cursor);
     } catch (err) {
-      // ENOENT is acceptable here only if `ensureDir` has not yet created the
-      // directory. We only snapshot dirs the caller has already ensured exist,
-      // so any error is a real problem — surface it.
+      // ENOENT is acceptable only if `ensureDir` has not yet created the
+      // directory. We only snapshot dirs the caller has already ensured
+      // exist, so any error is a real problem — surface it.
       throw err as NodeJS.ErrnoException;
     }
-    if (cursor === resolvedRoot) break;
+    if (lstat.isSymbolicLink()) {
+      let linkTarget = '<unreadable>';
+      try {
+        linkTarget = await fsPromises.readlink(cursor);
+      } catch {
+        /* informational only */
+      }
+      throw new UnsafeInstallPathError(
+        'symlink',
+        cursor,
+        linkTarget,
+        `refusing to snapshot: ancestor ${cursor} is a symbolic link → ${linkTarget}. ` +
+          `Remove the symlink manually after auditing where it points.`,
+      );
+    }
+
+    // (2) Resolve and assert containment. Anything that resolves outside
+    // `resolvedRoot` is a confirmed escape primitive.
+    let real: string;
+    try {
+      real = await fsPromises.realpath(cursor);
+    } catch (err) {
+      throw err as NodeJS.ErrnoException;
+    }
+    if (real !== resolvedRoot && !real.startsWith(rootWithSep)) {
+      throw new UnsafeInstallPathError(
+        'escape',
+        real,
+        undefined,
+        `refusing to snapshot: ancestor ${cursor} resolves to ${real}, which is outside install root ${resolvedRoot}`,
+      );
+    }
+    snapshot.set(cursor, real);
+
+    if (cursor === resolvedRoot) {
+      reachedRoot = true;
+      break;
+    }
     const parent = path.dirname(cursor);
     if (parent === cursor) break; // reached filesystem root without hitting resolvedRoot
     cursor = parent;
+  }
+
+  // (3) The walk must terminate at `resolvedRoot`. If we fell off the top of
+  // the filesystem without hitting the install root, the destination was
+  // never actually inside the install tree — `assertSafeDestination` was
+  // bypassed (bug), or the caller supplied a hostile path. Either way, refuse.
+  if (!reachedRoot) {
+    throw new UnsafeInstallPathError(
+      'escape',
+      leafDir,
+      undefined,
+      `refusing to snapshot: ancestor walk from ${leafDir} never reached install root ${resolvedRoot}`,
+    );
   }
   return snapshot;
 }
