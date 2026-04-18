@@ -49,6 +49,11 @@ export interface SafeRegexReplaceResult {
   timedOut: boolean;
 }
 
+export interface SafeRegexMatchAllResult {
+  matches: string[];
+  timedOut: boolean;
+}
+
 export interface SafeRegex {
   readonly pattern: RegExp;
   /**
@@ -64,6 +69,13 @@ export interface SafeRegex {
    * `redact.ts` for the sentinel contract.
    */
   replace(input: string, replacer: string): SafeRegexReplaceResult;
+  /**
+   * Return all full-string matches of the pattern in `input`. The pattern is
+   * compiled inside the worker with the global flag forced on so matchAll is
+   * meaningful regardless of how the original pattern was specified. On
+   * timeout returns `{ matches: [], timedOut: true }` and invokes `onTimeout`.
+   */
+  matchAll(input: string): SafeRegexMatchAllResult;
 }
 
 const DEFAULT_TIMEOUT_MS = 100;
@@ -96,6 +108,15 @@ try {
   } else if (req.op === 'replace') {
     re.lastIndex = 0;
     reply = { ok: true, op: 'replace', output: req.input.replace(re, req.replacer) };
+  } else if (req.op === 'matchAll') {
+    // Force the global flag on so matchAll is meaningful.
+    const flags = req.flags.includes('g') ? req.flags : req.flags + 'g';
+    const gre = new RegExp(req.source, flags);
+    const out = [];
+    for (const m of req.input.matchAll(gre)) {
+      out.push(m[0]);
+    }
+    reply = { ok: true, op: 'matchAll', matches: out };
   } else {
     reply = { ok: false, error: 'unknown op: ' + req.op };
   }
@@ -120,11 +141,20 @@ interface WorkerReplaceReply {
   op: 'replace';
   output: string;
 }
+interface WorkerMatchAllReply {
+  ok: true;
+  op: 'matchAll';
+  matches: string[];
+}
 interface WorkerErrorReply {
   ok: false;
   error: string;
 }
-type WorkerReply = WorkerTestReply | WorkerReplaceReply | WorkerErrorReply;
+type WorkerReply =
+  | WorkerTestReply
+  | WorkerReplaceReply
+  | WorkerMatchAllReply
+  | WorkerErrorReply;
 
 interface WorkerRequestBase {
   source: string;
@@ -138,65 +168,14 @@ interface WorkerReplaceRequest extends WorkerRequestBase {
   op: 'replace';
   replacer: string;
 }
-type WorkerRequest = WorkerTestRequest | WorkerReplaceRequest;
+interface WorkerMatchAllRequest extends WorkerRequestBase {
+  op: 'matchAll';
+}
+type WorkerRequest = WorkerTestRequest | WorkerReplaceRequest | WorkerMatchAllRequest;
 
 interface RunOutcome {
   reply: WorkerReply | null;
   timedOut: boolean;
-}
-
-/**
- * Run a single regex op in a worker, racing against the timeout. Returns either
- * the worker reply or a `timedOut: true` signal. The worker is always
- * terminated before this returns to avoid leaks.
- *
- * SECURITY: `worker.terminate()` is the hard kill — a catastrophic backtracker
- * can't ignore it.
- */
-function runInWorker(req: WorkerRequest, timeoutMs: number): Promise<RunOutcome> {
-  return new Promise((resolve) => {
-    const signalSab = new SharedArrayBuffer(4);
-    const { port1: workerSendPort, port2: parentRecvPort } = new MessageChannel();
-    const worker = new Worker(WORKER_SOURCE, {
-      eval: true,
-      workerData: { signalSab, replyPort: workerSendPort, req },
-      transferList: [workerSendPort],
-    });
-    let settled = false;
-
-    const finish = (outcome: RunOutcome): void => {
-      if (settled) return;
-      settled = true;
-      // Always terminate — even on success — so the worker thread is released.
-      void worker.terminate();
-      parentRecvPort.close();
-      resolve(outcome);
-    };
-
-    const timer = setTimeout(() => {
-      finish({ reply: null, timedOut: true });
-    }, timeoutMs);
-
-    // Don't let the worker or timer hold the process open.
-    worker.unref();
-    if (typeof timer.unref === 'function') timer.unref();
-
-    parentRecvPort.once('message', (reply: WorkerReply) => {
-      clearTimeout(timer);
-      finish({ reply, timedOut: false });
-    });
-
-    worker.once('error', (err: Error) => {
-      clearTimeout(timer);
-      finish({ reply: { ok: false, error: err.message }, timedOut: false });
-    });
-
-    worker.once('exit', (code) => {
-      if (settled) return;
-      clearTimeout(timer);
-      finish({ reply: { ok: false, error: `worker exited: ${code}` }, timedOut: false });
-    });
-  });
 }
 
 /**
@@ -327,35 +306,21 @@ export function wrapRegex(pattern: RegExp, opts?: MatchTimeoutOptions): SafeRege
       // Worker errored — preserve input unchanged (never corrupt payload).
       return { output: input, timedOut: false };
     },
+    matchAll(input: string): SafeRegexMatchAllResult {
+      const { reply, timedOut } = runInWorkerSync(
+        { op: 'matchAll', source, flags, input },
+        timeoutMs,
+      );
+      if (timedOut) {
+        emitTimeout(input);
+        return { matches: [], timedOut: true };
+      }
+      if (reply && reply.ok && reply.op === 'matchAll') {
+        return { matches: reply.matches, timedOut: false };
+      }
+      // Worker errored — return empty match set.
+      return { matches: [], timedOut: false };
+    },
   };
 }
 
-/**
- * Async variant for code paths that can await. Same contract as the sync API
- * but without the `Atomics.wait` bridge. Preferred for new code.
- */
-export async function wrapRegexAsync(
-  pattern: RegExp,
-  input: string,
-  op: 'test' | 'replace',
-  replacer: string,
-  opts?: MatchTimeoutOptions,
-): Promise<WorkerReply | { ok: false; timedOut: true }> {
-  const timeoutMs = opts?.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-  const req: WorkerRequest =
-    op === 'test'
-      ? { op: 'test', source: pattern.source, flags: pattern.flags, input }
-      : { op: 'replace', source: pattern.source, flags: pattern.flags, input, replacer };
-  const { reply, timedOut } = await runInWorker(req, timeoutMs);
-  if (timedOut) {
-    if (opts?.onTimeout) {
-      try {
-        opts.onTimeout(pattern, input);
-      } catch {
-        // see sync path
-      }
-    }
-    return { ok: false, timedOut: true };
-  }
-  return reply ?? { ok: false, error: 'no reply' };
-}
