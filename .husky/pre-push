@@ -7,9 +7,9 @@
 #
 # Minimum viable check — NOT a full replacement for the Claude Code gate:
 #   1. If `.rea/HALT` exists, block.
-#   2. If the push touches a protected path, require a `codex.review` audit
-#      entry for the HEAD SHA (or a `codex.review.skipped` record + explicit
-#      REA_SKIP_CODEX_REVIEW env var).
+#   2. If the push touches a protected path AND policy.review.codex_required
+#      is not explicitly false, require a `codex.review` audit entry for the
+#      HEAD SHA (or REA_SKIP_CODEX_REVIEW env var for a one-off bypass).
 #
 # Escape hatch: REA_SKIP_CODEX_REVIEW=<reason> bypasses the protected-path
 # check. The skip record is appended by `push-review-gate.sh` in the Claude
@@ -47,6 +47,22 @@ INPUT=$(cat)
 PROTECTED_RE='^src/gateway/middleware/|^hooks/|^\.claude/hooks/|^src/policy/|^\.github/workflows/'
 AUDIT_LOG="${REA_ROOT}/.rea/audit.jsonl"
 
+# G11.4 — honor review.codex_required. When explicitly false, skip the
+# protected-path Codex audit requirement entirely (first-class no-Codex
+# mode). Mirrors the logic in `.claude/hooks/push-review-gate.sh`.
+#
+# Fail-closed: if the helper is missing or errors, treat as true. A missing
+# helper means rea is unbuilt — the operator can run `pnpm build` or set
+# REA_SKIP_CODEX_REVIEW for a one-off bypass.
+CODEX_REQUIRED=true
+READ_FIELD_JS="${REA_ROOT}/dist/scripts/read-policy-field.js"
+if [ -f "$READ_FIELD_JS" ]; then
+  field_value=$(REA_ROOT="$REA_ROOT" node "$READ_FIELD_JS" review.codex_required 2>/dev/null || printf '')
+  if [ "$field_value" = "false" ]; then
+    CODEX_REQUIRED=false
+  fi
+fi
+
 block_push=0
 
 # Here-doc feeds the loop without creating a subshell, so `block_push=1`
@@ -74,6 +90,11 @@ while IFS=' ' read -r local_ref local_sha remote_ref remote_sha; do
 
   # Check if the diff touches protected paths.
   if git diff --name-only "$base" "$local_sha" 2>/dev/null | grep -qE "$PROTECTED_RE"; then
+    if [ "$CODEX_REQUIRED" = "false" ]; then
+      # Policy opts out of the Codex gate. The downstream `.claude/hooks/`
+      # path already records telemetry; terminal pushes skip silently.
+      continue
+    fi
     if [ -n "${REA_SKIP_CODEX_REVIEW:-}" ]; then
       printf 'rea: REA_SKIP_CODEX_REVIEW set (%s) — skipping Codex review requirement for %s\n' \
         "$REA_SKIP_CODEX_REVIEW" "$local_sha" >&2
