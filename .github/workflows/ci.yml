@@ -37,6 +37,13 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      # lint:regex inspects compiled dist/ output (authoritative source for
+      # every runtime regex). Build before lint so the static ReDoS check has
+      # something to inspect — otherwise pnpm lint exits 2 with "run pnpm
+      # build first".
+      - name: Build
+        run: pnpm build
+
       - name: Lint
         run: pnpm lint
 
@@ -88,6 +95,14 @@ jobs:
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+
+      # The no-codex push-gate integration tests symlink dist/scripts and
+      # dist/audit into a scratch repo; the gate then invokes the compiled
+      # read-policy-field.js / audit/append.js. Build before test so those
+      # symlink targets exist. (Vitest suites that only hit TS source are
+      # unaffected.)
+      - name: Build
+        run: pnpm build
 
       - name: Test
         run: pnpm test

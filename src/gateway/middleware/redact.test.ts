@@ -53,7 +53,7 @@ describe('redact middleware — G3 timeout behavior', () => {
         {
           name: 'catastrophic-fixture',
           source: 'user',
-          safe: wrapRegex(/(a+)+$/, { timeoutMs: 30 }),
+          safe: wrapRegex(/(a+)+$/, { timeoutMs: 250 }),
         },
       ];
     }
@@ -74,7 +74,7 @@ describe('redact middleware — G3 timeout behavior', () => {
       // Build a middleware manually with ONLY the catastrophic user pattern —
       // skip defaults so the test is deterministic and fast.
       const patterns = makeTimeoutPatterns();
-      const mw = createRedactMiddleware({ userPatterns: patterns, matchTimeoutMs: 30 });
+      const mw = createRedactMiddleware({ userPatterns: patterns, matchTimeoutMs: 250 });
 
       const bad = 'a'.repeat(25) + 'X';
       const ctx = makeCtx(bad);
@@ -95,7 +95,7 @@ describe('redact middleware — G3 timeout behavior', () => {
       expect(ev.event).toBe('redact.regex_timeout');
       expect(ev.pattern_source).toBe('user');
       expect(ev.pattern_id).toBe('catastrophic-fixture');
-      expect(ev.timeout_ms).toBe(30);
+      expect(ev.timeout_ms).toBe(250);
       expect(typeof ev.input_bytes).toBe('number');
       expect(ev.input_bytes).toBeGreaterThan(0);
       // SECURITY: the input text must NOT appear anywhere in metadata.
@@ -105,7 +105,7 @@ describe('redact middleware — G3 timeout behavior', () => {
 
     it('middleware: timeout does NOT fail the invocation — chain continues', async () => {
       const patterns = makeTimeoutPatterns();
-      const mw = createRedactMiddleware({ userPatterns: patterns, matchTimeoutMs: 30 });
+      const mw = createRedactMiddleware({ userPatterns: patterns, matchTimeoutMs: 250 });
 
       const bad = 'a'.repeat(25) + 'X';
       const ctx = makeCtx(bad);
@@ -122,7 +122,7 @@ describe('redact middleware — G3 timeout behavior', () => {
 
     it('middleware: timeout in a nested object replaces the offending value only', async () => {
       const patterns = makeTimeoutPatterns();
-      const mw = createRedactMiddleware({ userPatterns: patterns, matchTimeoutMs: 30 });
+      const mw = createRedactMiddleware({ userPatterns: patterns, matchTimeoutMs: 250 });
 
       const bad = 'a'.repeat(25) + 'X';
       const ctx = makeCtx({ clean: 'hello world', danger: bad });

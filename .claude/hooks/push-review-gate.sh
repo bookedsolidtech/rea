@@ -495,7 +495,11 @@ if [[ -f "$READ_FIELD_JS" ]]; then
   esac
 fi
 
-PROTECTED_RE='(src/gateway/middleware/|hooks/|src/policy/|\.github/workflows/)'
+# [.]github instead of \.github: GNU awk warns on `\.` inside an ERE (it
+# treats the escape as plain `.`), which dirties stderr and makes tests that
+# assert on gate output brittle. `[.]` is the unambiguous ERE form and is
+# silent on every awk we target.
+PROTECTED_RE='(src/gateway/middleware/|hooks/|src/policy/|[.]github/workflows/)'
 
 PROTECTED_HITS=$(cd "$REA_ROOT" && git diff --name-status "${MERGE_BASE}...${SOURCE_SHA}" 2>/dev/null)
 PROTECTED_DIFF_STATUS=$?
