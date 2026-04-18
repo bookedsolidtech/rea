@@ -3,12 +3,13 @@
  *
  * Both the `codex-adversarial` agent (via `@bookedsolid/rea/audit`) and the
  * `push-review-gate.sh` shell hook depend on these constants. If either drifts,
- * the push gate will silently stop detecting Codex reviews. Keep them in lockstep
- * or add a structured parser to the shell gate.
+ * the push gate will silently stop detecting Codex reviews. Keep them in lockstep.
  *
- * The shell gate relies on substring matches against the serialized JSON line —
- * do not reorder fields or change spellings without updating the grep patterns
- * in `hooks/push-review-gate.sh`.
+ * The shell gate parses audit lines with `jq` and matches on the top-level
+ * `tool_name` plus `metadata.{head_sha, verdict}` — substring greps against the
+ * raw JSON were retired because they were forgeable via arbitrary `metadata`
+ * payloads. If you rename any of those fields, update both this file and the
+ * `jq -e` predicate in `hooks/push-review-gate.sh`.
  */
 export const CODEX_REVIEW_TOOL_NAME = 'codex.review';
 export const CODEX_REVIEW_SERVER_NAME = 'codex';
