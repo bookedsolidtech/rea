@@ -1,0 +1,33 @@
+# profiles/open-source-no-codex.yaml
+#
+# open-source variant with Codex adversarial review disabled.
+#
+# Same governance settings as `open-source.yaml` — L1 autonomy with an L2
+# ceiling, the same blocked-paths list (sensitive release and disclosure
+# files flagged for human-only edits). The only difference: the installed
+# `.rea/policy.yaml` will carry `review.codex_required: false`.
+#
+# Pick this variant when:
+#   - Your public OSS project does not have a Codex account or does not
+#     want to require one from every contributor.
+#   - Contributors are expected to run a locally-hosted adversarial review
+#     instead (Claude self-review is the shipped fallback).
+#
+# To re-enable Codex later, edit `.rea/policy.yaml` and set
+# `review.codex_required: true` (or remove the field entirely — true is
+# the documented default).
+autonomy_level: L1
+max_autonomy_level: L2
+promotion_requires_human_approval: true
+block_ai_attribution: true
+blocked_paths:
+  - .env
+  - .env.*
+  - .rea/policy.yaml
+  - .rea/HALT
+  - CODEOWNERS
+  - LICENSE
+  - SECURITY.md
+  - .github/workflows/release.yml
+  - .github/workflows/publish.yml
+notification_channel: ""

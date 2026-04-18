@@ -1,0 +1,40 @@
+# profiles/bst-internal-no-codex.yaml
+#
+# bst-internal variant with Codex adversarial review disabled.
+#
+# Same governance settings as `bst-internal.yaml` — L1 autonomy with an L2
+# ceiling, the same blocked-paths list, the same context-protection rules.
+# The only difference: the installed `.rea/policy.yaml` will carry
+# `review.codex_required: false`, and `rea init` surfaces that choice as
+# the wizard default.
+#
+# Pick this variant when:
+#   - The team does not have an OpenAI account / Codex CLI on the bench.
+#   - A BST internal project is scoped such that Claude self-review is
+#     considered sufficient.
+#   - Codex is temporarily unavailable (rate limits, outage) and you want
+#     a durable opt-out rather than relying on REA_SKIP_CODEX_REVIEW.
+#
+# To re-enable Codex later, edit `.rea/policy.yaml` and set
+# `review.codex_required: true` (or remove the field entirely — true is
+# the documented default).
+autonomy_level: L1
+max_autonomy_level: L2
+promotion_requires_human_approval: true
+block_ai_attribution: true
+blocked_paths:
+  - .env
+  - .env.*
+  - .rea/policy.yaml
+  - .rea/HALT
+  - CODEOWNERS
+  - .github/workflows/release.yml
+  - SECURITY.md
+  - THREAT_MODEL.md
+notification_channel: ""
+context_protection:
+  delegate_to_subagent:
+    - pnpm run build
+    - pnpm run test
+    - pnpm run lint
+  max_bash_output_lines: 100
