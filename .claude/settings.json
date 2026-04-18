@@ -1,0 +1,93 @@
+{
+  "env": {
+    "ENABLE_TOOL_SEARCH": "auto:5",
+    "REA_DISCLOSURE_MODE": "advisory"
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/hooks/dangerous-bash-interceptor.sh",
+            "timeout": 10000,
+            "statusMessage": "Checking command safety..."
+          },
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/hooks/env-file-protection.sh",
+            "timeout": 5000,
+            "statusMessage": "Checking for .env file reads..."
+          },
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/hooks/dependency-audit-gate.sh",
+            "timeout": 15000,
+            "statusMessage": "Verifying package exists..."
+          },
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/hooks/security-disclosure-gate.sh",
+            "timeout": 5000,
+            "statusMessage": "Checking disclosure policy..."
+          },
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/hooks/pr-issue-link-gate.sh",
+            "timeout": 5000,
+            "statusMessage": "Checking PR for issue reference..."
+          },
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/hooks/attribution-advisory.sh",
+            "timeout": 5000,
+            "statusMessage": "Checking for AI attribution..."
+          }
+        ]
+      },
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/hooks/secret-scanner.sh",
+            "timeout": 15000,
+            "statusMessage": "Scanning for credentials..."
+          },
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/hooks/settings-protection.sh",
+            "timeout": 5000,
+            "statusMessage": "Checking settings protection..."
+          },
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/hooks/blocked-paths-enforcer.sh",
+            "timeout": 5000,
+            "statusMessage": "Checking blocked paths..."
+          },
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/hooks/changeset-security-gate.sh",
+            "timeout": 5000,
+            "statusMessage": "Checking changeset for security leaks..."
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/hooks/architecture-review-gate.sh",
+            "timeout": 10000,
+            "statusMessage": "Checking architecture impact..."
+          }
+        ]
+      }
+    ]
+  }
+}
