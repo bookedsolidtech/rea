@@ -68,10 +68,13 @@ jobs:
           commit: "chore: release"
           title: "chore: release"
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Intentionally NO NPM_TOKEN / NODE_AUTH_TOKEN. The changesets
-          # action invokes `npm publish --provenance`, which uses the
-          # workflow's OIDC identity (id-token: write) to mint a
-          # short-lived npm token at publish time. See:
-          # https://docs.npmjs.com/generating-provenance-statements
+          # CHANGESET_TOKEN is an org PAT that can open PRs that bypass
+          # branch protection (the default GITHUB_TOKEN cannot).
+          GITHUB_TOKEN: ${{ secrets.CHANGESET_TOKEN }}
+          # NPM_TOKEN is an automation-scoped token for the @bookedsolid
+          # org. Trusted-publisher OIDC for brand-new packages requires
+          # pre-registration on npm; until that's in place we publish
+          # with a classic token. Provenance is still attached via
+          # id-token: write + NPM_CONFIG_PROVENANCE.
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           NPM_CONFIG_PROVENANCE: "true"
