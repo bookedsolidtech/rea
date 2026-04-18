@@ -25,3 +25,5 @@ context_protection:
     - pnpm run test
     - pnpm run lint
   max_bash_output_lines: 100
+review:
+  codex_required: false
