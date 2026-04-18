@@ -73,6 +73,19 @@ export function createAuditMiddleware(baseDir: string, policy?: Policy): Middlew
         if (ctx.redacted_fields?.length) {
           recordBase.redacted_fields = ctx.redacted_fields;
         }
+        // Attach caller-supplied metadata when the middleware context carries any.
+        // The `autonomy_level` key is reserved for internal bookkeeping (see above)
+        // and is excluded from the exported metadata payload.
+        if (ctx.metadata !== undefined) {
+          const exported: Record<string, unknown> = {};
+          for (const [k, v] of Object.entries(ctx.metadata)) {
+            if (k === 'autonomy_level') continue;
+            exported[k] = v;
+          }
+          if (Object.keys(exported).length > 0) {
+            recordBase.metadata = exported;
+          }
+        }
 
         const hash = computeHash(recordBase);
         const record: AuditRecord = { ...recordBase, hash };
