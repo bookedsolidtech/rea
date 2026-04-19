@@ -6,6 +6,10 @@ import {
   CodexProbe,
   type CodexProbeState,
 } from '../gateway/observability/codex-probe.js';
+import {
+  inspectPrePushState,
+  type PrePushDoctorState,
+} from './install/pre-push.js';
 import { summarizeTelemetry } from '../gateway/observability/codex-telemetry.js';
 import {
   CLAUDE_MD_MANIFEST_PATH,
@@ -225,6 +229,53 @@ function checkCommitMsgHook(baseDir: string): CheckResult {
   }
 }
 
+/**
+ * G6 — Verify at least one pre-push hook is installed and executable.
+ *
+ * Three install shapes are acceptable:
+ *   1. `.git/hooks/pre-push` — vanilla git (no hooksPath).
+ *   2. `${core.hooksPath}/pre-push` — husky 9 or custom hooksPath.
+ *   3. `.husky/pre-push` is present on disk but only counts if husky has
+ *      configured `core.hooksPath=.husky`. A `.husky/pre-push` with an
+ *      unconfigured hooksPath is dead weight; we do NOT treat it as
+ *      sufficient.
+ *
+ * "Executable" is defined by any user/group/other exec bit, matching
+ * `checkHooksInstalled`. Status is `fail` when nothing is active — the
+ * protected-path Codex audit requirement depends on this hook.
+ */
+function checkPrePushHook(state: PrePushDoctorState): CheckResult {
+  if (state.ok) {
+    const active = state.candidates.find((c) => c.exists && c.executable);
+    const detail = active !== undefined
+      ? `${active.reaManaged ? 'rea-managed' : 'external'} at ${active.path}`
+      : undefined;
+    return detail !== undefined
+      ? { label: 'pre-push hook installed', status: 'pass', detail }
+      : { label: 'pre-push hook installed', status: 'pass' };
+  }
+  const present = state.candidates
+    .filter((c) => c.exists)
+    .map((c) => `${c.path}${c.executable ? '' : ' (not executable)'}`);
+  if (present.length > 0) {
+    return {
+      label: 'pre-push hook installed',
+      status: 'fail',
+      detail:
+        `no active pre-push hook. Files on disk: ${present.join(', ')}. ` +
+        'Run `rea init` to install the fallback, or configure `core.hooksPath=.husky` ' +
+        'if you are using husky.',
+    };
+  }
+  return {
+    label: 'pre-push hook installed',
+    status: 'fail',
+    detail:
+      'no pre-push hook found in `.git/hooks/`, configured `core.hooksPath`, or `.husky/`. ' +
+      'Run `rea init` to install the fallback.',
+  };
+}
+
 function checkCodexAgent(baseDir: string): CheckResult {
   const agentPath = path.join(baseDir, '.claude', 'agents', 'codex-adversarial.md');
   if (fs.existsSync(agentPath)) return { label: 'codex-adversarial agent installed', status: 'pass' };
@@ -303,13 +354,17 @@ function codexRequiredFromPolicy(baseDir: string): boolean {
  * `runDoctor`.
  *
  * `codexProbeState` is consulted ONLY when Codex is required by policy.
- * Callers that already have a fresh probe state (e.g. `runDoctor`) should
- * pass it; callers that don't (e.g. unit tests of the existing doctor
- * surface) can omit it and the probe-derived fields are skipped.
+ * `prePushState` is the pre-computed G6 pre-push inspection; when omitted
+ * the pre-push check is skipped entirely (older call sites that don't yet
+ * thread the state through keep working without behavioural change).
+ * Callers that already have fresh state (e.g. `runDoctor`) should pass
+ * both; callers that don't (e.g. unit tests of the existing doctor
+ * surface) can omit them and those checks are skipped.
  */
 export function collectChecks(
   baseDir: string,
   codexProbeState?: CodexProbeState,
+  prePushState?: PrePushDoctorState,
 ): CheckResult[] {
   const policyPath = reaPath(baseDir, POLICY_FILE);
   const registryPath = reaPath(baseDir, REGISTRY_FILE);
@@ -324,6 +379,9 @@ export function collectChecks(
     checkSettingsJson(baseDir),
     checkCommitMsgHook(baseDir),
   ];
+  if (prePushState !== undefined) {
+    checks.push(checkPrePushHook(prePushState));
+  }
 
   if (codexRequiredFromPolicy(baseDir)) {
     checks.push(checkCodexAgent(baseDir), checkCodexCommand(baseDir));
@@ -565,7 +623,16 @@ export async function runDoctor(opts: RunDoctorOptions = {}): Promise<void> {
     }
   }
 
-  const checks = collectChecks(baseDir, probeState);
+  // G6 — inspect pre-push state. Never throws; unreadable files downgrade
+  // individual candidates but never break the whole check.
+  let prePushState: PrePushDoctorState | undefined;
+  try {
+    prePushState = await inspectPrePushState(baseDir);
+  } catch {
+    prePushState = undefined;
+  }
+
+  const checks = collectChecks(baseDir, probeState, prePushState);
 
   console.log('');
   log(`Doctor — ${baseDir}`);

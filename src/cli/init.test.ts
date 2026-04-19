@@ -12,11 +12,16 @@
  * with the new flag semantics.
  */
 
+import { execFile } from 'node:child_process';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { promisify } from 'node:util';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { runInit } from './init.js';
+import { FALLBACK_MARKER } from './install/pre-push.js';
+
+const execFileAsync = promisify(execFile);
 
 async function makeScratch(): Promise<string> {
   return fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-init-test-')));
@@ -122,6 +127,47 @@ describe('rea init — G11.4 codex flags', () => {
 
     const policy = await readPolicy(dir);
     expect(policy).toMatch(/codex_required:\s+false/);
+  });
+
+  it('G6: installs fallback pre-push in a vanilla git repo', async () => {
+    const dir = await makeScratch();
+    cleanup.push(dir);
+    await execFileAsync('git', ['-C', dir, 'init', '--quiet']);
+    await execFileAsync('git', ['-C', dir, 'config', 'user.email', 't@example.com']);
+    await execFileAsync('git', ['-C', dir, 'config', 'user.name', 't']);
+    process.chdir(dir);
+
+    await runInit({ yes: true, profile: 'minimal', codex: false });
+
+    const prePushPath = path.join(dir, '.git', 'hooks', 'pre-push');
+    const content = await fs.readFile(prePushPath, 'utf8');
+    expect(content).toContain(FALLBACK_MARKER);
+    expect(content).toContain('.claude/hooks/push-review-gate.sh');
+
+    const stat = await fs.stat(prePushPath);
+    expect(stat.mode & 0o111).toBeGreaterThan(0);
+  });
+
+  it('G6: re-running init does not duplicate or corrupt the fallback', async () => {
+    const dir = await makeScratch();
+    cleanup.push(dir);
+    await execFileAsync('git', ['-C', dir, 'init', '--quiet']);
+    await execFileAsync('git', ['-C', dir, 'config', 'user.email', 't@example.com']);
+    await execFileAsync('git', ['-C', dir, 'config', 'user.name', 't']);
+    process.chdir(dir);
+
+    await runInit({ yes: true, profile: 'minimal', codex: false });
+    // Second invocation: --force so the policy overwrite path is taken.
+    await runInit({ yes: true, profile: 'minimal', codex: false, force: true });
+
+    // Still exactly one pre-push, still carries our marker, still executable.
+    const hooksDir = path.join(dir, '.git', 'hooks');
+    const entries = await fs.readdir(hooksDir);
+    const prePushEntries = entries.filter((e) => e === 'pre-push');
+    expect(prePushEntries).toEqual(['pre-push']);
+
+    const content = await fs.readFile(path.join(hooksDir, 'pre-push'), 'utf8');
+    expect(content).toContain(FALLBACK_MARKER);
   });
 
   it('written policy parses via the loader round-trip', async () => {

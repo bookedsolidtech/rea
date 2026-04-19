@@ -13,6 +13,8 @@ import {
   writeSettingsAtomic,
 } from './install/settings-merge.js';
 import { installCommitMsgHook } from './install/commit-msg.js';
+import { installPrePushFallback } from './install/pre-push.js';
+import { CodexProbe } from '../gateway/observability/codex-probe.js';
 import { buildFragment, writeClaudeMdFragment } from './install/claude-md.js';
 import {
   CLAUDE_MD_MANIFEST_PATH,
@@ -283,6 +285,55 @@ async function runWizard(
   };
 }
 
+/**
+ * G6 — Codex install-assist probe.
+ *
+ * Runs a single {@link CodexProbe} attempt and prints a guidance block when
+ * the CLI is NOT responsive. Behavior:
+ *
+ *   - `cli_responsive === true`  → print a single-line "Codex CLI detected"
+ *     acknowledgement (informational, not verbose).
+ *   - `cli_responsive === false` → print a 4-line install guidance block
+ *     naming the Claude Code helper that installs Codex.
+ *
+ * Failure of the probe itself is never fatal — a hung CLI must not stall
+ * `rea init`. The probe class already caps each subcommand at 2s/5s. Any
+ * throw bubbling out here is caught and treated as "not responsive".
+ *
+ * We deliberately reference the user-visible helper path (`/codex:setup`)
+ * rather than shelling out to install Codex ourselves. `rea init` does not
+ * auto-install third-party tooling; the operator signs off.
+ */
+async function printCodexInstallAssist(): Promise<void> {
+  let responsive = false;
+  let versionLine: string | undefined;
+  try {
+    const state = await new CodexProbe().probe();
+    responsive = state.cli_responsive;
+    versionLine = state.version;
+  } catch {
+    // probe() is documented as never-throws, but belt-and-suspenders.
+    responsive = false;
+  }
+
+  console.log('');
+  if (responsive) {
+    const suffix = versionLine !== undefined ? ` (${versionLine})` : '';
+    console.log(`Codex CLI detected${suffix}.`);
+    return;
+  }
+  console.log('Codex CLI not detected on PATH.');
+  console.log(
+    '  Adversarial review via `/codex-review` requires the Codex plugin.',
+  );
+  console.log(
+    '  Install via the Claude Code Codex plugin helper: `/codex:setup`,',
+  );
+  console.log(
+    '  or set `review.codex_required: false` in .rea/policy.yaml to opt out.',
+  );
+}
+
 function writePolicyYaml(targetDir: string, config: ResolvedConfig, layered: Profile): string {
   const policyPath = path.join(targetDir, REA_DIR, POLICY_FILE);
   const installedBy = process.env.USER ?? os.userInfo().username ?? 'unknown';
@@ -502,6 +553,7 @@ export async function runInit(options: InitOptions): Promise<void> {
   await writeSettingsAtomic(settingsPath, mergeResult.merged);
 
   const commitMsgResult = await installCommitMsgHook(targetDir);
+  const prePushResult = await installPrePushFallback(targetDir);
 
   const fragmentInput = {
     policyPath: `.${path.sep}rea${path.sep}policy.yaml`.replace(/\\/g, '/'),
@@ -534,6 +586,20 @@ export async function runInit(options: InitOptions): Promise<void> {
   if (commitMsgResult.gitHook) console.log(`  + ${path.relative(targetDir, commitMsgResult.gitHook)}`);
   if (commitMsgResult.huskyHook)
     console.log(`  + ${path.relative(targetDir, commitMsgResult.huskyHook)}`);
+  if (prePushResult.written !== undefined) {
+    const verb =
+      prePushResult.decision.action === 'refresh' ? '~' : '+';
+    console.log(
+      `  ${verb} ${path.relative(targetDir, prePushResult.written)} (pre-push fallback)`,
+    );
+  } else if (
+    prePushResult.decision.action === 'skip' &&
+    prePushResult.decision.reason === 'active-pre-push-present'
+  ) {
+    console.log(
+      `  = ${path.relative(targetDir, prePushResult.decision.hookPath)} (active pre-push already present — skipped fallback)`,
+    );
+  }
   console.log(
     `  ${mdResult.replaced ? '~' : '+'} ${path.relative(targetDir, mdResult.path)} (fragment ${mdResult.replaced ? 'replaced' : 'written'})`,
   );
@@ -544,19 +610,25 @@ export async function runInit(options: InitOptions): Promise<void> {
     for (const w of mergeResult.warnings) warn(w);
   }
   for (const w of commitMsgResult.warnings) warn(w);
+  for (const w of prePushResult.warnings) warn(w);
   for (const n of config.reagentNotices) warn(n);
 
-  // G11.4: when Codex review is disabled, print a durable notice. Mentions
-  // the exact edit path so the operator can flip back later without having
-  // to re-run init. (Coupling note: a future G6-style "Codex install
-  // assist" prompt belongs here too, and should short-circuit when
-  // codex_required is false — do not invoke install-assist in no-codex
-  // mode.)
-  if (!config.codexRequired) {
+  // G6 + G11.4: Codex install-assist.
+  //
+  // Split by codex_required:
+  //   - codex_required=true  → probe the CLI; if it is not responsive, print
+  //                            a clear "install Codex" guidance block so the
+  //                            operator knows why /codex-review will fail.
+  //   - codex_required=false → skip the probe entirely and print the
+  //                            existing "Codex review disabled" notice.
+  //                            Probing here is pointless (wasted 2s) and
+  //                            actively confusing — no-codex mode is a
+  //                            supported first-class configuration.
+  if (config.codexRequired) {
+    await printCodexInstallAssist();
+  } else {
     console.log('');
-    console.log(
-      'Codex review disabled. ClaudeSelfReviewer will be used.',
-    );
+    console.log('Codex review disabled. ClaudeSelfReviewer will be used.');
     console.log(
       '  Set review.codex_required: true in .rea/policy.yaml to re-enable.',
     );
