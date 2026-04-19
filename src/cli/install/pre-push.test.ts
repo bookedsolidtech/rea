@@ -635,6 +635,35 @@ describe('installPrePushFallback — concurrency + temp-file hygiene', () => {
     expect(stat.isDirectory()).toBe(true);
   });
 
+  it('race: file appears between re-check and write (EEXIST from link) → clean skip', async () => {
+    // Codex finding 2 — final window: after the safety re-check passes,
+    // but before writeExecutable completes, another process creates the
+    // destination. With rename() that file would be silently overwritten.
+    // With link() we get EEXIST; the installer must return a clean skip.
+    await initGitRepo(dir);
+    const hooksDir = path.join(dir, '.git', 'hooks');
+    await fs.mkdir(hooksDir, { recursive: true });
+
+    const racedBody = '#!/bin/sh\n# raced consumer hook\nexit 0\n';
+    const result = await installPrePushFallback(dir, {
+      onBeforeWrite: async (hookPath) => {
+        // Re-check passed (path was absent). Simulate another process
+        // dropping a file here before our link() call.
+        await fs.writeFile(hookPath, racedBody, { mode: 0o755 });
+      },
+    });
+
+    expect(result.written).toBeUndefined();
+    expect(result.decision.action).toBe('skip');
+    if (result.decision.action === 'skip') {
+      expect(result.decision.reason).toBe('foreign-pre-push');
+    }
+    expect(result.warnings.some((w) => w.includes('appeared at') && w.includes('after the safety check'))).toBe(true);
+    // The raced file is untouched.
+    const after = await fs.readFile(path.join(hooksDir, 'pre-push'), 'utf8');
+    expect(after).toBe(racedBody);
+  });
+
   it('linked git worktree: install succeeds (lock resolves via git common-dir, not the .git file)', async () => {
     // Post-merge Codex P1 on the patch itself: a previous iteration locked
     // against `<targetDir>/.git` unconditionally. In a linked worktree
@@ -916,15 +945,36 @@ describe('looksLikeGateInvocation — .sh suffix boundary (Finding 1)', () => {
 // The fix: add `HUSKY_GATE_MARKER` + `isReaManagedHuskyGate`, check it first.
 // ---------------------------------------------------------------------------
 describe('isReaManagedHuskyGate — Husky gate marker detection (Finding 2)', () => {
-  it('marker at line 2 (after shebang): returns true', () => {
-    // Canonical structure: shebang on line 1, marker on line 2.
-    expect(isReaManagedHuskyGate(`#!/bin/sh\n${HUSKY_GATE_MARKER}\n# comment\n`)).toBe(true);
+  it('marker at line 2 + gate invocation (canonical): returns true', () => {
+    // Canonical structure: shebang on line 1, marker on line 2, gate exec in body.
+    expect(
+      isReaManagedHuskyGate(
+        `#!/bin/sh\n${HUSKY_GATE_MARKER}\nexec .claude/hooks/push-review-gate.sh "$@"\n`,
+      ),
+    ).toBe(true);
   });
 
-  it('marker at line 2 with additional body content: returns true', () => {
+  it('marker at line 2 + gate invocation with set -eu: returns true', () => {
     expect(
-      isReaManagedHuskyGate(`#!/bin/sh\n${HUSKY_GATE_MARKER}\nset -eu\nsome-command\n`),
+      isReaManagedHuskyGate(
+        `#!/bin/sh\n${HUSKY_GATE_MARKER}\nset -eu\nexec .claude/hooks/push-review-gate.sh "$@"\n`,
+      ),
     ).toBe(true);
+  });
+
+  it('marker at line 2 but no gate invocation (spoofed): returns false', () => {
+    // Security fix: marker alone is insufficient — body must actually invoke the gate.
+    // Closes: `#!/bin/sh\n# rea:husky-pre-push-gate v1\nexit 0` bypass.
+    expect(isReaManagedHuskyGate(`#!/bin/sh\n${HUSKY_GATE_MARKER}\nexit 0\n`)).toBe(false);
+  });
+
+  it('marker at line 2 + comment-only gate reference (not an invocation): returns false', () => {
+    // A hook that mentions the gate path in a comment does not invoke it.
+    expect(
+      isReaManagedHuskyGate(
+        `#!/bin/sh\n${HUSKY_GATE_MARKER}\n# exec .claude/hooks/push-review-gate.sh "$@"\nexit 0\n`,
+      ),
+    ).toBe(false);
   });
 
   it('content without any marker returns false', () => {
@@ -981,7 +1031,7 @@ describe('classifyExistingHook — Husky gate marker integration (Finding 2)', (
     await fs.mkdir(huskyDir, { recursive: true });
     await fs.writeFile(
       path.join(huskyDir, 'pre-push'),
-      `#!/bin/sh\n${HUSKY_GATE_MARKER}\n# rea governance gate\nset -eu\n`,
+      `#!/bin/sh\n${HUSKY_GATE_MARKER}\nexec .claude/hooks/push-review-gate.sh "$@"\n`,
       { mode: 0o755 },
     );
     await execFileAsync('git', ['-C', dir, 'config', 'core.hooksPath', huskyDir]);
@@ -998,7 +1048,7 @@ describe('classifyExistingHook — Husky gate marker integration (Finding 2)', (
     await initGitRepo(dir);
     const huskyDir = path.join(dir, '.husky');
     await fs.mkdir(huskyDir, { recursive: true });
-    const originalContent = `#!/bin/sh\n${HUSKY_GATE_MARKER}\n# rea governance gate\nset -eu\n`;
+    const originalContent = `#!/bin/sh\n${HUSKY_GATE_MARKER}\nexec .claude/hooks/push-review-gate.sh "$@"\n`;
     await fs.writeFile(path.join(huskyDir, 'pre-push'), originalContent, { mode: 0o755 });
     await execFileAsync('git', ['-C', dir, 'config', 'core.hooksPath', huskyDir]);
 
@@ -1090,13 +1140,13 @@ describe('inspectPrePushState — Husky gate recognized as rea-managed (Finding 
 
   it('hooksPath=.husky + Husky gate marker at line 2: ok=true, reaManaged=true', async () => {
     // Core regression. Without the fix, activeForeign would be true and
-    // `rea doctor --strict` would hard-fail on a correctly governed repo.
+    // `rea doctor` would hard-fail on a correctly governed repo.
     await initGitRepo(dir);
     const huskyDir = path.join(dir, '.husky');
     await fs.mkdir(huskyDir, { recursive: true });
     await fs.writeFile(
       path.join(huskyDir, 'pre-push'),
-      `#!/bin/sh\n${HUSKY_GATE_MARKER}\n# rea governance gate\nset -eu\n`,
+      `#!/bin/sh\n${HUSKY_GATE_MARKER}\nexec .claude/hooks/push-review-gate.sh "$@"\n`,
       { mode: 0o755 },
     );
     await execFileAsync('git', ['-C', dir, 'config', 'core.hooksPath', huskyDir]);

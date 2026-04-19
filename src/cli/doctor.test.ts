@@ -391,8 +391,7 @@ describe('rea doctor — collectChecks (G11.4 codex_required)', () => {
         },
       ],
     };
-    // strict=true → fail.
-    const checks = collectChecks(repo.dir, undefined, state, true);
+    const checks = collectChecks(repo.dir, undefined, state);
     const check = findCheck(checks, 'pre-push hook installed');
     expect(check?.status).toBe('fail');
     expect(check?.detail).toMatch(/silently bypassed/);

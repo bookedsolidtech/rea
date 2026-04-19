@@ -256,7 +256,7 @@ function checkCommitMsgHook(baseDir: string): CheckResult {
  * "Executable" is defined by any user/group/other exec bit, matching
  * `checkHooksInstalled`.
  */
-function checkPrePushHook(state: PrePushDoctorState, _strict: boolean): CheckResult {
+function checkPrePushHook(state: PrePushDoctorState): CheckResult {
   if (state.ok) {
     const active = state.candidates.find((c) => c.path === state.activePath);
     const kind =
@@ -399,13 +399,12 @@ function codexRequiredFromPolicy(baseDir: string): boolean {
  * both; callers that don't (e.g. unit tests of the existing doctor
  * surface) can omit them and those checks are skipped.
  *
- * `strict` — reserved; `activeForeign` is always `fail` regardless of this flag.
+ * `activeForeign` always yields `fail` — a foreign hook bypassing the gate is a hard governance gap.
  */
 export function collectChecks(
   baseDir: string,
   codexProbeState?: CodexProbeState,
   prePushState?: PrePushDoctorState,
-  strict?: boolean,
 ): CheckResult[] {
   const policyPath = reaPath(baseDir, POLICY_FILE);
   const registryPath = reaPath(baseDir, REGISTRY_FILE);
@@ -421,7 +420,7 @@ export function collectChecks(
     checkCommitMsgHook(baseDir),
   ];
   if (prePushState !== undefined) {
-    checks.push(checkPrePushHook(prePushState, strict === true));
+    checks.push(checkPrePushHook(prePushState));
   }
 
   if (codexRequiredFromPolicy(baseDir)) {
@@ -455,17 +454,6 @@ export interface RunDoctorOptions {
    * `rea upgrade` to reconcile).
    */
   drift?: boolean;
-  /**
-   * G6 strict mode — when true, an executable pre-push hook that exists at
-   * the active git hooks path but does NOT invoke the shared review gate is
-   * classified as `fail` rather than `warn`. This is the governance-absent
-   * state the gate is designed to catch; CI should always pass `--strict`
-   * so `rea doctor --strict` exits 1 in that state.
-   *
-   * Default (`false`) keeps the interactive behaviour: `warn` surfaces the
-   * gap without blocking the user's local workflow.
-   */
-  strict?: boolean;
 }
 
 export interface DriftRow {
@@ -684,7 +672,7 @@ export async function runDoctor(opts: RunDoctorOptions = {}): Promise<void> {
     prePushState = undefined;
   }
 
-  const checks = collectChecks(baseDir, probeState, prePushState, opts.strict);
+  const checks = collectChecks(baseDir, probeState, prePushState);
 
   console.log('');
   log(`Doctor — ${baseDir}`);

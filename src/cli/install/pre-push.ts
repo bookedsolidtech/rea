@@ -149,11 +149,16 @@ export function isReaManagedFallback(content: string): boolean {
  * as a governance-carrying hook rather than `foreign/no-marker`.
  */
 export function isReaManagedHuskyGate(content: string): boolean {
-  // Require the marker on the SECOND LINE (after shebang) to prevent spoofing
-  // via a comment deeper in the file. The canonical .husky/pre-push structure
-  // places it at line 2.
+  // Require the marker on the SECOND LINE (after shebang) AND a real gate
+  // invocation in the body. The marker alone is insufficient: a spoofed hook
+  // `#!/bin/sh\n# rea:husky-pre-push-gate v1\nexit 0` satisfies the positional
+  // check but bypasses governance. Both conditions must be true.
   const lines = content.split(/\r?\n/);
-  return lines.length >= 2 && lines[1] === HUSKY_GATE_MARKER;
+  return (
+    lines.length >= 2 &&
+    lines[1] === HUSKY_GATE_MARKER &&
+    referencesReviewGate(content)
+  );
 }
 
 /**
@@ -630,11 +635,20 @@ async function cleanupStaleTempFiles(dst: string): Promise<void> {
 }
 
 /**
- * Atomically write `content` to `dst` with executable bits set. Uses
- * `O_EXCL` on the temp file so a race against another installer (or a
- * stale sibling we missed) fails fast instead of silently overwriting.
+ * Atomically write `content` to `dst` with executable bits set.
+ *
+ * When `exclusive` is true (new installs): uses `link(tmp, dst)` so the
+ * operation fails with EEXIST if a file appeared at `dst` after the caller's
+ * re-check. `rename()` on POSIX would silently clobber that file.
+ *
+ * When `exclusive` is false (refreshes): uses `rename()` — the destination
+ * is expected to exist and be rea-managed; the caller already verified this.
  */
-async function writeExecutable(dst: string, content: string): Promise<void> {
+async function writeExecutable(
+  dst: string,
+  content: string,
+  exclusive: boolean,
+): Promise<void> {
   await fsPromises.mkdir(path.dirname(dst), { recursive: true });
   // Random suffix + `wx` open flag: PID was observed to collide during
   // concurrent installs in the same process (e.g. two worktrees running
@@ -653,12 +667,23 @@ async function writeExecutable(dst: string, content: string): Promise<void> {
   } finally {
     await handle.close().catch(() => undefined);
   }
+  let finalizeErr: unknown;
   try {
+    if (exclusive) {
+      // link() fails with EEXIST if dst was created after our safety re-check.
+      // After a successful link both paths point to the same inode; unlink
+      // the tmp name so only dst remains.
+      await fsPromises.link(tmp, dst);
+      await fsPromises.unlink(tmp).catch(() => undefined);
+      return;
+    }
     await fsPromises.rename(tmp, dst);
+    return;
   } catch (err) {
-    await fsPromises.unlink(tmp).catch(() => undefined);
-    throw err;
+    finalizeErr = err;
   }
+  await fsPromises.unlink(tmp).catch(() => undefined);
+  throw finalizeErr;
 }
 
 /**
@@ -681,6 +706,13 @@ export interface InstallPrePushOptions {
    * Production callers never set this.
    */
   onBeforeReresolve?: (hookPath: string) => Promise<void> | void;
+  /**
+   * Called inside the lock, after the safety re-check passes but
+   * immediately before `writeExecutable`. Test-only seam: creates a
+   * file at the hook path to exercise the EEXIST-from-link path that
+   * guards the remaining TOCTOU window. Production callers never set this.
+   */
+  onBeforeWrite?: (hookPath: string) => Promise<void> | void;
 }
 
 /**
@@ -887,7 +919,33 @@ export async function installPrePushFallback(
           }
         }
 
-        await writeExecutable(decision.hookPath, fallbackHookContent());
+        if (options.onBeforeWrite !== undefined) {
+          await options.onBeforeWrite(decision.hookPath);
+        }
+
+        try {
+          await writeExecutable(
+            decision.hookPath,
+            fallbackHookContent(),
+            decision.action === 'install',
+          );
+        } catch (writeErr) {
+          const e = writeErr as NodeJS.ErrnoException;
+          if (e.code === 'EEXIST') {
+            // A file appeared between the re-check and the link(). Bail safely.
+            result.warnings.push(
+              `pre-push hook appeared at ${decision.hookPath} after the safety check — ` +
+                `leaving it untouched. Re-run \`rea init\` to re-evaluate.`,
+            );
+            result.decision = {
+              action: 'skip',
+              reason: 'foreign-pre-push',
+              hookPath: decision.hookPath,
+            };
+            return result;
+          }
+          throw writeErr;
+        }
         result.written = decision.hookPath;
         if (decision.action === 'refresh') {
           // Informational — refreshing our own marker is the idempotent
