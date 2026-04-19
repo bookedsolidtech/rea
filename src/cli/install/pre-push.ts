@@ -235,8 +235,60 @@ export function isLegacyReaManagedHuskyGate(content: string): boolean {
     /^#\s*\.husky\/pre-push\b[^\n]*[—-]\s*rea governance gate/;
   if (!legacyHeaderRe.test(line2)) return false;
   if (!hasHaltEnforcement(content)) return false;
-  if (!hasAuditCheck(content)) return false;
-  return true;
+  // R22 F2 — legacy recognition must accept BOTH the post-R15 if-form audit
+  // check AND the pre-R15 `block_push` accumulator pattern. The shipped
+  // pre-0.4 hook used the accumulator shape, which this branch's strict
+  // `hasAuditCheck` intentionally rejects (R18 dropped `continue` as a
+  // blocking terminator). Without a second detector, upgrading from `main`
+  // strands the consumer on a foreign hook.
+  //
+  // The legacy accumulator fingerprint is three textual signals unique to
+  // our own shipped hook:
+  //   1. `block_push=0` initialization
+  //   2. `block_push=1` inside a loop/branch
+  //   3. post-loop `"$block_push" -ne 0` comparison
+  // All three together identify the pre-0.4 rea hook and cannot be produced
+  // by a foreign hook that happens to share only the line-2 header.
+  if (hasAuditCheck(content)) return true;
+  if (hasLegacyAuditAccumulator(content)) return true;
+  return false;
+}
+
+/**
+ * R22 F2 — fingerprint-based detector for the pre-0.4 `.husky/pre-push`
+ * audit-enforcement shape. The shipped hook used a `block_push` accumulator
+ * inside the refspec loop plus a post-loop `if [ "$block_push" -ne 0 ]`
+ * guard because the R18-era text parser did not support loop-carried
+ * blocking. This helper recognizes that accumulator pattern so legacy
+ * consumers upgrading from `main` are classified as rea-managed and the
+ * canonical manifest reconciler can refresh the hook in-place.
+ *
+ * The three textual signals below are co-required; no subset is accepted.
+ * Comments are stripped first so a docstring mentioning `block_push` does
+ * not satisfy the fingerprint.
+ */
+function hasLegacyAuditAccumulator(content: string): boolean {
+  const stripped = stripComments(content);
+  const hasInit = /\bblock_push[ \t]*=[ \t]*0\b/.test(stripped);
+  if (!hasInit) return false;
+  const hasSet = /\bblock_push[ \t]*=[ \t]*1\b/.test(stripped);
+  if (!hasSet) return false;
+  // Post-loop guard: `[ "$block_push" -ne 0 ]` or `[ $block_push -ne 0 ]`
+  // wrapped in an `if` that exits non-zero. The bounded `.{0,200}` span
+  // (same-line or next-few-lines) prevents the guard from mis-matching
+  // against unrelated exits far away in the hook body.
+  const hasPostLoopGuard =
+    /\[\s*"?\$\{?block_push\}?"?\s+-ne\s+0\s*\][\s\S]{0,200}?\bexit[ \t]+[1-9]\d*\b/.test(
+      stripped,
+    );
+  if (!hasPostLoopGuard) return false;
+  // An audit grep must still be present — without it, the accumulator
+  // could be enforcing a protected-paths-only policy (plausible in a
+  // reagent-era install) and not a codex-review audit check.
+  const hasAuditGrep =
+    /\bgrep\b[^\n]*codex\\?\.review/.test(stripped) &&
+    /\.rea\/audit\.jsonl\b/.test(stripped);
+  return hasAuditGrep;
 }
 
 /**
@@ -787,6 +839,25 @@ function hasAuditCheck(content: string): boolean {
       return true;
     }
 
+    // R22 F1 — clear the pending fall-through requirement if we see an
+    // intervening top-level `exit`/`return` terminator that is NOT blocking
+    // (i.e. `exit 0`, bare `exit`, `return 0`, bare `return`). Such a
+    // terminator makes the later `exit N` unreachable, so the miss path
+    // still exits successfully — the hook is NOT audit-enforcing. Without
+    // this reset, `if grep ...; then exit 0; fi; exit 0; exit 1` would be
+    // accepted as fall-through-blocking because the later `exit 1` would
+    // satisfy `pendingFallThroughMissBlock` even though execution can never
+    // reach it on a miss.
+    if (
+      pendingFallThroughMissBlock &&
+      frames.length === 0 &&
+      loopDepth === 0 &&
+      isHeadTerminatorStmtLine(full) &&
+      !isBlockingStmtLine(full, loopDepth)
+    ) {
+      pendingFallThroughMissBlock = false;
+    }
+
     // Statement inside an open `if` frame — route blocking statements to
     // the correct branch counter. The shipped husky gate uses exactly this
     // shape: `if ! grep ...; then` followed by `printf ...` +
@@ -928,6 +999,39 @@ function isAllowOnMatchStmtLine(line: string): boolean {
     if (t.length === 0) continue;
     if (/\bexit[ \t]+0\b/.test(t)) return true;
     if (/\breturn[ \t]+0\b/.test(t)) return true;
+  }
+  return false;
+}
+
+/**
+ * True when `line` contains a head-position `exit` or `return` statement
+ * with ANY exit status (or none). Used to invalidate a pending
+ * fall-through-miss-block expectation in `hasAuditCheck` form (c) — if a
+ * top-level terminator runs before a later blocking `exit N`, the blocker
+ * becomes unreachable on the audit-miss path and the hook is no longer
+ * proved to be audit-enforcing.
+ *
+ * Grouped-block inner terminators are also recognized so
+ * `{ cleanup; exit 0; }` invalidates a pending expectation.
+ */
+function isHeadTerminatorStmtLine(line: string): boolean {
+  const text = line.trim();
+  if (text.length === 0) return false;
+  for (const stmt of splitStatements(text)) {
+    const t = stmt.trim();
+    if (t.length === 0) continue;
+    if (/^exit(?:[ \t]+\d+)?(?=[\s;|&]|$)/.test(t)) return true;
+    if (/^return(?:[ \t]+\d+)?(?=[\s;|&]|$)/.test(t)) return true;
+    const blockMatch = t.match(/^\{([^}]*)\}/);
+    if (blockMatch !== null) {
+      const body = blockMatch[1] ?? '';
+      for (const inner of body.split(/[;\n]/)) {
+        const sub = inner.trim();
+        if (sub.length === 0) continue;
+        if (/^exit(?:[ \t]+\d+)?(?=[\s;|&]|$)/.test(sub)) return true;
+        if (/^return(?:[ \t]+\d+)?(?=[\s;|&]|$)/.test(sub)) return true;
+      }
+    }
   }
   return false;
 }
@@ -1487,6 +1591,31 @@ function looksLikeGateInvocation(line: string): boolean {
     `^(exec|sh|bash|zsh|\\.)\\s+${pathChars}*\\.claude\\/hooks\\/push-review-gate\\.sh(?=\\s|$|[;|&"'()])`,
   );
   if (delegationRe.test(line)) return true;
+
+  // Form 3 (R22 F3) — absolute interpreter path or `env`-based interpreter.
+  // Real hooks commonly invoke the gate as `/bin/sh gate`, `/usr/bin/env sh
+  // gate`, or `exec /bin/bash gate`. All of these are unconditional and
+  // safe delegations, but forms 1 and 2 rejected them because the
+  // command-head token was a path (`/bin/sh`) instead of a bare word.
+  //   `/bin/sh .claude/hooks/push-review-gate.sh`
+  //   `/usr/bin/sh .claude/hooks/push-review-gate.sh`
+  //   `/usr/bin/env sh .claude/hooks/push-review-gate.sh`
+  //   `exec /bin/bash .claude/hooks/push-review-gate.sh`
+  //
+  // The `\/[^\s;|&()]+\/` prefix requires an absolute path with at least one
+  // path component, which rejects `/sh` (unlikely on any real system but
+  // not a valid interpreter invocation shape). The `env` form accepts either
+  // bare `env` (relies on PATH) or an absolute `/usr/bin/env` path.
+  const interpreterRe = new RegExp(
+    `^(?:exec\\s+)?` +
+      `(?:` +
+      `(?:\\/[^\\s;|&()]+\\/)?env\\s+(?:sh|bash|zsh)` +
+      `|` +
+      `\\/[^\\s;|&()]+\\/(?:sh|bash|zsh)` +
+      `)` +
+      `\\s+${pathChars}*\\.claude\\/hooks\\/push-review-gate\\.sh(?=\\s|$|[;|&"'()])`,
+  );
+  if (interpreterRe.test(line)) return true;
 
   return false;
 }

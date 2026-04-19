@@ -2368,6 +2368,238 @@ describe('classifyPrePushInstall — R21 F1 legacy husky hook migration', () => 
   });
 });
 
+// R22 regressions — exact `main:.husky/pre-push` body + form-(c) miss-path
+// clearance + broadened gate-invocation parser.
+const MAIN_LEGACY_BODY = [
+  '#!/bin/sh',
+  '# .husky/pre-push — rea governance gate for terminal-initiated pushes.',
+  '#',
+  '# Minimum viable check — NOT a full replacement for the Claude Code gate:',
+  '#   1. If `.rea/HALT` exists, block.',
+  '#   2. If the push touches a protected path AND policy.review.codex_required',
+  '#      is not explicitly false, require a `codex.review` audit entry for the',
+  '#      HEAD SHA (or REA_SKIP_CODEX_REVIEW env var for a one-off bypass).',
+  '',
+  'set -eu',
+  '',
+  'REA_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)',
+  '',
+  'if [ -f "${REA_ROOT}/.rea/HALT" ]; then',
+  '  reason=$(awk \'NR==1 { print; exit }\' "${REA_ROOT}/.rea/HALT" 2>/dev/null || printf \'unknown\')',
+  '  [ -z "${reason:-}" ] && reason=\'unknown\'',
+  '  printf \'REA HALT: %s\\n\' "$reason" >&2',
+  '  exit 1',
+  'fi',
+  '',
+  'INPUT=$(cat)',
+  '[ -z "$INPUT" ] && exit 0',
+  '',
+  'PROTECTED_RE=\'^src/gateway/middleware/|^hooks/|^\\.claude/hooks/|^src/policy/|^\\.github/workflows/\'',
+  'AUDIT_LOG="${REA_ROOT}/.rea/audit.jsonl"',
+  '',
+  'CODEX_REQUIRED=true',
+  'READ_FIELD_JS="${REA_ROOT}/dist/scripts/read-policy-field.js"',
+  'if [ -f "$READ_FIELD_JS" ]; then',
+  '  field_value=$(REA_ROOT="$REA_ROOT" node "$READ_FIELD_JS" review.codex_required 2>/dev/null || printf \'\')',
+  '  if [ "$field_value" = "false" ]; then',
+  '    CODEX_REQUIRED=false',
+  '  fi',
+  'fi',
+  '',
+  'block_push=0',
+  '',
+  'while IFS=\' \' read -r local_ref local_sha remote_ref remote_sha; do',
+  '  [ -z "${local_sha:-}" ] && continue',
+  '  case "$local_sha" in',
+  '    0000000000000000000000000000000000000000) continue ;;',
+  '  esac',
+  '',
+  '  if [ "$remote_sha" = "0000000000000000000000000000000000000000" ]; then',
+  '    default_branch=$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed \'s|^origin/||\')',
+  '    [ -z "${default_branch:-}" ] && default_branch="main"',
+  '    base=$(git merge-base "$default_branch" "$local_sha" 2>/dev/null || printf \'\')',
+  '  else',
+  '    base=$(git merge-base "$remote_sha" "$local_sha" 2>/dev/null || printf \'\')',
+  '  fi',
+  '  [ -z "${base:-}" ] && continue',
+  '',
+  '  if git diff --name-only "$base" "$local_sha" 2>/dev/null | grep -qE "$PROTECTED_RE"; then',
+  '    if [ "$CODEX_REQUIRED" = "false" ]; then',
+  '      continue',
+  '    fi',
+  '    if [ -n "${REA_SKIP_CODEX_REVIEW:-}" ]; then',
+  '      printf \'rea: REA_SKIP_CODEX_REVIEW set (%s)\\n\' "$REA_SKIP_CODEX_REVIEW" >&2',
+  '      continue',
+  '    fi',
+  '    if [ ! -f "$AUDIT_LOG" ]; then',
+  '      printf \'PUSH BLOCKED: no audit log %s\\n\' "$AUDIT_LOG" >&2',
+  '      block_push=1',
+  '      continue',
+  '    fi',
+  '    if ! grep -E \'"tool_name":"codex\\.review"\' "$AUDIT_LOG" 2>/dev/null | \\',
+  '         grep -qF "\\"head_sha\\":\\"$local_sha\\""; then',
+  '      printf \'PUSH BLOCKED: /codex-review required for %s\\n\' "$local_sha" >&2',
+  '      block_push=1',
+  '      continue',
+  '    fi',
+  '  fi',
+  'done <<HOOK_INPUT_EOF',
+  '$INPUT',
+  'HOOK_INPUT_EOF',
+  '',
+  'if [ "$block_push" -ne 0 ]; then',
+  '  exit 1',
+  'fi',
+  '',
+  'exit 0',
+].join('\n');
+
+describe('isLegacyReaManagedHuskyGate — R22 F2 main legacy body', () => {
+  it('accepts the exact main:.husky/pre-push body (block_push accumulator)', () => {
+    expect(isLegacyReaManagedHuskyGate(MAIN_LEGACY_BODY)).toBe(true);
+  });
+
+  it('rejects legacy body missing block_push=0 init', () => {
+    const body = MAIN_LEGACY_BODY.replace(/^block_push=0$/m, '');
+    expect(isLegacyReaManagedHuskyGate(body)).toBe(false);
+  });
+
+  it('rejects legacy body missing block_push=1 set', () => {
+    const body = MAIN_LEGACY_BODY.replace(/block_push=1/g, '# stub');
+    expect(isLegacyReaManagedHuskyGate(body)).toBe(false);
+  });
+
+  it('rejects legacy body missing post-loop -ne 0 guard', () => {
+    const body = MAIN_LEGACY_BODY.replace(
+      /if \[ "\$block_push" -ne 0 \]; then\n  exit 1\nfi/,
+      '',
+    );
+    expect(isLegacyReaManagedHuskyGate(body)).toBe(false);
+  });
+
+  it('rejects legacy body missing codex.review audit grep', () => {
+    const body = MAIN_LEGACY_BODY.replace(/codex\\\.review/g, 'other\\.tool');
+    expect(isLegacyReaManagedHuskyGate(body)).toBe(false);
+  });
+
+  it('classifies main legacy body as rea-managed-husky via classifyPrePushInstall', async () => {
+    const dir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-r22-')));
+    try {
+      await initGitRepo(dir);
+      await execFileAsync('git', ['-C', dir, 'config', 'core.hooksPath', '.husky']);
+      const huskyDir = path.join(dir, '.husky');
+      await fs.mkdir(huskyDir, { recursive: true });
+      await fs.writeFile(path.join(huskyDir, 'pre-push'), MAIN_LEGACY_BODY, { mode: 0o755 });
+
+      const decision = await classifyPrePushInstall(dir);
+      expect(decision.action).toBe('skip');
+      if (decision.action === 'skip') {
+        expect(decision.reason).toBe('active-pre-push-present');
+      }
+
+      const state = await inspectPrePushState(dir);
+      expect(state.ok).toBe(true);
+      expect(state.activeForeign).toBe(false);
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('hasAuditCheck — R22 F1 form-(c) fall-through miss-path clearance', () => {
+  // These hooks all have the header/HALT boilerplate but differ on the
+  // audit-check body. isReaManagedHuskyGate composes hasAuditCheck, so we
+  // probe it end-to-end via that entry point.
+  const wrapWithBoilerplate = (auditBody: string): string =>
+    [
+      '#!/bin/sh',
+      HUSKY_GATE_MARKER,
+      HUSKY_GATE_BODY_MARKER,
+      'set -eu',
+      '[ -f .rea/HALT ] && exit 1',
+      auditBody,
+    ].join('\n');
+
+  it('rejects `if grep ...; then exit 0; fi; exit 0; exit 1` (unreachable blocker)', () => {
+    const body = [
+      'if grep -qE \'"tool_name":"codex\\.review"\' .rea/audit.jsonl; then exit 0; fi',
+      'exit 0',
+      'exit 1',
+    ].join('\n');
+    expect(isReaManagedHuskyGate(wrapWithBoilerplate(body))).toBe(false);
+  });
+
+  it('rejects `if grep ...; then exit 0; fi; return 0; exit 1`', () => {
+    const body = [
+      'if grep -qE \'"tool_name":"codex\\.review"\' .rea/audit.jsonl; then exit 0; fi',
+      'return 0',
+      'exit 1',
+    ].join('\n');
+    expect(isReaManagedHuskyGate(wrapWithBoilerplate(body))).toBe(false);
+  });
+
+  it('rejects `if grep ...; then exit 0; fi; exit; exit 1` (bare exit clears pending)', () => {
+    const body = [
+      'if grep -qE \'"tool_name":"codex\\.review"\' .rea/audit.jsonl; then exit 0; fi',
+      'exit',
+      'exit 1',
+    ].join('\n');
+    expect(isReaManagedHuskyGate(wrapWithBoilerplate(body))).toBe(false);
+  });
+
+  it('accepts `if grep ...; then exit 0; fi; exit 1` (direct form c)', () => {
+    const body = [
+      'if grep -qE \'"tool_name":"codex\\.review"\' .rea/audit.jsonl; then exit 0; fi',
+      'exit 1',
+    ].join('\n');
+    expect(isReaManagedHuskyGate(wrapWithBoilerplate(body))).toBe(true);
+  });
+
+  it('accepts `if ! grep ...; then exit 1; fi` (form a unaffected)', () => {
+    const body = [
+      'if ! grep -qE \'"tool_name":"codex\\.review"\' .rea/audit.jsonl; then exit 1; fi',
+    ].join('\n');
+    expect(isReaManagedHuskyGate(wrapWithBoilerplate(body))).toBe(true);
+  });
+});
+
+describe('referencesReviewGate — R22 F3 interpreter-path delegation', () => {
+  const wrap = (invocation: string): string =>
+    ['#!/bin/sh', 'set -eu', invocation].join('\n');
+
+  it('accepts `/bin/sh <gate>`', () => {
+    expect(referencesReviewGate(wrap('/bin/sh .claude/hooks/push-review-gate.sh "$@"'))).toBe(true);
+  });
+
+  it('accepts `/usr/bin/sh <gate>`', () => {
+    expect(referencesReviewGate(wrap('/usr/bin/sh .claude/hooks/push-review-gate.sh "$@"'))).toBe(true);
+  });
+
+  it('accepts `/usr/bin/env sh <gate>`', () => {
+    expect(referencesReviewGate(wrap('/usr/bin/env sh .claude/hooks/push-review-gate.sh "$@"'))).toBe(true);
+  });
+
+  it('accepts `env bash <gate>` (PATH-based env)', () => {
+    expect(referencesReviewGate(wrap('env bash .claude/hooks/push-review-gate.sh "$@"'))).toBe(true);
+  });
+
+  it('accepts `exec /bin/bash <gate>`', () => {
+    expect(referencesReviewGate(wrap('exec /bin/bash .claude/hooks/push-review-gate.sh "$@"'))).toBe(true);
+  });
+
+  it('accepts `exec /usr/bin/env sh <gate>`', () => {
+    expect(referencesReviewGate(wrap('exec /usr/bin/env sh .claude/hooks/push-review-gate.sh "$@"'))).toBe(true);
+  });
+
+  it('still rejects `/bin/sh <gate> | tee log` (status-swallow pipeline)', () => {
+    expect(referencesReviewGate(wrap('/bin/sh .claude/hooks/push-review-gate.sh "$@" | tee log'))).toBe(false);
+  });
+
+  it('still rejects `/bin/sh <gate> || true` (status-swallow)', () => {
+    expect(referencesReviewGate(wrap('/bin/sh .claude/hooks/push-review-gate.sh "$@" || true'))).toBe(false);
+  });
+});
+
 describe('referencesReviewGate — depth-tracking exit detection (Finding 2)', () => {
   it('indented exit inside if-block does NOT set exitedBeforeGate (guard-block)', () => {
     // Core guard-block pattern: the exit is conditional, gate IS reachable.
