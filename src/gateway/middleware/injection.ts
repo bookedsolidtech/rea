@@ -231,6 +231,16 @@ function tryDecodeBase64(input: string, safe: CompiledInjectionPatterns): string
 const MIN_BASE64_PROBE_LENGTH = 24;
 
 /**
+ * Maximum token length considered for standalone base64 probing via
+ * `decodeBase64Strings`. Strings longer than this are skipped — base64
+ * payloads this large are unlikely to be valid whole-string injection
+ * vectors (they would need padding-aligned framing) and decoding them
+ * unboundedly can force significant CPU/memory. 16 KiB gives ample room
+ * for any plausible injection phrase.
+ */
+const MAX_BASE64_PROBE_LENGTH = 16384; // 16 KiB — beyond this, base64 strings are truncated or padding-invalid
+
+/**
  * G9 — printable-ASCII ratio threshold for accepting a base64 decode as a
  * potential injection payload. The spec requires ≥95% printable characters
  * and no null bytes; stricter than the inline decoder used by
@@ -283,6 +293,7 @@ export function decodeBase64Strings(input: unknown): string[] {
   const visit = (v: unknown): void => {
     if (typeof v === 'string') {
       if (v.length < MIN_BASE64_PROBE_LENGTH) return;
+      if (v.length > MAX_BASE64_PROBE_LENGTH) return;
       if (v.length % 4 !== 0) return;
       if (!INJECTION_BASE64_SHAPE.test(v)) return;
       let decoded: string;
@@ -651,12 +662,22 @@ export function createInjectionMiddleware(
     // execution path. Any phrase detected in a decoded whole-string payload
     // is merged into `base64DecodedMatches`, so classification rule #2
     // (any base64 match → `likely_injection`) fires.
-    const base64Decoded = decodeBase64Strings(ctx.result);
-    for (const decoded of base64Decoded) {
-      const normalized = normalizeForMatch(decoded);
-      for (const phrase of INJECTION_PHRASES) {
-        if (normalized.includes(phrase)) {
-          scan.base64DecodedMatches.add(phrase);
+    //
+    // Guard: skip the whole-string probe when the primary scan already
+    // timed out. The timeout-deny path runs below (block mode) or emits a
+    // verdict:'error' record (warn mode). Running `decodeBase64Strings`
+    // here would do unbounded work on a payload that already proved it
+    // can exhaust the regex budget — defeating the timeout protection.
+    // `MAX_BASE64_PROBE_LENGTH` inside `decodeBase64Strings` provides a
+    // second defence-in-depth cap for the non-timeout path.
+    if (!scanTimedOut) {
+      const base64Decoded = decodeBase64Strings(ctx.result);
+      for (const decoded of base64Decoded) {
+        const normalized = normalizeForMatch(decoded);
+        for (const phrase of INJECTION_PHRASES) {
+          if (normalized.includes(phrase)) {
+            scan.base64DecodedMatches.add(phrase);
+          }
         }
       }
     }
