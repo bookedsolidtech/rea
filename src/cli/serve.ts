@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { loadPolicy } from '../policy/loader.js';
 import { loadRegistry } from '../registry/loader.js';
+import { applyTofuGate } from '../registry/tofu-gate.js';
 import { createGateway } from '../gateway/server.js';
 import { CodexProbe } from '../gateway/observability/codex-probe.js';
 import {
@@ -136,7 +137,61 @@ export async function runServe(): Promise<void> {
     }
   }
 
-  const handle = createGateway({ baseDir, policy, registry, logger, metrics: metricsRegistry });
+  // G7: TOFU fingerprint gate. Runs BEFORE we build the downstream pool so
+  // drifted servers are filtered out at the edge. First-seen and accepted
+  // drift fire LOUD stderr + audit + log; the gateway stays up either way.
+  //
+  // We pass the FULL declared server list (enabled AND disabled) to the
+  // gate so every entry gets a fingerprint baseline on first sight.
+  // Disabled-entry escape was a real bypass: an attacker who tampered
+  // with a disabled entry got no baseline recorded, so the
+  // disabled→enabled transition always looked benign first-seen on the
+  // next boot. Fingerprinting is a pure canonicalize+sha256 operation on
+  // the registry config (no spawn), so including disabled entries is
+  // cheap and safe.
+  //
+  // The `enabled` filter is applied AFTER the gate: only enabled servers
+  // that passed the gate are handed to the downstream pool for spawn.
+  //
+  // When the registry declares zero servers there is nothing to
+  // fingerprint — skip the gate entirely to avoid a redundant disk write
+  // on zero-server installs.
+  let gatedRegistry = registry;
+  try {
+    if (registry.servers.length > 0) {
+      const { accepted } = await applyTofuGate(baseDir, registry.servers, logger);
+      const acceptedNames = new Set(accepted.map((s) => s.name));
+      gatedRegistry = {
+        ...registry,
+        // Keep only entries that passed the TOFU gate. The `enabled`
+        // filter is applied downstream when the pool decides what to
+        // spawn — disabled entries that passed the gate stay in the
+        // registry so a future enable uses the already-recorded
+        // baseline instead of looking like a fresh first-seen.
+        servers: registry.servers.filter((s) => acceptedNames.has(s.name)),
+      };
+    }
+  } catch (e) {
+    // Fail-closed on TOFU errors (e.g. corrupt fingerprint store). An attacker
+    // who can corrupt the store must not be able to downgrade drift detection
+    // by forcing the gateway into a "first-run" fallback. Surface the error
+    // and exit — operator can delete the store deliberately to re-bootstrap.
+    err(`TOFU gate failed: ${e instanceof Error ? e.message : e}`);
+    console.error('');
+    console.error('  To intentionally re-bootstrap the fingerprint store:');
+    console.error('  1. Inspect .rea/fingerprints.json for tampering');
+    console.error('  2. If safe, delete it and re-run `rea serve`');
+    console.error('');
+    process.exit(1);
+  }
+
+  const handle = createGateway({
+    baseDir,
+    policy,
+    registry: gatedRegistry,
+    logger,
+    metrics: metricsRegistry,
+  });
 
   // ── HALT acknowledgement at startup (G5) ─────────────────────────────────
   const haltPath = reaPath(baseDir, HALT_FILE);

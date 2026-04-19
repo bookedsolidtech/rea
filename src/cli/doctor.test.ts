@@ -12,10 +12,17 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
+  checkFingerprintStore,
   checksFromProbeState,
   collectChecks,
   type CheckResult,
 } from './doctor.js';
+import {
+  FINGERPRINT_STORE_VERSION,
+  saveFingerprintStore,
+} from '../registry/fingerprints-store.js';
+import { fingerprintServer } from '../registry/fingerprint.js';
+import type { RegistryServer } from '../registry/types.js';
 import type { CodexProbeState } from '../gateway/observability/codex-probe.js';
 import type { PrePushDoctorState } from './install/pre-push.js';
 
@@ -395,5 +402,89 @@ describe('rea doctor — collectChecks (G11.4 codex_required)', () => {
     const check = findCheck(checks, 'pre-push hook installed');
     expect(check?.status).toBe('fail');
     expect(check?.detail).toMatch(/silently bypassed/);
+  });
+});
+
+describe('rea doctor — checkFingerprintStore (G7)', () => {
+  const cleanup: string[] = [];
+
+  afterEach(async () => {
+    await Promise.all(
+      cleanup.splice(0).map((d) => fs.rm(d, { recursive: true, force: true })),
+    );
+  });
+
+  async function scratchWithRegistry(
+    servers: RegistryServer[],
+  ): Promise<ScratchRepo> {
+    const repo = await makeScratchRepo({ codexRequired: false });
+    const yaml = [
+      'version: "1"',
+      servers.length === 0 ? 'servers: []' : 'servers:',
+      ...servers.flatMap((s) => [
+        `  - name: ${s.name}`,
+        `    command: ${s.command}`,
+        `    args: ${JSON.stringify(s.args)}`,
+      ]),
+      '',
+    ].join('\n');
+    await fs.writeFile(path.join(repo.dir, '.rea', 'registry.yaml'), yaml);
+    return repo;
+  }
+
+  function svr(name: string): RegistryServer {
+    return { name, command: 'node', args: [], env: {}, enabled: true };
+  }
+
+  it('info when no enabled servers are declared', async () => {
+    const repo = await scratchWithRegistry([]);
+    cleanup.push(repo.dir);
+    const r = await checkFingerprintStore(repo.dir);
+    expect(r.status).toBe('info');
+  });
+
+  it('warn when the store is empty but servers are declared (first-seen ahead)', async () => {
+    const repo = await scratchWithRegistry([svr('mock')]);
+    cleanup.push(repo.dir);
+    const r = await checkFingerprintStore(repo.dir);
+    expect(r.status).toBe('warn');
+    expect(r.detail).toMatch(/first-seen/);
+  });
+
+  it('pass when every server has a matching stored fingerprint', async () => {
+    const s = svr('mock');
+    const repo = await scratchWithRegistry([s]);
+    cleanup.push(repo.dir);
+    await saveFingerprintStore(repo.dir, {
+      version: FINGERPRINT_STORE_VERSION,
+      servers: { mock: fingerprintServer(s) },
+    });
+    const r = await checkFingerprintStore(repo.dir);
+    expect(r.status).toBe('pass');
+  });
+
+  it('warn when a server drifted from its stored fingerprint', async () => {
+    const s = svr('mock');
+    const repo = await scratchWithRegistry([s]);
+    cleanup.push(repo.dir);
+    // Store a different fingerprint to simulate drift.
+    await saveFingerprintStore(repo.dir, {
+      version: FINGERPRINT_STORE_VERSION,
+      servers: { mock: 'f'.repeat(64) },
+    });
+    const r = await checkFingerprintStore(repo.dir);
+    expect(r.status).toBe('warn');
+    expect(r.detail).toMatch(/drifted/);
+  });
+
+  it('fail when the fingerprint store is corrupt', async () => {
+    const repo = await scratchWithRegistry([svr('mock')]);
+    cleanup.push(repo.dir);
+    await fs.writeFile(
+      path.join(repo.dir, '.rea', 'fingerprints.json'),
+      'not { valid json',
+    );
+    const r = await checkFingerprintStore(repo.dir);
+    expect(r.status).toBe('fail');
   });
 });
