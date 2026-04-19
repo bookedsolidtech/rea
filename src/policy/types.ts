@@ -35,6 +35,26 @@ export interface ReviewPolicy {
    * log. Default when unset is `true` (Codex required).
    */
   codex_required?: boolean;
+  /**
+   * Review-cache TTL used by `rea cache check` (BUG-009). Entries older
+   * than this window are treated as a miss, forcing re-review. Default
+   * when unset is 3600 seconds (1 hour) — matches the windows the
+   * push-review-gate hook already assumes. Express in seconds, positive
+   * integer.
+   */
+  cache_max_age_seconds?: number;
+  /**
+   * Authorization for `REA_SKIP_PUSH_REVIEW` / `REA_SKIP_CODEX_REVIEW` when
+   * the `CI` environment variable is set. The skip hatches are ambient and
+   * unauthenticated — a leaked env file or a malicious parent process can
+   * bypass the gate and record a forged actor (git config is mutable repo
+   * config). Refusing these hatches in CI contexts by default removes that
+   * bypass surface. Set `true` ONLY on build agents where the operator has
+   * an independent reason to trust the environment. Default `false`.
+   *
+   * Added in 0.5.0 as Codex F2 on the PR1 adversarial review.
+   */
+  allow_skip_in_ci?: boolean;
 }
 
 /**

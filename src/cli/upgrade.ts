@@ -66,6 +66,7 @@ import {
   readSettings,
   writeSettingsAtomic,
 } from './install/settings-merge.js';
+import { ensureReaGitignore } from './install/gitignore.js';
 import {
   manifestExists,
   readManifest,
@@ -552,6 +553,25 @@ export async function runUpgrade(options: UpgradeOptions = {}): Promise<void> {
       sha256: mdResult.sha,
       source: 'claude-md',
     });
+  }
+
+  // BUG-010 — ensure `.gitignore` carries every runtime artifact entry. This
+  // backfills older installs that predate the scaffolding in `rea init`. A
+  // consumer who upgraded from 0.3.x/0.4.0 was previously seeing
+  // `.rea/fingerprints.json` show up as an untracked file; this closes the
+  // loop without touching operator-authored gitignore lines.
+  if (!dryRun) {
+    const gi = await ensureReaGitignore(resolvedRoot);
+    if (gi.action === 'created') {
+      console.log(`  + ${path.relative(resolvedRoot, gi.path)} (managed block written)`);
+    } else if (gi.action === 'updated') {
+      console.log(
+        `  ~ ${path.relative(resolvedRoot, gi.path)} (managed block ${gi.addedEntries.length} entr${gi.addedEntries.length === 1 ? 'y' : 'ies'} added)`,
+      );
+    } else {
+      console.log(`  · ${path.relative(resolvedRoot, gi.path)} (managed block up to date)`);
+    }
+    for (const w of gi.warnings) warn(w);
   }
 
   if (dryRun) {

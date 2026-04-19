@@ -2,6 +2,13 @@
 
 import { Command } from 'commander';
 import { runAuditRotate, runAuditVerify } from './audit.js';
+import {
+  parseCacheResult,
+  runCacheCheck,
+  runCacheClear,
+  runCacheList,
+  runCacheSet,
+} from './cache.js';
 import { runCheck } from './check.js';
 import { runDoctor } from './doctor.js';
 import { runFreeze, runUnfreeze } from './freeze.js';
@@ -137,6 +144,63 @@ async function main(): Promise<void> {
     )
     .action(async (opts: { since?: string }) => {
       await runAuditVerify({ ...(opts.since !== undefined ? { since: opts.since } : {}) });
+    });
+
+  const cache = program
+    .command('cache')
+    .description(
+      'Review-cache operations — check/set/clear/list .rea/review-cache.jsonl (BUG-009). Used by hooks/push-review-gate.sh to skip re-review on a previously-approved diff.',
+    );
+
+  cache
+    .command('check <sha>')
+    .description(
+      'Look up a cache entry. Emits JSON to stdout ONLY — hook contract. On hit: {hit,true,result,branch,base,recorded_at[,reason]}. On miss: {hit:false}. Never exits non-zero for normal miss.',
+    )
+    .requiredOption('--branch <branch>', 'feature branch being pushed')
+    .requiredOption('--base <base>', 'base branch the feature targets')
+    .action(async (sha: string, opts: { branch: string; base: string }) => {
+      await runCacheCheck({ sha, branch: opts.branch, base: opts.base });
+    });
+
+  cache
+    .command('set <sha> <result>')
+    .description(
+      'Record a review outcome. <result> must be "pass" or "fail". Idempotent line-per-invocation; last write wins on (sha, branch, base).',
+    )
+    .requiredOption('--branch <branch>', 'feature branch being pushed')
+    .requiredOption('--base <base>', 'base branch the feature targets')
+    .option('--reason <text>', 'free-text context for this entry (recommended on fail)')
+    .action(
+      async (
+        sha: string,
+        rawResult: string,
+        opts: { branch: string; base: string; reason?: string },
+      ) => {
+        const result = parseCacheResult(rawResult);
+        await runCacheSet({
+          sha,
+          result,
+          branch: opts.branch,
+          base: opts.base,
+          ...(opts.reason !== undefined ? { reason: opts.reason } : {}),
+        });
+      },
+    );
+
+  cache
+    .command('clear <sha>')
+    .description('Remove every cache entry matching <sha>. Dev convenience — prints the removed count.')
+    .action(async (sha: string) => {
+      await runCacheClear({ sha });
+    });
+
+  cache
+    .command('list')
+    .description('Print cache entries in file order. Filter with --branch.')
+    .option('--branch <branch>', 'only list entries for this branch')
+    .action(async (opts: { branch?: string }) => {
+      await runCacheList({ ...(opts.branch !== undefined ? { branch: opts.branch } : {}) });
     });
 
   program
