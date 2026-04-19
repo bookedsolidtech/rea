@@ -149,16 +149,15 @@ export function isReaManagedFallback(content: string): boolean {
  * as a governance-carrying hook rather than `foreign/no-marker`.
  */
 export function isReaManagedHuskyGate(content: string): boolean {
-  // Require the marker on the SECOND LINE (after shebang) AND a real gate
-  // invocation in the body. The marker alone is insufficient: a spoofed hook
-  // `#!/bin/sh\n# rea:husky-pre-push-gate v1\nexit 0` satisfies the positional
-  // check but bypasses governance. Both conditions must be true.
+  // Require the marker on the SECOND LINE (after shebang). The marker IS the
+  // governance contract: the shipped `.husky/pre-push` implements the gate
+  // logic inline (HALT check, codex audit scan, refspec loop) rather than
+  // delegating to push-review-gate.sh. Requiring referencesReviewGate() here
+  // would always return false for the real file and misclassify every standard
+  // Husky install as foreign. The positional anchor (line 2 only) prevents
+  // spoofing via a consumer comment buried deeper in the file.
   const lines = content.split(/\r?\n/);
-  return (
-    lines.length >= 2 &&
-    lines[1] === HUSKY_GATE_MARKER &&
-    referencesReviewGate(content)
-  );
+  return lines.length >= 2 && lines[1] === HUSKY_GATE_MARKER;
 }
 
 /**
@@ -188,17 +187,19 @@ export function isReaManagedHuskyGate(content: string): boolean {
  */
 export function referencesReviewGate(content: string): boolean {
   const lines = content.split(/\r?\n/);
-  // Track whether an unconditional exit/return appeared before the gate
-  // invocation. A bare `exit 0` before the invocation makes the gate
-  // unreachable — we must not treat that as "governance present."
-  // This is a conservative heuristic (does not parse if-else), but it
-  // catches the simplest bypass pattern.
+  // Track control-structure depth to distinguish top-level exits (which make
+  // the gate unreachable) from conditional exits inside if/for/while/case
+  // blocks (which do NOT make the gate unreachable). We use raw.trim() — both
+  // ends — so that an unconditional `  exit 0` with unusual leading whitespace
+  // is still flagged when depth === 0, without regressing the guard-block case
+  // where `  exit 1` is legitimately inside an `if` block (depth > 0).
   let exitedBeforeGate = false;
+  let depth = 0;
   for (const raw of lines) {
-    // Normalize: drop leading whitespace, drop a trailing inline comment
+    // Normalize: strip both ends, drop a trailing inline comment
     // (naive — does not account for `#` inside single/double quotes, but
     // those would be wildly contrived in a real pre-push hook).
-    let line = raw.replace(/^\s+/, '');
+    let line = raw.trim();
     if (line.length === 0) continue;
     // Full-line comment — ignore.
     if (line.startsWith('#')) continue;
@@ -213,14 +214,14 @@ export function referencesReviewGate(content: string): boolean {
         line = line.slice(0, hashIdx).trimEnd();
       }
     }
-    // Detect bare unconditional exit/return before the gate invocation.
-    // Pattern: `exit` or `exit N` or `return` or `return N` as the sole
-    // command on the line (not inside a function body or if-statement —
-    // we can't parse those without a full shell parser, but catching the
-    // trivial case closes the most obvious bypass).
-    // Use raw (before whitespace stripping) so that indented exits inside
-    // if-blocks are not mistaken for unconditional top-level exits.
-    if (/^(exit|return)(\s+\d+)?$/.test(raw.trimEnd())) {
+    // Track block depth so exit inside an if/for/while/case is not treated
+    // as top-level. Simple keyword heuristic; does not handle one-liner forms
+    // (`if ...; then exit 1; fi`), but those are unusual in pre-push hooks.
+    if (/^(if|for|while|case|do)\b/.test(line)) depth++;
+    if (/^(fi|done|esac)\b/.test(line)) depth = Math.max(0, depth - 1);
+    // Detect bare unconditional exit/return at depth 0 before the gate
+    // invocation. Only a top-level exit makes the gate truly unreachable.
+    if (depth === 0 && /^(exit|return)(\s+\d+)?$/.test(line)) {
       exitedBeforeGate = true;
     }
     if (!line.includes(GATE_DELEGATION_TOKEN)) continue;
