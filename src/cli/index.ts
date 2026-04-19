@@ -76,7 +76,7 @@ async function main(): Promise<void> {
 
   program
     .command('serve')
-    .description('Start the MCP gateway (stub — prints status, verifies policy loads).')
+    .description('Start the MCP gateway — stdio server that proxies downstream MCPs declared in .rea/registry.yaml through the middleware chain.')
     .action(async () => {
       await runServe();
     });
