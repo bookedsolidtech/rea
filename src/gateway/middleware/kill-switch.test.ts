@@ -255,4 +255,67 @@ describe('kill-switch middleware', () => {
       expect(ctx.metadata.terminal_ran).toBe(false);
     }
   });
+
+  // ─────────────────── G5 blocker #4 — metrics integration ───────────────────
+
+  it('marks the halt-check gauge on every invocation (HALT absent path)', async () => {
+    const { MetricsRegistry } = await import('../observability/metrics.js');
+    const metrics = new MetricsRegistry();
+    // Registry starts with a startup-time mark, so reset it explicitly to
+    // the far past so we can detect a fresh per-call mark.
+    metrics.markHaltCheck(0);
+    const beforeSnap = metrics.snapshot();
+    expect(beforeSnap.lastHaltCheckMs).toBe(0);
+
+    const mw = createKillSwitchMiddleware(baseDir, metrics);
+    const ctx = freshCtx();
+    await mw(ctx, async () => {
+      /* terminal */
+    });
+
+    const afterSnap = metrics.snapshot();
+    // The middleware must have refreshed the gauge to a recent wall-clock
+    // moment, regardless of whether HALT was absent.
+    expect(afterSnap.lastHaltCheckMs).not.toBeNull();
+    expect(afterSnap.lastHaltCheckMs).toBeGreaterThan(beforeSnap.lastHaltCheckMs ?? 0);
+  });
+
+  it('marks the halt-check gauge on the HALT-present (deny) path', async () => {
+    const { MetricsRegistry } = await import('../observability/metrics.js');
+    const metrics = new MetricsRegistry();
+    metrics.markHaltCheck(0);
+
+    await fs.writeFile(path.join(baseDir, '.rea', 'HALT'), 'denied\n', 'utf8');
+    const mw = createKillSwitchMiddleware(baseDir, metrics);
+    const ctx = freshCtx();
+    await mw(ctx, async () => {
+      throw new Error('next should not be called');
+    });
+
+    expect(ctx.status).toBe(InvocationStatus.Denied);
+    const snap = metrics.snapshot();
+    // The gauge is marked BEFORE the fs.open — denial does not skip the mark.
+    expect(snap.lastHaltCheckMs).not.toBeNull();
+    expect(snap.lastHaltCheckMs).toBeGreaterThan(0);
+  });
+
+  it('swallows an infallible metrics failure without changing middleware behavior', async () => {
+    // A registry whose markHaltCheck throws must not take down the chain.
+    const brokenMetrics = {
+      markHaltCheck(): void {
+        throw new Error('metrics boom');
+      },
+    } as unknown as import('../observability/metrics.js').MetricsRegistry;
+
+    const mw = createKillSwitchMiddleware(baseDir, brokenMetrics);
+    const ctx = freshCtx();
+    let nextCalled = false;
+    await expect(
+      mw(ctx, async () => {
+        nextCalled = true;
+      }),
+    ).resolves.not.toThrow();
+    expect(nextCalled).toBe(true);
+    expect(ctx.metadata.halt_decision).toBe('absent');
+  });
 });
