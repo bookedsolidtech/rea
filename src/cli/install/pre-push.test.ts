@@ -20,8 +20,10 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   classifyPrePushInstall,
   FALLBACK_MARKER,
+  HUSKY_GATE_MARKER,
   inspectPrePushState,
   installPrePushFallback,
+  isReaManagedHuskyGate,
   referencesReviewGate,
 } from './pre-push.js';
 
@@ -850,5 +852,138 @@ describe('referencesReviewGate — positive-match only (Finding 1 regressions)',
       '',
     ].join('\n');
     expect(referencesReviewGate(content)).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Finding 1 (suffix-bypass) regression suite — .sh boundary lookahead
+//
+// Codex finding: both regexes in `looksLikeGateInvocation` ended at
+// `push-review-gate\.sh` with no word-boundary assertion. A `.sh.disabled`
+// or `.sh.bak` suffix still matched and returned `true`, allowing a
+// disabled-gate invocation to be misclassified as governance-carrying.
+// The fix adds `(?=\s|$|[;|&"'()])` after `.sh` in both forms.
+// ---------------------------------------------------------------------------
+describe('looksLikeGateInvocation — .sh suffix boundary (Finding 1)', () => {
+  const token = '.claude/hooks/push-review-gate.sh';
+
+  it('exec with .sh.disabled suffix: returns false', () => {
+    expect(
+      referencesReviewGate(`#!/bin/sh\nexec ${token}.disabled "$@"\n`),
+    ).toBe(false);
+  });
+
+  it('bare invocation with .sh.bak suffix: returns false', () => {
+    expect(
+      referencesReviewGate(`#!/bin/sh\n${token}.bak "$@"\n`),
+    ).toBe(false);
+  });
+
+  it('exec with .sh2 suffix: returns false', () => {
+    expect(
+      referencesReviewGate(`#!/bin/sh\nexec ${token}2 "$@"\n`),
+    ).toBe(false);
+  });
+
+  it('bare invocation with no suffix and args: still returns true (regression guard)', () => {
+    expect(
+      referencesReviewGate(`#!/bin/sh\n${token} "$@"\n`),
+    ).toBe(true);
+  });
+
+  it('exec with no suffix: still returns true (regression guard)', () => {
+    expect(
+      referencesReviewGate(`#!/bin/sh\nexec ${token}\n`),
+    ).toBe(true);
+  });
+
+  it('bare invocation with semicolon immediately after .sh: returns true', () => {
+    // Shell separator is a valid invocation boundary.
+    expect(
+      referencesReviewGate(`#!/bin/sh\n${token}; exit 0\n`),
+    ).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Finding 2 regression suite — Husky gate marker recognition
+//
+// Codex finding: `classifyExistingHook` only checked for `FALLBACK_MARKER`
+// (anchored prelude) and `referencesReviewGate`. The shipped `.husky/pre-push`
+// carries neither — it IS the gate (not a delegator), so it has no bare
+// `exec push-review-gate.sh` line. This caused `rea init` and `rea doctor`
+// to classify the default Husky install as `foreign/no-marker`.
+// The fix: add `HUSKY_GATE_MARKER` + `isReaManagedHuskyGate`, check it first.
+// ---------------------------------------------------------------------------
+describe('isReaManagedHuskyGate — Husky gate marker detection (Finding 2)', () => {
+  it('content with HUSKY_GATE_MARKER returns true', () => {
+    expect(isReaManagedHuskyGate(`#!/bin/sh\n${HUSKY_GATE_MARKER}\n# comment\n`)).toBe(true);
+  });
+
+  it('content without any marker returns false', () => {
+    expect(isReaManagedHuskyGate('#!/bin/sh\nnpx lint-staged\n')).toBe(false);
+  });
+
+  it('content with FALLBACK_MARKER but not HUSKY_GATE_MARKER returns false', () => {
+    expect(isReaManagedHuskyGate(`#!/bin/sh\n${FALLBACK_MARKER}\nexec /bin/true\n`)).toBe(false);
+  });
+});
+
+describe('classifyExistingHook — Husky gate marker integration (Finding 2)', () => {
+  let dir: string;
+
+  beforeEach(async () => {
+    dir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-prepush-hg-')));
+  });
+
+  afterEach(async () => {
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
+  it('hook containing HUSKY_GATE_MARKER: classified as rea-managed', async () => {
+    await initGitRepo(dir);
+    const huskyDir = path.join(dir, '.husky');
+    await fs.mkdir(huskyDir, { recursive: true });
+    await fs.writeFile(
+      path.join(huskyDir, 'pre-push'),
+      `#!/bin/sh\n${HUSKY_GATE_MARKER}\n# rea governance gate\nset -eu\n`,
+      { mode: 0o755 },
+    );
+    await execFileAsync('git', ['-C', dir, 'config', 'core.hooksPath', huskyDir]);
+
+    const decision = await classifyPrePushInstall(dir);
+    expect(decision.action).toBe('refresh');
+  });
+
+  it('hook containing only FALLBACK_MARKER: still classified as rea-managed', async () => {
+    await initGitRepo(dir);
+    const hooksDir = path.join(dir, '.git', 'hooks');
+    await fs.mkdir(hooksDir, { recursive: true });
+    await fs.writeFile(
+      path.join(hooksDir, 'pre-push'),
+      `#!/bin/sh\n${FALLBACK_MARKER}\nexec /bin/true\n`,
+      { mode: 0o755 },
+    );
+
+    const decision = await classifyPrePushInstall(dir);
+    expect(decision.action).toBe('refresh');
+  });
+
+  it('hook with neither marker but exec-ing the gate: classified as gate-delegating', async () => {
+    await initGitRepo(dir);
+    const hooksDir = path.join(dir, '.git', 'hooks');
+    await fs.mkdir(hooksDir, { recursive: true });
+    await fs.writeFile(
+      path.join(hooksDir, 'pre-push'),
+      '#!/bin/sh\nnpx lint-staged\nexec .claude/hooks/push-review-gate.sh "$@"\n',
+      { mode: 0o755 },
+    );
+
+    const decision = await classifyPrePushInstall(dir);
+    // gate-delegating + executable → active-pre-push-present (skip)
+    expect(decision.action).toBe('skip');
+    if (decision.action === 'skip') {
+      expect(decision.reason).toBe('active-pre-push-present');
+    }
   });
 });

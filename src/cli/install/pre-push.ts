@@ -92,6 +92,18 @@ const execFileAsync = promisify(execFile);
 export const FALLBACK_MARKER = '# rea:pre-push-fallback v1';
 
 /**
+ * Marker present in the shipped `.husky/pre-push` governance gate. Unlike
+ * `FALLBACK_MARKER`, which uses an anchored prelude check, this marker is
+ * detected by inclusion (`content.includes`) because the Husky file is not
+ * a rea-written artifact — its shebang and opening comments are fixed by the
+ * Husky toolchain, not by `rea init`. A substring match is sufficient because
+ * the marker string is long and structured enough that accidental collision
+ * with user content is negligible, and the anchored-prelude check remains the
+ * gold standard for `FALLBACK_MARKER`.
+ */
+export const HUSKY_GATE_MARKER = '# rea:husky-pre-push-gate v1';
+
+/**
  * Fixed two-line prelude every rea-managed fallback hook opens with. Used
  * to distinguish a real rea install from a file that merely happens to
  * contain the marker substring (consumer comment, grep log, copy-pasted
@@ -120,6 +132,21 @@ const GATE_DELEGATION_TOKEN = '.claude/hooks/push-review-gate.sh';
  */
 export function isReaManagedFallback(content: string): boolean {
   return content.startsWith(FALLBACK_PRELUDE);
+}
+
+/**
+ * True when `content` contains the shipped Husky gate marker. The marker is
+ * present in `.husky/pre-push` and signals that this is the rea-authored
+ * governance gate — not a lint-only Husky hook. Detection uses a substring
+ * match (not an anchored-prelude check) because the Husky shebang/header is
+ * not written by rea, so the marker may appear on any early line of the file.
+ *
+ * This classification is checked BEFORE `isReaManagedFallback` in
+ * `classifyExistingHook` so that the shipped `.husky/pre-push` is recognized
+ * as `rea-managed` rather than `foreign/no-marker`.
+ */
+export function isReaManagedHuskyGate(content: string): boolean {
+  return content.includes(HUSKY_GATE_MARKER);
 }
 
 /**
@@ -220,16 +247,22 @@ function looksLikeGateInvocation(line: string): boolean {
   // containing only path-safe characters) must start at position 0.
   // Characters like `=`, `[`, `(` before the gate token indicate a
   // non-invocation context and prevent a match.
+  //
+  // The lookahead `(?=\s|$|[;|&"'()])` enforces a word boundary after `.sh`
+  // so that `.sh.disabled`, `.sh.bak`, `.sh2` etc. do NOT match. Only
+  // whitespace, end-of-string, or a shell separator/quote following `.sh`
+  // constitutes a valid invocation boundary.
   const bareInvocationRe =
-    /^["']?[A-Za-z0-9_./${}~-]*\.claude\/hooks\/push-review-gate\.sh/;
+    /^["']?[A-Za-z0-9_./${}~-]*\.claude\/hooks\/push-review-gate\.sh(?=\s|$|[;|&"'()])/;
   if (bareInvocationRe.test(line)) {
     return true;
   }
 
   // Form 2: one of the explicit delegation keywords immediately before the
   // gate path. Pattern: keyword + one-or-more whitespace + gate-path.
+  // Same `.sh` boundary lookahead as Form 1 to prevent suffix bypass.
   const delegationRe =
-    /^(exec|source|sh|bash|zsh|\.)\s+["']?[A-Za-z0-9_./${}~-]*\.claude\/hooks\/push-review-gate\.sh/;
+    /^(exec|source|sh|bash|zsh|\.)\s+["']?[A-Za-z0-9_./${}~-]*\.claude\/hooks\/push-review-gate\.sh(?=\s|$|[;|&"'()])/;
   if (delegationRe.test(line)) {
     return true;
   }
@@ -285,6 +318,7 @@ async function classifyExistingHook(
   } catch {
     return { kind: 'foreign', reason: 'unreadable' };
   }
+  if (isReaManagedHuskyGate(content)) return { kind: 'rea-managed' };
   if (isReaManagedFallback(content)) return { kind: 'rea-managed' };
   if (referencesReviewGate(content)) return { kind: 'gate-delegating' };
   return { kind: 'foreign', reason: 'no-marker' };
