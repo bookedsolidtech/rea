@@ -149,15 +149,20 @@ export function isReaManagedFallback(content: string): boolean {
  * as a governance-carrying hook rather than `foreign/no-marker`.
  */
 export function isReaManagedHuskyGate(content: string): boolean {
-  // Require the marker on the SECOND LINE (after shebang). The marker IS the
-  // governance contract: the shipped `.husky/pre-push` implements the gate
-  // logic inline (HALT check, codex audit scan, refspec loop) rather than
-  // delegating to push-review-gate.sh. Requiring referencesReviewGate() here
-  // would always return false for the real file and misclassify every standard
-  // Husky install as foreign. The positional anchor (line 2 only) prevents
-  // spoofing via a consumer comment buried deeper in the file.
+  // Require the marker on the SECOND LINE (after shebang). The positional
+  // anchor (line 2 only) prevents spoofing via a consumer comment buried
+  // deeper in the file. The shipped `.husky/pre-push` implements the gate
+  // inline (HALT check, codex audit scan, refspec loop) rather than
+  // delegating to push-review-gate.sh — so referencesReviewGate() always
+  // returns false for it and must not be used as an additional predicate here.
+  //
+  // Body sentinel: the genuine rea gate ALWAYS contains a HALT check. Requiring
+  // `.rea/HALT` in the body closes the spoof vector where an attacker writes
+  // `#!/bin/sh\n# marker\nexit 0` — the marker is present but governance is
+  // absent.
   const lines = content.split(/\r?\n/);
-  return lines.length >= 2 && lines[1] === HUSKY_GATE_MARKER;
+  if (lines.length < 2 || lines[1] !== HUSKY_GATE_MARKER) return false;
+  return content.includes('.rea/HALT');
 }
 
 /**

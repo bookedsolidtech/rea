@@ -946,23 +946,27 @@ describe('looksLikeGateInvocation — .sh suffix boundary (Finding 1)', () => {
 // The fix: add `HUSKY_GATE_MARKER` + `isReaManagedHuskyGate`, check it first.
 // ---------------------------------------------------------------------------
 describe('isReaManagedHuskyGate — Husky gate marker detection (Finding 2)', () => {
-  it('marker at line 2 (after shebang): returns true', () => {
-    // Canonical structure: shebang on line 1, marker on line 2.
-    // The shipped .husky/pre-push IS the gate (inline implementation, no exec
-    // delegation), so marker presence alone is the governance contract.
-    expect(isReaManagedHuskyGate(`#!/bin/sh\n${HUSKY_GATE_MARKER}\n# comment\n`)).toBe(true);
-  });
-
-  it('marker at line 2 with gate body content: returns true', () => {
+  it('marker at line 2 with HALT sentinel: returns true', () => {
+    // Canonical check: shebang, marker, body containing .rea/HALT.
     expect(
-      isReaManagedHuskyGate(`#!/bin/sh\n${HUSKY_GATE_MARKER}\nset -eu\nsome-command\n`),
+      isReaManagedHuskyGate(
+        `#!/bin/sh\n${HUSKY_GATE_MARKER}\n[ -f .rea/HALT ] && exit 1\nexec ./gate.sh\n`,
+      ),
     ).toBe(true);
   });
 
-  it('marker at line 2 + exit 0 body (governance assumed by marker): returns true', () => {
-    // The marker IS the contract. A spoofed `exit 0` body is a consumer choice
-    // to bypass their own governance — not a false-negative in the classifier.
-    expect(isReaManagedHuskyGate(`#!/bin/sh\n${HUSKY_GATE_MARKER}\nexit 0\n`)).toBe(true);
+  it('marker at line 2 with full gate body: returns true', () => {
+    expect(
+      isReaManagedHuskyGate(
+        `#!/bin/sh\n${HUSKY_GATE_MARKER}\nset -eu\nif [ -f .rea/HALT ]; then exit 1; fi\nsome-command\n`,
+      ),
+    ).toBe(true);
+  });
+
+  it('marker at line 2 but exit 0 body without HALT sentinel: returns false (spoofed gate)', () => {
+    // Spoof vector: marker present but body is `exit 0` with no governance.
+    // Marker alone is insufficient — the HALT sentinel must also be present.
+    expect(isReaManagedHuskyGate(`#!/bin/sh\n${HUSKY_GATE_MARKER}\nexit 0\n`)).toBe(false);
   });
 
   it('content without any marker returns false', () => {
@@ -1003,7 +1007,7 @@ describe('isReaManagedHuskyGate — real shipped .husky/pre-push (regression)', 
   it('actual shipped .husky/pre-push is recognized as rea-managed', async () => {
     // Closes detector/artifact divergence: the real file implements the gate
     // inline (no exec delegation) so referencesReviewGate() returns false for
-    // it. isReaManagedHuskyGate() must return true based on marker alone.
+    // it. isReaManagedHuskyGate() must return true via marker + HALT sentinel.
     const huskyPrePush = await fs
       .readFile(
         path.resolve(fileURLToPath(import.meta.url), '../../../../.husky/pre-push'),
@@ -1197,15 +1201,16 @@ describe('inspectPrePushState — Husky gate recognized as rea-managed (Finding 
     await fs.rm(dir, { recursive: true, force: true });
   });
 
-  it('hooksPath=.husky + Husky gate marker at line 2: ok=true, reaManaged=true', async () => {
+  it('hooksPath=.husky + Husky gate marker at line 2 + HALT sentinel: ok=true, reaManaged=true', async () => {
     // Core regression. Without the fix, activeForeign would be true and
     // `rea doctor` would hard-fail on a correctly governed repo.
+    // Fixture includes the HALT sentinel so isReaManagedHuskyGate returns true.
     await initGitRepo(dir);
     const huskyDir = path.join(dir, '.husky');
     await fs.mkdir(huskyDir, { recursive: true });
     await fs.writeFile(
       path.join(huskyDir, 'pre-push'),
-      `#!/bin/sh\n${HUSKY_GATE_MARKER}\nexec .claude/hooks/push-review-gate.sh "$@"\n`,
+      `#!/bin/sh\n${HUSKY_GATE_MARKER}\n[ -f .rea/HALT ] && exit 1\nexec .claude/hooks/push-review-gate.sh "$@"\n`,
       { mode: 0o755 },
     );
     await execFileAsync('git', ['-C', dir, 'config', 'core.hooksPath', huskyDir]);
