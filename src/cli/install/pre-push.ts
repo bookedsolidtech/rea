@@ -163,41 +163,52 @@ export function isReaManagedHuskyGate(content: string): boolean {
   const lines = content.split(/\r?\n/);
   if (lines.length < 2 || lines[1] !== HUSKY_GATE_MARKER) return false;
 
-  // A genuine gate must contain substantive executable content — at least one
-  // non-comment, non-blank, non-trivial-noop line. A stub body with only
-  // `exit 0`, `return 0`, `:` (colon builtin), or `true` must not pass.
-  // R9 F1 targeted `exit N` / `return N`; R10 F3 extends the noop set to
-  // close `:` and `true` bypass vectors (both exported markers are public,
-  // so marker-plus-noop is a real spoof surface).
-  const hasSubstantiveContent = lines.some((raw) => {
-    const t = raw.trimStart();
-    return (
-      t.length > 0 &&
-      !t.startsWith('#') &&
-      !/^(exit|return)(\s+\d+)?\s*$/.test(t) &&
-      !/^:\s*$/.test(t) &&
-      !/^true\s*$/.test(t)
-    );
-  });
-  if (!hasSubstantiveContent) return false;
-
-  // Fresh install: body marker present — definitive two-factor match.
-  if (content.includes(HUSKY_GATE_BODY_MARKER)) return true;
-
-  // Backward-compat: rea gates installed before R6 have the header marker and
-  // the HALT sentinel but not the body marker (added in this release). Recognize
-  // them as rea-managed so existing governed repos are not reclassified as
-  // `foreign` after upgrading rea. The body marker is added on the next
-  // `rea init` or `rea upgrade` run.
+  // R11 F1: marker comments are public and trivially copyable — they cannot
+  // carry a security claim on their own. A genuine gate MUST have both
+  // behavioral signatures that make the file actually enforce governance:
   //
-  // Require an actual POSIX shell test form (`[ -f ... .rea/HALT` or
-  // `test -f ... .rea/HALT`) on a non-comment line. A raw substring match
-  // would accept `# check .rea/HALT` — a comment mention — as legacy-managed.
-  return lines.some((raw) => {
+  //   1. HALT test  — the gate must detect `.rea/HALT` and abort the push.
+  //                   Requires a POSIX shell test form on a non-comment line
+  //                   (`[ -f ... .rea/HALT` or `test -f ... .rea/HALT`).
+  //                   A raw comment mention (`# check .rea/HALT`) does NOT
+  //                   satisfy — the test form must be executable.
+  //
+  //   2. Audit reference — the gate must consult the audit log to verify
+  //                   a Codex review exists before protected-path pushes.
+  //                   Either the audit log path (`.rea/audit.jsonl`) or
+  //                   the Codex review event name (`codex.review`) must
+  //                   appear on a non-comment line.
+  //
+  // Both together are hard to fake without actually implementing the gate.
+  // A hook with `#!/bin/sh` + markers + `exec /bin/true` passes the marker
+  // check but cannot satisfy EITHER behavioral signature. This is the
+  // fundamental recognition — governance is a behavior, not a sticker.
+  let hasHaltTest = false;
+  let hasAuditReference = false;
+  for (const raw of lines) {
     const t = raw.trimStart();
-    if (t.startsWith('#')) return false;
-    return /\[[ \t]+-f[^\n]*\.rea\/HALT/.test(t) || /\btest[ \t]+-f[^\n]*\.rea\/HALT/.test(t);
-  });
+    if (t.startsWith('#')) continue;
+    if (!hasHaltTest) {
+      if (
+        /\[[ \t]+-f[^\n]*\.rea\/HALT/.test(t) ||
+        /\btest[ \t]+-f[^\n]*\.rea\/HALT/.test(t)
+      ) {
+        hasHaltTest = true;
+      }
+    }
+    if (!hasAuditReference) {
+      if (/\.rea\/audit\.jsonl/.test(t) || /codex\.review/.test(t)) {
+        hasAuditReference = true;
+      }
+    }
+    if (hasHaltTest && hasAuditReference) break;
+  }
+  if (!hasHaltTest || !hasAuditReference) return false;
+
+  // Both behavioral signatures confirmed. The body marker (when present)
+  // identifies a fresh install — useful for telemetry/upgrade paths — but
+  // is NOT the security boundary: recognition is gated by behavior above.
+  return true;
 }
 
 /**
@@ -995,13 +1006,19 @@ export async function installPrePushFallback(
           }
         } else {
           // refresh
-          // Accept both `rea-managed` (fallback marker) and `rea-managed-husky`
-          // (Husky gate) as valid governance — if a race replaced the fallback
-          // with the canonical Husky gate we must not overwrite it.
-          if (
-            reCheck.kind !== 'rea-managed' &&
-            reCheck.kind !== 'rea-managed-husky'
-          ) {
+          if (reCheck.kind === 'rea-managed-husky') {
+            // R11 F2: a canonical Husky gate replaced the fallback between
+            // classify and write. Do NOT proceed to writeExecutable — the
+            // Husky gate is the authoritative rea-authored hook and must
+            // never be clobbered by the fallback. Terminal skip.
+            result.decision = {
+              action: 'skip',
+              reason: 'active-pre-push-present',
+              hookPath: decision.hookPath,
+            };
+            return result;
+          }
+          if (reCheck.kind !== 'rea-managed') {
             result.warnings.push(
               `pre-push hook at ${decision.hookPath} is no longer rea-managed — ` +
                 `leaving it untouched.`,

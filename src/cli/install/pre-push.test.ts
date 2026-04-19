@@ -637,6 +637,44 @@ describe('installPrePushFallback — concurrency + temp-file hygiene', () => {
     expect(stat.isDirectory()).toBe(true);
   });
 
+  it('R11 F2: race: Husky gate replaces fallback between classify and re-check → skip, do NOT overwrite', async () => {
+    // Codex R11 F2: the refresh path previously accepted rea-managed-husky
+    // from the re-check and fell through to writeExecutable, clobbering the
+    // canonical gate. The fix turns rea-managed-husky into a terminal skip
+    // regardless of what the first-pass classify returned.
+    await initGitRepo(dir);
+    const hooksDir = path.join(dir, '.git', 'hooks');
+    await fs.mkdir(hooksDir, { recursive: true });
+    // Seed a rea-managed fallback so the classifier selects `refresh`.
+    const fallbackBody = `#!/bin/sh\n${FALLBACK_MARKER}\nexec ./gate.sh\n`;
+    await fs.writeFile(path.join(hooksDir, 'pre-push'), fallbackBody, {
+      mode: 0o755,
+    });
+
+    // The canonical Husky gate carries a full behavioral signature.
+    const huskyBody =
+      `#!/bin/sh\n${HUSKY_GATE_MARKER}\n${HUSKY_GATE_BODY_MARKER}\n` +
+      `if [ -f "\${REA_ROOT}/.rea/HALT" ]; then exit 1; fi\n` +
+      `grep -q codex.review .rea/audit.jsonl\n`;
+
+    const result = await installPrePushFallback(dir, {
+      onBeforeReresolve: async (hookPath) => {
+        // Another process replaces the fallback with the canonical gate
+        // between the initial classify (refresh) and the re-check.
+        await fs.writeFile(hookPath, huskyBody, { mode: 0o755 });
+      },
+    });
+
+    expect(result.written).toBeUndefined();
+    expect(result.decision.action).toBe('skip');
+    if (result.decision.action === 'skip') {
+      expect(result.decision.reason).toBe('active-pre-push-present');
+    }
+    // Husky gate is preserved byte-for-byte — NOT overwritten by fallback.
+    const after = await fs.readFile(path.join(hooksDir, 'pre-push'), 'utf8');
+    expect(after).toBe(huskyBody);
+  });
+
   it('race: file appears between re-check and write (EEXIST from link) → clean skip', async () => {
     // Codex finding 2 — final window: after the safety re-check passes,
     // but before writeExecutable completes, another process creates the
@@ -950,19 +988,67 @@ describe('looksLikeGateInvocation — .sh suffix boundary (Finding 1)', () => {
 // The fix: add `HUSKY_GATE_MARKER` + `isReaManagedHuskyGate`, check it first.
 // ---------------------------------------------------------------------------
 describe('isReaManagedHuskyGate — Husky gate marker detection (Finding 2)', () => {
-  it('marker at line 2 with body marker: returns true', () => {
-    // Canonical check: header marker on line 2 + body marker anywhere.
+  it('marker at line 2 + HALT test + audit reference (full behavioral signature): returns true', () => {
+    // R11 F1: behavioral signature required — both HALT test AND audit log
+    // reference must appear on non-comment lines. Markers are public, so
+    // they cannot be the security boundary.
     expect(
       isReaManagedHuskyGate(
-        `#!/bin/sh\n${HUSKY_GATE_MARKER}\n${HUSKY_GATE_BODY_MARKER}\n[ -f .rea/HALT ] && exit 1\nexec ./gate.sh\n`,
+        `#!/bin/sh\n${HUSKY_GATE_MARKER}\n${HUSKY_GATE_BODY_MARKER}\n[ -f .rea/HALT ] && exit 1\ngrep codex.review .rea/audit.jsonl\n`,
       ),
     ).toBe(true);
   });
 
+  it('R11 F1: both markers + HALT test only (no audit ref): returns false', () => {
+    // Codex R11 finding: marker-only stub with `exec /bin/true` previously
+    // passed because hasSubstantiveContent accepted any non-noop line.
+    // Now both behavioral signatures must appear.
+    expect(
+      isReaManagedHuskyGate(
+        `#!/bin/sh\n${HUSKY_GATE_MARKER}\n${HUSKY_GATE_BODY_MARKER}\n[ -f .rea/HALT ] && exit 1\nexec /bin/true\n`,
+      ),
+    ).toBe(false);
+  });
+
+  it('R11 F1: both markers + audit ref only (no HALT test): returns false', () => {
+    expect(
+      isReaManagedHuskyGate(
+        `#!/bin/sh\n${HUSKY_GATE_MARKER}\n${HUSKY_GATE_BODY_MARKER}\ngrep codex.review .rea/audit.jsonl\nexec /bin/true\n`,
+      ),
+    ).toBe(false);
+  });
+
+  it('R11 F1: both markers + exec /bin/true only (the critical spoof): returns false', () => {
+    // Exact case from Codex R11: a foreign hook with markers + exec /bin/true
+    // would have passed hasSubstantiveContent but never enforced governance.
+    expect(
+      isReaManagedHuskyGate(
+        `#!/bin/sh\n${HUSKY_GATE_MARKER}\n${HUSKY_GATE_BODY_MARKER}\nexec /bin/true\n`,
+      ),
+    ).toBe(false);
+  });
+
+  it('R11 F1: HALT test in comment only (not executable): returns false even with audit ref', () => {
+    // The HALT check must be in the form of an actual POSIX test, not a
+    // comment mention.
+    expect(
+      isReaManagedHuskyGate(
+        `#!/bin/sh\n${HUSKY_GATE_MARKER}\n${HUSKY_GATE_BODY_MARKER}\n# checks .rea/HALT for freeze\ngrep codex.review .rea/audit.jsonl\n`,
+      ),
+    ).toBe(false);
+  });
+
+  it('R11 F1: audit ref in comment only: returns false even with HALT test', () => {
+    expect(
+      isReaManagedHuskyGate(
+        `#!/bin/sh\n${HUSKY_GATE_MARKER}\n${HUSKY_GATE_BODY_MARKER}\n[ -f .rea/HALT ] && exit 1\n# references .rea/audit.jsonl\n`,
+      ),
+    ).toBe(false);
+  });
+
   it('R9 F1: both markers present but only exit 0 as executable content: returns false', () => {
-    // Codex R9 finding: a stub with only two marker comments + `exit 0` must
-    // not be classified as a genuine gate. hasSubstantiveContent requires at
-    // least one non-comment, non-blank, non-trivial-exit line.
+    // Codex R9 finding: stub with markers + `exit 0` must not be classified
+    // as a genuine gate. Now also fails the R11 behavioral signature check.
     expect(
       isReaManagedHuskyGate(`#!/bin/sh\n${HUSKY_GATE_MARKER}\n${HUSKY_GATE_BODY_MARKER}\nexit 0\n`),
     ).toBe(false);
@@ -975,8 +1061,6 @@ describe('isReaManagedHuskyGate — Husky gate marker detection (Finding 2)', ()
   });
 
   it('R10 F3: both markers + only `:` (colon noop) as executable content: returns false', () => {
-    // Codex R10 finding: colon builtin is a valid zero-op shell command.
-    // A stub of markers + `:\nexit 0` previously passed hasSubstantiveContent.
     expect(
       isReaManagedHuskyGate(`#!/bin/sh\n${HUSKY_GATE_MARKER}\n${HUSKY_GATE_BODY_MARKER}\n:\nexit 0\n`),
     ).toBe(false);
@@ -996,10 +1080,9 @@ describe('isReaManagedHuskyGate — Husky gate marker detection (Finding 2)', ()
     ).toBe(false);
   });
 
-  it('R10 F4: CRLF line endings with both markers + substantive body: returns true', () => {
+  it('R10 F4: CRLF line endings with full behavioral signature: returns true', () => {
     // Windows checkouts or `text=auto` gitattributes may produce CRLF.
-    // Split pattern `/\r?\n/` already handles this; test documents it.
-    const content = `#!/bin/sh\r\n${HUSKY_GATE_MARKER}\r\n${HUSKY_GATE_BODY_MARKER}\r\n[ -f .rea/HALT ] && exit 1\r\nexec ./gate.sh\r\n`;
+    const content = `#!/bin/sh\r\n${HUSKY_GATE_MARKER}\r\n${HUSKY_GATE_BODY_MARKER}\r\n[ -f .rea/HALT ] && exit 1\r\ngrep codex.review .rea/audit.jsonl\r\n`;
     expect(isReaManagedHuskyGate(content)).toBe(true);
   });
 
@@ -1008,23 +1091,14 @@ describe('isReaManagedHuskyGate — Husky gate marker detection (Finding 2)', ()
     expect(isReaManagedHuskyGate(content)).toBe(false);
   });
 
-  it('marker at line 2 with body marker in non-comment form: returns true', () => {
-    expect(
-      isReaManagedHuskyGate(
-        `#!/bin/sh\n${HUSKY_GATE_MARKER}\nset -eu\n${HUSKY_GATE_BODY_MARKER}\nsome-command\n`,
-      ),
-    ).toBe(true);
-  });
-
-  it('marker at line 2 but no body marker (exit 0 body): returns false (spoofed gate)', () => {
-    // Two-factor failure: header marker present but body marker absent.
-    // A stub body with `exit 0` cannot satisfy the body-marker requirement.
+  it('marker at line 2 but no body marker (exit 0 body): returns false (no behavioral signature)', () => {
     expect(isReaManagedHuskyGate(`#!/bin/sh\n${HUSKY_GATE_MARKER}\nexit 0\n`)).toBe(false);
   });
 
-  it('marker at line 2 + POSIX HALT test on non-comment line: returns true (legacy backward-compat)', () => {
-    // R7 backward-compat + R8 tightening: pre-R6 gates have the header marker
-    // and an actual [ -f .rea/HALT ] test but no body marker. Must return true.
+  it('marker at line 2 + POSIX HALT test + audit reference (legacy backward-compat): returns true', () => {
+    // R7 backward-compat: pre-R6 gates had the header marker and behavioral
+    // signature but no body marker. Must still return true — the body marker
+    // is telemetry, not the security boundary.
     expect(
       isReaManagedHuskyGate(
         `#!/bin/sh\n${HUSKY_GATE_MARKER}\nif [ -f "\${REA_ROOT}/.rea/HALT" ]; then exit 1; fi\nif grep -q codex.review .rea/audit.jsonl; then\n  exit 0\nfi\nexit 1\n`,
@@ -1033,14 +1107,12 @@ describe('isReaManagedHuskyGate — Husky gate marker detection (Finding 2)', ()
   });
 
   it('marker at line 2 + HALT in comment only (no POSIX test): returns false', () => {
-    // R8: comment-mention of .rea/HALT must not satisfy legacy check.
     expect(
       isReaManagedHuskyGate(`#!/bin/sh\n${HUSKY_GATE_MARKER}\n# check .rea/HALT here\nexit 0\n`),
     ).toBe(false);
   });
 
-  it('marker at line 2 + no body marker + no HALT sentinel: returns false (stub body)', () => {
-    // Only the header marker — body is entirely absent of both sentinels.
+  it('marker at line 2 + no body marker + no behavioral signature: returns false', () => {
     expect(isReaManagedHuskyGate(`#!/bin/sh\n${HUSKY_GATE_MARKER}\nexit 0\n`)).toBe(false);
   });
 
@@ -1289,12 +1361,17 @@ describe('classifyExistingHook — Husky gate marker integration (Finding 2)', (
     // The canonical Husky gate is governance-carrying but must NEVER be
     // overwritten by the fallback installer. `classifyPrePushInstall` must
     // return skip/active-pre-push-present, NOT refresh.
+    //
+    // R11: the behavioral signature (HALT test + audit reference) is
+    // required for the husky gate to be recognized — markers alone are
+    // spoofable. The fixture below mirrors the minimum governance body
+    // required by `isReaManagedHuskyGate`.
     await initGitRepo(dir);
     const huskyDir = path.join(dir, '.husky');
     await fs.mkdir(huskyDir, { recursive: true });
     await fs.writeFile(
       path.join(huskyDir, 'pre-push'),
-      `#!/bin/sh\n${HUSKY_GATE_MARKER}\nexec .claude/hooks/push-review-gate.sh "$@"\n`,
+      `#!/bin/sh\n${HUSKY_GATE_MARKER}\n[ -f .rea/HALT ] && exit 1\ngrep '"tool_name":"codex.review"' .rea/audit.jsonl || exit 1\nexec .claude/hooks/push-review-gate.sh "$@"\n`,
       { mode: 0o755 },
     );
     await execFileAsync('git', ['-C', dir, 'config', 'core.hooksPath', huskyDir]);
@@ -1311,7 +1388,7 @@ describe('classifyExistingHook — Husky gate marker integration (Finding 2)', (
     await initGitRepo(dir);
     const huskyDir = path.join(dir, '.husky');
     await fs.mkdir(huskyDir, { recursive: true });
-    const originalContent = `#!/bin/sh\n${HUSKY_GATE_MARKER}\nexec .claude/hooks/push-review-gate.sh "$@"\n`;
+    const originalContent = `#!/bin/sh\n${HUSKY_GATE_MARKER}\n[ -f .rea/HALT ] && exit 1\ngrep '"tool_name":"codex.review"' .rea/audit.jsonl || exit 1\nexec .claude/hooks/push-review-gate.sh "$@"\n`;
     await fs.writeFile(path.join(huskyDir, 'pre-push'), originalContent, { mode: 0o755 });
     await execFileAsync('git', ['-C', dir, 'config', 'core.hooksPath', huskyDir]);
 
@@ -1410,7 +1487,7 @@ describe('inspectPrePushState — Husky gate recognized as rea-managed (Finding 
     await fs.mkdir(huskyDir, { recursive: true });
     await fs.writeFile(
       path.join(huskyDir, 'pre-push'),
-      `#!/bin/sh\n${HUSKY_GATE_MARKER}\n${HUSKY_GATE_BODY_MARKER}\n[ -f .rea/HALT ] && exit 1\nexec .claude/hooks/push-review-gate.sh "$@"\n`,
+      `#!/bin/sh\n${HUSKY_GATE_MARKER}\n${HUSKY_GATE_BODY_MARKER}\n[ -f .rea/HALT ] && exit 1\ngrep '"tool_name":"codex.review"' .rea/audit.jsonl || exit 1\nexec .claude/hooks/push-review-gate.sh "$@"\n`,
       { mode: 0o755 },
     );
     await execFileAsync('git', ['-C', dir, 'config', 'core.hooksPath', huskyDir]);
