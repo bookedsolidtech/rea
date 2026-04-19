@@ -2355,6 +2355,267 @@ describe('isReaManagedHuskyGate — R26 F1 dead-conditional reachability', () =>
   });
 });
 
+describe('isReaManagedHuskyGate — R27 F1 echo-spoof grep head', () => {
+  // Codex R27 F1: prior `isAuditGrepLine` word-boundary matched `grep` anywhere
+  // in the line, so a hook whose audit-if condition was `echo "grep
+  // codex.review .rea/audit.jsonl"` passed the classifier — echo succeeds
+  // unconditionally and form-(b) (positive-if with blocking else) would
+  // never enter the else branch. The R27 fix restricts grep detection to
+  // the HEAD command of a pipeline segment, so echo-with-grep-in-args no
+  // longer satisfies the audit-grep contract.
+
+  const MARKER = '# rea:husky-pre-push-gate v1';
+  const BODY_MARKER = '# rea:gate-body-v1';
+  const haltBlock = [
+    'if [ -f "${REA_ROOT}/.rea/HALT" ]; then',
+    '  exit 1',
+    'fi',
+  ].join('\n');
+  const withMarkers = (body: string): string =>
+    ['#!/bin/sh', MARKER, BODY_MARKER, 'set -eu', 'REA_ROOT=$(pwd)', haltBlock, body, 'exit 0'].join('\n');
+
+  it('echo spoof `if ! echo "grep codex.review .rea/audit.jsonl"; then exit 1; fi` is NOT rea-managed', () => {
+    const content = withMarkers(
+      [
+        'AUDIT_LOG="${REA_ROOT}/.rea/audit.jsonl"',
+        'if ! echo "grep codex.review .rea/audit.jsonl"; then',
+        '  exit 1',
+        'fi',
+      ].join('\n'),
+    );
+    expect(isReaManagedHuskyGate(content)).toBe(false);
+  });
+
+  it('echo spoof form-(b) `if echo "grep codex.review ..."; then :; else exit 1; fi` is NOT rea-managed', () => {
+    const content = withMarkers(
+      [
+        'AUDIT_LOG="${REA_ROOT}/.rea/audit.jsonl"',
+        'if echo "grep codex.review $AUDIT_LOG"; then',
+        '  :',
+        'else',
+        '  exit 1',
+        'fi',
+      ].join('\n'),
+    );
+    expect(isReaManagedHuskyGate(content)).toBe(false);
+  });
+
+  it('printf spoof `if ! printf "grep codex.review .rea/audit.jsonl\\n"; then exit 1; fi` is NOT rea-managed', () => {
+    const content = withMarkers(
+      [
+        'AUDIT_LOG="${REA_ROOT}/.rea/audit.jsonl"',
+        'if ! printf "grep codex.review .rea/audit.jsonl\\n"; then',
+        '  exit 1',
+        'fi',
+      ].join('\n'),
+    );
+    expect(isReaManagedHuskyGate(content)).toBe(false);
+  });
+
+  it('cat spoof `if ! cat "grep codex.review .rea/audit.jsonl"; then exit 1; fi` is NOT rea-managed', () => {
+    const content = withMarkers(
+      [
+        'AUDIT_LOG="${REA_ROOT}/.rea/audit.jsonl"',
+        'if ! cat "grep codex.review .rea/audit.jsonl"; then',
+        '  exit 1',
+        'fi',
+      ].join('\n'),
+    );
+    expect(isReaManagedHuskyGate(content)).toBe(false);
+  });
+
+  it('real grep at head `if ! grep -qE codex.review "$AUDIT_LOG"; then exit 1; fi` IS rea-managed', () => {
+    const content = withMarkers(
+      [
+        'AUDIT_LOG="${REA_ROOT}/.rea/audit.jsonl"',
+        'if ! grep -qE \'"tool_name":"codex\\.review"\' "$AUDIT_LOG"; then',
+        '  exit 1',
+        'fi',
+      ].join('\n'),
+    );
+    expect(isReaManagedHuskyGate(content)).toBe(true);
+  });
+
+  it('real grep piped to grep `if ! grep -E X "$AUDIT" | grep -qF Y; then exit 1; fi` IS rea-managed', () => {
+    // Canonical shipped form — grep-family head in BOTH pipeline segments.
+    const content = withMarkers(
+      [
+        'AUDIT_LOG="${REA_ROOT}/.rea/audit.jsonl"',
+        'if ! grep -E \'"tool_name":"codex\\.review"\' "$AUDIT_LOG" 2>/dev/null | grep -qF "\\"head_sha\\":\\"$HEAD\\""; then',
+        '  exit 1',
+        'fi',
+      ].join('\n'),
+    );
+    expect(isReaManagedHuskyGate(content)).toBe(true);
+  });
+
+  it('/usr/bin/grep path-qualified at head IS rea-managed', () => {
+    const content = withMarkers(
+      [
+        'AUDIT_LOG="${REA_ROOT}/.rea/audit.jsonl"',
+        'if ! /usr/bin/grep -qE \'"tool_name":"codex\\.review"\' "$AUDIT_LOG"; then',
+        '  exit 1',
+        'fi',
+      ].join('\n'),
+    );
+    expect(isReaManagedHuskyGate(content)).toBe(true);
+  });
+});
+
+describe('isReaManagedHuskyGate — R27 F2 case-branch reachability', () => {
+  // Codex R27 F2: audit-if and HALT proofs buried inside a statically-dead
+  // `case` branch previously satisfied the classifier because `case` was
+  // not tracked as an enclosing construct. The fix: push a `CaseFrame` on
+  // `case WORD in`, flip `curBranchLive` on every `PATTERN)` based on
+  // static scrutinee/pattern match, and require every open case frame to
+  // have a live current branch before returning true from audit-if fi-pop
+  // or HALT fi-pop.
+
+  const MARKER = '# rea:husky-pre-push-gate v1';
+  const BODY_MARKER = '# rea:gate-body-v1';
+  const haltBlock = [
+    'if [ -f "${REA_ROOT}/.rea/HALT" ]; then',
+    '  exit 1',
+    'fi',
+  ].join('\n');
+  const auditIf = [
+    'AUDIT_LOG="${REA_ROOT}/.rea/audit.jsonl"',
+    'if ! grep -qE \'"tool_name":"codex\\.review"\' "$AUDIT_LOG"; then',
+    '  exit 1',
+    'fi',
+  ].join('\n');
+  const withMarkers = (body: string): string =>
+    ['#!/bin/sh', MARKER, BODY_MARKER, 'set -eu', 'REA_ROOT=$(pwd)', haltBlock, body, 'exit 0'].join('\n');
+
+  it('audit-if inside dead `case "a" in "b") ... ;; esac` branch is NOT rea-managed', () => {
+    const content = withMarkers(
+      [
+        'case "a" in',
+        '  "b")',
+        auditIf,
+        '    ;;',
+        'esac',
+      ].join('\n'),
+    );
+    expect(isReaManagedHuskyGate(content)).toBe(false);
+  });
+
+  it('audit-if inside dead bareword case `case foo in bar) ... ;; esac` branch is NOT rea-managed', () => {
+    const content = withMarkers(
+      [
+        'case foo in',
+        '  bar)',
+        auditIf,
+        '    ;;',
+        'esac',
+      ].join('\n'),
+    );
+    expect(isReaManagedHuskyGate(content)).toBe(false);
+  });
+
+  it('audit-if inside live `case "a" in "a") ... ;; esac` branch IS rea-managed', () => {
+    const content = withMarkers(
+      [
+        'case "a" in',
+        '  "a")',
+        auditIf,
+        '    ;;',
+        'esac',
+      ].join('\n'),
+    );
+    expect(isReaManagedHuskyGate(content)).toBe(true);
+  });
+
+  it('audit-if inside `case "a" in *) ... ;; esac` (glob default) IS rea-managed', () => {
+    const content = withMarkers(
+      [
+        'case "a" in',
+        '  *)',
+        auditIf,
+        '    ;;',
+        'esac',
+      ].join('\n'),
+    );
+    expect(isReaManagedHuskyGate(content)).toBe(true);
+  });
+
+  it('audit-if inside dynamic-scrutinee `case "$X" in "b") ... ;; esac` IS rea-managed', () => {
+    // Dynamic scrutinee cannot be statically ruled out — every branch is
+    // potentially live. Must accept.
+    const content = withMarkers(
+      [
+        'case "$REA_ROOT" in',
+        '  "/does/not/match")',
+        auditIf,
+        '    ;;',
+        'esac',
+      ].join('\n'),
+    );
+    expect(isReaManagedHuskyGate(content)).toBe(true);
+  });
+
+  it('audit-if inside `case "a" in "x"|"a") ... ;; esac` (one-alt matches) IS rea-managed', () => {
+    const content = withMarkers(
+      [
+        'case "a" in',
+        '  "x"|"a")',
+        auditIf,
+        '    ;;',
+        'esac',
+      ].join('\n'),
+    );
+    expect(isReaManagedHuskyGate(content)).toBe(true);
+  });
+
+  it('HALT enforcement inside dead `case "a" in "b") [ -f HALT ] && exit 1 ;; esac` is NOT rea-managed', () => {
+    // HALT enforcement path through hasHaltEnforcement — same attack vector.
+    // We drop the outer haltBlock from withMarkers helpers and inline a
+    // case-wrapped HALT so the only HALT proof is the dead one.
+    const content = [
+      '#!/bin/sh',
+      MARKER,
+      BODY_MARKER,
+      'set -eu',
+      'REA_ROOT=$(pwd)',
+      'case "a" in',
+      '  "b")',
+      '    [ -f "${REA_ROOT}/.rea/HALT" ] && exit 1',
+      '    ;;',
+      'esac',
+      'AUDIT_LOG="${REA_ROOT}/.rea/audit.jsonl"',
+      'if ! grep -qE \'"tool_name":"codex\\.review"\' "$AUDIT_LOG"; then',
+      '  exit 1',
+      'fi',
+      'exit 0',
+    ].join('\n');
+    expect(isReaManagedHuskyGate(content)).toBe(false);
+  });
+
+  it('post-esac top-level HALT enforcement IS rea-managed (case does not swallow live top-level proof)', () => {
+    // Sanity check: a benign case ABOVE the HALT/audit proofs must not
+    // break the classifier. The case itself proves nothing, but once
+    // closed with esac the HALT/audit proofs at top level should stand.
+    const content = [
+      '#!/bin/sh',
+      MARKER,
+      BODY_MARKER,
+      'set -eu',
+      'REA_ROOT=$(pwd)',
+      'case "$REA_ROOT" in',
+      '  /tmp/*) exit 1 ;;',
+      '  *) : ;;',
+      'esac',
+      haltBlock,
+      'AUDIT_LOG="${REA_ROOT}/.rea/audit.jsonl"',
+      'if ! grep -qE \'"tool_name":"codex\\.review"\' "$AUDIT_LOG"; then',
+      '  exit 1',
+      'fi',
+      'exit 0',
+    ].join('\n');
+    expect(isReaManagedHuskyGate(content)).toBe(true);
+  });
+});
+
 // Codex R21 F1: upgrade migration path. Pre-0.4 rea releases shipped a
 // `.husky/pre-push` without the line-2/3 versioned markers. A consumer
 // upgrading from those versions has a functional governance hook on disk
