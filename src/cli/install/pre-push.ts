@@ -224,72 +224,51 @@ export function isReaManagedHuskyGate(content: string): boolean {
  * operator opt into the refresh explicitly.
  */
 export function isLegacyReaManagedHuskyGate(content: string): boolean {
-  const lines = content.split(/\r?\n/);
-  if (lines.length < 2) return false;
-  const line2 = lines[1] ?? '';
-  // The em-dash in the published header (`— rea governance gate`) is the
-  // distinctive token; some terminals/IDEs may normalize it to `-`. Accept
-  // either, but require the `.husky/pre-push` filename prefix and the
-  // `rea governance gate` phrase together to prevent stub matches.
-  const legacyHeaderRe =
-    /^#\s*\.husky\/pre-push\b[^\n]*[—-]\s*rea governance gate/;
-  if (!legacyHeaderRe.test(line2)) return false;
-  if (!hasHaltEnforcement(content)) return false;
-  // R22 F2 — legacy recognition must accept BOTH the post-R15 if-form audit
-  // check AND the pre-R15 `block_push` accumulator pattern. The shipped
-  // pre-0.4 hook used the accumulator shape, which this branch's strict
-  // `hasAuditCheck` intentionally rejects (R18 dropped `continue` as a
-  // blocking terminator). Without a second detector, upgrading from `main`
-  // strands the consumer on a foreign hook.
+  // R24 F2 — byte-identical SHA256 allowlist.
   //
-  // The legacy accumulator fingerprint is three textual signals unique to
-  // our own shipped hook:
-  //   1. `block_push=0` initialization
-  //   2. `block_push=1` inside a loop/branch
-  //   3. post-loop `"$block_push" -ne 0` comparison
-  // All three together identify the pre-0.4 rea hook and cannot be produced
-  // by a foreign hook that happens to share only the line-2 header.
-  if (hasAuditCheck(content)) return true;
-  if (hasLegacyAuditAccumulator(content)) return true;
-  return false;
+  // The R22 token fingerprint (`block_push=0` + `block_push=1` + `"$block_push"
+  // -ne 0` + `codex.review` grep) did not prove control flow — a drifted or
+  // consumer-owned hook could retain those tokens while no longer enforcing
+  // the audit gate, and still be classified as rea-managed. The only safe
+  // recognition we can make without re-deriving POSIX control-flow semantics
+  // is exact-byte equality against a hook body we know we shipped.
+  //
+  // Each entry below is the SHA256 of a `.husky/pre-push` body that rea has
+  // historically published, collected via `git log --follow .husky/pre-push`.
+  // On match, the consumer is trusted to be on a known-good rea-managed body,
+  // and the canonical-manifest reconciler (`rea upgrade`) handles the refresh
+  // to the current canonical SHA. Any byte drift flips the file back to
+  // `foreign`, which forces an explicit opt-in upgrade instead of silent
+  // trust — the exact escape hatch R24 F2 demanded.
+  //
+  // Hashes are over the raw file bytes, no normalization. Consumers editing
+  // the legacy file (e.g. line endings, trailing newline) will see it
+  // classified as foreign; that is intentional and safer than heuristic
+  // similarity.
+  const hash = crypto.createHash('sha256').update(content).digest('hex');
+  return KNOWN_LEGACY_HUSKY_SHA256.has(hash);
 }
 
 /**
- * R22 F2 — fingerprint-based detector for the pre-0.4 `.husky/pre-push`
- * audit-enforcement shape. The shipped hook used a `block_push` accumulator
- * inside the refspec loop plus a post-loop `if [ "$block_push" -ne 0 ]`
- * guard because the R18-era text parser did not support loop-carried
- * blocking. This helper recognizes that accumulator pattern so legacy
- * consumers upgrading from `main` are classified as rea-managed and the
- * canonical manifest reconciler can refresh the hook in-place.
+ * R24 F2 — exact-byte allowlist of shipped `.husky/pre-push` bodies
+ * recognized as legacy rea-managed hooks. Append a new entry here the
+ * moment any change lands in `hooks/` or `.husky/` that alters the
+ * published hook body, so consumers upgrading from that version see their
+ * install classified correctly and not stranded as foreign.
  *
- * The three textual signals below are co-required; no subset is accepted.
- * Comments are stripped first so a docstring mentioning `block_push` does
- * not satisfy the fingerprint.
+ * Generated via: `git log --all --format='%H' --follow -- .husky/pre-push`
+ * then `git show <sha>:.husky/pre-push | shasum -a 256` for each commit.
  */
-function hasLegacyAuditAccumulator(content: string): boolean {
-  const stripped = stripComments(content);
-  const hasInit = /\bblock_push[ \t]*=[ \t]*0\b/.test(stripped);
-  if (!hasInit) return false;
-  const hasSet = /\bblock_push[ \t]*=[ \t]*1\b/.test(stripped);
-  if (!hasSet) return false;
-  // Post-loop guard: `[ "$block_push" -ne 0 ]` or `[ $block_push -ne 0 ]`
-  // wrapped in an `if` that exits non-zero. The bounded `.{0,200}` span
-  // (same-line or next-few-lines) prevents the guard from mis-matching
-  // against unrelated exits far away in the hook body.
-  const hasPostLoopGuard =
-    /\[\s*"?\$\{?block_push\}?"?\s+-ne\s+0\s*\][\s\S]{0,200}?\bexit[ \t]+[1-9]\d*\b/.test(
-      stripped,
-    );
-  if (!hasPostLoopGuard) return false;
-  // An audit grep must still be present — without it, the accumulator
-  // could be enforcing a protected-paths-only policy (plausible in a
-  // reagent-era install) and not a codex-review audit check.
-  const hasAuditGrep =
-    /\bgrep\b[^\n]*codex\\?\.review/.test(stripped) &&
-    /\.rea\/audit\.jsonl\b/.test(stripped);
-  return hasAuditGrep;
-}
+const KNOWN_LEGACY_HUSKY_SHA256: ReadonlySet<string> = new Set([
+  // v0.3.x shipped body (commit 320c090 → 0.3.0 release).
+  '5014c585c4af5aa0425fde36441711fa55833e03b81967c45045c5bd716b821e',
+  // Intermediate iteration (commit a356eb0, pre-release).
+  '9a668414c557d280a56f48795583acffefbd11b81e2799fd54eb023e48ccb14b',
+  // Intermediate iteration (commit 68c2cf2, pre-release).
+  '9d4885b64f50dd91887c2c6b4d17e3aa91b0be5da8e842ca8915bec1bf369de5',
+  // Initial publication (commit b513760, G6 MVP).
+  '1ee21164ccce628a1ef85c313d09afdcdb8560efd761ec64b046cca6cc319cba',
+]);
 
 /**
  * True when `content` contains a POSIX shell construct that detects
@@ -1971,12 +1950,50 @@ async function cleanupStaleTempFiles(dst: string): Promise<void> {
   } catch {
     return; // dir doesn't exist yet — nothing to clean.
   }
+  // R24 F1 — verify provenance BEFORE unlinking. The naming convention
+  // alone is not enough: a concurrent tool or an adversarial user could
+  // drop `pre-push.rea-tmp-XXX` files that we would otherwise delete.
+  //
+  // Ownership proof is three-fold:
+  //   1. `lstat` rejects anything that is not a regular file (symlink,
+  //      directory, fifo, socket). We never created a non-file tmp, so
+  //      anything else is not ours.
+  //   2. The file must be readable and begin with `#!/bin/sh` — our
+  //      `writeExecutable` always writes this header as the first line.
+  //   3. The body must contain one of our canonical markers
+  //      (`HUSKY_GATE_MARKER` or `FALLBACK_MARKER`). Any temp file we
+  //      created while crashing mid-write contains exactly these bytes.
+  //
+  // A 0-byte or partial-write tmp that predates either marker is left
+  // alone — if the installer crashes before writing any content, the
+  // caller's next run re-opens a fresh random UUID-suffixed file so the
+  // leftover is a harmless orphan. We would rather leak an orphan than
+  // delete someone else's file.
+  const candidates = entries.filter((e) => e.startsWith(prefix));
   await Promise.all(
-    entries
-      .filter((e) => e.startsWith(prefix))
-      .map((e) =>
-        fsPromises.unlink(path.join(dir, e)).catch(() => undefined),
-      ),
+    candidates.map(async (name) => {
+      const abs = path.join(dir, name);
+      try {
+        const st = await fsPromises.lstat(abs);
+        if (!st.isFile()) return;
+      } catch {
+        return;
+      }
+      let body: string;
+      try {
+        body = await fsPromises.readFile(abs, 'utf8');
+      } catch {
+        return;
+      }
+      if (!body.startsWith('#!/bin/sh')) return;
+      if (
+        !body.includes(HUSKY_GATE_MARKER) &&
+        !body.includes(FALLBACK_MARKER)
+      ) {
+        return;
+      }
+      await fsPromises.unlink(abs).catch(() => undefined);
+    }),
   );
 }
 
@@ -2309,14 +2326,18 @@ export async function installPrePushFallback(
     const decision = await classifyPrePushInstall(targetDir);
     result.decision = decision;
 
-    // Clean up stale temp files from any crashed previous install. Runs
-    // on every entry, not only the write branches, so a doctor-mode run
-    // or a re-entrance after a crash consistently leaves the dir tidy.
-    await cleanupStaleTempFiles(decision.hookPath);
-
     switch (decision.action) {
       case 'install':
       case 'refresh': {
+        // R24 F1 — stale-temp cleanup runs ONLY on write paths. Running
+        // it unconditionally (pre-R24 behavior) meant a `skip/foreign` or
+        // `skip/active-pre-push-present` decision still scanned and
+        // unlinked any sibling matching `pre-push.rea-tmp-*` — which
+        // under an adversarial or concurrent-tool scenario could delete
+        // unrelated files. The cleanup is only a hygiene step for
+        // recovery from a crashed write, so scope it to the branches
+        // that actually write.
+        await cleanupStaleTempFiles(decision.hookPath);
         if (options.onBeforeReresolve !== undefined) {
           await options.onBeforeReresolve(decision.hookPath);
         }

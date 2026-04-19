@@ -501,18 +501,19 @@ describe('installPrePushFallback — concurrency + temp-file hygiene', () => {
     await fs.rm(dir, { recursive: true, force: true });
   });
 
-  it('cleans up stale `.rea-tmp-*` siblings on install entry', async () => {
-    // Finding 4. A crash between writeFile and rename would leave a
-    // predictable `${dst}.rea-tmp-${pid}` sibling at 0o755 perms. Random
-    // suffixes make the filename unpredictable, and we proactively unlink
-    // any siblings on entry so they don't accumulate across runs.
+  it('cleans up stale `.rea-tmp-*` siblings carrying our marker on install entry', async () => {
+    // A crash between writeFile and rename would leave a predictable
+    // `${dst}.rea-tmp-${uuid}` sibling at 0o755 perms containing our
+    // marker. Scoped cleanup proves provenance (shebang + FALLBACK_MARKER)
+    // before unlinking so foreign prefix-collisions are left alone.
     await initGitRepo(dir);
     const hooksDir = path.join(dir, '.git', 'hooks');
     await fs.mkdir(hooksDir, { recursive: true });
     const stray1 = path.join(hooksDir, 'pre-push.rea-tmp-stale-1');
     const stray2 = path.join(hooksDir, 'pre-push.rea-tmp-stale-2');
-    await fs.writeFile(stray1, '#!/bin/sh\n# stale\n', { mode: 0o755 });
-    await fs.writeFile(stray2, '#!/bin/sh\n# stale\n', { mode: 0o755 });
+    const ownedStub = `#!/bin/sh\n${FALLBACK_MARKER}\nexec /bin/true\n`;
+    await fs.writeFile(stray1, ownedStub, { mode: 0o755 });
+    await fs.writeFile(stray2, ownedStub, { mode: 0o755 });
 
     const result = await installPrePushFallback(dir);
     expect(result.decision.action).toBe('install');
@@ -523,6 +524,58 @@ describe('installPrePushFallback — concurrency + temp-file hygiene', () => {
     await expect(fs.stat(stray2)).rejects.toMatchObject({ code: 'ENOENT' });
     const entries = await fs.readdir(hooksDir);
     expect(entries.filter((e) => e.startsWith('pre-push.rea-tmp-'))).toEqual([]);
+  });
+
+  it('R24 F1: does NOT delete unowned `.rea-tmp-*` prefix-collisions on install entry', async () => {
+    // An adversarial or concurrent tool could drop a file whose name
+    // matches `pre-push.rea-tmp-<foo>` but whose content is not ours.
+    // Cleanup must verify provenance (shebang + rea marker) BEFORE
+    // unlinking so we never delete something we did not author.
+    await initGitRepo(dir);
+    const hooksDir = path.join(dir, '.git', 'hooks');
+    await fs.mkdir(hooksDir, { recursive: true });
+    const foreign = path.join(hooksDir, 'pre-push.rea-tmp-not-ours');
+    const foreignBody = '#!/bin/sh\n# unrelated tool artifact\nexit 0\n';
+    await fs.writeFile(foreign, foreignBody, { mode: 0o755 });
+    const nonShell = path.join(hooksDir, 'pre-push.rea-tmp-binary-blob');
+    await fs.writeFile(nonShell, 'not a shell script at all\n', { mode: 0o644 });
+
+    const result = await installPrePushFallback(dir);
+    expect(result.decision.action).toBe('install');
+
+    // Both foreign files must still be present and byte-identical.
+    expect(await fs.readFile(foreign, 'utf8')).toBe(foreignBody);
+    expect(await fs.readFile(nonShell, 'utf8')).toBe('not a shell script at all\n');
+  });
+
+  it('R24 F1: does NOT run cleanup on skip paths (foreign hook present)', async () => {
+    // When the install decision is `skip/active-pre-push-present` — e.g.
+    // a foreign hook is already active — cleanup must not fire. Pre-R24,
+    // cleanup ran unconditionally on every entry, so even a skip run
+    // could silently unlink unrelated files. Verify owned stubs with the
+    // tmp prefix survive a skip run.
+    await initGitRepo(dir);
+    const hooksDir = path.join(dir, '.git', 'hooks');
+    await fs.mkdir(hooksDir, { recursive: true });
+    // Foreign active hook makes the decision `skip`.
+    const activeForeign = path.join(hooksDir, 'pre-push');
+    await fs.writeFile(activeForeign, '#!/bin/sh\n# consumer hook\nexit 0\n', {
+      mode: 0o755,
+    });
+    // An owned stub that, under the old cleanup, would have been unlinked
+    // on entry before the switch decided `skip`. With R24 F1, cleanup is
+    // scoped to write branches so this survives.
+    const ownedStub = path.join(hooksDir, 'pre-push.rea-tmp-owned-orphan');
+    await fs.writeFile(
+      ownedStub,
+      `#!/bin/sh\n${FALLBACK_MARKER}\nexec /bin/true\n`,
+      { mode: 0o755 },
+    );
+
+    const result = await installPrePushFallback(dir);
+    expect(result.decision.action).toBe('skip');
+    // Owned stub must still exist — we did not enter a write branch.
+    await expect(fs.stat(ownedStub)).resolves.toBeDefined();
   });
 
   it('race: file appears between classify and write → no stomp, no throw', async () => {
@@ -2254,10 +2307,13 @@ describe('isLegacyReaManagedHuskyGate — pre-0.4 migration', () => {
     expect(typeof maybeLegacy).toBe('boolean');
   });
 
-  it('legacy hook with unified audit if-form: isLegacyReaManagedHuskyGate=true', () => {
-    // Tighter legacy fixture: filename-comment header + real HALT short-
-    // circuit + negated-if audit block. This is the shape the shipped
-    // main:.husky/pre-push converged to in later 0.3.x patches.
+  it('R24 F2: loose legacy-shaped content is NOT auto-classified as legacy (byte-identical only)', () => {
+    // R24 tightening: `isLegacyReaManagedHuskyGate` now requires a
+    // byte-identical SHA256 match against a fixed historical allowlist,
+    // not a loose token fingerprint. Synthesized content that merely
+    // mimics the shape is rejected — matching Codex R24 F2's demand that
+    // legacy classification not silently bless any hook that LOOKS like
+    // the old thing.
     const content = [
       '#!/bin/sh',
       '# .husky/pre-push — rea governance gate for terminal-initiated pushes.',
@@ -2266,9 +2322,7 @@ describe('isLegacyReaManagedHuskyGate — pre-0.4 migration', () => {
       'if ! grep -qE \'"tool_name":"codex\\.review"\' .rea/audit.jsonl; then exit 1; fi',
       '',
     ].join('\n');
-    expect(isLegacyReaManagedHuskyGate(content)).toBe(true);
-    // And the new classifier still says "no" because no versioned marker
-    // on line 2 — the two detectors cover disjoint cases.
+    expect(isLegacyReaManagedHuskyGate(content)).toBe(false);
     expect(isReaManagedHuskyGate(content)).toBe(false);
   });
 
@@ -2295,16 +2349,18 @@ describe('isLegacyReaManagedHuskyGate — pre-0.4 migration', () => {
     expect(isLegacyReaManagedHuskyGate(content)).toBe(false);
   });
 
-  it('legacy hook with ASCII hyphen in header (not em-dash): returns true', () => {
-    // Some terminals or editors replace `—` with `-`. The detector
-    // accepts either.
+  it('R24 F2: ASCII-hyphen variant is NOT auto-classified as legacy (byte-identical only)', () => {
+    // Under R24 F2, header-variant parsing is irrelevant — the legacy
+    // detector is a SHA256 byte-identical allowlist. Any synthesized
+    // variant, hyphen or em-dash, returns false. Real historical hashes
+    // are the only accepted inputs.
     const content = [
       '#!/bin/sh',
       '# .husky/pre-push - rea governance gate for terminal-initiated pushes.',
       '[ -f .rea/HALT ] && exit 1',
       'if ! grep -qE \'"tool_name":"codex\\.review"\' .rea/audit.jsonl; then exit 1; fi',
     ].join('\n');
-    expect(isLegacyReaManagedHuskyGate(content)).toBe(true);
+    expect(isLegacyReaManagedHuskyGate(content)).toBe(false);
   });
 
   it('current rea-managed-husky (with markers) still matches new classifier, not legacy', () => {
@@ -2332,19 +2388,20 @@ describe('classifyPrePushInstall — R21 F1 legacy husky hook migration', () => 
     await fs.rm(dir, { recursive: true, force: true });
   });
 
-  it('legacy .husky/pre-push gate: classified as skip/active-pre-push-present', async () => {
+  it('shipped legacy .husky/pre-push: classified as skip/active-pre-push-present', async () => {
     await initGitRepo(dir);
     await execFileAsync('git', ['-C', dir, 'config', 'core.hooksPath', '.husky']);
     const huskyDir = path.join(dir, '.husky');
     await fs.mkdir(huskyDir, { recursive: true });
-    const legacy = [
-      '#!/bin/sh',
-      '# .husky/pre-push — rea governance gate for terminal-initiated pushes.',
-      'set -eu',
-      '[ -f .rea/HALT ] && exit 1',
-      'if ! grep -qE \'"tool_name":"codex\\.review"\' .rea/audit.jsonl; then exit 1; fi',
-    ].join('\n');
-    await fs.writeFile(path.join(huskyDir, 'pre-push'), legacy, { mode: 0o755 });
+    // R24 F2 — use the actual shipped body (byte-identical SHA allowlist).
+    // The hand-written approximation used pre-R24 did not match any shipped
+    // SHA and would now (correctly) classify as foreign.
+    const { stdout: shippedBody } = await execFileAsync(
+      'git',
+      ['show', 'main:.husky/pre-push'],
+      { cwd: process.cwd(), maxBuffer: 4 * 1024 * 1024 },
+    );
+    await fs.writeFile(path.join(huskyDir, 'pre-push'), shippedBody, { mode: 0o755 });
 
     const decision = await classifyPrePushInstall(dir);
     expect(decision.action).toBe('skip');
@@ -2353,18 +2410,17 @@ describe('classifyPrePushInstall — R21 F1 legacy husky hook migration', () => 
     }
   });
 
-  it('legacy .husky/pre-push: inspectPrePushState reports ok=true, activeForeign=false', async () => {
+  it('shipped legacy .husky/pre-push: inspectPrePushState reports ok=true, activeForeign=false', async () => {
     await initGitRepo(dir);
     await execFileAsync('git', ['-C', dir, 'config', 'core.hooksPath', '.husky']);
     const huskyDir = path.join(dir, '.husky');
     await fs.mkdir(huskyDir, { recursive: true });
-    const legacy = [
-      '#!/bin/sh',
-      '# .husky/pre-push — rea governance gate for terminal-initiated pushes.',
-      '[ -f .rea/HALT ] && exit 1',
-      'if ! grep -qE \'"tool_name":"codex\\.review"\' .rea/audit.jsonl; then exit 1; fi',
-    ].join('\n');
-    await fs.writeFile(path.join(huskyDir, 'pre-push'), legacy, { mode: 0o755 });
+    const { stdout: shippedBody } = await execFileAsync(
+      'git',
+      ['show', 'main:.husky/pre-push'],
+      { cwd: process.cwd(), maxBuffer: 4 * 1024 * 1024 },
+    );
+    await fs.writeFile(path.join(huskyDir, 'pre-push'), shippedBody, { mode: 0o755 });
 
     const state = await inspectPrePushState(dir);
     expect(state.ok).toBe(true);
@@ -2458,42 +2514,60 @@ const MAIN_LEGACY_BODY = [
   'exit 0',
 ].join('\n');
 
-describe('isLegacyReaManagedHuskyGate — R22 F2 main legacy body', () => {
-  it('accepts the exact main:.husky/pre-push body (block_push accumulator)', () => {
-    expect(isLegacyReaManagedHuskyGate(MAIN_LEGACY_BODY)).toBe(true);
+describe('isLegacyReaManagedHuskyGate — R24 F2 byte-identical SHA allowlist', () => {
+  it('accepts the exact main:.husky/pre-push body as shipped (byte-identical)', async () => {
+    // Pull the actual shipped bytes from git so the allowlist is exercised
+    // against real historical artifacts, not a hand-written approximation.
+    // If this ever fails, either the legacy hook was regenerated and a new
+    // SHA must be added to KNOWN_LEGACY_HUSKY_SHA256, or the content on
+    // `main` diverged from the entries in the allowlist.
+    const { stdout } = await execFileAsync('git', ['show', 'main:.husky/pre-push'], {
+      cwd: process.cwd(),
+      maxBuffer: 4 * 1024 * 1024,
+    });
+    expect(isLegacyReaManagedHuskyGate(stdout)).toBe(true);
   });
 
-  it('rejects legacy body missing block_push=0 init', () => {
-    const body = MAIN_LEGACY_BODY.replace(/^block_push=0$/m, '');
-    expect(isLegacyReaManagedHuskyGate(body)).toBe(false);
+  it('rejects the shipped body with a single trailing newline added (byte drift)', async () => {
+    const { stdout } = await execFileAsync('git', ['show', 'main:.husky/pre-push'], {
+      cwd: process.cwd(),
+      maxBuffer: 4 * 1024 * 1024,
+    });
+    expect(isLegacyReaManagedHuskyGate(stdout + '\n')).toBe(false);
   });
 
-  it('rejects legacy body missing block_push=1 set', () => {
+  it('rejects a hand-written accumulator body that has not been shipped', () => {
+    // Pre-R24, hasLegacyAuditAccumulator's token fingerprint accepted any
+    // body with block_push=0/1/-ne-0/codex.review tokens regardless of
+    // whether the grep actually drove block_push. The byte-identical
+    // allowlist fails closed on unshipped bodies, which is the R24 F2
+    // requirement.
+    expect(isLegacyReaManagedHuskyGate(MAIN_LEGACY_BODY)).toBe(false);
+  });
+
+  it('rejects a body missing one token of the old accumulator pattern', () => {
     const body = MAIN_LEGACY_BODY.replace(/block_push=1/g, '# stub');
     expect(isLegacyReaManagedHuskyGate(body)).toBe(false);
   });
 
-  it('rejects legacy body missing post-loop -ne 0 guard', () => {
-    const body = MAIN_LEGACY_BODY.replace(
-      /if \[ "\$block_push" -ne 0 \]; then\n  exit 1\nfi/,
-      '',
+  it('rejects an empty or stub body', () => {
+    expect(isLegacyReaManagedHuskyGate('')).toBe(false);
+    expect(isLegacyReaManagedHuskyGate('#!/bin/sh\nexit 0')).toBe(false);
+  });
+
+  it('classifies shipped main hook as rea-managed-husky via classifyPrePushInstall', async () => {
+    const { stdout: shippedBody } = await execFileAsync(
+      'git',
+      ['show', 'main:.husky/pre-push'],
+      { cwd: process.cwd(), maxBuffer: 4 * 1024 * 1024 },
     );
-    expect(isLegacyReaManagedHuskyGate(body)).toBe(false);
-  });
-
-  it('rejects legacy body missing codex.review audit grep', () => {
-    const body = MAIN_LEGACY_BODY.replace(/codex\\\.review/g, 'other\\.tool');
-    expect(isLegacyReaManagedHuskyGate(body)).toBe(false);
-  });
-
-  it('classifies main legacy body as rea-managed-husky via classifyPrePushInstall', async () => {
-    const dir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-r22-')));
+    const dir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-r24-')));
     try {
       await initGitRepo(dir);
       await execFileAsync('git', ['-C', dir, 'config', 'core.hooksPath', '.husky']);
       const huskyDir = path.join(dir, '.husky');
       await fs.mkdir(huskyDir, { recursive: true });
-      await fs.writeFile(path.join(huskyDir, 'pre-push'), MAIN_LEGACY_BODY, { mode: 0o755 });
+      await fs.writeFile(path.join(huskyDir, 'pre-push'), shippedBody, { mode: 0o755 });
 
       const decision = await classifyPrePushInstall(dir);
       expect(decision.action).toBe('skip');
