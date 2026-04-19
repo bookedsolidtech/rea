@@ -230,30 +230,64 @@ function checkCommitMsgHook(baseDir: string): CheckResult {
 }
 
 /**
- * G6 — Verify at least one pre-push hook is installed and executable.
+ * G6 — Verify at least one pre-push hook is installed and executable AND
+ * actually wires the protected-path review gate.
  *
  * Three install shapes are acceptable:
- *   1. `.git/hooks/pre-push` — vanilla git (no hooksPath).
- *   2. `${core.hooksPath}/pre-push` — husky 9 or custom hooksPath.
+ *   1. `.git/hooks/pre-push` — vanilla git (no hooksPath). Must carry the
+ *      rea fallback marker or delegate to `push-review-gate.sh`.
+ *   2. `${core.hooksPath}/pre-push` — husky 9 or custom hooksPath. Same
+ *      governance rule.
  *   3. `.husky/pre-push` is present on disk but only counts if husky has
  *      configured `core.hooksPath=.husky`. A `.husky/pre-push` with an
  *      unconfigured hooksPath is dead weight; we do NOT treat it as
  *      sufficient.
  *
+ * Three possible outcomes:
+ *   - `pass`: active hook exists, is executable, and governance-carrying.
+ *   - `warn`: active hook exists + is executable but does NOT reference
+ *     the review gate (the "silent bypass" case — a lint-only husky hook,
+ *     a pre-existing repo hook). We refuse to auto-stomp it, but the gate
+ *     is not wired; the user must add a gate `exec` or let `rea init`
+ *     install the fallback in a governance-carrying way.
+ *   - `fail`: no active hook at all (or active file is non-executable).
+ *
  * "Executable" is defined by any user/group/other exec bit, matching
- * `checkHooksInstalled`. Status is `fail` when nothing is active — the
- * protected-path Codex audit requirement depends on this hook.
+ * `checkHooksInstalled`.
  */
 function checkPrePushHook(state: PrePushDoctorState): CheckResult {
   if (state.ok) {
-    const active = state.candidates.find((c) => c.exists && c.executable);
-    const detail = active !== undefined
-      ? `${active.reaManaged ? 'rea-managed' : 'external'} at ${active.path}`
-      : undefined;
+    const active = state.candidates.find((c) => c.path === state.activePath);
+    const kind =
+      active?.reaManaged === true
+        ? 'rea-managed'
+        : active?.delegatesToGate === true
+          ? 'external (delegates to push-review-gate.sh)'
+          : 'external';
+    const detail = active !== undefined ? `${kind} at ${active.path}` : undefined;
     return detail !== undefined
       ? { label: 'pre-push hook installed', status: 'pass', detail }
       : { label: 'pre-push hook installed', status: 'pass' };
   }
+
+  if (state.activeForeign) {
+    // Executable file exists at the active path but does not carry
+    // governance. Downgrade to warn — the protected-path gate is not
+    // wired, but we don't have the authority to replace a consumer's hook
+    // silently. Surface the path so they can add the exec line manually
+    // or remove it and let `rea init` install the fallback.
+    return {
+      label: 'pre-push hook installed',
+      status: 'warn',
+      detail:
+        `active pre-push at ${state.activePath} is present and executable but does NOT ` +
+        `reference \`.claude/hooks/push-review-gate.sh\` — the protected-path ` +
+        `Codex audit gate is silently bypassed. Either add ` +
+        '`exec .claude/hooks/push-review-gate.sh "$@"` to the existing hook, or ' +
+        'remove it and re-run `rea init` to install the fallback.',
+    };
+  }
+
   const present = state.candidates
     .filter((c) => c.exists)
     .map((c) => `${c.path}${c.executable ? '' : ' (not executable)'}`);
