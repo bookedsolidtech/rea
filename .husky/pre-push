@@ -1,5 +1,6 @@
 #!/bin/sh
 # rea:husky-pre-push-gate v1
+# rea:gate-body-v1
 # .husky/pre-push — rea governance gate for terminal-initiated pushes.
 #
 # Mirrors the logic of `.claude/hooks/push-review-gate.sh` but consumes the

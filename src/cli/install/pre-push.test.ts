@@ -22,6 +22,7 @@ import {
   classifyPrePushInstall,
   FALLBACK_MARKER,
   HUSKY_GATE_MARKER,
+  HUSKY_GATE_BODY_MARKER,
   inspectPrePushState,
   installPrePushFallback,
   isReaManagedHuskyGate,
@@ -927,11 +928,13 @@ describe('looksLikeGateInvocation — .sh suffix boundary (Finding 1)', () => {
     ).toBe(true);
   });
 
-  it('bare invocation with semicolon immediately after .sh: returns true', () => {
-    // Shell separator is a valid invocation boundary.
+  it('bare invocation with semicolon + exit 0: returns false (status swallowed)', () => {
+    // `gate; exit 0` runs the gate then discards its exit code by always
+    // exiting 0. This is status-swallowing and must not satisfy governance.
+    // (Previously expected true — updated when status-swallow detection was added.)
     expect(
       referencesReviewGate(`#!/bin/sh\n${token}; exit 0\n`),
-    ).toBe(true);
+    ).toBe(false);
   });
 });
 
@@ -946,27 +949,34 @@ describe('looksLikeGateInvocation — .sh suffix boundary (Finding 1)', () => {
 // The fix: add `HUSKY_GATE_MARKER` + `isReaManagedHuskyGate`, check it first.
 // ---------------------------------------------------------------------------
 describe('isReaManagedHuskyGate — Husky gate marker detection (Finding 2)', () => {
-  it('marker at line 2 with HALT sentinel: returns true', () => {
-    // Canonical check: shebang, marker, body containing .rea/HALT.
+  it('marker at line 2 with body marker: returns true', () => {
+    // Canonical check: header marker on line 2 + body marker anywhere.
     expect(
       isReaManagedHuskyGate(
-        `#!/bin/sh\n${HUSKY_GATE_MARKER}\n[ -f .rea/HALT ] && exit 1\nexec ./gate.sh\n`,
+        `#!/bin/sh\n${HUSKY_GATE_MARKER}\n${HUSKY_GATE_BODY_MARKER}\n[ -f .rea/HALT ] && exit 1\nexec ./gate.sh\n`,
       ),
     ).toBe(true);
   });
 
-  it('marker at line 2 with full gate body: returns true', () => {
+  it('marker at line 2 with body marker in non-comment form: returns true', () => {
     expect(
       isReaManagedHuskyGate(
-        `#!/bin/sh\n${HUSKY_GATE_MARKER}\nset -eu\nif [ -f .rea/HALT ]; then exit 1; fi\nsome-command\n`,
+        `#!/bin/sh\n${HUSKY_GATE_MARKER}\nset -eu\n${HUSKY_GATE_BODY_MARKER}\nsome-command\n`,
       ),
     ).toBe(true);
   });
 
-  it('marker at line 2 but exit 0 body without HALT sentinel: returns false (spoofed gate)', () => {
-    // Spoof vector: marker present but body is `exit 0` with no governance.
-    // Marker alone is insufficient — the HALT sentinel must also be present.
+  it('marker at line 2 but no body marker (exit 0 body): returns false (spoofed gate)', () => {
+    // Two-factor failure: header marker present but body marker absent.
+    // A stub body with `exit 0` cannot satisfy the body-marker requirement.
     expect(isReaManagedHuskyGate(`#!/bin/sh\n${HUSKY_GATE_MARKER}\nexit 0\n`)).toBe(false);
+  });
+
+  it('marker at line 2 + HALT sentinel but no body marker: returns false', () => {
+    // HALT sentinel alone is insufficient after R6 fix. Both markers required.
+    expect(
+      isReaManagedHuskyGate(`#!/bin/sh\n${HUSKY_GATE_MARKER}\n[ -f .rea/HALT ] && exit 1\nexit 0\n`),
+    ).toBe(false);
   });
 
   it('content without any marker returns false', () => {
@@ -1069,6 +1079,47 @@ describe('referencesReviewGate — depth-tracking exit detection (Finding 2)', (
       'done',
       'exit 0',
       'exec .claude/hooks/push-review-gate.sh "$@"',
+    ].join('\n');
+    expect(referencesReviewGate(content)).toBe(false);
+  });
+
+  it('gate invocation inside if-block (conditional): returns false', () => {
+    // Finding 2 (R6). Gate inside an if-block is at depth=1 and must not
+    // satisfy governance — the push can bypass the gate when the condition
+    // is false.
+    const content = [
+      '#!/bin/sh',
+      'if [ "$CI" = "1" ]; then',
+      '  sh .claude/hooks/push-review-gate.sh "$@"',
+      'fi',
+    ].join('\n');
+    expect(referencesReviewGate(content)).toBe(false);
+  });
+
+  it('gate invocation with || true (status swallowed): returns false', () => {
+    // Finding 2 (R6). `|| true` discards the gate exit code — the hook
+    // always succeeds even if the gate blocks.
+    const content = [
+      '#!/bin/sh',
+      'sh .claude/hooks/push-review-gate.sh "$@" || true',
+    ].join('\n');
+    expect(referencesReviewGate(content)).toBe(false);
+  });
+
+  it('gate invocation with ; exit 0 (status swallowed): returns false', () => {
+    // Finding 2 (R6). '; exit 0' after the gate runs it but then exits
+    // successfully regardless of the gate's verdict.
+    const content = [
+      '#!/bin/sh',
+      'sh .claude/hooks/push-review-gate.sh "$@"; exit 0',
+    ].join('\n');
+    expect(referencesReviewGate(content)).toBe(false);
+  });
+
+  it('gate invocation with || : (status swallowed via noop): returns false', () => {
+    const content = [
+      '#!/bin/sh',
+      'exec .claude/hooks/push-review-gate.sh "$@" || :',
     ].join('\n');
     expect(referencesReviewGate(content)).toBe(false);
   });
@@ -1210,7 +1261,7 @@ describe('inspectPrePushState — Husky gate recognized as rea-managed (Finding 
     await fs.mkdir(huskyDir, { recursive: true });
     await fs.writeFile(
       path.join(huskyDir, 'pre-push'),
-      `#!/bin/sh\n${HUSKY_GATE_MARKER}\n[ -f .rea/HALT ] && exit 1\nexec .claude/hooks/push-review-gate.sh "$@"\n`,
+      `#!/bin/sh\n${HUSKY_GATE_MARKER}\n${HUSKY_GATE_BODY_MARKER}\n[ -f .rea/HALT ] && exit 1\nexec .claude/hooks/push-review-gate.sh "$@"\n`,
       { mode: 0o755 },
     );
     await execFileAsync('git', ['-C', dir, 'config', 'core.hooksPath', huskyDir]);

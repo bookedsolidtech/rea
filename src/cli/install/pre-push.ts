@@ -102,6 +102,15 @@ export const FALLBACK_MARKER = '# rea:pre-push-fallback v1';
 export const HUSKY_GATE_MARKER = '# rea:husky-pre-push-gate v1';
 
 /**
+ * Second versioned marker embedded in the body of the shipped `.husky/pre-push`.
+ * Required alongside `HUSKY_GATE_MARKER` so that a hook containing only the
+ * header marker + `exit 0` (or any stub body) is not classified as rea-managed.
+ * A genuine rea Husky gate always carries both. The marker is versioned so it
+ * can be bumped if the gate implementation changes significantly.
+ */
+export const HUSKY_GATE_BODY_MARKER = '# rea:gate-body-v1';
+
+/**
  * Fixed two-line prelude every rea-managed fallback hook opens with. Used
  * to distinguish a real rea install from a file that merely happens to
  * contain the marker substring (consumer comment, grep log, copy-pasted
@@ -149,20 +158,20 @@ export function isReaManagedFallback(content: string): boolean {
  * as a governance-carrying hook rather than `foreign/no-marker`.
  */
 export function isReaManagedHuskyGate(content: string): boolean {
-  // Require the marker on the SECOND LINE (after shebang). The positional
-  // anchor (line 2 only) prevents spoofing via a consumer comment buried
-  // deeper in the file. The shipped `.husky/pre-push` implements the gate
-  // inline (HALT check, codex audit scan, refspec loop) rather than
-  // delegating to push-review-gate.sh — so referencesReviewGate() always
-  // returns false for it and must not be used as an additional predicate here.
+  // Two-factor identity check:
+  //   1. Positional header marker on line 2 (after shebang) — prevents
+  //      classifying any file that merely mentions the sentinel.
+  //   2. Body marker (`HUSKY_GATE_BODY_MARKER`) anywhere in the body — closes
+  //      the spoof vector where only the header marker + a stub body is
+  //      present. A genuine rea gate always carries both markers.
   //
-  // Body sentinel: the genuine rea gate ALWAYS contains a HALT check. Requiring
-  // `.rea/HALT` in the body closes the spoof vector where an attacker writes
-  // `#!/bin/sh\n# marker\nexit 0` — the marker is present but governance is
-  // absent.
+  // Note: this is a best-effort heuristic for preventing ACCIDENTAL
+  // displacement during `rea init`. A determined actor with repo write
+  // access could add both markers to any file — that threat is out of scope
+  // for a text-based classifier.
   const lines = content.split(/\r?\n/);
   if (lines.length < 2 || lines[1] !== HUSKY_GATE_MARKER) return false;
-  return content.includes('.rea/HALT');
+  return content.includes(HUSKY_GATE_BODY_MARKER);
 }
 
 /**
@@ -246,9 +255,30 @@ export function referencesReviewGate(content: string): boolean {
     // This is a pragmatic heuristic, not a full shell parser. It
     // correctly accepts the shapes observed in husky+rea setups and
     // rejects `printf 'hint: ...push-review-gate.sh' >&2` style strings.
-    if (looksLikeGateInvocation(line) && !exitedBeforeGate) return true;
+    //
+    // Three conditions must all hold:
+    //   depth === 0   — unconditional top-level call, not inside if/for/case
+    //   !swallowsExitStatus — `|| true`, `|| :`, `; exit 0` etc. not present
+    //   !exitedBeforeGate  — no unconditional exit before this line
+    if (looksLikeGateInvocation(line) && depth === 0 && !swallowsExitStatus(line) && !exitedBeforeGate)
+      return true;
   }
   return false;
+}
+
+/**
+ * Returns true when `line` contains a shell pattern that discards the gate's
+ * exit code, making the invocation non-compliance-carrying. Detects:
+ *   `cmd || true`, `cmd || :`, `cmd || exit 0`
+ *   `cmd && exit 0`
+ *   `cmd; exit 0`
+ */
+function swallowsExitStatus(line: string): boolean {
+  return (
+    /\|\|\s*(true\b|:|exit\s+0\b)/.test(line) ||
+    /&&\s*exit\s+0\b/.test(line) ||
+    /;\s*exit\s+0\b/.test(line)
+  );
 }
 
 /**
