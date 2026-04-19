@@ -17,8 +17,37 @@ export interface PrefixedTool extends DownstreamToolInfo {
   name: string;
 }
 
+/**
+ * Per-downstream state surfaced by the `__rea__health` meta-tool. Kept
+ * separate from the richer internal state so we only expose what a caller
+ * can actually reason about.
+ */
+export interface DownstreamHealth {
+  name: string;
+  /** Registered in the registry (always true for entries present in the pool). */
+  enabled: boolean;
+  /** Underlying MCP client currently connected. */
+  connected: boolean;
+  /** Gateway considers this downstream healthy enough to route calls to. */
+  healthy: boolean;
+  /** Last error observed, or null if the connection is clean or never errored. */
+  last_error: string | null;
+  /**
+   * Number of tools advertised by the downstream on the most recent
+   * successful `tools/list`, or null when never listed / listing failed.
+   */
+  tools_count: number | null;
+}
+
 export class DownstreamPool {
   private readonly connections = new Map<string, DownstreamConnection>();
+  /**
+   * Cached tool counts from the most recent successful `listAllTools` cycle,
+   * keyed by server name. Surfaced via `healthSnapshot()` so the meta-tool
+   * can report per-server counts even when the current listing pass fails
+   * or is skipped. Stale but truthful > absent.
+   */
+  private readonly lastToolsCount = new Map<string, number>();
 
   constructor(registry: Registry, logger?: Logger) {
     for (const server of registry.servers) {
@@ -59,6 +88,7 @@ export class DownstreamPool {
       if (!conn.isHealthy) continue;
       try {
         const tools = await conn.listTools();
+        this.lastToolsCount.set(server, tools.length);
         for (const t of tools) {
           const prefixed: PrefixedTool = {
             ...t,
@@ -70,6 +100,37 @@ export class DownstreamPool {
       } catch {
         // Listing is best-effort — omit this server's tools this cycle.
       }
+    }
+    return out;
+  }
+
+  /**
+   * Snapshot per-server connection state for the `__rea__health` meta-tool.
+   * Pure / non-blocking — no MCP I/O — so it can be called while HALT is
+   * active or while other tool calls are in-flight.
+   */
+  healthSnapshot(): DownstreamHealth[] {
+    const out: DownstreamHealth[] = [];
+    for (const [name, conn] of this.connections) {
+      const cached = this.lastToolsCount.get(name);
+      const connected = conn.isConnected;
+      const healthy = conn.isHealthy;
+      // Only surface the cached tool count when the connection is BOTH
+      // connected AND healthy right now. Codex F1 caught that a dead
+      // downstream was showing its last-successful count alongside
+      // `healthy: false`, which is a worse-than-null diagnostic — operators
+      // would read "5 tools reachable" from a server that is reachable
+      // through exactly zero tools.
+      const tools_count =
+        connected && healthy && typeof cached === 'number' ? cached : null;
+      out.push({
+        name,
+        enabled: true,
+        connected,
+        healthy,
+        last_error: conn.lastError,
+        tools_count,
+      });
     }
     return out;
   }

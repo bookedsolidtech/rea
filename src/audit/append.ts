@@ -195,11 +195,22 @@ export async function appendAuditRecord(
     });
   writeQueues.set(
     key,
-    next.finally(() => {
-      // Keep the queue lean — once this write resolves, drop the reference
-      // if nothing newer is chained behind it.
-      if (writeQueues.get(key) === next) writeQueues.delete(key);
-    }),
+    next
+      .finally(() => {
+        // Keep the queue lean — once this write resolves, drop the reference
+        // if nothing newer is chained behind it.
+        if (writeQueues.get(key) === next) writeQueues.delete(key);
+      })
+      // Swallow rejections on the stored promise so Node doesn't flag it as
+      // an unhandled rejection. The current caller already owns this error
+      // via the `await next` below; the NEXT caller that chains off this
+      // entry also .catch()-es it at the top of its chain. Without this
+      // terminal .catch(), a failed audit append surfaces as a spurious
+      // `unhandledRejection` event — which matters in tests that run the
+      // whole process and in long-lived servers that would log it.
+      .catch(() => {
+        /* handled by caller */
+      }),
   );
   await next;
   return record;

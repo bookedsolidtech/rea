@@ -158,6 +158,13 @@ export class DownstreamConnection {
   /** Epoch ms of the last successful reconnect. Used by the flapping guard. */
   private lastReconnectAt = 0;
   private health: Health = 'healthy';
+  /**
+   * The most recent error observed on this connection (connect or call
+   * failure). Surfaced via `__rea__health` so callers can diagnose an empty
+   * tool catalog without digging through stderr logs. Set to `null` after a
+   * successful connect/reconnect.
+   */
+  private lastErrorMessage: string | null = null;
 
   constructor(
     private readonly config: RegistryServer,
@@ -175,6 +182,16 @@ export class DownstreamConnection {
 
   get isHealthy(): boolean {
     return this.health !== 'unhealthy';
+  }
+
+  /** True iff the underlying MCP client is currently connected. */
+  get isConnected(): boolean {
+    return this.client !== null;
+  }
+
+  /** Last error observed, or null if the connection has never failed (or fully recovered). */
+  get lastError(): string | null {
+    return this.lastErrorMessage;
   }
 
   async connect(): Promise<void> {
@@ -196,13 +213,14 @@ export class DownstreamConnection {
       built = buildChildEnv(this.config);
     } catch (err) {
       this.health = 'unhealthy';
-      throw new Error(
-        `failed to resolve env for downstream "${this.config.name}": ${err instanceof Error ? err.message : err}`,
-      );
+      const msg = `failed to resolve env for downstream "${this.config.name}": ${err instanceof Error ? err.message : err}`;
+      this.lastErrorMessage = msg;
+      throw new Error(msg);
     }
 
     if (built.missing.length > 0) {
       this.health = 'unhealthy';
+      this.lastErrorMessage = `missing env: ${built.missing.join(', ')}`;
       // One line per missing var so grep/jq users can find the exact gap.
       // We intentionally do NOT log the env key name's VALUE (there is none —
       // it's unresolved) nor any other env values.
@@ -230,11 +248,12 @@ export class DownstreamConnection {
       await client.connect(transport);
       this.client = client;
       this.health = 'healthy';
+      this.lastErrorMessage = null;
     } catch (err) {
       this.health = 'unhealthy';
-      throw new Error(
-        `failed to connect to downstream "${this.config.name}" (${this.config.command}): ${err instanceof Error ? err.message : err}`,
-      );
+      const msg = `failed to connect to downstream "${this.config.name}" (${this.config.command}): ${err instanceof Error ? err.message : err}`;
+      this.lastErrorMessage = msg;
+      throw new Error(msg);
     }
   }
 
@@ -256,7 +275,13 @@ export class DownstreamConnection {
       await this.connect();
     }
     try {
-      return await this.client!.callTool({ name: toolName, arguments: args });
+      const result = await this.client!.callTool({ name: toolName, arguments: args });
+      // Clear any lingering error from a previous transient failure. Without
+      // this, a connection that failed once and then recovered on the very
+      // next call (same client, no reconnect) would forever report the old
+      // error via `__rea__health`, misleading operators about live state.
+      this.lastErrorMessage = null;
+      return result;
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       const withinFlapWindow =
@@ -279,6 +304,7 @@ export class DownstreamConnection {
           // stamp the reconnect time so flap-guard can refuse rapid repeats.
           this.reconnectAttempted = false;
           this.lastReconnectAt = Date.now();
+          this.lastErrorMessage = null;
           this.logger?.info({
             event: 'downstream.reconnected',
             server_name: this.config.name,
@@ -287,18 +313,21 @@ export class DownstreamConnection {
           return result;
         } catch (reconnectErr) {
           this.health = 'unhealthy';
+          const errMsg = reconnectErr instanceof Error ? reconnectErr.message : String(reconnectErr);
+          this.lastErrorMessage = errMsg;
           this.logger?.error({
             event: 'downstream.reconnect_failed',
             server_name: this.config.name,
             message: `downstream "${this.config.name}" unhealthy after one reconnect`,
-            error: reconnectErr instanceof Error ? reconnectErr.message : String(reconnectErr),
+            error: errMsg,
           });
           throw new Error(
-            `downstream "${this.config.name}" unhealthy after one reconnect: ${reconnectErr instanceof Error ? reconnectErr.message : reconnectErr}`,
+            `downstream "${this.config.name}" unhealthy after one reconnect: ${errMsg}`,
           );
         }
       }
       this.health = 'unhealthy';
+      this.lastErrorMessage = message;
       this.logger?.error({
         event: 'downstream.call_failed',
         server_name: this.config.name,

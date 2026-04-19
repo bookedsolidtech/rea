@@ -255,6 +255,32 @@ describe('DownstreamConnection reconnect semantics', () => {
     expect(r2).toEqual({ ok: 'after-reconnect-2' });
   });
 
+  it('clears lastError after a successful call on the same connection (Codex F2)', async () => {
+    // Regression for Codex F2: the happy path of callTool must clear any
+    // lingering lastError. Without this, a future code path that sets
+    // lastErrorMessage (e.g. a listTools failure, or an operator-visible
+    // transient) combined with a subsequent successful call would leave
+    // the snapshot showing a stale error alongside a healthy downstream.
+    //
+    // We simulate the "lingering error" state by seeding the private field
+    // directly, then asserting a successful call wipes it.
+    const stub = makeStubClient(() => Promise.resolve({ ok: 'pong' }));
+    const conn = makeConnection([stub]);
+
+    // Prime the connection so `this.client !== null` and no reconnect fires.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (conn as any).client = stub;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (conn as any).health = 'healthy';
+    // Seed a stale error as if a prior call or listTools had set one.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (conn as any).lastErrorMessage = 'prior blip — should be cleared';
+
+    const result = await conn.callTool('ping', {});
+    expect(result).toEqual({ ok: 'pong' });
+    expect(conn.lastError).toBeNull();
+  });
+
   it('refuses a second reconnect within the flap window', async () => {
     const firstClient = makeStubClient(() => Promise.reject(new Error('transport closed #1')));
     const secondClient = makeStubClient(() => Promise.resolve({ ok: 'reconnect-1-retry' }));

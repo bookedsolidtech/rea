@@ -62,7 +62,7 @@ describe('gateway server smoke', () => {
     await fs.rm(baseDir, { recursive: true, force: true });
   });
 
-  it('zero-server mode: listTools returns empty catalog', async () => {
+  it('zero-server mode: listTools returns only the __rea__health meta-tool', async () => {
     const policy = basePolicy();
     await writePolicy(baseDir, policy);
     const handle = createGateway({ baseDir, policy, registry: emptyRegistry() });
@@ -76,8 +76,11 @@ describe('gateway server smoke', () => {
     );
     await client.connect(clientSide);
 
+    // The gateway ALWAYS exposes __rea__health so callers have a
+    // self-diagnostic path even when every downstream is unhealthy.
     const tools = await client.listTools();
-    expect(tools.tools).toEqual([]);
+    expect(tools.tools).toHaveLength(1);
+    expect(tools.tools[0]!.name).toBe('__rea__health');
 
     await client.close();
     await handle.stop();
