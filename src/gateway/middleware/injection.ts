@@ -52,11 +52,20 @@ export const INJECTION_PHRASES: readonly string[] = [
 const UNICODE_WHITESPACE_RE = /[\s\u00A0\u1680\u2000-\u200A\u202F\u205F\u3000]+/g;
 
 /**
- * G9 follow-up — zero-width characters, stripped entirely before matching.
- * U+200B ZERO WIDTH SPACE, U+200C ZERO WIDTH NON-JOINER, U+200D ZERO WIDTH
- * JOINER, U+FEFF ZERO WIDTH NO-BREAK SPACE / BOM. Also U+2060 WORD JOINER.
+ * G9 follow-up (Codex round-2, finding #1) — strip all Default_Ignorable_Code_Point
+ * characters before matching. The Unicode property `Default_Ignorable_Code_Point`
+ * covers every codepoint that is invisible and has no glyph in standard rendering:
+ * soft hyphen (U+00AD), combining grapheme joiner (U+034F), Arabic letter mark
+ * (U+061C), Mongolian vowel separator (U+180E), zero-width space/non-joiner/joiner
+ * (U+200B–U+200D), word joiner (U+2060), invisible times/separator/plus
+ * (U+2062–U+2064), BIDI isolation controls (U+2066–U+2069), variation selector-16
+ * (U+FE0F), zero-width no-break space / BOM (U+FEFF), and others.
+ *
+ * Using `\p{Default_Ignorable_Code_Point}` (requires the `u` flag, Node 22+)
+ * is future-proof: new Default_Ignorable codepoints added to Unicode are
+ * automatically covered without updating this regex.
  */
-const ZERO_WIDTH_RE = /[\u200B-\u200D\u2060\uFEFF]/g;
+const IGNORABLE_CP_RE = /\p{Default_Ignorable_Code_Point}/gu;
 
 /**
  * G9 follow-up — normalize an input string to a canonical form for literal
@@ -64,8 +73,10 @@ const ZERO_WIDTH_RE = /[\u200B-\u200D\u2060\uFEFF]/g;
  *
  *   1. NFKC Unicode normalization — folds compatibility forms (fullwidth
  *      letters, mathematical alphanumerics) into ASCII equivalents.
- *   2. Strip zero-width characters — these are invisible and only serve to
- *      break substring matches.
+ *   2. Strip all Default_Ignorable_Code_Point characters — invisible codepoints
+ *      that have no rendering and are used only to visually split or obscure
+ *      injection keywords (soft hyphen, zero-width joiners/non-joiners/spaces,
+ *      BIDI isolation controls, variation selectors, BOM, etc.).
  *   3. Collapse any run of Unicode whitespace (including NBSP, en/em space)
  *      to a single ASCII space.
  *   4. Lowercase — matches the case-insensitive contract of INJECTION_PHRASES.
@@ -77,7 +88,7 @@ const ZERO_WIDTH_RE = /[\u200B-\u200D\u2060\uFEFF]/g;
 export function normalizeForMatch(input: string): string {
   return input
     .normalize('NFKC')
-    .replace(ZERO_WIDTH_RE, '')
+    .replace(IGNORABLE_CP_RE, '')
     .replace(UNICODE_WHITESPACE_RE, ' ')
     .toLowerCase();
 }
@@ -652,13 +663,23 @@ export function createInjectionMiddleware(
 
     const classification = classifyInjection(scan, ctx.tier);
 
-    // G9 follow-up (finding #4): on scanner timeout, emit a verdict of
-    // 'error' if we otherwise have no signal. Real matches observed before
-    // the timeout fired still classify normally — the verdict is only
-    // rewritten to 'error' when the scan produced no actionable signal.
-    // Timeouts are NOT a deny signal: the worker was killed, we don't know
-    // what the attacker put in the payload, but we also cannot assume the
-    // worst without evidence. The audit record preserves the signal.
+    // G9 follow-up (finding #4 + Codex round-2 finding #2): on scanner
+    // timeout, the behavior depends on the configured action:
+    //
+    //   block mode: fail-closed — a timeout under block policy means we
+    //     cannot verify the payload is clean, so we DENY. The attacker who
+    //     crafted a payload that defeats the timeout budget must not get a
+    //     free pass. ctx.status is set to Denied and we return without
+    //     calling next().
+    //
+    //   warn/log mode: fail-open — emit a verdict:'error' metadata record
+    //     alongside the existing injection.regex_timeout event so downstream
+    //     audit consumers see a stable verdict shape, then allow through.
+    //
+    // In both cases the audit record and stderr warning are written first.
+    // Real matches observed before the timeout fired classify normally via
+    // the branches below — this branch only fires when classification is
+    // 'clean' (no actionable signal was collected before the timeout).
     if (classification.verdict === 'clean' && scanTimedOut) {
       const errorMeta: InjectionClassifierMetadata = {
         verdict: 'error',
@@ -669,6 +690,13 @@ export function createInjectionMiddleware(
       process.stderr.write(
         `[rea] INJECTION-GUARD (error): regex-timeout during scan of tool "${ctx.tool_name}" result; verdict inconclusive\n`,
       );
+      if (action === 'block') {
+        ctx.status = InvocationStatus.Denied;
+        ctx.error =
+          'injection scan timed out — failing closed under block policy';
+        return; // do NOT call next()
+      }
+      // warn/log mode: let through but record — verdict:'error' is written above.
       return;
     }
 
