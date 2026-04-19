@@ -39,7 +39,7 @@ jobs:
 
       - name: Setup Node
         # pin: actions/setup-node v4.0.3
-        uses: actions/setup-node@1e60f620b9541d16bece96c5465dc8ee9832be0b
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f
         with:
           node-version: 22
           cache: pnpm
