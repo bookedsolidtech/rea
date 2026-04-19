@@ -512,4 +512,75 @@ describe('installPrePushFallback — concurrency + temp-file hygiene', () => {
     const content = await fs.readFile(path.join(hooksDir, 'pre-push'), 'utf8');
     expect(content.startsWith(`#!/bin/sh\n${FALLBACK_MARKER}\n`)).toBe(true);
   });
+
+  it('race: directory raced into hook path → refuses to write instead of throwing on rename', async () => {
+    // Post-merge Codex P2 on the patch itself: the TOCTOU re-check must
+    // distinguish ENOENT (safe to proceed with install) from "a non-file
+    // appeared in the way" (must abort). A previous patch iteration
+    // treated both as `not-a-file` with the same reason, which let a
+    // directory racing into the destination flow through to writeExecutable
+    // and throw on rename(). The installer should return a clean skip.
+    await initGitRepo(dir);
+    const hooksDir = path.join(dir, '.git', 'hooks');
+    await fs.mkdir(hooksDir, { recursive: true });
+
+    const result = await installPrePushFallback(dir, {
+      onBeforeReresolve: async (hookPath) => {
+        // Drop a DIRECTORY at the spot the installer is about to write.
+        await fs.mkdir(hookPath, { recursive: true });
+      },
+    });
+
+    expect(result.written).toBeUndefined();
+    expect(result.decision.action).toBe('skip');
+    if (result.decision.action === 'skip') {
+      expect(result.decision.reason).toBe('foreign-pre-push');
+    }
+    // The directory the test dropped in is still there — installer did
+    // not touch it.
+    const stat = await fs.stat(path.join(hooksDir, 'pre-push'));
+    expect(stat.isDirectory()).toBe(true);
+  });
+
+  it('linked git worktree: install succeeds (lock resolves via git common-dir, not the .git file)', async () => {
+    // Post-merge Codex P1 on the patch itself: a previous iteration locked
+    // against `<targetDir>/.git` unconditionally. In a linked worktree
+    // `.git` is a FILE containing `gitdir: ...` — trying to place a
+    // lockfile inside it raises ENOTDIR and regresses the very case
+    // (husky in a worktree) the installer is supposed to cover. The fix
+    // resolves `git rev-parse --git-common-dir` so the lock lands under
+    // the real common dir.
+    await initGitRepo(dir);
+    // Seed a commit so `git worktree add` has a ref to check out.
+    await fs.writeFile(path.join(dir, 'README.md'), '# t\n');
+    await execFileAsync('git', ['-C', dir, 'add', '-A']);
+    await execFileAsync('git', ['-C', dir, 'commit', '-m', 'seed', '--quiet']);
+
+    const worktreeDir = path.join(dir, 'linked-worktree');
+    await execFileAsync('git', [
+      '-C',
+      dir,
+      'worktree',
+      'add',
+      '--quiet',
+      worktreeDir,
+      '-b',
+      'wt-branch',
+    ]);
+
+    // Sanity: .git in the linked worktree is a file, not a directory.
+    const dotGit = await fs.stat(path.join(worktreeDir, '.git'));
+    expect(dotGit.isFile()).toBe(true);
+
+    // Install must succeed against the linked worktree.
+    const result = await installPrePushFallback(worktreeDir);
+    expect(['install', 'refresh']).toContain(result.decision.action);
+    expect(result.written).toBeDefined();
+    const content = await fs.readFile(result.written!, 'utf8');
+    expect(content.startsWith(`#!/bin/sh\n${FALLBACK_MARKER}\n`)).toBe(true);
+
+    // And a subsequent call in the same worktree should cleanly refresh.
+    const second = await installPrePushFallback(worktreeDir);
+    expect(second.decision.action).toBe('refresh');
+  });
 });

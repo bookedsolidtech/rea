@@ -140,17 +140,27 @@ export function referencesReviewGate(content: string): boolean {
 /**
  * Classification of an on-disk pre-push file relative to rea governance.
  * Mirrors the decision tree in the module header.
+ *
+ * `absent` vs `not-a-file` is a deliberate split: when re-checking the
+ * destination in the TOCTOU guard we accept `absent` as "safe to proceed
+ * with install" but treat a directory/symlink-to-directory that raced
+ * into place as a write-path obstruction we must refuse to stomp.
  */
 type HookClassification =
   | { kind: 'rea-managed' }
   | { kind: 'gate-delegating' }
+  | { kind: 'absent' }
   | { kind: 'foreign'; reason: 'no-marker' | 'unreadable' | 'not-a-file' };
 
 /**
  * Read `hookPath` and classify. Does not consult file mode — callers are
  * expected to combine this with an executable-bit check where relevant.
- * A directory, symlink-to-directory, ENOENT, or unreadable file is "foreign"
- * so that we never silently clobber anything we cannot inspect.
+ *
+ * A directory, symlink-to-directory, or unreadable file is "foreign/not-
+ * a-file" so that we never silently clobber anything we cannot inspect.
+ * A missing path returns the distinct `absent` kind so the install
+ * re-check can distinguish "safe to write here" from "something non-file
+ * raced into place".
  */
 async function classifyExistingHook(
   hookPath: string,
@@ -158,7 +168,12 @@ async function classifyExistingHook(
   let stat: fs.Stats;
   try {
     stat = await fsPromises.stat(hookPath);
-  } catch {
+  } catch (err) {
+    // ENOENT is the expected state during an `install` flow. Any other
+    // stat error (permission denied, I/O) is treated as a "not-a-file"
+    // foreign signal so we never proceed with a write.
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT') return { kind: 'absent' };
     return { kind: 'foreign', reason: 'not-a-file' };
   }
   if (!stat.isFile()) {
@@ -264,9 +279,55 @@ export type InstallDecision =
   | { action: 'refresh'; hookPath: string };
 
 /**
+ * Resolve the git-managed hook path for a named hook (e.g. `pre-push`) via
+ * `git rev-parse --git-path hooks/<name>`. Returns the absolute path git
+ * itself would look at when `core.hooksPath` is unset.
+ *
+ * This is the correct way to locate `.git/hooks/<name>` in ALL repo shapes:
+ *   - Vanilla repo: `<repo>/.git/hooks/<name>`
+ *   - Linked worktree: `.git` is a FILE pointing at the worktree's gitdir,
+ *     and `git rev-parse --git-path hooks/<name>` returns the per-worktree
+ *     hooks directory (shared across worktrees in modern git — see
+ *     `extensions.worktreeConfig`). Hard-coding `<repo>/.git/hooks/<name>`
+ *     in that shape points at a path that does not exist.
+ *   - Submodule: `.git` is a file pointing into the superproject's modules/
+ *     dir. `git rev-parse --git-path` resolves to the correct location
+ *     inside that gitdir.
+ *
+ * Returns `null` when `targetDir` is not a git repo or the git binary is
+ * unreachable; the caller already short-circuits the non-repo case via
+ * `fs.existsSync(.git)`, but we fall back defensively so this seam never
+ * throws.
+ */
+async function resolveGitHookPath(
+  targetDir: string,
+  hookName: string,
+): Promise<string | null> {
+  try {
+    const { stdout } = await execFileAsync(
+      'git',
+      ['-C', targetDir, 'rev-parse', '--git-path', `hooks/${hookName}`],
+      { encoding: 'utf8' },
+    );
+    const trimmed = stdout.trim();
+    if (trimmed.length === 0) return null;
+    return path.isAbsolute(trimmed) ? trimmed : path.join(targetDir, trimmed);
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Resolve the hook path we would target given the current git config and
  * on-disk state. Split out so `installPrePushFallback` can re-resolve it
  * immediately before the write to close the classify → write TOCTOU window.
+ *
+ * When `core.hooksPath` is unset we ask git for the real hook path rather
+ * than hard-coding `<targetDir>/.git/hooks/pre-push`. In a linked worktree
+ * `<targetDir>/.git` is a FILE (pointing at the worktree's gitdir), so the
+ * hard-coded form resolves to a non-existent path and every classify call
+ * would report `absent` against the wrong location — silently installing
+ * (or refusing to install) in the wrong place.
  */
 async function resolveTargetHookPath(targetDir: string): Promise<{
   hookPath: string;
@@ -279,6 +340,13 @@ async function resolveTargetHookPath(targetDir: string): Promise<{
       hooksPathConfigured: true,
     };
   }
+  const gitHookPath = await resolveGitHookPath(targetDir, 'pre-push');
+  if (gitHookPath !== null) {
+    return { hookPath: gitHookPath, hooksPathConfigured: false };
+  }
+  // Last-resort fallback for non-git-repo edge cases (caller's existsSync
+  // already guards production paths, but keep behavior stable if git is
+  // unreachable).
   return {
     hookPath: path.join(targetDir, '.git', 'hooks', 'pre-push'),
     hooksPathConfigured: false,
@@ -299,15 +367,15 @@ export async function classifyPrePushInstall(
 ): Promise<InstallDecision> {
   const { hookPath, hooksPathConfigured } = await resolveTargetHookPath(targetDir);
 
-  // Fast path: no file at the target → always an install. Executable-bit
-  // and content classification only apply when something already lives
-  // there.
-  if (!fs.existsSync(hookPath)) {
+  // A file exists at the target. Classify before deciding. We skip the
+  // older `fs.existsSync` fast path because `classifyExistingHook` already
+  // distinguishes `absent` from foreign-non-file — collapsing both checks
+  // into one also removes a tiny TOCTOU window where a file could be
+  // unlinked between existsSync and stat.
+  const classification = await classifyExistingHook(hookPath);
+  if (classification.kind === 'absent') {
     return { action: 'install', hookPath };
   }
-
-  // A file exists at the target. Classify before deciding.
-  const classification = await classifyExistingHook(hookPath);
   if (classification.kind === 'rea-managed') {
     return { action: 'refresh', hookPath };
   }
@@ -439,23 +507,71 @@ export interface InstallPrePushOptions {
 }
 
 /**
- * Acquire a short-lived advisory lock under `.git/` so two concurrent
- * `rea init` runs do not race on the same pre-push hook. The `.git/`
- * directory is guaranteed to exist before we reach this (we check up
- * front) and is the only reliably-writable location that a consumer won't
- * be surprised to find a `.lock` in.
+ * Resolve the actual git common directory for `targetDir`. In a linked
+ * worktree or submodule, `<targetDir>/.git` is a FILE that points at the
+ * real git dir (`gitdir: /path/to/..../git/worktrees/<name>`), and the
+ * "common" directory — where locks and shared state belong — lives one
+ * level up via `git rev-parse --git-common-dir`. In a vanilla repo the
+ * common dir is just `<targetDir>/.git`.
+ *
+ * Returns `null` if `targetDir` is not a git repo (the caller already
+ * short-circuits this via `fs.existsSync(.git)`, but we handle the
+ * fallback anyway so we never throw from the lock seam).
+ */
+async function resolveGitCommonDir(targetDir: string): Promise<string | null> {
+  try {
+    const { stdout } = await execFileAsync(
+      'git',
+      ['-C', targetDir, 'rev-parse', '--git-common-dir'],
+      { encoding: 'utf8' },
+    );
+    const trimmed = stdout.trim();
+    if (trimmed.length === 0) return null;
+    return path.isAbsolute(trimmed) ? trimmed : path.join(targetDir, trimmed);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Acquire a short-lived advisory lock under the git common directory so
+ * two concurrent `rea init` runs do not race on the same pre-push hook.
+ *
+ * The lock lives under `<git-common-dir>/rea-pre-push-install.lock`. In
+ * a vanilla repo that's `<repo>/.git/rea-pre-push-install.lock`; in a
+ * linked worktree `.git` is a FILE, not a directory, so we resolve via
+ * `git rev-parse --git-common-dir` to find the real writable location.
+ * Writing inside the .git FILE would throw ENOTDIR and regress the very
+ * worktree/submodule cases husky is most common in.
  *
  * proper-lockfile is already a runtime dep (audit chain uses it). Stale
  * timeout is deliberately short — install is a few hundred milliseconds
  * in the worst case, and a crashed run should not block the next one for
  * long.
+ *
+ * If the git common dir cannot be resolved (unreachable git binary, not a
+ * repo, etc.), run without a lock rather than throwing. The outer caller
+ * already verified `.git` exists, so this is a belt-and-suspenders path.
  */
 async function withInstallLock<T>(
   targetDir: string,
   fn: () => Promise<T>,
 ): Promise<T> {
-  const lockTarget = path.join(targetDir, '.git');
-  const release = await properLockfile.lock(lockTarget, {
+  const commonDir = await resolveGitCommonDir(targetDir);
+  if (commonDir === null) {
+    // No lock available, but the work is still safe — we still do the
+    // TOCTOU re-check plus `wx` open. Concurrency hardening degrades to
+    // best-effort in this edge case.
+    return fn();
+  }
+
+  // Ensure the common dir exists before proper-lockfile tries to create
+  // a lockfile inside it. `git rev-parse --git-common-dir` returning a
+  // path is not a promise the path currently exists (submodules mid-init,
+  // etc.), so mkdir defensively.
+  await fsPromises.mkdir(commonDir, { recursive: true });
+
+  const release = await properLockfile.lock(commonDir, {
     stale: 10_000,
     retries: {
       retries: 20,
@@ -465,7 +581,7 @@ async function withInstallLock<T>(
       randomize: true,
     },
     realpath: false,
-    lockfilePath: path.join(lockTarget, 'rea-pre-push-install.lock'),
+    lockfilePath: path.join(commonDir, 'rea-pre-push-install.lock'),
   });
   try {
     return await fn();
@@ -549,13 +665,18 @@ export async function installPrePushFallback(
         }
 
         // Re-classify the destination. For `install` the fast rule is
-        // "file must still be absent". For `refresh` the rule is "still
-        // rea-managed"; a file that got replaced by a consumer between
-        // classify and write must not be clobbered.
+        // "must still be absent" — a regular file, directory, symlink, or
+        // unreadable entry that raced into place is all equally unsafe to
+        // stomp, and refusing early avoids a rename() that would either
+        // succeed silently against a foreign file or fail noisily against
+        // a non-file. For `refresh` the rule is "still rea-managed"; a
+        // file that got replaced by a consumer between classify and write
+        // must not be clobbered.
         const reCheck = await classifyExistingHook(decision.hookPath);
         if (decision.action === 'install') {
-          if (reCheck.kind !== 'foreign' || reCheck.reason !== 'not-a-file') {
-            // Something appeared. Do NOT stomp.
+          if (reCheck.kind !== 'absent') {
+            // Something appeared at the path (regular file, directory,
+            // symlink, or unreadable entry). Do NOT stomp.
             result.warnings.push(
               `pre-push hook at ${decision.hookPath} appeared during install — ` +
                 `leaving it untouched. Re-run \`rea init\` to re-evaluate.`,
@@ -656,16 +777,23 @@ export async function inspectPrePushState(
 ): Promise<PrePushDoctorState> {
   const candidatePaths: string[] = [];
   const hooksInfo = await resolveHooksDir(targetDir);
+  // Resolved via `git rev-parse --git-path hooks/pre-push` so linked
+  // worktrees (where `.git` is a FILE, not a directory) are handled
+  // correctly. Fall back to the hard-coded form only when git cannot
+  // answer — the inspect path must never throw.
+  const gitHookPath =
+    (await resolveGitHookPath(targetDir, 'pre-push')) ??
+    path.join(targetDir, '.git', 'hooks', 'pre-push');
 
   // Priority order matches install policy:
   //   1. Configured hooksPath (husky or custom)
-  //   2. `.git/hooks/pre-push` (fallback target)
+  //   2. `.git/hooks/pre-push` (fallback target, via git-path resolution)
   //   3. `.husky/pre-push` (source-of-truth copy, may be inert if husky
   //      isn't wired up yet)
   if (hooksInfo.configured && hooksInfo.dir !== null) {
     candidatePaths.push(path.join(hooksInfo.dir, 'pre-push'));
   }
-  candidatePaths.push(path.join(targetDir, '.git', 'hooks', 'pre-push'));
+  candidatePaths.push(gitHookPath);
   candidatePaths.push(path.join(targetDir, '.husky', 'pre-push'));
 
   // De-duplicate while preserving order (hooksPath may already point at
@@ -710,7 +838,7 @@ export async function inspectPrePushState(
   const activePath =
     hooksInfo.configured && hooksInfo.dir !== null
       ? path.join(hooksInfo.dir, 'pre-push')
-      : path.join(targetDir, '.git', 'hooks', 'pre-push');
+      : gitHookPath;
   const active = candidates.find((c) => c.path === activePath);
   const activeExistsExec =
     active !== undefined && active.exists && active.executable;
