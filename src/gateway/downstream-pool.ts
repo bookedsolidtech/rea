@@ -8,6 +8,7 @@
 
 import { DownstreamConnection, type DownstreamToolInfo } from './downstream.js';
 import type { Registry } from '../registry/types.js';
+import type { Logger } from './log.js';
 
 export interface PrefixedTool extends DownstreamToolInfo {
   /** Server name, not prefixed. */
@@ -19,10 +20,10 @@ export interface PrefixedTool extends DownstreamToolInfo {
 export class DownstreamPool {
   private readonly connections = new Map<string, DownstreamConnection>();
 
-  constructor(registry: Registry) {
+  constructor(registry: Registry, logger?: Logger) {
     for (const server of registry.servers) {
       if (!server.enabled) continue;
-      this.connections.set(server.name, new DownstreamConnection(server));
+      this.connections.set(server.name, new DownstreamConnection(server, logger));
     }
   }
 

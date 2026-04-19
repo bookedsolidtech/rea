@@ -26,6 +26,10 @@ export const POLICY_FILE = 'policy.yaml';
 export const REGISTRY_FILE = 'registry.yaml';
 export const HALT_FILE = 'HALT';
 export const AUDIT_FILE = 'audit.jsonl';
+/** Pidfile written by `rea serve` for `rea status` introspection (G5). */
+export const SERVE_PID_FILE = 'serve.pid';
+/** State file written by `rea serve` carrying session_id + start metadata (G5). */
+export const SERVE_STATE_FILE = 'serve.state.json';
 
 export function reaPath(baseDir: string, ...segments: string[]): string {
   return path.join(baseDir, REA_DIR, ...segments);

@@ -66,7 +66,10 @@ to build a separate package that composes with REA.
   `policy.yaml` is the maximum surface area — one outbound POST, opt-in.
 - **Not a daemon supervisor.** `rea serve` is started by Claude Code via
   `.mcp.json`. Claude Code owns the lifecycle. There is no `rea start`,
-  no `rea stop`, no pid file, no systemd unit.
+  no `rea stop`, no systemd unit. A short-lived `.rea/serve.pid`
+  breadcrumb is written at startup so `rea status` can detect a live
+  gateway — it is removed on graceful shutdown and never used for
+  locking or lifecycle management.
 - **Not a hosted service.** There is no REA Cloud, no SaaS tier, no
   multi-token workstreams, no workload isolation platform.
 - **Not a 70-agent roster.** 10 curated agents ship in the package. Four
@@ -131,6 +134,43 @@ rea doctor
 install, `.mcp.json` gateway wiring, Codex plugin availability, and the
 integrity of the audit hash chain. It returns a pass/fail summary with
 specific remediation hints.
+
+### 4. Watch the running gateway
+
+```bash
+rea status              # human-readable summary
+rea status --json       # JSON — pipe to jq
+```
+
+`rea status` is the live-process view. It reads the pidfile written by
+`rea serve`, verifies the pid is alive, and surfaces the session id,
+policy summary (profile, autonomy, HALT state), and audit stats (lines,
+last timestamp, whether the tail record's hash looks well-formed). Use
+`rea check` when you want the pure on-disk view without probing for a
+live process.
+
+### 5. Optional Prometheus `/metrics` endpoint
+
+`rea serve` can expose a loopback-only Prometheus endpoint when the
+`REA_METRICS_PORT` environment variable is set:
+
+```bash
+REA_METRICS_PORT=9464 rea serve
+# in another shell
+curl http://127.0.0.1:9464/metrics
+```
+
+Metrics exposed: per-downstream call and error counters, in-flight
+gauge, audit-lines-appended counter, circuit-breaker state gauge, and a
+seconds-since-last-HALT-check gauge. The listener binds to `127.0.0.1`
+only, serves only `GET /metrics` (everything else is a fixed-body 404),
+and never binds by default — "no silent listeners" is a design rule.
+There is no TLS; scrape through SSH/a reverse proxy if you need
+cross-host access.
+
+Set `REA_LOG_LEVEL=debug` for verbose gateway logs; the default is
+`info`. Records are JSON lines on a non-TTY stderr and pretty-printed
+on an interactive terminal.
 
 ## Architecture
 
