@@ -132,3 +132,39 @@ jobs:
 
       - name: Build
         run: pnpm build
+
+  tarball-smoke:
+    name: Tarball smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Pack the package, install the resulting tarball in an isolated tempdir,
+    # and exercise `rea --version`, `rea init`, `rea doctor`, and every public
+    # ESM export. Catches packaging regressions (missing files from `files:`,
+    # broken exports map, shebang/chmod issues on `bin`, postinstall failures,
+    # dep-resolution drift) BEFORE the tarball reaches npm. Runs on every PR
+    # and every push to main; a failure here should be treated as a publish
+    # blocker.
+    steps:
+      - name: Checkout
+        # pin: actions/checkout v4.1.7
+        uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332
+
+      - name: Setup pnpm
+        # pin: pnpm/action-setup v4.0.0 — version derived from packageManager in package.json
+        uses: pnpm/action-setup@fe02b34f77f8bc703788d5817da081398fad5dd2
+
+      - name: Setup Node
+        # pin: actions/setup-node v4.0.3
+        uses: actions/setup-node@1e60f620b9541d16bece96c5465dc8ee9832be0b
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        run: pnpm build
+
+      - name: Tarball smoke
+        run: scripts/tarball-smoke.sh
