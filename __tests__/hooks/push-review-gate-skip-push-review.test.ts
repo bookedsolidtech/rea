@@ -462,6 +462,10 @@ describe('push-review-gate.sh — REA_SKIP_PUSH_REVIEW whole-gate escape hatch',
           ...process.env,
           REA_SKIP_PUSH_REVIEW: 'native-pre-push-skip',
           CLAUDE_PROJECT_DIR: repo.dir,
+          // GitHub Actions sets CI=true; spreading process.env would trip
+          // the F2 CI-aware refusal branch. This test exercises the native
+          // pre-push contract, not CI behavior — explicitly unset CI.
+          CI: '',
         },
         input: prepushLine,
         encoding: 'utf8',
