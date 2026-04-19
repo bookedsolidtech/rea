@@ -229,6 +229,18 @@ describe('sanitizeForTerminal — ANSI/OSC escape injection defense', () => {
   });
 });
 
+describe('printPretty — base_dir sanitization', () => {
+  it('sanitizeForTerminal replaces ESC bytes in a base_dir-shaped path with ?', () => {
+    // A directory named with an ANSI red-text escape sequence must not reach
+    // the operator's terminal verbatim. Simulate what printPretty does:
+    // apply sanitizeForTerminal to a base_dir containing ESC bytes.
+    const maliciousPath = '/home/user/\x1b[31mevil\x1b[0m-project';
+    const sanitized = sanitizeForTerminal(maliciousPath);
+    expect(sanitized).not.toContain('\x1b');
+    expect(sanitized).toBe('/home/user/?[31mevil?[0m-project');
+  });
+});
+
 describe('summarizeAudit — terminal-safe output via computeStatusPayload', () => {
   let baseDir: string;
 

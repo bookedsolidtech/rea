@@ -360,15 +360,16 @@ export function computeStatusPayload(baseDir: string): StatusPayload {
 }
 
 function printPretty(payload: StatusPayload): void {
-  // Every disk-sourced string field below flows through `safePretty`
-  // because ANSI/OSC escape sequences in HALT reason, session_id,
-  // timestamps, or the policy profile would execute in the operator's
-  // terminal. `base_dir` comes from `process.cwd()` (trusted — set by
-  // the OS), so it is NOT sanitized.
+  // Every terminal-bound string field flows through `safePretty` or
+  // `sanitizeForTerminal` to prevent ANSI/OSC escape injection. This
+  // includes `base_dir`: although it originates from `process.cwd()`, the
+  // filesystem path is operator-controlled and a maliciously named directory
+  // can embed ESC/OSC bytes that inject terminal sequences when printed.
   const p = payload.policy;
   const s = payload.serve;
   const a = payload.audit;
 
+  const baseDir = sanitizeForTerminal(payload.base_dir);
   const profile = sanitizeForTerminal(p.profile);
   const autonomy = sanitizeForTerminal(p.autonomy_level);
   const haltReason = safePretty(p.halt_reason);
@@ -379,7 +380,7 @@ function printPretty(payload: StatusPayload): void {
   const lastTimestamp = safePretty(a.last_timestamp);
 
   console.log('');
-  log(`Status — ${payload.base_dir}`);
+  log(`Status — ${baseDir}`);
   console.log('');
   console.log('  Policy');
   console.log(`    Profile:            ${profile}`);

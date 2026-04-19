@@ -189,11 +189,24 @@ export async function runServe(): Promise<void> {
 
   // ── Observability setup (G5) ─────────────────────────────────────────────
   const sessionId = currentSessionId();
-  // Build a log-field redactor from the same SECRET_PATTERNS used by the
-  // redact middleware. Without this, raw downstream error messages
-  // (which can carry env var names, argv fragments, or file paths with
-  // credential material) reach stderr verbatim.
-  const logRedactor = buildRegexRedactor(SECRET_PATTERNS);
+  // Build a log-field redactor from the built-in SECRET_PATTERNS plus any
+  // operator-configured patterns from policy.redact.patterns. Without this,
+  // custom tenant/env-specific secrets that the gateway redact middleware
+  // catches in tool results would still appear verbatim in stderr log fields
+  // (e.g. downstream error messages). The logger uses plain sync RegExp (not
+  // SafeRegex workers) because log fields are short strings and the ReDoS
+  // surface that motivated SafeRegex for MCP payloads does not apply here.
+  const policyRedactPatterns: ReadonlyArray<{ name: string; pattern: RegExp }> =
+    (policy.redact?.patterns ?? []).flatMap((entry) => {
+      try {
+        return [{ name: entry.name, pattern: new RegExp(entry.regex, entry.flags ?? '') }];
+      } catch {
+        // The policy loader already validated these; a compile failure here is
+        // a defensive catch for any unreachable corner case. Drop and continue.
+        return [];
+      }
+    });
+  const logRedactor = buildRegexRedactor([...SECRET_PATTERNS, ...policyRedactPatterns]);
   const logger = createLogger({
     level: resolveLogLevel(process.env['REA_LOG_LEVEL']),
     base: { session_id: sessionId },
