@@ -186,6 +186,96 @@ describe('installPrePushFallback — classifyPrePushInstall branches', () => {
       expect(decision.reason).toBe('foreign-pre-push');
     }
   });
+
+  it('vanilla repo: executable .git/hooks/pre-push that EXECS the gate is active, not foreign', async () => {
+    // Round-2 Codex finding (P2-1). When `core.hooksPath` is unset, a
+    // user-authored `.git/hooks/pre-push` that already delegates to
+    // `.claude/hooks/push-review-gate.sh` satisfies governance. The
+    // classifier MUST treat it as `active-pre-push-present`, not
+    // `foreign-pre-push` — otherwise `rea init` would warn on every run
+    // telling the user to add the very `exec` line they already have,
+    // while `rea doctor` reports the same hook as ok. The two paths
+    // must agree.
+    await initGitRepo(dir);
+    const hooksDir = path.join(dir, '.git', 'hooks');
+    await fs.mkdir(hooksDir, { recursive: true });
+    await fs.writeFile(
+      path.join(hooksDir, 'pre-push'),
+      '#!/bin/sh\nnpx lint-staged\nexec .claude/hooks/push-review-gate.sh "$@"\n',
+      { mode: 0o755 },
+    );
+    const decision = await classifyPrePushInstall(dir);
+    expect(decision.action).toBe('skip');
+    if (decision.action === 'skip') {
+      expect(decision.reason).toBe('active-pre-push-present');
+    }
+
+    // And the install path must match — no write, no warning about
+    // replacing the hook.
+    const result = await installPrePushFallback(dir);
+    expect(result.decision.action).toBe('skip');
+    if (result.decision.action === 'skip') {
+      expect(result.decision.reason).toBe('active-pre-push-present');
+    }
+    expect(result.written).toBeUndefined();
+    // Must NOT warn when the hook is already wiring the gate.
+    expect(
+      result.warnings.some((w) => w.includes('not rea-managed')),
+    ).toBe(false);
+  });
+
+  it('comment-only mention of push-review-gate.sh: classified as foreign', async () => {
+    // Round-2 Codex finding (P2-2). `referencesReviewGate` used to accept
+    // any substring occurrence of the path, so a hint in a comment or a
+    // printf'd help string would bless a lint-only hook as "gate-
+    // delegating". The anchored check requires an actual exec-like
+    // invocation on a non-comment line. A comment mentioning the path
+    // MUST NOT satisfy governance.
+    await initGitRepo(dir);
+    const hooksDir = path.join(dir, '.git', 'hooks');
+    await fs.mkdir(hooksDir, { recursive: true });
+    await fs.writeFile(
+      path.join(hooksDir, 'pre-push'),
+      '#!/bin/sh\n# TODO: eventually add `exec .claude/hooks/push-review-gate.sh "$@"`\nnpx lint-staged\n',
+      { mode: 0o755 },
+    );
+    const decision = await classifyPrePushInstall(dir);
+    expect(decision.action).toBe('skip');
+    if (decision.action === 'skip') {
+      expect(decision.reason).toBe('foreign-pre-push');
+    }
+
+    // Doctor seam must also surface the warn, not a pass.
+    const state = await inspectPrePushState(dir);
+    expect(state.ok).toBe(false);
+    expect(state.activeForeign).toBe(true);
+    const active = state.candidates.find(
+      (c) => c.path === path.join(hooksDir, 'pre-push'),
+    );
+    expect(active?.delegatesToGate).toBe(false);
+  });
+
+  it('printf string containing the gate path: classified as foreign', async () => {
+    // Defense-in-depth for P2-2. A `printf 'help: run ...push-review-
+    // gate.sh'` somewhere in the hook body must NOT be treated as an
+    // invocation. Only an actual exec/command line counts.
+    await initGitRepo(dir);
+    const hooksDir = path.join(dir, '.git', 'hooks');
+    await fs.mkdir(hooksDir, { recursive: true });
+    await fs.writeFile(
+      path.join(hooksDir, 'pre-push'),
+      `#!/bin/sh
+printf 'hint: wire .claude/hooks/push-review-gate.sh into this hook to honor rea governance\\n' >&2
+exit 0
+`,
+      { mode: 0o755 },
+    );
+    const decision = await classifyPrePushInstall(dir);
+    expect(decision.action).toBe('skip');
+    if (decision.action === 'skip') {
+      expect(decision.reason).toBe('foreign-pre-push');
+    }
+  });
 });
 
 describe('installPrePushFallback — write semantics', () => {

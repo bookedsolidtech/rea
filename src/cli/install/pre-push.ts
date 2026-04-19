@@ -123,18 +123,100 @@ export function isReaManagedFallback(content: string): boolean {
 }
 
 /**
- * True when `content` contains a reference to `push-review-gate.sh`. Used
- * as a softer signal that a consumer-owned pre-push still wires the shared
- * gate (e.g. a husky 9 file that runs lint AND execs the gate). Combined
- * with "exists AND executable", a gate-referencing foreign hook is a
- * legitimate integration point — doctor reports `pass`, install skips.
+ * True when `content` contains a REAL shell invocation of
+ * `push-review-gate.sh`. Used as a softer signal that a consumer-owned
+ * pre-push still wires the shared gate (e.g. a husky 9 file that runs
+ * lint AND execs the gate). Combined with "exists AND executable", a
+ * gate-referencing foreign hook is a legitimate integration point —
+ * doctor reports `pass`, install skips.
  *
- * A file that does NOT reference the gate and is NOT rea-managed is
- * classified as foreign even if it exists and is executable: the governance
- * requirement is not satisfied and we need the user to see the warning.
+ * A plain `content.includes(...)` check is NOT enough: a comment that
+ * merely mentions the path (`# Hint: run push-review-gate.sh`), a HELP
+ * string, or leftover documentation would all false-positive as
+ * governance-wired and open the "silent bypass" hole this module exists
+ * to close. We require the token to appear on a NON-comment line that
+ * looks like an exec/command — either:
+ *   - opens with an exec form: `exec "…push-review-gate.sh"`, `exec …`,
+ *     `"…push-review-gate.sh" "$@"`, `sh .../push-review-gate.sh …`,
+ *     `bash .../push-review-gate.sh …`, `.../push-review-gate.sh "$@"`,
+ *   - or is a `source`/`.` inclusion: `source .../push-review-gate.sh`,
+ *     `. .../push-review-gate.sh`.
+ * Anything else — a comment starting with `#`, a shell string literal in
+ * a `printf`/`echo`, a grep log — is rejected.
+ *
+ * We strip inline comments (`# ...` to EOL) and leading whitespace before
+ * matching. We do NOT attempt full shell parsing; the goal is rejecting
+ * the obvious false positives Codex flagged, not sandboxing every
+ * conceivable legitimate invocation.
  */
 export function referencesReviewGate(content: string): boolean {
-  return content.includes(GATE_DELEGATION_TOKEN);
+  const lines = content.split(/\r?\n/);
+  for (const raw of lines) {
+    // Normalize: drop leading whitespace, drop a trailing inline comment
+    // (naive — does not account for `#` inside single/double quotes, but
+    // those would be wildly contrived in a real pre-push hook).
+    let line = raw.replace(/^\s+/, '');
+    if (line.length === 0) continue;
+    // Full-line comment — ignore.
+    if (line.startsWith('#')) continue;
+    // Strip inline trailing comment. Conservative: any unquoted `# ` or
+    // `#` at EOL.
+    const hashIdx = line.indexOf('#');
+    if (hashIdx > 0) {
+      // Only strip if preceded by whitespace (`cmd # comment`), not mid-
+      // token (`foo#bar` is not a comment in POSIX sh).
+      const before = line[hashIdx - 1];
+      if (before === ' ' || before === '\t') {
+        line = line.slice(0, hashIdx).trimEnd();
+      }
+    }
+    if (!line.includes(GATE_DELEGATION_TOKEN)) continue;
+
+    // Candidate line. Require it look like an invocation, not a string
+    // literal or a printf argument. The token must appear either:
+    //   (a) after an exec-like keyword: `exec`, `sh`, `bash`, `source`, `.`
+    //   (b) as the first program being invoked (possibly after a path
+    //       prefix): `"/abs/.../push-review-gate.sh" "$@"` or
+    //       `./relative/.claude/hooks/push-review-gate.sh "$@"`.
+    //
+    // We match token forms with optional surrounding quotes, preceded by
+    // either the line start (program invocation) OR an exec keyword.
+    //
+    // This is a pragmatic heuristic, not a full shell parser. It
+    // correctly accepts the shapes observed in husky+rea setups and
+    // rejects `printf 'hint: ...push-review-gate.sh' >&2` style strings.
+    if (looksLikeGateInvocation(line)) return true;
+  }
+  return false;
+}
+
+/**
+ * Heuristic: does `line` invoke the gate rather than merely mention it?
+ *
+ * Accepts:
+ *   - `exec <optional-prefix>.claude/hooks/push-review-gate.sh …`
+ *   - `sh <path>/push-review-gate.sh …`, `bash <path>/push-review-gate.sh …`
+ *   - `source <path>/push-review-gate.sh`, `. <path>/push-review-gate.sh`
+ *   - `<path>/push-review-gate.sh "$@"` (bare invocation at line start)
+ *   - Variants where the gate path is single/double quoted.
+ *
+ * Rejects:
+ *   - The token inside a `printf`/`echo`/string literal.
+ *   - A comment (already filtered by the caller).
+ */
+function looksLikeGateInvocation(line: string): boolean {
+  // Token anywhere on the line. We already confirmed presence in the caller.
+  // Strip leading/trailing quotes around the gate reference for uniform
+  // pattern matching.
+  const tokenRe = /(?:^|[\s;&|(])(?:(?:exec|source|sh|bash|zsh|\.)\s+)?["']?([A-Za-z0-9_./~${}-]*\.claude\/hooks\/push-review-gate\.sh)["']?(?=[\s;&|)"']|$)/;
+  const m = tokenRe.exec(line);
+  if (m === null) return false;
+  // Reject if the match is inside a simple string literal argument to a
+  // known "text output" command. This covers the `printf '... push-review-
+  // gate.sh ...'` false positive without trying to parse shell fully.
+  const before = line.slice(0, m.index).trim();
+  if (/^(printf|echo|cat|tee|logger)\b/.test(before)) return false;
+  return true;
 }
 
 /**
@@ -365,7 +447,7 @@ async function resolveTargetHookPath(targetDir: string): Promise<{
 export async function classifyPrePushInstall(
   targetDir: string,
 ): Promise<InstallDecision> {
-  const { hookPath, hooksPathConfigured } = await resolveTargetHookPath(targetDir);
+  const { hookPath } = await resolveTargetHookPath(targetDir);
 
   // A file exists at the target. Classify before deciding. We skip the
   // older `fs.existsSync` fast path because `classifyExistingHook` already
@@ -382,7 +464,7 @@ export async function classifyPrePushInstall(
 
   // Non-rea file present. Whether we call it "active governance hook" or
   // "foreign" depends on whether it (a) looks like a real executable git
-  // hook AND (b) actually references the shared review gate. Mere existence
+  // hook AND (b) actually invokes the shared review gate. Mere existence
   // of SOMETHING at the path does NOT satisfy governance — that was the
   // 0.2.x hole where a lint-only husky hook silently bypassed the Codex
   // audit gate.
@@ -394,13 +476,16 @@ export async function classifyPrePushInstall(
     executable = false;
   }
 
-  if (
-    hooksPathConfigured &&
-    executable &&
-    classification.kind === 'gate-delegating'
-  ) {
-    // Consumer-owned executable hook that wires the gate. Happy path for
-    // husky projects that added their own linting before the gate exec.
+  if (executable && classification.kind === 'gate-delegating') {
+    // Consumer-owned executable hook that wires the gate. Applies equally
+    // to a `.husky/pre-push` under a hooksPath-configured repo AND a
+    // user-authored `.git/hooks/pre-push` in a vanilla repo — git will
+    // fire whichever one is active, and either one is allowed to own the
+    // governance contract as long as it actually execs the gate. We
+    // intentionally do NOT gate this on `hooksPathConfigured`: doing so
+    // regressed the vanilla-repo case where a user already wired the
+    // gate into `.git/hooks/pre-push` themselves (and `rea doctor`
+    // correctly reports `ok` on that shape — the two must agree).
     return {
       action: 'skip',
       reason: 'active-pre-push-present',
