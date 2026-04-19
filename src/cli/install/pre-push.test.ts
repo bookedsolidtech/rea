@@ -2584,6 +2584,148 @@ describe('isLegacyReaManagedHuskyGate — R24 F2 byte-identical SHA allowlist', 
   });
 });
 
+describe('isLegacyReaManagedHuskyGate — R25 F3 CRLF line-ending tolerance', () => {
+  it('accepts the shipped body with LF endings (baseline)', async () => {
+    const { stdout: lfBody } = await execFileAsync(
+      'git',
+      ['show', 'main:.husky/pre-push'],
+      { cwd: process.cwd(), maxBuffer: 4 * 1024 * 1024 },
+    );
+    expect(isLegacyReaManagedHuskyGate(lfBody)).toBe(true);
+  });
+
+  it('accepts the shipped body converted to CRLF (Windows autocrlf checkout)', async () => {
+    // Windows git with `core.autocrlf=true` delivers text files with CRLF
+    // line endings. R25 F3: consumers on Windows must not be stranded as
+    // foreign just because their filesystem rewrote LF → CRLF on checkout.
+    const { stdout: lfBody } = await execFileAsync(
+      'git',
+      ['show', 'main:.husky/pre-push'],
+      { cwd: process.cwd(), maxBuffer: 4 * 1024 * 1024 },
+    );
+    const crlfBody = lfBody.replace(/\n/g, '\r\n');
+    // Sanity: CRLF body is NOT equal to the LF body byte-for-byte.
+    expect(crlfBody).not.toBe(lfBody);
+    // But it DOES round-trip through the legacy detector thanks to the
+    // normalization step.
+    expect(isLegacyReaManagedHuskyGate(crlfBody)).toBe(true);
+  });
+
+  it('accepts the shipped body converted to bare CR (classic-Mac) as a courtesy', async () => {
+    const { stdout: lfBody } = await execFileAsync(
+      'git',
+      ['show', 'main:.husky/pre-push'],
+      { cwd: process.cwd(), maxBuffer: 4 * 1024 * 1024 },
+    );
+    const crBody = lfBody.replace(/\n/g, '\r');
+    expect(isLegacyReaManagedHuskyGate(crBody)).toBe(true);
+  });
+
+  it('still rejects a CRLF body with an in-body byte edit (normalization covers EOL only)', async () => {
+    const { stdout: lfBody } = await execFileAsync(
+      'git',
+      ['show', 'main:.husky/pre-push'],
+      { cwd: process.cwd(), maxBuffer: 4 * 1024 * 1024 },
+    );
+    // CRLF is allowed, but any other drift flips to foreign.
+    const tampered = lfBody.replace('exit 1', 'exit 0').replace(/\n/g, '\r\n');
+    expect(isLegacyReaManagedHuskyGate(tampered)).toBe(false);
+  });
+});
+
+describe('classifyExistingHook — R25 F1 symlink handling', () => {
+  it('treats a symlink-to-managed-hook as foreign (never refreshable)', async () => {
+    // Real-world case: a shared-infra repo points `.git/hooks/pre-push` at
+    // a centrally-managed hook on disk. Before R25 F1, `stat()` followed
+    // the symlink and classified based on the target content, then refresh
+    // would `rename(tmp, dst)` and clobber the symlink with a regular
+    // file — silently breaking the central-hook pattern.
+    const dir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-r25-sym-')));
+    try {
+      await initGitRepo(dir);
+      // Put a real managed-fallback hook at a neutral path...
+      const centralHook = path.join(dir, 'central-pre-push');
+      const fallbackBody = `#!/bin/sh\n${FALLBACK_MARKER}\nexit 0\n`;
+      await fs.writeFile(centralHook, fallbackBody, { mode: 0o755 });
+
+      // ...and symlink the real hook location at it.
+      const { stdout: hookPath } = await execFileAsync(
+        'git',
+        ['-C', dir, 'rev-parse', '--git-path', 'hooks/pre-push'],
+        { encoding: 'utf8' },
+      );
+      const absHookPath = path.isAbsolute(hookPath.trim())
+        ? hookPath.trim()
+        : path.join(dir, hookPath.trim());
+      await fs.mkdir(path.dirname(absHookPath), { recursive: true });
+      await fs.symlink(centralHook, absHookPath);
+
+      const decision = await classifyPrePushInstall(dir);
+      // The symlink must NOT be re-classified as `refresh` — that is the
+      // path that would destroy the symlink. Skip or install-elsewhere is
+      // the only acceptable outcome.
+      expect(decision.action).not.toBe('refresh');
+      if (decision.action === 'skip') {
+        // Symlinks land in `foreign-pre-push` so doctor surfaces them.
+        expect(decision.reason).toBe('foreign-pre-push');
+      }
+
+      // And the symlink is still intact — nothing blew it away.
+      const finalStat = await fs.lstat(absHookPath);
+      expect(finalStat.isSymbolicLink()).toBe(true);
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('inspectPrePushState reports symlink as activeForeign (not ok)', async () => {
+    // Dogfood pairing: doctor should surface symlinked hooks, because the
+    // installer refuses to manage them.
+    const dir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-r25-sym-')));
+    try {
+      await initGitRepo(dir);
+      const centralHook = path.join(dir, 'central-pre-push');
+      await fs.writeFile(centralHook, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+
+      const { stdout: hookPath } = await execFileAsync(
+        'git',
+        ['-C', dir, 'rev-parse', '--git-path', 'hooks/pre-push'],
+        { encoding: 'utf8' },
+      );
+      const absHookPath = path.isAbsolute(hookPath.trim())
+        ? hookPath.trim()
+        : path.join(dir, hookPath.trim());
+      await fs.mkdir(path.dirname(absHookPath), { recursive: true });
+      await fs.symlink(centralHook, absHookPath);
+
+      const state = await inspectPrePushState(dir);
+      expect(state.ok).toBe(false);
+      expect(state.activeForeign).toBe(true);
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('installPrePushFallback — R25 F2 non-atomic fallback surfacing', () => {
+  it('normal hardlink-capable filesystem: no degraded-state warning', async () => {
+    // Happy path — macOS/Linux tmpdir supports link(2). A successful
+    // install should NOT emit the degraded-publication warning.
+    const dir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-r25-atom-')));
+    try {
+      await initGitRepo(dir);
+      const result = await installPrePushFallback(dir);
+      expect(result.decision.action).toBe('install');
+      const degradedWarning = result.warnings.find((w) =>
+        w.includes('published non-atomically'),
+      );
+      expect(degradedWarning).toBeUndefined();
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('hasAuditCheck — R22 F1 form-(c) fall-through miss-path clearance', () => {
   // These hooks all have the header/HALT boilerplate but differ on the
   // audit-check body. isReaManagedHuskyGate composes hasAuditCheck, so we

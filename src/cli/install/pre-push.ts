@@ -241,11 +241,21 @@ export function isLegacyReaManagedHuskyGate(content: string): boolean {
   // `foreign`, which forces an explicit opt-in upgrade instead of silent
   // trust — the exact escape hatch R24 F2 demanded.
   //
-  // Hashes are over the raw file bytes, no normalization. Consumers editing
-  // the legacy file (e.g. line endings, trailing newline) will see it
-  // classified as foreign; that is intentional and safer than heuristic
-  // similarity.
-  const hash = crypto.createHash('sha256').update(content).digest('hex');
+  // R25 F3 — line-ending normalization.
+  //
+  // Git with `core.autocrlf=true` on Windows checks out text files with CRLF,
+  // so a consumer on Windows would present us with `\r\n`-delimited bytes of
+  // the exact hook body we shipped. Rejecting those as foreign strands them
+  // on the legacy form with no clean upgrade path. We collapse `\r\n` → `\n`
+  // (and bare `\r` → `\n` — classic-Mac is dead but cheap to handle) BEFORE
+  // hashing so LF-normalized and CRLF-checkout bytes hash to the same value.
+  //
+  // Trailing-whitespace drift and in-body edits still flip to foreign; only
+  // the line-ending platform conversion is forgiven. That preserves the R24
+  // F2 invariant — exact-byte equality modulo platform EOL — without blessing
+  // semantic drift.
+  const normalized = content.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  const hash = crypto.createHash('sha256').update(normalized).digest('hex');
   return KNOWN_LEGACY_HUSKY_SHA256.has(hash);
 }
 
@@ -1640,31 +1650,54 @@ type HookClassification =
   | { kind: 'rea-managed-husky' }
   | { kind: 'gate-delegating' }
   | { kind: 'absent' }
-  | { kind: 'foreign'; reason: 'no-marker' | 'unreadable' | 'not-a-file' };
+  | { kind: 'foreign'; reason: 'no-marker' | 'unreadable' | 'not-a-file' | 'symlink' };
 
 /**
  * Read `hookPath` and classify. Does not consult file mode — callers are
  * expected to combine this with an executable-bit check where relevant.
  *
- * A directory, symlink-to-directory, or unreadable file is "foreign/not-
- * a-file" so that we never silently clobber anything we cannot inspect.
- * A missing path returns the distinct `absent` kind so the install
+ * A directory, symlink (regardless of target type), or unreadable file is
+ * "foreign" so that we never silently clobber anything we cannot inspect
+ * or own. A missing path returns the distinct `absent` kind so the install
  * re-check can distinguish "safe to write here" from "something non-file
  * raced into place".
+ *
+ * R25 F1 — symlink handling.
+ *
+ * The previous implementation used `stat()`, which silently follows
+ * symlinks. If a repository intentionally pointed `.git/hooks/pre-push` at
+ * a centrally-managed hook (a common shared-infra pattern, or the Husky
+ * `core.hooksPath` setup where a symlink proxies to a hook under `.husky/`),
+ * `stat` would report the target file and classify based on its body. The
+ * refresh path then writes via `rename(tmp, dst)` — which replaces the
+ * *symlink itself* with a regular file, breaking the central-managed link
+ * forever with no operator warning.
+ *
+ * We now `lstat()` first and treat any symlink as `foreign/symlink`. The
+ * caller (`classifyPrePushInstall`) maps `foreign` to `skip` on the install
+ * path, so a consumer with a central-hook symlink keeps their setup
+ * untouched. Operators who want rea to manage the hook must remove the
+ * symlink first — an explicit opt-in that preserves central infra intent.
  */
 async function classifyExistingHook(
   hookPath: string,
 ): Promise<HookClassification> {
   let stat: fs.Stats;
   try {
-    stat = await fsPromises.stat(hookPath);
+    stat = await fsPromises.lstat(hookPath);
   } catch (err) {
     // ENOENT is the expected state during an `install` flow. Any other
-    // stat error (permission denied, I/O) is treated as a "not-a-file"
+    // lstat error (permission denied, I/O) is treated as a "not-a-file"
     // foreign signal so we never proceed with a write.
     const code = (err as NodeJS.ErrnoException).code;
     if (code === 'ENOENT') return { kind: 'absent' };
     return { kind: 'foreign', reason: 'not-a-file' };
+  }
+  if (stat.isSymbolicLink()) {
+    // R25 F1 — symlinks are intentionally never refreshed. Treat as
+    // foreign so the install path skips and the consumer decides whether
+    // to unlink manually and re-run `rea init`.
+    return { kind: 'foreign', reason: 'symlink' };
   }
   if (!stat.isFile()) {
     return { kind: 'foreign', reason: 'not-a-file' };
@@ -2095,12 +2128,22 @@ async function verifyRefreshGuard(
   }
 }
 
+export interface WriteExecutableResult {
+  /**
+   * R25 F2 — set to true when the install path had to use a non-atomic
+   * fallback (copyFile after link() refused). Callers surface this as a
+   * warning to the operator so they know publication was best-effort on
+   * this filesystem rather than atomic.
+   */
+  degradedFromAtomic: boolean;
+}
+
 async function writeExecutable(
   dst: string,
   content: string,
   exclusive: boolean,
   guard: RefreshGuard = { kind: 'absent' },
-): Promise<void> {
+): Promise<WriteExecutableResult> {
   await fsPromises.mkdir(path.dirname(dst), { recursive: true });
   // Random suffix + `wx` open flag: PID was observed to collide during
   // concurrent installs in the same process (e.g. two worktrees running
@@ -2129,7 +2172,7 @@ async function writeExecutable(
       try {
         await fsPromises.link(tmp, dst);
         await fsPromises.unlink(tmp).catch(() => undefined);
-        return;
+        return { degradedFromAtomic: false };
       } catch (linkErr) {
         const e = linkErr as NodeJS.ErrnoException;
         // EEXIST is the one exclusive-violation case we MUST propagate —
@@ -2141,11 +2184,20 @@ async function writeExecutable(
         if (e.code !== 'EXDEV' && e.code !== 'EPERM' && e.code !== 'ENOSYS') {
           throw linkErr;
         }
-        // Fallback path — atomicity is best-effort here. Unavoidable
-        // tradeoff when the kernel refuses link(); documented above.
+        // R25 F2 — non-atomic fallback. `copyFile(..., COPYFILE_EXCL)`
+        // still refuses to clobber an existing `dst`, so the
+        // exclusive-semantic half of the atomic contract is preserved,
+        // but the copy itself is not instantaneous: a crash or concurrent
+        // reader CAN observe a partially-written live hook. We return
+        // `degradedFromAtomic: true` so the caller can surface a warning
+        // to the operator. This is the narrow, explicitly-signaled
+        // escape hatch for filesystems where link(2) is unavailable;
+        // we deliberately do not fail closed (which would make rea
+        // unusable on e.g. cross-mount `.git` dirs) but we also refuse
+        // to silently lose the atomicity guarantee.
         await fsPromises.copyFile(tmp, dst, fs.constants.COPYFILE_EXCL);
         await fsPromises.unlink(tmp).catch(() => undefined);
-        return;
+        return { degradedFromAtomic: true };
       }
     }
     // Refresh: verify dst still matches the identity captured at the
@@ -2154,15 +2206,17 @@ async function writeExecutable(
     await verifyRefreshGuard(dst, guard);
     try {
       await fsPromises.rename(tmp, dst);
-      return;
+      return { degradedFromAtomic: false };
     } catch (renameErr) {
       const e = renameErr as NodeJS.ErrnoException;
       if (e.code !== 'EXDEV') throw renameErr;
       // Cross-device mount: verify again, then fall back to copy+unlink.
       // The extra verify is cheap and narrows the window further.
+      // Non-atomic — same R25 F2 rationale applies on refresh.
       await verifyRefreshGuard(dst, guard);
       await fsPromises.copyFile(tmp, dst);
       await fsPromises.unlink(tmp).catch(() => undefined);
+      return { degradedFromAtomic: true };
     }
   } catch (err) {
     await fsPromises.unlink(tmp).catch(() => undefined);
@@ -2453,12 +2507,27 @@ export async function installPrePushFallback(
         }
 
         try {
-          await writeExecutable(
+          const writeResult = await writeExecutable(
             decision.hookPath,
             fallbackHookContent(),
             decision.action === 'install',
             refreshGuard,
           );
+          if (writeResult.degradedFromAtomic) {
+            // R25 F2 — link(2) unavailable on this filesystem; publication
+            // used copyFile(EXCL) which is exclusive-safe but not atomic.
+            // A concurrent reader or a crash mid-copy could observe the
+            // hook in a partially-written state. Operators should be
+            // aware so they can weigh whether to run `rea init` again or
+            // relocate `.git` to a filesystem that supports hardlinks.
+            result.warnings.push(
+              `pre-push hook at ${decision.hookPath} was published non-atomically ` +
+                `(link(2) unavailable on this filesystem). The file is in place and ` +
+                `correct, but a crash mid-install could leave a partial hook. ` +
+                `Consider moving the repo to a filesystem that supports hardlinks ` +
+                `for atomic publication.`,
+            );
+          }
         } catch (writeErr) {
           const e = writeErr as NodeJS.ErrnoException;
           if (e.code === 'EEXIST') {
