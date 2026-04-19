@@ -65,23 +65,39 @@ function parseAcceptDrift(raw?: string): Set<string> {
  * does not read or write the filesystem. Returns one classification per
  * server in the same order.
  *
- * ## Rename-then-tamper defense
+ * ## Rename-with-removal defense (scope: narrow)
  *
- * A name-only lookup is not enough: an attacker who rewrites a previously
- * trusted entry AND changes its `name` at the same time would miss the
- * stored lookup and land as benign `first-seen`. To close that gap we
- * compute a rename signal at boot time:
+ * A name-only lookup is not enough when an attacker rewrites a
+ * previously trusted entry AND changes its `name` at the same time: the
+ * stored lookup would miss and the tampered entry would land as benign
+ * `first-seen`. To close THAT specific shape we compute a rename signal
+ * at boot time:
  *
  *   - `disappeared = stored_names - registry_names`
  *   - `appeared    = registry_names - stored_names`
  *
  * If BOTH sets are non-empty in the same boot, at least one declared
- * entry has been renamed (stored entry vanished, a new name showed up).
- * In that case every entry in `appeared` is promoted from `first-seen`
- * to `drifted`: the operator MUST explicitly accept it via
- * `REA_ACCEPT_DRIFT=<new-name>` before it connects. Genuinely additive
- * installs (new entry appended to registry with no concurrent removal)
- * remain `first-seen` and are allowed with the usual LOUD stderr banner.
+ * entry has been renamed-with-removal (stored entry vanished, a new name
+ * showed up). In that case every entry in `appeared` is promoted from
+ * `first-seen` to `drifted`: the operator MUST explicitly accept it via
+ * `REA_ACCEPT_DRIFT=<new-name>` before it connects.
+ *
+ * ### What this defense does NOT catch
+ *
+ * If the attacker leaves the old trusted entry in the registry (e.g.
+ * flipped `enabled: false`, or left untouched as a decoy) and ADDS a
+ * tampered entry under a new name, `disappeared` stays empty, the
+ * set-difference heuristic does not fire, and the new entry lands as
+ * `first-seen`. That is **not a bypass** of the TOFU contract — it is
+ * structurally identical to `operator added a new MCP server`, which
+ * TOFU intentionally allows with a LOUD stderr banner demanding the
+ * operator's attention. The first-seen banner is the enforcement
+ * mechanism for that shape; the rename-with-removal heuristic above is
+ * strictly additional coverage for the harder-to-notice shape where the
+ * old entry disappears at the same moment the new one arrives.
+ *
+ * Genuinely additive installs (new entry appended with no concurrent
+ * removal) also remain `first-seen` and get the usual LOUD banner.
  *
  * This is strictly additive over the name-based lookup — a name-matched
  * drift (same name, changed config) still classifies as `drifted` via
@@ -92,7 +108,7 @@ function parseAcceptDrift(raw?: string): Set<string> {
  * renamed entry's fingerprint coincide with a stored one under a
  * different name. That means a cross-name fingerprint match would never
  * happen in practice — the set-difference heuristic above is what
- * actually defends the threat.
+ * actually defends the rename-with-removal shape.
  */
 export function classifyServers(
   servers: RegistryServer[],
