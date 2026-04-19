@@ -1531,6 +1531,138 @@ describe('isReaManagedHuskyGate — R15 F1 audit check must prove enforcement', 
   });
 });
 
+// R16 F1: block-form HALT enforcement must not be satisfied by an unrelated
+// `exit N` elsewhere in the file. The prior regex-based detector treated any
+// `exit [1-9]` anywhere in `[\s\S]*?` between `HALT` and `fi` as proof of
+// enforcement, which allowed a no-op HALT body followed by a separate
+// `if ...; then exit 1; fi` block to spoof the check.
+describe('isReaManagedHuskyGate — R16 F1 block-aware HALT enforcement', () => {
+  const audit =
+    'grep -qE \'"tool_name":"codex\\.review"\' .rea/audit.jsonl\n';
+
+  it('no-op HALT body + unrelated exit in a later if-block: returns false', () => {
+    const content =
+      `#!/bin/sh\n${HUSKY_GATE_MARKER}\n` +
+      `if [ -f .rea/HALT ]; then :; fi\n` +
+      `if [ "$USER" = "nobody" ]; then exit 1; fi\n` +
+      audit;
+    expect(isReaManagedHuskyGate(content)).toBe(false);
+  });
+
+  it('block-form HALT with exit 1 inside the then branch: returns true', () => {
+    const content =
+      `#!/bin/sh\n${HUSKY_GATE_MARKER}\n` +
+      `if [ -f .rea/HALT ]; then\n` +
+      `  printf "REA HALT\\n" >&2\n` +
+      `  exit 1\n` +
+      `fi\n` +
+      audit;
+    expect(isReaManagedHuskyGate(content)).toBe(true);
+  });
+
+  it('block-form HALT with only a no-op body: returns false', () => {
+    const content =
+      `#!/bin/sh\n${HUSKY_GATE_MARKER}\n` +
+      `if [ -f .rea/HALT ]; then :; fi\n` +
+      audit;
+    expect(isReaManagedHuskyGate(content)).toBe(false);
+  });
+
+  it('short-circuit form `[ -f .rea/HALT ] && exit 1`: returns true', () => {
+    const content = `#!/bin/sh\n${HUSKY_GATE_MARKER}\n[ -f .rea/HALT ] && exit 1\n${audit}`;
+    expect(isReaManagedHuskyGate(content)).toBe(true);
+  });
+});
+
+// R16 F2: a negated audit grep inside an `if ! …; then …; fi` construct can
+// spoof the gate when the then-body is a no-op (`:`), because the match-miss
+// silently closes the frame without blocking. The detector must require a
+// blocking statement (exit N, return N, or continue/break inside a loop) in
+// the then-body before accepting the construct.
+describe('isReaManagedHuskyGate — R16 F2 block-aware audit enforcement', () => {
+  const header = `#!/bin/sh\n${HUSKY_GATE_MARKER}\n[ -f .rea/HALT ] && exit 1\n`;
+
+  it('`if ! <audit-grep>; then :; fi` (no-op body): returns false', () => {
+    const content =
+      `${header}if ! grep -q codex.review .rea/audit.jsonl; then :; fi\n`;
+    expect(isReaManagedHuskyGate(content)).toBe(false);
+  });
+
+  it('`if ! <audit-grep>; then echo warn; fi` (non-blocking body): returns false', () => {
+    const content =
+      `${header}if ! grep -q codex.review .rea/audit.jsonl; then echo warn; fi\n`;
+    expect(isReaManagedHuskyGate(content)).toBe(false);
+  });
+
+  it('`if ! <audit-grep>; then exit 1; fi` (blocking body): returns true', () => {
+    const content =
+      `${header}if ! grep -q codex.review .rea/audit.jsonl; then exit 1; fi\n`;
+    expect(isReaManagedHuskyGate(content)).toBe(true);
+  });
+
+  it('`if ! <audit-grep>; then return 1; fi` (blocking body): returns true', () => {
+    const content =
+      `${header}if ! grep -q codex.review .rea/audit.jsonl; then return 1; fi\n`;
+    expect(isReaManagedHuskyGate(content)).toBe(true);
+  });
+
+  it('shipped shape: while-loop with `if ! … then block_push=1; continue; fi`: returns true', () => {
+    const content =
+      `${header}` +
+      `AUDIT_LOG=.rea/audit.jsonl\n` +
+      `while IFS= read -r line; do\n` +
+      `  if ! grep -qE '"tool_name":"codex\\.review"' "$AUDIT_LOG"; then\n` +
+      `    block_push=1\n` +
+      `    continue\n` +
+      `  fi\n` +
+      `done\n`;
+    expect(isReaManagedHuskyGate(content)).toBe(true);
+  });
+
+  it('top-level `continue` (no enclosing loop): does NOT count as blocking', () => {
+    const content =
+      `${header}if ! grep -q codex.review .rea/audit.jsonl; then continue; fi\n`;
+    expect(isReaManagedHuskyGate(content)).toBe(false);
+  });
+});
+
+// R16 F3: gate-delegation via variable MUST consider reassignment. A
+// pattern like `GATE=.claude/hooks/push-review-gate.sh; GATE=/bin/true;
+// exec "$GATE"` must not pass: the value at exec-time is what matters,
+// not the initial assignment.
+describe('referencesReviewGate — R16 F3 variable reassignment', () => {
+  it('reassignment to a non-gate path before exec: returns false', () => {
+    const content =
+      `#!/bin/sh\nGATE=.claude/hooks/push-review-gate.sh\n` +
+      `GATE=/bin/true\n` +
+      `exec "$GATE" "$@"\n`;
+    expect(referencesReviewGate(content)).toBe(false);
+  });
+
+  it('simple assignment + exec (no reassignment): returns true', () => {
+    const content =
+      `#!/bin/sh\nGATE=.claude/hooks/push-review-gate.sh\n` +
+      `exec "$GATE" "$@"\n`;
+    expect(referencesReviewGate(content)).toBe(true);
+  });
+
+  it('reassignment back to gate path: returns true', () => {
+    const content =
+      `#!/bin/sh\nGATE=/bin/true\n` +
+      `GATE=.claude/hooks/push-review-gate.sh\n` +
+      `exec "$GATE" "$@"\n`;
+    expect(referencesReviewGate(content)).toBe(true);
+  });
+
+  it('export with reassignment to non-gate: returns false', () => {
+    const content =
+      `#!/bin/sh\nexport GATE=.claude/hooks/push-review-gate.sh\n` +
+      `export GATE=/usr/bin/true\n` +
+      `exec "$GATE" "$@"\n`;
+    expect(referencesReviewGate(content)).toBe(false);
+  });
+});
+
 // R15 F2: `referencesReviewGate` early-exit detector missed non-bare forms of
 // `exit`/`return`, so a spoof like `exit 0;` followed by `exec .../gate.sh`
 // was classified as valid delegation despite the gate being dead code.

@@ -201,7 +201,8 @@ export function isReaManagedHuskyGate(content: string): boolean {
  *                         `test -f .rea/HALT && exit N`
  *                         `[ -f .rea/HALT ] && { ...; exit N; }`
  *   - Block form:        `if [ -f .rea/HALT ]; then ... exit N ... fi`
- *                         (exit must appear between `then` and the matching `fi`)
+ *                         (exit must appear in the THEN branch of the HALT if,
+ *                         bounded by the matching `fi`)
  *
  * Patterns rejected (previously accepted by R11's signature heuristic):
  *   - `[ -f .rea/HALT ] && :`          — no-op stub
@@ -220,41 +221,220 @@ export function isReaManagedHuskyGate(content: string): boolean {
  * status — commonly 0). A hook can satisfy R12 and still let pushes through
  * when HALT is present. Proof of blocking enforcement now REQUIRES an explicit
  * non-zero positive integer exit code on the HALT path.
+ *
+ * R16 F1: the R15 block-form regex used `[\s\S]*?` spans between `then`,
+ * `exit`, and `fi`, which could span across UNRELATED if/fi blocks. A spoof
+ * `if [ -f .rea/HALT ]; then :; fi; if X; then exit 1; fi` satisfied the regex
+ * even though the `exit 1` belonged to a separate if. We now walk statements
+ * via a frame stack: each `if` pushes a frame (tagged `haltCond=true` when the
+ * condition is the HALT test), statements in the `then` branch toggle
+ * `nonZeroExitInBody`, and the matching `fi` pops. Enforcement is proven only
+ * when BOTH flags are set on the same popped frame.
  */
 function hasHaltEnforcement(content: string): boolean {
-  // Strip comments before scanning so block-form patterns that span lines
-  // still match, while `# ... exit ...` does not count.
-  const stripped = content
-    .split(/\r?\n/)
-    .map((raw) => {
-      const t = raw.trimStart();
-      return t.startsWith('#') ? '' : raw;
-    })
-    .join('\n');
-
   // R13 F1: require `exit N` where N >= 1. Bare `exit` and `exit 0` MUST NOT
   // qualify — both allow the push. Leading zeros on a positive value (e.g.,
   // `exit 01`) are still rejected; shell treats the argument as a string and
   // the spec says "implementation-defined" for values outside 0–255, so we
   // keep the strict form `[1-9]\d*`.
-  const NONZERO_EXIT = String.raw`\bexit[ \t]+[1-9]\d*\b`;
+  const NONZERO_EXIT = /\bexit[ \t]+[1-9]\d*\b/;
+  const HALT_TEST =
+    /(?:\[[ \t]+-f[^\n]*\.rea\/HALT[^\n]*\]|\btest[ \t]+-f[^\n]*\.rea\/HALT)/;
 
-  // Pattern A — short-circuit. The HALT test is followed directly by `&&`
-  // and then a non-zero `exit` (optionally wrapped in `{ ... exit N ...; }`).
+  // Short-circuit form first — simple substring match on any statement.
+  const stripped = stripComments(content);
   const shortCircuit = new RegExp(
-    String.raw`(?:\[[ \t]+-f[^\n]*\.rea\/HALT[^\n]*\]|\btest[ \t]+-f[^\n]*\.rea\/HALT)[ \t]*&&[ \t]*(?:\{[^}]*?${NONZERO_EXIT}|${NONZERO_EXIT})`,
+    String.raw`(?:\[[ \t]+-f[^\n]*\.rea\/HALT[^\n]*\]|\btest[ \t]+-f[^\n]*\.rea\/HALT)[ \t]*&&[ \t]*(?:\{[^}]*?\bexit[ \t]+[1-9]\d*\b|\bexit[ \t]+[1-9]\d*\b)`,
   );
   if (shortCircuit.test(stripped)) return true;
 
-  // Pattern B — block form. Match `if <halt-test>` forward (non-greedy) to
-  // the first `fi`, and require a non-zero `exit` between `then` and `fi`.
-  // `[\s\S]` instead of `.` so the match spans newlines.
-  const blockForm = new RegExp(
-    String.raw`\bif\b[ \t]+(?:\[[ \t]+-f[^\n]*\.rea\/HALT[^\n]*\]|test[ \t]+-f[^\n]*\.rea\/HALT[^\n]*)[\s\S]*?\bthen\b[\s\S]*?${NONZERO_EXIT}[\s\S]*?\bfi\b`,
-  );
-  if (blockForm.test(stripped)) return true;
+  // Block form — walk statements with a frame stack.
+  type Frame = {
+    haltCond: boolean;
+    nonZeroExitInBody: boolean;
+    branch: 'cond' | 'body';
+  };
+  const frames: Frame[] = [];
+
+  for (const stmt of statementsOf(content)) {
+    const head = stmt.head;
+    const full = stmt.full;
+
+    if (/^if\b/.test(head)) {
+      const frame: Frame = {
+        haltCond: HALT_TEST.test(full),
+        nonZeroExitInBody: false,
+        branch: 'cond',
+      };
+      // If `then` appears on the same statement (`if ...; then <body>`),
+      // transition the branch and, if the body already contains an exit,
+      // record it.
+      if (/(^|[;\s])then\b/.test(full)) {
+        frame.branch = 'body';
+        if (NONZERO_EXIT.test(afterThen(full))) frame.nonZeroExitInBody = true;
+      }
+      frames.push(frame);
+      continue;
+    }
+
+    if (/^then\b/.test(head)) {
+      const frame = frames[frames.length - 1];
+      if (frame !== undefined) {
+        frame.branch = 'body';
+        if (NONZERO_EXIT.test(afterThen(full))) frame.nonZeroExitInBody = true;
+      }
+      continue;
+    }
+
+    if (/^(elif|else)\b/.test(head)) {
+      // Leave HALT's THEN branch — don't accept exits on elif/else paths
+      // because they fire when HALT is ABSENT.
+      const frame = frames[frames.length - 1];
+      if (frame !== undefined) frame.branch = 'cond';
+      continue;
+    }
+
+    if (/^fi\b/.test(head)) {
+      const frame = frames.pop();
+      if (frame !== undefined && frame.haltCond && frame.nonZeroExitInBody) {
+        return true;
+      }
+      continue;
+    }
+
+    // Statement inside an open `if` frame.
+    if (frames.length > 0) {
+      const frame = frames[frames.length - 1];
+      if (frame !== undefined && frame.branch === 'body') {
+        if (NONZERO_EXIT.test(full)) frame.nonZeroExitInBody = true;
+      }
+    }
+  }
 
   return false;
+}
+
+/**
+ * Strip shell comments (`# ...` at line start, preserving quoted `#`).
+ * Used for regex-style scans over the whole content; the statement-walking
+ * parsers call `stripTrailingComment` on each statement instead.
+ */
+function stripComments(content: string): string {
+  return content
+    .split(/\r?\n/)
+    .map((raw) => {
+      const t = raw.trimStart();
+      return t.startsWith('#') ? '' : stripTrailingComment(raw);
+    })
+    .join('\n');
+}
+
+/**
+ * Return everything after the first `then` keyword on a statement that
+ * combines the `if`/condition with the `then` body on the same logical line.
+ * Used by `hasHaltEnforcement` to scope the exit-body check so an `exit 1`
+ * that precedes `then` (impossible in valid shell, but defensive) is not
+ * mistaken for enforcement.
+ */
+function afterThen(line: string): string {
+  const m = line.match(/(^|[;\s])then\b(.*)$/s);
+  if (m === null || m[2] === undefined) return '';
+  return m[2];
+}
+
+/**
+ * A shell statement with both a head keyword and the full text. The head is
+ * the first non-whitespace token used for control-flow recognition; the full
+ * text preserves the statement for content matches (HALT test, audit grep).
+ */
+type ShellStatement = { head: string; full: string };
+
+/**
+ * Walk `content` and produce a stream of shell statements, normalized for
+ * parser consumption. Handles:
+ *
+ *   - Line continuations (`\<newline>` → single space) so multi-physical-line
+ *     constructs like the shipped husky `grep -E ... | \` + `grep -qF ...` are
+ *     evaluated as one statement.
+ *   - Full-line comments (`# ...` at line start) are dropped entirely.
+ *   - Trailing comments (` # ...`) are stripped via `stripTrailingComment`.
+ *   - `;`-separated statements are split via quote/paren/brace-aware
+ *     `splitStatements` so `fi; if X; then ...` yields THREE statements.
+ *
+ * Each statement's `head` is the first whitespace-delimited token so callers
+ * can cheaply classify as `if`/`then`/`fi`/`done`/etc. The `full` retains the
+ * complete statement text for regex content checks (HALT test, audit grep,
+ * exit N, variable assignments).
+ */
+function statementsOf(content: string): ShellStatement[] {
+  const out: ShellStatement[] = [];
+  const joined = joinLineContinuations(content);
+  for (const raw of joined.split(/\r?\n/)) {
+    const t = raw.trimStart();
+    if (t.startsWith('#')) continue;
+    const line = stripTrailingComment(t);
+    for (const stmt of splitStatements(line)) {
+      const trimmed = stmt.trim();
+      if (trimmed.length === 0) continue;
+      const head = trimmed.split(/\s+/, 1)[0] ?? '';
+      out.push({ head, full: trimmed });
+    }
+  }
+  return out;
+}
+
+/**
+ * Split a logical line into `;`-separated statements, respecting shell
+ * quoting and grouping so `;` inside strings / `(...)` / `{...}` is not a
+ * separator. Examples:
+ *
+ *   splitStatements("fi; if X; then exit 1; fi")
+ *     → ["fi", "if X", "then exit 1", "fi"]
+ *
+ *   splitStatements("echo 'a;b'; echo c")
+ *     → ["echo 'a;b'", "echo c"]
+ *
+ * Not a full POSIX parser (no heredoc, no command substitution nesting
+ * beyond depth counting) but sufficient for the one-liner hook shapes we
+ * actually need to analyze. Any ambiguous input falls back to treating the
+ * unclosed quote/paren as swallowing subsequent `;`, which is the safe
+ * behavior — the statement appears as a single larger block and the
+ * enclosing parser sees it as a non-control statement.
+ */
+function splitStatements(line: string): string[] {
+  const stmts: string[] = [];
+  let buf = '';
+  let inSingle = false;
+  let inDouble = false;
+  let parenDepth = 0;
+  let braceDepth = 0;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (c === "'" && !inDouble) {
+      inSingle = !inSingle;
+      buf += c;
+      continue;
+    }
+    if (c === '"' && !inSingle) {
+      inDouble = !inDouble;
+      buf += c;
+      continue;
+    }
+    if (!inSingle && !inDouble) {
+      if (c === '(') parenDepth++;
+      else if (c === ')') parenDepth = Math.max(0, parenDepth - 1);
+      else if (c === '{') braceDepth++;
+      else if (c === '}') braceDepth = Math.max(0, braceDepth - 1);
+      else if (c === ';' && parenDepth === 0 && braceDepth === 0) {
+        stmts.push(buf);
+        buf = '';
+        continue;
+      }
+    }
+    buf += c ?? '';
+  }
+  if (buf.length > 0) stmts.push(buf);
+  return stmts;
 }
 
 /**
@@ -316,29 +496,187 @@ function hasHaltEnforcement(content: string): boolean {
 function hasAuditCheck(content: string): boolean {
   const joined = joinLineContinuations(content);
   const auditVars = collectAuditLogVars(joined);
+
+  // R16 F2 — narrow tightening over the R15 line-at-a-time check:
+  //
+  //   Spoof `if ! grep ... audit.jsonl; then :; fi` previously passed because
+  //   the `if`-line text looked like a valid audit check — R15's scanner
+  //   accepted it and never inspected the `then` branch. The no-op `then`
+  //   body silently swallows the match-miss.
+  //
+  //   We now walk statements with a frame stack specifically for `if !
+  //   <audit-grep>` constructs: the frame succeeds ONLY when the `then`
+  //   branch contains a blocking statement. All OTHER R15 shapes (top-level
+  //   `grep ... audit.jsonl`, positive `if <audit-grep>; then exit 0; fi;
+  //   exit 1`, pipelines of grep-family commands, etc.) are preserved — they
+  //   remain valid detection signals.
+  //
+  // Everything else that R15 F1 already required (audit-log binding, no
+  // swallowing tails, grep-only pipelines) is still enforced via
+  // `isAuditGrepLine` called from the walker.
+  type Frame = {
+    isNegatedAuditIf: boolean;
+    hasBlockingStmt: boolean;
+    branch: 'cond' | 'body';
+  };
+  const frames: Frame[] = [];
+  let loopDepth = 0;
+
+  for (const stmt of statementsOf(content)) {
+    const { head, full } = stmt;
+
+    if (/^(for|while|until)\b/.test(head)) loopDepth++;
+    if (/^done\b/.test(head)) loopDepth = Math.max(0, loopDepth - 1);
+
+    if (/^if\b/.test(head)) {
+      const condStmt = /(^|[;\s])then\b/.test(full)
+        ? full.replace(/(^|[;\s])then\b.*$/s, '')
+        : full;
+      const condIsAuditGrep = isAuditGrepLine(condStmt, auditVars);
+      const condIsNegated = /^if\s+!\s/.test(condStmt);
+      const frame: Frame = {
+        isNegatedAuditIf: condIsAuditGrep && condIsNegated,
+        hasBlockingStmt: false,
+        branch: 'cond',
+      };
+      if (/(^|[;\s])then\b/.test(full)) {
+        frame.branch = 'body';
+        const bodyText = afterThen(full);
+        if (isBlockingStmtLine(bodyText, loopDepth)) frame.hasBlockingStmt = true;
+      }
+      frames.push(frame);
+
+      // Positive `if <audit-grep>; then ... fi` is R15's original shape and
+      // remains accepted (pre-R6 backward-compat installs use this form plus
+      // a trailing top-level `exit 1` to block when the audit is missing).
+      // The R16 F2 tightening only applies to the negated `if !` shape whose
+      // then-body actively runs when the match fails.
+      if (condIsAuditGrep && !condIsNegated) return true;
+      continue;
+    }
+
+    if (/^then\b/.test(head)) {
+      const frame = frames[frames.length - 1];
+      if (frame !== undefined) {
+        frame.branch = 'body';
+        const bodyText = afterThen(full);
+        if (isBlockingStmtLine(bodyText, loopDepth)) frame.hasBlockingStmt = true;
+      }
+      continue;
+    }
+
+    if (/^(elif|else)\b/.test(head)) {
+      const frame = frames[frames.length - 1];
+      if (frame !== undefined) frame.branch = 'cond';
+      continue;
+    }
+
+    if (/^fi\b/.test(head)) {
+      const frame = frames.pop();
+      if (
+        frame !== undefined &&
+        frame.isNegatedAuditIf &&
+        frame.hasBlockingStmt
+      ) {
+        return true;
+      }
+      continue;
+    }
+
+    // Track blocking statements inside any open `if` THEN branch — needed
+    // so the R16 F2 frame sees blocking statements on separate lines (the
+    // shipped husky gate uses exactly this shape: `if ! grep ...; then`
+    // followed by `printf ...` + `block_push=1` + `continue` + `fi`).
+    if (frames.length > 0) {
+      const frame = frames[frames.length - 1];
+      if (frame !== undefined && frame.branch === 'body') {
+        if (isBlockingStmtLine(full, loopDepth)) frame.hasBlockingStmt = true;
+      }
+    }
+  }
+
+  // Line-level fallback (R15 F1) — preserves the original top-level audit
+  // grep detection. Iterates over JOINED lines (line continuations collapsed)
+  // rather than semicolon-split statements so that swallow patterns of the
+  // form `grep ... audit.jsonl; echo done` are evaluated as a single logical
+  // line and rejected by `isSwallowingAuditCheck` inside `isAuditGrepLine`.
+  // Splitting on `;` first would hide the trailing swallow from that check.
+  //
+  // R16 F2 note: lines that are a complete inline `if … fi` construct are
+  // skipped here because the frame parser above has already analyzed them
+  // and made a correct accept/reject decision. Re-matching the embedded
+  // audit grep at line level would over-accept a no-op `then :; fi` spoof.
+  for (const rawLine of joined.split('\n')) {
+    const line = rawLine.trim();
+    if (line === '' || line.startsWith('#')) continue;
+    if (/^if\b/.test(line) && /\bfi\s*;?\s*$/.test(line)) continue;
+    if (isAuditGrepLine(line, auditVars)) return true;
+  }
+
+  return false;
+}
+
+/**
+ * True when `line` is a single logical line that performs an enforcing
+ * `grep`-family match against the audit log for the `codex.review` token.
+ * All R15 F1 constraints apply: audit-log binding (literal path or tracked
+ * variable), rejection of swallowing tails (`|| true`, `|| :`, trailing `&`,
+ * `;` followed by a non-control command), and pipelines must terminate in a
+ * grep-family command.
+ *
+ * Extracted into a helper so `hasAuditCheck` can call it from both the
+ * top-level-with-`set -e` path and the `if <audit-grep>; then ... fi` frame.
+ */
+function isAuditGrepLine(line: string, auditVars: Set<string>): boolean {
   const contentMatchCmd = /\b(grep|egrep|fgrep|rg)\b/;
   const codexReviewToken = /codex\\?\.review/;
   const auditLogLiteral = /\.rea\/audit\.jsonl/;
 
-  for (const raw of joined.split(/\r?\n/)) {
-    const t = raw.trimStart();
-    if (t.startsWith('#')) continue;
-    const line = stripTrailingComment(t);
-    if (!codexReviewToken.test(line)) continue;
-    if (!contentMatchCmd.test(line)) continue;
-    // R15 F1: must bind to the audit log (literal path OR tracked variable).
-    const referencesAuditLog =
-      auditLogLiteral.test(line) ||
-      Array.from(auditVars).some((v) =>
-        new RegExp(`\\$\\{?${v}\\}?`).test(line),
-      );
-    if (!referencesAuditLog) continue;
-    // R15 F1: reject enforcement-swallowing tails.
-    if (isSwallowingAuditCheck(line)) continue;
-    // R15 F1: pipelines must end in a grep-family command so the final
-    // status still reflects a content check.
-    if (!isGrepOnlyPipeline(line)) continue;
-    return true;
+  if (!codexReviewToken.test(line)) return false;
+  if (!contentMatchCmd.test(line)) return false;
+
+  const referencesAuditLog =
+    auditLogLiteral.test(line) ||
+    Array.from(auditVars).some((v) =>
+      new RegExp(`\\$\\{?${v}\\}?`).test(line),
+    );
+  if (!referencesAuditLog) return false;
+
+  if (isSwallowingAuditCheck(line)) return false;
+  if (!isGrepOnlyPipeline(line)) return false;
+  return true;
+}
+
+/**
+ * True when `line` contains at least one statement that, if executed, causes
+ * the push to block. Recognized forms:
+ *
+ *   - `exit N` / `return N` where N >= 1 — explicit non-zero termination.
+ *   - `continue` / `break` when `loopDepth > 0` — in a loop, these abort the
+ *     current iteration (or the loop), which combined with a later
+ *     accumulator check (`if [ $block_push -ne 0 ]; then exit 1; fi`)
+ *     produces a blocking outcome. The shipped husky gate uses exactly this
+ *     pattern: `block_push=1; continue` inside the while loop, followed by
+ *     `if [ "$block_push" -ne 0 ]; then exit 1; fi` after the loop.
+ *
+ * Explicitly NOT blocking:
+ *   - `:` (null command) — no-op.
+ *   - `printf` / `echo` — informational output only.
+ *   - Bare assignments (`block_push=1`) without a subsequent flow-control
+ *     statement — the flag means nothing by itself.
+ */
+function isBlockingStmtLine(line: string, loopDepth: number): boolean {
+  const text = line.trim();
+  if (text.length === 0) return false;
+  for (const stmt of splitStatements(text)) {
+    const t = stmt.trim();
+    if (t.length === 0) continue;
+    if (/\bexit[ \t]+[1-9]\d*\b/.test(t)) return true;
+    if (/\breturn[ \t]+[1-9]\d*\b/.test(t)) return true;
+    if (loopDepth > 0) {
+      if (/^continue\b/.test(t) || /[;\s]continue\b/.test(t)) return true;
+      if (/^break\b/.test(t) || /[;\s]break\b/.test(t)) return true;
+    }
   }
   return false;
 }
@@ -586,70 +924,72 @@ export function referencesReviewGate(content: string): boolean {
  * repos.
  */
 function hasVariableGateInvocation(content: string): boolean {
-  const lines = content.split(/\r?\n/).map((l) => {
-    let t = l.trim();
-    if (t.startsWith('#')) return '';
-    const hashIdx = t.indexOf('#');
-    if (hashIdx > 0) {
-      const before = t[hashIdx - 1];
-      if (before === ' ' || before === '\t') t = t.slice(0, hashIdx).trimEnd();
-    }
-    return t;
-  });
+  // R16 F3: track each variable's CURRENT value at exec time, not just
+  // whether the name has EVER appeared on the LHS of a gate-carrying
+  // assignment. A spoof like `GATE=gate.sh\nGATE=/bin/true\nexec "$GATE"`
+  // previously passed because the classifier only checked the first
+  // assignment and considered the variable "gate-carrying" for the rest of
+  // the file. We now process statements in order and update each variable's
+  // gate-carrying state on every assignment (including inside blocks).
+  //
+  // Conservative model: an assignment inside a conditional branch reassigns
+  // the variable unconditionally in the tracker. This is imprecise (the
+  // branch may not fire at runtime) but fail-closed — it causes us to
+  // under-accept, never to over-accept. An operator whose valid gate
+  // delegation accidentally trips this pattern can hoist the assignment to
+  // top level to recover recognition.
+  const varIsGateCarrying = new Map<string, boolean>();
+  const assignRe =
+    /^(?:export[ \t]+|readonly[ \t]+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$/;
 
-  // Find variable assignments whose RHS contains the gate token. Shape:
-  //   [export ]NAME=<value-with-gate>
-  // Value may be quoted with " or ' and may contain $-expansions. The gate
-  // literal must be substring-present in the RHS.
-  const assignRe = /^(?:export[ \t]+|readonly[ \t]+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$/;
-  const gateVars = new Set<string>();
-  for (const line of lines) {
-    const m = line.match(assignRe);
-    if (!m) continue;
-    const name = m[1];
-    const rhs = m[2];
-    if (name === undefined || rhs === undefined) continue;
-    if (rhs.includes(GATE_DELEGATION_TOKEN)) gateVars.add(name);
-  }
-  if (gateVars.size === 0) return false;
-
-  // Track depth + early-exit gates (same rules as referencesReviewGate).
-  let exitedBeforeGate = false;
   let depth = 0;
-  for (const line of lines) {
-    if (line.length === 0) continue;
-    if (/^(if|for|while|case)\b/.test(line)) depth++;
-    if (/^(fi|done|esac)\b/.test(line)) depth = Math.max(0, depth - 1);
-    if (depth === 0 && isTopLevelExit(line)) {
-      exitedBeforeGate = true;
+  let exitedBeforeGate = false;
+
+  for (const stmt of statementsOf(content)) {
+    const { head, full } = stmt;
+
+    if (/^(if|for|while|case|until)\b/.test(head)) depth++;
+    if (/^(fi|done|esac)\b/.test(head)) depth = Math.max(0, depth - 1);
+
+    // Some branch keywords (then/else/elif/do) may prefix a statement — strip
+    // them so the assignment match can see the underlying VAR=value shape.
+    const body = full
+      .replace(/^(then|else|elif|do)[ \t]+/, '')
+      .trimStart();
+
+    const m = body.match(assignRe);
+    if (m) {
+      const name = m[1];
+      const rhs = m[2];
+      if (name !== undefined && rhs !== undefined) {
+        varIsGateCarrying.set(name, rhs.includes(GATE_DELEGATION_TOKEN));
+      }
+      continue;
     }
-    // Check whether this line invokes any of the gate variables. Pattern:
-    //   ^(exec|sh|bash|zsh|\.)\s+["']?\$\{?VAR\}?["']?
-    for (const v of gateVars) {
+
+    if (depth === 0 && isTopLevelExit(full)) {
+      exitedBeforeGate = true;
+      continue;
+    }
+
+    for (const [v, isGate] of varIsGateCarrying) {
+      if (!isGate) continue;
       const pattern = new RegExp(
         `^(exec|sh|bash|zsh|\\.)[ \\t]+["']?\\$\\{?${v}\\}?["']?(?=[ \\t;|&"'()]|$)`,
       );
-      if (!pattern.test(line)) continue;
+      if (!pattern.test(body)) continue;
       if (depth !== 0) continue;
       if (exitedBeforeGate) continue;
-      // Apply status-swallowing operator check to the variable-invocation tail.
-      // Parse the portion after the closing VAR reference for continuation
-      // operators, ignoring a trailing `;` when the line starts with `exec`
-      // (exec replaces the shell — anything after is unreachable).
-      const execLed = /^exec\b/.test(line);
-      // Isolate the tail after the VAR reference for the check.
-      const varIdx = line.search(
-        new RegExp(`\\$\\{?${v}\\}?`),
-      );
+
+      const execLed = /^exec\b/.test(body);
+      const varIdx = body.search(new RegExp(`\\$\\{?${v}\\}?`));
       if (varIdx === -1) continue;
-      const afterVar = line
+      const afterVar = body
         .slice(varIdx)
         .replace(new RegExp(`^\\$\\{?${v}\\}?["']?`), '');
-      let tail = afterVar
+      const tail = afterVar
         .replace(/\d*[<>]&\d*-?/g, ' ')
         .replace(/&>>?/g, ' ');
-      // R14 F1: reject any pipe (single `|` or `||`) — the pipeline's
-      // exit is the LAST command's, not the gate's.
       if (/\|/.test(tail)) continue;
       if (execLed) {
         if (/&&/.test(tail) || /&\s*$/.test(tail)) continue;
