@@ -1790,6 +1790,171 @@ describe('isReaManagedHuskyGate — R19 F1 bare grep without set -e blocker', ()
   });
 });
 
+// R20 F1: `isBlockingStmtLine` must only accept `exit N` / `return N` at
+// COMMAND HEAD position. The substring regex `\bexit[ \t]+[1-9]\d*\b`
+// accepted `echo exit 1` and `printf 'exit 1\n'` as blocking because the
+// text `exit 1` appeared somewhere in the statement, but the shell never
+// executes those as exits.
+describe('isReaManagedHuskyGate — R20 F1 head-token exit parsing', () => {
+  const halt = '[ -f .rea/HALT ] && exit 1\n';
+
+  it('audit miss-branch with `echo exit 1` (not a real exit): returns false', () => {
+    const content =
+      `#!/bin/sh\n${HUSKY_GATE_MARKER}\n${halt}` +
+      `if ! grep -qE '"tool_name":"codex\\.review"' .rea/audit.jsonl; then echo exit 1; fi\n`;
+    expect(isReaManagedHuskyGate(content)).toBe(false);
+  });
+
+  it(`audit miss-branch with \`printf 'exit 1\\n'\` (not a real exit): returns false`, () => {
+    const content =
+      `#!/bin/sh\n${HUSKY_GATE_MARKER}\n${halt}` +
+      `if ! grep -qE '"tool_name":"codex\\.review"' .rea/audit.jsonl; then printf 'exit 1\\n'; fi\n`;
+    expect(isReaManagedHuskyGate(content)).toBe(false);
+  });
+
+  it('audit else-branch with `echo return 1` (not a real return): returns false', () => {
+    const content =
+      `#!/bin/sh\n${HUSKY_GATE_MARKER}\n${halt}` +
+      `if grep -qE '"tool_name":"codex\\.review"' .rea/audit.jsonl; then :; else echo return 1; fi\n`;
+    expect(isReaManagedHuskyGate(content)).toBe(false);
+  });
+
+  it('form-c fall-through with `echo exit 1` as the "blocker": returns false', () => {
+    const content =
+      `#!/bin/sh\n${HUSKY_GATE_MARKER}\n${halt}` +
+      `if grep -qE '"tool_name":"codex\\.review"' .rea/audit.jsonl; then exit 0; fi\n` +
+      `echo exit 1\n`;
+    expect(isReaManagedHuskyGate(content)).toBe(false);
+  });
+
+  it('real `exit 1` in miss-branch: returns true', () => {
+    const content =
+      `#!/bin/sh\n${HUSKY_GATE_MARKER}\n${halt}` +
+      `if ! grep -qE '"tool_name":"codex\\.review"' .rea/audit.jsonl; then exit 1; fi\n`;
+    expect(isReaManagedHuskyGate(content)).toBe(true);
+  });
+
+  it('grouped block `{ echo halt; exit 1; }` (real exit after echo): returns true', () => {
+    const content =
+      `#!/bin/sh\n${HUSKY_GATE_MARKER}\n${halt}` +
+      `if ! grep -qE '"tool_name":"codex\\.review"' .rea/audit.jsonl; then { echo halt; exit 1; }; fi\n`;
+    expect(isReaManagedHuskyGate(content)).toBe(true);
+  });
+});
+
+// R20 F2: audit-var binding state must update in order. A spoof hook that
+// assigns the audit path to a variable and then reassigns that variable to
+// an unrelated file must NOT be classified as audit-enforcing — the grep
+// that references the variable is checking the spoof file, not the audit
+// log.
+describe('isReaManagedHuskyGate — R20 F2 stateful audit-var tracking', () => {
+  const halt = '[ -f .rea/HALT ] && exit 1\n';
+  const audit =
+    'if ! grep -qE \'"tool_name":"codex\\.review"\' "$AUDIT_LOG"; then exit 1; fi\n';
+
+  it('AUDIT_LOG reassigned from audit path to spoof path: returns false', () => {
+    const content =
+      `#!/bin/sh\n${HUSKY_GATE_MARKER}\n${halt}` +
+      `AUDIT_LOG=.rea/audit.jsonl\n` +
+      `AUDIT_LOG=/tmp/spoof.log\n` +
+      audit;
+    expect(isReaManagedHuskyGate(content)).toBe(false);
+  });
+
+  it('AUDIT_LOG bound to audit path with no later reassignment: returns true', () => {
+    const content =
+      `#!/bin/sh\n${HUSKY_GATE_MARKER}\n${halt}` +
+      `AUDIT_LOG=.rea/audit.jsonl\n` +
+      audit;
+    expect(isReaManagedHuskyGate(content)).toBe(true);
+  });
+
+  it('AUDIT_LOG reassigned back to audit path (last binding wins): returns true', () => {
+    const content =
+      `#!/bin/sh\n${HUSKY_GATE_MARKER}\n${halt}` +
+      `AUDIT_LOG=/tmp/spoof.log\n` +
+      `AUDIT_LOG=.rea/audit.jsonl\n` +
+      audit;
+    expect(isReaManagedHuskyGate(content)).toBe(true);
+  });
+
+  it('export + reassignment to non-audit path: returns false', () => {
+    const content =
+      `#!/bin/sh\n${HUSKY_GATE_MARKER}\n${halt}` +
+      `export AUDIT_LOG=.rea/audit.jsonl\n` +
+      `export AUDIT_LOG=/dev/null\n` +
+      audit;
+    expect(isReaManagedHuskyGate(content)).toBe(false);
+  });
+
+  it('readonly binding to audit path (no later reassignment): returns true', () => {
+    const content =
+      `#!/bin/sh\n${HUSKY_GATE_MARKER}\n${halt}` +
+      `readonly AUDIT_LOG=.rea/audit.jsonl\n` +
+      audit;
+    expect(isReaManagedHuskyGate(content)).toBe(true);
+  });
+
+  it('assignment inside uncalled function does not bind the variable: returns false', () => {
+    const content =
+      `#!/bin/sh\n${HUSKY_GATE_MARKER}\n${halt}` +
+      `bind_audit() {\n` +
+      `  AUDIT_LOG=.rea/audit.jsonl\n` +
+      `}\n` +
+      audit;
+    expect(isReaManagedHuskyGate(content)).toBe(false);
+  });
+});
+
+// R20 F3: block-form HALT enforcement must parse `exit N` / `return N` at
+// COMMAND HEAD position inside the then-body. Substring matching accepted
+// `echo exit 1` / `printf 'exit 1\n'` as proof of HALT enforcement, but
+// the hook only printed text.
+describe('isReaManagedHuskyGate — R20 F3 HALT block-form head-token parsing', () => {
+  const audit =
+    'if ! grep -qE \'"tool_name":"codex\\.review"\' .rea/audit.jsonl; then exit 1; fi\n';
+
+  it('`if [ -f .rea/HALT ]; then echo exit 1; fi` (echo, not real exit): returns false', () => {
+    const content =
+      `#!/bin/sh\n${HUSKY_GATE_MARKER}\n` +
+      `if [ -f .rea/HALT ]; then echo exit 1; fi\n${audit}`;
+    expect(isReaManagedHuskyGate(content)).toBe(false);
+  });
+
+  it(`\`if [ -f .rea/HALT ]; then printf 'exit 1\\n'; fi\` (printf, not real exit): returns false`, () => {
+    const content =
+      `#!/bin/sh\n${HUSKY_GATE_MARKER}\n` +
+      `if [ -f .rea/HALT ]; then printf 'exit 1\\n'; fi\n${audit}`;
+    expect(isReaManagedHuskyGate(content)).toBe(false);
+  });
+
+  it('`if [ -f .rea/HALT ]; then echo halting; exit 1; fi` (echo + real exit): returns true', () => {
+    const content =
+      `#!/bin/sh\n${HUSKY_GATE_MARKER}\n` +
+      `if [ -f .rea/HALT ]; then echo halting; exit 1; fi\n${audit}`;
+    expect(isReaManagedHuskyGate(content)).toBe(true);
+  });
+
+  it('multi-line then-body with `echo exit 1` on its own line (no real exit): returns false', () => {
+    const content =
+      `#!/bin/sh\n${HUSKY_GATE_MARKER}\n` +
+      `if [ -f .rea/HALT ]; then\n` +
+      `  echo exit 1\n` +
+      `fi\n${audit}`;
+    expect(isReaManagedHuskyGate(content)).toBe(false);
+  });
+
+  it('multi-line then-body with explicit `exit 1`: returns true', () => {
+    const content =
+      `#!/bin/sh\n${HUSKY_GATE_MARKER}\n` +
+      `if [ -f .rea/HALT ]; then\n` +
+      `  echo halting\n` +
+      `  exit 1\n` +
+      `fi\n${audit}`;
+    expect(isReaManagedHuskyGate(content)).toBe(true);
+  });
+});
+
 // R16 F3: gate-delegation via variable MUST consider reassignment. A
 // pattern like `GATE=.claude/hooks/push-review-gate.sh; GATE=/bin/true;
 // exec "$GATE"` must not pass: the value at exec-time is what matters,

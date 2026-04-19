@@ -237,9 +237,29 @@ function hasHaltEnforcement(content: string): boolean {
   // `exit 01`) are still rejected; shell treats the argument as a string and
   // the spec says "implementation-defined" for values outside 0–255, so we
   // keep the strict form `[1-9]\d*`.
-  const NONZERO_EXIT = /\bexit[ \t]+[1-9]\d*\b/;
+  //
+  // R20 F3: the body-check used `NONZERO_EXIT.test(full)`, which only looked
+  // for the substring `exit N`. That accepted `echo exit 1` / `printf
+  // 'exit 1\n'` inside the HALT branch, even though the hook only printed
+  // text. Replaced with statement-level head-token parsing via
+  // `isHeadExitStmt` so only a command-head `exit N` / `return N` counts.
+  //
+  // R20 (defensive): also strip function bodies so a HALT-check + exit 1
+  // that lives inside an uncalled helper function doesn't register as
+  // enforcement. Consistent with `hasAuditCheck` and `referencesReviewGate`.
+  content = stripFunctionBodies(content);
   const HALT_TEST =
     /(?:\[[ \t]+-f[^\n]*\.rea\/HALT[^\n]*\]|\btest[ \t]+-f[^\n]*\.rea\/HALT)/;
+  // Scan a free-form body chunk (after `then`, or the whole branch body) for
+  // any head-token exit/return terminator. Splits on `;`/newline via
+  // `splitStatements` and rejects shapes like `echo exit 1`.
+  const bodyHasHeadExit = (body: string): boolean => {
+    if (body.length === 0) return false;
+    for (const stmt of splitStatements(body)) {
+      if (isHeadExitStmt(stmt)) return true;
+    }
+    return false;
+  };
 
   // Short-circuit form — `[ -f HALT ] && exit N` or the block form
   // `[ -f HALT ] && { printf ...; exit N; }`.
@@ -295,7 +315,7 @@ function hasHaltEnforcement(content: string): boolean {
       // record it.
       if (/(^|[;\s])then\b/.test(full)) {
         frame.branch = 'body';
-        if (NONZERO_EXIT.test(afterThen(full))) frame.nonZeroExitInBody = true;
+        if (bodyHasHeadExit(afterThen(full))) frame.nonZeroExitInBody = true;
       }
       frames.push(frame);
       continue;
@@ -305,7 +325,7 @@ function hasHaltEnforcement(content: string): boolean {
       const frame = frames[frames.length - 1];
       if (frame !== undefined) {
         frame.branch = 'body';
-        if (NONZERO_EXIT.test(afterThen(full))) frame.nonZeroExitInBody = true;
+        if (bodyHasHeadExit(afterThen(full))) frame.nonZeroExitInBody = true;
       }
       continue;
     }
@@ -330,7 +350,7 @@ function hasHaltEnforcement(content: string): boolean {
     if (frames.length > 0) {
       const frame = frames[frames.length - 1];
       if (frame !== undefined && frame.branch === 'body') {
-        if (NONZERO_EXIT.test(full)) frame.nonZeroExitInBody = true;
+        if (bodyHasHeadExit(full)) frame.nonZeroExitInBody = true;
       }
     }
   }
@@ -518,8 +538,38 @@ function splitStatements(line: string): string[] {
  *         `grep | grep` is evaluated as a single logical line.
  */
 function hasAuditCheck(content: string): boolean {
-  const joined = joinLineContinuations(content);
-  const auditVars = collectAuditLogVars(joined);
+  // R19 F2 + R20 F2: pre-strip function bodies so assignments and grep lines
+  // inside dead (uncalled) helper functions don't pollute classifier state.
+  const topLevel = stripFunctionBodies(content);
+
+  // R20 F2 (Codex): `collectAuditLogVars` was monotonic — it added every
+  // variable whose RHS had ever mentioned the audit path, and never removed
+  // the binding when that variable was later reassigned to an unrelated
+  // file. A spoof `AUDIT_LOG=.rea/audit.jsonl; AUDIT_LOG=/tmp/spoof; grep
+  // codex.review "$AUDIT_LOG"` therefore passed the classifier.
+  //
+  // Replaced with live in-order state: we walk statements ourselves and
+  // update `auditVars` on every assignment — RHS with audit path adds the
+  // binding, RHS without removes it. The set is mutated in place so the
+  // audit-grep check at each `if` sees the current bindings.
+  const auditVars = new Set<string>();
+  const ASSIGN_RE =
+    /^(?:export[ \t]+|readonly[ \t]+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$/;
+  const AUDIT_LITERAL = /\.rea\/audit\.jsonl/;
+  const updateAuditVarState = (full: string): void => {
+    const t = stripTrailingComment(full.trimStart());
+    if (t.startsWith('#')) return;
+    const m = t.match(ASSIGN_RE);
+    if (m === null) return;
+    const name = m[1];
+    const rhs = m[2];
+    if (name === undefined || rhs === undefined) return;
+    if (AUDIT_LITERAL.test(rhs)) {
+      auditVars.add(name);
+    } else {
+      auditVars.delete(name);
+    }
+  };
 
   // R17 F2 — the audit-check classifier must require that the MISS PATH is
   // blocking. Three enforcing forms are recognized:
@@ -577,8 +627,16 @@ function hasAuditCheck(content: string): boolean {
     if (frame.branch === 'else') frame.hasBlockingInElse = true;
   };
 
-  for (const stmt of statementsOf(content)) {
+  for (const stmt of statementsOf(topLevel)) {
     const { head, full } = stmt;
+
+    // R20 F2: update audit-var bindings BEFORE any classifier sees this
+    // statement. An assignment at the top of the hook records the binding;
+    // a later reassignment to a non-audit path removes it. Order matters —
+    // the audit-grep check below uses the CURRENT state, not a precomputed
+    // snapshot. Assignment-statement updates are idempotent for non-
+    // assignments (the regex fails cleanly and the set is untouched).
+    updateAuditVarState(full);
 
     if (/^(for|while|until)\b/.test(head)) loopDepth++;
     if (/^done\b/.test(head)) loopDepth = Math.max(0, loopDepth - 1);
@@ -760,6 +818,41 @@ function isAuditGrepLine(line: string, auditVars: Set<string>): boolean {
  *     body so that this detector can verify it cleanly.
  */
 /**
+ * True when the trimmed statement text's FIRST command token is `exit N`
+ * or `return N` with N >= 1. Refuses to match when `exit N` appears as an
+ * argument to another command (`echo exit 1`, `printf 'exit 1'`, etc.),
+ * which the shell never executes as a real exit.
+ *
+ * R20 F1/F3 (Codex): the prior substring regex `\bexit[ \t]+[1-9]\d*\b`
+ * accepted `echo exit 1` as blocking because the regex only cared that
+ * the characters `exit 1` appeared somewhere in the statement. Head-token
+ * parsing refuses that shape.
+ *
+ * Also recognizes a grouped block `{ … }` whose inner statements contain a
+ * head-matched exit — `{ echo halt; exit 1; }` still blocks, but
+ * `{ echo exit 1; }` does not.
+ */
+function isHeadExitStmt(stmt: string): boolean {
+  const t = stmt.trim();
+  if (t.length === 0) return false;
+  if (/^exit[ \t]+[1-9]\d*\b/.test(t)) return true;
+  if (/^return[ \t]+[1-9]\d*\b/.test(t)) return true;
+  // Grouped block `{ a; b; exit N; }` — split the body on `;`/newline and
+  // require that AT LEAST ONE inner statement is itself head-matched.
+  const blockMatch = t.match(/^\{([^}]*)\}/);
+  if (blockMatch !== null) {
+    const body = blockMatch[1] ?? '';
+    for (const inner of body.split(/[;\n]/)) {
+      const sub = inner.trim();
+      if (sub.length === 0) continue;
+      if (/^exit[ \t]+[1-9]\d*\b/.test(sub)) return true;
+      if (/^return[ \t]+[1-9]\d*\b/.test(sub)) return true;
+    }
+  }
+  return false;
+}
+
+/**
  * True when `line` contains at least one statement that unconditionally
  * allows the push to proceed from the current branch (`exit 0` / `return 0`).
  * Used to detect the legacy "allow-on-match + fall-through-block" shape
@@ -799,13 +892,16 @@ function isBlockingStmtLine(line: string, _loopDepth: number): boolean {
   // accumulator pattern is outside the scope of this text-level parser,
   // so we now require an explicit `exit N` or `return N` inside the
   // miss-path body and have restructured the shipped hook accordingly.
+  //
+  // R20 F1: the substring regex `\bexit[ \t]+[1-9]\d*\b` accepted any
+  // occurrence of `exit 1` in the statement, so `echo exit 1` and
+  // `printf 'exit 1'` were mistakenly treated as blocking. Switch to
+  // head-token parsing via `isHeadExitStmt`, which only accepts the
+  // terminator at command-head position (and inside grouped blocks).
   const text = line.trim();
   if (text.length === 0) return false;
   for (const stmt of splitStatements(text)) {
-    const t = stmt.trim();
-    if (t.length === 0) continue;
-    if (/\bexit[ \t]+[1-9]\d*\b/.test(t)) return true;
-    if (/\breturn[ \t]+[1-9]\d*\b/.test(t)) return true;
+    if (isHeadExitStmt(stmt)) return true;
   }
   return false;
 }
@@ -872,32 +968,6 @@ function stripFunctionBodies(content: string): string {
     out.push(raw);
   }
   return out.join('\n');
-}
-
-/**
- * Collect shell variable names whose assigned value contains the literal
- * audit log path `.rea/audit.jsonl`. The shipped husky gate binds the path
- * once into `AUDIT_LOG` and references `$AUDIT_LOG` on the grep line — a
- * spoof that binds an unrelated file into the variable would fail this
- * collection because the RHS literal check is on the source path, not the
- * variable name.
- */
-function collectAuditLogVars(content: string): Set<string> {
-  const auditVars = new Set<string>();
-  const assignRe =
-    /^(?:export[ \t]+|readonly[ \t]+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$/;
-  const auditLiteral = /\.rea\/audit\.jsonl/;
-  for (const raw of content.split(/\r?\n/)) {
-    const t = raw.trimStart();
-    if (t.startsWith('#')) continue;
-    const m = stripTrailingComment(t).match(assignRe);
-    if (!m) continue;
-    const name = m[1];
-    const rhs = m[2];
-    if (name === undefined || rhs === undefined) continue;
-    if (auditLiteral.test(rhs)) auditVars.add(name);
-  }
-  return auditVars;
 }
 
 /**
