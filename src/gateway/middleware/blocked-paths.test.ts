@@ -204,12 +204,16 @@ describe('blocked-paths middleware — key-name routing', () => {
     expect(ctx.status).toBe(InvocationStatus.Denied);
   });
 
-  it('does NOT scan CONTENT_KEYS even when value looks path-shaped', async () => {
+  it('DOES scan CONTENT_KEYS when value is path-shaped (post-0.4.0 hardening)', async () => {
+    // Post-merge Codex round-1 finding: the blanket CONTENT_KEYS skip-list let
+    // real blocked-path writes addressed as `{message: "/home/user/.env"}`
+    // bypass. Content-ish keys are now scanned when the value is path-shaped.
+    // Prose values remain unscanned (see the separate BUG-001 regression
+    // suite for `title`/`description` prose that stays allowed).
     const mw = createBlockedPathsMiddleware(stubPolicy(['.env']));
     const ctx = freshCtx({ message: '/home/user/.env' });
-    const nextCalled = await run(mw, ctx);
-    expect(nextCalled).toBe(true);
-    expect(ctx.status).toBe(InvocationStatus.Allowed);
+    await run(mw, ctx);
+    expect(ctx.status).toBe(InvocationStatus.Denied);
   });
 
   it('scans arrays of filenames under a PATH_LIKE_KEY', async () => {
@@ -249,10 +253,11 @@ describe('blocked-paths middleware — robustness', () => {
   it('tolerates malformed URL encoding', async () => {
     const mw = createBlockedPathsMiddleware(stubPolicy(['.env']));
     const ctx = freshCtx({ file_path: '/project/%E0%A4%A.env' });
-    // We do not require a specific allow/deny here — just that we neither
-    // throw nor leave the ctx in an inconsistent state. The important property
-    // is that decoding failure does not crash the middleware.
+    // Post-0.4.0 hardening: malformed %XX now fails closed rather than
+    // silently falling back to undecoded content. The important property
+    // is that the middleware does not crash and leaves ctx consistent.
     await expect(run(mw, ctx)).resolves.toBeDefined();
+    expect(ctx.status).toBe(InvocationStatus.Denied);
   });
 
   it('ignores non-string arg values (numbers, booleans, null)', async () => {
@@ -261,5 +266,143 @@ describe('blocked-paths middleware — robustness', () => {
     const nextCalled = await run(mw, ctx);
     expect(nextCalled).toBe(true);
     expect(ctx.status).toBe(InvocationStatus.Allowed);
+  });
+});
+
+describe('blocked-paths middleware — 0.4.0 Codex round-1 regressions', () => {
+  // Finding 1 (critical, verified): absolute blocked_paths matching regression.
+  describe('absolute-path blocked_paths matching', () => {
+    it('blocks write when blocked_paths has /etc/passwd and file_path is /etc/passwd', async () => {
+      const mw = createBlockedPathsMiddleware(stubPolicy(['/etc/passwd']));
+      const ctx = freshCtx({ file_path: '/etc/passwd' });
+      await run(mw, ctx);
+      expect(ctx.status).toBe(InvocationStatus.Denied);
+      expect(ctx.error).toContain('/etc/passwd');
+    });
+
+    it('blocks when absolute pattern matches a path-shaped `path` argument', async () => {
+      const mw = createBlockedPathsMiddleware(stubPolicy(['/etc/passwd']));
+      const ctx = freshCtx({ path: '/etc/passwd' });
+      await run(mw, ctx);
+      expect(ctx.status).toBe(InvocationStatus.Denied);
+    });
+
+    it('blocks subdirectory writes under an absolute dir pattern /var/log/', async () => {
+      const mw = createBlockedPathsMiddleware(stubPolicy(['/var/log/']));
+      const ctx = freshCtx({ file_path: '/var/log/auth.log' });
+      await run(mw, ctx);
+      expect(ctx.status).toBe(InvocationStatus.Denied);
+    });
+
+    it('allows non-absolute paths that happen to contain the same basename', async () => {
+      // /etc/passwd is anchored at root — /project/etc/passwd must not match.
+      const mw = createBlockedPathsMiddleware(stubPolicy(['/etc/passwd']));
+      const ctx = freshCtx({ file_path: '/project/etc/passwd' });
+      const nextCalled = await run(mw, ctx);
+      expect(nextCalled).toBe(true);
+      expect(ctx.status).toBe(InvocationStatus.Allowed);
+    });
+
+    it('absolute pattern does not match a relative basename occurrence', async () => {
+      const mw = createBlockedPathsMiddleware(stubPolicy(['/etc/passwd']));
+      const ctx = freshCtx({ file_path: 'etc/passwd' });
+      const nextCalled = await run(mw, ctx);
+      expect(nextCalled).toBe(true);
+      expect(ctx.status).toBe(InvocationStatus.Allowed);
+    });
+  });
+
+  // Finding 2 (high, verified): CONTENT_KEYS blanket skip-list false negatives.
+  describe('CONTENT_KEYS: path-shape still wins over key name', () => {
+    it('blocks {name: ".env"} even though `name` is a content-ish key', async () => {
+      const mw = createBlockedPathsMiddleware(stubPolicy(['.env']));
+      const ctx = freshCtx({ name: '.env' });
+      await run(mw, ctx);
+      expect(ctx.status).toBe(InvocationStatus.Denied);
+    });
+
+    it('blocks {value: "/etc/hosts"} under an absolute blocked entry', async () => {
+      const mw = createBlockedPathsMiddleware(stubPolicy(['/etc/hosts']));
+      const ctx = freshCtx({ value: '/etc/hosts' });
+      await run(mw, ctx);
+      expect(ctx.status).toBe(InvocationStatus.Denied);
+    });
+
+    it('blocks path-shaped value under `tag` key', async () => {
+      const mw = createBlockedPathsMiddleware(stubPolicy(['.env']));
+      const ctx = freshCtx({ tag: '/project/.env' });
+      await run(mw, ctx);
+      expect(ctx.status).toBe(InvocationStatus.Denied);
+    });
+
+    it('blocks path-shaped value under `title` key', async () => {
+      const mw = createBlockedPathsMiddleware(stubPolicy(['.env']));
+      const ctx = freshCtx({ title: '/app/.env' });
+      await run(mw, ctx);
+      expect(ctx.status).toBe(InvocationStatus.Denied);
+    });
+
+    it('still skips prose values under content-ish keys (no path shape)', async () => {
+      // Regression guard: BUG-001 fix must stay in place. Prose under a
+      // content-ish key is never a path value, so it stays unscanned.
+      const mw = createBlockedPathsMiddleware(stubPolicy(['.env']));
+      const ctx = freshCtx({
+        title: 'Working with .env files — best practices',
+        description: 'environment variables and deployment notes',
+      });
+      const nextCalled = await run(mw, ctx);
+      expect(nextCalled).toBe(true);
+      expect(ctx.status).toBe(InvocationStatus.Allowed);
+    });
+  });
+
+  // Finding 3 (high, verified, pre-existing): malformed URL-escape bypass.
+  describe('URL-escape decode — .rea/ trust-root', () => {
+    it('blocks `.rea/` via fully URL-encoded input (%2Erea%2Ffoo)', async () => {
+      const mw = createBlockedPathsMiddleware(stubPolicy([]));
+      const ctx = freshCtx({ file_path: '%2Erea%2Ffoo' });
+      await run(mw, ctx);
+      expect(ctx.status).toBe(InvocationStatus.Denied);
+      expect(ctx.error).toContain('.rea/');
+    });
+
+    it('blocks `.rea/` via mixed-encoded input (.%72ea/foo)', async () => {
+      const mw = createBlockedPathsMiddleware(stubPolicy([]));
+      const ctx = freshCtx({ file_path: '.%72ea/foo' });
+      await run(mw, ctx);
+      expect(ctx.status).toBe(InvocationStatus.Denied);
+      expect(ctx.error).toContain('.rea/');
+    });
+
+    it('fails closed on malformed %XX escape in a path-shaped value', async () => {
+      // `.rea%ZZ/foo` has a lone `%` not followed by two hex digits.
+      // Before this fix, decodeURIComponent threw, normalizePath swallowed,
+      // and segments split to `.rea%zz` + `foo` — bypassing `.rea/`.
+      // After this fix, the malformed escape is detected and request denied.
+      const mw = createBlockedPathsMiddleware(stubPolicy([]));
+      const ctx = freshCtx({ file_path: '.rea%ZZ/foo' });
+      await run(mw, ctx);
+      expect(ctx.status).toBe(InvocationStatus.Denied);
+      expect(ctx.error).toMatch(/malformed URL-escape/i);
+    });
+
+    it('fails closed on structurally-valid but utf-8-invalid escape', async () => {
+      // %E0%A4%A is a truncated multi-byte UTF-8 sequence — decodeURIComponent
+      // throws URIError. Previously silently passed through.
+      const mw = createBlockedPathsMiddleware(stubPolicy(['.env']));
+      const ctx = freshCtx({ file_path: '/project/%E0%A4%A.env' });
+      await run(mw, ctx);
+      expect(ctx.status).toBe(InvocationStatus.Denied);
+    });
+
+    it('allows well-formed %-containing inputs unrelated to blocked paths', async () => {
+      // %20 decodes to a space which is not path-shaped — skipped entirely.
+      // A well-formed encoded path that does NOT match blocked patterns.
+      const mw = createBlockedPathsMiddleware(stubPolicy(['.env']));
+      const ctx = freshCtx({ file_path: '/project/src/index%2Ets' });
+      const nextCalled = await run(mw, ctx);
+      expect(nextCalled).toBe(true);
+      expect(ctx.status).toBe(InvocationStatus.Allowed);
+    });
   });
 });
