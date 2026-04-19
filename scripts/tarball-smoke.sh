@@ -33,7 +33,8 @@ fi
 
 PACK_DIR="$(mktemp -d -t rea-smoke-pack-XXXXXX)"
 SMOKE_DIR="$(mktemp -d -t rea-smoke-install-XXXXXX)"
-cleanup() { rm -rf -- "$PACK_DIR" "$SMOKE_DIR" 2>/dev/null || true; }
+DIFF_TMP="$(mktemp -t rea-smoke-diff-XXXXXX)"
+cleanup() { rm -rf -- "$PACK_DIR" "$SMOKE_DIR" 2>/dev/null || true; rm -f "$DIFF_TMP"; }
 # EXIT alone misses Ctrl-C / TERM / HUP during local runs, leaving
 # /tmp/rea-smoke-* tempdirs behind. Trap the interrupt signals too.
 trap cleanup EXIT HUP INT TERM
@@ -111,13 +112,15 @@ assert_tree_equal() {
   # $2 — file listing of the source tree (one relative path per line)
   # $3 — file listing of the installed tree (one relative path per line)
   local label="$1" src="$2" dst="$3"
-  if ! diff -u <(printf '%s\n' "$src" | sort -u) <(printf '%s\n' "$dst" | sort -u) > /tmp/rea-smoke-diff.$$ 2>&1; then
-    echo "[smoke] FAIL — $label differs between source tree and installed tree:" >&2
-    cat /tmp/rea-smoke-diff.$$ >&2
-    rm -f /tmp/rea-smoke-diff.$$
+  if [ -z "$src" ] || [ -z "$dst" ]; then
+    printf '[smoke] FAIL — empty file listing for %s\n' "$label" >&2
     exit 2
   fi
-  rm -f /tmp/rea-smoke-diff.$$
+  if ! diff -u <(printf '%s\n' "$src" | sort -u) <(printf '%s\n' "$dst" | sort -u) > "$DIFF_TMP" 2>&1; then
+    echo "[smoke] FAIL — $label differs between source tree and installed tree:" >&2
+    cat "$DIFF_TMP" >&2
+    exit 2
+  fi
 }
 
 # 1. agents — flat listing of *.md
@@ -170,9 +173,9 @@ for git_hook in commit-msg pre-push; do
   fi
 done
 
-AGENT_COUNT="$(printf '%s\n' "$AGENTS_DST" | wc -l | awk '{print $1}')"
-HOOK_COUNT="$(printf '%s\n' "$HOOKS_DST" | wc -l | awk '{print $1}')"
-COMMAND_COUNT="$(printf '%s\n' "$COMMANDS_DST" | wc -l | awk '{print $1}')"
+AGENT_COUNT="$(printf '%s\n' "$AGENTS_DST" | grep -c . || true)"
+HOOK_COUNT="$(printf '%s\n' "$HOOKS_DST" | grep -c . || true)"
+COMMAND_COUNT="$(printf '%s\n' "$COMMANDS_DST" | grep -c . || true)"
 echo "[smoke]   → $AGENT_COUNT agents, $HOOK_COUNT hooks, $COMMAND_COUNT commands, .husky/{commit-msg,pre-push} shipped, .git/hooks/{commit-msg,pre-push} installed"
 
 echo "[smoke] rea doctor"
