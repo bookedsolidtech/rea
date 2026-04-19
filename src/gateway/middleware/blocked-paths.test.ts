@@ -204,16 +204,15 @@ describe('blocked-paths middleware — key-name routing', () => {
     expect(ctx.status).toBe(InvocationStatus.Denied);
   });
 
-  it('DOES scan CONTENT_KEYS when value is path-shaped (post-0.4.0 hardening)', async () => {
-    // Post-merge Codex round-1 finding: the blanket CONTENT_KEYS skip-list let
-    // real blocked-path writes addressed as `{message: "/home/user/.env"}`
-    // bypass. Content-ish keys are now scanned when the value is path-shaped.
-    // Prose values remain unscanned (see the separate BUG-001 regression
-    // suite for `title`/`description` prose that stays allowed).
+  it('does NOT scan CONTENT_KEYS even when value is path-shaped (gateway availability)', async () => {
+    // GPT-5.4 Codex round finding: scanning CONTENT_KEYS when path-shaped caused
+    // availability regressions on every tool call that used these keys as metadata.
+    // CONTENT_KEYS are now a pure skip-list — value shape is irrelevant.
     const mw = createBlockedPathsMiddleware(stubPolicy(['.env']));
-    const ctx = freshCtx({ message: '/home/user/.env' });
-    await run(mw, ctx);
-    expect(ctx.status).toBe(InvocationStatus.Denied);
+    const ctx = freshCtx({ message: '/home/user/.env', title: '.env', name: '.env' });
+    const nextCalled = await run(mw, ctx);
+    expect(nextCalled).toBe(true);
+    expect(ctx.status).toBe(InvocationStatus.Allowed);
   });
 
   it('scans arrays of filenames under a PATH_LIKE_KEY', async () => {
@@ -312,34 +311,42 @@ describe('blocked-paths middleware — 0.4.0 Codex round-1 regressions', () => {
     });
   });
 
-  // Finding 2 (high, verified): CONTENT_KEYS blanket skip-list false negatives.
-  describe('CONTENT_KEYS: path-shape still wins over key name', () => {
-    it('blocks {name: ".env"} even though `name` is a content-ish key', async () => {
+  // Finding 2 (high, accepted tradeoff): CONTENT_KEYS are a pure skip-list.
+  // Path-shape scanning of CONTENT_KEYS was reverted because it caused
+  // availability regressions on every gateway tool call using these keys as
+  // metadata. The accepted tradeoff: false negatives on content-key bypasses
+  // are preferable to false positives across the gateway.
+  describe('CONTENT_KEYS: pure skip-list regardless of value shape', () => {
+    it('does not scan {name: ".env"} — name is a content-ish key (pure skip)', async () => {
       const mw = createBlockedPathsMiddleware(stubPolicy(['.env']));
       const ctx = freshCtx({ name: '.env' });
-      await run(mw, ctx);
-      expect(ctx.status).toBe(InvocationStatus.Denied);
+      const nextCalled = await run(mw, ctx);
+      expect(nextCalled).toBe(true);
+      expect(ctx.status).toBe(InvocationStatus.Allowed);
     });
 
-    it('blocks {value: "/etc/hosts"} under an absolute blocked entry', async () => {
+    it('does not scan {value: "/etc/hosts"} — value is a content-ish key (pure skip)', async () => {
       const mw = createBlockedPathsMiddleware(stubPolicy(['/etc/hosts']));
       const ctx = freshCtx({ value: '/etc/hosts' });
-      await run(mw, ctx);
-      expect(ctx.status).toBe(InvocationStatus.Denied);
+      const nextCalled = await run(mw, ctx);
+      expect(nextCalled).toBe(true);
+      expect(ctx.status).toBe(InvocationStatus.Allowed);
     });
 
-    it('blocks path-shaped value under `tag` key', async () => {
+    it('does not scan path-shaped value under `tag` key (pure skip)', async () => {
       const mw = createBlockedPathsMiddleware(stubPolicy(['.env']));
       const ctx = freshCtx({ tag: '/project/.env' });
-      await run(mw, ctx);
-      expect(ctx.status).toBe(InvocationStatus.Denied);
+      const nextCalled = await run(mw, ctx);
+      expect(nextCalled).toBe(true);
+      expect(ctx.status).toBe(InvocationStatus.Allowed);
     });
 
-    it('blocks path-shaped value under `title` key', async () => {
+    it('does not scan path-shaped value under `title` key (pure skip)', async () => {
       const mw = createBlockedPathsMiddleware(stubPolicy(['.env']));
       const ctx = freshCtx({ title: '/app/.env' });
-      await run(mw, ctx);
-      expect(ctx.status).toBe(InvocationStatus.Denied);
+      const nextCalled = await run(mw, ctx);
+      expect(nextCalled).toBe(true);
+      expect(ctx.status).toBe(InvocationStatus.Allowed);
     });
 
     it('still skips prose values under content-ish keys (no path shape)', async () => {

@@ -20,9 +20,11 @@ import type { Middleware } from './chain.js';
  *
  * Post-merge hardening (0.4.0, PR #24 round-1 Codex blockers):
  *   - "Content" keys (content/body/text/message/name/value/label/tag/tags/
- *     title/description/...) are skipped ONLY when the value is NOT path-shaped.
- *     If an argument like `{name: ".env"}` or `{value: "/etc/hosts"}` lands in
- *     those keys, the path-shape heuristic still routes it into the scanner.
+ *     title/description/...) are ALWAYS skipped — they are never path
+ *     destinations. Scanning them by value shape caused availability regressions
+ *     on every tool call that used these keys as metadata (e.g. messaging tools
+ *     with `message: "/some/path"`). The accepted tradeoff: false negatives on
+ *     content-key bypasses are preferable to false positives across the gateway.
  *   - Absolute-path blocked_paths entries (e.g. `/etc/passwd`, `/var/log/`)
  *     match absolute-path values anchored at the filesystem root. The BUG-001
  *     narrowing dropped the leading `/` during segmentation and silently
@@ -90,12 +92,13 @@ const PATH_LIKE_KEYS: ReadonlySet<string> = new Set([
 ]);
 
 /**
- * Keys whose values are usually free-form prose rather than paths. We skip
- * these by name ONLY when the value is not path-shaped. A payload like
- * `{name: ".env"}` or `{value: "/etc/hosts"}` is still scanned because the
- * value itself passes `looksLikePath()`. This avoids the round-1 Codex
- * finding where these keys were a blanket skip-list that let real blocked-
- * path writes addressed as `{name: ".env"}` slip through.
+ * Keys whose values are free-form prose or metadata rather than path
+ * destinations. These are always skipped — scanning them by value shape
+ * caused availability regressions across every gateway tool call that
+ * happened to use these keys as metadata (e.g. a messaging tool with
+ * `message: "/some/path"` or a tagging tool with `tag: ".env"`).
+ * The accepted tradeoff: false negatives on content-key bypasses are
+ * preferable to false positives on all tool calls.
  */
 const CONTENT_KEYS: ReadonlySet<string> = new Set([
   'content',
@@ -174,11 +177,10 @@ export function createBlockedPathsMiddleware(initialPolicy: Policy, baseDir?: st
  *
  * Routing rules:
  *   - PATH_LIKE_KEYS (file_path, folder, …): always scan.
- *   - CONTENT_KEYS (content, body, name, value, title, …): scan ONLY when the
- *     value is path-shaped per `looksLikePath()`. A prose title like
- *     "Working with .env files" is not path-shaped (contains whitespace) and
- *     is skipped; a value like `"/etc/hosts"` or `".env"` is path-shaped and
- *     is scanned.
+ *   - CONTENT_KEYS (content, body, name, value, title, …): always skip.
+ *     These keys carry prose or tool metadata — not path destinations.
+ *     Scanning them (even only when path-shaped) denies legitimate tool calls
+ *     across the gateway. See CONTENT_KEYS JSDoc for the accepted tradeoff.
  *   - Any other key: scan when the value is path-shaped.
  * Array indices inherit the parent key's semantics.
  */
@@ -196,8 +198,9 @@ function extractScannableStrings(
     const leaf = inheritedKey.toLowerCase();
     const pathShaped = looksLikePath(obj);
     if (CONTENT_KEYS.has(leaf)) {
-      // Content-ish key: only scan when the value itself looks path-shaped.
-      if (pathShaped) out.push([prefix || 'value', obj]);
+      // Content-ish keys (message, title, name, body, etc.) are never path
+      // destinations — skip regardless of value shape. Scanning by shape here
+      // would deny legitimate tool metadata across the gateway.
       return out;
     }
     if (PATH_LIKE_KEYS.has(leaf) || pathShaped) {
