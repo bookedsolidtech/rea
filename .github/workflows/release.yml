@@ -55,6 +55,14 @@ jobs:
       - name: Build
         run: pnpm build
 
+      # Re-run the tarball smoke at release time. CI runs this on every PR and
+      # on every main push, but re-running here closes the window between the
+      # last main CI run and the actual `changeset:publish` step — if a merged
+      # changeset or dependency update broke the packed artifact, we catch it
+      # here rather than shipping a broken tarball to npm.
+      - name: Tarball smoke (pre-publish)
+        run: scripts/tarball-smoke.sh
+
       - name: Create release PR or publish
         id: changesets
         # pin: changesets/action v1.4.9
