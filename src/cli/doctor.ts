@@ -230,30 +230,70 @@ function checkCommitMsgHook(baseDir: string): CheckResult {
 }
 
 /**
- * G6 — Verify at least one pre-push hook is installed and executable.
+ * G6 — Verify at least one pre-push hook is installed and executable AND
+ * actually wires the protected-path review gate.
  *
  * Three install shapes are acceptable:
- *   1. `.git/hooks/pre-push` — vanilla git (no hooksPath).
- *   2. `${core.hooksPath}/pre-push` — husky 9 or custom hooksPath.
+ *   1. `.git/hooks/pre-push` — vanilla git (no hooksPath). Must carry the
+ *      rea fallback marker or delegate to `push-review-gate.sh`.
+ *   2. `${core.hooksPath}/pre-push` — husky 9 or custom hooksPath. Same
+ *      governance rule.
  *   3. `.husky/pre-push` is present on disk but only counts if husky has
  *      configured `core.hooksPath=.husky`. A `.husky/pre-push` with an
  *      unconfigured hooksPath is dead weight; we do NOT treat it as
  *      sufficient.
  *
+ * Two possible outcomes:
+ *   - `pass`: active hook exists, is executable, and governance-carrying
+ *     (rea-managed marker or direct gate delegation).
+ *   - `fail`: no active hook, active file is non-executable, OR the active
+ *     hook does not reference `.claude/hooks/push-review-gate.sh`. The last
+ *     case is the "silent bypass" state — a lint-only husky hook or a
+ *     pre-existing repo hook that bypasses the Codex audit gate entirely.
+ *     Always a hard fail; `rea init` can install the fallback if the user
+ *     removes or updates the existing hook.
+ *
  * "Executable" is defined by any user/group/other exec bit, matching
- * `checkHooksInstalled`. Status is `fail` when nothing is active — the
- * protected-path Codex audit requirement depends on this hook.
+ * `checkHooksInstalled`.
  */
 function checkPrePushHook(state: PrePushDoctorState): CheckResult {
   if (state.ok) {
-    const active = state.candidates.find((c) => c.exists && c.executable);
-    const detail = active !== undefined
-      ? `${active.reaManaged ? 'rea-managed' : 'external'} at ${active.path}`
-      : undefined;
+    const active = state.candidates.find((c) => c.path === state.activePath);
+    const kind =
+      active?.reaManaged === true
+        ? 'rea-managed'
+        : active?.delegatesToGate === true
+          ? 'external (delegates to push-review-gate.sh)'
+          : 'external';
+    const detail = active !== undefined ? `${kind} at ${active.path}` : undefined;
     return detail !== undefined
       ? { label: 'pre-push hook installed', status: 'pass', detail }
       : { label: 'pre-push hook installed', status: 'pass' };
   }
+
+  if (state.activeForeign) {
+    // Executable file exists at the active path but does not carry
+    // governance — the parser could not confirm the review gate is
+    // invoked unconditionally. Always a hard fail.
+    //
+    // R13 F3: previously, a substring match of the gate path in the hook
+    // downgraded this to WARN. That was unsafe — any comment, echo, or
+    // dead string mentioning the path would mask a silent-bypass hook.
+    // The classifier now fails closed: either the structural parser
+    // (`referencesReviewGate` in `pre-push.ts`) recognizes a real
+    // invocation, or doctor reports fail.
+    return {
+      label: 'pre-push hook installed',
+      status: 'fail',
+      detail:
+        `active pre-push at ${state.activePath} is present and executable but does NOT ` +
+        `reference \`.claude/hooks/push-review-gate.sh\` — the protected-path ` +
+        `Codex audit gate is silently bypassed. Either add ` +
+        '`exec .claude/hooks/push-review-gate.sh "$@"` to the existing hook, or ' +
+        'remove it and re-run `rea init` to install the fallback.',
+    };
+  }
+
   const present = state.candidates
     .filter((c) => c.exists)
     .map((c) => `${c.path}${c.executable ? '' : ' (not executable)'}`);
@@ -360,6 +400,8 @@ function codexRequiredFromPolicy(baseDir: string): boolean {
  * Callers that already have fresh state (e.g. `runDoctor`) should pass
  * both; callers that don't (e.g. unit tests of the existing doctor
  * surface) can omit them and those checks are skipped.
+ *
+ * `activeForeign` always yields `fail` — a foreign hook bypassing the gate is a hard governance gap.
  */
 export function collectChecks(
   baseDir: string,

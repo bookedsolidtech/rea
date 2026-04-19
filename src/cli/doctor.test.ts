@@ -199,14 +199,18 @@ describe('rea doctor — collectChecks (G11.4 codex_required)', () => {
   it('G6: pre-push state ok=true → pre-push check passes', async () => {
     const repo = await makeScratchRepo({ codexRequired: true });
     cleanup.push(repo.dir);
+    const hookPath = path.join(repo.dir, '.git', 'hooks', 'pre-push');
     const state: PrePushDoctorState = {
       ok: true,
+      activeForeign: false,
+      activePath: hookPath,
       candidates: [
         {
-          path: path.join(repo.dir, '.git', 'hooks', 'pre-push'),
+          path: hookPath,
           exists: true,
           executable: true,
           reaManaged: true,
+          delegatesToGate: true,
         },
       ],
     };
@@ -222,8 +226,16 @@ describe('rea doctor — collectChecks (G11.4 codex_required)', () => {
     const hookPath = path.join(repo.dir, '.git', 'hooks', 'pre-push');
     const state: PrePushDoctorState = {
       ok: false,
+      activeForeign: false,
+      activePath: hookPath,
       candidates: [
-        { path: hookPath, exists: true, executable: false, reaManaged: false },
+        {
+          path: hookPath,
+          exists: true,
+          executable: false,
+          reaManaged: false,
+          delegatesToGate: false,
+        },
       ],
     };
     const checks = collectChecks(repo.dir, undefined, state);
@@ -235,14 +247,18 @@ describe('rea doctor — collectChecks (G11.4 codex_required)', () => {
   it('G6: pre-push state ok=false with no candidates present → fail with install hint', async () => {
     const repo = await makeScratchRepo({ codexRequired: true });
     cleanup.push(repo.dir);
+    const hookPath = path.join(repo.dir, '.git', 'hooks', 'pre-push');
     const state: PrePushDoctorState = {
       ok: false,
+      activeForeign: false,
+      activePath: hookPath,
       candidates: [
         {
-          path: path.join(repo.dir, '.git', 'hooks', 'pre-push'),
+          path: hookPath,
           exists: false,
           executable: false,
           reaManaged: false,
+          delegatesToGate: false,
         },
       ],
     };
@@ -251,6 +267,61 @@ describe('rea doctor — collectChecks (G11.4 codex_required)', () => {
     expect(check?.status).toBe('fail');
     expect(check?.detail).toMatch(/no pre-push hook found/);
     expect(check?.detail).toMatch(/rea init/);
+  });
+
+  it('G6: executable-but-foreign active hook → fail, not pass', async () => {
+    // Finding 1 from the Codex post-merge review: an executable pre-push
+    // that does NOT reference the review gate used to pass doctor because
+    // the check only looked at `exists + executable`. With the governance
+    // requirement threaded through, this is now always a fail with guidance.
+    const repo = await makeScratchRepo({ codexRequired: true });
+    cleanup.push(repo.dir);
+    const hookPath = path.join(repo.dir, '.git', 'hooks', 'pre-push');
+    const state: PrePushDoctorState = {
+      ok: false,
+      activeForeign: true,
+      activePath: hookPath,
+      candidates: [
+        {
+          path: hookPath,
+          exists: true,
+          executable: true,
+          reaManaged: false,
+          delegatesToGate: false,
+        },
+      ],
+    };
+    const checks = collectChecks(repo.dir, undefined, state);
+    const check = findCheck(checks, 'pre-push hook installed');
+    expect(check?.status).toBe('fail');
+    expect(check?.detail).toMatch(/silently bypassed/);
+    expect(check?.detail).toMatch(/push-review-gate\.sh/);
+  });
+
+  it('G6: executable foreign hook that DOES delegate to the gate → pass', async () => {
+    // Consumer wrote their own pre-push but called the shared gate. This
+    // is a legitimate integration path — warn would be noise.
+    const repo = await makeScratchRepo({ codexRequired: true });
+    cleanup.push(repo.dir);
+    const hookPath = path.join(repo.dir, '.git', 'hooks', 'pre-push');
+    const state: PrePushDoctorState = {
+      ok: true,
+      activeForeign: false,
+      activePath: hookPath,
+      candidates: [
+        {
+          path: hookPath,
+          exists: true,
+          executable: true,
+          reaManaged: false,
+          delegatesToGate: true,
+        },
+      ],
+    };
+    const checks = collectChecks(repo.dir, undefined, state);
+    const check = findCheck(checks, 'pre-push hook installed');
+    expect(check?.status).toBe('pass');
+    expect(check?.detail).toMatch(/delegates to push-review-gate/);
   });
 
   it('codex_required=false: absence of the codex agent does not fail the check', async () => {
@@ -271,5 +342,58 @@ describe('rea doctor — collectChecks (G11.4 codex_required)', () => {
       /codex-adversarial|codex-review command/.test(c.label),
     );
     expect(codexChecks).toHaveLength(0);
+  });
+
+  it('G6 strict=false (default): activeForeign yields fail (always)', async () => {
+    // activeForeign is always a fail regardless of strict mode — a foreign hook
+    // that bypasses the review gate is a governance gap, not just a warning.
+    const repo = await makeScratchRepo({ codexRequired: true });
+    cleanup.push(repo.dir);
+    const hookPath = path.join(repo.dir, '.git', 'hooks', 'pre-push');
+    const state: PrePushDoctorState = {
+      ok: false,
+      activeForeign: true,
+      activePath: hookPath,
+      candidates: [
+        {
+          path: hookPath,
+          exists: true,
+          executable: true,
+          reaManaged: false,
+          delegatesToGate: false,
+        },
+      ],
+    };
+    const checks = collectChecks(repo.dir, undefined, state);
+    const check = findCheck(checks, 'pre-push hook installed');
+    expect(check?.status).toBe('fail');
+    expect(check?.detail).toMatch(/silently bypassed/);
+  });
+
+  it('G6 strict=true: activeForeign yields fail, not warn', async () => {
+    // Finding 2 — strict mode: CI must exit non-zero when the active pre-push
+    // hook does not invoke the review gate. This is the governance-absent
+    // state the gate exists to prevent.
+    const repo = await makeScratchRepo({ codexRequired: true });
+    cleanup.push(repo.dir);
+    const hookPath = path.join(repo.dir, '.git', 'hooks', 'pre-push');
+    const state: PrePushDoctorState = {
+      ok: false,
+      activeForeign: true,
+      activePath: hookPath,
+      candidates: [
+        {
+          path: hookPath,
+          exists: true,
+          executable: true,
+          reaManaged: false,
+          delegatesToGate: false,
+        },
+      ],
+    };
+    const checks = collectChecks(repo.dir, undefined, state);
+    const check = findCheck(checks, 'pre-push hook installed');
+    expect(check?.status).toBe('fail');
+    expect(check?.detail).toMatch(/silently bypassed/);
   });
 });

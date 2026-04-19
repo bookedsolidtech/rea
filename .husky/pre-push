@@ -1,4 +1,6 @@
 #!/bin/sh
+# rea:husky-pre-push-gate v1
+# rea:gate-body-v1
 # .husky/pre-push — rea governance gate for terminal-initiated pushes.
 #
 # Mirrors the logic of `.claude/hooks/push-review-gate.sh` but consumes the
@@ -20,8 +22,10 @@
 # which ran the loop in a subshell — `exit 1` inside the loop aborted the
 # subshell only, and the script then ran `exit 0` and allowed the push. We
 # now feed the loop with a here-doc so it runs in the main shell, and we
-# track `block_push` in the enclosing scope. Final `exit 1` is reached only
-# if no refspec is blocked; a single blocking refspec propagates correctly.
+# abort immediately (`exit 1`) on the first blocking refspec. The accumulator
+# pattern (`block_push=1; continue`) was dropped so the text-level detector
+# in `src/cli/install/pre-push.ts` can verify the miss-path is truly blocking
+# without modeling loop-carried flags and post-loop exit blocks.
 
 set -eu
 
@@ -63,13 +67,11 @@ if [ -f "$READ_FIELD_JS" ]; then
   fi
 fi
 
-block_push=0
-
-# Here-doc feeds the loop without creating a subshell, so `block_push=1`
-# assignments below persist in the enclosing scope and the final `exit`
-# reflects them. A pipeline would run the loop in a subshell and `exit 1`
-# inside it would only abort that subshell — NOT the push — which was a
-# real governance defect in the pre-review version of this file.
+# Here-doc feeds the loop without creating a subshell, so an `exit 1`
+# inside the loop terminates the hook and blocks the push. A pipeline
+# would run the loop in a subshell and `exit 1` inside it would only
+# abort that subshell — NOT the push — which was a real governance
+# defect in the pre-review version of this file.
 while IFS=' ' read -r local_ref local_sha remote_ref remote_sha; do
   [ -z "${local_sha:-}" ] && continue
   # Branch deletion: local_sha is 40 zeros. Skip protected-path check.
@@ -103,26 +105,21 @@ while IFS=' ' read -r local_ref local_sha remote_ref remote_sha; do
     if [ ! -f "$AUDIT_LOG" ]; then
       printf 'PUSH BLOCKED: protected paths changed but no audit log found at %s\n' "$AUDIT_LOG" >&2
       printf '  Run /codex-review on HEAD %s before pushing.\n' "$local_sha" >&2
-      block_push=1
-      continue
+      exit 1
     fi
     # Require both (a) a `codex.review` tool_name and (b) the exact head_sha
     # on the same JSONL line. The `codex.review` pattern ends with a closing
-    # quote, so `codex.review.skipped` never satisfies the gate.
+    # quote, so `codex.review.skipped` never satisfies the gate. The first
+    # refspec that fails this check aborts the hook — no accumulator needed.
     if ! grep -E '"tool_name":"codex\.review"' "$AUDIT_LOG" 2>/dev/null | \
          grep -qF "\"head_sha\":\"$local_sha\""; then
       printf 'PUSH BLOCKED: protected paths changed — /codex-review required for HEAD %s\n' "$local_sha" >&2
       printf '  Run /codex-review, or set REA_SKIP_CODEX_REVIEW=<reason> to bypass.\n' >&2
-      block_push=1
-      continue
+      exit 1
     fi
   fi
 done <<HOOK_INPUT_EOF
 $INPUT
 HOOK_INPUT_EOF
-
-if [ "$block_push" -ne 0 ]; then
-  exit 1
-fi
 
 exit 0
