@@ -1606,23 +1606,90 @@ describe('isReaManagedHuskyGate — R16 F2 block-aware audit enforcement', () =>
     expect(isReaManagedHuskyGate(content)).toBe(true);
   });
 
-  it('shipped shape: while-loop with `if ! … then block_push=1; continue; fi`: returns true', () => {
+  it('shipped shape: while-loop with `if ! … then exit 1; fi` (direct exit): returns true', () => {
+    // R18 F2: the shipped husky gate was restructured to use `exit 1`
+    // directly inside the miss-path body (previously `block_push=1;
+    // continue` paired with a post-loop accumulator check). The direct
+    // exit is what the text-level detector can verify without modeling
+    // loop-carried flags.
     const content =
       `${header}` +
       `AUDIT_LOG=.rea/audit.jsonl\n` +
       `while IFS= read -r line; do\n` +
       `  if ! grep -qE '"tool_name":"codex\\.review"' "$AUDIT_LOG"; then\n` +
-      `    block_push=1\n` +
-      `    continue\n` +
+      `    exit 1\n` +
       `  fi\n` +
       `done\n`;
     expect(isReaManagedHuskyGate(content)).toBe(true);
+  });
+
+  it('R18 F2: loop-local `continue` without post-loop exit: returns false', () => {
+    // `while …; do if ! grep …; then continue; fi; done` with no later
+    // blocking exit — continue only skips the current iteration.
+    const content =
+      `${header}` +
+      `while IFS= read -r line; do\n` +
+      `  if ! grep -q codex.review .rea/audit.jsonl; then\n` +
+      `    continue\n` +
+      `  fi\n` +
+      `done\n`;
+    expect(isReaManagedHuskyGate(content)).toBe(false);
+  });
+
+  it('R18 F2: loop-local `break` without post-loop exit: returns false', () => {
+    const content =
+      `${header}` +
+      `while IFS= read -r line; do\n` +
+      `  if ! grep -q codex.review .rea/audit.jsonl; then\n` +
+      `    break\n` +
+      `  fi\n` +
+      `done\n`;
+    expect(isReaManagedHuskyGate(content)).toBe(false);
   });
 
   it('top-level `continue` (no enclosing loop): does NOT count as blocking', () => {
     const content =
       `${header}if ! grep -q codex.review .rea/audit.jsonl; then continue; fi\n`;
     expect(isReaManagedHuskyGate(content)).toBe(false);
+  });
+});
+
+// R18 F1: `referencesReviewGate` must track function-body scope. A gate
+// call inside an uncalled function is dead code, but the line-level
+// depth tracker only covered `if`/`for`/`while`/`case`. Function bodies
+// were treated as depth 0, so an unused helper was classified as active
+// delegation.
+describe('referencesReviewGate — R18 F1 function-body scope', () => {
+  it('uncalled function wrapping gate exec: returns false', () => {
+    const content =
+      `#!/bin/sh\n` +
+      `run_gate() {\n` +
+      `  exec .claude/hooks/push-review-gate.sh "$@"\n` +
+      `}\n`;
+    expect(referencesReviewGate(content)).toBe(false);
+  });
+
+  it('same-line function definition `name() { exec gate "$@"; }`: returns false', () => {
+    const content =
+      `#!/bin/sh\n` +
+      `run_gate() { exec .claude/hooks/push-review-gate.sh "$@"; }\n`;
+    expect(referencesReviewGate(content)).toBe(false);
+  });
+
+  it('`function name { … }` keyword form: returns false', () => {
+    const content =
+      `#!/bin/sh\n` +
+      `function run_gate {\n` +
+      `  exec .claude/hooks/push-review-gate.sh "$@"\n` +
+      `}\n`;
+    expect(referencesReviewGate(content)).toBe(false);
+  });
+
+  it('top-level exec NOT inside any function: still returns true', () => {
+    const content =
+      `#!/bin/sh\n` +
+      `exec .claude/hooks/push-review-gate.sh "$@"\n`;
+    expect(referencesReviewGate(content)).toBe(true);
   });
 });
 

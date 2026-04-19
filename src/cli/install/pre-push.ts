@@ -522,18 +522,27 @@ function hasAuditCheck(content: string): boolean {
   const auditVars = collectAuditLogVars(joined);
 
   // R17 F2 — the audit-check classifier must require that the MISS PATH is
-  // blocking. There are only two forms that enforce:
+  // blocking. Three enforcing forms are recognized:
   //
   //   (a) `if ! <audit-grep>; then <BLOCKING>; fi`
   //       Negated: the grep failing (miss) runs the then-body, which must
-  //       block (`exit N`, `return N`, or `continue`/`break` inside a loop).
+  //       block (`exit N` or `return N`).
   //
   //   (b) `if <audit-grep>; then :; else <BLOCKING>; fi`
   //       Positive: the grep failing (miss) runs the else-body, which must
   //       block. A positive `if` with NO `else` (or a non-blocking else)
   //       silently succeeds when the audit record is missing.
   //
-  //   (c) Top-level bare grep — handled by the line-level fallback below
+  //   (c) `if <audit-grep>; then exit 0; fi` followed by a top-level
+  //       blocking statement (`exit N` / `return N`). R18 legacy backward-
+  //       compat shape: hit-path terminates inside `then` via allow (exit 0),
+  //       miss-path falls through the `fi` and is stopped by a post-fi
+  //       top-level blocker. Detected by flagging a pending fall-through
+  //       requirement on fi-pop and satisfying it the next time the main
+  //       walker sees a blocking statement at `frames.length === 0` and
+  //       `loopDepth === 0`.
+  //
+  //   (d) Top-level bare grep — handled by the line-level fallback below
   //       under POSIX `set -e` semantics.
   //
   // R15's original "accept any positive `if <audit-grep>`" was wrong: the
@@ -549,15 +558,20 @@ function hasAuditCheck(content: string): boolean {
     isPositiveAuditIf: boolean;
     hasBlockingInThen: boolean;
     hasBlockingInElse: boolean;
+    hasAllowOnMatchInThen: boolean;
     branch: 'cond' | 'then' | 'else';
   };
   const frames: Frame[] = [];
   let loopDepth = 0;
+  let pendingFallThroughMissBlock = false;
 
   const recordBlockingIntoFrame = (text: string): void => {
     if (frames.length === 0) return;
     const frame = frames[frames.length - 1];
     if (frame === undefined) return;
+    if (isAllowOnMatchStmtLine(text) && frame.branch === 'then') {
+      frame.hasAllowOnMatchInThen = true;
+    }
     if (!isBlockingStmtLine(text, loopDepth)) return;
     if (frame.branch === 'then') frame.hasBlockingInThen = true;
     if (frame.branch === 'else') frame.hasBlockingInElse = true;
@@ -580,6 +594,7 @@ function hasAuditCheck(content: string): boolean {
         isPositiveAuditIf: condIsAuditGrep && !condIsNegated,
         hasBlockingInThen: false,
         hasBlockingInElse: false,
+        hasAllowOnMatchInThen: false,
         branch: 'cond',
       };
       if (/(^|[;\s])then\b/.test(full)) {
@@ -587,6 +602,9 @@ function hasAuditCheck(content: string): boolean {
         const bodyText = afterThen(full);
         if (isBlockingStmtLine(bodyText, loopDepth)) {
           frame.hasBlockingInThen = true;
+        }
+        if (isAllowOnMatchStmtLine(bodyText)) {
+          frame.hasAllowOnMatchInThen = true;
         }
       }
       frames.push(frame);
@@ -600,6 +618,9 @@ function hasAuditCheck(content: string): boolean {
         const bodyText = afterThen(full);
         if (isBlockingStmtLine(bodyText, loopDepth)) {
           frame.hasBlockingInThen = true;
+        }
+        if (isAllowOnMatchStmtLine(bodyText)) {
+          frame.hasAllowOnMatchInThen = true;
         }
       }
       continue;
@@ -632,7 +653,31 @@ function hasAuditCheck(content: string): boolean {
       if (frame === undefined) continue;
       if (frame.isNegatedAuditIf && frame.hasBlockingInThen) return true;
       if (frame.isPositiveAuditIf && frame.hasBlockingInElse) return true;
+      // R18 legacy shape (form c): positive audit-if whose then-branch
+      // terminates via allow (`exit 0`/`return 0`) and no explicit else.
+      // The miss path falls through the fi — arm a pending requirement
+      // that's satisfied by the next top-level blocking statement.
+      if (
+        frame.isPositiveAuditIf &&
+        frame.hasAllowOnMatchInThen &&
+        !frame.hasBlockingInElse &&
+        frames.length === 0 &&
+        loopDepth === 0
+      ) {
+        pendingFallThroughMissBlock = true;
+      }
       continue;
+    }
+
+    // Top-level blocking statement after a qualifying positive audit-if:
+    // satisfies the fall-through miss-path requirement (form c).
+    if (
+      pendingFallThroughMissBlock &&
+      frames.length === 0 &&
+      loopDepth === 0 &&
+      isBlockingStmtLine(full, loopDepth)
+    ) {
+      return true;
     }
 
     // Statement inside an open `if` frame — route blocking statements to
@@ -656,7 +701,22 @@ function hasAuditCheck(content: string): boolean {
   for (const rawLine of joined.split('\n')) {
     const line = rawLine.trim();
     if (line === '' || line.startsWith('#')) continue;
-    if (/^if\b/.test(line) && /\bfi\s*;?\s*$/.test(line)) continue;
+    // Skip any line that is an `if` statement (whether single-line with
+    // trailing `fi` or the opening line of a multi-line block). The frame
+    // parser above is authoritative for if-constructs and correctly decides
+    // accept/reject; re-matching the embedded audit grep here would
+    // over-accept no-op `then :; fi` spoofs and `if ! …; then continue; fi`
+    // shapes whose miss path doesn't block. Top-level bare grep lines
+    // (the only thing this fallback exists to catch) do not start with
+    // `if` anyway, so this narrows the fallback without regressing it.
+    if (/^if\b/.test(line)) continue;
+    // Same reasoning for elif/then/else/fi/do/done/esac — these appear
+    // on their own lines inside multi-line constructs the frame parser
+    // is tracking. Re-matching the text inside those lines is not what
+    // the fallback is for.
+    if (/^(elif|then|else|fi|do|done|esac|while|for|until|case)\b/.test(line)) {
+      continue;
+    }
     if (isAuditGrepLine(line, auditVars)) return true;
   }
 
@@ -699,20 +759,61 @@ function isAuditGrepLine(line: string, auditVars: Set<string>): boolean {
  * the push to block. Recognized forms:
  *
  *   - `exit N` / `return N` where N >= 1 — explicit non-zero termination.
- *   - `continue` / `break` when `loopDepth > 0` — in a loop, these abort the
- *     current iteration (or the loop), which combined with a later
- *     accumulator check (`if [ $block_push -ne 0 ]; then exit 1; fi`)
- *     produces a blocking outcome. The shipped husky gate uses exactly this
- *     pattern: `block_push=1; continue` inside the while loop, followed by
- *     `if [ "$block_push" -ne 0 ]; then exit 1; fi` after the loop.
  *
  * Explicitly NOT blocking:
  *   - `:` (null command) — no-op.
  *   - `printf` / `echo` — informational output only.
- *   - Bare assignments (`block_push=1`) without a subsequent flow-control
- *     statement — the flag means nothing by itself.
+ *   - Bare assignments (e.g. `block_push=1`) without a subsequent
+ *     flow-control statement — the flag means nothing by itself.
+ *   - `continue` / `break` — loop control only. The shell still falls
+ *     through to whatever follows the enclosing `done`, which may be
+ *     `exit 0`. The accumulator pattern that would make them blocking
+ *     (`block_push=1; continue` paired with a post-loop
+ *     `if [ "$block_push" -ne 0 ]; then exit 1; fi`) is outside the
+ *     scope of this text-level parser (R18 F2). The shipped husky gate
+ *     was restructured to use `exit 1` directly inside the miss-path
+ *     body so that this detector can verify it cleanly.
  */
-function isBlockingStmtLine(line: string, loopDepth: number): boolean {
+/**
+ * True when `line` contains at least one statement that unconditionally
+ * allows the push to proceed from the current branch (`exit 0` / `return 0`).
+ * Used to detect the legacy "allow-on-match + fall-through-block" shape
+ * (R18 form c):
+ *
+ *   if grep -q codex.review .rea/audit.jsonl; then exit 0; fi
+ *   exit 1
+ *
+ * On match, `exit 0` in the then-branch terminates the shell successfully.
+ * On miss, the then-branch is skipped and control falls through the `fi`,
+ * where the post-fi `exit 1` blocks the push. The classifier needs to see
+ * both halves (allow in then, block after fi) to accept this shape.
+ *
+ * Bare `exit` / `return` (no arg) is not treated as allow-on-match because
+ * POSIX uses the last command's exit status, which is brittle inside a
+ * freshly-entered `then` branch (grep's status was already consumed by the
+ * `if`). Requiring an explicit `0` keeps the detector fail-closed.
+ */
+function isAllowOnMatchStmtLine(line: string): boolean {
+  const text = line.trim();
+  if (text.length === 0) return false;
+  for (const stmt of splitStatements(text)) {
+    const t = stmt.trim();
+    if (t.length === 0) continue;
+    if (/\bexit[ \t]+0\b/.test(t)) return true;
+    if (/\breturn[ \t]+0\b/.test(t)) return true;
+  }
+  return false;
+}
+
+function isBlockingStmtLine(line: string, _loopDepth: number): boolean {
+  // R18 F2: `continue`/`break` are no longer treated as blocking on their
+  // own. Both only affect loop control — the shell still falls through to
+  // whatever follows the enclosing `done`, which may well be `exit 0`.
+  // The shipped husky gate used `continue` paired with `block_push=1` +
+  // a post-loop `if [ "$block_push" -ne 0 ]; then exit 1; fi`; that
+  // accumulator pattern is outside the scope of this text-level parser,
+  // so we now require an explicit `exit N` or `return N` inside the
+  // miss-path body and have restructured the shipped hook accordingly.
   const text = line.trim();
   if (text.length === 0) return false;
   for (const stmt of splitStatements(text)) {
@@ -720,10 +821,6 @@ function isBlockingStmtLine(line: string, loopDepth: number): boolean {
     if (t.length === 0) continue;
     if (/\bexit[ \t]+[1-9]\d*\b/.test(t)) return true;
     if (/\breturn[ \t]+[1-9]\d*\b/.test(t)) return true;
-    if (loopDepth > 0) {
-      if (/^continue\b/.test(t) || /[;\s]continue\b/.test(t)) return true;
-      if (/^break\b/.test(t) || /[;\s]break\b/.test(t)) return true;
-    }
   }
   return false;
 }
@@ -923,6 +1020,14 @@ export function referencesReviewGate(content: string): boolean {
   const lines = content.split(/\r?\n/);
   let exitedBeforeGate = false;
   let depth = 0;
+  // R18 F1: function bodies are a separate scope that was not depth-tracked.
+  // A hook like `run_gate() { exec .claude/hooks/push-review-gate.sh; }` with
+  // no call site for `run_gate` previously passed because the exec sat at
+  // depth 0 by line-level accounting. We now treat any content inside a
+  // function body as "not top-level" and reject invocations there.
+  let funcBraceDepth = 0;
+  const funcDefRe =
+    /^(?:function[ \t]+[A-Za-z_][A-Za-z0-9_]*(?:[ \t]*\([ \t]*\))?|[A-Za-z_][A-Za-z0-9_]*[ \t]*\([ \t]*\))[ \t]*\{?[ \t]*$/;
   for (const raw of lines) {
     let line = raw.trim();
     if (line.length === 0) continue;
@@ -934,7 +1039,26 @@ export function referencesReviewGate(content: string): boolean {
         line = line.slice(0, hashIdx).trimEnd();
       }
     }
-    if (/^(if|for|while|case)\b/.test(line)) depth++;
+    // Function-body tracking. Enter when a function definition line is seen;
+    // exit when the matching `}` arrives on its own line. Nested braces
+    // (e.g. brace-expansion `${VAR:-default}`) are stripped first so they
+    // don't throw off the counter.
+    const stripped = line.replace(/\$\{[^}]*\}/g, '');
+    if (funcBraceDepth === 0 && funcDefRe.test(stripped)) {
+      funcBraceDepth++;
+      if (!line.includes('{')) {
+        // Body opens on a subsequent line — leave counter at 1, the next
+        // line's `{` will be absorbed by brace-balance below.
+      }
+      continue;
+    }
+    if (funcBraceDepth > 0) {
+      const opens = (stripped.match(/\{/g) ?? []).length;
+      const closes = (stripped.match(/\}/g) ?? []).length;
+      funcBraceDepth = Math.max(0, funcBraceDepth + opens - closes);
+      continue;
+    }
+    if (/^(if|for|while|until|case)\b/.test(line)) depth++;
     if (/^(fi|done|esac)\b/.test(line)) depth = Math.max(0, depth - 1);
     if (depth === 0 && isTopLevelExit(line)) {
       exitedBeforeGate = true;
