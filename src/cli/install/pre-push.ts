@@ -387,49 +387,31 @@ function hasHaltEnforcement(content: string): boolean {
   };
   const frames: Frame[] = [];
   let loopDepth = 0;
-  // R27 F2 — case-branch reachability, symmetric to `hasAuditCheck`. A
-  // HALT enforcement block inside a dead `case "a" in "b") ...` branch
-  // never runs, so we require `caseStack.every(c => c.curBranchLive)`
-  // alongside `frames.length === 0 && loopDepth === 0`.
-  const caseStack: CaseFrame[] = [];
+  // R28 B1/B2 — open `case ... esac` depth. R27 tracked per-branch
+  // liveness (scrutinee literal + pattern match) but that created two
+  // attack vectors: a dynamic scrutinee short-circuited to "all branches
+  // live" (exploitable by writing `case "$NEVER_SET" in "foo") proof ;;
+  // esac`), and a parenthesized POSIX pattern `(foo)` fell outside the
+  // branch-head regex, leaving `curBranchLive` at its init value. The
+  // canonical shipped hook never wraps HALT/audit proof inside a case —
+  // case is used only for the `0000...) continue` deletion guard BEFORE
+  // the audit-if. So we collapse to the strictly simpler rule: reject
+  // any proof inside any open case frame via `caseDepth === 0` at every
+  // acceptance site. Nested `if`/loop frames inside case still need to
+  // be tracked for stack balance, but their proofs can never satisfy the
+  // classifier.
+  let caseDepth = 0;
 
   for (const stmt of statementsOf(content)) {
-    let head = stmt.head;
-    let full = stmt.full;
-
-    if (caseStack.length > 0) {
-      const isShellKeyword =
-        /^(if|then|elif|else|fi|for|while|until|do|done|case|esac|function|\{|\})\b/.test(
-          head,
-        );
-      if (!isShellKeyword) {
-        const bm = full.match(/^(\S[^()\n]*?)\)[ \t]*(.*)$/);
-        if (bm !== null && bm[1] !== undefined) {
-          const pattern = bm[1].trim();
-          const caseFrame = caseStack[caseStack.length - 1];
-          if (caseFrame !== undefined) {
-            caseFrame.curBranchLive =
-              caseFrame.scrutineeLit === null ||
-              caseBranchMatchesLiteral(pattern, caseFrame.scrutineeLit);
-          }
-          const body = (bm[2] ?? '').trim();
-          if (body.length === 0) continue;
-          full = body;
-          head = body.split(/\s+/, 1)[0] ?? '';
-        }
-      }
-    }
+    const head = stmt.head;
+    const full = stmt.full;
 
     if (/^case\b/.test(head)) {
-      const scrutineeLit = extractCaseScrutinee(full);
-      caseStack.push({
-        scrutineeLit,
-        curBranchLive: scrutineeLit === null,
-      });
+      caseDepth++;
       continue;
     }
     if (/^esac\b/.test(head)) {
-      caseStack.pop();
+      caseDepth = Math.max(0, caseDepth - 1);
       continue;
     }
 
@@ -485,7 +467,7 @@ function hasHaltEnforcement(content: string): boolean {
         frame.nonZeroExitInBody &&
         frames.length === 0 &&
         loopDepth === 0 &&
-        caseStack.every((c) => c.curBranchLive)
+        caseDepth === 0
       ) {
         return true;
       }
@@ -496,11 +478,13 @@ function hasHaltEnforcement(content: string): boolean {
     // shape only proves enforcement when it lives at top level. An
     // equivalent shape inside `if false; then ... fi` is never executed
     // and must not count. `frames.length === 0 && loopDepth === 0` gates
-    // both conditions. R27 F2 adds the `caseStack` liveness guard.
+    // both conditions. R28 adds `caseDepth === 0` so a short-circuit HALT
+    // inside any open case branch (dead OR live under ambiguous
+    // scrutinee) is rejected.
     if (
       frames.length === 0 &&
       loopDepth === 0 &&
-      caseStack.every((c) => c.curBranchLive) &&
+      caseDepth === 0 &&
       stmtHasShortCircuitHalt(full)
     ) {
       return true;
@@ -773,11 +757,15 @@ function hasAuditCheck(content: string): boolean {
   // Length is the usual `loopDepth`; we keep a boolean for each loop so the
   // audit-if fi-pop can require every enclosing loop to be live.
   const loopLiveStack: boolean[] = [];
-  // R27 F2 — open `case ... esac` frames with per-branch live/dead tracking.
-  // A literal scrutinee (`case "a" in`) plus a literal pattern that fails
-  // to match (`"b")`) marks the branch dead; nested audit-if/HALT proofs
-  // inside a dead branch must NOT satisfy the classifier.
-  const caseStack: CaseFrame[] = [];
+  // R28 B1/B2 — open `case ... esac` depth. See `hasHaltEnforcement` for
+  // the rationale: per-branch liveness tracking (R27) had two bypass
+  // paths (dynamic-scrutinee short-circuit and parenthesized-pattern
+  // regex miss). The strictly simpler rule: reject any proof inside any
+  // open case frame via `caseDepth === 0`. The canonical shipped hook
+  // does not wrap the audit-if in a case — the `case "$local_sha" in
+  // 0000...) continue ;; esac` deletion guard closes before the audit-if
+  // so `caseDepth === 0` when the audit proof is walked.
+  let caseDepth = 0;
   let pendingFallThroughMissBlock = false;
 
   const recordBlockingIntoFrame = (text: string): void => {
@@ -793,8 +781,8 @@ function hasAuditCheck(content: string): boolean {
   };
 
   for (const stmt of statementsOf(topLevel)) {
-    let head = stmt.head;
-    let full = stmt.full;
+    const head = stmt.head;
+    const full = stmt.full;
 
     // R20 F2: update audit-var bindings BEFORE any classifier sees this
     // statement. An assignment at the top of the hook records the binding;
@@ -806,46 +794,12 @@ function hasAuditCheck(content: string): boolean {
 
     const loopDepth = loopLiveStack.length;
 
-    // R27 F2 — case-branch head detection. When a `case` frame is open,
-    // a statement whose leading tokens form a `PATTERN)` (not a shell
-    // keyword, no nested `(...)` before the `)`) transitions to that
-    // branch. We flip `curBranchLive` based on static scrutinee/pattern
-    // match. The body after `)` (if any) is re-processed as the current
-    // statement by rewriting `head`/`full` so the walker's standard
-    // `if`/`then`/`fi` logic still runs against it.
-    if (caseStack.length > 0) {
-      const isShellKeyword =
-        /^(if|then|elif|else|fi|for|while|until|do|done|case|esac|function|\{|\})\b/.test(
-          head,
-        );
-      if (!isShellKeyword) {
-        const bm = full.match(/^(\S[^()\n]*?)\)[ \t]*(.*)$/);
-        if (bm !== null && bm[1] !== undefined) {
-          const pattern = bm[1].trim();
-          const caseFrame = caseStack[caseStack.length - 1];
-          if (caseFrame !== undefined) {
-            caseFrame.curBranchLive =
-              caseFrame.scrutineeLit === null ||
-              caseBranchMatchesLiteral(pattern, caseFrame.scrutineeLit);
-          }
-          const body = (bm[2] ?? '').trim();
-          if (body.length === 0) continue;
-          full = body;
-          head = body.split(/\s+/, 1)[0] ?? '';
-        }
-      }
-    }
-
     if (/^case\b/.test(head)) {
-      const scrutineeLit = extractCaseScrutinee(full);
-      caseStack.push({
-        scrutineeLit,
-        curBranchLive: scrutineeLit === null,
-      });
+      caseDepth++;
       continue;
     }
     if (/^esac\b/.test(head)) {
-      caseStack.pop();
+      caseDepth = Math.max(0, caseDepth - 1);
       continue;
     }
 
@@ -953,12 +907,15 @@ function hasAuditCheck(content: string): boolean {
       // and wrapping it in a loop would make the blocker execute once
       // per iteration, a pathological shape outside the canonical
       // allow-on-match template.
-      const caseAllLive = caseStack.every((c) => c.curBranchLive);
+      // R28: replace per-branch liveness with "no open case at all".
+      // The canonical hook never wraps audit in a case; `caseDepth === 0`
+      // suffices and removes the whole dynamic-scrutinee and
+      // parenthesized-pattern bypass surface.
       const enclosingAllLive =
         frame.condIsLive &&
         frames.every((f) => f.condIsLive) &&
         loopLiveStack.every((v) => v) &&
-        caseAllLive;
+        caseDepth === 0;
       if (enclosingAllLive && frame.isNegatedAuditIf && frame.hasBlockingInThen) {
         return true;
       }
@@ -969,7 +926,7 @@ function hasAuditCheck(content: string): boolean {
         enclosingAllLive &&
         frames.length === 0 &&
         loopDepth === 0 &&
-        caseStack.length === 0 &&
+        caseDepth === 0 &&
         frame.isPositiveAuditIf &&
         frame.hasAllowOnMatchInThen &&
         !frame.hasBlockingInElse
@@ -989,7 +946,7 @@ function hasAuditCheck(content: string): boolean {
       pendingFallThroughMissBlock &&
       frames.length === 0 &&
       loopDepth === 0 &&
-      caseStack.length === 0 &&
+      caseDepth === 0 &&
       isBlockingStmtLine(full, loopDepth)
     ) {
       return true;
@@ -1008,7 +965,7 @@ function hasAuditCheck(content: string): boolean {
       pendingFallThroughMissBlock &&
       frames.length === 0 &&
       loopDepth === 0 &&
-      caseStack.length === 0 &&
+      caseDepth === 0 &&
       isHeadTerminatorStmtLine(full) &&
       !isBlockingStmtLine(full, loopDepth)
     ) {
@@ -1079,6 +1036,16 @@ function isAuditGrepLine(line: string, auditVars: Set<string>): boolean {
   // must both live inside the grep segment, not in a later command
   // joined by `&&` (`findCommandEnd`-style scoping is preserved via
   // segment boundaries).
+  // R28 C1 — reject any audit-grep line that contains an unquoted `$(`
+  // or backtick. The canonical shipped hook does not compose its audit
+  // grep via command substitution, and the pipeline segmenter does not
+  // model `$(...)` or backtick subshells. Accepting such lines would let
+  // an attacker hide a pipeline boundary inside `$(...)` — or more
+  // simply, embed a swallower like `$(echo; exit 0)` into the grep's
+  // own arg scope. Any hook using those constructs is drift; `rea init`
+  // will refresh it to the canonical form.
+  if (containsUnquotedSubshell(line)) return false;
+
   const segments = pipelineSegmentsForAudit(line);
   let bound = false;
   for (const seg of segments) {
@@ -1173,6 +1140,53 @@ function pipelineSegmentsForAudit(s: string): string[] {
 }
 
 /**
+ * R28 C1 — true when `s` contains an unquoted `$(` (POSIX command
+ * substitution), `` ` `` (backtick subshell), or `$((` (arithmetic
+ * expansion) outside single quotes. Any of these let an attacker hide
+ * pipeline/statement boundaries that `pipelineSegmentsForAudit` and
+ * `splitStatements` don't see — composing an audit grep via `$(...)`,
+ * embedding a swallower like `$(exit 0)`, or splitting the pattern
+ * across a subshell boundary. The canonical shipped hook never uses
+ * these in its audit check; rejecting them early is strictly stricter
+ * than what the shipped hook shape needs, so no regression.
+ *
+ * Single-quoted contents are inert in POSIX shell (no expansion), so we
+ * allow `$(` and backticks inside `'...'`. Double-quoted contents DO
+ * expand `$(...)`, so those are flagged. Backslash-escaped `\$(` and
+ * `` \` `` outside single quotes are allowed — the backslash disables
+ * expansion. Arithmetic `$((...))` shares the `$(` prefix and is
+ * flagged by the same check.
+ */
+function containsUnquotedSubshell(s: string): boolean {
+  let inSingle = false;
+  let inDouble = false;
+  let escape = false;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i] ?? '';
+    if (escape) {
+      escape = false;
+      continue;
+    }
+    if (c === '\\' && !inSingle) {
+      escape = true;
+      continue;
+    }
+    if (c === "'" && !inDouble) {
+      inSingle = !inSingle;
+      continue;
+    }
+    if (c === '"' && !inSingle) {
+      inDouble = !inDouble;
+      continue;
+    }
+    if (inSingle) continue;
+    if (c === '$' && s[i + 1] === '(') return true;
+    if (c === '`') return true;
+  }
+  return false;
+}
+
+/**
  * True when an `if <cond>; then ... fi` condition is an obviously-dead
  * literal — one whose exit status is statically known without executing any
  * external command. The classifier uses this to refuse to accept an audit-if
@@ -1259,78 +1273,6 @@ function isDeadIfCondition(condStmt: string): boolean {
  * Everything else (variable-driven conditions, command substitutions) is
  * treated as live.
  */
-/**
- * Extract a LITERAL scrutinee from `case WORD in`. Returns the literal
- * string when WORD is a pure literal (double-quoted, single-quoted, or
- * bareword of `[A-Za-z0-9_.\-]+`). Returns null for anything dynamic —
- * variable expansions (`"$X"`, `"${X:-default}"`), command substitution
- * (`"$(cmd)"`), arithmetic `$((...))`, or complex compositions.
- *
- * Used by `caseStack` reachability tracking (R27 F2). When the scrutinee
- * is a literal, we can statically rule out branches whose patterns do
- * not match; when the scrutinee is dynamic, we must treat every branch
- * as potentially live.
- */
-function extractCaseScrutinee(caseStmt: string): string | null {
-  const m = caseStmt.match(/^case[ \t]+([^\n]+?)[ \t]+in\b/);
-  if (m === null || m[1] === undefined) return null;
-  const word = m[1].trim();
-  const dq = word.match(/^"([^"$`\\]*)"$/);
-  if (dq !== null && dq[1] !== undefined) return dq[1];
-  const sq = word.match(/^'([^']*)'$/);
-  if (sq !== null && sq[1] !== undefined) return sq[1];
-  if (/^[A-Za-z0-9_.\-]+$/.test(word)) return word;
-  return null;
-}
-
-/**
- * True when a POSIX `case` pattern COULD match the literal scrutinee.
- *
- * Handles `|`-separated alternatives (`"a"|"b")`) and conservatively
- * treats the presence of any glob metacharacter (`*`, `?`, `[`) as
- * matching (live branch) — we only prove deadness for purely-literal
- * patterns that fail a bytewise equality against the literal scrutinee.
- *
- * Quote handling: strips outer `"..."` or `'...'` around each alternative
- * before comparing. Mixed quoting or escape sequences inside the pattern
- * are treated as literal by the underlying `===`, which means we may
- * accept a legitimate match that an operational shell would also accept.
- * The failure mode is "accept live when we could have proven dead" — we
- * do NOT reject a live branch as dead.
- */
-function caseBranchMatchesLiteral(pattern: string, scrutinee: string): boolean {
-  const alts = pattern.split('|').map((s) => s.trim());
-  for (const alt of alts) {
-    let unquoted = alt;
-    const dq = alt.match(/^"([^"]*)"$/);
-    const sq = alt.match(/^'([^']*)'$/);
-    if (dq !== null && dq[1] !== undefined) unquoted = dq[1];
-    else if (sq !== null && sq[1] !== undefined) unquoted = sq[1];
-    if (/[*?[]/.test(unquoted)) return true;
-    if (unquoted === scrutinee) return true;
-  }
-  return false;
-}
-
-/**
- * State of one open `case ... esac` frame.
- *
- * `scrutineeLit` is the literal scrutinee if `case WORD in` where WORD is
- * a pure literal, or null when WORD is dynamic (variable expansion,
- * command substitution, etc.).
- *
- * `curBranchLive` toggles as the walker crosses `PATTERN)` branch heads:
- * true when the pattern could match the scrutinee (or scrutinee is
- * dynamic), false when the pattern is statically-known not to match.
- * Between `case WORD in` and the first `PATTERN)` no statements execute;
- * we initialize to `scrutineeLit === null` so dynamic scrutinees default
- * to live (conservative).
- */
-type CaseFrame = {
-  scrutineeLit: string | null;
-  curBranchLive: boolean;
-};
-
 function isDeadLoopHead(loopHead: string): boolean {
   const s = loopHead.trim();
   const whileM = s.match(/^while[ \t]+(.+?)(?:[;\s]+do\b|;?\s*$)/);
@@ -1640,24 +1582,33 @@ function isSwallowingAuditCheck(line: string): boolean {
   // do not look like backgrounding.
   const stripped = line.replace(/\d*[<>]&\d*-?/g, ' ').replace(/&>>?/g, ' ');
   if (/(?<!&)&(?!&)/.test(stripped)) return true;
-  // `;` followed by a non-control command word. Control keywords close an
-  // `if`/`while`/`until`/`case`/`for` construct and are safe. A trailing
-  // comment (`;` followed by `#`) is also safe — nothing more runs.
-  const postSemi = line.match(/;\s*(\S+)/);
-  if (postSemi && postSemi[1] !== undefined) {
-    const first = postSemi[1];
-    if (!first.startsWith('#')) {
-      const controlKeywords = new Set([
-        'then',
-        'do',
-        'fi',
-        'done',
-        'else',
-        'elif',
-        'esac',
-      ]);
-      if (!controlKeywords.has(first)) return true;
-    }
+  // R28 C2 — check EVERY `;` position in the line, not just the first.
+  // The pre-R28 `line.match(/;\s*(\S+)/)` (non-global) only returned the
+  // first `;` match. A line like
+  //   `if ! grep -qE codex.review "$AUDIT_LOG"; then exit 1; fi; exit 0`
+  // matched the first `;` (followed by `then`, a control keyword, safe),
+  // declared the line non-swallowing, and missed the trailing `; exit 0`
+  // that actually neutralizes the blocker. Splitting on all `;`s and
+  // checking each tail's head token closes the gap. Each logical
+  // statement the splitter emits is still passed through this check
+  // separately, but defense-in-depth: any joined-statement input is
+  // checked comprehensively.
+  const controlKeywords = new Set([
+    'then',
+    'do',
+    'fi',
+    'done',
+    'else',
+    'elif',
+    'esac',
+  ]);
+  const semiMatches = Array.from(line.matchAll(/;\s*(\S+)/g));
+  for (const m of semiMatches) {
+    const first = m[1];
+    if (first === undefined) continue;
+    if (first.startsWith('#')) continue;
+    if (controlKeywords.has(first)) continue;
+    return true;
   }
   return false;
 }

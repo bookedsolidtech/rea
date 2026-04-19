@@ -2462,14 +2462,18 @@ describe('isReaManagedHuskyGate — R27 F1 echo-spoof grep head', () => {
   });
 });
 
-describe('isReaManagedHuskyGate — R27 F2 case-branch reachability', () => {
-  // Codex R27 F2: audit-if and HALT proofs buried inside a statically-dead
-  // `case` branch previously satisfied the classifier because `case` was
-  // not tracked as an enclosing construct. The fix: push a `CaseFrame` on
-  // `case WORD in`, flip `curBranchLive` on every `PATTERN)` based on
-  // static scrutinee/pattern match, and require every open case frame to
-  // have a live current branch before returning true from audit-if fi-pop
-  // or HALT fi-pop.
+describe('isReaManagedHuskyGate — R27/R28 case-frame rejection', () => {
+  // R27 tracked per-branch liveness (static scrutinee + pattern match);
+  // R28 adversarial review found two bypass paths (B1: dynamic-scrutinee
+  // short-circuit, B2: parenthesized POSIX pattern regex miss) and
+  // recommended collapsing to the strictly simpler rule: reject any
+  // proof inside any open `case` frame. The canonical shipped hook
+  // never wraps audit/HALT in a case — the `case "$local_sha" in
+  // 0000...) continue ;; esac` deletion guard is closed BEFORE the
+  // audit-if. So `caseDepth === 0` at every acceptance site is both
+  // sound (rejects the whole attack class, including B1/B2/nested/
+  // parenthesized/multi-alt) and complete for the canonical shape
+  // (post-esac top-level proofs still accept).
 
   const MARKER = '# rea:husky-pre-push-gate v1';
   const BODY_MARKER = '# rea:gate-body-v1';
@@ -2513,7 +2517,11 @@ describe('isReaManagedHuskyGate — R27 F2 case-branch reachability', () => {
     expect(isReaManagedHuskyGate(content)).toBe(false);
   });
 
-  it('audit-if inside live `case "a" in "a") ... ;; esac` branch IS rea-managed', () => {
+  it('audit-if inside live `case "a" in "a") ... ;; esac` branch is NOT rea-managed (R28: case wraps proof)', () => {
+    // Under R27 this was accepted (branch statically live). R28: the
+    // canonical hook never wraps audit in a case, so we reject
+    // regardless of liveness. `caseDepth === 0` is simpler and removes
+    // the dynamic-scrutinee / parenthesized-pattern bypass surface.
     const content = withMarkers(
       [
         'case "a" in',
@@ -2523,10 +2531,10 @@ describe('isReaManagedHuskyGate — R27 F2 case-branch reachability', () => {
         'esac',
       ].join('\n'),
     );
-    expect(isReaManagedHuskyGate(content)).toBe(true);
+    expect(isReaManagedHuskyGate(content)).toBe(false);
   });
 
-  it('audit-if inside `case "a" in *) ... ;; esac` (glob default) IS rea-managed', () => {
+  it('audit-if inside `case "a" in *) ... ;; esac` (glob default) is NOT rea-managed (R28: case wraps proof)', () => {
     const content = withMarkers(
       [
         'case "a" in',
@@ -2536,12 +2544,15 @@ describe('isReaManagedHuskyGate — R27 F2 case-branch reachability', () => {
         'esac',
       ].join('\n'),
     );
-    expect(isReaManagedHuskyGate(content)).toBe(true);
+    expect(isReaManagedHuskyGate(content)).toBe(false);
   });
 
-  it('audit-if inside dynamic-scrutinee `case "$X" in "b") ... ;; esac` IS rea-managed', () => {
-    // Dynamic scrutinee cannot be statically ruled out — every branch is
-    // potentially live. Must accept.
+  it('R28 B1: audit-if inside dynamic-scrutinee `case "$X" in "b") ... ;; esac` is NOT rea-managed', () => {
+    // Under R27 this was accepted (scrutineeLit === null → all branches
+    // live). R28 B1: attacker can deliberately write a never-set
+    // variable (`case "$NEVER_SET" in "foo") proof ;; esac`) and still
+    // pass the classifier — the proof never runs at hook exec. Collapse
+    // the entire class with `caseDepth === 0`.
     const content = withMarkers(
       [
         'case "$REA_ROOT" in',
@@ -2551,10 +2562,74 @@ describe('isReaManagedHuskyGate — R27 F2 case-branch reachability', () => {
         'esac',
       ].join('\n'),
     );
-    expect(isReaManagedHuskyGate(content)).toBe(true);
+    expect(isReaManagedHuskyGate(content)).toBe(false);
   });
 
-  it('audit-if inside `case "a" in "x"|"a") ... ;; esac` (one-alt matches) IS rea-managed', () => {
+  it('R28 B1: audit-if inside `case "$NEVER_SET" in "foo") ... ;; esac` (unbound variable scrutinee) is NOT rea-managed', () => {
+    // Explicit regression for the specific R28 B1 attack shape.
+    const content = withMarkers(
+      [
+        'case "$NEVER_SET" in',
+        '  "foo")',
+        auditIf,
+        '    ;;',
+        'esac',
+      ].join('\n'),
+    );
+    expect(isReaManagedHuskyGate(content)).toBe(false);
+  });
+
+  it('R28 B1: dead branch with `$`-containing literal scrutinee (extractor returns null) is NOT rea-managed', () => {
+    // The pre-R28 dq extractor rejected any literal containing `$`,
+    // backtick, or `\`, returning null → all branches "live" by
+    // default. Even though the scrutinee is statically a literal,
+    // R27's extractor gave up and treated it as dynamic. R28 closes
+    // the class by removing liveness tracking entirely.
+    const content = withMarkers(
+      [
+        'case "a\\$" in',
+        '  "b")',
+        auditIf,
+        '    ;;',
+        'esac',
+      ].join('\n'),
+    );
+    expect(isReaManagedHuskyGate(content)).toBe(false);
+  });
+
+  it('R28 B2: audit-if inside POSIX-parenthesized pattern `case W in (pattern) ...` is NOT rea-managed', () => {
+    // POSIX allows optional leading `(` on patterns. The pre-R28
+    // branch-head regex `[^()]*?` excluded `(`, so these patterns were
+    // not detected as branch heads, `curBranchLive` stayed at its init
+    // value, and with a dynamic scrutinee the walker accepted the
+    // body. R28 sidesteps by rejecting any open case frame, regardless
+    // of how branches are written.
+    const content = withMarkers(
+      [
+        'case "$REA_ROOT" in',
+        '  (/does/not/match)',
+        auditIf,
+        '    ;;',
+        'esac',
+      ].join('\n'),
+    );
+    expect(isReaManagedHuskyGate(content)).toBe(false);
+  });
+
+  it('R28 B2: parenthesized `(a)` pattern with literal matching scrutinee is still NOT rea-managed', () => {
+    const content = withMarkers(
+      [
+        'case "a" in',
+        '  (a)',
+        auditIf,
+        '    ;;',
+        'esac',
+      ].join('\n'),
+    );
+    expect(isReaManagedHuskyGate(content)).toBe(false);
+  });
+
+  it('R28: multi-alt `"x"|"a")` is NOT rea-managed under stricter rule', () => {
     const content = withMarkers(
       [
         'case "a" in',
@@ -2564,13 +2639,10 @@ describe('isReaManagedHuskyGate — R27 F2 case-branch reachability', () => {
         'esac',
       ].join('\n'),
     );
-    expect(isReaManagedHuskyGate(content)).toBe(true);
+    expect(isReaManagedHuskyGate(content)).toBe(false);
   });
 
-  it('HALT enforcement inside dead `case "a" in "b") [ -f HALT ] && exit 1 ;; esac` is NOT rea-managed', () => {
-    // HALT enforcement path through hasHaltEnforcement — same attack vector.
-    // We drop the outer haltBlock from withMarkers helpers and inline a
-    // case-wrapped HALT so the only HALT proof is the dead one.
+  it('HALT enforcement inside `case "a" in "b") [ -f HALT ] && exit 1 ;; esac` is NOT rea-managed', () => {
     const content = [
       '#!/bin/sh',
       MARKER,
@@ -2591,10 +2663,26 @@ describe('isReaManagedHuskyGate — R27 F2 case-branch reachability', () => {
     expect(isReaManagedHuskyGate(content)).toBe(false);
   });
 
+  it('R28: nested `case` inside an outer case (both with live branches) is NOT rea-managed', () => {
+    // Even if the outer case pattern matches and the inner case pattern
+    // matches, we reject — `caseDepth > 0` at the audit-if fi-pop.
+    const content = withMarkers(
+      [
+        'case "a" in',
+        '  "a")',
+        '    case "x" in',
+        '      "x")',
+        auditIf,
+        '        ;;',
+        '    esac',
+        '    ;;',
+        'esac',
+      ].join('\n'),
+    );
+    expect(isReaManagedHuskyGate(content)).toBe(false);
+  });
+
   it('post-esac top-level HALT enforcement IS rea-managed (case does not swallow live top-level proof)', () => {
-    // Sanity check: a benign case ABOVE the HALT/audit proofs must not
-    // break the classifier. The case itself proves nothing, but once
-    // closed with esac the HALT/audit proofs at top level should stand.
     const content = [
       '#!/bin/sh',
       MARKER,
@@ -2614,7 +2702,118 @@ describe('isReaManagedHuskyGate — R27 F2 case-branch reachability', () => {
     ].join('\n');
     expect(isReaManagedHuskyGate(content)).toBe(true);
   });
+
+  it('shipped-hook shape: `case "$local_sha" in 0000...) continue ;; esac` INSIDE while loop, audit-if AFTER esac IS rea-managed', () => {
+    // Regression: the canonical shipped .husky/pre-push uses a case for
+    // the branch-deletion guard inside the `while read refspec` loop.
+    // The audit-if lives after the esac at top level of the loop body.
+    // caseDepth=0 at the audit-if fi-pop — must accept.
+    const content = [
+      '#!/bin/sh',
+      MARKER,
+      BODY_MARKER,
+      'set -eu',
+      'REA_ROOT=$(pwd)',
+      haltBlock,
+      'INPUT=$(cat)',
+      '[ -z "$INPUT" ] && exit 0',
+      'AUDIT_LOG="${REA_ROOT}/.rea/audit.jsonl"',
+      'while IFS=\' \' read -r local_ref local_sha remote_ref remote_sha; do',
+      '  [ -z "${local_sha:-}" ] && continue',
+      '  case "$local_sha" in',
+      '    0000000000000000000000000000000000000000) continue ;;',
+      '  esac',
+      '  if ! grep -E \'"tool_name":"codex\\.review"\' "$AUDIT_LOG" 2>/dev/null | \\',
+      '       grep -qF "\\"head_sha\\":\\"$local_sha\\""; then',
+      '    exit 1',
+      '  fi',
+      'done <<HOOK_INPUT_EOF',
+      '$INPUT',
+      'HOOK_INPUT_EOF',
+      'exit 0',
+    ].join('\n');
+    expect(isReaManagedHuskyGate(content)).toBe(true);
+  });
 });
+
+describe('isReaManagedHuskyGate — R28 C1 subshell rejection in audit-grep', () => {
+  // R28 C1: the pipeline segmenter does not model `$(...)` or
+  // backticks. A hook that composes its audit grep through those
+  // constructs (or embeds a swallower like `$(exit 0)`) is not drift in
+  // the benign sense — it is an attacker-planted shape. Reject the
+  // class entirely at the isAuditGrepLine layer.
+
+  const MARKER = '# rea:husky-pre-push-gate v1';
+  const BODY_MARKER = '# rea:gate-body-v1';
+  const haltBlock = [
+    'if [ -f "${REA_ROOT}/.rea/HALT" ]; then',
+    '  exit 1',
+    'fi',
+  ].join('\n');
+
+  it('audit-grep using `$(cmd)` command substitution is NOT rea-managed', () => {
+    const content = [
+      '#!/bin/sh',
+      MARKER,
+      BODY_MARKER,
+      'set -eu',
+      'REA_ROOT=$(pwd)',
+      haltBlock,
+      'AUDIT_LOG="${REA_ROOT}/.rea/audit.jsonl"',
+      'if ! grep -qE "$(printf \'%s\' \'codex\\.review\')" "$AUDIT_LOG"; then',
+      '  exit 1',
+      'fi',
+      'exit 0',
+    ].join('\n');
+    expect(isReaManagedHuskyGate(content)).toBe(false);
+  });
+
+  it('audit-grep using backtick subshell is NOT rea-managed', () => {
+    const content = [
+      '#!/bin/sh',
+      MARKER,
+      BODY_MARKER,
+      'set -eu',
+      'REA_ROOT=$(pwd)',
+      haltBlock,
+      'AUDIT_LOG="${REA_ROOT}/.rea/audit.jsonl"',
+      'if ! grep -qE `echo codex.review` "$AUDIT_LOG"; then',
+      '  exit 1',
+      'fi',
+      'exit 0',
+    ].join('\n');
+    expect(isReaManagedHuskyGate(content)).toBe(false);
+  });
+
+  it('audit-grep with `$(` inside single quotes is still OK (no expansion)', () => {
+    // POSIX single quotes suppress `$(...)` expansion, so a literal
+    // `$(` inside `'...'` is inert. Confirm our detector allows it.
+    const content = [
+      '#!/bin/sh',
+      MARKER,
+      BODY_MARKER,
+      'set -eu',
+      'REA_ROOT=$(pwd)',
+      haltBlock,
+      'AUDIT_LOG="${REA_ROOT}/.rea/audit.jsonl"',
+      "if ! grep -qE '\"tool_name\":\"codex\\.review\".*\\$(anything)' \"$AUDIT_LOG\"; then",
+      '  exit 1',
+      'fi',
+      'exit 0',
+    ].join('\n');
+    expect(isReaManagedHuskyGate(content)).toBe(true);
+  });
+});
+
+// R28 C2: isSwallowingAuditCheck now iterates every `;` position in
+// the line, not just the first. This is defense-in-depth — in practice
+// `splitStatements` breaks `fi; exit 0` into two statements before
+// isSwallowingAuditCheck sees it, so the fix has no observable effect
+// through the public `isReaManagedHuskyGate`. We keep the fix (a
+// joined-line input bypassing the splitter would otherwise be able to
+// hide a swallower after the first control-keyword `;`) and document
+// the defense-in-depth posture here rather than asserting it in a
+// test that the splitter would always satisfy.
 
 // Codex R21 F1: upgrade migration path. Pre-0.4 rea releases shipped a
 // `.husky/pre-push` without the line-2/3 versioned markers. A consumer
