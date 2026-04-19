@@ -35,7 +35,7 @@ describe('buildChildEnv', () => {
       ANTHROPIC_API_KEY: 'sk-ant-leak-me',
     };
 
-    const out = buildChildEnv(baseServer(), hostEnv);
+    const { env: out, missing } = buildChildEnv(baseServer(), hostEnv);
 
     expect(out.PATH).toBe('/usr/bin');
     expect(out.HOME).toBe('/home/tester');
@@ -44,12 +44,13 @@ describe('buildChildEnv', () => {
     expect(out.OPENAI_API_KEY).toBeUndefined();
     expect(out.GITHUB_TOKEN).toBeUndefined();
     expect(out.ANTHROPIC_API_KEY).toBeUndefined();
+    expect(missing).toEqual([]);
   });
 
   it('skips allowlisted vars that are absent on the host (no "undefined" strings)', () => {
     const hostEnv = { PATH: '/usr/bin' };
 
-    const out = buildChildEnv(baseServer(), hostEnv);
+    const { env: out } = buildChildEnv(baseServer(), hostEnv);
 
     // Absent values must be skipped, not serialized as the string "undefined".
     expect(out.HOME).toBeUndefined();
@@ -65,7 +66,7 @@ describe('buildChildEnv', () => {
   it('env_passthrough forwards opt-in names from the host environment', () => {
     const hostEnv = { PATH: '/usr/bin', MY_DEBUG: '1', UNRELATED: 'nope' };
 
-    const out = buildChildEnv(
+    const { env: out } = buildChildEnv(
       baseServer({ env_passthrough: ['MY_DEBUG'] }),
       hostEnv,
     );
@@ -77,7 +78,7 @@ describe('buildChildEnv', () => {
   it('explicit env: wins over both allowlist and passthrough', () => {
     const hostEnv = { PATH: '/host/bin', MY_DEBUG: 'host-value' };
 
-    const out = buildChildEnv(
+    const { env: out } = buildChildEnv(
       baseServer({
         env_passthrough: ['MY_DEBUG'],
         env: { PATH: '/override/bin', MY_DEBUG: 'explicit-value' },
@@ -92,11 +93,91 @@ describe('buildChildEnv', () => {
   it('explicit env: can set a secret-looking name (operator made the decision)', () => {
     // The schema refuses secret-name heuristic in env_passthrough, but explicit
     // env: is the escape hatch — test here that buildChildEnv doesn't re-refuse.
-    const out = buildChildEnv(
+    const { env: out, secretKeys } = buildChildEnv(
       baseServer({ env: { GITHUB_TOKEN: 'operator-typed-this' } }),
       {},
     );
     expect(out.GITHUB_TOKEN).toBe('operator-typed-this');
+    // Literal values still get flagged on the secretKeys axis because the KEY
+    // name matches the secret-name heuristic — downstream logging gates on it.
+    expect(secretKeys).toEqual(['GITHUB_TOKEN']);
+  });
+
+  it('interpolates ${VAR} placeholders from the host environment', () => {
+    const hostEnv = { PATH: '/usr/bin', DISCORD_BOT_TOKEN: 'abc123' };
+
+    const { env: out, missing, secretKeys } = buildChildEnv(
+      baseServer({ env: { BOT_TOKEN: '${DISCORD_BOT_TOKEN}' } }),
+      hostEnv,
+    );
+
+    expect(out.BOT_TOKEN).toBe('abc123');
+    expect(missing).toEqual([]);
+    expect(secretKeys).toEqual(['BOT_TOKEN']);
+  });
+
+  it('reports missing vars via `missing`; resolved value keeps placeholder as canary', () => {
+    const { env: out, missing } = buildChildEnv(
+      baseServer({ env: { BOT_TOKEN: '${DISCORD_BOT_TOKEN}' } }),
+      { PATH: '/usr/bin' },
+    );
+
+    expect(missing).toEqual(['DISCORD_BOT_TOKEN']);
+    // Unresolved placeholder is preserved so an operator who inspects the
+    // object sees the raw template. The DownstreamConnection refuses to
+    // spawn when missing.length > 0, so this string never reaches the child.
+    expect(out.BOT_TOKEN).toBe('${DISCORD_BOT_TOKEN}');
+  });
+
+  it('mixes literal + interpolated env entries', () => {
+    const hostEnv = { PATH: '/usr/bin', X: 'resolved' };
+
+    const { env: out, missing } = buildChildEnv(
+      baseServer({ env: { LOG_LEVEL: 'info', TOKEN: '${X}' } }),
+      hostEnv,
+    );
+
+    expect(out.LOG_LEVEL).toBe('info');
+    expect(out.TOKEN).toBe('resolved');
+    expect(missing).toEqual([]);
+  });
+});
+
+describe('DownstreamConnection startup env refusal', () => {
+  const originalEnv = process.env;
+
+  afterEach(() => {
+    process.env = originalEnv;
+  });
+
+  it('refuses to start when a ${VAR} reference is unset', async () => {
+    // Isolate process.env so the test is deterministic.
+    process.env = { PATH: '/usr/bin' };
+    const conn = new DownstreamConnection({
+      name: 'needs-token',
+      command: 'node',
+      args: [],
+      env: { BOT_TOKEN: '${MISSING_TOKEN_FOR_TEST}' },
+      enabled: true,
+    });
+    await expect(conn.connect()).rejects.toThrow(
+      /refused to start — missing env: MISSING_TOKEN_FOR_TEST/,
+    );
+    expect(conn.isHealthy).toBe(false);
+  });
+
+  it('throws with server context on malformed ${ syntax', async () => {
+    const conn = new DownstreamConnection({
+      name: 'bad-template',
+      command: 'node',
+      args: [],
+      env: { X: '${unterminated' },
+      enabled: true,
+    });
+    await expect(conn.connect()).rejects.toThrow(
+      /failed to resolve env for downstream "bad-template"/,
+    );
+    expect(conn.isHealthy).toBe(false);
   });
 });
 

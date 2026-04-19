@@ -38,6 +38,7 @@
 
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+import { interpolateEnv } from '../registry/interpolate.js';
 import type { RegistryServer } from '../registry/types.js';
 import type { Logger } from './log.js';
 
@@ -82,16 +83,40 @@ const RECONNECT_FLAP_WINDOW_MS = 30_000;
 
 /**
  * Build the child env by layering:
- *   allowlist → registry env_passthrough → registry env.
+ *   allowlist → registry env_passthrough → interpolated registry env.
  * Later entries win. Missing host values are skipped so `process.env[name]`
  * being undefined does not serialize as the literal string "undefined".
  *
+ * The explicit `env:` map may contain `${VAR}` placeholders (see
+ * `registry/interpolate.ts` for the exact grammar). Placeholders referencing
+ * unset host vars are returned via the `missing` array — the caller MUST
+ * refuse to spawn the server if `missing.length > 0`, otherwise the child
+ * receives unresolved `${...}` strings which are nearly always wrong.
+ *
  * Exported for testing.
  */
+export interface BuiltChildEnv {
+  /** Fully resolved env to pass to the child transport. */
+  env: Record<string, string>;
+  /**
+   * Names of `${VAR}` references that were not set in `hostEnv`. When
+   * non-empty, the caller MUST NOT spawn the child — mark the connection
+   * unhealthy and log each entry.
+   */
+  missing: string[];
+  /**
+   * Keys in `env` whose value is secret-bearing (either because the key
+   * name matches the secret-name heuristic, or because one of its
+   * interpolated `${VAR}` references did). Callers MUST NOT log the
+   * corresponding values.
+   */
+  secretKeys: string[];
+}
+
 export function buildChildEnv(
   config: RegistryServer,
   hostEnv: NodeJS.ProcessEnv = process.env,
-): Record<string, string> {
+): BuiltChildEnv {
   const out: Record<string, string> = {};
 
   for (const name of DEFAULT_ENV_ALLOWLIST) {
@@ -106,12 +131,19 @@ export function buildChildEnv(
     }
   }
 
+  // Interpolate placeholders in config.env BEFORE layering it on top.
+  // `interpolateEnv` is pure — no I/O, throws only on malformed syntax
+  // (unterminated brace, empty `${}`, illegal var name). Missing host
+  // vars are reported via `result.missing`; the caller decides whether
+  // to refuse the spawn.
+  const interp = interpolateEnv(config.env, hostEnv);
+
   // Explicit config.env wins — operator typed these values deliberately.
-  for (const [k, v] of Object.entries(config.env)) {
+  for (const [k, v] of Object.entries(interp.resolved)) {
     out[k] = v;
   }
 
-  return out;
+  return { env: out, missing: interp.missing, secretKeys: interp.secretKeys };
 }
 
 export class DownstreamConnection {
@@ -147,10 +179,48 @@ export class DownstreamConnection {
 
   async connect(): Promise<void> {
     if (this.client !== null) return;
+
+    // Resolve env BEFORE spawning. If any `${VAR}` reference in the registry's
+    // explicit env: map is unset at startup, refuse to spawn this server:
+    //   - log a clear, secret-safe error (only the var name appears; the
+    //     resolved value would not exist anyway since it's missing)
+    //   - mark this connection unhealthy so the pool skips it
+    //   - leave every other server's spawn path untouched (the gateway as a
+    //     whole keeps coming up)
+    //
+    // Malformed syntax (unterminated brace, `${}`, illegal identifier) throws
+    // from interpolateEnv — that's a load-time error and we propagate it so
+    // the operator sees it at startup with server context attached.
+    let built: BuiltChildEnv;
+    try {
+      built = buildChildEnv(this.config);
+    } catch (err) {
+      this.health = 'unhealthy';
+      throw new Error(
+        `failed to resolve env for downstream "${this.config.name}": ${err instanceof Error ? err.message : err}`,
+      );
+    }
+
+    if (built.missing.length > 0) {
+      this.health = 'unhealthy';
+      // One line per missing var so grep/jq users can find the exact gap.
+      // We intentionally do NOT log the env key name's VALUE (there is none —
+      // it's unresolved) nor any other env values.
+      for (const missingVar of built.missing) {
+        console.error(
+          `[rea-gateway] refusing to start downstream "${this.config.name}": ` +
+            `env references ${'${'}${missingVar}${'}'} but process.env.${missingVar} is not set`,
+        );
+      }
+      throw new Error(
+        `downstream "${this.config.name}" refused to start — missing env: ${built.missing.join(', ')}`,
+      );
+    }
+
     const transport = new StdioClientTransport({
       command: this.config.command,
       args: this.config.args,
-      env: buildChildEnv(this.config),
+      env: built.env,
     });
     const client = new Client(
       { name: `rea-gateway-client:${this.config.name}`, version: '0.2.0' },

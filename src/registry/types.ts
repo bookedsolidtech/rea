@@ -13,7 +13,15 @@ export interface RegistryServer {
   command: string;
   /** Arguments passed to the spawned child process. */
   args: string[];
-  /** Environment variables merged onto the child process env. */
+  /**
+   * Environment variables merged onto the child process env. Values may
+   * reference rea-serve's own `process.env` via `${VAR}` syntax — e.g.
+   * `{ BOT_TOKEN: '${DISCORD_BOT_TOKEN}' }`. Only the curly-brace form is
+   * supported; no `$VAR`, no defaults, no command substitution. If a
+   * referenced var is unset at spawn time the affected server fails to
+   * start (the rest of the gateway still comes up). See
+   * `registry/interpolate.ts` for the full grammar and contract.
+   */
   env: Record<string, string>;
   /**
    * Optional opt-in list of operator-env var names to forward into the child.
