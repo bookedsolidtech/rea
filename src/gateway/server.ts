@@ -147,6 +147,10 @@ function buildMiddlewareChain(opts: GatewayOptions, deps: ChainDeps): Middleware
     createCircuitBreakerMiddleware(deps.breaker),
     createInjectionMiddleware(policy.injection_detection === 'warn' ? 'warn' : 'block', {
       matchTimeoutMs,
+      // G9: default false at the schema layer. `bst-internal` profile pins
+      // this to true to preserve 0.2.x strict posture for Booked-internal
+      // consumers. `likely_injection` denies regardless of this flag.
+      suspiciousBlocksWrites: policy.injection?.suspicious_blocks_writes ?? false,
     }),
     createRedactMiddleware({ matchTimeoutMs, userPatterns }),
     createResultSizeCapMiddleware(),

@@ -32,6 +32,11 @@ blocked_paths:
   - SECURITY.md
   - THREAT_MODEL.md
 notification_channel: ""
+# G9: Booked-internal consumers retain the stricter 0.2.x posture — a single
+# literal injection match at write/destructive tier denies (does not merely
+# warn). External profiles inherit the schema default `false`.
+injection:
+  suspicious_blocks_writes: true
 context_protection:
   delegate_to_subagent:
     - pnpm run build

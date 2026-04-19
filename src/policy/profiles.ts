@@ -29,6 +29,18 @@ const ContextProtectionProfileSchema = z
   .strict();
 
 /**
+ * G9: injection tier-escalation knobs. Profile-layer schema mirrors the policy
+ * loader's `InjectionPolicySchema` but leaves the flag fully optional so the
+ * profile-default lives at the policy-loader layer (ships `false` by default).
+ * Strict mode still rejects typos so a misspelled key fails loudly at init.
+ */
+const InjectionProfileSchema = z
+  .object({
+    suspicious_blocks_writes: z.boolean().optional(),
+  })
+  .strict();
+
+/**
  * Profile is PolicySchema with every field optional. Strict mode still rejects
  * unknown keys so a typo in a profile YAML fails loudly at init time rather
  * than silently getting dropped on the floor.
@@ -42,6 +54,7 @@ export const ProfileSchema = z
     blocked_paths: z.array(z.string()).optional(),
     notification_channel: z.string().optional(),
     injection_detection: z.enum(['block', 'warn']).optional(),
+    injection: InjectionProfileSchema.optional(),
     context_protection: ContextProtectionProfileSchema.optional(),
   })
   .strict();

@@ -73,6 +73,24 @@ const AuditPolicySchema = z
   })
   .strict();
 
+/**
+ * G9: injection tier escalation. `suspicious_blocks_writes` defaults to
+ * `false` at the schema layer — this intentionally ships a NARROWER default
+ * so 0.2.x users upgrading to 0.3.0 do not silently tighten (single-literal
+ * matches at write/destructive tier become warn-only, no longer deny).
+ *
+ * The `bst-internal` profile (and this repo's own policy) pins the flag to
+ * `true` to preserve the stricter posture for Booked-internal consumers.
+ *
+ * `likely_injection` verdicts (multi-literal matches, base64-decoded matches,
+ * or any read-tier match) are ALWAYS deny regardless of this flag.
+ */
+const InjectionPolicySchema = z
+  .object({
+    suspicious_blocks_writes: z.boolean().default(false),
+  })
+  .strict();
+
 const PolicySchema = z
   .object({
     version: z.string(),
@@ -86,6 +104,7 @@ const PolicySchema = z
     blocked_paths: z.array(z.string()),
     notification_channel: z.string().default(''),
     injection_detection: z.enum(['block', 'warn']).optional(),
+    injection: InjectionPolicySchema.optional(),
     context_protection: ContextProtectionSchema.optional(),
     review: ReviewPolicySchema.optional(),
     redact: RedactPolicySchema.optional(),
