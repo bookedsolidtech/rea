@@ -2,6 +2,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { loadPolicy } from '../policy/loader.js';
 import { loadRegistry } from '../registry/loader.js';
+import { loadFingerprintStore } from '../registry/fingerprints-store.js';
+import { fingerprintServer } from '../registry/fingerprint.js';
 import {
   CodexProbe,
   type CodexProbeState,
@@ -64,6 +66,64 @@ function checkPolicyParses(baseDir: string, policyPath: string): CheckResult {
       detail: e instanceof Error ? e.message : String(e),
     };
   }
+}
+
+/**
+ * G7: report the TOFU fingerprint-store state. Pass = every enabled server
+ * in the registry has a matching stored fingerprint. Warn = at least one
+ * server would be first-seen or drifted at next `rea serve`. Info = no
+ * enabled servers (nothing to fingerprint). Fail only for unreadable store.
+ *
+ * Exported so tests can drive this without spinning up the full `runDoctor`.
+ */
+export async function checkFingerprintStore(baseDir: string): Promise<CheckResult> {
+  const label = 'fingerprint store';
+  let registry;
+  try {
+    registry = loadRegistry(baseDir);
+  } catch {
+    return {
+      label,
+      status: 'info',
+      detail: 'registry missing — no fingerprints to compare',
+    };
+  }
+  const enabled = registry.servers.filter((s) => s.enabled);
+  if (enabled.length === 0) {
+    return { label, status: 'info', detail: 'no enabled servers to fingerprint' };
+  }
+  let store;
+  try {
+    store = await loadFingerprintStore(baseDir);
+  } catch (e) {
+    return {
+      label,
+      status: 'fail',
+      detail: e instanceof Error ? e.message : String(e),
+    };
+  }
+  let firstSeen = 0;
+  let drifted = 0;
+  for (const s of enabled) {
+    const stored = store.servers[s.name];
+    if (stored === undefined) firstSeen += 1;
+    else if (stored !== fingerprintServer(s)) drifted += 1;
+  }
+  if (firstSeen === 0 && drifted === 0) {
+    return {
+      label,
+      status: 'pass',
+      detail: `${enabled.length} server(s) trusted`,
+    };
+  }
+  const parts: string[] = [];
+  if (firstSeen > 0) parts.push(`${firstSeen} first-seen`);
+  if (drifted > 0) parts.push(`${drifted} drifted`);
+  return {
+    label,
+    status: 'warn',
+    detail: `${parts.join(', ')} — next \`rea serve\` will block drift (set REA_ACCEPT_DRIFT=<name> to accept)`,
+  };
 }
 
 function checkRegistryParses(baseDir: string, registryPath: string): CheckResult {
@@ -633,6 +693,10 @@ export async function runDoctor(opts: RunDoctorOptions = {}): Promise<void> {
   }
 
   const checks = collectChecks(baseDir, probeState, prePushState);
+  // G7: async fingerprint-store check. Kept out of `collectChecks` so the
+  // existing sync contract stays intact for downstream consumers; appended
+  // here so runDoctor surfaces it inline.
+  checks.push(await checkFingerprintStore(baseDir));
 
   console.log('');
   log(`Doctor — ${baseDir}`);

@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { loadPolicy } from '../policy/loader.js';
 import { loadRegistry } from '../registry/loader.js';
+import { applyTofuGate } from '../registry/tofu-gate.js';
 import { createGateway } from '../gateway/server.js';
 import { CodexProbe } from '../gateway/observability/codex-probe.js';
 import {
@@ -136,7 +137,44 @@ export async function runServe(): Promise<void> {
     }
   }
 
-  const handle = createGateway({ baseDir, policy, registry, logger, metrics: metricsRegistry });
+  // G7: TOFU fingerprint gate. Runs BEFORE we build the downstream pool so
+  // drifted servers are filtered out at the edge. First-seen and accepted
+  // drift fire LOUD stderr + audit + log; the gateway stays up either way.
+  // When the registry has zero enabled servers there is nothing to
+  // fingerprint — skip the gate entirely to avoid a redundant disk write
+  // on zero-server installs.
+  let gatedRegistry = registry;
+  const enabledServers = registry.servers.filter((s) => s.enabled);
+  try {
+    if (enabledServers.length > 0) {
+      const { accepted } = await applyTofuGate(baseDir, enabledServers, logger);
+      const acceptedNames = new Set(accepted.map((s) => s.name));
+      gatedRegistry = {
+        ...registry,
+        servers: registry.servers.filter((s) => !s.enabled || acceptedNames.has(s.name)),
+      };
+    }
+  } catch (e) {
+    // Fail-closed on TOFU errors (e.g. corrupt fingerprint store). An attacker
+    // who can corrupt the store must not be able to downgrade drift detection
+    // by forcing the gateway into a "first-run" fallback. Surface the error
+    // and exit — operator can delete the store deliberately to re-bootstrap.
+    err(`TOFU gate failed: ${e instanceof Error ? e.message : e}`);
+    console.error('');
+    console.error('  To intentionally re-bootstrap the fingerprint store:');
+    console.error('  1. Inspect .rea/fingerprints.json for tampering');
+    console.error('  2. If safe, delete it and re-run `rea serve`');
+    console.error('');
+    process.exit(1);
+  }
+
+  const handle = createGateway({
+    baseDir,
+    policy,
+    registry: gatedRegistry,
+    logger,
+    metrics: metricsRegistry,
+  });
 
   // ── HALT acknowledgement at startup (G5) ─────────────────────────────────
   const haltPath = reaPath(baseDir, HALT_FILE);
