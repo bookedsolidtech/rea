@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { loadPolicy } from '../policy/loader.js';
@@ -50,7 +51,7 @@ interface ServeState {
 function writeFileAtomic(filePath: string, data: string): void {
   const dir = path.dirname(filePath);
   const base = path.basename(filePath);
-  const tmp = path.join(dir, `.${base}.${process.pid}.${process.hrtime.bigint()}.tmp`);
+  const tmp = path.join(dir, `.${base}.${crypto.randomUUID()}.tmp`);
   fs.writeFileSync(tmp, data, { encoding: 'utf8', mode: 0o600 });
   try {
     fs.renameSync(tmp, filePath);

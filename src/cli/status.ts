@@ -281,6 +281,10 @@ function summarizeAudit(baseDir: string): AuditStats {
   }
 
   // Streaming line count — O(file-size) CPU, O(chunk) memory.
+  // NOTE: countLinesStreaming and readTailBytes open the file independently.
+  // A concurrent append between the two opens can produce a `lines` count
+  // that is one higher than the tail record implies. This is a display-only
+  // function; the inconsistency is cosmetic and intentionally accepted.
   const lineCount = countLinesStreaming(p);
 
   // Tail-window scan for the last JSON record. If the last window isn't

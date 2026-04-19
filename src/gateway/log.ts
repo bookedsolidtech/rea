@@ -210,19 +210,22 @@ function formatPretty(
 ): string {
   const color = levelColor(level);
   const levelTag = level.toUpperCase().padEnd(5);
-  const event = fields.event;
-  const message = fields.message;
+  // Strip C0 controls and DEL from disk-sourced strings before terminal output
+  // to prevent ANSI/OSC escape injection from compromised MCP error messages.
+  const strip = (s: string) => s.replace(/[\x00-\x1f\x7f]/g, '?');
+  const event = strip(fields.event);
+  const message = strip(fields.message);
   // Extract the well-known fields we already rendered.
   const { event: _e, message: _m, session_id, server_name, ...rest } = fields;
   void _e;
   void _m;
 
   const extras: string[] = [];
-  if (server_name !== undefined) extras.push(`server=${server_name}`);
-  if (session_id !== undefined) extras.push(`session=${String(session_id).slice(0, 8)}`);
+  if (server_name !== undefined) extras.push(`server=${strip(String(server_name))}`);
+  if (session_id !== undefined) extras.push(`session=${strip(String(session_id)).slice(0, 8)}`);
   for (const [k, v] of Object.entries(rest)) {
     if (k === 'timestamp' || k === 'level') continue;
-    extras.push(`${k}=${typeof v === 'string' ? v : safeStringifyExtra(v)}`);
+    extras.push(`${k}=${typeof v === 'string' ? strip(v) : safeStringifyExtra(v)}`);
   }
   const extrasStr = extras.length > 0 ? ` ${COLOR.dim}${extras.join(' ')}${COLOR.reset}` : '';
 
@@ -368,11 +371,13 @@ export function buildRegexRedactor(
   return (value: string): string => {
     let out = value;
     for (const { pattern } of patterns) {
-      // Use a fresh RegExp so `lastIndex` side effects from concurrent
-      // invocations can't desync a global-flagged pattern.
+      // Always create a fresh RegExp for global patterns — shared global RegExp
+      // objects carry `lastIndex` state that concurrent callers (e.g. the
+      // SafeRegex worker in the redact middleware) can leave non-zero, causing
+      // String.replace to start mid-string and silently skip leading secrets.
       const re = pattern.global
-        ? pattern
-        : new RegExp(pattern.source, pattern.flags);
+        ? new RegExp(pattern.source, pattern.flags)
+        : pattern;
       out = out.replace(re, '[REDACTED]');
     }
     return out;

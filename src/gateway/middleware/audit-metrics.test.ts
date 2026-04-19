@@ -13,7 +13,7 @@
 import fsp from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createAuditMiddleware } from './audit.js';
 import type { InvocationContext } from './chain.js';
 import { InvocationStatus, Tier } from '../../policy/types.js';
@@ -122,6 +122,40 @@ describe('audit middleware — metrics.incAuditLines integration', () => {
       }),
     ).resolves.not.toThrow();
 
+    const auditFile = path.join(baseDir, '.rea', 'audit.jsonl');
+    const raw = await fsp.readFile(auditFile, 'utf8');
+    const lines = raw.split('\n').filter((l) => l.length > 0);
+    expect(lines.length).toBe(1);
+  });
+
+  it('still increments counter when first appendFile throws ENOENT and the retry succeeds', async () => {
+    const registry = new MetricsRegistry();
+    const mw = createAuditMiddleware(baseDir, undefined, registry);
+
+    // Simulate the audit directory being deleted externally between ensureDir()
+    // and the first appendFile(). The retry path recreates the dir and retries.
+    const realAppendFile = fsp.appendFile.bind(fsp);
+    let firstCall = true;
+    const spy = vi.spyOn(fsp, 'appendFile').mockImplementation(async (...args) => {
+      if (firstCall) {
+        firstCall = false;
+        const err = Object.assign(new Error('ENOENT (simulated)'), { code: 'ENOENT' });
+        throw err;
+      }
+      return realAppendFile(...(args as Parameters<typeof fsp.appendFile>));
+    });
+
+    try {
+      const ctx = freshCtx();
+      await mw(ctx, async () => { /* terminal */ });
+    } finally {
+      spy.mockRestore();
+    }
+
+    // Counter must advance exactly once even via the retry path.
+    expect(registry.snapshot().auditLinesAppended).toBe(1);
+
+    // Retry must have actually written the record.
     const auditFile = path.join(baseDir, '.rea', 'audit.jsonl');
     const raw = await fsp.readFile(auditFile, 'utf8');
     const lines = raw.split('\n').filter((l) => l.length > 0);
