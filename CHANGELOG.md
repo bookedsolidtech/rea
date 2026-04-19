@@ -1,5 +1,354 @@
 # @bookedsolid/rea
 
+## 0.4.0
+
+### Minor Changes
+
+- a27fc06: Registry `env:` values now support `${VAR}` interpolation.
+
+  Registry entries can now reference process env vars via `${VAR}` syntax in the explicit `env:` map. Enables token-bearing MCPs (discord-ops, github, etc.) to route through rea-gateway without committing literal tokens to `registry.yaml` and without widening the restrictive `env_passthrough` allowlist. Missing vars fail the affected server at startup (fail-closed); the rest of the gateway still comes up. `env_passthrough` behavior is unchanged.
+
+  ### Grammar (deliberately minimal)
+  - Only `${VAR}` — curly-brace form in env **values**. Keys are never interpolated.
+  - No bare `$VAR` (ambiguous with shell semantics).
+  - No default syntax (`${VAR:-fallback}`) — kept out of the 0.3.0 surface.
+  - No command substitution (`$(cmd)`) — never.
+  - No recursive expansion. If `${FOO}` resolves to a string that itself contains `${BAR}`, the inner text is treated as a literal. This is intentional: a hostile env var's _contents_ cannot trigger further lookups.
+  - Var names follow POSIX identifier rules: `^[A-Za-z_][A-Za-z0-9_]*$`. Empty `${}` or illegal identifier chars are rejected at load time with a clear error.
+
+  ### Fail-closed on missing vars
+
+  If any `${VAR}` referenced by an enabled server is unset at spawn time:
+  - The affected server is marked unhealthy and skipped by the pool's tool list.
+  - One stderr line per missing var is emitted with server + var context.
+  - Every other server with resolved env still starts normally.
+  - The gateway as a whole does not crash.
+
+  ### Example
+
+  ```yaml
+  # .rea/registry.yaml
+  version: '1'
+  servers:
+    - name: discord-ops
+      command: npx
+      args: ['-y', 'discord-ops@latest']
+      env:
+        BOOKED_DISCORD_BOT_TOKEN: '${BOOKED_DISCORD_BOT_TOKEN}'
+        CLARITY_DISCORD_BOT_TOKEN: '${CLARITY_DISCORD_BOT_TOKEN}'
+      enabled: true
+  ```
+
+  Export the tokens in the same shell that runs `rea serve`:
+
+  ```bash
+  export BOOKED_DISCORD_BOT_TOKEN="…"
+  export CLARITY_DISCORD_BOT_TOKEN="…"
+  rea serve
+  ```
+
+  ### Redact-by-default contract
+
+  The template in `registry.yaml` is auditable (it commits); the runtime value is not. Env values resolve only inside `buildChildEnv` and pass straight to the child transport — they never flow into `ctx.metadata` or audit records. A new `secretKeys` signal identifies env entries that are secret-bearing (either because the key name matches `/(TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL)/i` or because a `${VAR}` reference in the value does), so any future telemetry path can make the right call without re-deriving the heuristic.
+
+  ### Compatibility
+  - `env_passthrough` semantics unchanged — still refuses secret-looking names at load time. The sanctioned path for secrets is now `env: { NAME: '${ENV_VAR}' }`.
+  - Existing registries without interpolation continue to work unchanged.
+  - No new dependencies.
+
+- 6e84930: feat(gateway): G5 — gateway observability. Adds three user-visible surfaces:
+  - `rea status` — new CLI command that reports live-process state for a
+    running `rea serve` (pid, session id, metrics endpoint URL), the policy
+    summary (profile, autonomy, blocked-paths count, codex_required, HALT), and
+    audit log stats (lines, last timestamp, tail-hash smoke). Supports `--json`
+    for composing with `jq` and future tooling. `rea check` remains the
+    authoritative on-disk snapshot — `rea status` is the running-process view.
+  - Structured JSON-lines gateway logger at `src/gateway/log.ts`. Honors
+    `REA_LOG_LEVEL` (info default; debug/warn/error supported). Pretty-prints
+    when stderr is a TTY, emits JSON lines on non-TTY sinks. No new deps —
+    ~200-line no-dep implementation. `rea serve` wires the logger into
+    connection open/close/reconnect events and circuit-breaker state transitions.
+    `[rea-serve]` prefix preserved in pretty mode so existing grep-based smoke
+    tests (helix) continue to match.
+  - Optional loopback `/metrics` HTTP endpoint. Opt-in via `REA_METRICS_PORT`
+    — no silent listeners. Binds `127.0.0.1` only, serves Prometheus text
+    exposition, exposes per-downstream call/error/in-flight counters, audit
+    lines appended, circuit-breaker state gauge, and a seconds-since-last-HALT
+    gauge. Rejects non-GET methods with 405 and non-`/metrics` paths with 404
+    (no request-path reflection in response bodies). `node:http` only — no
+    express/fastify.
+
+  `rea serve` now writes a short-lived breadcrumb pidfile at `.rea/serve.pid`
+  and session state at `.rea/serve.state.json` for `rea status` introspection.
+  Both files are removed on graceful shutdown (SIGTERM/SIGINT). The README
+  non-goal "no pid file" is narrowed to clarify that this is a read-only
+  breadcrumb, not a supervisor lock — there is still no `rea start`/`rea stop`.
+
+- 862440d: G6 — Codex install assist at init time, and pre-push hook fallback installer.
+
+  `rea init` now probes for the Codex CLI when the chosen policy sets
+  `review.codex_required: true`. If Codex is not responsive, init prints a
+  clear guidance block pointing at the Claude Code `/codex:setup` helper
+  instead of silently succeeding; `/codex-review` would otherwise fail later.
+  In no-Codex mode the probe is skipped entirely (no wasted 2s, no confusing
+  output).
+
+  `rea init` also installs a fallback `pre-push` hook in the active git
+  hooks directory when Husky is not the consumer's primary hook path. The
+  fallback is a thin `exec` into `.claude/hooks/push-review-gate.sh` so
+  there is still exactly one implementation of the push-review logic. The
+  installer detects `core.hooksPath` correctly, refuses to stomp foreign
+  hooks (no marker → leave alone), and is idempotent across re-runs.
+
+  `rea doctor` gains a "pre-push hook installed" check that requires an
+  executable pre-push at whichever path git is actually configured to fire
+  (`.git/hooks/pre-push` by default, or the configured `core.hooksPath`).
+  A `.husky/pre-push` alone — without `core.hooksPath=.husky` — no longer
+  satisfies the check, closing the 0.2.x dogfooding gap where protected-
+  path Codex audit enforcement could be silently bypassed.
+
+  Non-goals (explicitly out of scope for G6): the `push-review-gate.sh`
+  logic itself is unchanged, the protected-path regex is unchanged, and no
+  middleware was moved.
+
+- 795a8bc: G7 — Proxy-poisoning defense via TOFU fingerprints.
+
+  The gateway now fingerprints every downstream server declared in
+  `.rea/registry.yaml` on first startup and persists the result to
+  `.rea/fingerprints.json` (versioned JSON, schema-validated). On every
+  subsequent `rea serve`, each server is reclassified as `unchanged`,
+  `first-seen`, or `drifted`:
+  - **Unchanged** — proceed silently.
+  - **First-seen** — LOUD stderr block announcing the new fingerprint,
+    structured `tofu.first_seen` audit record, allow the connection. This
+    is deliberately noisy so a poisoned registry at first install is
+    visible in stderr, logs, and audit trail at the same time.
+  - **Drifted** — stderr block, `tofu.drift_blocked` audit record (status
+    `denied`), and the server is DROPPED from the downstream pool. Other
+    servers stay up; the gateway does not fail-close on drift of a single
+    server. To accept a legitimate rotation for one boot, set
+    `REA_ACCEPT_DRIFT=<name>` (comma-separated for multiple).
+
+  The fingerprint is **path-only**: `name`, `command`, `args`, sorted
+  `env` KEY SET, sorted `env_passthrough`, and `tier_overrides`. Env
+  VALUES are intentionally excluded so rotating a token (`GITHUB_TOKEN`
+  etc.) does not trip drift. We do NOT hash the binary at `config.command`
+  — that would be a slow-boot tax on every restart, legitimate MCP
+  upgrades would trip false-positive drift, and host-binary compromise is
+  a separate G-number, not G7. The G7 threat is YAML tampering, which the
+  canonicalized config hash covers.
+
+  A corrupt or schema-invalid `fingerprints.json` fails the gateway
+  closed: we never silently reset TOFU state, because that would downgrade
+  drift detection to first-seen acceptance. The operator can delete the
+  file deliberately to re-bootstrap. `rea doctor` grows a `fingerprint
+store` row that surfaces first-seen / drifted counts without waiting for
+  `rea serve`.
+
+- fa66785: G9 — Injection tier escalation: clean / suspicious / likely_injection.
+
+  **Behavior change on upgrade for external profiles — read this before upgrading if you depend on the 0.2.x deny-on-any-match behavior.**
+
+  The injection middleware (`src/gateway/middleware/injection.ts`) was a single-threshold binary: any known phrase match in a tool result denied the call. That was too blunt — a single literal match at write tier is noise-prone, while multi-literal + base64-decoded matches at any tier are near-certain attacks that should deny regardless of context. G9 introduces a three-level classifier and a policy knob governing the middle bucket.
+
+  ### Classification rules
+
+  Every PostToolUse scan now returns one of three verdicts (recorded in `ctx.metadata.injection` and exported to the audit log):
+  - `clean` — no match → allow, no log.
+  - `suspicious` — exactly ONE distinct literal pattern at write/destructive tier, with no base64-decoded match → warn (stderr + audit metadata). Whether this denies is governed by the new `policy.injection.suspicious_blocks_writes` flag.
+  - `likely_injection` — any of: ≥2 distinct literal patterns, any base64-decoded match, any match at read tier, or an unknown tier (fail-closed) → **always deny, regardless of the flag**.
+
+  ### The narrow relaxation (the reason for the loud callout)
+
+  **In 0.2.x, a single literal match at any tier denied.** In 0.3.0, for profiles that do NOT pin the new flag (`open-source`, `client-engagement`, `minimal`, `lit-wc`, and any hand-authored policy that omits the `injection:` block), a single literal match at write/destructive tier is classified `suspicious` → warn-only by default. This means the call is ALLOWED through. The warning is written to stderr and the audit record still captures `verdict: suspicious` with the matched phrase, but the tool result is NOT blocked.
+
+  The `bst-internal` and `bst-internal-no-codex` profiles pin `suspicious_blocks_writes: true`, preserving the 0.2.x strict-deny posture. This repo's own `.rea/policy.yaml` continues to inherit that strict posture by profile.
+
+  **Why ship narrower:** silent tightening on upgrade is a worse footgun than the narrower default. External consumers who want the strict 0.2.x behavior can opt in explicitly:
+
+  ```yaml
+  injection:
+    suspicious_blocks_writes: true
+  ```
+
+  `likely_injection` remains an unconditional deny. The attacker cases that matter most (multi-pattern coordinated injection, base64-obfuscated payloads) still deny in every profile.
+
+  ### Policy flag
+
+  New optional top-level policy block:
+
+  ```yaml
+  injection:
+    suspicious_blocks_writes: true # default: false
+  ```
+
+  - `false` (schema default): `suspicious` → warn-only, tool result allowed through. Audit record carries `verdict: suspicious`.
+  - `true`: `suspicious` → deny at write/destructive tier (matches 0.2.x deny-on-literal semantics for writes). Audit record carries `verdict: suspicious` plus `status: denied`.
+  - `likely_injection` denies in either case.
+
+  The loader defaults are `false`; the `bst-internal*` profiles pin `true`.
+
+  ### Audit metadata
+
+  On any non-clean verdict the middleware writes `ctx.metadata.injection`, which the audit middleware exports verbatim into the per-call record:
+
+  ```json
+  {
+    "verdict": "likely_injection",
+    "matched_patterns": ["disregard your", "ignore previous instructions"],
+    "base64_decoded": false
+  }
+  ```
+
+  `matched_patterns` is a sorted list of distinct phrase strings from the built-in phrase list. NO input payload text is ever written to metadata (guard against leaking the attack content through audit trail redaction bypass).
+
+  ### Legacy `injection_detection: warn` interaction
+
+  Operators who pinned 0.2.x `injection_detection: warn` continue to get warn-only for `suspicious`. However, under G9, `likely_injection` (multi-literal or base64-decoded) will now DENY even when `injection_detection: warn` is set. This is a narrow tightening for operators who explicitly pinned warn mode — the classifier's whole value is distinguishing high-confidence attacks from ambiguous single-hits, and high-confidence attacks deserve a deny. If you need the full-allow-through behavior for all matches (not recommended), disable the middleware by removing it from your gateway configuration.
+
+  ### Stderr format change
+
+  The warning line format changed from `[rea] INJECTION-GUARD: ...` to `[rea] INJECTION-GUARD (<verdict>): ...`. Log consumers grepping for the old exact prefix should update their filters.
+
+  ### Pattern list unchanged
+
+  This PR does NOT modify the built-in `INJECTION_PHRASES` list. Extending or reshaping the pattern set is explicit future work (a per-pattern "deny-tag" extension point is stubbed with a TODO in `classifyInjection`).
+
+  ### New public exports
+
+  From `src/gateway/middleware/injection.ts`:
+  - `classifyInjection(scan, tier) → InjectionClassification` — pure classifier
+  - `scanStringForInjection(s, result, safe)` / `scanValueForInjection(v, result, safe)` — structured scanners
+  - `decodeBase64Strings(input: unknown) → string[]` — pure base64 probe
+  - `INJECTION_METADATA_KEY` — `'injection'`, the ctx.metadata key for the verdict record
+  - `InjectionClassifierMetadata`, `InjectionScanResult`, `InjectionClassification` — types
+
+  Back-compat: `scanForInjection(string, safe) → string[]` is retained as a wrapper so `scripts/lint-safe-regex.mjs` and any external consumer that imported it continue to work.
+
+### Patch Changes
+
+- 6a2f00c: ci: tarball smoke workflow (packaging regression gate)
+
+  Adds `scripts/tarball-smoke.sh`, invoked on every PR and every push to `main` via a new `Tarball smoke` CI job, and re-invoked in the release workflow immediately before `changeset:publish`. The script packs the repo with `pnpm pack`, installs the resulting tarball in an isolated tempdir, and asserts:
+  - `rea --version` matches `package.json` version
+  - `rea --help` prints the full command tree
+  - `rea init --yes --profile open-source` creates the expected layout
+  - `rea doctor` returns OK on the freshly installed artifacts
+  - At least 10 agents and 13 hooks shipped in the tarball
+  - Every public ESM export (`.`, `./policy`, `./middleware`, `./audit`) resolves
+
+  This catches packaging regressions — missing files from the `files:` allow-list, broken `exports` map, shebang / chmod issues on `bin/rea`, postinstall failures, dependency-resolution drift — before the tarball reaches npm. No runtime behavior change.
+
+  Branch protection on `main` should be updated to include `Tarball smoke` as a required check alongside the existing seven.
+
+- 52e655d: fix(gateway/blocked-paths): restore absolute-path matching and close content-key + URL-escape bypasses
+
+  Address three post-merge Codex findings on BUG-001:
+  - **[critical]** Absolute `blocked_paths` entries (e.g. `/etc/passwd`) no longer matched after the content-substring narrowing — restored.
+  - **[high]** `CONTENT_KEYS` blanket skip on `name/value/label/tag/tags/title` let `{name: ".env"}` bypass — now only skipped when value is not path-shaped.
+  - **[high]** Malformed `%XX` URL-escape silently disabled decode, enabling `.rea/` trust-root bypass via `%2Erea%2F` — now fails closed on malformed escapes.
+
+- 1e1f247: fix(gateway): G5 observability — post-merge Codex blocker sweep. Eight
+  BLOCKING findings from adversarial review of the G5 feature (merged as
+  PR #22) are resolved ahead of 0.4.0:
+  - **metrics bind allowlist (security).** `startMetricsServer` now validates
+    the `host` option against a strict loopback allowlist (`127.0.0.1`,
+    `::1`). Anything else — `localhost`, `0.0.0.0`, `::`, any LAN IP — throws
+    a `TypeError` BEFORE a socket is opened. Closes the path where a caller
+    could accidentally expose the unauthenticated `/metrics` endpoint to
+    the network. A test-only `__TEST_HOST_OVERRIDE` symbol preserves the
+    hostname-resolution test path; the symbol is unreachable from YAML,
+    JSON, or CLI deserialization.
+  - **pid/state breadcrumb race.** `rea serve` now writes `.rea/serve.pid`
+    and `.rea/serve.state.json` atomically (stage-to-temp + `rename(2)`)
+    and cleans them up only when the file still carries this process's pid
+    (pidfile) or session id (state). Two overlapping `rea serve`
+    invocations in the same `baseDir` no longer clobber each other's
+    breadcrumbs on the first instance's shutdown.
+  - **ANSI/OSC escape injection in `rea status` pretty mode.** Every
+    disk-sourced string field (`profile`, `autonomy_level`, `halt_reason`,
+    `session_id`, `started_at`, `last_timestamp`) is scrubbed through a
+    new `sanitizeForTerminal` helper before reaching the operator's
+    terminal. C0 control bytes (0x00-0x1F) and DEL (0x7F) are replaced
+    with `?` — the ESC byte that initiates CSI/OSC sequences and the BEL
+    byte that terminates OSC 8 hyperlinks are both scrubbed. JSON mode
+    output is untouched (JSON.stringify already escapes safely).
+  - **observability counter wiring.** `createAuditMiddleware` and
+    `createKillSwitchMiddleware` now accept an optional `MetricsRegistry`.
+    The audit middleware increments `rea_audit_lines_appended_total` on
+    every successful fsynced append; the kill-switch middleware refreshes
+    `rea_seconds_since_last_halt_check` on every invocation (previously
+    the gauge only reflected the startup-time mark). `rea serve` wires
+    the same registry into both. Counter failures never crash the chain.
+  - **log-field redaction.** The gateway logger now accepts an optional
+    `redactField` hook applied to every string-valued field before
+    serialization. `rea serve` installs a redactor compiled from the
+    same `SECRET_PATTERNS` the redact middleware uses, so downstream
+    error messages that carry env var names, argv fragments, or file
+    paths with credential material reach stderr already scrubbed. A
+    redactor that throws falls back to `[redactor-error]` per field —
+    the record itself is never dropped.
+  - **bounded-memory audit tail.** `rea status` no longer reads the
+    whole `audit.jsonl` into a buffer to count lines or find the last
+    record. Line count uses a streaming 64-KiB-chunk scan; the last
+    record is sourced from a positioned 64-KiB tail-window read. On
+    multi-hundred-MB chains the memory footprint is bounded to the
+    window size plus the scan buffer.
+  - **bounded metrics `close()`.** `startMetricsServer` tracks every
+    live socket and guarantees `close()` resolves within 2 s even when
+    a Prometheus scraper is holding a keep-alive connection open. On
+    deadline the server calls `closeIdleConnections()` (Node 18.2+)
+    and destroys any surviving tracked sockets. The timer is `unref`'d
+    so it never holds the process open.
+  - **pretty-mode cyclic-safe serialization.** Pretty-mode logger extras
+    that contain a cyclic reference no longer drop the entire record.
+    A safe-stringify wrapper substitutes a stable `[unserializable]`
+    placeholder so the operator still sees the event, level, and
+    message.
+
+- b6a69ff: fix(cli): harden pre-push fallback installer (G6 post-merge hardening)
+
+  Close four classification/write-path issues in the G6 pre-push fallback installer: existence-only skip bypass (doctor pass on foreign hooks), classify/write TOCTOU, substring `FALLBACK_MARKER` collision, and deterministic tmp-filename collisions.
+
+- 795a8bc: docs(registry/tofu): tighten rename-bypass defense scope
+
+  Clarify in `classifyServers` that the set-difference heuristic catches **rename-with-removal** (attacker removes old trusted entry at the same moment the tampered new entry appears), not rename-with-placeholder (attacker leaves old entry in place as a decoy, adds tampered new entry under a new name).
+
+  Rename-with-placeholder lands as `first-seen` with a LOUD stderr banner — the documented, intentional TOFU contract for new entries. No code change; the docstring previously oversold the defense's scope.
+
+- a5cca2a: fix(injection): guard base64 probe on timeout + correct changeset default-behavior doc
+
+  Address four post-merge Codex findings on the G9 three-tier injection classifier (PR #25):
+  - **[high]** `denyOnSuspicious` flag behavior clarified: the `suspicious_blocks_writes` flag defaults to `false` when omitted (preserving the 0.3.x warn-only default for unset installs). Consumers who want the tighter block posture must opt in explicitly with `injection.suspicious_blocks_writes: true`. The `bst-internal*` profiles pin `true`. This was the correct approach: silently switching to block behavior on upgrade would be a breaking change for 0.3.x consumers.
+  - **[high]** The 7-phrase ASCII pattern library was trivially bypassed by Unicode whitespace (NBSP, en-space, em-space, ideographic space, etc.), zero-width joiners, and fullwidth compatibility characters. Inputs are now NFKC-normalized, zero-width-stripped, Unicode-whitespace-collapsed, and lowercased before literal matching. The phrase library was also modestly expanded with two conservative persona-swap vectors (`pretend you are`, `roleplay as`). Broader candidates like `act as a` / `act as an` were considered but dropped: at read tier a single literal match escalates to `likely_injection`, which would falsely deny benign prose such as "this proxy can act as a bridge." Pattern-set extensibility via policy is filed as G9.1 follow-up.
+  - **[medium]** `decodeBase64Strings` was exported and tested but never wired into the middleware execution path — 28 lines of dead code advertised as a second-opinion base64 probe. It is now called from the middleware after the primary scan; any phrase detected in a decoded whole-string payload is merged into `base64DecodedMatches`, triggering classification rule #2 (`likely_injection`). The call is guarded behind `!scanTimedOut` so a timeout-induced incomplete scan cannot force unbounded CPU/memory in the base64 probe path; a `MAX_BASE64_PROBE_LENGTH` cap (16 KiB) is also applied per-string inside `decodeBase64Strings`.
+  - **[low]** On worker-bounded regex timeout, the audit record carried timing metadata under `injection.regex_timeout` but no `verdict` field under `injection`. A new `verdict: 'error'` value is emitted when a timeout produces no actionable signal, giving downstream audit consumers a stable record shape. A new `InjectionMetadataSchema` zod schema is exported from the injection middleware module for internal test coverage; promoting it to a public package entrypoint is tracked as G9.2 follow-up (the module is not reachable via the current `exports` map, so do not rely on it from outside this repo yet).
+
+  `likely_injection` continues to deny unconditionally in all configurations.
+
+- 4f4d19d: ci: close tarball-smoke coverage gaps (post-merge)
+
+  Address four post-merge Codex findings on the tarball-smoke gate:
+  - **[high]** Gate counted `.claude/agents/` + `.claude/hooks/` only — now tree-equality asserts against `.claude/commands/`, recursive `hooks/**` (walks `hooks/_lib/`), and the shipped `.husky/{commit-msg,pre-push}` so a tarball missing those surfaces fails loud with a unified-diff delta. `.git/hooks/{commit-msg,pre-push}` are also asserted as the real enforcement surface on a fresh consumer.
+  - **[medium]** Fresh-consumer `npm init -y` temp files were not actually cleaned before `git init` — comment now matches behavior (`rm -f package.json package-lock.json`).
+  - **[low]** Version probe interpolated repo path into a JS string literal — now passes the path via argv so repo-roots with apostrophes, backslashes, or `${...}`-style expansions do not break the require() call.
+  - **[low]** Cleanup trap bound to `EXIT` only — now catches `HUP`/`INT`/`TERM` so Ctrl-C during a local run does not leave `/tmp/rea-smoke-*` tempdirs behind.
+
+- c0b8a2b: fix(gateway/blocked-paths): eliminate content-substring false positives (BUG-001)
+
+  The blocked-paths middleware previously substring-matched policy patterns against every string value in the argument tree, including free-form `content` and `body` fields. A secondary fallback stripped the leading `.` from patterns like `.env`, which caused the naked substring `env` to match inside any string containing "environment" — breaking legitimate note creation on Helix (`obsidian__create-note` with 14 KB of prose that mentioned GitHub Environments and `.env` files in passing).
+
+  The matcher is now key-aware and path-segment aware:
+  - Arguments with a known path-like leaf key (`path`, `file_path`, `filename`, `folder`, `dir`, `src`, `dst`, `target`, …) are always scanned.
+  - Arguments with a content-like leaf key (`content`, `body`, `text`, `message`, `description`, `summary`, `title`, `query`, `prompt`, `comment`, …) are never scanned, regardless of how the value looks.
+  - Arguments with any other key are scanned only when the value looks like a filesystem path (contains a separator, starts with `~`, is a dotfile, or matches a Windows drive prefix).
+  - Pattern matching is strictly path-segment aware; `*` and `?` are single-segment globs (they do not cross `/`), and all other regex metacharacters in a pattern are escaped. Trailing `/` on a pattern means "this directory and everything under it".
+  - `.rea/` is still unconditionally enforced regardless of policy.
+
+  The policy file format is unchanged. Existing installs that list both `.env` and `.env.*` in `blocked_paths` continue to block every `.env` variant. If a policy previously relied on accidental substring matching (e.g., listing only `.env` and expecting `.env.local` to be blocked), add `.env.*` explicitly — this is how the `bst-internal` profile already works.
+
+- c4c4cc8: fix(cli): correct `rea serve` help description — the serve command is no longer a stub. Also refresh `.rea/install-manifest.json` to reflect the post-G10/G1 content hashes for `.claude/hooks/push-review-gate.sh` and `.husky/pre-push`.
+
 ## 0.3.0
 
 ### Minor Changes
