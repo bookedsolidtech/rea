@@ -191,6 +191,55 @@ export function isReaManagedHuskyGate(content: string): boolean {
 }
 
 /**
+ * Pre-0.4 rea-authored `.husky/pre-push` shape — same governance behavior
+ * as the current gate but lacks the line-2/3 versioned markers
+ * (`# rea:husky-pre-push-gate v1` / `# rea:gate-body-v1`) introduced in
+ * 0.4.
+ *
+ * Codex R21 F1: without this detector, any consumer upgrading from a rea
+ * release that shipped the pre-marker hook fell into `foreign/no-marker`.
+ * `classifyPrePushInstall` mapped that to `skip/foreign-pre-push` and
+ * `rea init` refused to touch the file. `rea doctor` reported
+ * `activeForeign=true`. Users had no self-heal path short of manually
+ * deleting the hook — which is a bad migration story for a governance
+ * primitive that they are supposed to trust.
+ *
+ * Shape-level detection:
+ *   1. Line 2 is the canonical pre-0.4 filename header
+ *      `# .husky/pre-push — rea governance gate for terminal-initiated pushes.`
+ *      This header shipped verbatim across the 0.2.x/0.3.x rea releases.
+ *   2. Real governance still present — `hasHaltEnforcement(content)` AND
+ *      `hasAuditCheck(content)` both pass. A stub that only matches the
+ *      header comment (no enforcement) fails the shape check and stays
+ *      classified as foreign.
+ *
+ * Classification consequence: `classifyExistingHook` returns
+ * `rea-managed-husky` for legacy matches. `classifyPrePushInstall` maps
+ * that to `skip/active-pre-push-present` — `rea init` does not touch the
+ * hook (correctness: the file IS still functional governance), but
+ * `inspectPrePushState` reports `ok=true, activeForeign=false` so doctor
+ * stops flagging it. The canonical-manifest-driven upgrade path
+ * (`rea upgrade`) detects the hash mismatch against the packaged
+ * `.husky/pre-push` and surfaces the legacy shape as drift, letting the
+ * operator opt into the refresh explicitly.
+ */
+export function isLegacyReaManagedHuskyGate(content: string): boolean {
+  const lines = content.split(/\r?\n/);
+  if (lines.length < 2) return false;
+  const line2 = lines[1] ?? '';
+  // The em-dash in the published header (`— rea governance gate`) is the
+  // distinctive token; some terminals/IDEs may normalize it to `-`. Accept
+  // either, but require the `.husky/pre-push` filename prefix and the
+  // `rea governance gate` phrase together to prevent stub matches.
+  const legacyHeaderRe =
+    /^#\s*\.husky\/pre-push\b[^\n]*[—-]\s*rea governance gate/;
+  if (!legacyHeaderRe.test(line2)) return false;
+  if (!hasHaltEnforcement(content)) return false;
+  if (!hasAuditCheck(content)) return false;
+  return true;
+}
+
+/**
  * True when `content` contains a POSIX shell construct that detects
  * `.rea/HALT` AND causes the script to exit non-zero on match. Comment
  * lines are stripped before scanning so `# if [ -f .rea/HALT ]; then exit`
@@ -1500,6 +1549,11 @@ async function classifyExistingHook(
     return { kind: 'foreign', reason: 'unreadable' };
   }
   if (isReaManagedHuskyGate(content)) return { kind: 'rea-managed-husky' };
+  // R21 F1: pre-0.4 rea `.husky/pre-push` shape. Same governance, no
+  // line-2 marker. Fold into `rea-managed-husky` so upgrade paths treat
+  // the legacy hook as a known rea artifact (skip/active rather than
+  // foreign) and the canonical manifest reconciler handles the refresh.
+  if (isLegacyReaManagedHuskyGate(content)) return { kind: 'rea-managed-husky' };
   if (isReaManagedFallback(content)) return { kind: 'rea-managed' };
   if (referencesReviewGate(content)) return { kind: 'gate-delegating' };
   return { kind: 'foreign', reason: 'no-marker' };
@@ -1804,11 +1858,26 @@ type RefreshGuard =
 /**
  * Atomically write `content` to `dst` with executable bits set.
  *
- * When `exclusive` is true (new installs): uses `copyFile(COPYFILE_EXCL)`
- * which opens dst with O_CREAT|O_EXCL — atomic and works on network
- * filesystems and cross-device mounts (unlike `link()` which fails with
- * EXDEV/EPERM/ENOSYS on those). Fails with EEXIST if a file appeared at
- * `dst` after the caller's re-check.
+ * When `exclusive` is true (new installs): primary path is `link(tmp, dst)`
+ * — POSIX guarantees the hardlink creation is atomic: `dst` does not exist
+ * until the operation succeeds, and then it points to the FULLY-WRITTEN
+ * temp file. A concurrent reader (e.g. git firing the hook) either sees
+ * the file absent or the complete content, never a partial write. Fails
+ * with EEXIST if a file appeared at `dst` after the caller's re-check.
+ *
+ * Codex R21 F2: the previous implementation used
+ * `copyFile(tmp, dst, COPYFILE_EXCL)`, which opens dst with
+ * `O_CREAT|O_EXCL|O_WRONLY` and then writes content through it. The
+ * create IS atomic but the subsequent write is not — `dst` is observable
+ * empty/partial by concurrent readers during the copy, and a crash mid-
+ * copy leaves a broken live hook. For a governance primitive that's a
+ * real bypass window. `link()` closes it.
+ *
+ * On `EXDEV`, `EPERM`, or `ENOSYS` (cross-device mounts, some network
+ * filesystems, sandboxes that disable `link(2)`), fall back to
+ * `copyFile(COPYFILE_EXCL)`. The fallback is strictly worse but
+ * unavoidable when the kernel refuses the primary path; the warning
+ * accompanying this code is documentation, not configuration.
  *
  * When `exclusive` is false (refreshes): uses `rename()` — the destination
  * is expected to exist and be rea-managed. Immediately before the rename,
@@ -1887,12 +1956,32 @@ async function writeExecutable(
   }
   try {
     if (exclusive) {
-      // COPYFILE_EXCL opens dst with O_CREAT|O_EXCL — fails with EEXIST if
-      // dst appeared after our safety re-check; works on network FS and
-      // cross-device mounts unlike link().
-      await fsPromises.copyFile(tmp, dst, fs.constants.COPYFILE_EXCL);
-      await fsPromises.unlink(tmp).catch(() => undefined);
-      return;
+      // R21 F2: link-first for ATOMIC publication. `link(2)` atomically
+      // creates `dst` pointing at the fully-written `tmp`; a concurrent
+      // reader either sees the file absent or the complete content, never
+      // a partial write. EEXIST still propagates if dst appeared after
+      // our safety re-check (exclusive semantics preserved).
+      try {
+        await fsPromises.link(tmp, dst);
+        await fsPromises.unlink(tmp).catch(() => undefined);
+        return;
+      } catch (linkErr) {
+        const e = linkErr as NodeJS.ErrnoException;
+        // EEXIST is the one exclusive-violation case we MUST propagate —
+        // another writer won the race, we must abort the install.
+        if (e.code === 'EEXIST') throw linkErr;
+        // EXDEV: cross-device mount (link doesn't span filesystems).
+        // EPERM / ENOSYS: some network filesystems and sandboxes refuse
+        //                  or don't implement link(2).
+        if (e.code !== 'EXDEV' && e.code !== 'EPERM' && e.code !== 'ENOSYS') {
+          throw linkErr;
+        }
+        // Fallback path — atomicity is best-effort here. Unavoidable
+        // tradeoff when the kernel refuses link(); documented above.
+        await fsPromises.copyFile(tmp, dst, fs.constants.COPYFILE_EXCL);
+        await fsPromises.unlink(tmp).catch(() => undefined);
+        return;
+      }
     }
     // Refresh: verify dst still matches the identity captured at the
     // re-check before the atomic replace. Rename is atomic on the same
@@ -2349,7 +2438,10 @@ export async function inspectPrePushState(
         executable = (stat.mode & 0o111) !== 0;
         try {
           const content = await fsPromises.readFile(p, 'utf8');
-          reaManaged = isReaManagedFallback(content) || isReaManagedHuskyGate(content);
+          reaManaged =
+            isReaManagedFallback(content) ||
+            isReaManagedHuskyGate(content) ||
+            isLegacyReaManagedHuskyGate(content);
           delegatesToGate = referencesReviewGate(content);
         } catch {
           // unreadable — leave both false
