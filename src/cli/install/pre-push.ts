@@ -956,7 +956,12 @@ function isHeadExitStmt(stmt: string): boolean {
   const t = stmt.trim();
   if (t.length === 0) return false;
   if (/^exit[ \t]+[1-9]\d*\b/.test(t)) return true;
-  if (/^return[ \t]+[1-9]\d*\b/.test(t)) return true;
+  // R23 F1 — top-level `return N` in a POSIX hook script is NOT a script
+  // terminator. `/bin/sh -c 'return 1; exit 0'` emits a diagnostic and
+  // continues to `exit 0`, so a hook that writes `return 1` where it means
+  // `exit 1` is still fully bypassable. `stripFunctionBodies` already zeroes
+  // out real function bodies, so by the time the parser sees a statement
+  // every `return` here is top-level — treat it as non-blocking.
   // Grouped block `{ a; b; exit N; }` — split the body on `;`/newline and
   // require that AT LEAST ONE inner statement is itself head-matched.
   const blockMatch = t.match(/^\{([^}]*)\}/);
@@ -966,7 +971,6 @@ function isHeadExitStmt(stmt: string): boolean {
       const sub = inner.trim();
       if (sub.length === 0) continue;
       if (/^exit[ \t]+[1-9]\d*\b/.test(sub)) return true;
-      if (/^return[ \t]+[1-9]\d*\b/.test(sub)) return true;
     }
   }
   return false;
@@ -997,8 +1001,22 @@ function isAllowOnMatchStmtLine(line: string): boolean {
   for (const stmt of splitStatements(text)) {
     const t = stmt.trim();
     if (t.length === 0) continue;
-    if (/\bexit[ \t]+0\b/.test(t)) return true;
-    if (/\breturn[ \t]+0\b/.test(t)) return true;
+    // R23 F2 — the prior substring regex accepted `echo exit 0` and
+    // `printf 'return 0'` as allow-on-match because `\bexit 0\b` matched
+    // the string argument. Use head-position parsing so only a real command
+    // `exit 0` / `return 0` qualifies, and drop `return` entirely at top
+    // level (R23 F1: top-level `return` is not a terminator in a POSIX
+    // script).
+    if (/^exit[ \t]+0(?=[\s;|&]|$)/.test(t)) return true;
+    const blockMatch = t.match(/^\{([^}]*)\}/);
+    if (blockMatch !== null) {
+      const body = blockMatch[1] ?? '';
+      for (const inner of body.split(/[;\n]/)) {
+        const sub = inner.trim();
+        if (sub.length === 0) continue;
+        if (/^exit[ \t]+0(?=[\s;|&]|$)/.test(sub)) return true;
+      }
+    }
   }
   return false;
 }
@@ -1021,7 +1039,9 @@ function isHeadTerminatorStmtLine(line: string): boolean {
     const t = stmt.trim();
     if (t.length === 0) continue;
     if (/^exit(?:[ \t]+\d+)?(?=[\s;|&]|$)/.test(t)) return true;
-    if (/^return(?:[ \t]+\d+)?(?=[\s;|&]|$)/.test(t)) return true;
+    // R23 F1 — top-level `return` is NOT a script terminator in a POSIX
+    // hook. Excluded here so it does not falsely clear a pending
+    // fall-through expectation.
     const blockMatch = t.match(/^\{([^}]*)\}/);
     if (blockMatch !== null) {
       const body = blockMatch[1] ?? '';
@@ -1029,7 +1049,6 @@ function isHeadTerminatorStmtLine(line: string): boolean {
         const sub = inner.trim();
         if (sub.length === 0) continue;
         if (/^exit(?:[ \t]+\d+)?(?=[\s;|&]|$)/.test(sub)) return true;
-        if (/^return(?:[ \t]+\d+)?(?=[\s;|&]|$)/.test(sub)) return true;
       }
     }
   }

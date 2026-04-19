@@ -1601,10 +1601,14 @@ describe('isReaManagedHuskyGate — R16 F2 block-aware audit enforcement', () =>
     expect(isReaManagedHuskyGate(content)).toBe(true);
   });
 
-  it('`if ! <audit-grep>; then return 1; fi` (blocking body): returns true', () => {
+  it('`if ! <audit-grep>; then return 1; fi` (top-level return): returns false (R23 F1)', () => {
+    // Top-level `return 1` in a POSIX hook is NOT a script terminator —
+    // `/bin/sh` emits a diagnostic and continues to the next statement.
+    // A hook that writes `return 1` where it means `exit 1` is still fully
+    // bypassable, so we refuse to classify it as audit-enforcing.
     const content =
       `${header}if ! grep -q codex.review .rea/audit.jsonl; then return 1; fi\n`;
-    expect(isReaManagedHuskyGate(content)).toBe(true);
+    expect(isReaManagedHuskyGate(content)).toBe(false);
   });
 
   it('shipped shape: while-loop with `if ! … then exit 1; fi` (direct exit): returns true', () => {
@@ -2529,13 +2533,18 @@ describe('hasAuditCheck — R22 F1 form-(c) fall-through miss-path clearance', (
     expect(isReaManagedHuskyGate(wrapWithBoilerplate(body))).toBe(false);
   });
 
-  it('rejects `if grep ...; then exit 0; fi; return 0; exit 1`', () => {
+  it('accepts `if grep ...; then exit 0; fi; return 0; exit 1` — top-level return is inert (R23 F1)', () => {
+    // R22 originally expected `return 0` to invalidate the pending
+    // fall-through state. R23 corrected that — top-level `return 0` in a
+    // POSIX hook does NOT terminate the script (it emits a diagnostic and
+    // continues). So the miss path still reaches `exit 1`; the hook IS
+    // audit-enforcing.
     const body = [
       'if grep -qE \'"tool_name":"codex\\.review"\' .rea/audit.jsonl; then exit 0; fi',
       'return 0',
       'exit 1',
     ].join('\n');
-    expect(isReaManagedHuskyGate(wrapWithBoilerplate(body))).toBe(false);
+    expect(isReaManagedHuskyGate(wrapWithBoilerplate(body))).toBe(true);
   });
 
   it('rejects `if grep ...; then exit 0; fi; exit; exit 1` (bare exit clears pending)', () => {
@@ -2560,6 +2569,122 @@ describe('hasAuditCheck — R22 F1 form-(c) fall-through miss-path clearance', (
       'if ! grep -qE \'"tool_name":"codex\\.review"\' .rea/audit.jsonl; then exit 1; fi',
     ].join('\n');
     expect(isReaManagedHuskyGate(wrapWithBoilerplate(body))).toBe(true);
+  });
+});
+
+describe('R23 F1 — top-level `return` is NOT a hook terminator', () => {
+  // Boilerplate for a hook that passes every other classifier so the only
+  // variable is the blocking/allow statement under test.
+  const wrapHalt = (haltBody: string): string =>
+    [
+      '#!/bin/sh',
+      HUSKY_GATE_MARKER,
+      HUSKY_GATE_BODY_MARKER,
+      'set -eu',
+      haltBody,
+      'if ! grep -qE \'"tool_name":"codex\\.review"\' .rea/audit.jsonl; then exit 1; fi',
+    ].join('\n');
+
+  const wrapAudit = (auditBody: string): string =>
+    [
+      '#!/bin/sh',
+      HUSKY_GATE_MARKER,
+      HUSKY_GATE_BODY_MARKER,
+      'set -eu',
+      '[ -f .rea/HALT ] && exit 1',
+      auditBody,
+    ].join('\n');
+
+  it('HALT: `[ -f .rea/HALT ] && return 1` is NOT accepted (top-level return)', () => {
+    expect(isReaManagedHuskyGate(wrapHalt('[ -f .rea/HALT ] && return 1'))).toBe(false);
+  });
+
+  it('HALT: `if [ -f .rea/HALT ]; then return 1; fi` is NOT accepted', () => {
+    expect(
+      isReaManagedHuskyGate(
+        wrapHalt('if [ -f .rea/HALT ]; then return 1; fi'),
+      ),
+    ).toBe(false);
+  });
+
+  it('AUDIT: `if ! grep ...; then return 1; fi` is NOT accepted', () => {
+    expect(
+      isReaManagedHuskyGate(
+        wrapAudit('if ! grep -qE \'"tool_name":"codex\\.review"\' .rea/audit.jsonl; then return 1; fi'),
+      ),
+    ).toBe(false);
+  });
+
+  it('AUDIT: `if grep ...; then exit 0; fi; return 1` does NOT satisfy form-(c)', () => {
+    // `return 1` at top level is a noop in a real hook, so the post-fi
+    // position has no blocking statement; miss path falls through to `exit 0`.
+    const auditBody = [
+      'if grep -qE \'"tool_name":"codex\\.review"\' .rea/audit.jsonl; then exit 0; fi',
+      'return 1',
+      'exit 0',
+    ].join('\n');
+    expect(isReaManagedHuskyGate(wrapAudit(auditBody))).toBe(false);
+  });
+
+  it('AUDIT: `if grep ...; then exit 0; fi; exit 1` is still accepted (exit unaffected)', () => {
+    const auditBody = [
+      'if grep -qE \'"tool_name":"codex\\.review"\' .rea/audit.jsonl; then exit 0; fi',
+      'exit 1',
+    ].join('\n');
+    expect(isReaManagedHuskyGate(wrapAudit(auditBody))).toBe(true);
+  });
+});
+
+describe('R23 F2 — isAllowOnMatchStmtLine head-token parsing', () => {
+  // Only reachable via hasAuditCheck form (c); test end-to-end.
+  const wrapAudit = (auditBody: string): string =>
+    [
+      '#!/bin/sh',
+      HUSKY_GATE_MARKER,
+      HUSKY_GATE_BODY_MARKER,
+      'set -eu',
+      '[ -f .rea/HALT ] && exit 1',
+      auditBody,
+    ].join('\n');
+
+  it('rejects `if grep ...; then echo exit 0; fi; exit 1` (printed `exit 0` is not a real allow)', () => {
+    const auditBody = [
+      'if grep -qE \'"tool_name":"codex\\.review"\' .rea/audit.jsonl; then echo exit 0; fi',
+      'exit 1',
+    ].join('\n');
+    expect(isReaManagedHuskyGate(wrapAudit(auditBody))).toBe(false);
+  });
+
+  it('rejects `if grep ...; then printf \'exit 0\\n\'; fi; exit 1`', () => {
+    const auditBody = [
+      'if grep -qE \'"tool_name":"codex\\.review"\' .rea/audit.jsonl; then printf \'exit 0\\n\'; fi',
+      'exit 1',
+    ].join('\n');
+    expect(isReaManagedHuskyGate(wrapAudit(auditBody))).toBe(false);
+  });
+
+  it('rejects `if grep ...; then : exit 0; fi; exit 1` (colon-prefixed comment)', () => {
+    const auditBody = [
+      'if grep -qE \'"tool_name":"codex\\.review"\' .rea/audit.jsonl; then : exit 0; fi',
+      'exit 1',
+    ].join('\n');
+    expect(isReaManagedHuskyGate(wrapAudit(auditBody))).toBe(false);
+  });
+
+  it('rejects `if grep ...; then return 0; fi; exit 1` (top-level return is not a terminator)', () => {
+    const auditBody = [
+      'if grep -qE \'"tool_name":"codex\\.review"\' .rea/audit.jsonl; then return 0; fi',
+      'exit 1',
+    ].join('\n');
+    expect(isReaManagedHuskyGate(wrapAudit(auditBody))).toBe(false);
+  });
+
+  it('accepts `if grep ...; then exit 0; fi; exit 1` (real head-position exit 0)', () => {
+    const auditBody = [
+      'if grep -qE \'"tool_name":"codex\\.review"\' .rea/audit.jsonl; then exit 0; fi',
+      'exit 1',
+    ].join('\n');
+    expect(isReaManagedHuskyGate(wrapAudit(auditBody))).toBe(true);
   });
 });
 
