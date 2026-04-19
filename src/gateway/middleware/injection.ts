@@ -529,14 +529,13 @@ export interface InjectionMiddlewareOptions {
    *     pinned warn mode never get a suspicious-deny, even if a profile
    *     layer flipped the flag to `true`.
    *   - `action: 'block'` + flag `true`: suspicious denies.
-   *   - `action: 'block'` + flag `false`: suspicious warns only (explicit
-   *     opt-out). Non-bst consumers who want the looser posture must ask
-   *     for it.
-   *   - `action: 'block'` + flag `undefined` (UNSET): defaults to `true`,
-   *     restoring 0.2.x `injection_detection: block` parity for consumers
-   *     who omit the `injection:` policy block entirely. This was the
-   *     Codex-reported regression in PR #25 — non-bst consumers got
-   *     silently looser behavior on upgrade.
+   *   - `action: 'block'` + flag `false`: suspicious warns only.
+   *   - `action: 'block'` + flag `undefined` (UNSET): defaults to `false`
+   *     to preserve 0.3.x behavior. Consumers who omit the `injection:`
+   *     policy block will NOT be silently tightened on upgrade. To enable
+   *     the stricter posture, set `injection.suspicious_blocks_writes: true`
+   *     explicitly in policy (or use the bst-internal profile, which
+   *     already sets it).
    *
    * Wired from `policy.injection.suspicious_blocks_writes` by the gateway.
    * When the policy omits the `injection:` block, the field is `undefined`
@@ -604,20 +603,21 @@ export function createInjectionMiddleware(
   opts: InjectionMiddlewareOptions = {},
 ): Middleware {
   const timeoutMs = opts.matchTimeoutMs ?? 100;
-  // G9 follow-up (Codex round-1, finding #1): when `action === 'block'` and
-  // `suspicious_blocks_writes` is unset, default to `true` (strict, matches
-  // 0.2.x). The pre-patch default of `false` silently loosened upgraded
-  // consumers who had `injection_detection: block` pinned — a security
-  // regression masquerading as a refinement.
+  // Default `suspiciousBlocksWrites` to `false` when unset to preserve 0.3.x
+  // behavior for existing installs that omit the `injection:` policy block.
+  // A consumer who had `injection_detection: block` in 0.3.x without the new
+  // field would otherwise silently start hard-failing benign tool writes that
+  // contain a single matching phrase on upgrade — a breaking change disguised
+  // as a default. The tighter posture (single literal hit → deny) must be
+  // opted into explicitly via `injection.suspicious_blocks_writes: true`, or
+  // by using a profile (e.g. bst-internal) that already sets it.
   //
-  // Non-bst consumers who want the looser warn-only behavior MUST now opt
-  // out explicitly by setting `injection.suspicious_blocks_writes: false`.
-  // Operators who pinned `injection_detection: warn` still get warn-only by
-  // default (0.2.x warn parity), regardless of this flag.
+  // Fail-closed-on-timeout (Finding 1 fix) already tightens security for
+  // incomplete scans; this default preserves parity for complete scans.
   const denyOnSuspicious =
     action === 'warn'
       ? false // warn mode hard-overrides suspicious deny — 0.2.x parity with `injection_detection: warn`
-      : (opts.suspiciousBlocksWrites ?? true); // block mode: default true (0.2.x parity)
+      : (opts.suspiciousBlocksWrites ?? false); // block mode: default false (0.3.x default preserved)
 
   return async (ctx, next) => {
     await next();
@@ -661,26 +661,15 @@ export function createInjectionMiddleware(
       }
     }
 
-    const classification = classifyInjection(scan, ctx.tier);
-
-    // G9 follow-up (finding #4 + Codex round-2 finding #2): on scanner
-    // timeout, the behavior depends on the configured action:
-    //
-    //   block mode: fail-closed — a timeout under block policy means we
-    //     cannot verify the payload is clean, so we DENY. The attacker who
-    //     crafted a payload that defeats the timeout budget must not get a
-    //     free pass. ctx.status is set to Denied and we return without
-    //     calling next().
-    //
-    //   warn/log mode: fail-open — emit a verdict:'error' metadata record
-    //     alongside the existing injection.regex_timeout event so downstream
-    //     audit consumers see a stable verdict shape, then allow through.
-    //
-    // In both cases the audit record and stderr warning are written first.
-    // Real matches observed before the timeout fired classify normally via
-    // the branches below — this branch only fires when classification is
-    // 'clean' (no actionable signal was collected before the timeout).
-    if (classification.verdict === 'clean' && scanTimedOut) {
+    // Fail closed: in block mode, ANY timeout denies — regardless of what the
+    // partial scan found. An incomplete scan cannot prove the unscanned suffix
+    // is safe. If the provisional classification were `suspicious` (one early
+    // literal hit before the timeout), falling through to the normal policy
+    // path could still allow the call under `suspiciousBlocksWrites: false`,
+    // even though the unscanned suffix might contain a second phrase that
+    // would have escalated to `likely_injection`. Hoisting this check before
+    // `classifyInjection` closes that gap.
+    if (scanTimedOut && action === 'block') {
       const errorMeta: InjectionClassifierMetadata = {
         verdict: 'error',
         matched_patterns: [],
@@ -690,12 +679,28 @@ export function createInjectionMiddleware(
       process.stderr.write(
         `[rea] INJECTION-GUARD (error): regex-timeout during scan of tool "${ctx.tool_name}" result; verdict inconclusive\n`,
       );
-      if (action === 'block') {
-        ctx.status = InvocationStatus.Denied;
-        ctx.error =
-          'injection scan timed out — failing closed under block policy';
-        return; // do NOT call next()
-      }
+      ctx.status = InvocationStatus.Denied;
+      ctx.error = 'injection scan timed out — failing closed under block policy';
+      return; // do NOT call next()
+    }
+
+    const classification = classifyInjection(scan, ctx.tier);
+
+    // warn/log mode + timeout: fail-open — emit a verdict:'error' metadata
+    // record alongside the existing injection.regex_timeout event so
+    // downstream audit consumers see a stable verdict shape, then allow
+    // through. This branch only fires in warn mode (block mode was handled
+    // above) when no actionable signal was collected before the timeout.
+    if (scanTimedOut && classification.verdict === 'clean') {
+      const errorMeta: InjectionClassifierMetadata = {
+        verdict: 'error',
+        matched_patterns: [],
+        base64_decoded: false,
+      };
+      ctx.metadata[INJECTION_METADATA_KEY] = errorMeta;
+      process.stderr.write(
+        `[rea] INJECTION-GUARD (error): regex-timeout during scan of tool "${ctx.tool_name}" result; verdict inconclusive\n`,
+      );
       // warn/log mode: let through but record — verdict:'error' is written above.
       return;
     }
