@@ -38,6 +38,21 @@ async function initGitRepo(dir: string): Promise<void> {
   await execFileAsync('git', ['-C', dir, 'config', 'user.name', 'test']);
 }
 
+// Returns the shipped .husky/pre-push body. Prefers `git show main:.husky/pre-push`
+// for byte-accuracy against the merged-to-main artifact; falls back to reading the
+// working-tree copy when main is not fetched (e.g. CI with default fetch-depth: 1).
+async function readShippedHuskyPrePushBody(): Promise<string> {
+  try {
+    const { stdout } = await execFileAsync('git', ['show', 'main:.husky/pre-push'], {
+      cwd: process.cwd(),
+      maxBuffer: 4 * 1024 * 1024,
+    });
+    return stdout;
+  } catch {
+    return fs.readFile(path.join(process.cwd(), '.husky', 'pre-push'), 'utf8');
+  }
+}
+
 describe('installPrePushFallback — classifyPrePushInstall branches', () => {
   let dir: string;
 
@@ -2975,11 +2990,7 @@ describe('classifyPrePushInstall — R21 F1 legacy husky hook migration', () => 
     // R24 F2 — use the actual shipped body (byte-identical SHA allowlist).
     // The hand-written approximation used pre-R24 did not match any shipped
     // SHA and would now (correctly) classify as foreign.
-    const { stdout: shippedBody } = await execFileAsync(
-      'git',
-      ['show', 'main:.husky/pre-push'],
-      { cwd: process.cwd(), maxBuffer: 4 * 1024 * 1024 },
-    );
+    const shippedBody = await readShippedHuskyPrePushBody();
     await fs.writeFile(path.join(huskyDir, 'pre-push'), shippedBody, { mode: 0o755 });
 
     const decision = await classifyPrePushInstall(dir);
@@ -2994,11 +3005,7 @@ describe('classifyPrePushInstall — R21 F1 legacy husky hook migration', () => 
     await execFileAsync('git', ['-C', dir, 'config', 'core.hooksPath', '.husky']);
     const huskyDir = path.join(dir, '.husky');
     await fs.mkdir(huskyDir, { recursive: true });
-    const { stdout: shippedBody } = await execFileAsync(
-      'git',
-      ['show', 'main:.husky/pre-push'],
-      { cwd: process.cwd(), maxBuffer: 4 * 1024 * 1024 },
-    );
+    const shippedBody = await readShippedHuskyPrePushBody();
     await fs.writeFile(path.join(huskyDir, 'pre-push'), shippedBody, { mode: 0o755 });
 
     const state = await inspectPrePushState(dir);
@@ -3100,18 +3107,12 @@ describe('isLegacyReaManagedHuskyGate — R24 F2 byte-identical SHA allowlist', 
     // If this ever fails, either the legacy hook was regenerated and a new
     // SHA must be added to KNOWN_LEGACY_HUSKY_SHA256, or the content on
     // `main` diverged from the entries in the allowlist.
-    const { stdout } = await execFileAsync('git', ['show', 'main:.husky/pre-push'], {
-      cwd: process.cwd(),
-      maxBuffer: 4 * 1024 * 1024,
-    });
+    const stdout = await readShippedHuskyPrePushBody();
     expect(isLegacyReaManagedHuskyGate(stdout)).toBe(true);
   });
 
   it('rejects the shipped body with a single trailing newline added (byte drift)', async () => {
-    const { stdout } = await execFileAsync('git', ['show', 'main:.husky/pre-push'], {
-      cwd: process.cwd(),
-      maxBuffer: 4 * 1024 * 1024,
-    });
+    const stdout = await readShippedHuskyPrePushBody();
     expect(isLegacyReaManagedHuskyGate(stdout + '\n')).toBe(false);
   });
 
@@ -3135,11 +3136,7 @@ describe('isLegacyReaManagedHuskyGate — R24 F2 byte-identical SHA allowlist', 
   });
 
   it('classifies shipped main hook as rea-managed-husky via classifyPrePushInstall', async () => {
-    const { stdout: shippedBody } = await execFileAsync(
-      'git',
-      ['show', 'main:.husky/pre-push'],
-      { cwd: process.cwd(), maxBuffer: 4 * 1024 * 1024 },
-    );
+    const shippedBody = await readShippedHuskyPrePushBody();
     const dir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-r24-')));
     try {
       await initGitRepo(dir);
@@ -3165,11 +3162,7 @@ describe('isLegacyReaManagedHuskyGate — R24 F2 byte-identical SHA allowlist', 
 
 describe('isLegacyReaManagedHuskyGate — R25 F3 CRLF line-ending tolerance', () => {
   it('accepts the shipped body with LF endings (baseline)', async () => {
-    const { stdout: lfBody } = await execFileAsync(
-      'git',
-      ['show', 'main:.husky/pre-push'],
-      { cwd: process.cwd(), maxBuffer: 4 * 1024 * 1024 },
-    );
+    const lfBody = await readShippedHuskyPrePushBody();
     expect(isLegacyReaManagedHuskyGate(lfBody)).toBe(true);
   });
 
@@ -3177,11 +3170,7 @@ describe('isLegacyReaManagedHuskyGate — R25 F3 CRLF line-ending tolerance', ()
     // Windows git with `core.autocrlf=true` delivers text files with CRLF
     // line endings. R25 F3: consumers on Windows must not be stranded as
     // foreign just because their filesystem rewrote LF → CRLF on checkout.
-    const { stdout: lfBody } = await execFileAsync(
-      'git',
-      ['show', 'main:.husky/pre-push'],
-      { cwd: process.cwd(), maxBuffer: 4 * 1024 * 1024 },
-    );
+    const lfBody = await readShippedHuskyPrePushBody();
     const crlfBody = lfBody.replace(/\n/g, '\r\n');
     // Sanity: CRLF body is NOT equal to the LF body byte-for-byte.
     expect(crlfBody).not.toBe(lfBody);
@@ -3191,21 +3180,13 @@ describe('isLegacyReaManagedHuskyGate — R25 F3 CRLF line-ending tolerance', ()
   });
 
   it('accepts the shipped body converted to bare CR (classic-Mac) as a courtesy', async () => {
-    const { stdout: lfBody } = await execFileAsync(
-      'git',
-      ['show', 'main:.husky/pre-push'],
-      { cwd: process.cwd(), maxBuffer: 4 * 1024 * 1024 },
-    );
+    const lfBody = await readShippedHuskyPrePushBody();
     const crBody = lfBody.replace(/\n/g, '\r');
     expect(isLegacyReaManagedHuskyGate(crBody)).toBe(true);
   });
 
   it('still rejects a CRLF body with an in-body byte edit (normalization covers EOL only)', async () => {
-    const { stdout: lfBody } = await execFileAsync(
-      'git',
-      ['show', 'main:.husky/pre-push'],
-      { cwd: process.cwd(), maxBuffer: 4 * 1024 * 1024 },
-    );
+    const lfBody = await readShippedHuskyPrePushBody();
     // CRLF is allowed, but any other drift flips to foreign.
     const tampered = lfBody.replace('exit 1', 'exit 0').replace(/\n/g, '\r\n');
     expect(isLegacyReaManagedHuskyGate(tampered)).toBe(false);
