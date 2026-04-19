@@ -687,39 +687,24 @@ function hasAuditCheck(content: string): boolean {
     recordBlockingIntoFrame(full);
   }
 
-  // Line-level fallback (R15 F1) — preserves the original top-level audit
-  // grep detection. Iterates over JOINED lines (line continuations collapsed)
-  // rather than semicolon-split statements so that swallow patterns of the
-  // form `grep ... audit.jsonl; echo done` are evaluated as a single logical
-  // line and rejected by `isSwallowingAuditCheck` inside `isAuditGrepLine`.
-  // Splitting on `;` first would hide the trailing swallow from that check.
+  // R19 F1: No bare-grep fallback. The prior line-level fallback accepted a
+  // top-level audit grep under the assumption that POSIX `set -e` would
+  // abort the shell on a miss. But `isReaManagedHuskyGate` never verifies
+  // that `set -e` is actually enabled for the containing hook, so a gate
+  // with `grep ... .rea/audit.jsonl` followed by `exit 0` would pass the
+  // classifier while leaving the miss path non-blocking. Rather than chase
+  // that proof (`set -e` can be disabled by a nested `set +e`, aliased,
+  // overridden by `trap`, etc.), we require an explicit if-form miss-path
+  // blocker — that's what forms (a), (b), and (c) above enforce.
   //
-  // R16 F2 note: lines that are a complete inline `if … fi` construct are
-  // skipped here because the frame parser above has already analyzed them
-  // and made a correct accept/reject decision. Re-matching the embedded
-  // audit grep at line level would over-accept a no-op `then :; fi` spoof.
-  for (const rawLine of joined.split('\n')) {
-    const line = rawLine.trim();
-    if (line === '' || line.startsWith('#')) continue;
-    // Skip any line that is an `if` statement (whether single-line with
-    // trailing `fi` or the opening line of a multi-line block). The frame
-    // parser above is authoritative for if-constructs and correctly decides
-    // accept/reject; re-matching the embedded audit grep here would
-    // over-accept no-op `then :; fi` spoofs and `if ! …; then continue; fi`
-    // shapes whose miss path doesn't block. Top-level bare grep lines
-    // (the only thing this fallback exists to catch) do not start with
-    // `if` anyway, so this narrows the fallback without regressing it.
-    if (/^if\b/.test(line)) continue;
-    // Same reasoning for elif/then/else/fi/do/done/esac — these appear
-    // on their own lines inside multi-line constructs the frame parser
-    // is tracking. Re-matching the text inside those lines is not what
-    // the fallback is for.
-    if (/^(elif|then|else|fi|do|done|esac|while|for|until|case)\b/.test(line)) {
-      continue;
-    }
-    if (isAuditGrepLine(line, auditVars)) return true;
-  }
-
+  // Consequence: the only accepted audit-check shapes are now
+  //   (a) `if ! <audit-grep>; then exit N; fi`
+  //   (b) `if <audit-grep>; then :; else exit N; fi`
+  //   (c) `if <audit-grep>; then exit 0; fi` followed by top-level `exit N`
+  //
+  // Any hook shape outside this set is treated as not-audit-enforced and
+  // therefore not rea-managed; `rea doctor` will flag it and the installer
+  // will refresh it to the canonical husky-gate template.
   return false;
 }
 
@@ -836,6 +821,57 @@ function isBlockingStmtLine(line: string, _loopDepth: number): boolean {
  */
 function joinLineContinuations(content: string): string {
   return content.replace(/\\\r?\n/g, ' ');
+}
+
+/**
+ * Replace every function-body line with an empty line so downstream
+ * classifiers only see top-level (reachable) shell. A function definition
+ * with no call site is dead code — any `exec <gate>` / `GATE=...; exec
+ * "$GATE"` / etc. inside it MUST be ignored, otherwise the classifier
+ * accepts uncalled helper functions as proof of gate delegation (R18 F1
+ * + R19 F2).
+ *
+ * Recognizes both POSIX and bash-style function definitions:
+ *   name() { body; }
+ *   name() {
+ *     body
+ *   }
+ *   function name { body; }
+ *   function name() { body; }
+ *
+ * Brace counting strips `${...}` parameter expansions first so they don't
+ * skew the depth counter. Approximate but fail-closed: a pathological
+ * unbalanced `{` inside a heredoc would leak into a "still-in-function"
+ * state, erasing more content than necessary — that errs toward
+ * under-accepting, never over-accepting.
+ */
+function stripFunctionBodies(content: string): string {
+  const lines = content.split(/\r?\n/);
+  const out: string[] = [];
+  let funcBraceDepth = 0;
+  const funcDefRe =
+    /^(?:function[ \t]+[A-Za-z_][A-Za-z0-9_]*(?:[ \t]*\([ \t]*\))?|[A-Za-z_][A-Za-z0-9_]*[ \t]*\([ \t]*\))[ \t]*\{?[ \t]*$/;
+  for (const raw of lines) {
+    const line = raw.trimStart();
+    if (funcBraceDepth === 0) {
+      const stripped = line.replace(/\$\{[^}]*\}/g, '');
+      if (funcDefRe.test(stripped)) {
+        funcBraceDepth++;
+        out.push('');
+        continue;
+      }
+    }
+    if (funcBraceDepth > 0) {
+      const stripped = line.replace(/\$\{[^}]*\}/g, '');
+      const opens = (stripped.match(/\{/g) ?? []).length;
+      const closes = (stripped.match(/\}/g) ?? []).length;
+      funcBraceDepth = Math.max(0, funcBraceDepth + opens - closes);
+      out.push('');
+      continue;
+    }
+    out.push(raw);
+  }
+  return out.join('\n');
 }
 
 /**
@@ -1012,12 +1048,19 @@ function isGrepOnlyPipeline(line: string): boolean {
  * correctly-governed consumer repos.
  */
 export function referencesReviewGate(content: string): boolean {
+  // R19 F2: Pre-strip function bodies before ANY detection pass. Both the
+  // literal-path line walker and the variable-indirection helper must agree
+  // that content inside an uncalled function is dead code. Previously the
+  // variable-indirection path ran first (early return) and bypassed the
+  // function-scope guard that only the literal-path walker applied.
+  const topLevel = stripFunctionBodies(content);
+
   // First pass: variable indirection. If the caller wrote the path into a
   // shell variable and execs the variable, same-line matching won't catch it.
   // Scan for assignment + later invocation of the same variable.
-  if (hasVariableGateInvocation(content)) return true;
+  if (hasVariableGateInvocation(topLevel)) return true;
 
-  const lines = content.split(/\r?\n/);
+  const lines = topLevel.split(/\r?\n/);
   let exitedBeforeGate = false;
   let depth = 0;
   // R18 F1: function bodies are a separate scope that was not depth-tracked.

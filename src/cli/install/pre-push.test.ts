@@ -655,7 +655,7 @@ describe('installPrePushFallback — concurrency + temp-file hygiene', () => {
     const huskyBody =
       `#!/bin/sh\n${HUSKY_GATE_MARKER}\n${HUSKY_GATE_BODY_MARKER}\n` +
       `if [ -f "\${REA_ROOT}/.rea/HALT" ]; then exit 1; fi\n` +
-      `grep -q codex.review .rea/audit.jsonl\n`;
+      `if ! grep -q codex.review .rea/audit.jsonl; then exit 1; fi\n`;
 
     const result = await installPrePushFallback(dir, {
       onBeforeReresolve: async (hookPath) => {
@@ -1072,7 +1072,7 @@ describe('isReaManagedHuskyGate — Husky gate marker detection (Finding 2)', ()
     // they cannot be the security boundary.
     expect(
       isReaManagedHuskyGate(
-        `#!/bin/sh\n${HUSKY_GATE_MARKER}\n${HUSKY_GATE_BODY_MARKER}\n[ -f .rea/HALT ] && exit 1\ngrep codex.review .rea/audit.jsonl\n`,
+        `#!/bin/sh\n${HUSKY_GATE_MARKER}\n${HUSKY_GATE_BODY_MARKER}\n[ -f .rea/HALT ] && exit 1\nif ! grep codex.review .rea/audit.jsonl; then exit 1; fi\n`,
       ),
     ).toBe(true);
   });
@@ -1160,7 +1160,7 @@ describe('isReaManagedHuskyGate — Husky gate marker detection (Finding 2)', ()
 
   it('R10 F4: CRLF line endings with full behavioral signature: returns true', () => {
     // Windows checkouts or `text=auto` gitattributes may produce CRLF.
-    const content = `#!/bin/sh\r\n${HUSKY_GATE_MARKER}\r\n${HUSKY_GATE_BODY_MARKER}\r\n[ -f .rea/HALT ] && exit 1\r\ngrep codex.review .rea/audit.jsonl\r\n`;
+    const content = `#!/bin/sh\r\n${HUSKY_GATE_MARKER}\r\n${HUSKY_GATE_BODY_MARKER}\r\n[ -f .rea/HALT ] && exit 1\r\nif ! grep codex.review .rea/audit.jsonl; then exit 1; fi\r\n`;
     expect(isReaManagedHuskyGate(content)).toBe(true);
   });
 
@@ -1218,7 +1218,7 @@ describe('isReaManagedHuskyGate — Husky gate marker detection (Finding 2)', ()
     const content =
       `#!/bin/sh\n${HUSKY_GATE_MARKER}\n` +
       `[ -f .rea/HALT ] && exit 1\n` +
-      `grep -q codex.review .rea/audit.jsonl\n`;
+      `if ! grep -q codex.review .rea/audit.jsonl; then exit 1; fi\n`;
     expect(isReaManagedHuskyGate(content)).toBe(true);
   });
 
@@ -1230,7 +1230,7 @@ describe('isReaManagedHuskyGate — Husky gate marker detection (Finding 2)', ()
       `  printf 'frozen\\n' >&2\n` +
       `  exit 1\n` +
       `fi\n` +
-      `grep -qE '"tool_name":"codex.review"' .rea/audit.jsonl\n`;
+      `if ! grep -qE '"tool_name":"codex.review"' .rea/audit.jsonl; then exit 1; fi\n`;
     expect(isReaManagedHuskyGate(content)).toBe(true);
   });
 
@@ -1238,7 +1238,7 @@ describe('isReaManagedHuskyGate — Husky gate marker detection (Finding 2)', ()
     const content =
       `#!/bin/sh\n${HUSKY_GATE_MARKER}\n` +
       `[ -f .rea/HALT ] && { printf 'frozen\\n' >&2; exit 1; }\n` +
-      `grep -q codex.review .rea/audit.jsonl\n`;
+      `if ! grep -q codex.review .rea/audit.jsonl; then exit 1; fi\n`;
     expect(isReaManagedHuskyGate(content)).toBe(true);
   });
 
@@ -1249,7 +1249,7 @@ describe('isReaManagedHuskyGate — Husky gate marker detection (Finding 2)', ()
     const content =
       `#!/bin/sh\n${HUSKY_GATE_MARKER}\n` +
       `test -f .rea/HALT && exit 1\n` +
-      `grep -q '"tool_name":"codex.review"' .rea/audit.jsonl\n`;
+      `if ! grep -q '"tool_name":"codex.review"' .rea/audit.jsonl; then exit 1; fi\n`;
     expect(isReaManagedHuskyGate(content)).toBe(true);
   });
 
@@ -1257,7 +1257,7 @@ describe('isReaManagedHuskyGate — Husky gate marker detection (Finding 2)', ()
     const content =
       `#!/bin/sh\n${HUSKY_GATE_MARKER}\n` +
       `[ -f .rea/HALT ] && exit 1\n` +
-      `rg -q codex.review .rea/audit.jsonl\n`;
+      `if ! rg -q codex.review .rea/audit.jsonl; then exit 1; fi\n`;
     expect(isReaManagedHuskyGate(content)).toBe(true);
   });
 
@@ -1312,7 +1312,7 @@ describe('isReaManagedHuskyGate — Husky gate marker detection (Finding 2)', ()
     const content =
       `#!/bin/sh\n${HUSKY_GATE_MARKER}\n` +
       `if [ -f .rea/HALT ]; then exit 2; fi\n` +
-      `grep -q codex.review .rea/audit.jsonl\n`;
+      `if ! grep -q codex.review .rea/audit.jsonl; then exit 1; fi\n`;
     expect(isReaManagedHuskyGate(content)).toBe(true);
   });
 
@@ -1364,7 +1364,7 @@ describe('isReaManagedHuskyGate — Husky gate marker detection (Finding 2)', ()
     const content =
       `#!/bin/sh\n${HUSKY_GATE_MARKER}\n` +
       `[ -f .rea/HALT ] && exit 1\n` +
-      `grep -q codex.review .rea/audit.jsonl\n`;
+      `if ! grep -q codex.review .rea/audit.jsonl; then exit 1; fi\n`;
     expect(isReaManagedHuskyGate(content)).toBe(true);
   });
 
@@ -1372,7 +1372,7 @@ describe('isReaManagedHuskyGate — Husky gate marker detection (Finding 2)', ()
     const content =
       `#!/bin/sh\n${HUSKY_GATE_MARKER}\n` +
       `[ -f .rea/HALT ] && exit 1\n` +
-      `grep -E '"tool_name":"codex\\.review"' .rea/audit.jsonl\n`;
+      `if ! grep -E '"tool_name":"codex\\.review"' .rea/audit.jsonl; then exit 1; fi\n`;
     expect(isReaManagedHuskyGate(content)).toBe(true);
   });
 
@@ -1491,13 +1491,13 @@ describe('isReaManagedHuskyGate — R15 F1 audit check must prove enforcement', 
 
   it('grep piped to grep (both grep-family): returns true', () => {
     const content =
-      `${header}grep -E '"tool_name":"codex.review"' .rea/audit.jsonl | grep -qF head_sha\n`;
+      `${header}if ! grep -E '"tool_name":"codex.review"' .rea/audit.jsonl | grep -qF head_sha; then exit 1; fi\n`;
     expect(isReaManagedHuskyGate(content)).toBe(true);
   });
 
   it('variable indirection bound to .rea/audit.jsonl: returns true', () => {
     const content =
-      `${header}AUDIT=.rea/audit.jsonl\ngrep -q codex.review "$AUDIT"\n`;
+      `${header}AUDIT=.rea/audit.jsonl\nif ! grep -q codex.review "$AUDIT"; then exit 1; fi\n`;
     expect(isReaManagedHuskyGate(content)).toBe(true);
   });
 
@@ -1538,7 +1538,7 @@ describe('isReaManagedHuskyGate — R15 F1 audit check must prove enforcement', 
 // `if ...; then exit 1; fi` block to spoof the check.
 describe('isReaManagedHuskyGate — R16 F1 block-aware HALT enforcement', () => {
   const audit =
-    'grep -qE \'"tool_name":"codex\\.review"\' .rea/audit.jsonl\n';
+    'if ! grep -qE \'"tool_name":"codex\\.review"\' .rea/audit.jsonl; then exit 1; fi\n';
 
   it('no-op HALT body + unrelated exit in a later if-block: returns false', () => {
     const content =
@@ -1693,6 +1693,103 @@ describe('referencesReviewGate — R18 F1 function-body scope', () => {
   });
 });
 
+// R19 F2: `hasVariableGateInvocation` must also respect function-body
+// scope. Previously it ran BEFORE the line-level function-scope guard
+// and returned true for an uncalled function whose body did
+// `GATE=.../gate; exec "$GATE" "$@"`. `referencesReviewGate` now
+// pre-strips function bodies via `stripFunctionBodies` so BOTH the
+// variable-indirection helper and the literal-path walker see only
+// top-level content.
+describe('referencesReviewGate — R19 F2 variable gate inside uncalled function', () => {
+  it('uncalled function with variable-indirected exec: returns false', () => {
+    const content =
+      `#!/bin/sh\n` +
+      `run_gate() {\n` +
+      `  GATE=.claude/hooks/push-review-gate.sh\n` +
+      `  exec "$GATE" "$@"\n` +
+      `}\n`;
+    expect(referencesReviewGate(content)).toBe(false);
+  });
+
+  it('same-line function body with variable exec: returns false', () => {
+    const content =
+      `#!/bin/sh\n` +
+      `run_gate() { GATE=.claude/hooks/push-review-gate.sh; exec "$GATE" "$@"; }\n`;
+    expect(referencesReviewGate(content)).toBe(false);
+  });
+
+  it('`function name { … }` keyword form with variable exec: returns false', () => {
+    const content =
+      `#!/bin/sh\n` +
+      `function run_gate {\n` +
+      `  GATE=.claude/hooks/push-review-gate.sh\n` +
+      `  exec "$GATE" "$@"\n` +
+      `}\n`;
+    expect(referencesReviewGate(content)).toBe(false);
+  });
+
+  it('top-level variable-indirected exec (no function wrapper): returns true', () => {
+    const content =
+      `#!/bin/sh\n` +
+      `GATE=.claude/hooks/push-review-gate.sh\n` +
+      `exec "$GATE" "$@"\n`;
+    expect(referencesReviewGate(content)).toBe(true);
+  });
+});
+
+// R19 F1: `hasAuditCheck` no longer accepts a bare top-level grep as
+// proof of audit enforcement. The previous line-level fallback assumed
+// POSIX `set -e` would abort the shell on a grep miss, but the
+// classifier never verified `set -e` was actually enabled. Acceptance
+// now requires one of three explicit if-form blocking shapes (a/b/c).
+describe('isReaManagedHuskyGate — R19 F1 bare grep without set -e blocker', () => {
+  it('bare grep audit + explicit `exit 0` (no set -e): returns false', () => {
+    const content =
+      `#!/bin/sh\n${HUSKY_GATE_MARKER}\n[ -f .rea/HALT ] && exit 1\n` +
+      `grep -qE '"tool_name":"codex\\.review"' .rea/audit.jsonl\n` +
+      `exit 0\n`;
+    expect(isReaManagedHuskyGate(content)).toBe(false);
+  });
+
+  it('bare grep audit followed by bare `:` (no blocker anywhere): returns false', () => {
+    const content =
+      `#!/bin/sh\n${HUSKY_GATE_MARKER}\n[ -f .rea/HALT ] && exit 1\n` +
+      `grep -qE '"tool_name":"codex\\.review"' .rea/audit.jsonl\n`;
+    expect(isReaManagedHuskyGate(content)).toBe(false);
+  });
+
+  it('bare grep audit with `set -e` and fall-through: still returns false', () => {
+    // Even with `set -e` present, the bare-grep fallback is dropped —
+    // the classifier cannot prove `set -e` stays in effect (nested
+    // `set +e`, aliases, traps, etc.). Require an explicit if-form.
+    const content =
+      `#!/bin/sh\n${HUSKY_GATE_MARKER}\nset -e\n[ -f .rea/HALT ] && exit 1\n` +
+      `grep -qE '"tool_name":"codex\\.review"' .rea/audit.jsonl\n`;
+    expect(isReaManagedHuskyGate(content)).toBe(false);
+  });
+
+  it('form (a) negated if + exit: still returns true', () => {
+    const content =
+      `#!/bin/sh\n${HUSKY_GATE_MARKER}\n[ -f .rea/HALT ] && exit 1\n` +
+      `if ! grep -qE '"tool_name":"codex\\.review"' .rea/audit.jsonl; then exit 1; fi\n`;
+    expect(isReaManagedHuskyGate(content)).toBe(true);
+  });
+
+  it('form (b) positive if + blocking else: still returns true', () => {
+    const content =
+      `#!/bin/sh\n${HUSKY_GATE_MARKER}\n[ -f .rea/HALT ] && exit 1\n` +
+      `if grep -qE '"tool_name":"codex\\.review"' .rea/audit.jsonl; then :; else exit 1; fi\n`;
+    expect(isReaManagedHuskyGate(content)).toBe(true);
+  });
+
+  it('form (c) positive if + allow in then + post-fi blocker: still returns true', () => {
+    const content =
+      `#!/bin/sh\n${HUSKY_GATE_MARKER}\n[ -f .rea/HALT ] && exit 1\n` +
+      `if grep -qE '"tool_name":"codex\\.review"' .rea/audit.jsonl; then exit 0; fi\nexit 1\n`;
+    expect(isReaManagedHuskyGate(content)).toBe(true);
+  });
+});
+
 // R16 F3: gate-delegation via variable MUST consider reassignment. A
 // pattern like `GATE=.claude/hooks/push-review-gate.sh; GATE=/bin/true;
 // exec "$GATE"` must not pass: the value at exec-time is what matters,
@@ -1736,7 +1833,7 @@ describe('referencesReviewGate — R16 F3 variable reassignment', () => {
 // the text `exit 1` satisfied the check without any actual exit.
 describe('isReaManagedHuskyGate — R17 F1 HALT command-token parsing', () => {
   const audit =
-    'grep -qE \'"tool_name":"codex\\.review"\' .rea/audit.jsonl\n';
+    'if ! grep -qE \'"tool_name":"codex\\.review"\' .rea/audit.jsonl; then exit 1; fi\n';
 
   it('`[ -f .rea/HALT ] && echo exit 1` (echo as argument): returns false', () => {
     const content =
@@ -2417,7 +2514,7 @@ describe('inspectPrePushState — Husky gate recognized as rea-managed (Finding 
     await fs.mkdir(huskyDir, { recursive: true });
     await fs.writeFile(
       path.join(huskyDir, 'pre-push'),
-      `#!/bin/sh\n${HUSKY_GATE_MARKER}\n${HUSKY_GATE_BODY_MARKER}\n[ -f .rea/HALT ] && exit 1\ngrep '"tool_name":"codex.review"' .rea/audit.jsonl || exit 1\nexec .claude/hooks/push-review-gate.sh "$@"\n`,
+      `#!/bin/sh\n${HUSKY_GATE_MARKER}\n${HUSKY_GATE_BODY_MARKER}\n[ -f .rea/HALT ] && exit 1\nif ! grep '"tool_name":"codex.review"' .rea/audit.jsonl; then exit 1; fi\nexec .claude/hooks/push-review-gate.sh "$@"\n`,
       { mode: 0o755 },
     );
     await execFileAsync('git', ['-C', dir, 'config', 'core.hooksPath', huskyDir]);
