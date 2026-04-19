@@ -944,6 +944,20 @@ export async function installPrePushFallback(
             };
             return result;
           }
+          if (e.code === 'EXDEV' || e.code === 'EPERM' || e.code === 'ENOSYS') {
+            // link() not supported (cross-device mount, network FS, old kernel).
+            // Degrade gracefully rather than surfacing an opaque FS error.
+            result.warnings.push(
+              `pre-push hook at ${decision.hookPath} could not be installed (${e.code}) — ` +
+                `filesystem does not support hard links. Run \`rea init --force\` on a local filesystem.`,
+            );
+            result.decision = {
+              action: 'skip',
+              reason: 'foreign-pre-push',
+              hookPath: decision.hookPath,
+            };
+            return result;
+          }
           throw writeErr;
         }
         result.written = decision.hookPath;

@@ -243,15 +243,15 @@ function checkCommitMsgHook(baseDir: string): CheckResult {
  *      unconfigured hooksPath is dead weight; we do NOT treat it as
  *      sufficient.
  *
- * Three possible outcomes (default / strict):
- *   - `pass`: active hook exists, is executable, and governance-carrying.
- *   - `warn` (default) / `fail` (strict): active hook exists + is
- *     executable but does NOT invoke the review gate (the "silent bypass"
- *     case — a lint-only husky hook, a pre-existing repo hook). We refuse
- *     to auto-stomp it, but the gate is not wired; the user must add a
- *     gate `exec` or let `rea init` install the fallback. CI must run with
- *     `--strict` so this state causes a non-zero exit code.
- *   - `fail`: no active hook at all (or active file is non-executable).
+ * Two possible outcomes:
+ *   - `pass`: active hook exists, is executable, and governance-carrying
+ *     (rea-managed marker or direct gate delegation).
+ *   - `fail`: no active hook, active file is non-executable, OR the active
+ *     hook does not reference `.claude/hooks/push-review-gate.sh`. The last
+ *     case is the "silent bypass" state — a lint-only husky hook or a
+ *     pre-existing repo hook that bypasses the Codex audit gate entirely.
+ *     Always a hard fail; `rea init` can install the fallback if the user
+ *     removes or updates the existing hook.
  *
  * "Executable" is defined by any user/group/other exec bit, matching
  * `checkHooksInstalled`.
@@ -278,8 +278,7 @@ function checkPrePushHook(state: PrePushDoctorState): CheckResult {
     // add the exec line manually or remove it and let `rea init` install
     // the fallback.
     //
-    // Always fail — a foreign hook that bypasses the review gate is a
-    // governance gap regardless of strict mode.
+    // Always fail — a foreign hook that bypasses the review gate is a governance gap.
     return {
       label: 'pre-push hook installed',
       status: 'fail',
