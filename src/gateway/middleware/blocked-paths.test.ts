@@ -496,7 +496,7 @@ describe('blocked-paths middleware — Codex round-2 security findings', () => {
 describe('blocked-paths middleware — Finding 1 round-3 — deeper encoding', () => {
   // GPT-5.4 Codex adversarial review finding: the two-pass logic closed
   // double-encoding (%252F) but not triple-encoding (%25252F) or deeper.
-  // The iterative decode-until-stable loop (max 5 passes) closes all depths.
+  // The iterative decode-until-stable loop (no cap) closes all depths.
 
   it('blocks .rea/ via triple-encoded separator (%25252F)', async () => {
     // .rea%25252Ffoo → first pass → .rea%252Ffoo → second pass → .rea%2Ffoo
@@ -532,5 +532,110 @@ describe('blocked-paths middleware — Finding 1 round-3 — deeper encoding', (
     const ctx = freshCtx({ file_path: 'file:/etc/passwd' });
     await run(mw, ctx);
     expect(ctx.status).toBe(InvocationStatus.Denied);
+  });
+});
+
+describe('blocked-paths middleware — GPT-5.4 Codex round-4 security findings', () => {
+  // Finding 1 [critical]: decode cap bypassable at depth 6+
+  // The 5-pass cap meant .rea%25252525252Ffoo (6 encode levels) emerged as
+  // .rea%2ffoo after 5 passes. The loop is now cap-free + hasDeepEncodedSeparator
+  // catches any remaining %2f/%5c after the stable loop exits.
+  describe('Finding 1 — depth-6+ encode bypass (no-cap loop + hasDeepEncodedSeparator)', () => {
+    it('blocks .rea/ via 6-level encoded separator', async () => {
+      // 6 encode levels: .rea%25252525252Ffoo
+      // Previously: 5 passes → .rea%2ffoo → missed
+      // Now: stable loop decodes fully → .rea/foo → Denied
+      const mw = createBlockedPathsMiddleware(stubPolicy([]));
+      const ctx = freshCtx({ file_path: '.rea%25252525252Ffoo' });
+      await run(mw, ctx);
+      expect(ctx.status).toBe(InvocationStatus.Denied);
+    });
+
+    it('blocks .env via 6-level encoded separator', async () => {
+      const mw = createBlockedPathsMiddleware(stubPolicy(['.env']));
+      const ctx = freshCtx({ file_path: '/project%25252525252F.env' });
+      await run(mw, ctx);
+      expect(ctx.status).toBe(InvocationStatus.Denied);
+    });
+
+    it('blocks .rea/ via double-encoded separator in path component (%252f)', async () => {
+      // .rea%252ffoo → pass 1 → .rea%2ffoo → pass 2 → .rea/foo → stable.
+      // normalizePath fully decodes → segments ['.rea', 'foo'] → matches .rea/.
+      // hasDeepEncodedSeparator provides defense-in-depth for residual %2f
+      // that would survive a catch-early exit from the decode loop.
+      const mw = createBlockedPathsMiddleware(stubPolicy([]));
+      const ctx = freshCtx({ file_path: '.rea%252ffoo' });
+      await run(mw, ctx);
+      expect(ctx.status).toBe(InvocationStatus.Denied);
+    });
+  });
+
+  // Finding 2 [high]: file: URIs with query/fragment bypass exact blocked paths
+  // file:///etc/passwd#x → after scheme strip → /etc/passwd#x →
+  // posix.normalize keeps # in last segment → 'passwd#x' !== 'passwd'
+  describe('Finding 2 — file: URI query/fragment bypass', () => {
+    it('blocks /etc/passwd referenced as file:///etc/passwd#fragment', async () => {
+      const mw = createBlockedPathsMiddleware(stubPolicy(['/etc/passwd']));
+      const ctx = freshCtx({ file_path: 'file:///etc/passwd#fragment' });
+      await run(mw, ctx);
+      expect(ctx.status).toBe(InvocationStatus.Denied);
+    });
+
+    it('blocks .env referenced as file:///project/.env?dl=1', async () => {
+      const mw = createBlockedPathsMiddleware(stubPolicy(['.env']));
+      const ctx = freshCtx({ file_path: 'file:///project/.env?dl=1' });
+      await run(mw, ctx);
+      expect(ctx.status).toBe(InvocationStatus.Denied);
+    });
+
+    it('blocks .env referenced as file:///project/.env?dl=1#section', async () => {
+      const mw = createBlockedPathsMiddleware(stubPolicy(['.env']));
+      const ctx = freshCtx({ file_path: 'file:///project/.env?dl=1#section' });
+      await run(mw, ctx);
+      expect(ctx.status).toBe(InvocationStatus.Denied);
+    });
+
+    it('blocks .rea/ referenced as file:///project/.rea/policy.yaml#top', async () => {
+      const mw = createBlockedPathsMiddleware(stubPolicy([]));
+      const ctx = freshCtx({ file_path: 'file:///project/.rea/policy.yaml#top' });
+      await run(mw, ctx);
+      expect(ctx.status).toBe(InvocationStatus.Denied);
+    });
+  });
+
+  // Finding 3 [medium]: non-file schemes collapsed to local paths → false positives
+  // http://example.com/etc/passwd previously → /etc/passwd → Denied (wrong).
+  // Now normalizePath returns '' for non-file schemes → Allowed (correct).
+  describe('Finding 3 — non-file schemes are not local paths (false positive fix)', () => {
+    it('allows http://example.com/etc/passwd — remote URL, not a local path', async () => {
+      const mw = createBlockedPathsMiddleware(stubPolicy(['/etc/passwd']));
+      const ctx = freshCtx({ url: 'http://example.com/etc/passwd' });
+      const nextCalled = await run(mw, ctx);
+      expect(nextCalled).toBe(true);
+      expect(ctx.status).toBe(InvocationStatus.Allowed);
+    });
+
+    it('allows https://evil.com/.rea/policy.yaml — remote URL', async () => {
+      const mw = createBlockedPathsMiddleware(stubPolicy([]));
+      const ctx = freshCtx({ url: 'https://evil.com/.rea/policy.yaml' });
+      const nextCalled = await run(mw, ctx);
+      expect(nextCalled).toBe(true);
+      expect(ctx.status).toBe(InvocationStatus.Allowed);
+    });
+
+    it('allows ftp://server/etc/passwd — remote URL', async () => {
+      const mw = createBlockedPathsMiddleware(stubPolicy(['/etc/passwd']));
+      const ctx = freshCtx({ url: 'ftp://server/etc/passwd' });
+      const nextCalled = await run(mw, ctx);
+      expect(nextCalled).toBe(true);
+      expect(ctx.status).toBe(InvocationStatus.Allowed);
+    });
+
+    it('still denies file:///etc/passwd — local file URI', async () => {
+      const mw = createBlockedPathsMiddleware(stubPolicy(['/etc/passwd']));
+      const ctx = freshCtx({ url: 'file:///etc/passwd' });
+      await run(mw, ctx);
+      expect(ctx.status).toBe(InvocationStatus.Denied);
+    });
   });
 });

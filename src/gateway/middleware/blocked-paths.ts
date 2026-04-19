@@ -38,11 +38,16 @@ import type { Middleware } from './chain.js';
  *   single-segment globs (`*` = any chars except `/`, `?` = one non-`/` char).
  * SECURITY: URL-encoded separators and case variants are normalized first.
  * SECURITY: Triple+ encoded separators (%25252F → … → /) are decoded via an
- *   iterative decode-until-stable loop (max 5 passes) so they cannot escape
- *   the normalizer.
- * SECURITY: URI scheme + optional authority (file://host/path, file:///path,
- *   file:/path) are stripped before decoding so all scheme forms collapse to
- *   a bare path and cannot bypass absolute-path patterns.
+ *   iterative decode-until-stable loop (no arbitrary cap) so they cannot escape
+ *   the normalizer regardless of encoding depth.
+ * SECURITY: Only `file:` URIs are mapped to local filesystem paths. All other
+ *   URI schemes (http:, https:, ftp:, etc.) reference remote resources and are
+ *   returned as empty string so they never match any blocked_paths entry.
+ * SECURITY: `file:` URI authority forms (file://host/path, file:///path,
+ *   file:/path) are all stripped to a bare path before decoding.
+ * SECURITY: Query strings and fragments in `file:` URIs
+ *   (`file:///etc/passwd?dl=1#x`) are stripped before normalization so the
+ *   path component is compared cleanly against blocked entries.
  * SECURITY: C0 control characters (including null bytes) are stripped after
  *   decoding so they cannot smuggle segment prefixes past equality checks.
  * SECURITY: Malformed URL-escapes are treated as hostile (request blocked).
@@ -140,6 +145,15 @@ export function createBlockedPathsMiddleware(initialPolicy: Policy, baseDir?: st
       if (hasMalformedEscape(value)) {
         ctx.status = InvocationStatus.Denied;
         ctx.error = `Argument "${key}" contains malformed URL-escape; blocked as hostile. Tool: ${ctx.tool_name}`;
+        return;
+      }
+      // Fail closed: if encoded path separators (%2f / %5c) remain after a
+      // full iterative decode, the value is using evasion-level encoding
+      // deeper than the decode loop would surface (>5 levels). Treat as hostile
+      // rather than risk a miss.
+      if (hasDeepEncodedSeparator(value)) {
+        ctx.status = InvocationStatus.Denied;
+        ctx.error = `Argument "${key}" contains deeply-encoded path separator; blocked as hostile. Tool: ${ctx.tool_name}`;
         return;
       }
       for (const pattern of patterns) {
@@ -263,6 +277,35 @@ function hasMalformedEscape(value: string): boolean {
 }
 
 /**
+ * Detect evasion-level encoding: run a decode-until-stable loop and check
+ * whether any percent-encoded path separators (%2f / %5c) survive all passes.
+ *
+ * This closes the depth-6+ bypass: `.rea%25252525252Ffoo` encodes the
+ * separator at 6 levels. After 5 decode passes it emerges as `.rea%2ffoo` —
+ * the pattern check would miss it. Running to true stability and then checking
+ * for remaining encoded separators catches all depths regardless of how many
+ * encode rounds were applied.
+ *
+ * Strings without `%` short-circuit immediately. The try/catch exits cleanly
+ * on any URIError so malformed inputs (already caught by hasMalformedEscape)
+ * do not crash here.
+ */
+function hasDeepEncodedSeparator(value: string): boolean {
+  if (!value.includes('%')) return false;
+  let v = value;
+  for (;;) {
+    try {
+      const next = decodeURIComponent(v);
+      if (next === v) break;
+      v = next;
+    } catch {
+      break;
+    }
+  }
+  return /%2[fF]|%5[cC]/i.test(v);
+}
+
+/**
  * Check a candidate value against a blocked-path pattern with path-segment
  * awareness. Supports simple globs: `*` = any chars except `/`, `?` = one
  * non-`/` char. Trailing `/` means "this directory and everything under it".
@@ -362,8 +405,8 @@ function globToRegex(glob: string): RegExp {
 }
 
 /**
- * Normalize a value or pattern: strip URI scheme, URL-decode (with a second
- * pass for double-encoded separators), strip C0 control characters, normalize
+ * Normalize a value or pattern: strip URI scheme, URL-decode iteratively until
+ * stable (handles any encoding depth), strip C0 control characters, normalize
  * path separators, resolve `.`/`..` segments, lowercase.
  *
  * IMPORTANT: callers MUST first reject malformed URL-escapes via
@@ -371,33 +414,56 @@ function globToRegex(glob: string): RegExp {
  * falling back to undecoded content on URIError previously allowed crafted
  * `.rea%ZZ/foo` sequences to bypass the `.rea/` check.
  *
- * Step 1 — Strip URI scheme + optional authority: handles all three forms so
- *   `file:///path`, `file://host/path`, and `file:/path` all collapse to
- *   `/path` before any pattern matching.
- * Steps 2–3 — Iterative decode until stable (max 5 passes): catches triple+
- *   encoded separators (`%25252F` → `%252F` → `%2F` → `/`). Exits early when
- *   the value stops changing; per-iteration try/catch exits on URIError.
- * Step 4 — Strip C0 control characters (Finding 2): removes null bytes and
+ * Step 1 — URI scheme dispatch:
+ *   - Non-file schemes (http:, https:, ftp:, …) reference remote resources and
+ *     are returned immediately as `''` — they never match any blocked_paths
+ *     entry (all of which are local filesystem paths).
+ *   - `file:` URIs: strip the scheme + optional authority so all three forms
+ *     collapse to a plain absolute path (`file:///path`, `file://host/path`,
+ *     `file:/path` → `/path`).
+ *   - No scheme: left as-is.
+ * Step 1b — Strip query string and fragment from `file:` paths so
+ *   `file:///etc/passwd?dl=1#x` → `/etc/passwd` before any matching.
+ * Step 2 — Iterative decode until stable (no cap): catches triple+ encoded
+ *   separators (`%25252F` → `%252F` → `%2F` → `/`). Exits when the value
+ *   stops changing; per-iteration try/catch exits on URIError.
+ * Step 3 — Strip C0 control characters (Finding 2): removes null bytes and
  *   other control chars that could smuggle segment prefixes past equality
  *   checks (e.g. `\x00.gitignore` → `.gitignore`).
  */
 function normalizePath(raw: string): string {
-  // Step 1: strip URI scheme + optional authority so all three forms collapse
-  // to a plain absolute path:
-  //   scheme:///path        → /path  (triple-slash, empty authority)
-  //   scheme://host/path    → /path  (named authority)
-  //   scheme:/path          → /path  (single-slash, no authority)
-  // Bare `/path` and relative `path` are left untouched (no match).
-  let v = raw.replace(/^[a-zA-Z][a-zA-Z0-9+\-.]*:(?:\/\/[^/?#]*)?\//, '/');
+  // Step 1: URI scheme dispatch.
+  // Only `file:` URIs map to local filesystem paths. All other schemes
+  // (http:, https:, ftp:, data:, etc.) reference remote or non-filesystem
+  // resources. Mapping them to local paths (e.g. http://evil.com/etc/passwd
+  // → /etc/passwd) creates false positives. Return '' so they never match
+  // any blocked pattern.
+  const fileScheme = /^file:/i.test(raw);
+  const otherScheme = !fileScheme && /^[a-zA-Z][a-zA-Z0-9+\-.]*:\/\//i.test(raw);
+  if (otherScheme) return '';
 
-  // Steps 2–3: iterative decode until stable (handles triple+ encoded
-  // separators such as %25252F → %252F → %2F → /).
-  // Each iteration decodes one level; we exit early when the value stops
-  // changing. The per-iteration try/catch exits cleanly on any URIError so
-  // malformed inputs that somehow pass hasMalformedEscape() (trusted-pattern
+  let v: string;
+  if (fileScheme) {
+    // Strip file: scheme + optional authority (all three forms):
+    //   file:///path        → /path  (triple-slash, empty authority)
+    //   file://host/path    → /path  (named authority)
+    //   file:/path          → /path  (single-slash, no authority)
+    v = raw.replace(/^file:(?:\/\/[^/?#]*)?(?=\/)/, '');
+    // Step 1b: strip query string and fragment so file:///etc/passwd?dl=1#x
+    // and file:///etc/passwd#fragment both reduce to /etc/passwd.
+    v = v.replace(/[?#].*$/, '');
+  } else {
+    v = raw;
+  }
+
+  // Step 2: iterative decode until stable (no iteration cap).
+  // Terminates because each successful decode either shortens or leaves the
+  // string unchanged; once unchanged we break. Handles any encoding depth
+  // (triple, quad, N-level). Per-iteration try/catch exits cleanly on URIError
+  // so malformed inputs that somehow pass hasMalformedEscape() (trusted-pattern
   // code path) are left at the last valid value rather than crashing.
   let prev = v;
-  for (let i = 0; i < 5; i++) {
+  for (;;) {
     try {
       const next = decodeURIComponent(prev);
       if (next === prev) break;
@@ -408,7 +474,7 @@ function normalizePath(raw: string): string {
   }
   v = prev;
 
-  // Step 4: strip C0 control characters (including null bytes \x00–\x1f)
+  // Step 3: strip C0 control characters (including null bytes \x00–\x1f)
   // that could prefix a segment and defeat segment-equality matching.
   v = v.replace(/[\x00-\x1f]/g, '');
 
