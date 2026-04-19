@@ -12,6 +12,7 @@ import path from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { z } from 'zod';
 import { Tier } from '../policy/types.js';
+import { interpolateEnv } from './interpolate.js';
 import type { Registry, RegistryReviewer, RegistryServer } from './types.js';
 
 /**
@@ -32,7 +33,26 @@ const RegistryServerSchema = z
       ),
     command: z.string().min(1),
     args: z.array(z.string()).default([]),
-    env: z.record(z.string()).default({}),
+    // Values may contain `${VAR}` placeholders (see `registry/interpolate.ts`)
+    // which resolve at server-spawn time against rea-serve's own process.env.
+    // We validate SYNTAX at load time by running a dry-run pass with an empty
+    // host env — interpolateEnv throws on malformed syntax but treats missing
+    // vars as runtime signal, not a load-time error. The runtime check lives
+    // in `downstream.ts` where it can mark the affected server unhealthy
+    // without taking down the gateway.
+    env: z
+      .record(z.string())
+      .default({})
+      .superRefine((raw, ctx) => {
+        try {
+          interpolateEnv(raw, {});
+        } catch (err) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }),
     env_passthrough: z
       .array(
         z

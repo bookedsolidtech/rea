@@ -147,6 +147,90 @@ servers:
     expect(r.servers[0]?.env_passthrough).toBeUndefined();
   });
 
+  describe('env interpolation syntax (load-time)', () => {
+    it('accepts ${VAR} placeholders with valid identifier names', async () => {
+      const yaml = `version: "1"
+servers:
+  - name: mock
+    command: node
+    env:
+      BOT_TOKEN: '\${DISCORD_BOT_TOKEN}'
+      AUTH_HEADER: 'Bearer \${A}-\${B_2}'
+`;
+      await fs.writeFile(path.join(baseDir, '.rea', 'registry.yaml'), yaml, 'utf8');
+      const r = loadRegistry(baseDir);
+      expect(r.servers[0]?.env).toEqual({
+        BOT_TOKEN: '${DISCORD_BOT_TOKEN}',
+        AUTH_HEADER: 'Bearer ${A}-${B_2}',
+      });
+    });
+
+    it('rejects empty ${} placeholder at load time', async () => {
+      const yaml = `version: "1"
+servers:
+  - name: mock
+    command: node
+    env:
+      X: '\${}'
+`;
+      await fs.writeFile(path.join(baseDir, '.rea', 'registry.yaml'), yaml, 'utf8');
+      expect(() => loadRegistry(baseDir)).toThrow(/empty \$\{\}/);
+    });
+
+    it('rejects invalid var name chars at load time (space)', async () => {
+      const yaml = `version: "1"
+servers:
+  - name: mock
+    command: node
+    env:
+      X: '\${BAD NAME}'
+`;
+      await fs.writeFile(path.join(baseDir, '.rea', 'registry.yaml'), yaml, 'utf8');
+      expect(() => loadRegistry(baseDir)).toThrow(/invalid var name/);
+    });
+
+    it('rejects var name starting with a digit at load time', async () => {
+      const yaml = `version: "1"
+servers:
+  - name: mock
+    command: node
+    env:
+      X: '\${1BAD}'
+`;
+      await fs.writeFile(path.join(baseDir, '.rea', 'registry.yaml'), yaml, 'utf8');
+      expect(() => loadRegistry(baseDir)).toThrow(/invalid var name/);
+    });
+
+    it('rejects unterminated ${ at load time', async () => {
+      const yaml = `version: "1"
+servers:
+  - name: mock
+    command: node
+    env:
+      X: '\${unterminated'
+`;
+      await fs.writeFile(path.join(baseDir, '.rea', 'registry.yaml'), yaml, 'utf8');
+      expect(() => loadRegistry(baseDir)).toThrow(/unterminated/);
+    });
+
+    it('does NOT fail at load time when the referenced var is unset (runtime concern)', async () => {
+      // Missing vars are a spawn-time signal (mark the affected server
+      // unhealthy), not a load-time error — so the registry must still parse.
+      const yaml = `version: "1"
+servers:
+  - name: mock
+    command: node
+    env:
+      BOT_TOKEN: '\${DISCORD_BOT_TOKEN_DEFINITELY_NOT_SET_ANYWHERE}'
+`;
+      await fs.writeFile(path.join(baseDir, '.rea', 'registry.yaml'), yaml, 'utf8');
+      const r = loadRegistry(baseDir);
+      expect(r.servers[0]?.env.BOT_TOKEN).toBe(
+        '${DISCORD_BOT_TOKEN_DEFINITELY_NOT_SET_ANYWHERE}',
+      );
+    });
+  });
+
   describe('reviewer pin (G11.2)', () => {
     it('accepts reviewer: codex', async () => {
       const yaml = `version: "1"\nservers: []\nreviewer: codex\n`;
