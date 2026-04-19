@@ -163,52 +163,119 @@ export function isReaManagedHuskyGate(content: string): boolean {
   const lines = content.split(/\r?\n/);
   if (lines.length < 2 || lines[1] !== HUSKY_GATE_MARKER) return false;
 
-  // R11 F1: marker comments are public and trivially copyable — they cannot
-  // carry a security claim on their own. A genuine gate MUST have both
-  // behavioral signatures that make the file actually enforce governance:
+  // R12 F1 (strengthened from R11): heuristic "mentions the string"
+  // signatures are still spoofable. A file can include `[ -f .rea/HALT ]`
+  // followed by `:` (no-op), or `echo codex.review .rea/audit.jsonl`, and
+  // trivially satisfy a presence check without ever enforcing anything.
   //
-  //   1. HALT test  — the gate must detect `.rea/HALT` and abort the push.
-  //                   Requires a POSIX shell test form on a non-comment line
-  //                   (`[ -f ... .rea/HALT` or `test -f ... .rea/HALT`).
-  //                   A raw comment mention (`# check .rea/HALT`) does NOT
-  //                   satisfy — the test form must be executable.
+  // Recognition now requires PROOF OF ENFORCEMENT:
   //
-  //   2. Audit reference — the gate must consult the audit log to verify
-  //                   a Codex review exists before protected-path pushes.
-  //                   Either the audit log path (`.rea/audit.jsonl`) or
-  //                   the Codex review event name (`codex.review`) must
-  //                   appear on a non-comment line.
+  //   1. HALT enforcement — the HALT test must be paired with a non-zero
+  //      `exit` in the matching path. Either short-circuit form
+  //      (`[ -f .rea/HALT ] && exit N`) or block form
+  //      (`if [ -f .rea/HALT ]; then ... exit N ... fi`).
   //
-  // Both together are hard to fake without actually implementing the gate.
-  // A hook with `#!/bin/sh` + markers + `exec /bin/true` passes the marker
-  // check but cannot satisfy EITHER behavioral signature. This is the
-  // fundamental recognition — governance is a behavior, not a sticker.
-  let hasHaltTest = false;
-  let hasAuditReference = false;
-  for (const raw of lines) {
+  //   2. Audit check — the audit token must appear on a line with a command
+  //      that can FAIL on a missing match. `grep`, `rg`, `awk`, `test`, `[`,
+  //      or `[[` paired with `.rea/audit.jsonl` or `codex.review` satisfies.
+  //      `echo codex.review .rea/audit.jsonl` does NOT — echo always succeeds.
+  //
+  // Both together demand the file actually implement the enforcement
+  // behavior. Governance is a behavior, not a sticker; proving behavior
+  // requires matching the structure of a real check, not just the text of
+  // one.
+  if (!hasHaltEnforcement(content)) return false;
+  if (!hasAuditCheck(content)) return false;
+
+  return true;
+}
+
+/**
+ * True when `content` contains a POSIX shell construct that detects
+ * `.rea/HALT` AND causes the script to exit non-zero on match. Comment
+ * lines are stripped before scanning so `# if [ -f .rea/HALT ]; then exit`
+ * does not satisfy.
+ *
+ * Patterns accepted:
+ *   - Short-circuit:     `[ -f .rea/HALT ] && exit N`
+ *                         `test -f .rea/HALT && exit N`
+ *                         `[ -f .rea/HALT ] && { ...; exit N; }`
+ *   - Block form:        `if [ -f .rea/HALT ]; then ... exit N ... fi`
+ *                         (exit must appear between `then` and the matching `fi`)
+ *
+ * Patterns rejected (previously accepted by R11's signature heuristic):
+ *   - `[ -f .rea/HALT ] && :`          — no-op stub
+ *   - `if [ -f .rea/HALT ]; then :; fi` — no-op stub
+ *   - `# check .rea/HALT`               — comment only
+ *   - `echo .rea/HALT`                   — print, not enforce
+ *
+ * R12 F1: the previous `hasHaltTest` regex allowed a no-op body. We now
+ * require proof that the HALT match actually exits the script.
+ */
+function hasHaltEnforcement(content: string): boolean {
+  // Strip comments before scanning so block-form patterns that span lines
+  // still match, while `# ... exit ...` does not count.
+  const stripped = content
+    .split(/\r?\n/)
+    .map((raw) => {
+      const t = raw.trimStart();
+      return t.startsWith('#') ? '' : raw;
+    })
+    .join('\n');
+
+  // Pattern A — short-circuit. The HALT test is followed directly by `&&`
+  // and then an `exit` (optionally wrapped in `{ ... exit ...; }`).
+  const shortCircuit =
+    /(?:\[[ \t]+-f[^\n]*\.rea\/HALT[^\n]*\]|\btest[ \t]+-f[^\n]*\.rea\/HALT)[ \t]*&&[ \t]*(?:\{[^}]*?\bexit\b|\bexit\b)/;
+  if (shortCircuit.test(stripped)) return true;
+
+  // Pattern B — block form. Match `if <halt-test>` forward (non-greedy) to
+  // the first `fi`, and require `exit` to appear between `then` and `fi`.
+  // `[\s\S]` instead of `.` so the match spans newlines.
+  const blockForm =
+    /\bif\b[ \t]+(?:\[[ \t]+-f[^\n]*\.rea\/HALT[^\n]*\]|test[ \t]+-f[^\n]*\.rea\/HALT[^\n]*)[\s\S]*?\bthen\b[\s\S]*?\bexit\b[\s\S]*?\bfi\b/;
+  if (blockForm.test(stripped)) return true;
+
+  return false;
+}
+
+/**
+ * True when `content` contains a shell command that CAN FAIL on a missing
+ * `codex.review` / `.rea/audit.jsonl` match. A bare `echo` / `printf` of
+ * those tokens does NOT count — `echo` always returns 0.
+ *
+ * Check commands accepted (any one of these on a non-comment line that also
+ * references `.rea/audit.jsonl` or `codex.review`):
+ *   - `grep` / `egrep` / `fgrep`  — classic POSIX pattern match
+ *   - `rg`                         — ripgrep
+ *   - `awk` / `sed`               — stream editors
+ *   - `test` / `[` / `[[`         — POSIX/Bash test conditionals
+ *
+ * R12 F1: the previous `hasAuditReference` regex accepted ANY non-comment
+ * mention. The spoof `echo codex.review .rea/audit.jsonl` satisfied it
+ * without ever checking the log. We now require pairing with a command
+ * that propagates failure when the expected content is absent.
+ */
+function hasAuditCheck(content: string): boolean {
+  const checkCmd = /\b(grep|egrep|fgrep|rg|awk|sed|test)\b|(^|\s)(\[|\[\[)\s/;
+  // `codex\\?\.review` accepts both `codex.review` (literal) and
+  // `codex\.review` (the shape used when the token appears inside a grep
+  // regex, where the dot is escaped for grep's interpretation). The
+  // shipped `.husky/pre-push` uses the latter form.
+  const auditToken = /\.rea\/audit\.jsonl|codex\\?\.review/;
+  for (const raw of content.split(/\r?\n/)) {
     const t = raw.trimStart();
     if (t.startsWith('#')) continue;
-    if (!hasHaltTest) {
-      if (
-        /\[[ \t]+-f[^\n]*\.rea\/HALT/.test(t) ||
-        /\btest[ \t]+-f[^\n]*\.rea\/HALT/.test(t)
-      ) {
-        hasHaltTest = true;
-      }
-    }
-    if (!hasAuditReference) {
-      if (/\.rea\/audit\.jsonl/.test(t) || /codex\.review/.test(t)) {
-        hasAuditReference = true;
-      }
-    }
-    if (hasHaltTest && hasAuditReference) break;
+    if (!auditToken.test(t)) continue;
+    // The audit token is on this line — require a check command on the
+    // same line. Cross-line pairings (e.g., `AUDIT=.rea/audit.jsonl` then
+    // `grep ... "$AUDIT"`) are not accepted here because the check
+    // command's argument list may not contain the token literal; the
+    // shipped `.husky/pre-push` places both on the same line in at least
+    // two places, so same-line is a reasonable floor.
+    if (checkCmd.test(t)) return true;
   }
-  if (!hasHaltTest || !hasAuditReference) return false;
-
-  // Both behavioral signatures confirmed. The body marker (when present)
-  // identifies a fresh install — useful for telemetry/upgrade paths — but
-  // is NOT the security boundary: recognition is gated by behavior above.
-  return true;
+  return false;
 }
 
 /**
@@ -219,118 +286,200 @@ export function isReaManagedHuskyGate(content: string): boolean {
  * gate-referencing foreign hook is a legitimate integration point —
  * doctor reports `pass`, install skips.
  *
- * Uses a positive-match (allowlist) strategy via `looksLikeGateInvocation`:
- * the gate token must appear as an actual invocation — either as the first
- * command on a line (bare path) or immediately after one of the explicit
- * POSIX delegation keywords (`exec`, `.`, `sh`, `bash`, `zsh`). The bash-only
- * `source` keyword is NOT accepted — hooks use `#!/bin/sh` so `source` may
- * silently fail on dash/busybox; the POSIX equivalent `.` is in the allowlist.
+ * Accepts (positive-match allowlist):
+ *   - Bare invocation: `.claude/hooks/push-review-gate.sh "$@"`
+ *   - POSIX exec keyword: `exec`, `.`, `sh`, `bash`, `zsh` followed by the
+ *     gate path. The bash-only `source` keyword is NOT accepted — the POSIX
+ *     equivalent `.` (dot) is.
+ *   - Quoted/expanded path prefix: `exec "$REA_ROOT"/.claude/hooks/push-review-gate.sh "$@"`
+ *     — double- or single-quoted variable expansions before the literal path
+ *     are treated as part of the path, not as a mention context.
+ *   - Trailing `;` after `exec <gate>`: `exec gate.sh "$@";` — exec replaces
+ *     the shell, so the `;` and anything after it never runs; gate exit IS
+ *     the hook's exit status.
+ *   - Variable indirection: `GATE=<path-containing-gate>` on one line plus
+ *     `exec "$GATE"` / `. "$GATE"` / etc. on a later line.
  *
- * Non-invocation references that return `false` include:
- *   - A comment line starting with `#`
- *   - A shell test: `[ -x .claude/hooks/push-review-gate.sh ]`
- *   - A file-existence test: `test -f .claude/hooks/push-review-gate.sh`
- *   - A chmod: `chmod +x .claude/hooks/push-review-gate.sh`
- *   - A copy: `cp .claude/hooks/push-review-gate.sh /tmp/`
- *   - A printf/echo/string literal mentioning the path
+ * Rejects:
+ *   - Comment lines starting with `#`
+ *   - Shell tests: `[ -x .claude/hooks/push-review-gate.sh ]`
+ *   - File tests: `test -f .claude/hooks/push-review-gate.sh`
+ *   - Chmod / cp / mv / cat / printf / echo mentioning the path
+ *   - String literals inside quoted arguments to non-invocation commands
+ *   - Invocations inside `if`/`for`/`while`/`case` blocks (conditional —
+ *     not guaranteed to run)
+ *   - Invocations after an unconditional top-level `exit`
+ *   - Non-`exec` invocations followed by `||`, `&&`, `;`, or trailing `&`
+ *     (status-swallowing operators)
  *
- * We strip inline comments and leading whitespace before matching. We do
- * NOT attempt full shell parsing; the goal is reliably accepting the
- * canonical invocation forms and rejecting the known false-positive shapes.
+ * This is a pragmatic heuristic, not a full shell parser. R12 F2 broadened
+ * the allowlist to match the forms Codex flagged as valid but previously
+ * rejected; narrower patterns silently hard-failed `rea doctor` on
+ * correctly-governed consumer repos.
  */
 export function referencesReviewGate(content: string): boolean {
+  // First pass: variable indirection. If the caller wrote the path into a
+  // shell variable and execs the variable, same-line matching won't catch it.
+  // Scan for assignment + later invocation of the same variable.
+  if (hasVariableGateInvocation(content)) return true;
+
   const lines = content.split(/\r?\n/);
-  // Track control-structure depth to distinguish top-level exits (which make
-  // the gate unreachable) from conditional exits inside if/for/while/case
-  // blocks (which do NOT make the gate unreachable). We use raw.trim() — both
-  // ends — so that an unconditional `  exit 0` with unusual leading whitespace
-  // is still flagged when depth === 0, without regressing the guard-block case
-  // where `  exit 1` is legitimately inside an `if` block (depth > 0).
   let exitedBeforeGate = false;
   let depth = 0;
   for (const raw of lines) {
-    // Normalize: strip both ends, drop a trailing inline comment
-    // (naive — does not account for `#` inside single/double quotes, but
-    // those would be wildly contrived in a real pre-push hook).
     let line = raw.trim();
     if (line.length === 0) continue;
-    // Full-line comment — ignore.
     if (line.startsWith('#')) continue;
-    // Strip inline trailing comment. Conservative: any unquoted `# ` or
-    // `#` at EOL.
     const hashIdx = line.indexOf('#');
     if (hashIdx > 0) {
-      // Only strip if preceded by whitespace (`cmd # comment`), not mid-
-      // token (`foo#bar` is not a comment in POSIX sh).
       const before = line[hashIdx - 1];
       if (before === ' ' || before === '\t') {
         line = line.slice(0, hashIdx).trimEnd();
       }
     }
-    // Track block depth so exit inside an if/for/while/case is not treated
-    // as top-level. Simple keyword heuristic; does not handle one-liner forms
-    // (`if ...; then exit 1; fi`), but those are unusual in pre-push hooks.
-    // Note: `do` is intentionally excluded — in POSIX `for`/`while` loops it
-    // appears on its own line and would double-increment depth if included.
     if (/^(if|for|while|case)\b/.test(line)) depth++;
     if (/^(fi|done|esac)\b/.test(line)) depth = Math.max(0, depth - 1);
-    // Detect bare unconditional exit/return at depth 0 before the gate
-    // invocation. Only a top-level exit makes the gate truly unreachable.
     if (depth === 0 && /^(exit|return)(\s+\d+)?$/.test(line)) {
       exitedBeforeGate = true;
     }
     if (!line.includes(GATE_DELEGATION_TOKEN)) continue;
 
-    // Candidate line. Require it look like an invocation, not a string
-    // literal or a printf argument. The token must appear either:
-    //   (a) after a POSIX exec-like keyword: `exec`, `sh`, `bash`, `zsh`, `.`
-    //       (NOT `source` — bash-only, excluded from allowlist)
-    //   (b) as the first program being invoked (possibly after a path
-    //       prefix): `"/abs/.../push-review-gate.sh" "$@"` or
-    //       `./relative/.claude/hooks/push-review-gate.sh "$@"`.
-    //
-    // We match token forms with optional surrounding quotes, preceded by
-    // either the line start (program invocation) OR an exec keyword.
-    //
-    // This is a pragmatic heuristic, not a full shell parser. It
-    // correctly accepts the shapes observed in husky+rea setups and
-    // rejects `printf 'hint: ...push-review-gate.sh' >&2` style strings.
-    //
-    // Three conditions must all hold:
-    //   depth === 0   — unconditional top-level call, not inside if/for/case
-    //   !hasContinuationOperator — no `||`, `&&`, or `;` after the gate token
-    //   !exitedBeforeGate        — no unconditional exit before this line
-    if (looksLikeGateInvocation(line) && depth === 0 && !hasContinuationOperator(line) && !exitedBeforeGate)
+    if (
+      looksLikeGateInvocation(line) &&
+      depth === 0 &&
+      !hasContinuationOperator(line) &&
+      !exitedBeforeGate
+    )
       return true;
   }
   return false;
 }
 
 /**
- * Returns true when `line` contains a shell status-swallowing operator after
- * the gate filename. The operators are:
- *   - `||` / `&&` — chained commands (gate's exit code is masked by follow-up)
- *   - `;`         — sequential commands (final command's status is the line's)
- *   - trailing `&` — background job (line exits 0 regardless of gate status)
+ * True when `content` contains a variable assignment whose value contains
+ * the gate token, followed (later in the file) by an `exec`/`.`/`sh`/`bash`/
+ * `zsh` invocation of that same variable. Handles the idiomatic defensive
+ * form Codex flagged:
  *
- * Note: plain `&` inside file-descriptor redirects (`2>&1`, `>&2`, `1>&2`)
- * is NOT a status-swallowing operator — `exec gate "$@" 2>&1` preserves the
- * gate's exit code intact. R10 F2: the previous character-class regex
- * `/[|&;]/` incorrectly flagged stderr redirection as swallowing. Strip POSIX
- * fd-duplication tokens from the tail before the check.
+ *   GATE=.claude/hooks/push-review-gate.sh
+ *   exec "$GATE" "$@"
+ *
+ * Same guards apply to the invocation line (unconditional, top-level, no
+ * status-swallowing operators) — we do NOT accept a variable invocation
+ * that sits inside an `if` block or is followed by `&&` / `||` / `;`.
+ *
+ * R12 F2: previous `referencesReviewGate` only checked same-line literal
+ * path forms. A valid delegating hook that routed through a variable was
+ * classified as foreign, causing `rea doctor` to hard-fail on governed
+ * repos.
+ */
+function hasVariableGateInvocation(content: string): boolean {
+  const lines = content.split(/\r?\n/).map((l) => {
+    let t = l.trim();
+    if (t.startsWith('#')) return '';
+    const hashIdx = t.indexOf('#');
+    if (hashIdx > 0) {
+      const before = t[hashIdx - 1];
+      if (before === ' ' || before === '\t') t = t.slice(0, hashIdx).trimEnd();
+    }
+    return t;
+  });
+
+  // Find variable assignments whose RHS contains the gate token. Shape:
+  //   [export ]NAME=<value-with-gate>
+  // Value may be quoted with " or ' and may contain $-expansions. The gate
+  // literal must be substring-present in the RHS.
+  const assignRe = /^(?:export[ \t]+|readonly[ \t]+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$/;
+  const gateVars = new Set<string>();
+  for (const line of lines) {
+    const m = line.match(assignRe);
+    if (!m) continue;
+    const name = m[1];
+    const rhs = m[2];
+    if (name === undefined || rhs === undefined) continue;
+    if (rhs.includes(GATE_DELEGATION_TOKEN)) gateVars.add(name);
+  }
+  if (gateVars.size === 0) return false;
+
+  // Track depth + early-exit gates (same rules as referencesReviewGate).
+  let exitedBeforeGate = false;
+  let depth = 0;
+  for (const line of lines) {
+    if (line.length === 0) continue;
+    if (/^(if|for|while|case)\b/.test(line)) depth++;
+    if (/^(fi|done|esac)\b/.test(line)) depth = Math.max(0, depth - 1);
+    if (depth === 0 && /^(exit|return)(\s+\d+)?$/.test(line)) {
+      exitedBeforeGate = true;
+    }
+    // Check whether this line invokes any of the gate variables. Pattern:
+    //   ^(exec|sh|bash|zsh|\.)\s+["']?\$\{?VAR\}?["']?
+    for (const v of gateVars) {
+      const pattern = new RegExp(
+        `^(exec|sh|bash|zsh|\\.)[ \\t]+["']?\\$\\{?${v}\\}?["']?(?=[ \\t;|&"'()]|$)`,
+      );
+      if (!pattern.test(line)) continue;
+      if (depth !== 0) continue;
+      if (exitedBeforeGate) continue;
+      // Apply status-swallowing operator check to the variable-invocation tail.
+      // Parse the portion after the closing VAR reference for continuation
+      // operators, ignoring a trailing `;` when the line starts with `exec`
+      // (exec replaces the shell — anything after is unreachable).
+      const execLed = /^exec\b/.test(line);
+      // Isolate the tail after the VAR reference for the check.
+      const varIdx = line.search(
+        new RegExp(`\\$\\{?${v}\\}?`),
+      );
+      if (varIdx === -1) continue;
+      const afterVar = line
+        .slice(varIdx)
+        .replace(new RegExp(`^\\$\\{?${v}\\}?["']?`), '');
+      let tail = afterVar
+        .replace(/\d*[<>]&\d*-?/g, ' ')
+        .replace(/&>>?/g, ' ');
+      if (execLed) {
+        if (/\|\||&&/.test(tail) || /&\s*$/.test(tail)) continue;
+      } else {
+        if (/\|\||&&|;/.test(tail) || /&\s*$/.test(tail)) continue;
+      }
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Returns true when `line` contains a shell status-swallowing operator after
+ * the gate filename. Swallowing operators:
+ *   - `||` / `&&` — the gate's exit is masked by the follow-up command
+ *   - `;`         — the sequential-command separator; the LAST command's
+ *                   exit becomes the line's (only problematic for non-exec
+ *                   invocations — exec REPLACES the shell, so anything
+ *                   after `exec gate "$@" ;` is dead code and the `;` is
+ *                   harmless).
+ *   - trailing `&` — background job (line exits 0 regardless of gate)
+ *
+ * Not swallowing:
+ *   - POSIX fd redirects: `2>&1`, `>&2`, `&>/dev/null` — contain `&` but
+ *     do not change exit propagation. Stripped before the check.
+ *   - `;` after `exec gate` — exec REPLACES the current shell with the
+ *     command, so no code after the exec statement runs. The gate's exit
+ *     IS the hook's exit status.
+ *
+ * R10 F2: stripped fd duplications before checking `&`.
+ * R12 F2: treat a trailing `;` as harmless when the line begins with `exec`.
  */
 function hasContinuationOperator(line: string): boolean {
   const gateIdx = line.indexOf(GATE_DELEGATION_TOKEN);
   if (gateIdx === -1) return false;
   let tail = line.slice(gateIdx + GATE_DELEGATION_TOKEN.length);
-  // Strip POSIX file-descriptor redirects: `N>&M`, `N<&M`, `>&M`, `<&M`,
-  // `&>`, `>>&` etc. These contain `&` but do not swallow the command's
-  // exit status. Simpler than parsing the full redirect grammar: drop any
-  // [digits]?(<|>)&[digits|-]? sequence and the `&>` / `>&` bashisms.
   tail = tail.replace(/\d*[<>]&\d*-?/g, ' ');
   tail = tail.replace(/&>>?/g, ' ');
-  // Now check for the actual swallowing operators. Trailing `&` (background
-  // job) is detected as `&` followed only by whitespace to end-of-string.
+  const execLed = /^\s*exec\b/.test(line);
+  if (execLed) {
+    // Under exec, `;` and anything after it is unreachable. `||` and `&&`
+    // still apply to exec-failure (command-not-found) and DO swallow.
+    return /\|\||&&/.test(tail) || /&\s*$/.test(tail);
+  }
   return /\|\||&&|;/.test(tail) || /&\s*$/.test(tail);
 }
 
@@ -364,33 +513,38 @@ function hasContinuationOperator(line: string): boolean {
  * exec a shell script does not grow.
  */
 function looksLikeGateInvocation(line: string): boolean {
-  // Form 1: gate path is the first thing on the (already-trimmed) line.
-  // The gate reference (optionally quoted, optionally with a path prefix
-  // containing only path-safe characters) must start at position 0.
-  // Characters like `=`, `[`, `(` before the gate token indicate a
-  // non-invocation context and prevent a match.
+  // The character class for path prefixes was previously
+  //   [A-Za-z0-9_./${}~-]*
+  // which rejected quoted variable expansions in the middle of a path —
+  // the idiomatic defensive form `exec "$REA_ROOT"/.claude/hooks/...`
+  // contains a `"` after `$REA_ROOT` that was not in the class, so the
+  // match stopped before reaching the literal path.
   //
-  // The lookahead `(?=\s|$|[;|&"'()])` enforces a word boundary after `.sh`
-  // so that `.sh.disabled`, `.sh.bak`, `.sh2` etc. do NOT match. Only
-  // whitespace, end-of-string, or a shell separator/quote following `.sh`
-  // constitutes a valid invocation boundary.
-  const bareInvocationRe =
-    /^["']?[A-Za-z0-9_./${}~-]*\.claude\/hooks\/push-review-gate\.sh(?=\s|$|[;|&"'()])/;
-  if (bareInvocationRe.test(line)) {
-    return true;
-  }
+  // R12 F2: extend the char class to include `"` and `'` so that quoted
+  // mid-path expansions are consumed as part of the path. This accepts:
+  //   - `exec "$REA_ROOT"/.claude/hooks/push-review-gate.sh`
+  //   - `exec "$HOME"/project/.claude/hooks/push-review-gate.sh`
+  //   - `"$A"'/'.claude/hooks/push-review-gate.sh` (pathological; still works)
+  // The false-positive surface is limited: ANY line that begins with a
+  // quoted string and then contains the literal gate path will be accepted,
+  // but that is exactly the invocation shape we want to recognize — a
+  // line like `echo "$X/.claude/hooks/push-review-gate.sh"` would not
+  // match because it begins with `echo`, not a path/quoted-prefix.
+  const pathChars = '["\'$A-Za-z0-9_./${}~-]';
 
-  // Form 2: one of the explicit delegation keywords immediately before the
-  // gate path. Pattern: keyword + one-or-more whitespace + gate-path.
-  // Same `.sh` boundary lookahead as Form 1 to prevent suffix bypass.
-  // `source` is bash-specific and not defined by POSIX sh. Hooks use `#!/bin/sh`
-  // so `source` may silently fail on dash/busybox. The POSIX equivalent is `.`
-  // (dot), which is already in the allowlist.
-  const delegationRe =
-    /^(exec|sh|bash|zsh|\.)\s+["']?[A-Za-z0-9_./${}~-]*\.claude\/hooks\/push-review-gate\.sh(?=\s|$|[;|&"'()])/;
-  if (delegationRe.test(line)) {
-    return true;
-  }
+  // Form 1: gate path (optionally prefixed by quoted/expanded chars) is the
+  // first thing on the (already-trimmed) line.
+  const bareInvocationRe = new RegExp(
+    `^${pathChars}*\\.claude\\/hooks\\/push-review-gate\\.sh(?=\\s|$|[;|&"'()])`,
+  );
+  if (bareInvocationRe.test(line)) return true;
+
+  // Form 2: POSIX delegation keyword + gate path. `source` is bash-only and
+  // excluded; the POSIX equivalent `.` is accepted.
+  const delegationRe = new RegExp(
+    `^(exec|sh|bash|zsh|\\.)\\s+${pathChars}*\\.claude\\/hooks\\/push-review-gate\\.sh(?=\\s|$|[;|&"'()])`,
+  );
+  if (delegationRe.test(line)) return true;
 
   return false;
 }
@@ -1125,6 +1279,20 @@ export interface PrePushDoctorState {
    * a warn. Distinct from `ok=false + absent` (which is a hard fail).
    */
   activeForeign: boolean;
+  /**
+   * True when `activeForeign` is true AND the file mentions the gate path
+   * literally somewhere. The parser could not confirm a clean delegating
+   * invocation, but the hook clearly references the gate — this is usually
+   * an unusual-but-valid invocation shape (exotic variable indirection,
+   * command substitution, etc.). Doctor downgrades these to WARN instead
+   * of hard FAIL so a governed-but-unparseable hook does not cause a
+   * red-light on every `rea doctor` run.
+   *
+   * R12 F2: the parser's no-match verdict is no longer proof that
+   * governance is absent. A mention-but-no-parse signal needs human
+   * review, not a blanket failure.
+   */
+  activeSuspect: boolean;
 }
 
 export async function inspectPrePushState(
@@ -1161,6 +1329,10 @@ export async function inspectPrePushState(
   });
 
   const candidates: PrePushDoctorState['candidates'] = [];
+  // Track which active-candidate files merely MENTION the gate token —
+  // used downstream to populate `activeSuspect` for the doctor warning
+  // downgrade path.
+  const mentionsByPath = new Map<string, boolean>();
   for (const p of uniq) {
     let exists = false;
     let executable = false;
@@ -1175,6 +1347,7 @@ export async function inspectPrePushState(
           const content = await fsPromises.readFile(p, 'utf8');
           reaManaged = isReaManagedFallback(content) || isReaManagedHuskyGate(content);
           delegatesToGate = referencesReviewGate(content);
+          mentionsByPath.set(p, content.includes(GATE_DELEGATION_TOKEN));
         } catch {
           // unreadable — leave both false
         }
@@ -1201,6 +1374,12 @@ export async function inspectPrePushState(
     active !== undefined && (active.reaManaged || active.delegatesToGate);
   const ok = activeExistsExec && activeGoverns;
   const activeForeign = activeExistsExec && !activeGoverns;
+  // Suspect = foreign-by-parse BUT the file literally mentions the gate
+  // path. Most likely an exotic invocation shape our parser could not
+  // confirm (command substitution, eval, unusual indirection). Doctor
+  // downgrades these to WARN instead of hard FAIL.
+  const activeSuspect =
+    activeForeign && mentionsByPath.get(activePath) === true;
 
-  return { candidates, activePath, ok, activeForeign };
+  return { candidates, activePath, ok, activeForeign, activeSuspect };
 }

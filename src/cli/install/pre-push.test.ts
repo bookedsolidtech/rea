@@ -1091,6 +1091,95 @@ describe('isReaManagedHuskyGate — Husky gate marker detection (Finding 2)', ()
     expect(isReaManagedHuskyGate(content)).toBe(false);
   });
 
+  // R12 F1: the R11 "token-mentions-on-a-line" check was still spoofable
+  // because the HALT mention plus an audit string could appear without
+  // either actually ENFORCING anything. These tests pin the tighter
+  // "proof of enforcement" requirement: the HALT test must be paired with
+  // a non-zero `exit`, and the audit token must appear on a line with a
+  // check command that can fail.
+
+  it('R12 F1: HALT test + no-op `:` in block form: returns false (no enforcement)', () => {
+    // The exact spoof Codex R12 flagged: `if [ -f .rea/HALT ]; then :; fi`
+    // mentions the HALT path and passes a presence check, but the match
+    // path is a noop. The hook does not block freeze, so it cannot be
+    // recognized as rea-managed.
+    const content =
+      `#!/bin/sh\n${HUSKY_GATE_MARKER}\n` +
+      `if [ -f .rea/HALT ]; then :; fi\n` +
+      `grep codex.review .rea/audit.jsonl\n`;
+    expect(isReaManagedHuskyGate(content)).toBe(false);
+  });
+
+  it('R12 F1: HALT short-circuit `&& :` (noop after match): returns false', () => {
+    const content =
+      `#!/bin/sh\n${HUSKY_GATE_MARKER}\n` +
+      `[ -f .rea/HALT ] && :\n` +
+      `grep codex.review .rea/audit.jsonl\n`;
+    expect(isReaManagedHuskyGate(content)).toBe(false);
+  });
+
+  it('R12 F1: audit token in echo only (no failure path): returns false', () => {
+    // The other half of the Codex R12 spoof: `echo codex.review .rea/audit.jsonl`
+    // mentions both tokens but `echo` always succeeds — it is not a check.
+    const content =
+      `#!/bin/sh\n${HUSKY_GATE_MARKER}\n` +
+      `[ -f .rea/HALT ] && exit 1\n` +
+      `echo codex.review .rea/audit.jsonl\n`;
+    expect(isReaManagedHuskyGate(content)).toBe(false);
+  });
+
+  it('R12 F1: audit token in printf only: returns false', () => {
+    const content =
+      `#!/bin/sh\n${HUSKY_GATE_MARKER}\n` +
+      `[ -f .rea/HALT ] && exit 1\n` +
+      `printf '%s\\n' codex.review .rea/audit.jsonl\n`;
+    expect(isReaManagedHuskyGate(content)).toBe(false);
+  });
+
+  it('R12 F1: HALT short-circuit `&& exit 1` + grep audit: returns true', () => {
+    const content =
+      `#!/bin/sh\n${HUSKY_GATE_MARKER}\n` +
+      `[ -f .rea/HALT ] && exit 1\n` +
+      `grep -q codex.review .rea/audit.jsonl\n`;
+    expect(isReaManagedHuskyGate(content)).toBe(true);
+  });
+
+  it('R12 F1: HALT block form with multi-line body + grep audit: returns true', () => {
+    // Matches the actual shape the shipped .husky/pre-push uses.
+    const content =
+      `#!/bin/sh\n${HUSKY_GATE_MARKER}\n` +
+      `if [ -f .rea/HALT ]; then\n` +
+      `  printf 'frozen\\n' >&2\n` +
+      `  exit 1\n` +
+      `fi\n` +
+      `grep -qE '"tool_name":"codex.review"' .rea/audit.jsonl\n`;
+    expect(isReaManagedHuskyGate(content)).toBe(true);
+  });
+
+  it('R12 F1: block form with grouped short-circuit `&& { ...; exit 1; }`: returns true', () => {
+    const content =
+      `#!/bin/sh\n${HUSKY_GATE_MARKER}\n` +
+      `[ -f .rea/HALT ] && { printf 'frozen\\n' >&2; exit 1; }\n` +
+      `grep -q codex.review .rea/audit.jsonl\n`;
+    expect(isReaManagedHuskyGate(content)).toBe(true);
+  });
+
+  it('R12 F1: test -f form + test audit command: returns true', () => {
+    const content =
+      `#!/bin/sh\n${HUSKY_GATE_MARKER}\n` +
+      `test -f .rea/HALT && exit 1\n` +
+      `test -s .rea/audit.jsonl\n`;
+    expect(isReaManagedHuskyGate(content)).toBe(true);
+  });
+
+  it('R12 F1: rg (ripgrep) + audit token: returns true', () => {
+    const content =
+      `#!/bin/sh\n${HUSKY_GATE_MARKER}\n` +
+      `[ -f .rea/HALT ] && exit 1\n` +
+      `rg -q codex.review .rea/audit.jsonl\n`;
+    expect(isReaManagedHuskyGate(content)).toBe(true);
+  });
+
   it('marker at line 2 but no body marker (exit 0 body): returns false (no behavioral signature)', () => {
     expect(isReaManagedHuskyGate(`#!/bin/sh\n${HUSKY_GATE_MARKER}\nexit 0\n`)).toBe(false);
   });
@@ -1346,6 +1435,142 @@ describe('referencesReviewGate — depth-tracking exit detection (Finding 2)', (
   });
 });
 
+// R12 F2: previous allowlist was too narrow and hard-failed real hooks
+// that DO delegate. These tests pin the broader set of shell-equivalent
+// invocation shapes that must be accepted.
+describe('referencesReviewGate — R12 F2 broadened invocation shapes', () => {
+  it('quoted variable-expansion mid-path: `exec "$REA_ROOT"/.../gate.sh`: returns true', () => {
+    const content = [
+      '#!/bin/sh',
+      'REA_ROOT=$(git rev-parse --show-toplevel)',
+      'exec "$REA_ROOT"/.claude/hooks/push-review-gate.sh "$@"',
+    ].join('\n');
+    expect(referencesReviewGate(content)).toBe(true);
+  });
+
+  it('quoted variable-expansion with ${} braces: returns true', () => {
+    const content = [
+      '#!/bin/sh',
+      'REA_ROOT=$(git rev-parse --show-toplevel)',
+      'exec "${REA_ROOT}"/.claude/hooks/push-review-gate.sh "$@"',
+    ].join('\n');
+    expect(referencesReviewGate(content)).toBe(true);
+  });
+
+  it('variable indirection: `GATE=path; exec "$GATE"`: returns true', () => {
+    const content = [
+      '#!/bin/sh',
+      'GATE=.claude/hooks/push-review-gate.sh',
+      'exec "$GATE" "$@"',
+    ].join('\n');
+    expect(referencesReviewGate(content)).toBe(true);
+  });
+
+  it('variable indirection with ${} braces: returns true', () => {
+    const content = [
+      '#!/bin/sh',
+      'GATE=.claude/hooks/push-review-gate.sh',
+      'exec "${GATE}" "$@"',
+    ].join('\n');
+    expect(referencesReviewGate(content)).toBe(true);
+  });
+
+  it('variable indirection with export: returns true', () => {
+    const content = [
+      '#!/bin/sh',
+      'export GATE=.claude/hooks/push-review-gate.sh',
+      'exec "$GATE" "$@"',
+    ].join('\n');
+    expect(referencesReviewGate(content)).toBe(true);
+  });
+
+  it('variable indirection with `.` (dot/POSIX-source) form: returns true', () => {
+    const content = [
+      '#!/bin/sh',
+      'GATE=.claude/hooks/push-review-gate.sh',
+      '. "$GATE"',
+    ].join('\n');
+    expect(referencesReviewGate(content)).toBe(true);
+  });
+
+  it('variable indirection inside if-block (conditional): returns false', () => {
+    // Even with indirection, the invocation must be unconditional. A
+    // conditional call does not guarantee the gate runs.
+    const content = [
+      '#!/bin/sh',
+      'GATE=.claude/hooks/push-review-gate.sh',
+      'if [ "$DEBUG" = "1" ]; then',
+      '  exec "$GATE" "$@"',
+      'fi',
+    ].join('\n');
+    expect(referencesReviewGate(content)).toBe(false);
+  });
+
+  it('variable indirection followed by `|| true` (swallowed): returns false', () => {
+    const content = [
+      '#!/bin/sh',
+      'GATE=.claude/hooks/push-review-gate.sh',
+      '. "$GATE" || true',
+    ].join('\n');
+    expect(referencesReviewGate(content)).toBe(false);
+  });
+
+  it('variable assignment to non-gate path: indirection check is inert', () => {
+    // The assignment contains no gate token; the exec line references
+    // `$OTHER` which has no gate path. Must return false.
+    const content = [
+      '#!/bin/sh',
+      'OTHER=/usr/bin/echo',
+      'exec "$OTHER" "$@"',
+    ].join('\n');
+    expect(referencesReviewGate(content)).toBe(false);
+  });
+
+  it('trailing `;` after `exec <gate>`: returns true (exec replaces shell, `;` is dead code)', () => {
+    const content = [
+      '#!/bin/sh',
+      'exec .claude/hooks/push-review-gate.sh "$@";',
+    ].join('\n');
+    expect(referencesReviewGate(content)).toBe(true);
+  });
+
+  it('trailing `;` after non-exec invocation: still returns false (status-swallowing)', () => {
+    // Without `exec`, `;` truly separates commands — final command sets
+    // exit status. Must remain flagged.
+    const content = [
+      '#!/bin/sh',
+      'sh .claude/hooks/push-review-gate.sh "$@"; exit 0',
+    ].join('\n');
+    expect(referencesReviewGate(content)).toBe(false);
+  });
+
+  it('`||` after `exec <gate>`: still returns false (exec-failure swallowing)', () => {
+    // `||` DOES apply to the exec-failure case (command-not-found). Still
+    // a status-swallowing operator.
+    const content = [
+      '#!/bin/sh',
+      'exec .claude/hooks/push-review-gate.sh "$@" || true',
+    ].join('\n');
+    expect(referencesReviewGate(content)).toBe(false);
+  });
+
+  it('`&&` after `exec <gate>`: still returns false', () => {
+    const content = [
+      '#!/bin/sh',
+      'exec .claude/hooks/push-review-gate.sh "$@" && foo',
+    ].join('\n');
+    expect(referencesReviewGate(content)).toBe(false);
+  });
+
+  it('trailing `&` (background) after `exec <gate>`: still returns false', () => {
+    const content = [
+      '#!/bin/sh',
+      'exec .claude/hooks/push-review-gate.sh "$@" &',
+    ].join('\n');
+    expect(referencesReviewGate(content)).toBe(false);
+  });
+});
+
 describe('classifyExistingHook — Husky gate marker integration (Finding 2)', () => {
   let dir: string;
 
@@ -1520,5 +1745,63 @@ describe('inspectPrePushState — Husky gate recognized as rea-managed (Finding 
       (c) => c.path === path.join(huskyDir, 'pre-push'),
     );
     expect(active?.reaManaged).toBe(false);
+  });
+
+  // R12 F2: when the parser cannot confirm a gate invocation, but the file
+  // DOES mention the gate path literally, doctor must downgrade to warn
+  // (activeSuspect) rather than hard fail (activeForeign && !activeSuspect).
+  // A parser miss is not proof of governance absence.
+
+  it('R12 F2: hook mentions gate path via unusual indirection: activeSuspect=true, activeForeign=true', async () => {
+    await initGitRepo(dir);
+    const hooksDir = path.join(dir, '.git', 'hooks');
+    await fs.mkdir(hooksDir, { recursive: true });
+    // Exotic shape: command substitution assigning a transformed gate
+    // path. Parser doesn't recognize the invocation form, but the file
+    // clearly references the gate — doctor should warn, not fail.
+    const content = [
+      '#!/bin/sh',
+      'RUNNER=$(printf "%s" .claude/hooks/push-review-gate.sh | tr a-z a-z)',
+      'eval "$RUNNER" "$@"',
+    ].join('\n');
+    await fs.writeFile(path.join(hooksDir, 'pre-push'), content, {
+      mode: 0o755,
+    });
+
+    const state = await inspectPrePushState(dir);
+    expect(state.activeForeign).toBe(true);
+    expect(state.activeSuspect).toBe(true);
+  });
+
+  it('R12 F2: hook that has no gate mention at all: activeForeign=true, activeSuspect=false', async () => {
+    await initGitRepo(dir);
+    const hooksDir = path.join(dir, '.git', 'hooks');
+    await fs.mkdir(hooksDir, { recursive: true });
+    const content = ['#!/bin/sh', 'npm run lint', 'npm test'].join('\n');
+    await fs.writeFile(path.join(hooksDir, 'pre-push'), content, {
+      mode: 0o755,
+    });
+
+    const state = await inspectPrePushState(dir);
+    expect(state.activeForeign).toBe(true);
+    expect(state.activeSuspect).toBe(false);
+  });
+
+  it('R12 F2: cleanly-governed hook is NOT suspect (activeForeign=false)', async () => {
+    await initGitRepo(dir);
+    const hooksDir = path.join(dir, '.git', 'hooks');
+    await fs.mkdir(hooksDir, { recursive: true });
+    const content = [
+      '#!/bin/sh',
+      'exec .claude/hooks/push-review-gate.sh "$@"',
+    ].join('\n');
+    await fs.writeFile(path.join(hooksDir, 'pre-push'), content, {
+      mode: 0o755,
+    });
+
+    const state = await inspectPrePushState(dir);
+    expect(state.ok).toBe(true);
+    expect(state.activeForeign).toBe(false);
+    expect(state.activeSuspect).toBe(false);
   });
 });
