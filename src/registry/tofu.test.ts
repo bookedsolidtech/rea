@@ -138,6 +138,141 @@ describe('classifyServers', () => {
   });
 });
 
+describe('classifyServers rename-then-tamper defense', () => {
+  // The threat: attacker edits .rea/registry.yaml offline, renames a
+  // previously trusted entry, AND tampers its command/args in the same
+  // edit. Name-based lookup alone misses it — `mcp-a` disappears from
+  // the registry (its fingerprint stays in the store, un-pruned by
+  // design), and the new `mcp-a-renamed` has no matching stored entry,
+  // so it lands as benign first-seen. The defense is a set-difference
+  // heuristic: if something vanished AND something new appeared in the
+  // SAME boot, the new entries are classified drifted.
+
+  it('steady state: no renames → unchanged stays unchanged', () => {
+    const a = server('mcp-a');
+    const store: FingerprintStore = {
+      version: FINGERPRINT_STORE_VERSION,
+      servers: { 'mcp-a': fingerprintServer(a) },
+    };
+    const out = classifyServers([a], store);
+    expect(out).toHaveLength(1);
+    expect(out[0]?.verdict).toBe('unchanged');
+  });
+
+  it('genuinely new install (store empty, registry has entries) → first-seen', () => {
+    const a = server('mcp-a');
+    const out = classifyServers([a], emptyStore());
+    expect(out[0]?.verdict).toBe('first-seen');
+  });
+
+  it('purely additive (stored entries unchanged + one brand-new name) → first-seen for the new name', () => {
+    const a = server('mcp-a');
+    const b = server('mcp-b');
+    // Store has mcp-a; registry adds mcp-b alongside unchanged mcp-a.
+    const store: FingerprintStore = {
+      version: FINGERPRINT_STORE_VERSION,
+      servers: { 'mcp-a': fingerprintServer(a) },
+    };
+    const out = classifyServers([a, b], store);
+    const byName = Object.fromEntries(out.map((c) => [c.server, c]));
+    expect(byName['mcp-a']?.verdict).toBe('unchanged');
+    // Nothing disappeared from the store, so mcp-b is benign first-seen.
+    expect(byName['mcp-b']?.verdict).toBe('first-seen');
+  });
+
+  it('rename-then-tamper: stored entry vanishes + new name appears → drifted (NOT first-seen)', () => {
+    // Stored: mcp-a with a trusted fingerprint.
+    // Registry now has mcp-a-renamed with a tampered command.
+    // Name lookup misses. Cross-name fingerprint match is impossible
+    // (fingerprint includes name in canonicalization). Set-difference
+    // heuristic catches it: mcp-a disappeared, mcp-a-renamed appeared.
+    const original = server('mcp-a');
+    const store: FingerprintStore = {
+      version: FINGERPRINT_STORE_VERSION,
+      servers: { 'mcp-a': fingerprintServer(original) },
+    };
+    const tampered = server('mcp-a-renamed', { command: 'evil-node' });
+    const out = classifyServers([tampered], store);
+    expect(out).toHaveLength(1);
+    expect(out[0]?.verdict).toBe('drifted');
+    expect(out[0]?.bypassed).toBe(false);
+    // `stored` is populated with a representative disappeared fingerprint
+    // so the drift-block banner has a value to display.
+    expect(out[0]?.stored).toBe(fingerprintServer(original));
+  });
+
+  it('rename-then-tamper with REA_ACCEPT_DRIFT on new name → drifted + bypassed (operator authorized)', () => {
+    const original = server('mcp-a');
+    const store: FingerprintStore = {
+      version: FINGERPRINT_STORE_VERSION,
+      servers: { 'mcp-a': fingerprintServer(original) },
+    };
+    const renamed = server('mcp-a-renamed');
+    const out = classifyServers([renamed], store, {
+      acceptDrift: 'mcp-a-renamed',
+    });
+    expect(out[0]?.verdict).toBe('drifted');
+    expect(out[0]?.bypassed).toBe(true);
+  });
+
+  it('mixed: one stored vanished + one new name + one unchanged → only the new name is drifted', () => {
+    const a = server('mcp-a');
+    const b = server('mcp-b');
+    const store: FingerprintStore = {
+      version: FINGERPRINT_STORE_VERSION,
+      servers: {
+        'mcp-a': fingerprintServer(a),
+        'mcp-b': fingerprintServer(b),
+      },
+    };
+    // Registry: mcp-a unchanged, mcp-b gone, mcp-c new. Rename detected.
+    const c = server('mcp-c');
+    const out = classifyServers([a, c], store);
+    const byName = Object.fromEntries(out.map((o) => [o.server, o]));
+    expect(byName['mcp-a']?.verdict).toBe('unchanged');
+    expect(byName['mcp-c']?.verdict).toBe('drifted');
+    expect(byName['mcp-c']?.bypassed).toBe(false);
+  });
+
+  it('rename-detection does NOT fire when stored has entries but registry removed them without adding new ones', () => {
+    // Operator deliberately disabled/removed an entry. Nothing new
+    // appeared. That's not a rename signal — no need to promote anyone.
+    const a = server('mcp-a');
+    const store: FingerprintStore = {
+      version: FINGERPRINT_STORE_VERSION,
+      servers: {
+        'mcp-a': fingerprintServer(a),
+        'mcp-b': 'b'.repeat(64),
+      },
+    };
+    // Registry only has mcp-a.
+    const out = classifyServers([a], store);
+    expect(out[0]?.verdict).toBe('unchanged');
+  });
+
+  it('rename-detection does NOT fire when registry adds entries but nothing vanished', () => {
+    // Purely additive — stored names all still present, just one new.
+    // Not a rename signal.
+    const a = server('mcp-a');
+    const store: FingerprintStore = {
+      version: FINGERPRINT_STORE_VERSION,
+      servers: { 'mcp-a': fingerprintServer(a) },
+    };
+    const b = server('mcp-b');
+    const out = classifyServers([a, b], store);
+    const byName = Object.fromEntries(out.map((o) => [o.server, o]));
+    expect(byName['mcp-b']?.verdict).toBe('first-seen');
+  });
+
+  // Documented behavior: a pure rename (operator intentionally renames an
+  // entry with no command/args/env changes) also trips this detection —
+  // the old name vanishes, a new name appears. The operator must
+  // REA_ACCEPT_DRIFT=<new-name> once to re-baseline, same as for a
+  // malicious rename-then-tamper. That's the intended trade-off: we
+  // refuse to silently trust a rename because we cannot tell operator
+  // intent from attacker intent. An explicit accept is the escape hatch.
+});
+
 describe('updateStore merge rules', () => {
   it('records first-seen fingerprints', () => {
     const store = emptyStore();

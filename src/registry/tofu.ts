@@ -64,6 +64,35 @@ function parseAcceptDrift(raw?: string): Set<string> {
  * Classify every server in `servers` against the loaded `store`. Pure:
  * does not read or write the filesystem. Returns one classification per
  * server in the same order.
+ *
+ * ## Rename-then-tamper defense
+ *
+ * A name-only lookup is not enough: an attacker who rewrites a previously
+ * trusted entry AND changes its `name` at the same time would miss the
+ * stored lookup and land as benign `first-seen`. To close that gap we
+ * compute a rename signal at boot time:
+ *
+ *   - `disappeared = stored_names - registry_names`
+ *   - `appeared    = registry_names - stored_names`
+ *
+ * If BOTH sets are non-empty in the same boot, at least one declared
+ * entry has been renamed (stored entry vanished, a new name showed up).
+ * In that case every entry in `appeared` is promoted from `first-seen`
+ * to `drifted`: the operator MUST explicitly accept it via
+ * `REA_ACCEPT_DRIFT=<new-name>` before it connects. Genuinely additive
+ * installs (new entry appended to registry with no concurrent removal)
+ * remain `first-seen` and are allowed with the usual LOUD stderr banner.
+ *
+ * This is strictly additive over the name-based lookup — a name-matched
+ * drift (same name, changed config) still classifies as `drifted` via
+ * the primary path.
+ *
+ * The fingerprint itself already includes `server.name` (see
+ * `fingerprint.ts` canonicalization), so an attacker cannot make a
+ * renamed entry's fingerprint coincide with a stored one under a
+ * different name. That means a cross-name fingerprint match would never
+ * happen in practice — the set-difference heuristic above is what
+ * actually defends the threat.
  */
 export function classifyServers(
   servers: RegistryServer[],
@@ -71,10 +100,49 @@ export function classifyServers(
   opts: ClassifyOptions = {},
 ): TofuClassification[] {
   const bypass = parseAcceptDrift(opts.acceptDrift);
+
+  const registryNames = new Set(servers.map((s) => s.name));
+  const storedNames = new Set(Object.keys(store.servers));
+  const disappeared = new Set<string>();
+  for (const n of storedNames) {
+    if (!registryNames.has(n)) disappeared.add(n);
+  }
+  const appeared = new Set<string>();
+  for (const n of registryNames) {
+    if (!storedNames.has(n)) appeared.add(n);
+  }
+  // A rename is only plausible when something vanished AND something new
+  // appeared in the same boot. Pure additions (disappeared empty) are
+  // still benign first-seen.
+  const renameDetected = disappeared.size > 0 && appeared.size > 0;
+
+  // When a rename is detected, surface one disappeared stored fingerprint
+  // so the drift-block banner and audit entry have a concrete `stored`
+  // value to display. The choice is deterministic (first in insertion
+  // order from the store object) and documented as representative rather
+  // than authoritative — the operator's job is to compare the new entry
+  // against .rea/fingerprints.json by hand.
+  const representativeStored =
+    renameDetected && disappeared.size > 0
+      ? store.servers[[...disappeared][0] as string]
+      : undefined;
+
   return servers.map((s) => {
     const current = fingerprintServer(s);
     const stored = store.servers[s.name];
     if (stored === undefined) {
+      if (renameDetected && appeared.has(s.name)) {
+        // Rename-then-tamper defense: promote to drifted. Operator must
+        // REA_ACCEPT_DRIFT the new name to let it connect.
+        const c: TofuClassification = {
+          server: s.name,
+          verdict: 'drifted',
+          current,
+          bypassed: bypass.has(s.name),
+        };
+        if (representativeStored !== undefined) c.stored = representativeStored;
+        return c;
+      }
       return { server: s.name, verdict: 'first-seen', current, bypassed: false };
     }
     if (stored === current) {

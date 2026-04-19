@@ -236,6 +236,78 @@ describe('applyTofuGate', () => {
     expect(store.servers.alpha).not.toBe(fingerprintServer(poisonedAlpha));
   });
 
+  it('disabled entries at first boot get a fingerprint baseline (no spawn, just hash)', async () => {
+    // Regression: `rea serve` used to filter registry.servers by `enabled`
+    // BEFORE calling applyTofuGate. A disabled entry got no baseline, so
+    // the disabled→enabled transition always looked benign first-seen on
+    // the next boot — even if the command was tampered while disabled.
+    // Fix: pass the full declared list into the gate; baseline every
+    // entry. Fingerprinting is a pure hash (see fingerprint.ts) — no
+    // spawn is attempted for disabled entries.
+    const disabled = server('mcp-x', { enabled: false, command: '/legit/path' });
+    const { accepted } = await applyTofuGate(baseDir, [disabled]);
+
+    // The disabled entry is still in `accepted` — applyTofuGate itself
+    // does not filter by `enabled`. The caller (rea serve) is
+    // responsible for keeping the `enabled` flag honored downstream at
+    // the spawn step. What matters here is that the fingerprint
+    // baseline landed on disk.
+    expect(accepted.map((s) => s.name)).toEqual(['mcp-x']);
+
+    const storeRaw = await fs.readFile(
+      path.join(baseDir, '.rea', 'fingerprints.json'),
+      'utf8',
+    );
+    const store = JSON.parse(storeRaw) as { servers: Record<string, string> };
+    expect(store.servers['mcp-x']).toBe(fingerprintServer(disabled));
+  });
+
+  it('disabled-then-tampered-then-enabled: classifies drifted (no escape via disabled window)', async () => {
+    // Full regression for the disabled-entry escape. Boot 1: entry
+    // exists, disabled, legit command → baseline recorded. Boot 2:
+    // attacker tampered while disabled AND flipped enabled=true → the
+    // gate MUST see a drift, not a first-seen.
+    const legit = server('mcp-x', { enabled: false, command: '/legit/path' });
+    await applyTofuGate(baseDir, [legit]);
+    stderrChunks.length = 0;
+
+    const tampered = server('mcp-x', { enabled: true, command: '/tampered/path' });
+    const { accepted, classifications } = await applyTofuGate(baseDir, [tampered]);
+
+    expect(classifications[0]?.verdict).toBe('drifted');
+    expect(classifications[0]?.bypassed).toBe(false);
+    // Drifted without bypass → server dropped from accepted set.
+    expect(accepted).toHaveLength(0);
+    expect(stderrChunks.join('')).toMatch(/FINGERPRINT DRIFT/);
+  });
+
+  it('rename-then-tamper at the gate: new name is classified drifted, not first-seen', async () => {
+    // End-to-end coverage of the rename-bypass fix through the side-
+    // effect layer: the side-effect emitter must fire the drift banner
+    // (not the first-seen banner), audit must land a `tofu.drift_blocked`
+    // record, and the tampered entry must be dropped from accepted.
+    const original = server('mcp-a');
+    await applyTofuGate(baseDir, [original]);
+    stderrChunks.length = 0;
+
+    const tampered = server('mcp-a-renamed', { command: 'evil-node' });
+    const { accepted, classifications } = await applyTofuGate(baseDir, [tampered]);
+
+    expect(classifications[0]?.verdict).toBe('drifted');
+    expect(accepted).toHaveLength(0);
+    const stderr = stderrChunks.join('');
+    expect(stderr).toMatch(/FINGERPRINT DRIFT/);
+    expect(stderr).not.toMatch(/NEW DOWNSTREAM SERVER/);
+
+    const lines = await readAuditLines(baseDir);
+    const driftBlocked = lines.filter(
+      (l) =>
+        l.tool_name === 'rea.tofu' &&
+        (l.metadata as Record<string, unknown>)?.event === 'tofu.drift_blocked',
+    );
+    expect(driftBlocked).toHaveLength(1);
+  });
+
   it('REA_ACCEPT_DRIFT is single-shot: on next call without the env var, drift re-blocks', async () => {
     // This test enforces the "single-shot bypass" contract: the env var is
     // the ONLY bypass channel. After the bypass is consumed, the new

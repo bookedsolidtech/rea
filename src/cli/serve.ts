@@ -140,18 +140,35 @@ export async function runServe(): Promise<void> {
   // G7: TOFU fingerprint gate. Runs BEFORE we build the downstream pool so
   // drifted servers are filtered out at the edge. First-seen and accepted
   // drift fire LOUD stderr + audit + log; the gateway stays up either way.
-  // When the registry has zero enabled servers there is nothing to
+  //
+  // We pass the FULL declared server list (enabled AND disabled) to the
+  // gate so every entry gets a fingerprint baseline on first sight.
+  // Disabled-entry escape was a real bypass: an attacker who tampered
+  // with a disabled entry got no baseline recorded, so the
+  // disabled→enabled transition always looked benign first-seen on the
+  // next boot. Fingerprinting is a pure canonicalize+sha256 operation on
+  // the registry config (no spawn), so including disabled entries is
+  // cheap and safe.
+  //
+  // The `enabled` filter is applied AFTER the gate: only enabled servers
+  // that passed the gate are handed to the downstream pool for spawn.
+  //
+  // When the registry declares zero servers there is nothing to
   // fingerprint — skip the gate entirely to avoid a redundant disk write
   // on zero-server installs.
   let gatedRegistry = registry;
-  const enabledServers = registry.servers.filter((s) => s.enabled);
   try {
-    if (enabledServers.length > 0) {
-      const { accepted } = await applyTofuGate(baseDir, enabledServers, logger);
+    if (registry.servers.length > 0) {
+      const { accepted } = await applyTofuGate(baseDir, registry.servers, logger);
       const acceptedNames = new Set(accepted.map((s) => s.name));
       gatedRegistry = {
         ...registry,
-        servers: registry.servers.filter((s) => !s.enabled || acceptedNames.has(s.name)),
+        // Keep only entries that passed the TOFU gate. The `enabled`
+        // filter is applied downstream when the pool decides what to
+        // spawn — disabled entries that passed the gate stay in the
+        // registry so a future enable uses the already-recorded
+        // baseline instead of looking like a fresh first-seen.
+        servers: registry.servers.filter((s) => acceptedNames.has(s.name)),
       };
     }
   } catch (e) {
