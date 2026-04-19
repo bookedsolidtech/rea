@@ -1,0 +1,195 @@
+/**
+ * Integration tests for BUG-008: `hooks/push-review-gate.sh` self-detects
+ * git's native pre-push stdin contract.
+ *
+ * Background: through 0.4.0, the hook only parsed Claude-Code JSON stdin
+ * (`.tool_input.command`). When wired into `.husky/pre-push`, git sends
+ * ref-list lines as stdin and positional remote/url as argv. The jq parse
+ * produced an empty CMD, `if [[ -z "$CMD" ]]; then exit 0; fi` fired, and
+ * the gate silently became a no-op. Every consumer that ran `rea init` on
+ * 0.3.x/0.4.0 had a broken pre-push gate.
+ *
+ * 0.5.0 adds a sniff: when jq returns empty AND the first non-blank stdin
+ * line matches the pre-push `<ref> <sha> <ref> <sha>` shape, CMD is
+ * synthesized as `git push <argv $1>` and the existing step-6 pre-push
+ * parser handles the rest. This test asserts the sniff activates, the
+ * existing argv flow still works (regression guard), and random stdin
+ * still exits 0.
+ */
+
+import { execFileSync, spawnSync } from 'node:child_process';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+
+const REPO_ROOT = path.resolve(__dirname, '..', '..');
+const HOOK_PATH = path.join(REPO_ROOT, 'hooks', 'push-review-gate.sh');
+
+interface ScratchRepo {
+  dir: string;
+  featureSha: string;
+  mainSha: string;
+}
+
+/**
+ * A scratch repo with two commits: baseline on `main`, and a second
+ * commit on `feature` touching `hooks/__test__.sh` (a protected path).
+ */
+async function makeRepo(): Promise<ScratchRepo> {
+  const dir = await fs.realpath(
+    await fs.mkdtemp(path.join(os.tmpdir(), 'rea-push-gate-prepush-')),
+  );
+
+  const git = (...args: string[]): string =>
+    execFileSync('git', args, { cwd: dir, encoding: 'utf8' }).trim();
+
+  git('init', '--initial-branch=main', '--quiet');
+  git('config', 'user.email', 'test@example.test');
+  git('config', 'user.name', 'REA Test');
+  git('config', 'commit.gpgsign', 'false');
+
+  await fs.writeFile(path.join(dir, 'README.md'), '# scratch\n');
+  git('add', 'README.md');
+  git('commit', '-m', 'baseline', '--quiet');
+  const mainSha = git('rev-parse', 'HEAD');
+
+  git('checkout', '-b', 'feature', '--quiet');
+  await fs.mkdir(path.join(dir, 'hooks'), { recursive: true });
+  await fs.writeFile(
+    path.join(dir, 'hooks', '__test__.sh'),
+    '#!/bin/bash\necho scratch\n',
+  );
+  git('add', 'hooks/__test__.sh');
+  git('commit', '-m', 'touch protected path', '--quiet');
+  const featureSha = git('rev-parse', 'HEAD');
+
+  // A fake remote ref so merge-base resolves against something other than
+  // HEAD. We simulate git's ref-list by writing to refs/remotes/origin/main.
+  await fs.mkdir(path.join(dir, '.git', 'refs', 'remotes', 'origin'), {
+    recursive: true,
+  });
+  await fs.writeFile(
+    path.join(dir, '.git', 'refs', 'remotes', 'origin', 'main'),
+    `${mainSha}\n`,
+  );
+
+  return { dir, featureSha, mainSha };
+}
+
+function jqExists(): boolean {
+  const res = spawnSync('jq', ['--version'], { encoding: 'utf8' });
+  return res.status === 0;
+}
+
+describe('push-review-gate.sh — BUG-008 pre-push stdin self-detect', () => {
+  const cleanup: string[] = [];
+
+  beforeEach(() => {
+    cleanup.length = 0;
+  });
+
+  afterEach(async () => {
+    await Promise.all(
+      cleanup.map((d) => fs.rm(d, { recursive: true, force: true })),
+    );
+  });
+
+  it('blocks a push when invoked with git-native pre-push stdin + argv', async () => {
+    if (!jqExists()) return;
+
+    const repo = await makeRepo();
+    cleanup.push(repo.dir);
+
+    // Synthesize git's pre-push stdin contract:
+    //   `<local_ref> <local_sha> <remote_ref> <remote_sha>`
+    const prepushLine = `refs/heads/feature ${repo.featureSha} refs/heads/main ${repo.mainSha}\n`;
+
+    const res = spawnSync('bash', [HOOK_PATH, 'origin', 'git@example.test:foo/bar.git'], {
+      cwd: repo.dir,
+      env: { ...process.env, CLAUDE_PROJECT_DIR: repo.dir },
+      input: prepushLine,
+      encoding: 'utf8',
+    });
+
+    // With a protected-path diff and no Codex record, the gate must block.
+    // That proves the stdin was picked up — a pre-BUG-008 script would have
+    // exited 0 on the empty-jq-parse early return.
+    expect(res.status).toBe(2);
+    expect(res.stderr).toMatch(/protected paths changed|PUSH REVIEW GATE/);
+  });
+
+  it('falls through to exit 0 on unrelated stdin (no jq match, no pre-push shape)', async () => {
+    if (!jqExists()) return;
+
+    const repo = await makeRepo();
+    cleanup.push(repo.dir);
+
+    const res = spawnSync('bash', [HOOK_PATH], {
+      cwd: repo.dir,
+      env: { ...process.env, CLAUDE_PROJECT_DIR: repo.dir },
+      input: 'not-a-tool-call\nnot-pre-push-format\n',
+      encoding: 'utf8',
+    });
+
+    expect(res.status).toBe(0);
+  });
+
+  it('regression: Claude-Code JSON stdin path still works (tool_input.command)', async () => {
+    if (!jqExists()) return;
+
+    const repo = await makeRepo();
+    cleanup.push(repo.dir);
+
+    const json = JSON.stringify({ tool_input: { command: 'git push origin feature:main' } });
+    const res = spawnSync('bash', [HOOK_PATH], {
+      cwd: repo.dir,
+      env: { ...process.env, CLAUDE_PROJECT_DIR: repo.dir },
+      input: json,
+      encoding: 'utf8',
+    });
+
+    expect(res.status).toBe(2);
+    expect(res.stderr).toMatch(/protected paths changed|PUSH REVIEW GATE/);
+  });
+
+  it('regression: non-git-push JSON command still exits 0', async () => {
+    if (!jqExists()) return;
+
+    const repo = await makeRepo();
+    cleanup.push(repo.dir);
+
+    const json = JSON.stringify({ tool_input: { command: 'ls -la' } });
+    const res = spawnSync('bash', [HOOK_PATH], {
+      cwd: repo.dir,
+      env: { ...process.env, CLAUDE_PROJECT_DIR: repo.dir },
+      input: json,
+      encoding: 'utf8',
+    });
+
+    expect(res.status).toBe(0);
+  });
+
+  it('honors push_review: false policy even under pre-push stdin', async () => {
+    if (!jqExists()) return;
+
+    const repo = await makeRepo();
+    cleanup.push(repo.dir);
+
+    await fs.mkdir(path.join(repo.dir, '.rea'), { recursive: true });
+    await fs.writeFile(
+      path.join(repo.dir, '.rea', 'policy.yaml'),
+      'push_review: false\n',
+    );
+
+    const prepushLine = `refs/heads/feature ${repo.featureSha} refs/heads/main ${repo.mainSha}\n`;
+    const res = spawnSync('bash', [HOOK_PATH, 'origin'], {
+      cwd: repo.dir,
+      env: { ...process.env, CLAUDE_PROJECT_DIR: repo.dir },
+      input: prepushLine,
+      encoding: 'utf8',
+    });
+
+    expect(res.status).toBe(0);
+  });
+});

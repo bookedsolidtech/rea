@@ -28,6 +28,8 @@ const ContextProtectionSchema = z.object({
 const ReviewPolicySchema = z
   .object({
     codex_required: z.boolean().optional(),
+    cache_max_age_seconds: z.number().int().positive().optional(),
+    allow_skip_in_ci: z.boolean().optional(),
   })
   .strict();
 
