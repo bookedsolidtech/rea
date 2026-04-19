@@ -259,54 +259,235 @@ function hasHaltEnforcement(content: string): boolean {
 
 /**
  * True when `content` contains a shell command that performs a CONTENT match
- * against the `codex.review` audit record and propagates failure on miss.
+ * against the `codex.review` audit record, BOUND TO the audit log path, and
+ * whose failure is allowed to propagate (no `|| true`, no backgrounding, no
+ * pipelines that mask the match via a non-grep tail).
  *
- * Commands accepted (any one of these on a non-comment line that also
- * references `codex.review`, literally or with the backslash-escaped form a
- * `grep` regex uses):
+ * Commands accepted (on a non-comment logical line that references
+ * `codex.review`, literally or with the backslash-escaped form `codex\.review`
+ * that appears inside a grep -E pattern):
  *   - `grep` / `egrep` / `fgrep` — classic POSIX content match
  *   - `rg`                       — ripgrep
  *
- * Commands REJECTED (R13 F2):
+ * Binding to the audit log (required — R15 F1):
+ *   - Literal `.rea/audit.jsonl` appears on the same logical line, OR
+ *   - A variable reference like `$AUDIT` / `${AUDIT}` whose ASSIGNMENT has a
+ *     RHS containing the literal `.rea/audit.jsonl`. The shipped husky gate
+ *     uses `AUDIT_LOG="${REA_ROOT}/.rea/audit.jsonl"` and `grep ... "$AUDIT_LOG"`.
+ *
+ * Line continuations: a trailing backslash followed by a newline is joined
+ * before scanning. The shipped husky gate splits the audit check across two
+ * physical lines via `grep -E ... "$AUDIT_LOG" 2>/dev/null | \` + `grep -qF ...`
+ * — we must see the full logical line so the pipe-tail check runs against
+ * the complete construct.
+ *
+ * Commands REJECTED (R13 F2, preserved):
  *   - `test -s .rea/audit.jsonl` / `[ -f .rea/audit.jsonl ]` — file existence
- *     or non-empty test does NOT prove a `codex.review` record is present
- *     for the current HEAD. A stale audit file from a previous push (or even
- *     a deliberately-placed empty-JSON line) satisfies these tests.
- *   - `awk`, `sed` — stream editors. `awk '/pattern/' file` exits 0 whether
- *     or not the pattern matches any line; `sed -n '/pattern/p'` is the same.
- *     Their no-match behavior is silent success, which is the inverse of what
- *     we need.
- *   - Any line that only mentions `.rea/audit.jsonl` without also mentioning
- *     `codex.review` — accessing the file is not the same as checking content.
+ *     or non-empty test does NOT prove a `codex.review` record is present.
+ *   - `awk`, `sed` — pattern-no-match is silent success; the opposite of
+ *     what we need.
+ *
+ * Enforcement-swallowing forms REJECTED (R15 F1):
+ *   - `|| true` / `|| :` / `|| /bin/true` / `|| /usr/bin/true` / `|| exit 0`
+ *     / `|| exit` with no arg — any of these mask a grep miss.
+ *   - Backgrounded: bare `&` that is not part of `&&` or an fd redirect —
+ *     the backgrounded pipeline returns 0 to the shell regardless of grep.
+ *   - `;` followed by a non-control command word — the LAST command becomes
+ *     the status, swallowing the grep miss. Control keywords
+ *     (`then`/`do`/`fi`/`done`/`else`/`elif`/`esac`) and trailing comments
+ *     are allowed.
+ *   - Pipelines whose LAST segment is NOT a grep-family command — under
+ *     POSIX sh the pipeline's exit is the last command's, so `grep ... | cat`
+ *     returns 0 even when grep missed. Pipelines of grep-only segments are
+ *     allowed (the shipped husky gate uses `grep -E ... | grep -qF ...`).
  *
  * Why `codex\.review` (literal backslash) is accepted: the shipped
- * `.husky/pre-push` embeds the token inside a grep -E regex where the `.` is
+ * `.husky/pre-push` embeds the token inside a grep -E regex where `.` is
  * escaped to match the literal character, so the token appears on disk as
  * `codex\.review`. The classifier must recognize both forms.
  *
  * R12 F1: rejected `echo`-based spoofs by requiring a paired check command.
  * R13 F2: rejected file-existence-only proofs by requiring a content-match
- * command AND the `codex.review` token (not just the audit log path).
+ *         command AND the `codex.review` token.
+ * R15 F1: bind the match to the audit log, reject failure-swallowing tails,
+ *         and join shell line continuations so the shipped gate's multi-line
+ *         `grep | grep` is evaluated as a single logical line.
  */
 function hasAuditCheck(content: string): boolean {
-  // Content-match commands only. `awk` / `sed` / `test` / `[` / `[[` are
-  // deliberately excluded: they do not propagate no-match as non-zero.
-  // `grep -q` and `rg -q` are fine (quiet mode still exits non-zero on miss).
+  const joined = joinLineContinuations(content);
+  const auditVars = collectAuditLogVars(joined);
   const contentMatchCmd = /\b(grep|egrep|fgrep|rg)\b/;
-  // Require `codex.review` specifically (literal or grep-escaped). Mere
-  // mention of `.rea/audit.jsonl` is not enough: a hook that greps the audit
-  // file for an unrelated token (or one the author hand-crafted to always
-  // match) would satisfy a pure-path test without ever checking for a real
-  // review entry.
   const codexReviewToken = /codex\\?\.review/;
-  for (const raw of content.split(/\r?\n/)) {
+  const auditLogLiteral = /\.rea\/audit\.jsonl/;
+
+  for (const raw of joined.split(/\r?\n/)) {
     const t = raw.trimStart();
     if (t.startsWith('#')) continue;
-    if (!codexReviewToken.test(t)) continue;
-    if (!contentMatchCmd.test(t)) continue;
+    const line = stripTrailingComment(t);
+    if (!codexReviewToken.test(line)) continue;
+    if (!contentMatchCmd.test(line)) continue;
+    // R15 F1: must bind to the audit log (literal path OR tracked variable).
+    const referencesAuditLog =
+      auditLogLiteral.test(line) ||
+      Array.from(auditVars).some((v) =>
+        new RegExp(`\\$\\{?${v}\\}?`).test(line),
+      );
+    if (!referencesAuditLog) continue;
+    // R15 F1: reject enforcement-swallowing tails.
+    if (isSwallowingAuditCheck(line)) continue;
+    // R15 F1: pipelines must end in a grep-family command so the final
+    // status still reflects a content check.
+    if (!isGrepOnlyPipeline(line)) continue;
     return true;
   }
   return false;
+}
+
+/**
+ * Join POSIX shell line continuations so the rest of the parser sees one
+ * logical line per command. A trailing backslash immediately before `\n`
+ * (no intervening whitespace — POSIX rule) is the continuation token.
+ *
+ * Using a single space as the join character preserves token boundaries so
+ * downstream regexes (which rely on `\b`) still match correctly across the
+ * former line break.
+ */
+function joinLineContinuations(content: string): string {
+  return content.replace(/\\\r?\n/g, ' ');
+}
+
+/**
+ * Collect shell variable names whose assigned value contains the literal
+ * audit log path `.rea/audit.jsonl`. The shipped husky gate binds the path
+ * once into `AUDIT_LOG` and references `$AUDIT_LOG` on the grep line — a
+ * spoof that binds an unrelated file into the variable would fail this
+ * collection because the RHS literal check is on the source path, not the
+ * variable name.
+ */
+function collectAuditLogVars(content: string): Set<string> {
+  const auditVars = new Set<string>();
+  const assignRe =
+    /^(?:export[ \t]+|readonly[ \t]+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$/;
+  const auditLiteral = /\.rea\/audit\.jsonl/;
+  for (const raw of content.split(/\r?\n/)) {
+    const t = raw.trimStart();
+    if (t.startsWith('#')) continue;
+    const m = stripTrailingComment(t).match(assignRe);
+    if (!m) continue;
+    const name = m[1];
+    const rhs = m[2];
+    if (name === undefined || rhs === undefined) continue;
+    if (auditLiteral.test(rhs)) auditVars.add(name);
+  }
+  return auditVars;
+}
+
+/**
+ * Strip a trailing `# ...` comment (hash preceded by whitespace and outside
+ * of quoted strings) from a line. Preserves `#` inside single- or double-
+ * quoted segments — a pragmatic but non-complete quoting parser that is
+ * sufficient for hook-script shapes (no `$(...)` command substitution
+ * nesting is handled). Without this, an attacker could hide a swallower
+ * behind a comment boundary during manual code review, though not from the
+ * shell itself; stripping here keeps the classifier aligned with the
+ * shell's view of the line.
+ */
+function stripTrailingComment(line: string): string {
+  let inSingle = false;
+  let inDouble = false;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    const prev = i > 0 ? line[i - 1] : '';
+    if (c === "'" && !inDouble) inSingle = !inSingle;
+    else if (c === '"' && !inSingle) inDouble = !inDouble;
+    else if (
+      c === '#' &&
+      !inSingle &&
+      !inDouble &&
+      (prev === ' ' || prev === '\t')
+    ) {
+      return line.slice(0, i).trimEnd();
+    }
+  }
+  return line;
+}
+
+/**
+ * True when `line` uses any construct that silently discards the grep's
+ * non-zero exit when no `codex.review` record matches. Applies to the
+ * logical line containing the audit-check grep (continuations already joined).
+ *
+ * NOTE: `grep ...; then` (the shipped husky gate's shape, as the condition
+ * of `if ! grep ...; then`) is accepted — `then` is a control keyword.
+ */
+function isSwallowingAuditCheck(line: string): boolean {
+  // `\b` only matches at a word/non-word boundary, which excludes `:` when
+  // followed by end-of-line or whitespace (both non-word). Use `(?!\w)`
+  // instead so `|| :`, `|| true`, `|| /bin/true` all match regardless of
+  // what trails.
+  if (/\|\|\s*(true|:|\/bin\/true|\/usr\/bin\/true)(?!\w)/.test(line))
+    return true;
+  // `|| exit` with no numeric argument falls through to `$?` which can be
+  // 0; `|| exit 0` (and `exit 00` etc.) explicitly allows the push.
+  if (/\|\|\s*exit(\s+0+\b|\s*$|\s*;)/.test(line)) return true;
+  // Bare `&` that is not part of `&&` and not an fd-redirect piece. Strip
+  // POSIX fd redirects first so `2>&1`, `1>&2`, `<&0`, and bash `&>` forms
+  // do not look like backgrounding.
+  const stripped = line.replace(/\d*[<>]&\d*-?/g, ' ').replace(/&>>?/g, ' ');
+  if (/(?<!&)&(?!&)/.test(stripped)) return true;
+  // `;` followed by a non-control command word. Control keywords close an
+  // `if`/`while`/`until`/`case`/`for` construct and are safe. A trailing
+  // comment (`;` followed by `#`) is also safe — nothing more runs.
+  const postSemi = line.match(/;\s*(\S+)/);
+  if (postSemi && postSemi[1] !== undefined) {
+    const first = postSemi[1];
+    if (!first.startsWith('#')) {
+      const controlKeywords = new Set([
+        'then',
+        'do',
+        'fi',
+        'done',
+        'else',
+        'elif',
+        'esac',
+      ]);
+      if (!controlKeywords.has(first)) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * True when every pipeline segment's last command is a grep-family match.
+ * For single-command lines (no `|`) returns true trivially.
+ *
+ * Under POSIX `/bin/sh`, a pipeline's exit is the LAST command's, so
+ * `grep ... .rea/audit.jsonl | cat` returns 0 on miss. Requiring the tail
+ * to be a grep (or rg) keeps enforcement meaningful while permitting the
+ * shipped husky gate's `grep -E ... | grep -qF ...` form.
+ */
+function isGrepOnlyPipeline(line: string): boolean {
+  const segments: string[] = [];
+  let buf = '';
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    const next = line[i + 1] ?? '';
+    if (c === '|' && next !== '|') {
+      segments.push(buf);
+      buf = '';
+    } else if (c === '|' && next === '|') {
+      buf += c + next;
+      i++;
+    } else {
+      buf += c;
+    }
+  }
+  if (buf.length > 0) segments.push(buf);
+  if (segments.length <= 1) return true;
+  const grepCmd = /(^|\s)(grep|egrep|fgrep|rg)\b/;
+  const last = segments[segments.length - 1];
+  if (last === undefined) return true;
+  return grepCmd.test(last);
 }
 
 /**
@@ -370,7 +551,7 @@ export function referencesReviewGate(content: string): boolean {
     }
     if (/^(if|for|while|case)\b/.test(line)) depth++;
     if (/^(fi|done|esac)\b/.test(line)) depth = Math.max(0, depth - 1);
-    if (depth === 0 && /^(exit|return)(\s+\d+)?$/.test(line)) {
+    if (depth === 0 && isTopLevelExit(line)) {
       exitedBeforeGate = true;
     }
     if (!line.includes(GATE_DELEGATION_TOKEN)) continue;
@@ -439,7 +620,7 @@ function hasVariableGateInvocation(content: string): boolean {
     if (line.length === 0) continue;
     if (/^(if|for|while|case)\b/.test(line)) depth++;
     if (/^(fi|done|esac)\b/.test(line)) depth = Math.max(0, depth - 1);
-    if (depth === 0 && /^(exit|return)(\s+\d+)?$/.test(line)) {
+    if (depth === 0 && isTopLevelExit(line)) {
       exitedBeforeGate = true;
     }
     // Check whether this line invokes any of the gate variables. Pattern:
@@ -514,6 +695,36 @@ function hasVariableGateInvocation(content: string): boolean {
  * R14 F1: reject single `|` (pipe) — the pipeline's last-command exit is
  *   never the gate's, so the gate's failure is silently dropped.
  */
+/**
+ * True when the trimmed `line` is a top-level `exit` or `return` statement
+ * that terminates (or short-circuits) the script. Accepts the forms Codex
+ * R15 F2 called out as gaps in the earlier `^(exit|return)(\s+\d+)?$`
+ * regex, all of which must mark the script as having already exited so
+ * later gate-invocation lines are treated as dead code:
+ *
+ *   - `exit`        / `return`
+ *   - `exit 0`      / `return 1`
+ *   - `exit 0;`     / `return 1;`        — trailing semicolon
+ *   - `exit 0 # x`  / `return 1 # x`     — trailing comment
+ *   - `exit 0; # x` / `exit 0 ; # x`     — semicolon then comment
+ *   - `exit 0; foo`                       — multi-statement; first is exit,
+ *                                            so the shell never reaches `foo`
+ *
+ * We split on the first `;` and test the leading statement. This mirrors
+ * how a POSIX shell executes the line: it evaluates statements left-to-
+ * right, and `exit`/`return` unwinds before any right-hand statements run.
+ *
+ * R15 F2: the earlier anchored regex missed every non-bare form above, so
+ * a spoof like `exit 0;` followed by `exec .claude/hooks/push-review-gate.sh`
+ * was classified as valid delegation — dead code reported as governance.
+ */
+function isTopLevelExit(line: string): boolean {
+  const trimmed = stripTrailingComment(line).trimEnd();
+  if (trimmed.length === 0) return false;
+  const firstStmt = trimmed.split(';')[0]?.trim() ?? '';
+  return /^(exit|return)(\s+\d+)?$/.test(firstStmt);
+}
+
 function hasContinuationOperator(line: string): boolean {
   const gateIdx = line.indexOf(GATE_DELEGATION_TOKEN);
   if (gateIdx === -1) return false;

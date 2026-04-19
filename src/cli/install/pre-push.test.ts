@@ -1435,6 +1435,175 @@ describe('isReaManagedHuskyGate — Husky gate marker detection (Finding 2)', ()
   });
 });
 
+// R15 F1: `hasAuditCheck` must bind to the audit log and reject enforcement-
+// swallowing tails. Previous R13 F2 allowed any `grep` + `codex.review` line
+// regardless of which file was being grepped or what trailed the command —
+// a spoof like `grep -q codex.review README.md` or
+// `grep -q codex.review .rea/audit.jsonl || true` satisfied the check
+// without ever enforcing anything.
+describe('isReaManagedHuskyGate — R15 F1 audit check must prove enforcement', () => {
+  const header = `#!/bin/sh\n${HUSKY_GATE_MARKER}\n[ -f .rea/HALT ] && exit 1\n`;
+
+  it('grep of codex.review on README.md (wrong file): returns false', () => {
+    const content = `${header}grep -q codex.review README.md\n`;
+    expect(isReaManagedHuskyGate(content)).toBe(false);
+  });
+
+  it('grep with `|| true` (explicit swallow): returns false', () => {
+    const content = `${header}grep -q codex.review .rea/audit.jsonl || true\n`;
+    expect(isReaManagedHuskyGate(content)).toBe(false);
+  });
+
+  it('grep with `|| :` (null-command swallow): returns false', () => {
+    const content = `${header}grep -q codex.review .rea/audit.jsonl || :\n`;
+    expect(isReaManagedHuskyGate(content)).toBe(false);
+  });
+
+  it('grep with `|| /bin/true` (absolute-path swallow): returns false', () => {
+    const content = `${header}grep -q codex.review .rea/audit.jsonl || /bin/true\n`;
+    expect(isReaManagedHuskyGate(content)).toBe(false);
+  });
+
+  it('grep with `|| exit 0` (explicit allow): returns false', () => {
+    const content = `${header}grep -q codex.review .rea/audit.jsonl || exit 0\n`;
+    expect(isReaManagedHuskyGate(content)).toBe(false);
+  });
+
+  it('grep with `|| exit` (implicit $? allow): returns false', () => {
+    const content = `${header}grep -q codex.review .rea/audit.jsonl || exit\n`;
+    expect(isReaManagedHuskyGate(content)).toBe(false);
+  });
+
+  it('grep with trailing `&` (backgrounded): returns false', () => {
+    const content = `${header}grep -q codex.review .rea/audit.jsonl &\n`;
+    expect(isReaManagedHuskyGate(content)).toBe(false);
+  });
+
+  it('grep with `; echo done` (sequential command swallow): returns false', () => {
+    const content = `${header}grep -q codex.review .rea/audit.jsonl; echo done\n`;
+    expect(isReaManagedHuskyGate(content)).toBe(false);
+  });
+
+  it('grep piped to cat (non-grep tail swallows): returns false', () => {
+    const content = `${header}grep codex.review .rea/audit.jsonl | cat\n`;
+    expect(isReaManagedHuskyGate(content)).toBe(false);
+  });
+
+  it('grep piped to grep (both grep-family): returns true', () => {
+    const content =
+      `${header}grep -E '"tool_name":"codex.review"' .rea/audit.jsonl | grep -qF head_sha\n`;
+    expect(isReaManagedHuskyGate(content)).toBe(true);
+  });
+
+  it('variable indirection bound to .rea/audit.jsonl: returns true', () => {
+    const content =
+      `${header}AUDIT=.rea/audit.jsonl\ngrep -q codex.review "$AUDIT"\n`;
+    expect(isReaManagedHuskyGate(content)).toBe(true);
+  });
+
+  it('variable indirection bound to a non-audit file: returns false', () => {
+    const content =
+      `${header}FAKE=README.md\ngrep -q codex.review "$FAKE"\n`;
+    expect(isReaManagedHuskyGate(content)).toBe(false);
+  });
+
+  it('line continuation joins the audit grep and its pipe-tail grep: returns true', () => {
+    // Mirrors the shipped `.husky/pre-push` which splits the check across two
+    // physical lines via a trailing backslash. `joinLineContinuations` must
+    // merge them so `isGrepOnlyPipeline` evaluates the full construct.
+    const content =
+      `${header}AUDIT_LOG="\${REA_ROOT}/.rea/audit.jsonl"\n` +
+      `if ! grep -E '"tool_name":"codex\\.review"' "$AUDIT_LOG" 2>/dev/null | \\\n` +
+      `     grep -qF "\\"head_sha\\":\\"$local_sha\\""; then\n` +
+      `  exit 1\n` +
+      `fi\n`;
+    expect(isReaManagedHuskyGate(content)).toBe(true);
+  });
+
+  it('`if !` construct with `; then` closing keyword is NOT a swallow: returns true', () => {
+    // The `;` inside `grep ...; then` is part of the `if`/`then` shell
+    // syntax, not a sequential-command swallower. Must be accepted.
+    const content =
+      `${header}if ! grep -q codex.review .rea/audit.jsonl; then\n` +
+      `  exit 1\n` +
+      `fi\n`;
+    expect(isReaManagedHuskyGate(content)).toBe(true);
+  });
+});
+
+// R15 F2: `referencesReviewGate` early-exit detector missed non-bare forms of
+// `exit`/`return`, so a spoof like `exit 0;` followed by `exec .../gate.sh`
+// was classified as valid delegation despite the gate being dead code.
+describe('referencesReviewGate — R15 F2 early-exit handles terminators', () => {
+  it('exit 0; followed by exec gate: returns false (dead code)', () => {
+    const content = [
+      '#!/bin/sh',
+      'exit 0;',
+      'exec .claude/hooks/push-review-gate.sh "$@"',
+    ].join('\n');
+    expect(referencesReviewGate(content)).toBe(false);
+  });
+
+  it('return 1; followed by `.` (dot) gate: returns false', () => {
+    const content = [
+      '#!/bin/sh',
+      'return 1;',
+      '. .claude/hooks/push-review-gate.sh',
+    ].join('\n');
+    expect(referencesReviewGate(content)).toBe(false);
+  });
+
+  it('exit 0 # comment followed by exec gate: returns false', () => {
+    const content = [
+      '#!/bin/sh',
+      'exit 0 # early-exit spoof',
+      'exec .claude/hooks/push-review-gate.sh "$@"',
+    ].join('\n');
+    expect(referencesReviewGate(content)).toBe(false);
+  });
+
+  it('exit 0; # comment followed by exec gate: returns false', () => {
+    const content = [
+      '#!/bin/sh',
+      'exit 0; # early-exit spoof with semicolon',
+      'exec .claude/hooks/push-review-gate.sh "$@"',
+    ].join('\n');
+    expect(referencesReviewGate(content)).toBe(false);
+  });
+
+  it('multi-statement `exit 0; echo dead` followed by exec gate: returns false', () => {
+    // `exit` unwinds before `echo` runs — treat the line as an exit so the
+    // later gate invocation is dead code.
+    const content = [
+      '#!/bin/sh',
+      'exit 0; echo unreachable',
+      'exec .claude/hooks/push-review-gate.sh "$@"',
+    ].join('\n');
+    expect(referencesReviewGate(content)).toBe(false);
+  });
+
+  it('variable-indirection path: exit 0; before exec "$GATE": returns false', () => {
+    // The same early-exit fix must apply inside `hasVariableGateInvocation`
+    // so a gate variable invoked after a top-level `exit` is also rejected.
+    const content = [
+      '#!/bin/sh',
+      'GATE=.claude/hooks/push-review-gate.sh',
+      'exit 0;',
+      'exec "$GATE" "$@"',
+    ].join('\n');
+    expect(referencesReviewGate(content)).toBe(false);
+  });
+
+  it('bare `exit` (no arg) with trailing semicolon: still treated as exit', () => {
+    const content = [
+      '#!/bin/sh',
+      'exit;',
+      'exec .claude/hooks/push-review-gate.sh "$@"',
+    ].join('\n');
+    expect(referencesReviewGate(content)).toBe(false);
+  });
+});
+
 describe('isReaManagedHuskyGate — real shipped .husky/pre-push (regression)', () => {
   it('actual shipped .husky/pre-push is recognized as rea-managed', async () => {
     // Closes detector/artifact divergence: the real file implements the gate
