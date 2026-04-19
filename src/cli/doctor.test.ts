@@ -17,6 +17,7 @@ import {
   type CheckResult,
 } from './doctor.js';
 import type { CodexProbeState } from '../gateway/observability/codex-probe.js';
+import type { PrePushDoctorState } from './install/pre-push.js';
 
 interface ScratchRepo {
   dir: string;
@@ -186,6 +187,70 @@ describe('rea doctor — collectChecks (G11.4 codex_required)', () => {
     expect(out).toHaveLength(2);
     expect(out[0]?.status).toBe('pass');
     expect(out[1]?.status).toBe('info');
+  });
+
+  it('G6: pre-push state omitted → pre-push check is NOT present (back-compat)', async () => {
+    const repo = await makeScratchRepo({ codexRequired: true });
+    cleanup.push(repo.dir);
+    const checks = collectChecks(repo.dir);
+    expect(findCheck(checks, 'pre-push hook installed')).toBeUndefined();
+  });
+
+  it('G6: pre-push state ok=true → pre-push check passes', async () => {
+    const repo = await makeScratchRepo({ codexRequired: true });
+    cleanup.push(repo.dir);
+    const state: PrePushDoctorState = {
+      ok: true,
+      candidates: [
+        {
+          path: path.join(repo.dir, '.git', 'hooks', 'pre-push'),
+          exists: true,
+          executable: true,
+          reaManaged: true,
+        },
+      ],
+    };
+    const checks = collectChecks(repo.dir, undefined, state);
+    const check = findCheck(checks, 'pre-push hook installed');
+    expect(check?.status).toBe('pass');
+    expect(check?.detail).toMatch(/rea-managed/);
+  });
+
+  it('G6: pre-push state ok=false with file present but not executable → fail with detail', async () => {
+    const repo = await makeScratchRepo({ codexRequired: true });
+    cleanup.push(repo.dir);
+    const hookPath = path.join(repo.dir, '.git', 'hooks', 'pre-push');
+    const state: PrePushDoctorState = {
+      ok: false,
+      candidates: [
+        { path: hookPath, exists: true, executable: false, reaManaged: false },
+      ],
+    };
+    const checks = collectChecks(repo.dir, undefined, state);
+    const check = findCheck(checks, 'pre-push hook installed');
+    expect(check?.status).toBe('fail');
+    expect(check?.detail).toMatch(/not executable/);
+  });
+
+  it('G6: pre-push state ok=false with no candidates present → fail with install hint', async () => {
+    const repo = await makeScratchRepo({ codexRequired: true });
+    cleanup.push(repo.dir);
+    const state: PrePushDoctorState = {
+      ok: false,
+      candidates: [
+        {
+          path: path.join(repo.dir, '.git', 'hooks', 'pre-push'),
+          exists: false,
+          executable: false,
+          reaManaged: false,
+        },
+      ],
+    };
+    const checks = collectChecks(repo.dir, undefined, state);
+    const check = findCheck(checks, 'pre-push hook installed');
+    expect(check?.status).toBe('fail');
+    expect(check?.detail).toMatch(/no pre-push hook found/);
+    expect(check?.detail).toMatch(/rea init/);
   });
 
   it('codex_required=false: absence of the codex agent does not fail the check', async () => {
