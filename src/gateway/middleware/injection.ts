@@ -282,11 +282,13 @@ function isPrintableDecoded(s: string): boolean {
  *   - match the `INJECTION_BASE64_SHAPE` (`^[A-Za-z0-9+/]+=*$`)
  *   - decode to a UTF-8 string that is ≥95% printable and contains no null bytes
  *
- * This is a separate entry point from the inline base64 probe in
- * `scanForInjection`: the inline path scans tokens extracted from within
- * strings (via `INJECTION_BASE64_PATTERN`, which finds embedded base64
- * fragments), while `decodeBase64Strings` is a whole-string probe used by
- * the classifier as a second-opinion signal.
+ * NOTE: This function is NOT called from the middleware body. The inline base64
+ * probe in `scanStringForInjection` (via `INJECTION_BASE64_PATTERN`) already
+ * covers embedded base64 token detection. Calling `decodeBase64Strings` as a
+ * second full-tree pass would duplicate that work and add an avoidable DoS
+ * amplification surface (full tree traversal + decoded-string allocation for
+ * every base64-shaped leaf). This function is exported for testing and external
+ * use only.
  */
 export function decodeBase64Strings(input: unknown): string[] {
   const out: string[] = [];
@@ -526,6 +528,15 @@ export function classifyInjection(
 
 export type InjectionAction = 'block' | 'warn';
 
+/**
+ * Maximum result size (in UTF-8 bytes) that the injection scanner will attempt
+ * to scan. Payloads larger than this cannot be scanned within the 100ms timeout
+ * budget before result-size-cap (which runs later in the chain) has had a
+ * chance to truncate them. Treat oversized payloads the same as a scan timeout:
+ * deny in block mode, pass in warn mode.
+ */
+const MAX_RESULT_SCAN_BYTES = 2 * 1024 * 1024; // 2 MiB
+
 export interface InjectionMiddlewareOptions {
   /** Timeout budget for each regex call. Default 100ms. */
   matchTimeoutMs?: number;
@@ -636,6 +647,26 @@ export function createInjectionMiddleware(
     // Only scan if we have a result to inspect
     if (ctx.result == null) return;
 
+    // Pre-scan size check: if the result is too large to scan within the timeout
+    // budget, treat as a timeout. Result-size-cap runs later in the chain, so we
+    // bound the scan here rather than relying on downstream truncation.
+    const resultBytes = Buffer.byteLength(JSON.stringify(ctx.result), 'utf8');
+    if (resultBytes > MAX_RESULT_SCAN_BYTES) {
+      if (action === 'block') {
+        const errorMeta: InjectionClassifierMetadata = {
+          verdict: 'error',
+          matched_patterns: [],
+          base64_decoded: false,
+        };
+        ctx.metadata[INJECTION_METADATA_KEY] = errorMeta;
+        ctx.status = InvocationStatus.Denied;
+        ctx.error = `injection scan skipped — result exceeds ${MAX_RESULT_SCAN_BYTES} bytes; failing closed under block policy`;
+        return;
+      }
+      // warn mode: let through — result-size-cap will truncate downstream.
+      return;
+    }
+
     // G9 follow-up (finding #4): track scanner timeout via a closure flag so
     // we can emit a stable `verdict: 'error'` metadata record alongside the
     // existing `injection.regex_timeout` event. Downstream audit consumers
@@ -652,35 +683,6 @@ export function createInjectionMiddleware(
       base64DecodedMatches: new Set(),
     };
     scanValueForInjection(ctx.result, scan, safe);
-
-    // G9 follow-up (finding #3): second-opinion base64 probe. The inline
-    // probe in `scanStringForInjection` scans tokens extracted from WITHIN
-    // strings. `decodeBase64Strings` is a stricter whole-string probe
-    // (length%4==0, ≥95% printable, no null bytes) that walks the whole
-    // result tree. Pre-patch, this helper was exported but never called —
-    // the G9 changeset advertised a probe that did not exist in the
-    // execution path. Any phrase detected in a decoded whole-string payload
-    // is merged into `base64DecodedMatches`, so classification rule #2
-    // (any base64 match → `likely_injection`) fires.
-    //
-    // Guard: skip the whole-string probe when the primary scan already
-    // timed out. The timeout-deny path runs below (block mode) or emits a
-    // verdict:'error' record (warn mode). Running `decodeBase64Strings`
-    // here would do unbounded work on a payload that already proved it
-    // can exhaust the regex budget — defeating the timeout protection.
-    // `MAX_BASE64_PROBE_LENGTH` inside `decodeBase64Strings` provides a
-    // second defence-in-depth cap for the non-timeout path.
-    if (!scanTimedOut) {
-      const base64Decoded = decodeBase64Strings(ctx.result);
-      for (const decoded of base64Decoded) {
-        const normalized = normalizeForMatch(decoded);
-        for (const phrase of INJECTION_PHRASES) {
-          if (normalized.includes(phrase)) {
-            scan.base64DecodedMatches.add(phrase);
-          }
-        }
-      }
-    }
 
     // Fail closed: in block mode, ANY timeout denies — regardless of what the
     // partial scan found. An incomplete scan cannot prove the unscanned suffix
