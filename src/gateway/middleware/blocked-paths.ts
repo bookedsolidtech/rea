@@ -37,10 +37,12 @@ import type { Middleware } from './chain.js';
  * SECURITY: Glob patterns (`*`, `?`) in blocked_paths are interpreted as
  *   single-segment globs (`*` = any chars except `/`, `?` = one non-`/` char).
  * SECURITY: URL-encoded separators and case variants are normalized first.
- * SECURITY: Double-encoded separators (%252F → %2F → /) are decoded on a
- *   second pass so they cannot escape the normalizer.
- * SECURITY: URI scheme prefixes (file://, http://, …) are stripped before
- *   decoding so scheme-wrapped absolute paths cannot bypass absolute patterns.
+ * SECURITY: Triple+ encoded separators (%25252F → … → /) are decoded via an
+ *   iterative decode-until-stable loop (max 5 passes) so they cannot escape
+ *   the normalizer.
+ * SECURITY: URI scheme + optional authority (file://host/path, file:///path,
+ *   file:/path) are stripped before decoding so all scheme forms collapse to
+ *   a bare path and cannot bypass absolute-path patterns.
  * SECURITY: C0 control characters (including null bytes) are stripped after
  *   decoding so they cannot smuggle segment prefixes past equality checks.
  * SECURITY: Malformed URL-escapes are treated as hostile (request blocked).
@@ -369,37 +371,42 @@ function globToRegex(glob: string): RegExp {
  * falling back to undecoded content on URIError previously allowed crafted
  * `.rea%ZZ/foo` sequences to bypass the `.rea/` check.
  *
- * Step 1 — Strip URI scheme prefix (Finding 3): `file:///etc/passwd` becomes
- *   `/etc/passwd` so absolute-path patterns match correctly.
- * Step 2 — First decode pass.
- * Step 3 — Second decode pass (Finding 1): catches double-encoded separators
- *   such as `%252F` → `%2F` → `/`. We only run the second pass when the
- *   first-decoded result still contains a percent-encoded path separator or
- *   dot (`%2f`, `%5c`, `%2e`).
+ * Step 1 — Strip URI scheme + optional authority: handles all three forms so
+ *   `file:///path`, `file://host/path`, and `file:/path` all collapse to
+ *   `/path` before any pattern matching.
+ * Steps 2–3 — Iterative decode until stable (max 5 passes): catches triple+
+ *   encoded separators (`%25252F` → `%252F` → `%2F` → `/`). Exits early when
+ *   the value stops changing; per-iteration try/catch exits on URIError.
  * Step 4 — Strip C0 control characters (Finding 2): removes null bytes and
  *   other control chars that could smuggle segment prefixes past equality
  *   checks (e.g. `\x00.gitignore` → `.gitignore`).
  */
 function normalizePath(raw: string): string {
-  // Step 1: strip URI scheme prefix so file:///etc/passwd → /etc/passwd.
-  let v = raw.replace(/^[a-zA-Z][a-zA-Z0-9+\-.]*:\/\/\//g, '/');
+  // Step 1: strip URI scheme + optional authority so all three forms collapse
+  // to a plain absolute path:
+  //   scheme:///path        → /path  (triple-slash, empty authority)
+  //   scheme://host/path    → /path  (named authority)
+  //   scheme:/path          → /path  (single-slash, no authority)
+  // Bare `/path` and relative `path` are left untouched (no match).
+  let v = raw.replace(/^[a-zA-Z][a-zA-Z0-9+\-.]*:(?:\/\/[^/?#]*)?\//, '/');
 
-  try {
-    // Step 2: first decode pass.
-    v = decodeURIComponent(v);
-    // Step 3: second decode pass for double-encoded path separators/dots.
-    // %252F → (first pass) %2F → (second pass) /
-    // %252E → (first pass) %2E → (second pass) .
-    // %255C → (first pass) %5C → (second pass) \
-    if (/%2[fFeE]|%5[cC]/i.test(v)) {
-      v = decodeURIComponent(v);
+  // Steps 2–3: iterative decode until stable (handles triple+ encoded
+  // separators such as %25252F → %252F → %2F → /).
+  // Each iteration decodes one level; we exit early when the value stops
+  // changing. The per-iteration try/catch exits cleanly on any URIError so
+  // malformed inputs that somehow pass hasMalformedEscape() (trusted-pattern
+  // code path) are left at the last valid value rather than crashing.
+  let prev = v;
+  for (let i = 0; i < 5; i++) {
+    try {
+      const next = decodeURIComponent(prev);
+      if (next === prev) break;
+      prev = next;
+    } catch {
+      break;
     }
-  } catch {
-    // Trusted-pattern fallback: patterns come from policy.yaml and never
-    // reach this branch in practice. Untrusted values are filtered upstream
-    // by `hasMalformedEscape()`, so this catch is defense in depth for
-    // trusted inputs only. Leave value as-is.
   }
+  v = prev;
 
   // Step 4: strip C0 control characters (including null bytes \x00–\x1f)
   // that could prefix a segment and defeat segment-equality matching.

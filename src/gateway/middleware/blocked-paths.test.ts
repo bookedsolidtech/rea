@@ -492,3 +492,45 @@ describe('blocked-paths middleware — Codex round-2 security findings', () => {
     });
   });
 });
+
+describe('blocked-paths middleware — Finding 1 round-3 — deeper encoding', () => {
+  // GPT-5.4 Codex adversarial review finding: the two-pass logic closed
+  // double-encoding (%252F) but not triple-encoding (%25252F) or deeper.
+  // The iterative decode-until-stable loop (max 5 passes) closes all depths.
+
+  it('blocks .rea/ via triple-encoded separator (%25252F)', async () => {
+    // .rea%25252Ffoo → first pass → .rea%252Ffoo → second pass → .rea%2Ffoo
+    // → third pass → .rea/foo → matches .rea/ pattern
+    const mw = createBlockedPathsMiddleware(stubPolicy([]));
+    const ctx = freshCtx({ file_path: '.rea%25252Ffoo' });
+    await run(mw, ctx);
+    expect(ctx.status).toBe(InvocationStatus.Denied);
+  });
+
+  it('blocks .rea/ via quad-encoded separator (%2525252F)', async () => {
+    const mw = createBlockedPathsMiddleware(stubPolicy([]));
+    const ctx = freshCtx({ file_path: '.rea%2525252Ffoo' });
+    await run(mw, ctx);
+    expect(ctx.status).toBe(InvocationStatus.Denied);
+  });
+
+  it('blocks /etc/passwd when referenced as file://localhost/etc/passwd', async () => {
+    // GPT-5.4 finding: file://localhost/etc/passwd was not stripped by the
+    // triple-slash-only regex; authority `localhost` remained and foiled the
+    // absolute-path pattern match. The new regex strips all authority forms.
+    const mw = createBlockedPathsMiddleware(stubPolicy(['/etc/passwd']));
+    const ctx = freshCtx({ file_path: 'file://localhost/etc/passwd' });
+    await run(mw, ctx);
+    expect(ctx.status).toBe(InvocationStatus.Denied);
+  });
+
+  it('blocks /etc/passwd when referenced as file:/etc/passwd (single-slash form)', async () => {
+    // single-slash URI form was entirely unmatched by the triple-slash-only
+    // regex, leaving the raw `file:/etc/passwd` value which does not match
+    // the absolute pattern `/etc/passwd`.
+    const mw = createBlockedPathsMiddleware(stubPolicy(['/etc/passwd']));
+    const ctx = freshCtx({ file_path: 'file:/etc/passwd' });
+    await run(mw, ctx);
+    expect(ctx.status).toBe(InvocationStatus.Denied);
+  });
+});
