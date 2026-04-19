@@ -241,12 +241,36 @@ function hasHaltEnforcement(content: string): boolean {
   const HALT_TEST =
     /(?:\[[ \t]+-f[^\n]*\.rea\/HALT[^\n]*\]|\btest[ \t]+-f[^\n]*\.rea\/HALT)/;
 
-  // Short-circuit form first — simple substring match on any statement.
+  // Short-circuit form — `[ -f HALT ] && exit N` or the block form
+  // `[ -f HALT ] && { printf ...; exit N; }`.
+  //
+  // R17 F1: `exit N` must be parsed as a COMMAND in the list after `&&`,
+  // not as an argument text inside another command. The previous regex
+  // `\{[^}]*?\bexit\b` matched `echo exit 1` and `printf 'exit 1'` because
+  // the `exit 1` substring appeared inside an argument. The fix:
+  //
+  //   • Bare tail after `&&`: must start with `exit N` directly
+  //     (`echo exit 1` fails — the first command word is `echo`, not
+  //     `exit`).
+  //   • Block tail `{ ... }`: split the block body on `;`/newline and
+  //     require that AT LEAST ONE statement is exactly `exit N` (or a
+  //     leading `exit N` followed by whitespace/comment). Statements that
+  //     are `echo exit 1` / `printf 'exit 1'` start with `echo`/`printf`
+  //     and do NOT match.
   const stripped = stripComments(content);
-  const shortCircuit = new RegExp(
-    String.raw`(?:\[[ \t]+-f[^\n]*\.rea\/HALT[^\n]*\]|\btest[ \t]+-f[^\n]*\.rea\/HALT)[ \t]*&&[ \t]*(?:\{[^}]*?\bexit[ \t]+[1-9]\d*\b|\bexit[ \t]+[1-9]\d*\b)`,
-  );
-  if (shortCircuit.test(stripped)) return true;
+  const haltTestRe =
+    /(?:\[[ \t]+-f[^\n]*\.rea\/HALT[^\n]*\]|\btest[ \t]+-f[^\n]*\.rea\/HALT)[ \t]*&&[ \t]*(.*)$/gm;
+  const exitStmtRe = /^exit[ \t]+[1-9]\d*\b/;
+  for (const match of stripped.matchAll(haltTestRe)) {
+    const tail = match[1] ?? '';
+    if (exitStmtRe.test(tail.trimStart())) return true;
+    const blockMatch = tail.match(/^\s*\{([^}]*)\}/);
+    if (blockMatch !== null) {
+      const body = blockMatch[1] ?? '';
+      const stmts = body.split(/[;\n]/).map((s) => s.trim());
+      if (stmts.some((s) => exitStmtRe.test(s))) return true;
+    }
+  }
 
   // Block form — walk statements with a frame stack.
   type Frame = {
@@ -497,30 +521,47 @@ function hasAuditCheck(content: string): boolean {
   const joined = joinLineContinuations(content);
   const auditVars = collectAuditLogVars(joined);
 
-  // R16 F2 — narrow tightening over the R15 line-at-a-time check:
+  // R17 F2 — the audit-check classifier must require that the MISS PATH is
+  // blocking. There are only two forms that enforce:
   //
-  //   Spoof `if ! grep ... audit.jsonl; then :; fi` previously passed because
-  //   the `if`-line text looked like a valid audit check — R15's scanner
-  //   accepted it and never inspected the `then` branch. The no-op `then`
-  //   body silently swallows the match-miss.
+  //   (a) `if ! <audit-grep>; then <BLOCKING>; fi`
+  //       Negated: the grep failing (miss) runs the then-body, which must
+  //       block (`exit N`, `return N`, or `continue`/`break` inside a loop).
   //
-  //   We now walk statements with a frame stack specifically for `if !
-  //   <audit-grep>` constructs: the frame succeeds ONLY when the `then`
-  //   branch contains a blocking statement. All OTHER R15 shapes (top-level
-  //   `grep ... audit.jsonl`, positive `if <audit-grep>; then exit 0; fi;
-  //   exit 1`, pipelines of grep-family commands, etc.) are preserved — they
-  //   remain valid detection signals.
+  //   (b) `if <audit-grep>; then :; else <BLOCKING>; fi`
+  //       Positive: the grep failing (miss) runs the else-body, which must
+  //       block. A positive `if` with NO `else` (or a non-blocking else)
+  //       silently succeeds when the audit record is missing.
+  //
+  //   (c) Top-level bare grep — handled by the line-level fallback below
+  //       under POSIX `set -e` semantics.
+  //
+  // R15's original "accept any positive `if <audit-grep>`" was wrong: the
+  // `if` construct explicitly swallows the grep's exit status, so the miss
+  // path needs its own blocking. Removing the blanket acceptance forces the
+  // frame to carry through to `fi` and check the appropriate branch.
   //
   // Everything else that R15 F1 already required (audit-log binding, no
   // swallowing tails, grep-only pipelines) is still enforced via
   // `isAuditGrepLine` called from the walker.
   type Frame = {
     isNegatedAuditIf: boolean;
-    hasBlockingStmt: boolean;
-    branch: 'cond' | 'body';
+    isPositiveAuditIf: boolean;
+    hasBlockingInThen: boolean;
+    hasBlockingInElse: boolean;
+    branch: 'cond' | 'then' | 'else';
   };
   const frames: Frame[] = [];
   let loopDepth = 0;
+
+  const recordBlockingIntoFrame = (text: string): void => {
+    if (frames.length === 0) return;
+    const frame = frames[frames.length - 1];
+    if (frame === undefined) return;
+    if (!isBlockingStmtLine(text, loopDepth)) return;
+    if (frame.branch === 'then') frame.hasBlockingInThen = true;
+    if (frame.branch === 'else') frame.hasBlockingInElse = true;
+  };
 
   for (const stmt of statementsOf(content)) {
     const { head, full } = stmt;
@@ -536,63 +577,69 @@ function hasAuditCheck(content: string): boolean {
       const condIsNegated = /^if\s+!\s/.test(condStmt);
       const frame: Frame = {
         isNegatedAuditIf: condIsAuditGrep && condIsNegated,
-        hasBlockingStmt: false,
+        isPositiveAuditIf: condIsAuditGrep && !condIsNegated,
+        hasBlockingInThen: false,
+        hasBlockingInElse: false,
         branch: 'cond',
       };
       if (/(^|[;\s])then\b/.test(full)) {
-        frame.branch = 'body';
+        frame.branch = 'then';
         const bodyText = afterThen(full);
-        if (isBlockingStmtLine(bodyText, loopDepth)) frame.hasBlockingStmt = true;
+        if (isBlockingStmtLine(bodyText, loopDepth)) {
+          frame.hasBlockingInThen = true;
+        }
       }
       frames.push(frame);
-
-      // Positive `if <audit-grep>; then ... fi` is R15's original shape and
-      // remains accepted (pre-R6 backward-compat installs use this form plus
-      // a trailing top-level `exit 1` to block when the audit is missing).
-      // The R16 F2 tightening only applies to the negated `if !` shape whose
-      // then-body actively runs when the match fails.
-      if (condIsAuditGrep && !condIsNegated) return true;
       continue;
     }
 
     if (/^then\b/.test(head)) {
       const frame = frames[frames.length - 1];
       if (frame !== undefined) {
-        frame.branch = 'body';
+        frame.branch = 'then';
         const bodyText = afterThen(full);
-        if (isBlockingStmtLine(bodyText, loopDepth)) frame.hasBlockingStmt = true;
+        if (isBlockingStmtLine(bodyText, loopDepth)) {
+          frame.hasBlockingInThen = true;
+        }
       }
       continue;
     }
 
-    if (/^(elif|else)\b/.test(head)) {
+    if (/^elif\b/.test(head)) {
       const frame = frames[frames.length - 1];
       if (frame !== undefined) frame.branch = 'cond';
       continue;
     }
 
-    if (/^fi\b/.test(head)) {
-      const frame = frames.pop();
-      if (
-        frame !== undefined &&
-        frame.isNegatedAuditIf &&
-        frame.hasBlockingStmt
-      ) {
-        return true;
+    if (/^else\b/.test(head)) {
+      const frame = frames[frames.length - 1];
+      if (frame !== undefined) {
+        frame.branch = 'else';
+        // Body after `else` on the same statement (e.g. `else exit 1`
+        // produced by `splitStatements` on `; else exit 1;`). Must be
+        // routed to hasBlockingInElse — otherwise the blocking text is
+        // visible only as statement head text and the frame never sees it.
+        const bodyText = full.replace(/^else\b/, '');
+        if (isBlockingStmtLine(bodyText, loopDepth)) {
+          frame.hasBlockingInElse = true;
+        }
       }
       continue;
     }
 
-    // Track blocking statements inside any open `if` THEN branch — needed
-    // so the R16 F2 frame sees blocking statements on separate lines (the
-    // shipped husky gate uses exactly this shape: `if ! grep ...; then`
-    // followed by `printf ...` + `block_push=1` + `continue` + `fi`).
-    if (frames.length > 0) {
-      const frame = frames[frames.length - 1];
-      if (frame !== undefined && frame.branch === 'body') {
-        if (isBlockingStmtLine(full, loopDepth)) frame.hasBlockingStmt = true;
-      }
+    if (/^fi\b/.test(head)) {
+      const frame = frames.pop();
+      if (frame === undefined) continue;
+      if (frame.isNegatedAuditIf && frame.hasBlockingInThen) return true;
+      if (frame.isPositiveAuditIf && frame.hasBlockingInElse) return true;
+      continue;
     }
+
+    // Statement inside an open `if` frame — route blocking statements to
+    // the correct branch counter. The shipped husky gate uses exactly this
+    // shape: `if ! grep ...; then` followed by `printf ...` +
+    // `block_push=1` + `continue` + `fi`.
+    recordBlockingIntoFrame(full);
   }
 
   // Line-level fallback (R15 F1) — preserves the original top-level audit
@@ -1061,7 +1108,12 @@ function hasVariableGateInvocation(content: string): boolean {
 function isTopLevelExit(line: string): boolean {
   const trimmed = stripTrailingComment(line).trimEnd();
   if (trimmed.length === 0) return false;
-  const firstStmt = trimmed.split(';')[0]?.trim() ?? '';
+  // R17 F3: split on `;`, `&&`, and `||`. Once `exit`/`return` runs, the
+  // shell unwinds — all three list operators leave their right-hand side
+  // unreachable. The previous `split(';')[0]` missed `exit 0 && cmd` and
+  // `return 1 || :`, allowing a later gate invocation to be classified
+  // reachable when it was actually dead code.
+  const firstStmt = trimmed.split(/;|&&|\|\|/)[0]?.trim() ?? '';
   return /^(exit|return)(\s+\d+)?$/.test(firstStmt);
 }
 

@@ -1663,6 +1663,100 @@ describe('referencesReviewGate — R16 F3 variable reassignment', () => {
   });
 });
 
+// R17 F1: short-circuit HALT enforcement must parse `exit N` as a command,
+// not as an argument inside another command. Before this fix, the regex
+// matched the substring `exit 1` anywhere after `&&`, so echoing or printing
+// the text `exit 1` satisfied the check without any actual exit.
+describe('isReaManagedHuskyGate — R17 F1 HALT command-token parsing', () => {
+  const audit =
+    'grep -qE \'"tool_name":"codex\\.review"\' .rea/audit.jsonl\n';
+
+  it('`[ -f .rea/HALT ] && echo exit 1` (echo as argument): returns false', () => {
+    const content =
+      `#!/bin/sh\n${HUSKY_GATE_MARKER}\n[ -f .rea/HALT ] && echo exit 1\n${audit}`;
+    expect(isReaManagedHuskyGate(content)).toBe(false);
+  });
+
+  it(`\`[ -f .rea/HALT ] && printf 'exit 1\\n'\` (printf as argument): returns false`, () => {
+    const content =
+      `#!/bin/sh\n${HUSKY_GATE_MARKER}\n[ -f .rea/HALT ] && printf 'exit 1\\n'\n${audit}`;
+    expect(isReaManagedHuskyGate(content)).toBe(false);
+  });
+
+  it('`[ -f .rea/HALT ] && exit 1` (real exit): returns true', () => {
+    const content =
+      `#!/bin/sh\n${HUSKY_GATE_MARKER}\n[ -f .rea/HALT ] && exit 1\n${audit}`;
+    expect(isReaManagedHuskyGate(content)).toBe(true);
+  });
+
+  it('block form `&& { echo halt; exit 1; }` (echo precedes exit): returns true', () => {
+    const content =
+      `#!/bin/sh\n${HUSKY_GATE_MARKER}\n[ -f .rea/HALT ] && { echo halt; exit 1; }\n${audit}`;
+    expect(isReaManagedHuskyGate(content)).toBe(true);
+  });
+
+  it('block form `&& { echo exit 1; }` (echo is the only command): returns false', () => {
+    const content =
+      `#!/bin/sh\n${HUSKY_GATE_MARKER}\n[ -f .rea/HALT ] && { echo exit 1; }\n${audit}`;
+    expect(isReaManagedHuskyGate(content)).toBe(false);
+  });
+});
+
+// R17 F2: positive `if <audit-grep>; then …; fi` requires a blocking `else`
+// branch (or a paired top-level mechanism). The `if` construct swallows the
+// grep's exit status, so a positive `if` with no else lets a missing audit
+// record fall through to script success.
+describe('isReaManagedHuskyGate — R17 F2 positive-if requires blocking else', () => {
+  const header = `#!/bin/sh\n${HUSKY_GATE_MARKER}\n[ -f .rea/HALT ] && exit 1\n`;
+
+  it('positive `if <grep>; then :; fi` (no else): returns false', () => {
+    const content =
+      `${header}if grep -q codex.review .rea/audit.jsonl; then :; fi\n`;
+    expect(isReaManagedHuskyGate(content)).toBe(false);
+  });
+
+  it('positive `if <grep>; then echo ok; fi` (non-blocking body, no else): returns false', () => {
+    const content =
+      `${header}if grep -q codex.review .rea/audit.jsonl; then echo ok; fi\n`;
+    expect(isReaManagedHuskyGate(content)).toBe(false);
+  });
+
+  it('positive `if <grep>; then :; else echo warn; fi` (non-blocking else): returns false', () => {
+    const content =
+      `${header}if grep -q codex.review .rea/audit.jsonl; then :; else echo warn; fi\n`;
+    expect(isReaManagedHuskyGate(content)).toBe(false);
+  });
+
+  it('positive `if <grep>; then :; else exit 1; fi` (blocking else): returns true', () => {
+    const content =
+      `${header}if grep -q codex.review .rea/audit.jsonl; then :; else exit 1; fi\n`;
+    expect(isReaManagedHuskyGate(content)).toBe(true);
+  });
+});
+
+// R17 F3: `isTopLevelExit` must recognize exit/return with list operators
+// (`exit 0 && cmd`, `return 1 || :`) as top-level exits. The right-hand
+// side is dead because `exit`/`return` unwinds the shell before any list
+// operator's right side runs.
+describe('referencesReviewGate — R17 F3 early-exit list operators', () => {
+  const gateLine = 'exec .claude/hooks/push-review-gate.sh "$@"\n';
+
+  it('`exit 0 && echo dead` before gate: returns false (dead code)', () => {
+    const content = `#!/bin/sh\nexit 0 && echo dead\n${gateLine}`;
+    expect(referencesReviewGate(content)).toBe(false);
+  });
+
+  it('`return 1 || :` before gate: returns false (dead code)', () => {
+    const content = `#!/bin/sh\nreturn 1 || :\n${gateLine}`;
+    expect(referencesReviewGate(content)).toBe(false);
+  });
+
+  it('`exit 0; echo dead` before gate (control via ;): returns false', () => {
+    const content = `#!/bin/sh\nexit 0; echo dead\n${gateLine}`;
+    expect(referencesReviewGate(content)).toBe(false);
+  });
+});
+
 // R15 F2: `referencesReviewGate` early-exit detector missed non-bare forms of
 // `exit`/`return`, so a spoof like `exit 0;` followed by `exec .../gate.sh`
 // was classified as valid delegation despite the gate being dead code.
