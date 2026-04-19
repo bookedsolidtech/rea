@@ -164,15 +164,19 @@ export function isReaManagedHuskyGate(content: string): boolean {
   if (lines.length < 2 || lines[1] !== HUSKY_GATE_MARKER) return false;
 
   // A genuine gate must contain substantive executable content — at least one
-  // non-comment, non-blank, non-trivial-exit line. A stub with only marker
-  // comments + `exit 0` must not pass (prevents R9 spoof vector where an
-  // attacker plants the two markers without any actual governance logic).
+  // non-comment, non-blank, non-trivial-noop line. A stub body with only
+  // `exit 0`, `return 0`, `:` (colon builtin), or `true` must not pass.
+  // R9 F1 targeted `exit N` / `return N`; R10 F3 extends the noop set to
+  // close `:` and `true` bypass vectors (both exported markers are public,
+  // so marker-plus-noop is a real spoof surface).
   const hasSubstantiveContent = lines.some((raw) => {
     const t = raw.trimStart();
     return (
       t.length > 0 &&
       !t.startsWith('#') &&
-      !/^(exit|return)(\s+\d+)?\s*$/.test(t)
+      !/^(exit|return)(\s+\d+)?\s*$/.test(t) &&
+      !/^:\s*$/.test(t) &&
+      !/^true\s*$/.test(t)
     );
   });
   if (!hasSubstantiveContent) return false;
@@ -207,7 +211,9 @@ export function isReaManagedHuskyGate(content: string): boolean {
  * Uses a positive-match (allowlist) strategy via `looksLikeGateInvocation`:
  * the gate token must appear as an actual invocation — either as the first
  * command on a line (bare path) or immediately after one of the explicit
- * delegation keywords (`exec`, `.`, `source`, `sh`, `bash`, `zsh`).
+ * POSIX delegation keywords (`exec`, `.`, `sh`, `bash`, `zsh`). The bash-only
+ * `source` keyword is NOT accepted — hooks use `#!/bin/sh` so `source` may
+ * silently fail on dash/busybox; the POSIX equivalent `.` is in the allowlist.
  *
  * Non-invocation references that return `false` include:
  *   - A comment line starting with `#`
@@ -266,7 +272,8 @@ export function referencesReviewGate(content: string): boolean {
 
     // Candidate line. Require it look like an invocation, not a string
     // literal or a printf argument. The token must appear either:
-    //   (a) after an exec-like keyword: `exec`, `sh`, `bash`, `source`, `.`
+    //   (a) after a POSIX exec-like keyword: `exec`, `sh`, `bash`, `zsh`, `.`
+    //       (NOT `source` — bash-only, excluded from allowlist)
     //   (b) as the first program being invoked (possibly after a path
     //       prefix): `"/abs/.../push-review-gate.sh" "$@"` or
     //       `./relative/.claude/hooks/push-review-gate.sh "$@"`.
@@ -289,20 +296,31 @@ export function referencesReviewGate(content: string): boolean {
 }
 
 /**
- * Returns true when `line` contains a shell continuation operator (`||`, `&&`,
- * or `;`) anywhere after the gate filename. Any such operator means the gate's
- * exit code is not the line's exit code — the invocation is not
- * compliance-carrying regardless of what follows.
+ * Returns true when `line` contains a shell status-swallowing operator after
+ * the gate filename. The operators are:
+ *   - `||` / `&&` — chained commands (gate's exit code is masked by follow-up)
+ *   - `;`         — sequential commands (final command's status is the line's)
+ *   - trailing `&` — background job (line exits 0 regardless of gate status)
  *
- * Uses a tail scan from the end of the gate token rather than a literal
- * denylist, so path-qualified variants (`|| /bin/true`, `|| /usr/bin/true`)
- * are rejected the same as literal `|| true`.
+ * Note: plain `&` inside file-descriptor redirects (`2>&1`, `>&2`, `1>&2`)
+ * is NOT a status-swallowing operator — `exec gate "$@" 2>&1` preserves the
+ * gate's exit code intact. R10 F2: the previous character-class regex
+ * `/[|&;]/` incorrectly flagged stderr redirection as swallowing. Strip POSIX
+ * fd-duplication tokens from the tail before the check.
  */
 function hasContinuationOperator(line: string): boolean {
   const gateIdx = line.indexOf(GATE_DELEGATION_TOKEN);
   if (gateIdx === -1) return false;
-  const tail = line.slice(gateIdx + GATE_DELEGATION_TOKEN.length);
-  return /[|&;]/.test(tail);
+  let tail = line.slice(gateIdx + GATE_DELEGATION_TOKEN.length);
+  // Strip POSIX file-descriptor redirects: `N>&M`, `N<&M`, `>&M`, `<&M`,
+  // `&>`, `>>&` etc. These contain `&` but do not swallow the command's
+  // exit status. Simpler than parsing the full redirect grammar: drop any
+  // [digits]?(<|>)&[digits|-]? sequence and the `&>` / `>&` bashisms.
+  tail = tail.replace(/\d*[<>]&\d*-?/g, ' ');
+  tail = tail.replace(/&>>?/g, ' ');
+  // Now check for the actual swallowing operators. Trailing `&` (background
+  // job) is detected as `&` followed only by whitespace to end-of-string.
+  return /\|\||&&|;/.test(tail) || /&\s*$/.test(tail);
 }
 
 /**
@@ -313,9 +331,12 @@ function hasContinuationOperator(line: string): boolean {
  *      with a path prefix) is the first token on the line. Examples:
  *        `.claude/hooks/push-review-gate.sh "$@"`
  *        `"/abs/path/.claude/hooks/push-review-gate.sh"`
- *   2. Explicit delegation keyword immediately before the path — exactly one
- *      of `exec`, `.`, `source`, `sh`, `bash`, or `zsh` followed only by
+ *   2. Explicit POSIX delegation keyword immediately before the path —
+ *      exactly one of `exec`, `.`, `sh`, `bash`, or `zsh` followed only by
  *      whitespace and then the gate path (again, optionally quoted/prefixed).
+ *      `source` is NOT accepted: it is bash-only and not in POSIX sh, so
+ *      hooks shebanged `#!/bin/sh` would fail silently on dash/busybox.
+ *      Use `.` (dot) — the POSIX equivalent — instead.
  *      Examples:
  *        `exec .claude/hooks/push-review-gate.sh "$@"`
  *        `. .claude/hooks/push-review-gate.sh`

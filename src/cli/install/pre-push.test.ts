@@ -974,6 +974,40 @@ describe('isReaManagedHuskyGate — Husky gate marker detection (Finding 2)', ()
     ).toBe(false);
   });
 
+  it('R10 F3: both markers + only `:` (colon noop) as executable content: returns false', () => {
+    // Codex R10 finding: colon builtin is a valid zero-op shell command.
+    // A stub of markers + `:\nexit 0` previously passed hasSubstantiveContent.
+    expect(
+      isReaManagedHuskyGate(`#!/bin/sh\n${HUSKY_GATE_MARKER}\n${HUSKY_GATE_BODY_MARKER}\n:\nexit 0\n`),
+    ).toBe(false);
+  });
+
+  it('R10 F3: both markers + only `true` as executable content: returns false', () => {
+    expect(
+      isReaManagedHuskyGate(`#!/bin/sh\n${HUSKY_GATE_MARKER}\n${HUSKY_GATE_BODY_MARKER}\ntrue\n`),
+    ).toBe(false);
+  });
+
+  it('R10 F3: both markers + mix of noops only (`:`, `true`, `exit 0`): returns false', () => {
+    expect(
+      isReaManagedHuskyGate(
+        `#!/bin/sh\n${HUSKY_GATE_MARKER}\n${HUSKY_GATE_BODY_MARKER}\n:\ntrue\nexit 0\n`,
+      ),
+    ).toBe(false);
+  });
+
+  it('R10 F4: CRLF line endings with both markers + substantive body: returns true', () => {
+    // Windows checkouts or `text=auto` gitattributes may produce CRLF.
+    // Split pattern `/\r?\n/` already handles this; test documents it.
+    const content = `#!/bin/sh\r\n${HUSKY_GATE_MARKER}\r\n${HUSKY_GATE_BODY_MARKER}\r\n[ -f .rea/HALT ] && exit 1\r\nexec ./gate.sh\r\n`;
+    expect(isReaManagedHuskyGate(content)).toBe(true);
+  });
+
+  it('R10 F4: CRLF with markers + only exit 0 stub: returns false', () => {
+    const content = `#!/bin/sh\r\n${HUSKY_GATE_MARKER}\r\n${HUSKY_GATE_BODY_MARKER}\r\nexit 0\r\n`;
+    expect(isReaManagedHuskyGate(content)).toBe(false);
+  });
+
   it('marker at line 2 with body marker in non-comment form: returns true', () => {
     expect(
       isReaManagedHuskyGate(
@@ -1188,6 +1222,53 @@ describe('referencesReviewGate — depth-tracking exit detection (Finding 2)', (
     const content = [
       '#!/bin/sh',
       'sh .claude/hooks/push-review-gate.sh "$@"; /bin/true',
+    ].join('\n');
+    expect(referencesReviewGate(content)).toBe(false);
+  });
+
+  it('R10 F2: exec gate "$@" 2>&1 (stderr redirect): returns true (not status-swallowed)', () => {
+    // POSIX fd-duplication in redirects (`2>&1`) contains `&` but does not
+    // swallow the command's exit status. Previous character-class regex
+    // flagged this as status-swallowing; narrowed regex + redirect strip fix it.
+    const content = [
+      '#!/bin/sh',
+      'exec .claude/hooks/push-review-gate.sh "$@" 2>&1',
+    ].join('\n');
+    expect(referencesReviewGate(content)).toBe(true);
+  });
+
+  it('R10 F2: exec gate "$@" >&2 (stderr redirect): returns true', () => {
+    const content = [
+      '#!/bin/sh',
+      'exec .claude/hooks/push-review-gate.sh "$@" >&2',
+    ].join('\n');
+    expect(referencesReviewGate(content)).toBe(true);
+  });
+
+  it('R10 F2: exec gate "$@" 1>&2 (numbered fd redirect): returns true', () => {
+    const content = [
+      '#!/bin/sh',
+      'exec .claude/hooks/push-review-gate.sh "$@" 1>&2',
+    ].join('\n');
+    expect(referencesReviewGate(content)).toBe(true);
+  });
+
+  it('R10 F2: exec gate "$@" &>/tmp/log (bash &> redirect): returns true', () => {
+    // Some consumer hooks use the bashism `&>` even under #!/bin/sh when
+    // dash is not the executor. It is still a redirect, not a status-swallow.
+    const content = [
+      '#!/bin/sh',
+      'exec .claude/hooks/push-review-gate.sh "$@" &>/tmp/log',
+    ].join('\n');
+    expect(referencesReviewGate(content)).toBe(true);
+  });
+
+  it('R10 F2: gate invocation with trailing & (background job): returns false', () => {
+    // A bare trailing `&` backgrounds the job; the line exits 0 regardless
+    // of gate verdict. Must be treated as status-swallowing.
+    const content = [
+      '#!/bin/sh',
+      'exec .claude/hooks/push-review-gate.sh "$@" &',
     ].join('\n');
     expect(referencesReviewGate(content)).toBe(false);
   });
