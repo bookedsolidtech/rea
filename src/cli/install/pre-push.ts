@@ -351,28 +351,25 @@ function hasHaltEnforcement(content: string): boolean {
     return false;
   };
 
-  // Short-circuit form — `[ -f HALT ] && exit N` or the block form
-  // `[ -f HALT ] && { printf ...; exit N; }`.
+  // R26 F1 — reachability-aware walk.
   //
-  // R17 F1: `exit N` must be parsed as a COMMAND in the list after `&&`,
-  // not as an argument text inside another command. The previous regex
-  // `\{[^}]*?\bexit\b` matched `echo exit 1` and `printf 'exit 1'` because
-  // the `exit 1` substring appeared inside an argument. The fix:
+  // A HALT enforcement match is only proof of governance when it lives at
+  // the TOP LEVEL of the script. An enforcement block nested under `if false;
+  // then ... fi`, under a loop that never runs, or under any outer control
+  // structure can never be reached, so it does not actually block pushes.
   //
-  //   • Bare tail after `&&`: must start with `exit N` directly
-  //     (`echo exit 1` fails — the first command word is `echo`, not
-  //     `exit`).
-  //   • Block tail `{ ... }`: split the block body on `;`/newline and
-  //     require that AT LEAST ONE statement is exactly `exit N` (or a
-  //     leading `exit N` followed by whitespace/comment). Statements that
-  //     are `echo exit 1` / `printf 'exit 1'` start with `echo`/`printf`
-  //     and do NOT match.
-  const stripped = stripComments(content);
-  const haltTestRe =
-    /(?:\[[ \t]+-f[^\n]*\.rea\/HALT[^\n]*\]|\btest[ \t]+-f[^\n]*\.rea\/HALT)[ \t]*&&[ \t]*(.*)$/gm;
+  // Both the short-circuit form (`[ -f HALT ] && exit N`) and the block
+  // form (`if [ -f HALT ]; then exit N fi`) are now recognized only when
+  // they appear at `frames.length === 0 && loopDepth === 0`. A nested
+  // enforcement block still closes its frame, but we refuse to return
+  // true for it.
+  const shortCircuitRe =
+    /(?:\[[ \t]+-f[^\n]*\.rea\/HALT[^\n]*\]|\btest[ \t]+-f[^\n]*\.rea\/HALT)[ \t]*&&[ \t]*(.*)$/m;
   const exitStmtRe = /^exit[ \t]+[1-9]\d*\b/;
-  for (const match of stripped.matchAll(haltTestRe)) {
-    const tail = match[1] ?? '';
+  const stmtHasShortCircuitHalt = (stmtFull: string): boolean => {
+    const m = stmtFull.match(shortCircuitRe);
+    if (m === null) return false;
+    const tail = m[1] ?? '';
     if (exitStmtRe.test(tail.trimStart())) return true;
     const blockMatch = tail.match(/^\s*\{([^}]*)\}/);
     if (blockMatch !== null) {
@@ -380,19 +377,29 @@ function hasHaltEnforcement(content: string): boolean {
       const stmts = body.split(/[;\n]/).map((s) => s.trim());
       if (stmts.some((s) => exitStmtRe.test(s))) return true;
     }
-  }
+    return false;
+  };
 
-  // Block form — walk statements with a frame stack.
   type Frame = {
     haltCond: boolean;
     nonZeroExitInBody: boolean;
     branch: 'cond' | 'body';
   };
   const frames: Frame[] = [];
+  let loopDepth = 0;
 
   for (const stmt of statementsOf(content)) {
     const head = stmt.head;
     const full = stmt.full;
+
+    if (/^(for|while|until)\b/.test(head)) {
+      loopDepth++;
+      continue;
+    }
+    if (/^done\b/.test(head)) {
+      loopDepth = Math.max(0, loopDepth - 1);
+      continue;
+    }
 
     if (/^if\b/.test(head)) {
       const frame: Frame = {
@@ -400,9 +407,6 @@ function hasHaltEnforcement(content: string): boolean {
         nonZeroExitInBody: false,
         branch: 'cond',
       };
-      // If `then` appears on the same statement (`if ...; then <body>`),
-      // transition the branch and, if the body already contains an exit,
-      // record it.
       if (/(^|[;\s])then\b/.test(full)) {
         frame.branch = 'body';
         if (bodyHasHeadExit(afterThen(full))) frame.nonZeroExitInBody = true;
@@ -421,8 +425,6 @@ function hasHaltEnforcement(content: string): boolean {
     }
 
     if (/^(elif|else)\b/.test(head)) {
-      // Leave HALT's THEN branch — don't accept exits on elif/else paths
-      // because they fire when HALT is ABSENT.
       const frame = frames[frames.length - 1];
       if (frame !== undefined) frame.branch = 'cond';
       continue;
@@ -430,13 +432,36 @@ function hasHaltEnforcement(content: string): boolean {
 
     if (/^fi\b/.test(head)) {
       const frame = frames.pop();
-      if (frame !== undefined && frame.haltCond && frame.nonZeroExitInBody) {
+      // R26 F1: the closing `fi` only proves enforcement when the if it
+      // closes was itself TOP-LEVEL. `frames.length === 0` post-pop means
+      // there is no outer enclosing `if`; `loopDepth === 0` means we are
+      // not inside a `for/while/until`. A nested HALT if under any parent
+      // guard is rejected.
+      if (
+        frame !== undefined &&
+        frame.haltCond &&
+        frame.nonZeroExitInBody &&
+        frames.length === 0 &&
+        loopDepth === 0
+      ) {
         return true;
       }
       continue;
     }
 
-    // Statement inside an open `if` frame.
+    // R26 F1 — top-level short-circuit form. The `[ -f HALT ] && exit N`
+    // shape only proves enforcement when it lives at top level. An
+    // equivalent shape inside `if false; then ... fi` is never executed
+    // and must not count. `frames.length === 0 && loopDepth === 0` gates
+    // both conditions.
+    if (
+      frames.length === 0 &&
+      loopDepth === 0 &&
+      stmtHasShortCircuitHalt(full)
+    ) {
+      return true;
+    }
+
     if (frames.length > 0) {
       const frame = frames[frames.length - 1];
       if (frame !== undefined && frame.branch === 'body') {
@@ -446,21 +471,6 @@ function hasHaltEnforcement(content: string): boolean {
   }
 
   return false;
-}
-
-/**
- * Strip shell comments (`# ...` at line start, preserving quoted `#`).
- * Used for regex-style scans over the whole content; the statement-walking
- * parsers call `stripTrailingComment` on each statement instead.
- */
-function stripComments(content: string): string {
-  return content
-    .split(/\r?\n/)
-    .map((raw) => {
-      const t = raw.trimStart();
-      return t.startsWith('#') ? '' : stripTrailingComment(raw);
-    })
-    .join('\n');
 }
 
 /**
@@ -700,9 +710,25 @@ function hasAuditCheck(content: string): boolean {
     hasBlockingInElse: boolean;
     hasAllowOnMatchInThen: boolean;
     branch: 'cond' | 'then' | 'else';
+    // R26 F1 v2 — true when the `if` condition is NOT an obviously-dead
+    // literal like `if false;`, `if /bin/false;`, or
+    // `if [ "a" = "b" ];` with literal-constant unequal sides. The audit-if
+    // fi-pop rejects when ANY enclosing frame has `condIsLive === false`,
+    // which catches the `if false; then audit-if; fi` spoof Codex flagged.
+    // Conditions that cannot be statically ruled out (variable expansions,
+    // command substitutions, non-literal tests) are treated as live — we
+    // deliberately err toward accepting legitimate conditional guards over
+    // rejecting them, since dead-literal spoofs have to look painfully
+    // obvious to slip past human review AND this classifier.
+    condIsLive: boolean;
   };
   const frames: Frame[] = [];
-  let loopDepth = 0;
+  // Parallel stack mirroring `for`/`while`/`until` nesting: `true` for loops
+  // whose header is NOT an obviously-dead literal (`while false; do`,
+  // `until true; do`, `for X in; do` with empty list), `false` otherwise.
+  // Length is the usual `loopDepth`; we keep a boolean for each loop so the
+  // audit-if fi-pop can require every enclosing loop to be live.
+  const loopLiveStack: boolean[] = [];
   let pendingFallThroughMissBlock = false;
 
   const recordBlockingIntoFrame = (text: string): void => {
@@ -712,7 +738,7 @@ function hasAuditCheck(content: string): boolean {
     if (isAllowOnMatchStmtLine(text) && frame.branch === 'then') {
       frame.hasAllowOnMatchInThen = true;
     }
-    if (!isBlockingStmtLine(text, loopDepth)) return;
+    if (!isBlockingStmtLine(text, loopLiveStack.length)) return;
     if (frame.branch === 'then') frame.hasBlockingInThen = true;
     if (frame.branch === 'else') frame.hasBlockingInElse = true;
   };
@@ -728,8 +754,14 @@ function hasAuditCheck(content: string): boolean {
     // assignments (the regex fails cleanly and the set is untouched).
     updateAuditVarState(full);
 
-    if (/^(for|while|until)\b/.test(head)) loopDepth++;
-    if (/^done\b/.test(head)) loopDepth = Math.max(0, loopDepth - 1);
+    const loopDepth = loopLiveStack.length;
+
+    if (/^(for|while|until)\b/.test(head)) {
+      loopLiveStack.push(!isDeadLoopHead(full));
+    }
+    if (/^done\b/.test(head)) {
+      loopLiveStack.pop();
+    }
 
     if (/^if\b/.test(head)) {
       const condStmt = /(^|[;\s])then\b/.test(full)
@@ -744,6 +776,7 @@ function hasAuditCheck(content: string): boolean {
         hasBlockingInElse: false,
         hasAllowOnMatchInThen: false,
         branch: 'cond',
+        condIsLive: !isDeadIfCondition(condStmt),
       };
       if (/(^|[;\s])then\b/.test(full)) {
         frame.branch = 'then';
@@ -799,18 +832,51 @@ function hasAuditCheck(content: string): boolean {
     if (/^fi\b/.test(head)) {
       const frame = frames.pop();
       if (frame === undefined) continue;
-      if (frame.isNegatedAuditIf && frame.hasBlockingInThen) return true;
-      if (frame.isPositiveAuditIf && frame.hasBlockingInElse) return true;
-      // R18 legacy shape (form c): positive audit-if whose then-branch
-      // terminates via allow (`exit 0`/`return 0`) and no explicit else.
-      // The miss path falls through the fi — arm a pending requirement
-      // that's satisfied by the next top-level blocking statement.
+      // R26 F1 v2 — reject an audit-if whose execution path is statically
+      // dead. Two cases to catch:
+      //   (1) The audit-if itself has a dead condition (`if false; then
+      //       audit-grep; ...`): the audit machinery is inside a branch
+      //       that never runs.
+      //   (2) The audit-if is nested inside a dead enclosing construct —
+      //       either an `if` frame whose cond is a dead literal (`if false;
+      //       then if ! grep ...; then exit 1; fi; fi`), or a `for/while/
+      //       until` loop whose header is dead (`while false; do audit-if;
+      //       done`).
+      //
+      // v1 of R26 over-tightened by requiring `frames.length === 0`,
+      // which broke the canonical shipped hook: it wraps the audit-if in
+      // a legitimate protected-paths `if git diff ... | grep -qE PROTECTED;
+      // then ... fi` guard, AND inside a `while read refspec; do ... done`
+      // loop. Those enclosing constructs are live under normal execution.
+      //
+      // v2 checks every enclosing frame and loop for an obviously-dead
+      // literal header. Live-but-text-visible conditions (variable tests,
+      // command substitutions, user-supplied globs) pass through — the
+      // threat we harden against here is the "look painfully obvious"
+      // dead-code spoof, not arbitrary reachability analysis.
+      //
+      // The fall-through miss-path form (c) additionally requires
+      // `loopDepth === 0`: the post-fi blocker is inherently top-level,
+      // and wrapping it in a loop would make the blocker execute once
+      // per iteration, a pathological shape outside the canonical
+      // allow-on-match template.
+      const enclosingAllLive =
+        frame.condIsLive &&
+        frames.every((f) => f.condIsLive) &&
+        loopLiveStack.every((v) => v);
+      if (enclosingAllLive && frame.isNegatedAuditIf && frame.hasBlockingInThen) {
+        return true;
+      }
+      if (enclosingAllLive && frame.isPositiveAuditIf && frame.hasBlockingInElse) {
+        return true;
+      }
       if (
+        enclosingAllLive &&
+        frames.length === 0 &&
+        loopDepth === 0 &&
         frame.isPositiveAuditIf &&
         frame.hasAllowOnMatchInThen &&
-        !frame.hasBlockingInElse &&
-        frames.length === 0 &&
-        loopDepth === 0
+        !frame.hasBlockingInElse
       ) {
         pendingFallThroughMissBlock = true;
       }
@@ -887,23 +953,220 @@ function hasAuditCheck(content: string): boolean {
  * top-level-with-`set -e` path and the `if <audit-grep>; then ... fi` frame.
  */
 function isAuditGrepLine(line: string, auditVars: Set<string>): boolean {
-  const contentMatchCmd = /\b(grep|egrep|fgrep|rg)\b/;
-  const codexReviewToken = /codex\\?\.review/;
-  const auditLogLiteral = /\.rea\/audit\.jsonl/;
-
-  if (!codexReviewToken.test(line)) return false;
-  if (!contentMatchCmd.test(line)) return false;
-
-  const referencesAuditLog =
-    auditLogLiteral.test(line) ||
-    Array.from(auditVars).some((v) =>
-      new RegExp(`\\$\\{?${v}\\}?`).test(line),
-    );
-  if (!referencesAuditLog) return false;
+  // R26 F2 — scope-bound codex.review token.
+  //
+  // The previous shape-level check tested each constraint against the full
+  // line: contains `codex.review` SOMEWHERE, contains a grep command
+  // SOMEWHERE, references the audit log SOMEWHERE. A spoof like
+  //
+  //   if grep -q '.' "$AUDIT_LOG" && echo codex.review; then exit 0; fi
+  //
+  // trivially satisfies all three: the grep's pattern is `.` (matches any
+  // non-empty line), the `codex.review` literal lives inside a bound `echo`,
+  // and nothing prevents the grep from succeeding on any populated audit
+  // log — including one with zero codex.review entries. The then-branch
+  // then `exit 0`s and the push proceeds without a real review.
+  //
+  // We now require BOTH (a) the `codex.review` pattern AND (b) the audit-log
+  // reference to appear WITHIN the argument range of a single grep-family
+  // invocation. `findCommandEnd` walks from the grep token forward through
+  // simple quoting and stops at the first unquoted command separator
+  // (`;`, `&&`, `||`, `|`, `)`, newline), giving us the grep's own arg
+  // scope. `codex.review` anywhere outside that scope — in an adjacent
+  // `echo`, a later list member, a following command — fails the check.
+  const grepRe = /\b(grep|egrep|fgrep|rg)\b/g;
+  let bound = false;
+  let match: RegExpExecArray | null;
+  while ((match = grepRe.exec(line)) !== null) {
+    const start = match.index;
+    const rest = line.slice(start);
+    const end = findCommandEnd(rest);
+    const segment = rest.slice(0, end);
+    // The pattern literal MUST live in the grep's own args. Accept both
+    // the raw `codex.review` form and the shell-escaped `codex\.review`
+    // form (the shipped canonical gate uses the escaped form).
+    if (!/codex\\?\.review/.test(segment)) continue;
+    const refsAuditLog =
+      /\.rea\/audit\.jsonl/.test(segment) ||
+      Array.from(auditVars).some((v) =>
+        new RegExp(`\\$\\{?${v}\\}?`).test(segment),
+      );
+    if (!refsAuditLog) continue;
+    bound = true;
+  }
+  if (!bound) return false;
 
   if (isSwallowingAuditCheck(line)) return false;
   if (!isGrepOnlyPipeline(line)) return false;
   return true;
+}
+
+/**
+ * True when an `if <cond>; then ... fi` condition is an obviously-dead
+ * literal — one whose exit status is statically known without executing any
+ * external command. The classifier uses this to refuse to accept an audit-if
+ * whose then-body (or whose enclosing then-body) is unreachable in every
+ * execution, which would otherwise let `if false; then <audit-if>; fi`
+ * score as governance proof.
+ *
+ * Detected shapes (after stripping leading `if ` and optional `! ` negation):
+ *   - Bare `false`, `/bin/false`, `/usr/bin/false` — exit status 1 always.
+ *     With odd-count negations those become live; even-count stays dead.
+ *   - `[ "LITA" OP "LITB" ]` / `test "LITA" OP "LITB"` where OP is `=`/`==`/
+ *     `!=` and both sides are plain double-quoted literals with no variable
+ *     expansion or command substitution. Dead when `=`/`==` with unequal
+ *     literals, or `!=` with equal literals.
+ *
+ * Everything else is treated as LIVE — variable tests, command
+ * substitutions (`$(...)`), pipelines, and non-test commands cannot be
+ * statically evaluated by this parser. The safety posture is: err toward
+ * accepting legitimate conditional guards. Dead-code spoofs beyond these
+ * patterns are outside the threat model this heuristic targets; a
+ * sufficiently creative adversary (`if [ "$SECRET" = "nomatch" ]; then
+ * audit-if; fi`) is caught by human review and by the broader reachability
+ * checks elsewhere in this module, not by a more elaborate literal-folding
+ * engine here.
+ */
+function isDeadIfCondition(condStmt: string): boolean {
+  let s = condStmt.trim();
+  if (!s.startsWith('if ') && !s.startsWith('if\t')) return false;
+  s = s.replace(/^if[ \t]+/, '');
+  let negations = 0;
+  while (/^![ \t]+/.test(s)) {
+    negations++;
+    s = s.replace(/^![ \t]+/, '');
+  }
+  // Head-token dead commands: `false`, `/bin/false`, `/usr/bin/false`. A
+  // trailing space, semicolon, or end-of-string separates the head.
+  const headMatch = s.match(/^(\S+)(?=\s|;|$)/);
+  const head = headMatch ? headMatch[1] : '';
+  const headIsDeadFalse =
+    head === 'false' || head === '/bin/false' || head === '/usr/bin/false';
+  const headIsDeadTrue =
+    head === 'true' || head === ':' || head === '/bin/true' || head === '/usr/bin/true';
+  if (headIsDeadFalse) {
+    return negations % 2 === 0;
+  }
+  if (headIsDeadTrue) {
+    // `if true; then ...` is ALWAYS-TAKEN, not dead. But under a single
+    // negation (`if ! true;`) it becomes always-skipped — dead.
+    return negations % 2 === 1;
+  }
+  // Literal-constant equality tests: `[ "x" = "y" ]` / `test "x" = "y"`.
+  const LITEQ =
+    /^(?:\[|test)\s+"([^"$`\\]*)"\s+(=|==|!=)\s+"([^"$`\\]*)"\s+\]?\s*$/;
+  const m = s.match(LITEQ);
+  if (m !== null) {
+    const lhs = m[1] ?? '';
+    const op = m[2] ?? '';
+    const rhs = m[3] ?? '';
+    let dead: boolean;
+    if (op === '=' || op === '==') {
+      dead = lhs !== rhs;
+    } else {
+      dead = lhs === rhs;
+    }
+    return negations % 2 === 0 ? dead : !dead;
+  }
+  return false;
+}
+
+/**
+ * True when a loop header (`for`/`while`/`until`) is statically dead — no
+ * iteration will ever execute. Catches the `while false; do <audit-if>;
+ * done` spoof symmetric to `isDeadIfCondition`.
+ *
+ * Detected shapes:
+ *   - `while false`, `while /bin/false`, `while /usr/bin/false`
+ *   - `until true`, `until :`, `until /bin/true`, `until /usr/bin/true`
+ *   - `for VAR in ; do` — empty in-list, no iterations. Note: `for VAR;`
+ *     (no `in`) iterates positional params and is treated as LIVE because
+ *     `"$@"` is usually populated; a hook invoked with no args would
+ *     not iterate but that is an operational state, not a syntactic
+ *     deadness, so we accept it as live.
+ *
+ * Everything else (variable-driven conditions, command substitutions) is
+ * treated as live.
+ */
+function isDeadLoopHead(loopHead: string): boolean {
+  const s = loopHead.trim();
+  const whileM = s.match(/^while[ \t]+(.+?)(?:[;\s]+do\b|;?\s*$)/);
+  if (whileM !== null) {
+    const cond = (whileM[1] ?? '').trim();
+    const head = cond.split(/\s+/, 1)[0] ?? '';
+    if (head === 'false' || head === '/bin/false' || head === '/usr/bin/false') {
+      return true;
+    }
+    return false;
+  }
+  const untilM = s.match(/^until[ \t]+(.+?)(?:[;\s]+do\b|;?\s*$)/);
+  if (untilM !== null) {
+    const cond = (untilM[1] ?? '').trim();
+    const head = cond.split(/\s+/, 1)[0] ?? '';
+    if (
+      head === 'true' ||
+      head === ':' ||
+      head === '/bin/true' ||
+      head === '/usr/bin/true'
+    ) {
+      return true;
+    }
+    return false;
+  }
+  const forEmptyIn = /^for[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]+in[ \t]*(?:;|\s*do\b|\s*$)/;
+  if (forEmptyIn.test(s)) return true;
+  return false;
+}
+
+/**
+ * Scan `s` forward from offset 0 and return the index of the first unquoted
+ * command separator, or `s.length` if none. Used by `isAuditGrepLine` to
+ * carve out the argument scope of a single grep-family invocation.
+ *
+ * Recognizes shell single- and double-quote pairs and backslash escapes.
+ * Does NOT implement full POSIX parsing — ANSI-C `$'...'`, command
+ * substitution `$()`, arithmetic `$(( ))`, and backtick subshells are not
+ * modeled. That is intentional: the audit-check patterns we accept are
+ * deliberately simple, and any hook using exotic quoting or substitution
+ * to compose an audit grep should be treated as drift and reinstalled to
+ * the canonical form. This keeps the parser conservative — it may cut a
+ * scope short and reject a legitimate shape, never extend a scope past a
+ * real separator and accept a spoof.
+ */
+function findCommandEnd(s: string): number {
+  let i = 0;
+  let quote: '"' | "'" | null = null;
+  let escape = false;
+  while (i < s.length) {
+    const c = s[i];
+    if (escape) {
+      escape = false;
+      i++;
+      continue;
+    }
+    if (c === '\\') {
+      escape = true;
+      i++;
+      continue;
+    }
+    if (quote !== null) {
+      if (c === quote) quote = null;
+      i++;
+      continue;
+    }
+    if (c === '"' || c === "'") {
+      quote = c;
+      i++;
+      continue;
+    }
+    if (c === ';') return i;
+    if (c === '\n') return i;
+    if (c === ')') return i;
+    if (c === '&' && s[i + 1] === '&') return i;
+    if (c === '|') return i;
+    i++;
+  }
+  return s.length;
 }
 
 /**

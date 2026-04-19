@@ -2236,6 +2236,125 @@ describe('isReaManagedHuskyGate — real shipped .husky/pre-push (regression)', 
   });
 });
 
+describe('isReaManagedHuskyGate — R26 F1 dead-conditional reachability', () => {
+  // Codex R26 F1: a hook that wraps the audit-if in a statically-dead outer
+  // condition (`if false; then ...; fi`, `while false; do ...; done`, etc.)
+  // previously classified as rea-managed because the classifier accepted
+  // any lexically-present audit-if. The fix: enclosing `if`/`for`/`while`/
+  // `until` constructs whose header is an obviously-dead literal are
+  // recognized and poison the audit-if classification.
+  //
+  // Live-but-text-visible conditions (variable tests, command substitutions,
+  // user-supplied globs) still pass through — the shipped hook wraps the
+  // audit-if in a `while read refspec; do ... if git diff ... | grep -qE
+  // PROTECTED ...; then ... fi ... done` chain of non-literal conditions
+  // and that shape remains accepted.
+
+  const MARKER = '# rea:husky-pre-push-gate v1';
+  const BODY_MARKER = '# rea:gate-body-v1';
+  const haltBlock = [
+    'if [ -f "${REA_ROOT}/.rea/HALT" ]; then',
+    '  exit 1',
+    'fi',
+  ].join('\n');
+  const auditIf = [
+    'AUDIT_LOG="${REA_ROOT}/.rea/audit.jsonl"',
+    'if ! grep -E \'"tool_name":"codex\\.review"\' "$AUDIT_LOG" 2>/dev/null | grep -qF "\\"head_sha\\":\\"$HEAD\\""; then',
+    '  exit 1',
+    'fi',
+  ].join('\n');
+
+  const withMarkers = (body: string): string =>
+    ['#!/bin/sh', MARKER, BODY_MARKER, 'set -eu', 'REA_ROOT=$(pwd)', haltBlock, body, 'exit 0'].join('\n');
+
+  it('audit-if wrapped in `if false; then ... fi` is NOT rea-managed', () => {
+    const content = withMarkers(['if false; then', auditIf, 'fi'].join('\n'));
+    expect(isReaManagedHuskyGate(content)).toBe(false);
+  });
+
+  it('audit-if wrapped in `if /bin/false; then ... fi` is NOT rea-managed', () => {
+    const content = withMarkers(
+      ['if /bin/false; then', auditIf, 'fi'].join('\n'),
+    );
+    expect(isReaManagedHuskyGate(content)).toBe(false);
+  });
+
+  it('audit-if wrapped in `if [ "a" = "b" ]; then ... fi` (literal inequality) is NOT rea-managed', () => {
+    const content = withMarkers(
+      ['if [ "a" = "b" ]; then', auditIf, 'fi'].join('\n'),
+    );
+    expect(isReaManagedHuskyGate(content)).toBe(false);
+  });
+
+  it('audit-if wrapped in `while false; do ... done` is NOT rea-managed', () => {
+    const content = withMarkers(
+      ['while false; do', auditIf, 'done'].join('\n'),
+    );
+    expect(isReaManagedHuskyGate(content)).toBe(false);
+  });
+
+  it('audit-if wrapped in `until true; do ... done` is NOT rea-managed', () => {
+    const content = withMarkers(
+      ['until true; do', auditIf, 'done'].join('\n'),
+    );
+    expect(isReaManagedHuskyGate(content)).toBe(false);
+  });
+
+  it('audit-if wrapped in `for X in ; do ... done` (empty list) is NOT rea-managed', () => {
+    const content = withMarkers(
+      ['for X in ; do', auditIf, 'done'].join('\n'),
+    );
+    expect(isReaManagedHuskyGate(content)).toBe(false);
+  });
+
+  it('audit-if nested two levels deep with outer dead literal is NOT rea-managed', () => {
+    const content = withMarkers(
+      [
+        'if false; then',
+        '  if [ -n "$X" ]; then',
+        auditIf,
+        '  fi',
+        'fi',
+      ].join('\n'),
+    );
+    expect(isReaManagedHuskyGate(content)).toBe(false);
+  });
+
+  it('audit-if wrapped in `if ! false; then ... fi` (double-negation live) IS rea-managed', () => {
+    // `if ! false` is always-taken; negation flips the dead-literal status.
+    const content = withMarkers(
+      ['if ! false; then', auditIf, 'fi'].join('\n'),
+    );
+    expect(isReaManagedHuskyGate(content)).toBe(true);
+  });
+
+  it('audit-if wrapped in a live variable test IS rea-managed', () => {
+    // This mirrors the shipped hook's `if git diff ... | grep -qE PROTECTED;
+    // then ... fi` shape: a non-literal condition that cannot be statically
+    // evaluated as dead. Must still pass.
+    const content = withMarkers(
+      [
+        'if [ -n "${REA_ROOT:-}" ]; then',
+        auditIf,
+        'fi',
+      ].join('\n'),
+    );
+    expect(isReaManagedHuskyGate(content)).toBe(true);
+  });
+
+  it('audit-if wrapped in `while read X; do ... done` (live loop) IS rea-managed', () => {
+    // The canonical shipped hook wraps its audit check in exactly this shape.
+    const content = withMarkers(
+      [
+        'while IFS= read -r LINE; do',
+        auditIf,
+        'done',
+      ].join('\n'),
+    );
+    expect(isReaManagedHuskyGate(content)).toBe(true);
+  });
+});
+
 // Codex R21 F1: upgrade migration path. Pre-0.4 rea releases shipped a
 // `.husky/pre-push` without the line-2/3 versioned markers. A consumer
 // upgrading from those versions has a functional governance hook on disk
