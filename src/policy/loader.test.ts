@@ -244,16 +244,19 @@ describe('policy loader', () => {
       expect(p.injection?.suspicious_blocks_writes).toBe(false);
     });
 
-    it('defaults suspicious_blocks_writes to false when the injection block is present but empty', async () => {
-      // Empty block { } exercises the zod default. Omitting the block entirely
-      // leaves `policy.injection` undefined, which the server reads as `?? false`.
+    it('leaves suspicious_blocks_writes undefined when the injection block is present but empty (G9 follow-up)', async () => {
+      // Post-patch: the schema no longer applies a default. Absence is
+      // preserved so the middleware can distinguish "not configured" from
+      // "explicitly false" and apply 0.2.x block-default parity for
+      // `action: 'block'` + unset.
       const yaml = SAMPLE + '\ninjection: {}\n';
       await fs.writeFile(path.join(baseDir, '.rea', 'policy.yaml'), yaml, 'utf8');
       const p = loadPolicy(baseDir);
-      expect(p.injection?.suspicious_blocks_writes).toBe(false);
+      expect(p.injection).toBeDefined();
+      expect(p.injection?.suspicious_blocks_writes).toBeUndefined();
     });
 
-    it('leaves injection undefined when not set — external profiles inherit schema default (false)', async () => {
+    it('leaves injection undefined when not set — middleware applies 0.2.x block-default parity (G9 follow-up)', async () => {
       await fs.writeFile(path.join(baseDir, '.rea', 'policy.yaml'), SAMPLE, 'utf8');
       const p = loadPolicy(baseDir);
       expect(p.injection).toBeUndefined();
