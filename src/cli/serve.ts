@@ -1,10 +1,24 @@
+import fs from 'node:fs';
+import path from 'node:path';
 import { loadPolicy } from '../policy/loader.js';
 import { loadRegistry } from '../registry/loader.js';
 import { createGateway } from '../gateway/server.js';
 import { CodexProbe } from '../gateway/observability/codex-probe.js';
 import {
+  MetricsRegistry,
+  resolveMetricsPort,
+  startMetricsServer,
+  type MetricsServer,
+} from '../gateway/observability/metrics.js';
+import { createLogger, resolveLogLevel } from '../gateway/log.js';
+import { currentSessionId } from '../gateway/session.js';
+import {
+  HALT_FILE,
   POLICY_FILE,
+  REA_DIR,
   REGISTRY_FILE,
+  SERVE_PID_FILE,
+  SERVE_STATE_FILE,
   err,
   exitWithMissingPolicy,
   log,
@@ -13,11 +27,47 @@ import {
 } from './utils.js';
 
 /**
+ * Write the `.rea/serve.pid` breadcrumb so `rea status` can detect us.
+ * This is NOT a supervisor lock (no stale-detection, no exclusive open) —
+ * it's a read-only hint file. `rea status` independently checks
+ * `kill(pid, 0)` before trusting it.
+ */
+function writePidfile(baseDir: string): string {
+  const reaDir = path.join(baseDir, REA_DIR);
+  if (!fs.existsSync(reaDir)) fs.mkdirSync(reaDir, { recursive: true });
+  const pidPath = reaPath(baseDir, SERVE_PID_FILE);
+  fs.writeFileSync(pidPath, String(process.pid), 'utf8');
+  return pidPath;
+}
+
+function writeStateFile(
+  baseDir: string,
+  state: { session_id: string; started_at: string; metrics_port: number | null },
+): string {
+  const p = reaPath(baseDir, SERVE_STATE_FILE);
+  fs.writeFileSync(p, JSON.stringify(state, null, 2) + '\n', 'utf8');
+  return p;
+}
+
+function removeIfExists(filePath: string): void {
+  try {
+    fs.unlinkSync(filePath);
+  } catch {
+    // Best-effort cleanup — file may already be gone (SIGKILL, double-unlink).
+  }
+}
+
+/**
  * `rea serve` — start the MCP gateway.
  *
  * Loads `.rea/policy.yaml` and `.rea/registry.yaml`, builds the middleware
  * chain, spawns downstream children from the registry, and connects an upstream
  * stdio MCP server that clients (Claude Code, Helix, etc.) can talk to.
+ *
+ * G5 additions:
+ *   - Writes a pidfile + session state breadcrumb for `rea status`.
+ *   - Boots a loopback `/metrics` HTTP endpoint when `REA_METRICS_PORT` is set.
+ *   - Emits structured log records through the gateway logger.
  *
  * Signals: SIGTERM and SIGINT both trigger a graceful shutdown. We do NOT exit
  * on uncaughtException — that path is owned by `src/cli/index.ts`. If the
@@ -46,7 +96,9 @@ export async function runServe(): Promise<void> {
     if (message.includes('not found')) {
       err(`Registry file not found: ${registryPath}`);
       console.error('');
-      console.error('  Run `rea init` to create an empty registry, then edit it to declare downstream servers.');
+      console.error(
+        '  Run `rea init` to create an empty registry, then edit it to declare downstream servers.',
+      );
       console.error('');
       process.exit(1);
     }
@@ -54,7 +106,47 @@ export async function runServe(): Promise<void> {
     process.exit(1);
   }
 
-  const handle = createGateway({ baseDir, policy, registry });
+  // ── Observability setup (G5) ─────────────────────────────────────────────
+  const sessionId = currentSessionId();
+  const logger = createLogger({
+    level: resolveLogLevel(process.env['REA_LOG_LEVEL']),
+    base: { session_id: sessionId },
+  });
+
+  const metricsRegistry = new MetricsRegistry();
+  metricsRegistry.markHaltCheck();
+  const metricsPort = resolveMetricsPort(process.env['REA_METRICS_PORT'], logger);
+
+  let metricsServer: MetricsServer | undefined;
+  if (metricsPort !== null) {
+    try {
+      metricsServer = await startMetricsServer({
+        port: metricsPort,
+        registry: metricsRegistry,
+        logger,
+      });
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      // We do NOT fail gateway startup because of a metrics-bind failure —
+      // observability is best-effort. Log loudly so the operator notices.
+      logger.error({
+        event: 'metrics.bind_failed',
+        message: `failed to start /metrics on port ${metricsPort}: ${message}`,
+      });
+    }
+  }
+
+  const handle = createGateway({ baseDir, policy, registry, logger, metrics: metricsRegistry });
+
+  // ── HALT acknowledgement at startup (G5) ─────────────────────────────────
+  const haltPath = reaPath(baseDir, HALT_FILE);
+  if (fs.existsSync(haltPath)) {
+    logger.info({
+      event: 'halt.acknowledged_at_startup',
+      message:
+        'HALT present at startup — every tool call will be denied until `.rea/HALT` is removed',
+    });
+  }
 
   // G11.3 — Codex availability probe. Observational only: a failed probe
   // NEVER fail-closes the gateway at startup. When the policy explicitly
@@ -74,7 +166,22 @@ export async function runServe(): Promise<void> {
     codexProbe.start();
   }
 
+  // ── Pidfile + state (AFTER metrics boot so we persist the real port) ─────
+  const startedAt = new Date().toISOString();
+  const pidPath = writePidfile(baseDir);
+  const statePath = writeStateFile(baseDir, {
+    session_id: sessionId,
+    started_at: startedAt,
+    metrics_port: metricsServer?.port() ?? null,
+  });
+
+  let shuttingDown = false;
   const shutdown = async (signal: string): Promise<void> => {
+    // A second signal (e.g. SIGTERM then SIGINT) must NOT re-enter cleanup —
+    // `handle.stop()` is idempotent but `process.exit(0)` racing against
+    // still-running unlink calls would be messy. One-shot guard.
+    if (shuttingDown) return;
+    shuttingDown = true;
     log(`rea serve: received ${signal} — draining and shutting down`);
     codexProbe?.stop();
     try {
@@ -82,6 +189,17 @@ export async function runServe(): Promise<void> {
     } catch (e) {
       err(`shutdown error: ${e instanceof Error ? e.message : e}`);
     }
+    if (metricsServer !== undefined) {
+      try {
+        await metricsServer.close();
+      } catch {
+        // Best-effort
+      }
+    }
+    // Remove the breadcrumbs LAST so external observers (rea status) can
+    // still see "running" right up until the gateway is really gone.
+    removeIfExists(pidPath);
+    removeIfExists(statePath);
     process.exit(0);
   };
   process.on('SIGTERM', () => void shutdown('SIGTERM'));
@@ -94,6 +212,17 @@ export async function runServe(): Promise<void> {
     await handle.start();
   } catch (e) {
     err(`gateway start failed: ${e instanceof Error ? e.message : e}`);
+    // Clean up breadcrumbs before exit — a failed startup should not leave
+    // a stale pidfile claiming we're up.
+    removeIfExists(pidPath);
+    removeIfExists(statePath);
+    if (metricsServer !== undefined) {
+      try {
+        await metricsServer.close();
+      } catch {
+        /* ignored */
+      }
+    }
     process.exit(1);
   }
 }

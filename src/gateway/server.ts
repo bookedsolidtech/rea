@@ -32,10 +32,7 @@
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import {
-  CallToolRequestSchema,
-  ListToolsRequestSchema,
-} from '@modelcontextprotocol/sdk/types.js';
+import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { DownstreamPool, splitPrefixed } from './downstream-pool.js';
 import { createAuditMiddleware } from './middleware/audit.js';
 import { createKillSwitchMiddleware } from './middleware/kill-switch.js';
@@ -45,10 +42,7 @@ import { createBlockedPathsMiddleware } from './middleware/blocked-paths.js';
 import { createRateLimitMiddleware } from './middleware/rate-limit.js';
 import { createCircuitBreakerMiddleware } from './middleware/circuit-breaker.js';
 import { createInjectionMiddleware } from './middleware/injection.js';
-import {
-  createRedactMiddleware,
-  type CompiledSecretPattern,
-} from './middleware/redact.js';
+import { createRedactMiddleware, type CompiledSecretPattern } from './middleware/redact.js';
 import { wrapRegex } from './redact-safe/match-timeout.js';
 import { createResultSizeCapMiddleware } from './middleware/result-size-cap.js';
 import { executeChain, type InvocationContext, type Middleware } from './middleware/chain.js';
@@ -59,11 +53,26 @@ import type { Registry } from '../registry/types.js';
 import type { Policy } from '../policy/types.js';
 import { InvocationStatus, Tier } from '../policy/types.js';
 import { log } from '../cli/utils.js';
+import { createLogger, type Logger } from './log.js';
+import { CIRCUIT_GAUGE, type MetricsRegistry } from './observability/metrics.js';
 
 export interface GatewayOptions {
   baseDir: string;
   policy: Policy;
   registry: Registry;
+  /**
+   * Optional structured logger. If omitted, a default logger is created that
+   * writes to `process.stderr` honoring `REA_LOG_LEVEL`. Tests inject their
+   * own logger to capture records.
+   */
+  logger?: Logger;
+  /**
+   * Optional metrics registry. When supplied, the terminal middleware and
+   * connection lifecycle events increment counters/gauges on it. When
+   * omitted, no metrics are recorded — this keeps the gateway usable in
+   * tests without bringing in the metrics surface.
+   */
+  metrics?: MetricsRegistry;
 }
 
 export interface GatewayHandle {
@@ -75,6 +84,10 @@ export interface GatewayHandle {
   stop(): Promise<void>;
   /** Exposed for tests. */
   pool: DownstreamPool;
+  /** The active logger — shared with serve.ts so startup messages stay in one sink. */
+  logger: Logger;
+  /** Optional metrics registry (undefined when the caller did not supply one). */
+  metrics: MetricsRegistry | undefined;
 }
 
 /**
@@ -116,7 +129,11 @@ function compileUserRedactPatterns(
   return out;
 }
 
-function buildMiddlewareChain(opts: GatewayOptions): Middleware[] {
+interface ChainDeps {
+  breaker: CircuitBreaker;
+}
+
+function buildMiddlewareChain(opts: GatewayOptions, deps: ChainDeps): Middleware[] {
   const { baseDir, policy } = opts;
   const matchTimeoutMs = policy.redact?.match_timeout_ms ?? 100;
   const userPatterns = compileUserRedactPatterns(policy, matchTimeoutMs);
@@ -127,7 +144,7 @@ function buildMiddlewareChain(opts: GatewayOptions): Middleware[] {
     createPolicyMiddleware(policy, undefined, baseDir),
     createBlockedPathsMiddleware(policy, baseDir),
     createRateLimitMiddleware(new RateLimiter()),
-    createCircuitBreakerMiddleware(new CircuitBreaker()),
+    createCircuitBreakerMiddleware(deps.breaker),
     createInjectionMiddleware(policy.injection_detection === 'warn' ? 'warn' : 'block', {
       matchTimeoutMs,
     }),
@@ -138,14 +155,38 @@ function buildMiddlewareChain(opts: GatewayOptions): Middleware[] {
 
 export function createGateway(opts: GatewayOptions): GatewayHandle {
   const { registry } = opts;
-  const pool = new DownstreamPool(registry);
+  const logger = opts.logger ?? createLogger({ base: { session_id: currentSessionId() } });
+  const metrics = opts.metrics;
+  const pool = new DownstreamPool(registry, logger);
 
-  const server = new Server(
-    { name: 'rea', version: '0.2.0' },
-    { capabilities: { tools: {} } },
-  );
+  const server = new Server({ name: 'rea', version: '0.2.0' }, { capabilities: { tools: {} } });
 
-  const staticChain = buildMiddlewareChain(opts);
+  // Build the circuit breaker with observability hooks wired in — state
+  // transitions log a structured record AND update the Prometheus gauge.
+  const breaker = new CircuitBreaker({
+    onStateChange: (event) => {
+      const level = event.to === 'open' ? 'warn' : 'info';
+      logger[level]({
+        event: `circuit.${event.to.replace('-', '_')}`,
+        server_name: event.server,
+        message: `circuit-breaker: "${event.server}" ${event.from} → ${event.to} (${event.reason})`,
+        ...(event.retryAt !== undefined ? { retry_at: event.retryAt } : {}),
+      });
+      switch (event.to) {
+        case 'closed':
+          metrics?.setCircuitState(event.server, CIRCUIT_GAUGE.closed);
+          break;
+        case 'half-open':
+          metrics?.setCircuitState(event.server, CIRCUIT_GAUGE.halfOpen);
+          break;
+        case 'open':
+          metrics?.setCircuitState(event.server, CIRCUIT_GAUGE.open);
+          break;
+      }
+    },
+  });
+
+  const staticChain = buildMiddlewareChain(opts, { breaker });
 
   // ── Handlers ─────────────────────────────────────────────────────────────
   server.setRequestHandler(ListToolsRequestSchema, async () => {
@@ -201,11 +242,16 @@ export function createGateway(opts: GatewayOptions): GatewayHandle {
         context.error = 'No downstream servers in .rea/registry.yaml — add one to enable proxying';
         return;
       }
+      metrics?.incDownstreamCall(serverName);
+      metrics?.incDownstreamInFlight(serverName);
       try {
         context.result = await pool.callTool(prefixed, context.arguments);
       } catch (err) {
+        metrics?.incDownstreamError(serverName);
         context.status = InvocationStatus.Error;
         context.error = err instanceof Error ? err.message : String(err);
+      } finally {
+        metrics?.decDownstreamInFlight(serverName);
       }
     };
 
@@ -270,14 +316,47 @@ export function createGateway(opts: GatewayOptions): GatewayHandle {
     // Connect to downstream children first so the `listTools` catalog is ready
     // by the time the upstream client connects.
     if (pool.size === 0) {
-      log(
-        'rea serve: no downstream servers in .rea/registry.yaml — running in no-op mode. Add servers to enable proxying.',
-      );
+      logger.info({
+        event: 'gateway.no_downstreams',
+        message:
+          'no downstream servers in .rea/registry.yaml — running in no-op mode. Add servers to enable proxying.',
+      });
     } else {
+      for (const s of registry.servers) {
+        if (!s.enabled) continue;
+        logger.info({
+          event: 'downstream.connect_attempt',
+          server_name: s.name,
+          message: `connecting downstream "${s.name}"`,
+        });
+      }
       try {
         await pool.connectAll();
+        for (const s of registry.servers) {
+          if (!s.enabled) continue;
+          const conn = pool.getConnection(s.name);
+          if (conn !== undefined && conn.isHealthy) {
+            logger.info({
+              event: 'downstream.connected',
+              server_name: s.name,
+              message: `downstream "${s.name}" connected`,
+            });
+            // Every healthy downstream starts in the closed state — record
+            // the initial circuit-breaker gauge so scrapers see a baseline.
+            metrics?.setCircuitState(s.name, CIRCUIT_GAUGE.closed);
+          } else {
+            logger.warn({
+              event: 'downstream.unhealthy_on_start',
+              server_name: s.name,
+              message: `downstream "${s.name}" did not come up healthy`,
+            });
+          }
+        }
       } catch (err) {
-        log(`rea serve: downstream connect error: ${err instanceof Error ? err.message : err}`);
+        logger.error({
+          event: 'downstream.connect_failed',
+          message: `downstream connect error: ${err instanceof Error ? err.message : err}`,
+        });
         // Continue — individual connections may still be healthy.
       }
     }
@@ -289,6 +368,7 @@ export function createGateway(opts: GatewayOptions): GatewayHandle {
   async function stop(): Promise<void> {
     if (stopping) return;
     stopping = true;
+    logger.info({ event: 'gateway.shutdown', message: 'gateway stop requested' });
     try {
       await server.close();
     } catch {
@@ -297,7 +377,7 @@ export function createGateway(opts: GatewayOptions): GatewayHandle {
     await pool.close();
   }
 
-  return { server, start, stop, pool };
+  return { server, start, stop, pool, logger, metrics };
 }
 
 // Prevent TS from complaining about the unused `Tier` import when the file is

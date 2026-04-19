@@ -7,6 +7,7 @@ import { runDoctor } from './doctor.js';
 import { runFreeze, runUnfreeze } from './freeze.js';
 import { runInit } from './init.js';
 import { runServe } from './serve.js';
+import { runStatus } from './status.js';
 import { runUpgrade } from './upgrade.js';
 import { err, getPkgVersion } from './utils.js';
 
@@ -20,7 +21,9 @@ async function main(): Promise<void> {
 
   program
     .command('init')
-    .description('Interactive wizard — write .rea/policy.yaml, install .claude/, commit-msg hook, and CLAUDE.md fragment')
+    .description(
+      'Interactive wizard — write .rea/policy.yaml, install .claude/, commit-msg hook, and CLAUDE.md fragment',
+    )
     .option('-y, --yes', 'non-interactive mode — accept defaults, skip existing files')
     .option('--from-reagent', 'migrate from a .reagent/ directory if present')
     .option(
@@ -102,6 +105,16 @@ async function main(): Promise<void> {
     .description('Read-only status — autonomy, HALT, profile, recent audit entries.')
     .action(() => {
       runCheck();
+    });
+
+  program
+    .command('status')
+    .description(
+      'Running-process view — is `rea serve` live for this project? Session id, policy summary, audit stats. Use `rea check` for the on-disk view.',
+    )
+    .option('--json', 'emit JSON instead of the pretty table (composes with jq)')
+    .action((opts: { json?: boolean }) => {
+      runStatus({ json: opts.json });
     });
 
   const audit = program

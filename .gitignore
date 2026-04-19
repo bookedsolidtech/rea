@@ -29,6 +29,8 @@ coverage/
 .rea/audit.jsonl
 .rea/HALT
 .rea/metrics.jsonl
+.rea/serve.pid
+.rea/serve.state.json
 
 # Scratch space
 .scratch/

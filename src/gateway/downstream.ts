@@ -39,6 +39,7 @@
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import type { RegistryServer } from '../registry/types.js';
+import type { Logger } from './log.js';
 
 export interface DownstreamToolInfo {
   name: string;
@@ -126,7 +127,15 @@ export class DownstreamConnection {
   private lastReconnectAt = 0;
   private health: Health = 'healthy';
 
-  constructor(private readonly config: RegistryServer) {}
+  constructor(
+    private readonly config: RegistryServer,
+    /**
+     * Optional structured logger (G5). When omitted, connection lifecycle
+     * events are simply not logged — keeping the class usable in unit tests
+     * that don't care about observability.
+     */
+    private readonly logger?: Logger,
+  ) {}
 
   get name(): string {
     return this.config.name;
@@ -181,12 +190,17 @@ export class DownstreamConnection {
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       const withinFlapWindow =
-        this.lastReconnectAt !== 0 &&
-        Date.now() - this.lastReconnectAt < RECONNECT_FLAP_WINDOW_MS;
+        this.lastReconnectAt !== 0 && Date.now() - this.lastReconnectAt < RECONNECT_FLAP_WINDOW_MS;
 
       if (!this.reconnectAttempted && !withinFlapWindow) {
         this.reconnectAttempted = true;
         this.health = 'degraded';
+        this.logger?.warn({
+          event: 'downstream.reconnect_attempt',
+          server_name: this.config.name,
+          message: `downstream "${this.config.name}" will reconnect once after error`,
+          reason: message,
+        });
         try {
           await this.close();
           await this.connect();
@@ -195,15 +209,32 @@ export class DownstreamConnection {
           // stamp the reconnect time so flap-guard can refuse rapid repeats.
           this.reconnectAttempted = false;
           this.lastReconnectAt = Date.now();
+          this.logger?.info({
+            event: 'downstream.reconnected',
+            server_name: this.config.name,
+            message: `downstream "${this.config.name}" reconnected successfully`,
+          });
           return result;
         } catch (reconnectErr) {
           this.health = 'unhealthy';
+          this.logger?.error({
+            event: 'downstream.reconnect_failed',
+            server_name: this.config.name,
+            message: `downstream "${this.config.name}" unhealthy after one reconnect`,
+            error: reconnectErr instanceof Error ? reconnectErr.message : String(reconnectErr),
+          });
           throw new Error(
             `downstream "${this.config.name}" unhealthy after one reconnect: ${reconnectErr instanceof Error ? reconnectErr.message : reconnectErr}`,
           );
         }
       }
       this.health = 'unhealthy';
+      this.logger?.error({
+        event: 'downstream.call_failed',
+        server_name: this.config.name,
+        message: `downstream "${this.config.name}" call failed`,
+        error: message,
+      });
       throw new Error(`downstream "${this.config.name}" call failed: ${message}`);
     }
   }
