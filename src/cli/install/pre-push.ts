@@ -158,20 +158,24 @@ export function isReaManagedFallback(content: string): boolean {
  * as a governance-carrying hook rather than `foreign/no-marker`.
  */
 export function isReaManagedHuskyGate(content: string): boolean {
-  // Two-factor identity check:
-  //   1. Positional header marker on line 2 (after shebang) — prevents
-  //      classifying any file that merely mentions the sentinel.
-  //   2. Body marker (`HUSKY_GATE_BODY_MARKER`) anywhere in the body — closes
-  //      the spoof vector where only the header marker + a stub body is
-  //      present. A genuine rea gate always carries both markers.
-  //
-  // Note: this is a best-effort heuristic for preventing ACCIDENTAL
-  // displacement during `rea init`. A determined actor with repo write
-  // access could add both markers to any file — that threat is out of scope
-  // for a text-based classifier.
+  // Positional anchor: header marker must be on line 2 (immediately after
+  // shebang). Prevents classifying any file that merely mentions the sentinel.
   const lines = content.split(/\r?\n/);
   if (lines.length < 2 || lines[1] !== HUSKY_GATE_MARKER) return false;
-  return content.includes(HUSKY_GATE_BODY_MARKER);
+
+  // Fresh install: body marker present — definitive two-factor match.
+  if (content.includes(HUSKY_GATE_BODY_MARKER)) return true;
+
+  // Backward-compat: rea gates installed before R6 have the header marker and
+  // the HALT sentinel but not the body marker (added in this release). Recognize
+  // them as rea-managed so existing governed repos are not reclassified as
+  // `foreign` after upgrading rea. The body marker is added on the next
+  // `rea init` or `rea upgrade` run.
+  //
+  // Note: as with the two-factor check, this is a best-effort heuristic for
+  // preventing ACCIDENTAL displacement. A determined actor with write access
+  // could construct a matching file — that threat is out of scope here.
+  return content.includes('.rea/HALT');
 }
 
 /**
@@ -258,27 +262,29 @@ export function referencesReviewGate(content: string): boolean {
     //
     // Three conditions must all hold:
     //   depth === 0   — unconditional top-level call, not inside if/for/case
-    //   !swallowsExitStatus — `|| true`, `|| :`, `; exit 0` etc. not present
-    //   !exitedBeforeGate  — no unconditional exit before this line
-    if (looksLikeGateInvocation(line) && depth === 0 && !swallowsExitStatus(line) && !exitedBeforeGate)
+    //   !hasContinuationOperator — no `||`, `&&`, or `;` after the gate token
+    //   !exitedBeforeGate        — no unconditional exit before this line
+    if (looksLikeGateInvocation(line) && depth === 0 && !hasContinuationOperator(line) && !exitedBeforeGate)
       return true;
   }
   return false;
 }
 
 /**
- * Returns true when `line` contains a shell pattern that discards the gate's
- * exit code, making the invocation non-compliance-carrying. Detects:
- *   `cmd || true`, `cmd || :`, `cmd || exit 0`
- *   `cmd && exit 0`
- *   `cmd; exit 0`
+ * Returns true when `line` contains a shell continuation operator (`||`, `&&`,
+ * or `;`) anywhere after the gate filename. Any such operator means the gate's
+ * exit code is not the line's exit code — the invocation is not
+ * compliance-carrying regardless of what follows.
+ *
+ * Uses a tail scan from the end of the gate token rather than a literal
+ * denylist, so path-qualified variants (`|| /bin/true`, `|| /usr/bin/true`)
+ * are rejected the same as literal `|| true`.
  */
-function swallowsExitStatus(line: string): boolean {
-  return (
-    /\|\|\s*(true\b|:|exit\s+0\b)/.test(line) ||
-    /&&\s*exit\s+0\b/.test(line) ||
-    /;\s*exit\s+0\b/.test(line)
-  );
+function hasContinuationOperator(line: string): boolean {
+  const gateIdx = line.indexOf(GATE_DELEGATION_TOKEN);
+  if (gateIdx === -1) return false;
+  const tail = line.slice(gateIdx + GATE_DELEGATION_TOKEN.length);
+  return /[|&;]/.test(tail);
 }
 
 /**

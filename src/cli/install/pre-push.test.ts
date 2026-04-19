@@ -972,11 +972,20 @@ describe('isReaManagedHuskyGate — Husky gate marker detection (Finding 2)', ()
     expect(isReaManagedHuskyGate(`#!/bin/sh\n${HUSKY_GATE_MARKER}\nexit 0\n`)).toBe(false);
   });
 
-  it('marker at line 2 + HALT sentinel but no body marker: returns false', () => {
-    // HALT sentinel alone is insufficient after R6 fix. Both markers required.
+  it('marker at line 2 + HALT sentinel but no body marker: returns true (legacy backward-compat)', () => {
+    // R7 backward-compat: rea gates installed before R6 have the header marker
+    // and .rea/HALT but not the body marker. Must return true so existing
+    // governed repos are not reclassified as foreign after upgrading rea.
     expect(
-      isReaManagedHuskyGate(`#!/bin/sh\n${HUSKY_GATE_MARKER}\n[ -f .rea/HALT ] && exit 1\nexit 0\n`),
-    ).toBe(false);
+      isReaManagedHuskyGate(
+        `#!/bin/sh\n${HUSKY_GATE_MARKER}\n[ -f .rea/HALT ] && exit 1\nif grep -q codex.review .rea/audit.jsonl; then\n  exit 0\nfi\nexit 1\n`,
+      ),
+    ).toBe(true);
+  });
+
+  it('marker at line 2 + no body marker + no HALT sentinel: returns false (stub body)', () => {
+    // Only the header marker — body is entirely absent of both sentinels.
+    expect(isReaManagedHuskyGate(`#!/bin/sh\n${HUSKY_GATE_MARKER}\nexit 0\n`)).toBe(false);
   });
 
   it('content without any marker returns false', () => {
@@ -1120,6 +1129,24 @@ describe('referencesReviewGate — depth-tracking exit detection (Finding 2)', (
     const content = [
       '#!/bin/sh',
       'exec .claude/hooks/push-review-gate.sh "$@" || :',
+    ].join('\n');
+    expect(referencesReviewGate(content)).toBe(false);
+  });
+
+  it('gate invocation with || /bin/true (path-qualified bypass): returns false', () => {
+    // R7 F2: denylist of literals was bypassable with path-qualified forms.
+    // The tail-continuation check catches any `||` regardless of what follows.
+    const content = [
+      '#!/bin/sh',
+      'sh .claude/hooks/push-review-gate.sh "$@" || /bin/true',
+    ].join('\n');
+    expect(referencesReviewGate(content)).toBe(false);
+  });
+
+  it('gate invocation with ; /bin/true (path-qualified semicolon bypass): returns false', () => {
+    const content = [
+      '#!/bin/sh',
+      'sh .claude/hooks/push-review-gate.sh "$@"; /bin/true',
     ].join('\n');
     expect(referencesReviewGate(content)).toBe(false);
   });
