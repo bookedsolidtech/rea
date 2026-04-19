@@ -92,14 +92,12 @@ const execFileAsync = promisify(execFile);
 export const FALLBACK_MARKER = '# rea:pre-push-fallback v1';
 
 /**
- * Marker present in the shipped `.husky/pre-push` governance gate. Unlike
- * `FALLBACK_MARKER`, which uses an anchored prelude check, this marker is
- * detected by inclusion (`content.includes`) because the Husky file is not
- * a rea-written artifact — its shebang and opening comments are fixed by the
- * Husky toolchain, not by `rea init`. A substring match is sufficient because
- * the marker string is long and structured enough that accidental collision
- * with user content is negligible, and the anchored-prelude check remains the
- * gold standard for `FALLBACK_MARKER`.
+ * Marker present in the shipped `.husky/pre-push` governance gate. Detection
+ * requires the marker to appear on the SECOND LINE of the file (immediately
+ * after the shebang) to prevent a consumer comment or copy-pasted snippet
+ * that mentions the string from causing a foreign hook to be misclassified
+ * as rea-managed and then silently overwritten. See `isReaManagedHuskyGate`
+ * for the anchored check.
  */
 export const HUSKY_GATE_MARKER = '# rea:husky-pre-push-gate v1';
 
@@ -135,18 +133,27 @@ export function isReaManagedFallback(content: string): boolean {
 }
 
 /**
- * True when `content` contains the shipped Husky gate marker. The marker is
- * present in `.husky/pre-push` and signals that this is the rea-authored
- * governance gate — not a lint-only Husky hook. Detection uses a substring
- * match (not an anchored-prelude check) because the Husky shebang/header is
- * not written by rea, so the marker may appear on any early line of the file.
+ * True when `content` has the shipped Husky gate marker on the SECOND LINE
+ * (immediately after the shebang). This is the canonical structure of the
+ * rea-authored `.husky/pre-push` — the shebang occupies line 1 and the marker
+ * occupies line 2 with no intervening blank lines.
+ *
+ * Requiring line-2 placement prevents a consumer comment, copy-pasted snippet,
+ * or any other text that merely *mentions* the marker string from reclassifying
+ * a consumer-owned hook as rea-managed and triggering an overwrite on the next
+ * `rea init`. A marker buried anywhere else in the file is not the canonical
+ * structure and must not be trusted.
  *
  * This classification is checked BEFORE `isReaManagedFallback` in
  * `classifyExistingHook` so that the shipped `.husky/pre-push` is recognized
- * as `rea-managed` rather than `foreign/no-marker`.
+ * as a governance-carrying hook rather than `foreign/no-marker`.
  */
 export function isReaManagedHuskyGate(content: string): boolean {
-  return content.includes(HUSKY_GATE_MARKER);
+  // Require the marker on the SECOND LINE (after shebang) to prevent spoofing
+  // via a comment deeper in the file. The canonical .husky/pre-push structure
+  // places it at line 2.
+  const lines = content.split(/\r?\n/);
+  return lines.length >= 2 && lines[1] === HUSKY_GATE_MARKER;
 }
 
 /**
@@ -278,9 +285,18 @@ function looksLikeGateInvocation(line: string): boolean {
  * destination in the TOCTOU guard we accept `absent` as "safe to proceed
  * with install" but treat a directory/symlink-to-directory that raced
  * into place as a write-path obstruction we must refuse to stomp.
+ *
+ * `rea-managed-husky` is distinct from `rea-managed`: both represent
+ * rea governance-carrying hooks, but the Husky gate is the canonical
+ * `.husky/pre-push` that rea copies via `rea init`. It must NEVER be
+ * refreshed or overwritten by the fallback installer — the install path
+ * maps it to `skip/active-pre-push-present`. `rea-managed` (the fallback
+ * marker variant) maps to `refresh` because that file IS the fallback
+ * artifact and re-running `rea init` should keep it current.
  */
 type HookClassification =
   | { kind: 'rea-managed' }
+  | { kind: 'rea-managed-husky' }
   | { kind: 'gate-delegating' }
   | { kind: 'absent' }
   | { kind: 'foreign'; reason: 'no-marker' | 'unreadable' | 'not-a-file' };
@@ -318,7 +334,7 @@ async function classifyExistingHook(
   } catch {
     return { kind: 'foreign', reason: 'unreadable' };
   }
-  if (isReaManagedHuskyGate(content)) return { kind: 'rea-managed' };
+  if (isReaManagedHuskyGate(content)) return { kind: 'rea-managed-husky' };
   if (isReaManagedFallback(content)) return { kind: 'rea-managed' };
   if (referencesReviewGate(content)) return { kind: 'gate-delegating' };
   return { kind: 'foreign', reason: 'no-marker' };
@@ -512,6 +528,14 @@ export async function classifyPrePushInstall(
   }
   if (classification.kind === 'rea-managed') {
     return { action: 'refresh', hookPath };
+  }
+  if (classification.kind === 'rea-managed-husky') {
+    // The canonical `.husky/pre-push` governance gate. It is the authoritative
+    // rea-authored hook for Husky installs and must NEVER be overwritten by the
+    // fallback installer. Treat it as governance-carrying (like gate-delegating)
+    // so doctor reports `ok` — but map to skip/active-pre-push-present so
+    // `installPrePushFallback` never touches it.
+    return { action: 'skip', reason: 'active-pre-push-present', hookPath };
   }
 
   // Non-rea file present. Whether we call it "active governance hook" or
@@ -827,7 +851,13 @@ export async function installPrePushFallback(
           }
         } else {
           // refresh
-          if (reCheck.kind !== 'rea-managed') {
+          // Accept both `rea-managed` (fallback marker) and `rea-managed-husky`
+          // (Husky gate) as valid governance — if a race replaced the fallback
+          // with the canonical Husky gate we must not overwrite it.
+          if (
+            reCheck.kind !== 'rea-managed' &&
+            reCheck.kind !== 'rea-managed-husky'
+          ) {
             result.warnings.push(
               `pre-push hook at ${decision.hookPath} is no longer rea-managed — ` +
                 `leaving it untouched.`,
@@ -955,7 +985,7 @@ export async function inspectPrePushState(
         executable = (stat.mode & 0o111) !== 0;
         try {
           const content = await fsPromises.readFile(p, 'utf8');
-          reaManaged = isReaManagedFallback(content);
+          reaManaged = isReaManagedFallback(content) || isReaManagedHuskyGate(content);
           delegatesToGate = referencesReviewGate(content);
         } catch {
           // unreadable — leave both false
