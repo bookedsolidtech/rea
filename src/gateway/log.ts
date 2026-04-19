@@ -39,6 +39,18 @@ const LEVEL_ORDER: Record<LogLevel, number> = {
   error: 40,
 };
 
+/**
+ * Hard byte-cap for string-valued log fields. Applied before any regex runs
+ * so that an attacker-influenced error message (e.g. a downstream MCP error
+ * that echoes request content) cannot cause catastrophic backtracking against
+ * the redaction pattern set, even if a badly-written pattern is loaded.
+ *
+ * 4 KiB is generous for any legitimate structured-log value and tiny compared
+ * to the multi-MB payloads that would be needed to trigger backtracking on
+ * a pathological pattern.
+ */
+const MAX_LOG_FIELD_BYTES = 4096;
+
 /** Structured fields every record carries. Additional fields are allowed. */
 export interface LogFields {
   /** Short verb-ish name — `downstream.connect`, `circuit.open`, etc. */
@@ -280,22 +292,38 @@ class BasicLogger implements Logger {
    * unchanged — a JSON-serializable object with credentials inside would
    * need its own redactor upstream; the typical leak path for downstream
    * MCP errors is a plain-string `error` or `message` field.
+   *
+   * SECURITY: downstream error messages are attacker-influenced and can
+   * be arbitrarily long. A badly-backtracking pattern applied to a large
+   * string would stall the event loop. Hard-cap each string field at
+   * MAX_LOG_FIELD_BYTES BEFORE applying any regex. The cap is applied
+   * regardless of whether a redactor is configured so the logger never
+   * writes runaway-length values to stderr even without patterns loaded.
    */
   private applyRedactor(
     merged: LogFields & Record<string, unknown>,
   ): LogFields & Record<string, unknown> {
     const redactor = this.redactField;
-    if (redactor === undefined) return merged;
     const out: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(merged)) {
       if (typeof v === 'string') {
-        try {
-          out[k] = redactor(v);
-        } catch {
-          // A crashing redactor must not drop the record. Fall back to
-          // a stable sentinel so the record still reaches the operator
-          // without the raw (possibly sensitive) value.
-          out[k] = '[redactor-error]';
+        // Truncate before regex — prevents catastrophic backtracking on
+        // attacker-controlled strings regardless of which patterns are loaded.
+        const capped =
+          v.length > MAX_LOG_FIELD_BYTES
+            ? v.slice(0, MAX_LOG_FIELD_BYTES) + '\u2026[truncated]'
+            : v;
+        if (redactor === undefined) {
+          out[k] = capped;
+        } else {
+          try {
+            out[k] = redactor(capped);
+          } catch {
+            // A crashing redactor must not drop the record. Fall back to
+            // a stable sentinel so the record still reaches the operator
+            // without the raw (possibly sensitive) value.
+            out[k] = '[redactor-error]';
+          }
         }
       } else {
         out[k] = v;

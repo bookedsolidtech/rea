@@ -58,15 +58,6 @@ const LOOPBACK = '127.0.0.1';
  */
 const ALLOWED_HOSTS: ReadonlySet<string> = new Set(['127.0.0.1', '::1']);
 
-/**
- * Test-only symbol escape hatch. Unit tests that need to bind `localhost`
- * (hostname resolution path) can pass this symbol as a key with the desired
- * host value. External callers deserializing options from YAML/JSON/CLI
- * cannot reach a `unique symbol` identity, so the bypass is effectively
- * unreachable from the outside world.
- */
-export const __TEST_HOST_OVERRIDE: unique symbol = Symbol('rea.metrics.__test_host_override');
-
 /** Path we serve. All other paths get 404. */
 const METRICS_PATH = '/metrics';
 
@@ -246,15 +237,6 @@ export interface StartMetricsServerOptions {
    * Default: `127.0.0.1`.
    */
   host?: string;
-  /**
-   * TEST-ONLY. Keyed by the {@link __TEST_HOST_OVERRIDE} symbol. When
-   * present, the value is used verbatim as the bind host and the public
-   * allowlist is bypassed. Not reachable via any deserialization path
-   * (YAML, JSON, CLI arg), so this cannot be smuggled in by an attacker.
-   *
-   * Production code paths must NEVER set this.
-   */
-  [__TEST_HOST_OVERRIDE]?: string;
 }
 
 /**
@@ -333,17 +315,13 @@ export function startMetricsServer(opts: StartMetricsServerOptions): Promise<Met
     });
 
     // Resolve the bind host with defense-in-depth:
-    //   1. Test-only symbol override wins (unreachable from config/CLI).
-    //   2. Otherwise the public `host` option is validated against a strict
-    //      loopback allowlist. Non-loopback values throw synchronously
-    //      BEFORE a socket opens — a caller bug cannot silently bind
-    //      0.0.0.0 and expose the unauthenticated endpoint.
-    //   3. Default when unset: 127.0.0.1.
-    const testHost = opts[__TEST_HOST_OVERRIDE];
+    //   1. The public `host` option is validated against a strict loopback
+    //      allowlist. Non-loopback values throw synchronously BEFORE a socket
+    //      opens — a caller bug cannot silently bind 0.0.0.0 and expose the
+    //      unauthenticated endpoint.
+    //   2. Default when unset: 127.0.0.1.
     let host: string;
-    if (typeof testHost === 'string') {
-      host = testHost;
-    } else if (opts.host === undefined) {
+    if (opts.host === undefined) {
       host = LOOPBACK;
     } else if (ALLOWED_HOSTS.has(opts.host)) {
       host = opts.host;

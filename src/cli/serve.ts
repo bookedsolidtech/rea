@@ -189,24 +189,17 @@ export async function runServe(): Promise<void> {
 
   // ── Observability setup (G5) ─────────────────────────────────────────────
   const sessionId = currentSessionId();
-  // Build a log-field redactor from the built-in SECRET_PATTERNS plus any
-  // operator-configured patterns from policy.redact.patterns. Without this,
-  // custom tenant/env-specific secrets that the gateway redact middleware
-  // catches in tool results would still appear verbatim in stderr log fields
-  // (e.g. downstream error messages). The logger uses plain sync RegExp (not
-  // SafeRegex workers) because log fields are short strings and the ReDoS
-  // surface that motivated SafeRegex for MCP payloads does not apply here.
-  const policyRedactPatterns: ReadonlyArray<{ name: string; pattern: RegExp }> =
-    (policy.redact?.patterns ?? []).flatMap((entry) => {
-      try {
-        return [{ name: entry.name, pattern: new RegExp(entry.regex, entry.flags ?? '') }];
-      } catch {
-        // The policy loader already validated these; a compile failure here is
-        // a defensive catch for any unreachable corner case. Drop and continue.
-        return [];
-      }
-    });
-  const logRedactor = buildRegexRedactor([...SECRET_PATTERNS, ...policyRedactPatterns]);
+  // Use only the built-in SECRET_PATTERNS for the logger redactor. Policy
+  // patterns are intentionally excluded: the logger applies regex
+  // synchronously on the event-loop thread with no size cap, and downstream
+  // error messages are attacker-influenced and can be arbitrarily long.
+  // Combining operator-supplied patterns (which may backtrack badly) with
+  // large error strings multiplied across the full pattern set could stall
+  // the event loop during a failure event. The built-in patterns are
+  // anchored and bounded; policy patterns are not guaranteed to be.
+  // Field strings are hard-capped at MAX_LOG_FIELD_BYTES before any regex
+  // runs — see applyRedactor in log.ts.
+  const logRedactor = buildRegexRedactor(SECRET_PATTERNS);
   const logger = createLogger({
     level: resolveLogLevel(process.env['REA_LOG_LEVEL']),
     base: { session_id: sessionId },
