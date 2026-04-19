@@ -1051,6 +1051,23 @@ describe('referencesReviewGate — depth-tracking exit detection (Finding 2)', (
     ].join('\n');
     expect(referencesReviewGate(content)).toBe(false);
   });
+
+  it('standalone `do` on its own line does not double-increment depth (POSIX loop)', () => {
+    // POSIX `for`/`while` loops may have `do` on its own line.
+    // If `do` were included in the depth-increment set it would double-
+    // increment (once for `for`, once for `do`), leaving depth=1 after
+    // `done`, so the post-loop `exit 0` would be missed as a bypass.
+    const content = [
+      '#!/bin/sh',
+      'for item in x y',
+      'do',
+      '  something',
+      'done',
+      'exit 0',
+      'exec .claude/hooks/push-review-gate.sh "$@"',
+    ].join('\n');
+    expect(referencesReviewGate(content)).toBe(false);
+  });
 });
 
 describe('classifyExistingHook — Husky gate marker integration (Finding 2)', () => {

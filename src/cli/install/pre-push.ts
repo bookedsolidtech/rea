@@ -217,7 +217,9 @@ export function referencesReviewGate(content: string): boolean {
     // Track block depth so exit inside an if/for/while/case is not treated
     // as top-level. Simple keyword heuristic; does not handle one-liner forms
     // (`if ...; then exit 1; fi`), but those are unusual in pre-push hooks.
-    if (/^(if|for|while|case|do)\b/.test(line)) depth++;
+    // Note: `do` is intentionally excluded — in POSIX `for`/`while` loops it
+    // appears on its own line and would double-increment depth if included.
+    if (/^(if|for|while|case)\b/.test(line)) depth++;
     if (/^(fi|done|esac)\b/.test(line)) depth = Math.max(0, depth - 1);
     // Detect bare unconditional exit/return at depth 0 before the gate
     // invocation. Only a top-level exit makes the gate truly unreachable.
@@ -949,8 +951,8 @@ export async function installPrePushFallback(
             // link() not supported (cross-device mount, network FS, old kernel).
             // Degrade gracefully rather than surfacing an opaque FS error.
             result.warnings.push(
-              `pre-push hook at ${decision.hookPath} could not be installed (${e.code}) — ` +
-                `filesystem does not support hard links. Run \`rea init --force\` on a local filesystem.`,
+              `pre-push hook at ${decision.hookPath} could not be written (${e.code}) — ` +
+                `try running on a local filesystem or use \`rea init --force\`.`,
             );
             result.decision = {
               action: 'skip',
