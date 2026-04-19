@@ -86,6 +86,26 @@ export interface AuditPolicy {
   rotation?: AuditRotationPolicy;
 }
 
+/**
+ * G9 — injection tier escalation knobs. The classifier bucketed matches into
+ * `clean` / `suspicious` / `likely_injection`; this block governs what happens
+ * to the `suspicious` bucket (a single literal match at write/destructive tier,
+ * no base64 escalation). `likely_injection` is ALWAYS a deny regardless of
+ * these knobs.
+ *
+ * `suspicious_blocks_writes` —
+ *   `false` (schema default): suspicious matches warn-only (log + audit
+ *     metadata, `status: allowed`). Ships narrower default so 0.2.x users are
+ *     not silently tightened on upgrade. External profiles
+ *     (`open-source`, `client-engagement`, `minimal`, `lit-wc`) inherit this.
+ *   `true` (pinned in `bst-internal` and this repo's own policy): suspicious
+ *     matches at write/destructive tier deny with verdict `suspicious` in the
+ *     audit record.
+ */
+export interface InjectionPolicy {
+  suspicious_blocks_writes: boolean;
+}
+
 export interface Policy {
   version: string;
   profile: string;
@@ -98,6 +118,7 @@ export interface Policy {
   blocked_paths: string[];
   notification_channel: string;
   injection_detection?: 'block' | 'warn';
+  injection?: InjectionPolicy;
   context_protection?: ContextProtection;
   review?: ReviewPolicy;
   redact?: RedactPolicy;

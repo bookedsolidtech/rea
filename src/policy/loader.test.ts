@@ -228,4 +228,71 @@ describe('policy loader', () => {
       expect(() => loadPolicy(baseDir)).toThrow(/Invalid policy schema/);
     });
   });
+
+  describe('injection policy (G9)', () => {
+    it('accepts injection.suspicious_blocks_writes when pinned true (bst-internal posture)', async () => {
+      const yaml = SAMPLE + '\ninjection:\n  suspicious_blocks_writes: true\n';
+      await fs.writeFile(path.join(baseDir, '.rea', 'policy.yaml'), yaml, 'utf8');
+      const p = loadPolicy(baseDir);
+      expect(p.injection?.suspicious_blocks_writes).toBe(true);
+    });
+
+    it('accepts injection.suspicious_blocks_writes when pinned false', async () => {
+      const yaml = SAMPLE + '\ninjection:\n  suspicious_blocks_writes: false\n';
+      await fs.writeFile(path.join(baseDir, '.rea', 'policy.yaml'), yaml, 'utf8');
+      const p = loadPolicy(baseDir);
+      expect(p.injection?.suspicious_blocks_writes).toBe(false);
+    });
+
+    it('defaults suspicious_blocks_writes to false when the injection block is present but empty', async () => {
+      // Empty block { } exercises the zod default. Omitting the block entirely
+      // leaves `policy.injection` undefined, which the server reads as `?? false`.
+      const yaml = SAMPLE + '\ninjection: {}\n';
+      await fs.writeFile(path.join(baseDir, '.rea', 'policy.yaml'), yaml, 'utf8');
+      const p = loadPolicy(baseDir);
+      expect(p.injection?.suspicious_blocks_writes).toBe(false);
+    });
+
+    it('leaves injection undefined when not set — external profiles inherit schema default (false)', async () => {
+      await fs.writeFile(path.join(baseDir, '.rea', 'policy.yaml'), SAMPLE, 'utf8');
+      const p = loadPolicy(baseDir);
+      expect(p.injection).toBeUndefined();
+    });
+
+    it('rejects unknown fields inside injection (strict)', async () => {
+      const yaml =
+        SAMPLE + '\ninjection:\n  suspicious_blocks_writes: true\n  mystery: 1\n';
+      await fs.writeFile(path.join(baseDir, '.rea', 'policy.yaml'), yaml, 'utf8');
+      expect(() => loadPolicy(baseDir)).toThrow(/Invalid policy schema/);
+    });
+
+    it('rejects non-boolean suspicious_blocks_writes', async () => {
+      const yaml = SAMPLE + '\ninjection:\n  suspicious_blocks_writes: "yes"\n';
+      await fs.writeFile(path.join(baseDir, '.rea', 'policy.yaml'), yaml, 'utf8');
+      expect(() => loadPolicy(baseDir)).toThrow(/Invalid policy schema/);
+    });
+
+    it('reload picks up a pin change (flag flipped on disk, cache invalidates on mtime)', async () => {
+      const policyPath = path.join(baseDir, '.rea', 'policy.yaml');
+      await fs.writeFile(
+        policyPath,
+        SAMPLE + '\ninjection:\n  suspicious_blocks_writes: false\n',
+        'utf8',
+      );
+      const first = await loadPolicyAsync(baseDir);
+      expect(first.injection?.suspicious_blocks_writes).toBe(false);
+
+      // Wait enough for mtime to tick on disk. macOS HFS+ is 1s granularity;
+      // APFS is sub-ms but we still give a small sleep so stat.mtimeMs differs.
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      await fs.writeFile(
+        policyPath,
+        SAMPLE + '\ninjection:\n  suspicious_blocks_writes: true\n',
+        'utf8',
+      );
+      const second = await loadPolicyAsync(baseDir);
+      expect(second.injection?.suspicious_blocks_writes).toBe(true);
+    });
+  });
 });

@@ -310,6 +310,14 @@ function writePolicyYaml(targetDir: string, config: ResolvedConfig, layered: Pro
   if (layered.injection_detection !== undefined) {
     lines.push(`injection_detection: ${layered.injection_detection}`);
   }
+  // G9: preserve `injection.suspicious_blocks_writes` when the layered profile
+  // pinned it (bst-internal/bst-internal-no-codex pin `true`). External profiles
+  // leave this unset so the policy loader's schema default (`false`) applies,
+  // which keeps 0.2.x consumers from being silently tightened on upgrade.
+  if (layered.injection?.suspicious_blocks_writes !== undefined) {
+    lines.push(`injection:`);
+    lines.push(`  suspicious_blocks_writes: ${layered.injection.suspicious_blocks_writes ? 'true' : 'false'}`);
+  }
   if (layered.context_protection !== undefined) {
     lines.push(`context_protection:`);
     const cp = layered.context_protection;
