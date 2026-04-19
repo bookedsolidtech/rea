@@ -134,12 +134,15 @@ interface ChainDeps {
 }
 
 function buildMiddlewareChain(opts: GatewayOptions, deps: ChainDeps): Middleware[] {
-  const { baseDir, policy } = opts;
+  const { baseDir, policy, metrics } = opts;
   const matchTimeoutMs = policy.redact?.match_timeout_ms ?? 100;
   const userPatterns = compileUserRedactPatterns(policy, matchTimeoutMs);
   return [
-    createAuditMiddleware(baseDir, policy),
-    createKillSwitchMiddleware(baseDir),
+    // Metrics threaded through so `rea_audit_lines_appended_total` advances
+    // on every durable audit append and `rea_seconds_since_last_halt_check`
+    // reflects per-invocation cadence, not gateway uptime.
+    createAuditMiddleware(baseDir, policy, metrics),
+    createKillSwitchMiddleware(baseDir, metrics),
     createTierMiddleware(),
     createPolicyMiddleware(policy, undefined, baseDir),
     createBlockedPathsMiddleware(policy, baseDir),

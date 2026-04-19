@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { Writable } from 'node:stream';
-import { createLogger, resolveLogLevel } from './log.js';
+import { buildRegexRedactor, createLogger, resolveLogLevel } from './log.js';
+import { SECRET_PATTERNS } from './middleware/redact.js';
 
 /**
  * Collect every chunk written to a stream into an array of UTF-8 strings.
@@ -133,5 +134,125 @@ describe('logger — pretty mode (TTY)', () => {
     // A JSON line is parseable; a pretty line is not.
     const line = stream.chunks[0]!.trim();
     expect(() => JSON.parse(line)).not.toThrow();
+  });
+
+  it('pretty mode: a cyclic extra field is rendered as [unserializable] without dropping the record', () => {
+    const stream = new CaptureStream();
+    stream.isTTY = true;
+    const log = createLogger({ stream, level: 'info' });
+
+    type Cyclic = { self?: Cyclic };
+    const cyclic: Cyclic = {};
+    cyclic.self = cyclic;
+
+    expect(() =>
+      log.info({ event: 'weird', message: 'test', cyclic }),
+    ).not.toThrow();
+
+    // The record must still reach the stream. Previously the pretty-mode
+    // JSON.stringify on `cyclic` would throw and the whole line was dropped.
+    expect(stream.chunks.length).toBe(1);
+    const line = stream.chunks[0]!;
+    expect(line).toContain('[rea-serve]');
+    expect(line).toContain('weird');
+    expect(line).toContain('test');
+    // The unserializable field renders as the stable sentinel.
+    expect(line).toContain('[unserializable]');
+  });
+});
+
+describe('buildRegexRedactor', () => {
+  it('replaces SECRET_PATTERNS matches with [REDACTED]', () => {
+    const redact = buildRegexRedactor(SECRET_PATTERNS);
+
+    // Known shapes from SECRET_PATTERNS:
+    //   - AWS access key: AKIA + 16 uppercase alphanum
+    //   - GitHub personal access token: ghp_ + ≥36 alphanum
+    //   - Anthropic API key: sk-ant- + ≥32 alphanum
+    const aws = 'AKIA' + 'A'.repeat(16);
+    const gh = 'ghp_' + 'a'.repeat(40);
+    const ant = 'sk-ant-' + 'a'.repeat(40);
+
+    expect(redact(`leak: ${aws}`)).toBe('leak: [REDACTED]');
+    expect(redact(`leak: ${gh}`)).toBe('leak: [REDACTED]');
+    expect(redact(`leak: ${ant}`)).toBe('leak: [REDACTED]');
+  });
+
+  it('redacts multiple occurrences of the same pattern in one string', () => {
+    const redact = buildRegexRedactor(SECRET_PATTERNS);
+    const a = 'AKIA' + 'A'.repeat(16);
+    const b = 'AKIA' + 'B'.repeat(16);
+    const out = redact(`first ${a} and second ${b} keys`);
+    expect(out).toBe('first [REDACTED] and second [REDACTED] keys');
+  });
+
+  it('is idempotent: redacting an already-redacted string does not corrupt it', () => {
+    const redact = buildRegexRedactor(SECRET_PATTERNS);
+    const clean = 'nothing sensitive here';
+    expect(redact(clean)).toBe(clean);
+    const once = redact(`leak: AKIA${'A'.repeat(16)}`);
+    expect(redact(once)).toBe(once);
+  });
+
+  it('leaves non-secret strings unchanged', () => {
+    const redact = buildRegexRedactor(SECRET_PATTERNS);
+    expect(redact('connected to downstream slack')).toBe('connected to downstream slack');
+    expect(redact('autonomy_level=L1 profile=bst-internal')).toBe(
+      'autonomy_level=L1 profile=bst-internal',
+    );
+  });
+
+  it('logger integration: redacts a secret in a log field before serialization', () => {
+    const stream = new CaptureStream();
+    const log = createLogger({
+      stream,
+      mode: 'json',
+      level: 'info',
+      redactField: buildRegexRedactor(SECRET_PATTERNS),
+    });
+
+    const secret = 'AKIA' + 'A'.repeat(16);
+    log.error({
+      event: 'downstream.error',
+      message: `child process died with env AWS_KEY=${secret}`,
+    });
+
+    const parsed = JSON.parse(stream.chunks[0]!) as { message: string };
+    expect(parsed.message).not.toContain('AKIA');
+    expect(parsed.message).toContain('[REDACTED]');
+  });
+
+  it('logger integration: a redactor that throws falls back to [redactor-error] instead of crashing the logger', () => {
+    const stream = new CaptureStream();
+    const log = createLogger({
+      stream,
+      mode: 'json',
+      level: 'info',
+      redactField: () => {
+        throw new Error('boom');
+      },
+    });
+
+    expect(() => log.info({ event: 'e', message: 'normally-safe' })).not.toThrow();
+    const parsed = JSON.parse(stream.chunks[0]!) as { message: string };
+    expect(parsed.message).toBe('[redactor-error]');
+  });
+
+  it('logger integration: child() loggers inherit the parent redactor', () => {
+    const stream = new CaptureStream();
+    const root = createLogger({
+      stream,
+      mode: 'json',
+      level: 'info',
+      redactField: buildRegexRedactor(SECRET_PATTERNS),
+    });
+    const child = root.child({ session_id: 'abc-123' });
+
+    const secret = 'ghp_' + 'a'.repeat(40);
+    child.info({ event: 'x', message: `token=${secret}` });
+    const parsed = JSON.parse(stream.chunks[0]!) as { message: string; session_id: string };
+    expect(parsed.session_id).toBe('abc-123');
+    expect(parsed.message).toContain('[REDACTED]');
+    expect(parsed.message).not.toContain('ghp_');
   });
 });

@@ -38,7 +38,7 @@
  */
 
 import http from 'node:http';
-import type { AddressInfo } from 'node:net';
+import type { AddressInfo, Socket } from 'node:net';
 import type { Logger } from '../log.js';
 
 /**
@@ -47,8 +47,35 @@ import type { Logger } from '../log.js';
  */
 const LOOPBACK = '127.0.0.1';
 
+/**
+ * Strict allowlist of host values that `startMetricsServer` will accept.
+ * Anything else (0.0.0.0, ::, LAN IPs, hostnames) is rejected at the API
+ * boundary so no in-process caller can accidentally expose the
+ * unauthenticated /metrics surface to the network.
+ *
+ * SECURITY: Do NOT add non-loopback entries. If you need off-host scraping,
+ * tunnel via SSH or front 127.0.0.1 with a TLS-terminating reverse proxy.
+ */
+const ALLOWED_HOSTS: ReadonlySet<string> = new Set(['127.0.0.1', '::1']);
+
+/**
+ * Test-only symbol escape hatch. Unit tests that need to bind `localhost`
+ * (hostname resolution path) can pass this symbol as a key with the desired
+ * host value. External callers deserializing options from YAML/JSON/CLI
+ * cannot reach a `unique symbol` identity, so the bypass is effectively
+ * unreachable from the outside world.
+ */
+export const __TEST_HOST_OVERRIDE: unique symbol = Symbol('rea.metrics.__test_host_override');
+
 /** Path we serve. All other paths get 404. */
 const METRICS_PATH = '/metrics';
+
+/**
+ * Wall-clock budget for `server.close()`. Past this point any surviving
+ * keep-alive sockets are destroyed outright so shutdown never waits on a
+ * Prometheus scraper that is holding the connection open.
+ */
+const CLOSE_DEADLINE_MS = 2_000;
 
 /**
  * Encoded values for the circuit-breaker gauge. Keep numerically ordered by
@@ -209,8 +236,25 @@ export interface StartMetricsServerOptions {
   port: number;
   registry: MetricsRegistry;
   logger?: Logger;
-  /** Override hostname for tests that need to bind to ::1 / localhost. */
+  /**
+   * Override the bind host. Only loopback values (`127.0.0.1`, `::1`) are
+   * accepted; any other value — including `localhost`, `0.0.0.0`, `::`, or
+   * any LAN IP — throws a TypeError before a socket is opened. The
+   * /metrics endpoint has no auth, so binding a non-loopback interface
+   * would expose gateway internals to the network.
+   *
+   * Default: `127.0.0.1`.
+   */
   host?: string;
+  /**
+   * TEST-ONLY. Keyed by the {@link __TEST_HOST_OVERRIDE} symbol. When
+   * present, the value is used verbatim as the bind host and the public
+   * allowlist is bypassed. Not reachable via any deserialization path
+   * (YAML, JSON, CLI arg), so this cannot be smuggled in by an attacker.
+   *
+   * Production code paths must NEVER set this.
+   */
+  [__TEST_HOST_OVERRIDE]?: string;
 }
 
 /**
@@ -227,6 +271,12 @@ export interface StartMetricsServerOptions {
  */
 export function startMetricsServer(opts: StartMetricsServerOptions): Promise<MetricsServer> {
   return new Promise((resolve, reject) => {
+    // Track every live socket so shutdown can guarantee a bounded wall-clock.
+    // `server.close()` on its own only stops accepting NEW connections —
+    // keep-alive sessions (like a sticky Prometheus scraper) drain on their
+    // own schedule. We destroy tracked sockets past the deadline.
+    const sockets = new Set<Socket>();
+
     const server = http.createServer((req, res) => {
       // Defensive: if the url is missing or non-string we treat it as 404.
       const url = typeof req.url === 'string' ? req.url : '';
@@ -271,11 +321,40 @@ export function startMetricsServer(opts: StartMetricsServerOptions): Promise<Met
       }
     });
 
+    server.on('connection', (socket) => {
+      sockets.add(socket);
+      socket.once('close', () => {
+        sockets.delete(socket);
+      });
+    });
+
     server.on('error', (err) => {
       reject(err);
     });
 
-    const host = opts.host ?? LOOPBACK;
+    // Resolve the bind host with defense-in-depth:
+    //   1. Test-only symbol override wins (unreachable from config/CLI).
+    //   2. Otherwise the public `host` option is validated against a strict
+    //      loopback allowlist. Non-loopback values throw synchronously
+    //      BEFORE a socket opens — a caller bug cannot silently bind
+    //      0.0.0.0 and expose the unauthenticated endpoint.
+    //   3. Default when unset: 127.0.0.1.
+    const testHost = opts[__TEST_HOST_OVERRIDE];
+    let host: string;
+    if (typeof testHost === 'string') {
+      host = testHost;
+    } else if (opts.host === undefined) {
+      host = LOOPBACK;
+    } else if (ALLOWED_HOSTS.has(opts.host)) {
+      host = opts.host;
+    } else {
+      reject(
+        new TypeError(
+          `rea metrics: refusing to bind host "${opts.host}" — only loopback (127.0.0.1, ::1) is permitted; the endpoint has no auth`,
+        ),
+      );
+      return;
+    }
 
     server.listen(opts.port, host, () => {
       const addr = server.address();
@@ -293,7 +372,45 @@ export function startMetricsServer(opts: StartMetricsServerOptions): Promise<Met
         port: () => actualPort,
         close: (): Promise<void> =>
           new Promise((closeResolve) => {
-            server.close(() => closeResolve());
+            let settled = false;
+            const finish = (): void => {
+              if (settled) return;
+              settled = true;
+              clearTimeout(deadline);
+              closeResolve();
+            };
+
+            // Happy path: server.close() fires when all in-flight requests
+            // plus their underlying sockets have drained naturally.
+            server.close(() => finish());
+
+            // Fallback path: after CLOSE_DEADLINE_MS, destroy any surviving
+            // sockets so the close callback can fire. `closeIdleConnections`
+            // handles idle keep-alive sessions first (Node 18.2+), then we
+            // destroy whatever is left — including in-flight requests, which
+            // a stalled scraper could pin indefinitely otherwise.
+            const deadline = setTimeout(() => {
+              try {
+                (
+                  server as http.Server & { closeIdleConnections?: () => void }
+                ).closeIdleConnections?.();
+              } catch {
+                // Best-effort — method is optional on older Node.
+              }
+              for (const sock of sockets) {
+                try {
+                  sock.destroy();
+                } catch {
+                  // Sockets may already be closing.
+                }
+              }
+              sockets.clear();
+              // Some platforms don't deliver the close() callback after a
+              // forced socket shutdown — settle directly.
+              finish();
+            }, CLOSE_DEADLINE_MS);
+            // Don't let the timer hold the process open if shutdown beats it.
+            deadline.unref();
           }),
       });
     });

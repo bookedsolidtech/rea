@@ -11,6 +11,7 @@ import {
   withAuditLock,
 } from '../../audit/fs.js';
 import { maybeRotate } from '../audit/rotator.js';
+import type { MetricsRegistry } from '../observability/metrics.js';
 
 /**
  * Post-execution middleware: appends a hash-chained JSONL audit record.
@@ -35,7 +36,18 @@ import { maybeRotate } from '../audit/rotator.js';
  *     the rotation boundary. When no `audit.rotation` block is set in policy,
  *     rotation is a no-op — 0.2.x behavior is preserved.
  */
-export function createAuditMiddleware(baseDir: string, policy?: Policy): Middleware {
+export function createAuditMiddleware(
+  baseDir: string,
+  policy?: Policy,
+  /**
+   * Optional metrics registry. When supplied, the
+   * `rea_audit_lines_appended_total` counter is incremented on every
+   * successful append (post-fsync). When omitted, no metrics are emitted —
+   * keeps the middleware usable in unit tests that don't exercise the
+   * observability surface.
+   */
+  metrics?: MetricsRegistry,
+): Middleware {
   // REA writes to a single .rea/audit.jsonl file (not dated per-day files).
   const reaDir = path.join(baseDir, '.rea');
   const auditFile = path.join(reaDir, 'audit.jsonl');
@@ -130,6 +142,13 @@ export function createAuditMiddleware(baseDir: string, policy?: Policy): Middlew
             await fs.appendFile(auditFile, line);
           }
           await fsyncFile(auditFile);
+          // Only increment after fsync — a counter advance for a line that
+          // was never durable on disk would be a lie.
+          try {
+            metrics?.incAuditLines(1);
+          } catch {
+            // Metrics failures must never crash the gateway.
+          }
         });
       } catch (auditErr) {
         // SECURITY: Never crash the gateway on audit failure — log to stderr.

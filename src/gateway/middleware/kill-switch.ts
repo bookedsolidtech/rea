@@ -3,6 +3,7 @@ import { constants as fsConstants } from 'node:fs';
 import path from 'node:path';
 import { InvocationStatus } from '../../policy/types.js';
 import type { Middleware } from './chain.js';
+import type { MetricsRegistry } from '../observability/metrics.js';
 
 const MAX_HALT_READ_BYTES = 1024;
 const REA_DIR = '.rea';
@@ -31,9 +32,30 @@ const HALT_FILE = 'HALT';
  *   - The decision is recorded on `ctx.metadata.halt_decision` for audit and is
  *     never re-consulted by downstream middleware.
  */
-export function createKillSwitchMiddleware(baseDir: string): Middleware {
+export function createKillSwitchMiddleware(
+  baseDir: string,
+  /**
+   * Optional metrics registry. When supplied, every invocation marks the
+   * `rea_seconds_since_last_halt_check` gauge with a fresh timestamp so the
+   * exposed gauge reflects real per-call check cadence rather than the
+   * startup-time mark `rea serve` sets once. When omitted, no metric is
+   * emitted.
+   */
+  metrics?: MetricsRegistry,
+): Middleware {
   return async (ctx, next) => {
     const haltPath = path.join(baseDir, REA_DIR, HALT_FILE);
+
+    // Record the HALT-check attempt BEFORE we probe the filesystem so the
+    // gauge reflects "how long since we last looked", regardless of whether
+    // this check succeeds or fails. Fresh on every invocation; failure to
+    // update metrics must not crash the gateway.
+    try {
+      metrics?.markHaltCheck();
+    } catch {
+      // Metrics registry implementations are expected to be infallible,
+      // but we refuse to let them take down the chain in any case.
+    }
 
     let fh: fs.FileHandle | undefined;
     try {

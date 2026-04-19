@@ -40,6 +40,45 @@ import {
   reaPath,
 } from './utils.js';
 
+/**
+ * Tail window size for the audit summary. 64 KiB is more than enough to
+ * hold the last audit record (typical record ≪ 1 KiB) but small enough
+ * that reading it never spikes memory even on a multi-hundred-MB chain.
+ */
+const AUDIT_TAIL_WINDOW_BYTES = 64 * 1024;
+
+/**
+ * Strip every ASCII control code (C0 plus DEL) from a string. Defense
+ * against ANSI/OSC escape injection when a disk-controlled field reaches
+ * the operator's terminal via `console.log` in pretty mode.
+ *
+ * This is strict: every byte in 0x00-0x1F plus 0x7F is replaced with `?`.
+ * That drops CR/LF/TAB inside fields, which is fine — the fields this
+ * helper guards (halt_reason, session_id, started_at, last_timestamp,
+ * profile) are short identifiers or trimmed reasons, not multi-line
+ * narratives. Preserving TAB/LF would reopen the ESC+... attack surface
+ * because ANSI sequences begin with ESC (0x1B).
+ *
+ * SECURITY: Only pretty-print paths call this — JSON mode must not, since
+ * JSON.stringify already escapes control chars safely (`\u0000`), and a
+ * double-pass would corrupt legitimate audit values for downstream jq
+ * consumers.
+ *
+ * Exported so unit tests can assert the exact sanitization behavior.
+ */
+export function sanitizeForTerminal(value: string): string {
+  return value.replace(/[\x00-\x1f\x7f]/g, '?');
+}
+
+/**
+ * Null-safe wrapper for {@link sanitizeForTerminal} so call sites don't
+ * need a ternary at every disk-sourced field.
+ */
+function safePretty(value: string | null | undefined): string | null {
+  if (value === null || value === undefined) return null;
+  return sanitizeForTerminal(value);
+}
+
 export interface StatusOptions {
   json?: boolean | undefined;
 }
@@ -162,26 +201,107 @@ function probeServe(baseDir: string): ServeLiveness {
 }
 
 /**
- * Quickly compute audit stats without running the full verifier. We read the
- * file's last non-empty line and JSON-parse it; missing / corrupt / empty
- * files degrade to "present: false" or "lines: 0".
+ * Count newline bytes in the file via a streaming read. O(file-size) in
+ * wall-clock but O(chunk-size) in memory — production chains can reach
+ * hundreds of MB; we must never hold the full file in a Buffer.
+ */
+function countLinesStreaming(filePath: string): number {
+  let count = 0;
+  let fd: number | undefined;
+  try {
+    fd = fs.openSync(filePath, 'r');
+    const buf = Buffer.alloc(64 * 1024);
+    let bytesRead = 0;
+    while ((bytesRead = fs.readSync(fd, buf, 0, buf.length, null)) > 0) {
+      for (let i = 0; i < bytesRead; i++) {
+        if (buf[i] === 0x0a) count++;
+      }
+    }
+  } catch {
+    // Partial result is still useful; return whatever we counted.
+  } finally {
+    if (fd !== undefined) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        /* ignored */
+      }
+    }
+  }
+  return count;
+}
+
+/**
+ * Read up to `windowBytes` from the end of the file. Uses `pread` via a
+ * positioned `readSync` so we never materialize more than the window into
+ * memory, regardless of file size. The window is intentionally generous
+ * (default 64 KiB) vs. a typical ~200-byte audit record so the tail line
+ * is always fully represented.
+ */
+function readTailBytes(filePath: string, windowBytes: number): string {
+  let fd: number | undefined;
+  try {
+    fd = fs.openSync(filePath, 'r');
+    const stat = fs.fstatSync(fd);
+    if (stat.size === 0) return '';
+    const toRead = Math.min(windowBytes, stat.size);
+    const buf = Buffer.alloc(toRead);
+    const start = stat.size - toRead;
+    fs.readSync(fd, buf, 0, toRead, start);
+    return buf.toString('utf8');
+  } catch {
+    return '';
+  } finally {
+    if (fd !== undefined) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        /* ignored */
+      }
+    }
+  }
+}
+
+/**
+ * Quickly compute audit stats without running the full verifier. Memory
+ * posture:
+ *   - Line count is computed with a streaming newline scan (64 KiB chunk
+ *     buffer, regardless of total file size).
+ *   - `last_timestamp` + `tail_hash_looks_valid` come from a 64-KiB tail
+ *     window read via `readSync` at a positive offset — we never
+ *     materialize the full file.
+ *
+ * Missing / corrupt / empty files degrade to "present: false" or
+ * "lines: 0".
  */
 function summarizeAudit(baseDir: string): AuditStats {
   const p = reaPath(baseDir, AUDIT_FILE);
   if (!fs.existsSync(p)) {
     return { present: false, lines: 0, last_timestamp: null, tail_hash_looks_valid: false };
   }
-  let raw: string;
-  try {
-    raw = fs.readFileSync(p, 'utf8');
-  } catch {
-    return { present: true, lines: 0, last_timestamp: null, tail_hash_looks_valid: false };
+
+  // Streaming line count — O(file-size) CPU, O(chunk) memory.
+  const lineCount = countLinesStreaming(p);
+
+  // Tail-window scan for the last JSON record. If the last window isn't
+  // large enough to contain a full record (extremely rare: record >64 KiB),
+  // we degrade gracefully — the JSON parse just fails and we emit null.
+  const tailWindow = readTailBytes(p, AUDIT_TAIL_WINDOW_BYTES);
+  if (tailWindow.length === 0) {
+    return {
+      present: true,
+      lines: lineCount,
+      last_timestamp: null,
+      tail_hash_looks_valid: false,
+    };
   }
-  if (raw.length === 0) {
-    return { present: true, lines: 0, last_timestamp: null, tail_hash_looks_valid: false };
-  }
-  const lines = raw.split('\n').filter((line) => line.length > 0);
-  const tail = lines[lines.length - 1];
+
+  // Find the last complete line. The first line in the window may be a
+  // partial record (we sliced mid-line); ignore it by finding the last
+  // newline-terminated segment.
+  const windowLines = tailWindow.split('\n').filter((line) => line.length > 0);
+  const tail = windowLines[windowLines.length - 1];
+
   let last_timestamp: string | null = null;
   let tail_hash_looks_valid = false;
   if (tail !== undefined) {
@@ -195,7 +315,7 @@ function summarizeAudit(baseDir: string): AuditStats {
       // Broken last line — leave both as default.
     }
   }
-  return { present: true, lines: lines.length, last_timestamp, tail_hash_looks_valid };
+  return { present: true, lines: lineCount, last_timestamp, tail_hash_looks_valid };
 }
 
 /**
@@ -236,18 +356,36 @@ export function computeStatusPayload(baseDir: string): StatusPayload {
 }
 
 function printPretty(payload: StatusPayload): void {
+  // Every disk-sourced string field below flows through `safePretty`
+  // because ANSI/OSC escape sequences in HALT reason, session_id,
+  // timestamps, or the policy profile would execute in the operator's
+  // terminal. `base_dir` comes from `process.cwd()` (trusted — set by
+  // the OS), so it is NOT sanitized.
+  const p = payload.policy;
+  const s = payload.serve;
+  const a = payload.audit;
+
+  const profile = sanitizeForTerminal(p.profile);
+  const autonomy = sanitizeForTerminal(p.autonomy_level);
+  const haltReason = safePretty(p.halt_reason);
+
+  const sessionId = safePretty(s.session_id);
+  const startedAt = safePretty(s.started_at);
+
+  const lastTimestamp = safePretty(a.last_timestamp);
+
   console.log('');
   log(`Status — ${payload.base_dir}`);
   console.log('');
   console.log('  Policy');
-  console.log(`    Profile:            ${payload.policy.profile}`);
-  console.log(`    Autonomy:           ${payload.policy.autonomy_level}`);
-  console.log(`    Blocked paths:      ${payload.policy.blocked_paths_count} entries`);
-  console.log(`    Codex required:     ${payload.policy.codex_required ? 'yes' : 'no'}`);
-  if (payload.policy.halt_active) {
+  console.log(`    Profile:            ${profile}`);
+  console.log(`    Autonomy:           ${autonomy}`);
+  console.log(`    Blocked paths:      ${p.blocked_paths_count} entries`);
+  console.log(`    Codex required:     ${p.codex_required ? 'yes' : 'no'}`);
+  if (p.halt_active) {
     console.log(`    HALT:               ACTIVE`);
-    if (payload.policy.halt_reason !== null) {
-      console.log(`                        ${payload.policy.halt_reason}`);
+    if (haltReason !== null) {
+      console.log(`                        ${haltReason}`);
     }
   } else {
     console.log(`    HALT:               inactive`);
@@ -255,22 +393,22 @@ function printPretty(payload: StatusPayload): void {
   console.log('');
 
   console.log('  rea serve');
-  if (!payload.serve.running) {
-    if (payload.serve.pid !== null && payload.serve.stale) {
-      console.log(`    Running:            no (stale pidfile — pid ${payload.serve.pid})`);
+  if (!s.running) {
+    if (s.pid !== null && s.stale) {
+      console.log(`    Running:            no (stale pidfile — pid ${s.pid})`);
     } else {
       console.log(`    Running:            no`);
     }
   } else {
-    console.log(`    Running:            yes (pid ${payload.serve.pid ?? '?'})`);
-    if (payload.serve.session_id !== null) {
-      console.log(`    Session id:         ${payload.serve.session_id}`);
+    console.log(`    Running:            yes (pid ${s.pid ?? '?'})`);
+    if (sessionId !== null) {
+      console.log(`    Session id:         ${sessionId}`);
     }
-    if (payload.serve.started_at !== null) {
-      console.log(`    Started at:         ${payload.serve.started_at}`);
+    if (startedAt !== null) {
+      console.log(`    Started at:         ${startedAt}`);
     }
-    if (payload.serve.metrics_port !== null) {
-      console.log(`    Metrics endpoint:   http://127.0.0.1:${payload.serve.metrics_port}/metrics`);
+    if (s.metrics_port !== null) {
+      console.log(`    Metrics endpoint:   http://127.0.0.1:${s.metrics_port}/metrics`);
     } else {
       console.log(`    Metrics endpoint:   disabled (set REA_METRICS_PORT to enable)`);
     }
@@ -278,17 +416,17 @@ function printPretty(payload: StatusPayload): void {
   console.log('');
 
   console.log('  Audit log');
-  if (!payload.audit.present) {
+  if (!a.present) {
     console.log(`    State:              not yet written`);
-  } else if (payload.audit.lines === 0) {
+  } else if (a.lines === 0) {
     console.log(`    State:              empty`);
   } else {
-    console.log(`    Lines:              ${payload.audit.lines}`);
-    if (payload.audit.last_timestamp !== null) {
-      console.log(`    Last record at:     ${payload.audit.last_timestamp}`);
+    console.log(`    Lines:              ${a.lines}`);
+    if (lastTimestamp !== null) {
+      console.log(`    Last record at:     ${lastTimestamp}`);
     }
     console.log(
-      `    Tail hash:          ${payload.audit.tail_hash_looks_valid ? 'looks valid' : 'unexpected shape — run `rea audit verify`'}`,
+      `    Tail hash:          ${a.tail_hash_looks_valid ? 'looks valid' : 'unexpected shape — run `rea audit verify`'}`,
     );
   }
   console.log('');

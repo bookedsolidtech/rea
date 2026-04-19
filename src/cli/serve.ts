@@ -10,7 +10,8 @@ import {
   startMetricsServer,
   type MetricsServer,
 } from '../gateway/observability/metrics.js';
-import { createLogger, resolveLogLevel } from '../gateway/log.js';
+import { buildRegexRedactor, createLogger, resolveLogLevel } from '../gateway/log.js';
+import { SECRET_PATTERNS } from '../gateway/middleware/redact.js';
 import { currentSessionId } from '../gateway/session.js';
 import {
   HALT_FILE,
@@ -27,33 +28,104 @@ import {
 } from './utils.js';
 
 /**
- * Write the `.rea/serve.pid` breadcrumb so `rea status` can detect us.
- * This is NOT a supervisor lock (no stale-detection, no exclusive open) —
- * it's a read-only hint file. `rea status` independently checks
- * `kill(pid, 0)` before trusting it.
+ * State-file shape. `session_id` is the ownership key used by
+ * `cleanupStateIfOwned` during shutdown — a shutting-down instance
+ * that finds a different session_id in the file leaves it alone, so a
+ * later `rea serve` that has raced in and rewritten the breadcrumbs
+ * is never unexpectedly unlinked.
+ */
+interface ServeState {
+  session_id: string;
+  started_at: string;
+  metrics_port: number | null;
+}
+
+/**
+ * Atomic file write: stage to a per-pid temp name, then rename(2). The
+ * rename is atomic on POSIX within the same filesystem, so readers never
+ * see a half-written buffer. The unique-per-pid temp prefix ensures two
+ * overlapping `rea serve` processes don't clobber each other's stage
+ * files during the brief window between stage and rename.
+ */
+function writeFileAtomic(filePath: string, data: string): void {
+  const dir = path.dirname(filePath);
+  const base = path.basename(filePath);
+  const tmp = path.join(dir, `.${base}.${process.pid}.${process.hrtime.bigint()}.tmp`);
+  fs.writeFileSync(tmp, data, { encoding: 'utf8', mode: 0o600 });
+  try {
+    fs.renameSync(tmp, filePath);
+  } catch (e) {
+    try {
+      fs.unlinkSync(tmp);
+    } catch {
+      /* ignored */
+    }
+    throw e;
+  }
+}
+
+/**
+ * Write the `.rea/serve.pid` breadcrumb atomically. `rea status` reads
+ * it and independently `kill(pid, 0)`s before trusting liveness. Stamping
+ * with `process.pid` is what lets `cleanupPidIfOwned` refuse to unlink a
+ * breadcrumb that a newer instance has already claimed.
  */
 function writePidfile(baseDir: string): string {
   const reaDir = path.join(baseDir, REA_DIR);
   if (!fs.existsSync(reaDir)) fs.mkdirSync(reaDir, { recursive: true });
   const pidPath = reaPath(baseDir, SERVE_PID_FILE);
-  fs.writeFileSync(pidPath, String(process.pid), 'utf8');
+  writeFileAtomic(pidPath, String(process.pid));
   return pidPath;
 }
 
-function writeStateFile(
-  baseDir: string,
-  state: { session_id: string; started_at: string; metrics_port: number | null },
-): string {
+function writeStateFile(baseDir: string, state: ServeState): string {
   const p = reaPath(baseDir, SERVE_STATE_FILE);
-  fs.writeFileSync(p, JSON.stringify(state, null, 2) + '\n', 'utf8');
+  writeFileAtomic(p, JSON.stringify(state, null, 2) + '\n');
   return p;
 }
 
-function removeIfExists(filePath: string): void {
+/**
+ * Remove the pidfile ONLY if it still carries this process's pid. A
+ * shutting-down instance that finds a newer pid leaves the breadcrumb
+ * intact so the newer instance's `rea status` users still see "running".
+ * Any read/parse error is treated as "not mine" — we never unlink a file
+ * we cannot prove we own.
+ */
+function cleanupPidIfOwned(pidPath: string): void {
   try {
-    fs.unlinkSync(filePath);
+    const raw = fs.readFileSync(pidPath, 'utf8').trim();
+    const pid = Number.parseInt(raw, 10);
+    if (pid === process.pid) {
+      try {
+        fs.unlinkSync(pidPath);
+      } catch {
+        /* already gone */
+      }
+    }
   } catch {
-    // Best-effort cleanup — file may already be gone (SIGKILL, double-unlink).
+    // Missing, unreadable, mid-rename — nothing to clean up safely.
+  }
+}
+
+/**
+ * Remove the state file ONLY if its `session_id` matches ours. Keyed on
+ * session id (not pid) because the state payload already carries the
+ * session; reusing that avoids a second cross-file lookup and keeps the
+ * ownership signal local to the file being deleted.
+ */
+function cleanupStateIfOwned(statePath: string, ownSessionId: string): void {
+  try {
+    const raw = fs.readFileSync(statePath, 'utf8');
+    const parsed = JSON.parse(raw) as Partial<ServeState>;
+    if (parsed.session_id === ownSessionId) {
+      try {
+        fs.unlinkSync(statePath);
+      } catch {
+        /* already gone */
+      }
+    }
+  } catch {
+    // Missing, unreadable, mid-rename — leave alone.
   }
 }
 
@@ -68,6 +140,14 @@ function removeIfExists(filePath: string): void {
  *   - Writes a pidfile + session state breadcrumb for `rea status`.
  *   - Boots a loopback `/metrics` HTTP endpoint when `REA_METRICS_PORT` is set.
  *   - Emits structured log records through the gateway logger.
+ *
+ * Breadcrumb race posture:
+ *   - Writes are atomic (`writeFileSync` → `rename(2)`) so readers never see
+ *     a half-written file.
+ *   - Shutdown cleanup is ownership-aware: we only unlink `serve.pid` if its
+ *     pid matches ours, and only unlink `serve.state.json` if its session_id
+ *     matches ours. This prevents a second overlapping `rea serve` from
+ *     losing its breadcrumbs to the first instance's SIGTERM path.
  *
  * Signals: SIGTERM and SIGINT both trigger a graceful shutdown. We do NOT exit
  * on uncaughtException — that path is owned by `src/cli/index.ts`. If the
@@ -108,9 +188,15 @@ export async function runServe(): Promise<void> {
 
   // ── Observability setup (G5) ─────────────────────────────────────────────
   const sessionId = currentSessionId();
+  // Build a log-field redactor from the same SECRET_PATTERNS used by the
+  // redact middleware. Without this, raw downstream error messages
+  // (which can carry env var names, argv fragments, or file paths with
+  // credential material) reach stderr verbatim.
+  const logRedactor = buildRegexRedactor(SECRET_PATTERNS);
   const logger = createLogger({
     level: resolveLogLevel(process.env['REA_LOG_LEVEL']),
     base: { session_id: sessionId },
+    redactField: logRedactor,
   });
 
   const metricsRegistry = new MetricsRegistry();
@@ -196,10 +282,12 @@ export async function runServe(): Promise<void> {
         // Best-effort
       }
     }
-    // Remove the breadcrumbs LAST so external observers (rea status) can
-    // still see "running" right up until the gateway is really gone.
-    removeIfExists(pidPath);
-    removeIfExists(statePath);
+    // Remove the breadcrumbs LAST and ONLY if we still own them. Another
+    // `rea serve` in the same baseDir may have rewritten them — in that
+    // case the newer instance's `rea status` users should keep seeing
+    // "running".
+    cleanupPidIfOwned(pidPath);
+    cleanupStateIfOwned(statePath, sessionId);
     process.exit(0);
   };
   process.on('SIGTERM', () => void shutdown('SIGTERM'));
@@ -213,9 +301,10 @@ export async function runServe(): Promise<void> {
   } catch (e) {
     err(`gateway start failed: ${e instanceof Error ? e.message : e}`);
     // Clean up breadcrumbs before exit — a failed startup should not leave
-    // a stale pidfile claiming we're up.
-    removeIfExists(pidPath);
-    removeIfExists(statePath);
+    // a stale pidfile claiming we're up. Ownership-aware so we don't nuke
+    // a sibling's breadcrumbs that raced in during our failing startup.
+    cleanupPidIfOwned(pidPath);
+    cleanupStateIfOwned(statePath, sessionId);
     if (metricsServer !== undefined) {
       try {
         await metricsServer.close();
@@ -226,3 +315,12 @@ export async function runServe(): Promise<void> {
     process.exit(1);
   }
 }
+
+// Exported for unit testing (the serve entry point itself is process-global).
+export const __TEST_INTERNALS = {
+  writeFileAtomic,
+  writePidfile,
+  writeStateFile,
+  cleanupPidIfOwned,
+  cleanupStateIfOwned,
+};
