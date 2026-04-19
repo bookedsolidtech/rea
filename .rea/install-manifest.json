@@ -1,8 +1,8 @@
 {
-  "version": "0.1.0",
+  "version": "0.2.0",
   "profile": "unknown",
   "installed_at": "2026-04-18T21:31:41.169Z",
-  "upgraded_at": "2026-04-18T21:59:45.400Z",
+  "upgraded_at": "2026-04-18T22:33:21.010Z",
   "files": [
     {
       "path": ".claude/hooks/_lib/common.sh",
@@ -66,7 +66,7 @@
     },
     {
       "path": ".claude/hooks/push-review-gate.sh",
-      "sha256": "7c3c7418adc4172a12beea7e5c10f5745485c50d7ff6a0dc28f938b0516c4282",
+      "sha256": "767a8f6aa01fcf92b04a29dd03cc380667d8296c22975784d53adeb19e9d7bdc",
       "source": "hook"
     },
     {
@@ -166,7 +166,7 @@
     },
     {
       "path": ".husky/pre-push",
-      "sha256": "3561118bca682e98fb412c72a7a8093520e274d7ef572b9dbfeca186e77be3ca",
+      "sha256": "5014c585c4af5aa0425fde36441711fa55833e03b81967c45045c5bd716b821e",
       "source": "husky"
     },
     {
