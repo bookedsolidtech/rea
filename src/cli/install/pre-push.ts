@@ -467,10 +467,13 @@ function hasVariableGateInvocation(content: string): boolean {
       let tail = afterVar
         .replace(/\d*[<>]&\d*-?/g, ' ')
         .replace(/&>>?/g, ' ');
+      // R14 F1: reject any pipe (single `|` or `||`) — the pipeline's
+      // exit is the LAST command's, not the gate's.
+      if (/\|/.test(tail)) continue;
       if (execLed) {
-        if (/\|\||&&/.test(tail) || /&\s*$/.test(tail)) continue;
+        if (/&&/.test(tail) || /&\s*$/.test(tail)) continue;
       } else {
-        if (/\|\||&&|;/.test(tail) || /&\s*$/.test(tail)) continue;
+        if (/&&|;/.test(tail) || /&\s*$/.test(tail)) continue;
       }
       return true;
     }
@@ -487,6 +490,16 @@ function hasVariableGateInvocation(content: string): boolean {
  *                   invocations — exec REPLACES the shell, so anything
  *                   after `exec gate "$@" ;` is dead code and the `;` is
  *                   harmless).
+ *   - `|` / `|&`  — pipeline. Under POSIX `/bin/sh`, a pipeline's exit
+ *                   status is that of the LAST command in the pipe, so
+ *                   `gate "$@" | cat` returns `cat`'s status (always 0),
+ *                   silently dropping gate failures. Bash's
+ *                   `pipefail` option fixes this, but we cannot assume
+ *                   `set -o pipefail` is in effect (it is not POSIX and
+ *                   the shipped gate does not set it for consumers).
+ *                   Applies to both exec-led and non-exec-led lines —
+ *                   `exec gate | cat` is still a pipe whose exit comes
+ *                   from the right-hand side.
  *   - trailing `&` — background job (line exits 0 regardless of gate)
  *
  * Not swallowing:
@@ -498,6 +511,8 @@ function hasVariableGateInvocation(content: string): boolean {
  *
  * R10 F2: stripped fd duplications before checking `&`.
  * R12 F2: treat a trailing `;` as harmless when the line begins with `exec`.
+ * R14 F1: reject single `|` (pipe) — the pipeline's last-command exit is
+ *   never the gate's, so the gate's failure is silently dropped.
  */
 function hasContinuationOperator(line: string): boolean {
   const gateIdx = line.indexOf(GATE_DELEGATION_TOKEN);
@@ -505,13 +520,20 @@ function hasContinuationOperator(line: string): boolean {
   let tail = line.slice(gateIdx + GATE_DELEGATION_TOKEN.length);
   tail = tail.replace(/\d*[<>]&\d*-?/g, ' ');
   tail = tail.replace(/&>>?/g, ' ');
+  // `\|` matches any pipe character, which covers both `||` (logical OR)
+  // and a single `|` (pipeline). Both swallow the gate's exit status:
+  // `||` masks via fallback-chaining, `|` masks via POSIX pipeline
+  // last-command semantics. Listing them together means we never have to
+  // disambiguate `|` from `||` — either is a rejection.
+  const PIPE_OR_LOGICAL_OR = /\|/;
+  if (PIPE_OR_LOGICAL_OR.test(tail)) return true;
   const execLed = /^\s*exec\b/.test(line);
   if (execLed) {
-    // Under exec, `;` and anything after it is unreachable. `||` and `&&`
-    // still apply to exec-failure (command-not-found) and DO swallow.
-    return /\|\||&&/.test(tail) || /&\s*$/.test(tail);
+    // Under exec, `;` and anything after it is unreachable. `&&` still
+    // applies to exec-failure (command-not-found) and DOES swallow.
+    return /&&/.test(tail) || /&\s*$/.test(tail);
   }
-  return /\|\||&&|;/.test(tail) || /&\s*$/.test(tail);
+  return /&&|;/.test(tail) || /&\s*$/.test(tail);
 }
 
 /**
@@ -917,6 +939,29 @@ async function cleanupStaleTempFiles(dst: string): Promise<void> {
 }
 
 /**
+ * Compare-and-swap guard for the refresh write path. Captures the
+ * identity-sensitive stat fields of a rea-managed destination immediately
+ * after the safety re-check so that `writeExecutable` can verify the file
+ * has not been swapped out before the final rename. Set `kind: 'absent'`
+ * for the install (non-refresh) path — no dst file exists at re-check.
+ *
+ * R14 F2: the refresh path used to blind-rename onto `dst`, so a consumer
+ * editor or another installer that replaced the file between classify and
+ * write would be silently stomped. `dev+ino+mtimeMs+size` is sufficient to
+ * detect any common replacement (rename, remove+recreate, in-place rewrite);
+ * the irreducible window is the stat→rename gap, which is microseconds.
+ */
+type RefreshGuard =
+  | { kind: 'absent' }
+  | {
+      kind: 'present';
+      dev: number;
+      ino: number;
+      mtimeMs: number;
+      size: number;
+    };
+
+/**
  * Atomically write `content` to `dst` with executable bits set.
  *
  * When `exclusive` is true (new installs): uses `copyFile(COPYFILE_EXCL)`
@@ -926,13 +971,61 @@ async function cleanupStaleTempFiles(dst: string): Promise<void> {
  * `dst` after the caller's re-check.
  *
  * When `exclusive` is false (refreshes): uses `rename()` — the destination
- * is expected to exist and be rea-managed; falls back to `copyFile()` on
- * EXDEV (cross-device rename).
+ * is expected to exist and be rea-managed. Immediately before the rename,
+ * re-stats `dst` and verifies (dev, ino, mtimeMs, size) match `guard`.
+ * Mismatch throws an error with `code = 'REA_REFRESH_RACE'` so the caller
+ * can downgrade to a foreign-pre-push skip instead of stomping an
+ * unexpected replacement. Falls back to `copyFile()` on EXDEV with the
+ * same guard applied against a stat taken just before the copy.
+ *
+ * R14 F2: the previous implementation used `rename(tmp, dst)` without any
+ * final destination check. Even with the lock-scoped re-check upstream, a
+ * concurrent writer outside the lock (Husky, a user editor, another tool)
+ * could rewrite `dst` between the re-check and the rename; the blind
+ * rename would silently replace their hook with ours. The guard closes
+ * every detectable race window short of the kernel-level atomic swap
+ * (renameat2 RENAME_EXCHANGE) which Node does not expose.
  */
+class RefreshRaceError extends Error {
+  code = 'REA_REFRESH_RACE' as const;
+  constructor(dst: string) {
+    super(
+      `refresh aborted: ${dst} was modified by another writer between ` +
+        `the safety re-check and the rename. Re-run \`rea init\` to re-evaluate.`,
+    );
+    this.name = 'RefreshRaceError';
+  }
+}
+
+async function verifyRefreshGuard(
+  dst: string,
+  guard: RefreshGuard,
+): Promise<void> {
+  if (guard.kind === 'absent') return;
+  let current: fs.Stats;
+  try {
+    current = await fsPromises.stat(dst);
+  } catch {
+    // File vanished — a consumer removed it. Aborting the refresh is
+    // safer than re-creating a file where one no longer exists; the user
+    // can re-run `rea init` to land a fresh install.
+    throw new RefreshRaceError(dst);
+  }
+  if (
+    current.dev !== guard.dev ||
+    current.ino !== guard.ino ||
+    current.mtimeMs !== guard.mtimeMs ||
+    current.size !== guard.size
+  ) {
+    throw new RefreshRaceError(dst);
+  }
+}
+
 async function writeExecutable(
   dst: string,
   content: string,
   exclusive: boolean,
+  guard: RefreshGuard = { kind: 'absent' },
 ): Promise<void> {
   await fsPromises.mkdir(path.dirname(dst), { recursive: true });
   // Random suffix + `wx` open flag: PID was observed to collide during
@@ -961,14 +1054,19 @@ async function writeExecutable(
       await fsPromises.unlink(tmp).catch(() => undefined);
       return;
     }
-    // Refresh: rename is atomic on the same filesystem.
+    // Refresh: verify dst still matches the identity captured at the
+    // re-check before the atomic replace. Rename is atomic on the same
+    // filesystem.
+    await verifyRefreshGuard(dst, guard);
     try {
       await fsPromises.rename(tmp, dst);
       return;
     } catch (renameErr) {
       const e = renameErr as NodeJS.ErrnoException;
       if (e.code !== 'EXDEV') throw renameErr;
-      // Cross-device mount: fall back to copy then unlink.
+      // Cross-device mount: verify again, then fall back to copy+unlink.
+      // The extra verify is cheap and narrows the window further.
+      await verifyRefreshGuard(dst, guard);
       await fsPromises.copyFile(tmp, dst);
       await fsPromises.unlink(tmp).catch(() => undefined);
     }
@@ -1217,6 +1315,41 @@ export async function installPrePushFallback(
           }
         }
 
+        // R14 F2: capture the identity of the destination as it stood at
+        // re-check time. `writeExecutable` will re-verify right before the
+        // rename so a replacement landed by a concurrent writer (outside
+        // our install lock) cannot be silently stomped. Only refreshes
+        // need a guard; installs use `COPYFILE_EXCL` which is inherently
+        // race-safe against new files appearing at `dst`.
+        let refreshGuard: RefreshGuard = { kind: 'absent' };
+        if (decision.action === 'refresh') {
+          try {
+            const s = await fsPromises.stat(decision.hookPath);
+            refreshGuard = {
+              kind: 'present',
+              dev: s.dev,
+              ino: s.ino,
+              mtimeMs: s.mtimeMs,
+              size: s.size,
+            };
+          } catch {
+            // The file vanished between reCheck and this stat. Abort the
+            // refresh — a missing file at refresh time means something
+            // outside our control removed it; re-running `rea init` will
+            // re-install fresh.
+            result.warnings.push(
+              `pre-push hook at ${decision.hookPath} disappeared before refresh — ` +
+                `re-run \`rea init\` to re-install.`,
+            );
+            result.decision = {
+              action: 'skip',
+              reason: 'foreign-pre-push',
+              hookPath: decision.hookPath,
+            };
+            return result;
+          }
+        }
+
         if (options.onBeforeWrite !== undefined) {
           await options.onBeforeWrite(decision.hookPath);
         }
@@ -1226,6 +1359,7 @@ export async function installPrePushFallback(
             decision.hookPath,
             fallbackHookContent(),
             decision.action === 'install',
+            refreshGuard,
           );
         } catch (writeErr) {
           const e = writeErr as NodeJS.ErrnoException;
@@ -1235,6 +1369,23 @@ export async function installPrePushFallback(
             result.warnings.push(
               `pre-push hook appeared at ${decision.hookPath} after the safety check — ` +
                 `leaving it untouched. Re-run \`rea init\` to re-evaluate.`,
+            );
+            result.decision = {
+              action: 'skip',
+              reason: 'foreign-pre-push',
+              hookPath: decision.hookPath,
+            };
+            return result;
+          }
+          if (e.code === 'REA_REFRESH_RACE') {
+            // R14 F2: the destination changed between the safety re-check
+            // and the rename — a consumer or another installer landed a
+            // file at the hook path outside our advisory lock. Fail
+            // closed: do not stomp the replacement. The user can re-run
+            // `rea init` to re-evaluate.
+            result.warnings.push(
+              `pre-push hook at ${decision.hookPath} was modified during refresh — ` +
+                `leaving the current file in place. Re-run \`rea init\` to re-evaluate.`,
             );
             result.decision = {
               action: 'skip',

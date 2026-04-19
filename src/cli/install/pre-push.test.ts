@@ -675,6 +675,84 @@ describe('installPrePushFallback — concurrency + temp-file hygiene', () => {
     expect(after).toBe(huskyBody);
   });
 
+  it('R14 F2: refresh — consumer replaces rea-managed hook between re-check and write → clean skip, original replacement preserved', async () => {
+    // The advisory lock only serializes rea installers. Husky, a user
+    // editor, or a concurrent tool outside the lock can swap the hook
+    // between our classify+reCheck pass and the rename. The refresh
+    // guard captures (dev, ino, mtimeMs, size) at reCheck and re-verifies
+    // immediately before rename. On mismatch the refresh aborts with a
+    // foreign-pre-push skip — the intruder's content is preserved.
+    await initGitRepo(dir);
+    const hooksDir = path.join(dir, '.git', 'hooks');
+    await fs.mkdir(hooksDir, { recursive: true });
+    const hookPath = path.join(hooksDir, 'pre-push');
+
+    // Seed a rea-managed fallback so the second call lands on refresh.
+    const first = await installPrePushFallback(dir);
+    expect(first.decision.action).toBe('install');
+
+    const racedBody = '#!/bin/sh\n# raced consumer hook — not ours\nexit 0\n';
+    const result = await installPrePushFallback(dir, {
+      onBeforeWrite: async (p) => {
+        // Classification + reCheck have already passed. Simulate another
+        // writer replacing the file AFTER we captured the refresh guard
+        // but BEFORE our verify-and-rename. Remove first so the new
+        // file has a different inode (mtime alone can collide within the
+        // same ms on fast filesystems).
+        await fs.unlink(p);
+        await fs.writeFile(p, racedBody, { mode: 0o755 });
+      },
+    });
+
+    expect(result.written).toBeUndefined();
+    expect(result.decision.action).toBe('skip');
+    if (result.decision.action === 'skip') {
+      expect(result.decision.reason).toBe('foreign-pre-push');
+    }
+    expect(
+      result.warnings.some((w) => w.includes('modified during refresh')),
+    ).toBe(true);
+
+    // Most important assertion: the raced content is still on disk; the
+    // fallback did NOT stomp it.
+    const after = await fs.readFile(hookPath, 'utf8');
+    expect(after).toBe(racedBody);
+  });
+
+  it('R14 F2: refresh — destination vanishes before refresh capture → clean skip', async () => {
+    // If the file has already been removed between reCheck (rea-managed)
+    // and the refresh-guard stat, we must not re-create blindly; the user
+    // may have deliberately removed the hook.
+    await initGitRepo(dir);
+    const hooksDir = path.join(dir, '.git', 'hooks');
+    await fs.mkdir(hooksDir, { recursive: true });
+    const hookPath = path.join(hooksDir, 'pre-push');
+
+    const first = await installPrePushFallback(dir);
+    expect(first.decision.action).toBe('install');
+
+    const result = await installPrePushFallback(dir, {
+      onBeforeReresolve: async (p) => {
+        // Do nothing yet — reCheck still sees the file.
+        void p;
+      },
+      onBeforeWrite: async (p) => {
+        // After reCheck + refresh-guard capture, delete the file so the
+        // final verify fails via ENOENT.
+        await fs.unlink(p);
+      },
+    });
+
+    expect(result.written).toBeUndefined();
+    expect(result.decision.action).toBe('skip');
+    if (result.decision.action === 'skip') {
+      expect(result.decision.reason).toBe('foreign-pre-push');
+    }
+    // The file is absent because the race partner removed it. The refresh
+    // did NOT race-restore our fallback over the deleted state.
+    await expect(fs.stat(hookPath)).rejects.toThrow();
+  });
+
   it('race: file appears between re-check and write (EEXIST from link) → clean skip', async () => {
     // Codex finding 2 — final window: after the safety re-check passes,
     // but before writeExecutable completes, another process creates the
@@ -1501,6 +1579,53 @@ describe('referencesReviewGate — depth-tracking exit detection (Finding 2)', (
     const content = [
       '#!/bin/sh',
       'sh .claude/hooks/push-review-gate.sh "$@"; /bin/true',
+    ].join('\n');
+    expect(referencesReviewGate(content)).toBe(false);
+  });
+
+  // R14 F1: a pipeline's exit is the last command's, not the gate's.
+  // Any `|` after the gate path silently drops the gate's failure.
+
+  it('R14 F1: gate invocation piped to `cat` (non-exec): returns false', () => {
+    const content = [
+      '#!/bin/sh',
+      'sh .claude/hooks/push-review-gate.sh "$@" | cat',
+    ].join('\n');
+    expect(referencesReviewGate(content)).toBe(false);
+  });
+
+  it('R14 F1: gate invocation piped to `tee` (non-exec): returns false', () => {
+    const content = [
+      '#!/bin/sh',
+      'sh .claude/hooks/push-review-gate.sh "$@" | tee -a /tmp/push.log',
+    ].join('\n');
+    expect(referencesReviewGate(content)).toBe(false);
+  });
+
+  it('R14 F1: `exec gate | cat` (exec-led pipeline): returns false', () => {
+    // Under POSIX sh, `exec cmd | other` runs `cmd` in a subshell and the
+    // pipeline's last-command exit still applies. Even the exec keyword
+    // does NOT make a pipe safe — reject it.
+    const content = [
+      '#!/bin/sh',
+      'exec .claude/hooks/push-review-gate.sh "$@" | cat',
+    ].join('\n');
+    expect(referencesReviewGate(content)).toBe(false);
+  });
+
+  it('R14 F1: bare gate invocation piped: returns false', () => {
+    const content = [
+      '#!/bin/sh',
+      '.claude/hooks/push-review-gate.sh "$@" | logger',
+    ].join('\n');
+    expect(referencesReviewGate(content)).toBe(false);
+  });
+
+  it('R14 F1: variable-indirected gate piped: returns false', () => {
+    const content = [
+      '#!/bin/sh',
+      'GATE=.claude/hooks/push-review-gate.sh',
+      'exec "$GATE" "$@" | cat',
     ].join('\n');
     expect(referencesReviewGate(content)).toBe(false);
   });
