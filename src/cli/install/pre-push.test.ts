@@ -959,6 +959,21 @@ describe('isReaManagedHuskyGate — Husky gate marker detection (Finding 2)', ()
     ).toBe(true);
   });
 
+  it('R9 F1: both markers present but only exit 0 as executable content: returns false', () => {
+    // Codex R9 finding: a stub with only two marker comments + `exit 0` must
+    // not be classified as a genuine gate. hasSubstantiveContent requires at
+    // least one non-comment, non-blank, non-trivial-exit line.
+    expect(
+      isReaManagedHuskyGate(`#!/bin/sh\n${HUSKY_GATE_MARKER}\n${HUSKY_GATE_BODY_MARKER}\nexit 0\n`),
+    ).toBe(false);
+  });
+
+  it('R9 F1: both markers + only return 0 as executable content: returns false', () => {
+    expect(
+      isReaManagedHuskyGate(`#!/bin/sh\n${HUSKY_GATE_MARKER}\n${HUSKY_GATE_BODY_MARKER}\nreturn 0\n`),
+    ).toBe(false);
+  });
+
   it('marker at line 2 with body marker in non-comment form: returns true', () => {
     expect(
       isReaManagedHuskyGate(

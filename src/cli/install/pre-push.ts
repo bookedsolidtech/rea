@@ -163,6 +163,20 @@ export function isReaManagedHuskyGate(content: string): boolean {
   const lines = content.split(/\r?\n/);
   if (lines.length < 2 || lines[1] !== HUSKY_GATE_MARKER) return false;
 
+  // A genuine gate must contain substantive executable content — at least one
+  // non-comment, non-blank, non-trivial-exit line. A stub with only marker
+  // comments + `exit 0` must not pass (prevents R9 spoof vector where an
+  // attacker plants the two markers without any actual governance logic).
+  const hasSubstantiveContent = lines.some((raw) => {
+    const t = raw.trimStart();
+    return (
+      t.length > 0 &&
+      !t.startsWith('#') &&
+      !/^(exit|return)(\s+\d+)?\s*$/.test(t)
+    );
+  });
+  if (!hasSubstantiveContent) return false;
+
   // Fresh install: body marker present — definitive two-factor match.
   if (content.includes(HUSKY_GATE_BODY_MARKER)) return true;
 
@@ -688,12 +702,15 @@ async function cleanupStaleTempFiles(dst: string): Promise<void> {
 /**
  * Atomically write `content` to `dst` with executable bits set.
  *
- * When `exclusive` is true (new installs): uses `link(tmp, dst)` so the
- * operation fails with EEXIST if a file appeared at `dst` after the caller's
- * re-check. `rename()` on POSIX would silently clobber that file.
+ * When `exclusive` is true (new installs): uses `copyFile(COPYFILE_EXCL)`
+ * which opens dst with O_CREAT|O_EXCL — atomic and works on network
+ * filesystems and cross-device mounts (unlike `link()` which fails with
+ * EXDEV/EPERM/ENOSYS on those). Fails with EEXIST if a file appeared at
+ * `dst` after the caller's re-check.
  *
  * When `exclusive` is false (refreshes): uses `rename()` — the destination
- * is expected to exist and be rea-managed; the caller already verified this.
+ * is expected to exist and be rea-managed; falls back to `copyFile()` on
+ * EXDEV (cross-device rename).
  */
 async function writeExecutable(
   dst: string,
@@ -713,28 +730,35 @@ async function writeExecutable(
   try {
     await handle.writeFile(content, 'utf8');
     // Some platforms ignore the open-time mode argument; force the bits
-    // again before rename for belt-and-suspenders.
+    // again before finalize for belt-and-suspenders.
     await handle.chmod(0o755);
   } finally {
     await handle.close().catch(() => undefined);
   }
-  let finalizeErr: unknown;
   try {
     if (exclusive) {
-      // link() fails with EEXIST if dst was created after our safety re-check.
-      // After a successful link both paths point to the same inode; unlink
-      // the tmp name so only dst remains.
-      await fsPromises.link(tmp, dst);
+      // COPYFILE_EXCL opens dst with O_CREAT|O_EXCL — fails with EEXIST if
+      // dst appeared after our safety re-check; works on network FS and
+      // cross-device mounts unlike link().
+      await fsPromises.copyFile(tmp, dst, fs.constants.COPYFILE_EXCL);
       await fsPromises.unlink(tmp).catch(() => undefined);
       return;
     }
-    await fsPromises.rename(tmp, dst);
-    return;
+    // Refresh: rename is atomic on the same filesystem.
+    try {
+      await fsPromises.rename(tmp, dst);
+      return;
+    } catch (renameErr) {
+      const e = renameErr as NodeJS.ErrnoException;
+      if (e.code !== 'EXDEV') throw renameErr;
+      // Cross-device mount: fall back to copy then unlink.
+      await fsPromises.copyFile(tmp, dst);
+      await fsPromises.unlink(tmp).catch(() => undefined);
+    }
   } catch (err) {
-    finalizeErr = err;
+    await fsPromises.unlink(tmp).catch(() => undefined);
+    throw err;
   }
-  await fsPromises.unlink(tmp).catch(() => undefined);
-  throw finalizeErr;
 }
 
 /**
@@ -983,24 +1007,11 @@ export async function installPrePushFallback(
         } catch (writeErr) {
           const e = writeErr as NodeJS.ErrnoException;
           if (e.code === 'EEXIST') {
-            // A file appeared between the re-check and the link(). Bail safely.
+            // A file appeared between the re-check and the copyFile(EXCL).
+            // Bail safely.
             result.warnings.push(
               `pre-push hook appeared at ${decision.hookPath} after the safety check — ` +
                 `leaving it untouched. Re-run \`rea init\` to re-evaluate.`,
-            );
-            result.decision = {
-              action: 'skip',
-              reason: 'foreign-pre-push',
-              hookPath: decision.hookPath,
-            };
-            return result;
-          }
-          if (e.code === 'EXDEV' || e.code === 'EPERM' || e.code === 'ENOSYS') {
-            // link() not supported (cross-device mount, network FS, old kernel).
-            // Degrade gracefully rather than surfacing an opaque FS error.
-            result.warnings.push(
-              `pre-push hook at ${decision.hookPath} could not be written (${e.code}) — ` +
-                `try running on a local filesystem or use \`rea init --force\`.`,
             );
             result.decision = {
               action: 'skip',
