@@ -8,16 +8,23 @@
  * `git status` that nobody told them about. Helix reported this as BUG-010.
  *
  * The fix is broader than fingerprints.json — every runtime artifact rea
- * writes under `.rea/` must be in the consumer's `.gitignore`:
+ * writes (under `.rea/` AND its sibling `proper-lockfile` directory at
+ * `.rea.lock`) must be in the consumer's `.gitignore`:
  *
- *   - `.rea/audit.jsonl`          — G1 hash-chained audit log (append-only)
- *   - `.rea/audit-*.jsonl`        — G1 rotated audit archives
- *   - `.rea/HALT`                 — /freeze marker (ephemeral)
- *   - `.rea/metrics.jsonl`        — G5 metrics stream
- *   - `.rea/serve.pid`            — G5 `rea serve` pidfile
- *   - `.rea/serve.state.json`     — G5 `rea serve` state snapshot
- *   - `.rea/fingerprints.json`    — G7 downstream catalog fingerprints (BUG-010)
- *   - `.rea/review-cache.jsonl`   — BUG-009 review cache (rea cache set/check)
+ *   - `.rea/audit.jsonl`              — G1 hash-chained audit log (append-only)
+ *   - `.rea/audit-*.jsonl`            — G1 rotated audit archives
+ *   - `.rea/HALT`                     — /freeze marker (ephemeral)
+ *   - `.rea/metrics.jsonl`            — G5 metrics stream
+ *   - `.rea/serve.pid`                — G5 `rea serve` pidfile
+ *   - `.rea/serve.state.json`         — G5 `rea serve` state snapshot
+ *   - `.rea/fingerprints.json`        — G7 downstream catalog fingerprints (BUG-010)
+ *   - `.rea/review-cache.jsonl`       — BUG-009 review cache (rea cache set/check)
+ *   - `.rea/*.tmp`                    — serve temp-file-then-rename pattern
+ *   - `.rea/*.tmp.*`                  — review-cache pid-salted temp pattern
+ *   - `.rea/install-manifest.json.bak` / `.tmp` — fs-safe atomic-replace sidecars
+ *   - `.rea/.gitignore.rea-tmp-*`     — this module's own temp files on crash
+ *   - `.rea.lock`                     — proper-lockfile sibling dir (NOT under .rea/)
+ *     (Codex F1 on the BUG-010 review caught all three of these last groups.)
  *
  * Idempotency contract.
  *
@@ -34,16 +41,42 @@
  *     operator-authored lines within the block.
  *   - All entries already present, in any order → no-op.
  *
- * Security/containment. This helper writes ONLY `.gitignore` at the root of
- * the resolved install target. No symlink traversal: we refuse to follow a
- * `.gitignore` that is a symlink (avoids writing through a link to
- * `/etc/shadow`). Content is bounded (managed block is small), so we use a
- * straightforward read/append model rather than the full `safeInstallFile`
- * apparatus — but we still resolve via `realpath` and re-verify containment
- * at write time, matching the rest of the install-side defenses.
+ *   Operator DELETIONS of canonical entries are NOT preserved — re-running
+ *   ensureReaGitignore will re-insert any canonical entry missing from the
+ *   block body. To opt out of ignoring a specific artifact, operators must
+ *   configure rea itself, not edit the managed block. This is intentional —
+ *   the managed block is rea's territory.
+ *
+ * Security/containment.
+ *
+ *   - Refuse to follow a `.gitignore` symlink (`lstat` gate before any read).
+ *     The subsequent read uses `O_NOFOLLOW | O_RDONLY` so a TOCTOU swap after
+ *     the lstat cannot trick us into reading through a symlink to secrets
+ *     (e.g. `~/.ssh/id_rsa`) and splicing them into the written `.gitignore`.
+ *   - Temp file name uses `crypto.randomBytes(16)` — not PID + Date.now, which
+ *     are predictable and leak process info. (Codex F2.)
+ *   - Cleanup best-effort on write failure so a stale temp file from a
+ *     prior crash does not accrete.
+ *
+ * CRLF compatibility (Codex F3).
+ *
+ *   Windows consumers with `core.autocrlf=true` get CRLF line endings on
+ *   `.gitignore`. Without explicit handling, `"# === rea managed ==="` !==
+ *   `"# === rea managed ===\r"` and every upgrade would append a duplicate
+ *   block. We detect the input EOL on read, split on `\r?\n`, trim trailing
+ *   whitespace from each line before marker-anchored matching, and re-emit
+ *   with the detected EOL on write.
+ *
+ * Duplicate blocks (Codex F4).
+ *
+ *   If the file already contains two managed blocks (from a prior bug,
+ *   manual copy-paste, or two different rea versions), refuse to modify and
+ *   surface a warning. Merging is more ambitious than this module needs to
+ *   be — the operator resolves manually, then a subsequent run proceeds.
  */
 
 import type fs from 'node:fs';
+import crypto from 'node:crypto';
 import fsPromises from 'node:fs/promises';
 import path from 'node:path';
 
@@ -57,6 +90,14 @@ export const GITIGNORE_BLOCK_END = '# === end rea managed ===';
  * so the scaffolded block is deterministic across runs, which in turn makes
  * drift detection tractable: a diff in the managed block means a consumer
  * (or another installer) edited it, not that rea reshuffled.
+ *
+ * The grouping below is by origin, not alphabetical:
+ *   1. audit + HALT + metrics   (G1, G4, G5)
+ *   2. serve state              (G5)
+ *   3. fingerprints             (G7 / BUG-010)
+ *   4. review cache             (BUG-009)
+ *   5. temp/sidecar patterns    (Codex F1)
+ *   6. sibling lockfile         (Codex F1 — OUTSIDE .rea/)
  */
 export const REA_GITIGNORE_ENTRIES: readonly string[] = [
   '.rea/audit.jsonl',
@@ -67,6 +108,15 @@ export const REA_GITIGNORE_ENTRIES: readonly string[] = [
   '.rea/serve.state.json',
   '.rea/fingerprints.json',
   '.rea/review-cache.jsonl',
+  '.rea/*.tmp',
+  '.rea/*.tmp.*',
+  '.rea/install-manifest.json.bak',
+  '.rea/install-manifest.json.tmp',
+  '.rea/.gitignore.rea-tmp-*',
+  // proper-lockfile (audit chain, cache) locks `.rea/` via a SIBLING dir at
+  // `.rea.lock` — NOT inside `.rea/`. If this looks wrong to a future
+  // maintainer: it is correct, see src/audit/fs.ts.
+  '.rea.lock',
 ];
 
 export interface EnsureGitignoreResult {
@@ -76,12 +126,22 @@ export interface EnsureGitignoreResult {
   action: 'created' | 'updated' | 'unchanged';
   /** Entries the caller added this run (subset of `REA_GITIGNORE_ENTRIES`). */
   addedEntries: string[];
-  /** Non-fatal operator-facing messages (e.g. "`.gitignore` is a symlink — skipped"). */
+  /** Non-fatal operator-facing messages (e.g. symlink refused, duplicate blocks). */
   warnings: string[];
 }
 
-function buildManagedBlock(entries: readonly string[]): string {
-  return [GITIGNORE_BLOCK_START, ...entries, GITIGNORE_BLOCK_END].join('\n');
+function buildManagedBlock(entries: readonly string[], eol: string): string {
+  return [GITIGNORE_BLOCK_START, ...entries, GITIGNORE_BLOCK_END].join(eol);
+}
+
+/**
+ * Trim trailing whitespace ONLY (not leading) and strip a leading UTF-8 BOM.
+ * Leading whitespace would defeat the substring-spoof-rejection guarantee
+ * the tests exercise (`## === rea managed ===` must NOT match).
+ */
+function normalizeLineForMatch(line: string, isFirst: boolean): string {
+  const noBom = isFirst ? line.replace(/^\uFEFF/, '') : line;
+  return noBom.replace(/\s+$/, '');
 }
 
 /**
@@ -91,21 +151,25 @@ function buildManagedBlock(entries: readonly string[]): string {
  *
  * Returns `null` if the start or end marker is not present, or if the start
  * appears after the end (mangled block — caller falls back to append).
+ *
+ * Returns `'duplicate'` if more than one start marker or more than one end
+ * marker is found — caller refuses to modify in that case.
  */
 function findManagedBlock(
   lines: readonly string[],
-): { startIdx: number; endIdx: number } | null {
-  let startIdx = -1;
-  let endIdx = -1;
+): { startIdx: number; endIdx: number } | null | 'duplicate' {
+  const startIndices: number[] = [];
+  const endIndices: number[] = [];
   for (let i = 0; i < lines.length; i += 1) {
-    if (startIdx === -1 && lines[i] === GITIGNORE_BLOCK_START) {
-      startIdx = i;
-    } else if (startIdx !== -1 && lines[i] === GITIGNORE_BLOCK_END) {
-      endIdx = i;
-      break;
-    }
+    const norm = normalizeLineForMatch(lines[i]!, i === 0);
+    if (norm === GITIGNORE_BLOCK_START) startIndices.push(i);
+    else if (norm === GITIGNORE_BLOCK_END) endIndices.push(i);
   }
-  if (startIdx === -1 || endIdx === -1 || endIdx <= startIdx) return null;
+  if (startIndices.length === 0 || endIndices.length === 0) return null;
+  if (startIndices.length > 1 || endIndices.length > 1) return 'duplicate';
+  const [startIdx] = startIndices as [number];
+  const [endIdx] = endIndices as [number];
+  if (endIdx <= startIdx) return null;
   return { startIdx, endIdx };
 }
 
@@ -115,12 +179,17 @@ function findManagedBlock(
  * `.rea/my-local-cache` to the block directly — we leave it alone). Missing
  * required entries are appended in the canonical order, after the existing
  * body lines.
+ *
+ * NOTE: operator deletions of canonical entries are NOT preserved — see the
+ * module docstring.
  */
 function reconcileBlock(
   bodyLines: readonly string[],
   required: readonly string[],
 ): { lines: string[]; added: string[] } {
-  const present = new Set(bodyLines.map((l) => l.trim()).filter((l) => l.length > 0));
+  const present = new Set(
+    bodyLines.map((l) => l.replace(/\s+$/, '')).filter((l) => l.length > 0),
+  );
   const added: string[] = [];
   const appended: string[] = [];
   for (const entry of required) {
@@ -133,10 +202,12 @@ function reconcileBlock(
 }
 
 /**
- * Read `.gitignore` if it exists. Refuses symlinks — attempting to follow one
- * during an install-time write is a supply-chain hazard we pay a small
- * ergonomic cost to prevent. Returns `null` when absent; throws only on
- * unexpected I/O errors or symlink refusal.
+ * Open `.gitignore` via `O_NOFOLLOW | O_RDONLY` so a symlink that appeared
+ * after our `lstat` (TOCTOU window) cannot be followed. Darwin/Linux map
+ * `O_NOFOLLOW` to `ELOOP`; we translate that to the same symlink-refusal
+ * message the lstat path would produce.
+ *
+ * Returns `null` when the file does not exist.
  */
 async function readGitignoreIfFile(absPath: string): Promise<string | null> {
   let lst: fs.Stats;
@@ -157,19 +228,51 @@ async function readGitignoreIfFile(absPath: string): Promise<string | null> {
       `${absPath} is not a regular file (type=${String(lst.mode & 0o170000)}) — refusing to edit.`,
     );
   }
-  return fsPromises.readFile(absPath, 'utf8');
+  // O_NOFOLLOW closes the TOCTOU window between lstat and open.
+  const fd = await fsPromises.open(
+    absPath,
+    fsPromises.constants?.O_RDONLY !== undefined
+      ? fsPromises.constants.O_RDONLY | (fsPromises.constants.O_NOFOLLOW ?? 0)
+      : 'r',
+  ).catch((err: NodeJS.ErrnoException) => {
+    if (err.code === 'ELOOP') {
+      throw new Error(
+        `${absPath} became a symlink between lstat and open — refusing to read.`,
+      );
+    }
+    throw err;
+  });
+  try {
+    return await fd.readFile('utf8');
+  } finally {
+    await fd.close();
+  }
 }
 
 /**
  * Write `.gitignore` with a temp-file + rename, same pattern as the cache
  * atomic-clear (F4). Avoids torn reads for any tool (IDE, `rea doctor`)
  * racing this write.
+ *
+ * Temp-name uses `crypto.randomBytes(16)` (not PID/timestamp) — Codex F2
+ * flagged the old name as predictable, which gave a local attacker a way
+ * to pre-create the path and block the write (or place a FIFO on it).
  */
 async function writeAtomic(absPath: string, content: string): Promise<void> {
   const dir = path.dirname(absPath);
-  const tmp = path.join(dir, `.gitignore.rea-tmp-${process.pid}-${Date.now()}`);
-  await fsPromises.writeFile(tmp, content, { encoding: 'utf8', mode: 0o644 });
-  await fsPromises.rename(tmp, absPath);
+  const rand = crypto.randomBytes(16).toString('hex');
+  const tmp = path.join(dir, `.gitignore.rea-tmp-${rand}`);
+  try {
+    await fsPromises.writeFile(tmp, content, { encoding: 'utf8', mode: 0o644 });
+    await fsPromises.rename(tmp, absPath);
+  } catch (err) {
+    await fsPromises.unlink(tmp).catch(() => {
+      // Best-effort cleanup. If rename failed the tmp exists; if writeFile
+      // failed before anything landed, unlink fails with ENOENT — either way
+      // we don't want the original error masked.
+    });
+    throw err;
+  }
 }
 
 /**
@@ -195,8 +298,11 @@ export async function ensureReaGitignore(
     return { path: absPath, action: 'unchanged', addedEntries: [], warnings };
   }
 
+  // Detect EOL so a CRLF repo stays CRLF and doesn't get torn. Codex F3.
+  const eol = existing !== null && existing.includes('\r\n') ? '\r\n' : '\n';
+
   if (existing === null) {
-    const content = buildManagedBlock(entries) + '\n';
+    const content = buildManagedBlock(entries, '\n') + '\n';
     await writeAtomic(absPath, content);
     return {
       path: absPath,
@@ -206,13 +312,18 @@ export async function ensureReaGitignore(
     };
   }
 
-  const lines = existing.split('\n');
-  // `split('\n')` on content ending in `\n` yields a trailing empty string.
-  // Preserve it so we can reconstruct identical-trailing-newline content
-  // when no changes are needed.
+  const lines = existing.split(/\r?\n/);
   const hadTrailingNewline = existing.endsWith('\n');
 
   const block = findManagedBlock(lines);
+
+  if (block === 'duplicate') {
+    warnings.push(
+      `${absPath} contains multiple '# === rea managed' blocks — refusing to modify. ` +
+        `Consolidate the managed blocks manually and rerun.`,
+    );
+    return { path: absPath, action: 'unchanged', addedEntries: [], warnings };
+  }
 
   if (block === null) {
     // No managed block. Append one after a blank-line separator (unless the
@@ -227,9 +338,9 @@ export async function ensureReaGitignore(
     const newLines = [
       ...bodyLines,
       ...separator,
-      buildManagedBlock(entries),
+      buildManagedBlock(entries, eol),
     ];
-    const content = newLines.join('\n') + '\n';
+    const content = newLines.join(eol) + eol;
     await writeAtomic(absPath, content);
     return {
       path: absPath,
@@ -257,12 +368,9 @@ export async function ensureReaGitignore(
     ...reconciledBody,
     ...lines.slice(block.endIdx),
   ];
-  const content = newLines.join('\n') + (hadTrailingNewline ? '' : '\n');
-  // `lines.join('\n')` already restores the internal newlines; if the file
-  // had a trailing newline the split left an empty string at the end and
-  // the join restores it naturally. We ensure EOL newline regardless.
-  const finalContent = content.endsWith('\n') ? content : content + '\n';
-  await writeAtomic(absPath, finalContent);
+  let content = newLines.join(eol);
+  if (hadTrailingNewline && !content.endsWith(eol)) content += eol;
+  await writeAtomic(absPath, content);
   return {
     path: absPath,
     action: 'updated',

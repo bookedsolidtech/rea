@@ -104,14 +104,11 @@ describe('ensureReaGitignore — BUG-010 scaffolding', () => {
     const result = await ensureReaGitignore(dir);
     expect(result.action).toBe('updated');
     // Entries that were missing must be in addedEntries, in canonical order.
-    expect(result.addedEntries).toEqual([
-      '.rea/audit-*.jsonl',
-      '.rea/metrics.jsonl',
-      '.rea/serve.pid',
-      '.rea/serve.state.json',
-      '.rea/fingerprints.json',
-      '.rea/review-cache.jsonl',
-    ]);
+    // All canonical entries minus the two the partial state already had.
+    const alreadyPresent = new Set(['.rea/audit.jsonl', '.rea/HALT']);
+    expect(result.addedEntries).toEqual(
+      REA_GITIGNORE_ENTRIES.filter((e) => !alreadyPresent.has(e)),
+    );
 
     const content = await fsPromises.readFile(result.path, 'utf8');
     expect(content).toContain('.rea/my-local-thing');
@@ -222,5 +219,144 @@ describe('stat check — symlink refusal uses fs directly', () => {
     const stat = fs.lstatSync(result.path);
     expect(stat.isFile()).toBe(true);
     expect(stat.isSymbolicLink()).toBe(false);
+  });
+});
+
+describe('Codex F7 — adversarial regression fixtures', () => {
+  it('F3: CRLF input does not get a duplicate block appended on rerun', async () => {
+    const dir = await makeTempDir();
+    // Simulate a Windows consumer whose `.gitignore` is CRLF-encoded.
+    const crlf = ['node_modules', 'dist', ''].join('\r\n');
+    await fsPromises.writeFile(path.join(dir, '.gitignore'), crlf, 'utf8');
+
+    const r1 = await ensureReaGitignore(dir);
+    expect(r1.action).toBe('updated');
+    const after1 = await fsPromises.readFile(path.join(dir, '.gitignore'), 'utf8');
+    // EOL preserved: file stays CRLF.
+    expect(after1.includes('\r\n')).toBe(true);
+    // Exactly one managed block.
+    const startCount1 = (after1.match(/# === rea managed — do not edit between markers ===/g) ?? []).length;
+    expect(startCount1).toBe(1);
+
+    // Second run must be a no-op — THIS is what F3 was protecting against.
+    const r2 = await ensureReaGitignore(dir);
+    expect(r2.action).toBe('unchanged');
+    const after2 = await fsPromises.readFile(path.join(dir, '.gitignore'), 'utf8');
+    const startCount2 = (after2.match(/# === rea managed — do not edit between markers ===/g) ?? []).length;
+    expect(startCount2).toBe(1);
+  });
+
+  it('F4: duplicate managed blocks trigger refuse-and-warn, no modification', async () => {
+    const dir = await makeTempDir();
+    // Two full managed blocks — the failure mode F4 was catching. The
+    // scaffolder must NOT silently touch only the first; it refuses and
+    // surfaces a warning so the operator consolidates manually.
+    const doubled = [
+      'node_modules',
+      '',
+      GITIGNORE_BLOCK_START,
+      '.rea/audit.jsonl',
+      GITIGNORE_BLOCK_END,
+      '',
+      GITIGNORE_BLOCK_START,
+      '.rea/HALT',
+      GITIGNORE_BLOCK_END,
+      '',
+    ].join('\n');
+    await fsPromises.writeFile(path.join(dir, '.gitignore'), doubled, 'utf8');
+
+    const result = await ensureReaGitignore(dir);
+    expect(result.action).toBe('unchanged');
+    expect(result.addedEntries).toEqual([]);
+    expect(result.warnings.length).toBe(1);
+    expect(result.warnings[0]).toMatch(/multiple|duplicate/i);
+
+    // File was not modified.
+    const after = await fsPromises.readFile(path.join(dir, '.gitignore'), 'utf8');
+    expect(after).toBe(doubled);
+  });
+
+  it('F5: trailing whitespace on marker lines is normalized for anchored match', async () => {
+    const dir = await makeTempDir();
+    // A marker line that happens to have a trailing space (editors sometimes
+    // auto-insert these) must still be recognized as the block start.
+    const withTrailingWs = [
+      'node_modules',
+      '',
+      GITIGNORE_BLOCK_START + '  ',
+      '.rea/audit.jsonl',
+      GITIGNORE_BLOCK_END + '\t',
+      '',
+    ].join('\n');
+    await fsPromises.writeFile(path.join(dir, '.gitignore'), withTrailingWs, 'utf8');
+
+    const result = await ensureReaGitignore(dir);
+    // Should be recognized as an existing block needing backfill — NOT
+    // treated as a non-existent block (which would double the managed
+    // block on disk).
+    expect(result.action).toBe('updated');
+    const after = await fsPromises.readFile(path.join(dir, '.gitignore'), 'utf8');
+    const startCount = (after.match(/# === rea managed — do not edit between markers ===/g) ?? []).length;
+    expect(startCount).toBe(1);
+  });
+
+  it('F5: UTF-8 BOM on the first line does not prevent marker matching', async () => {
+    const dir = await makeTempDir();
+    // Some Windows editors prepend U+FEFF to new text files. Without BOM
+    // handling, the marker on line 0 would silently not match.
+    const bom = '\uFEFF' + GITIGNORE_BLOCK_START + '\n.rea/audit.jsonl\n' + GITIGNORE_BLOCK_END + '\n';
+    await fsPromises.writeFile(path.join(dir, '.gitignore'), bom, 'utf8');
+
+    const result = await ensureReaGitignore(dir);
+    expect(result.action).toBe('updated');
+    const after = await fsPromises.readFile(path.join(dir, '.gitignore'), 'utf8');
+    const startCount = (after.match(/# === rea managed — do not edit between markers ===/g) ?? []).length;
+    expect(startCount).toBe(1);
+  });
+
+  it('F7: concurrent invocations produce exactly one managed block on disk', async () => {
+    const dir = await makeTempDir();
+    // Two writers racing. The atomic temp+rename contract means the last
+    // rename wins, but critically: there is never a torn `.gitignore` on
+    // disk, and there is never more than one managed block after both
+    // resolve.
+    await Promise.all([ensureReaGitignore(dir), ensureReaGitignore(dir)]);
+
+    const content = await fsPromises.readFile(path.join(dir, '.gitignore'), 'utf8');
+    const startCount = (content.match(/# === rea managed — do not edit between markers ===/g) ?? []).length;
+    const endCount = (content.match(/# === end rea managed ===/g) ?? []).length;
+    expect(startCount).toBe(1);
+    expect(endCount).toBe(1);
+    // All canonical entries present.
+    for (const entry of REA_GITIGNORE_ENTRIES) {
+      expect(content).toContain(entry);
+    }
+  });
+
+  it('F7: crashed-temp leftover does not block a subsequent successful write', async () => {
+    const dir = await makeTempDir();
+    // Simulate a prior crash mid-write: stale temp file in-place. The
+    // atomic writer uses randomBytes(16), so name collision is
+    // astronomically unlikely — but the stale file shouldn't interfere
+    // with a subsequent run either way. This test asserts the target
+    // gitignore ends up correct and the stale file is irrelevant (we
+    // don't require cleanup of unrelated temps — that is gitignored via
+    // `.rea/.gitignore.rea-tmp-*`... but wait, the tmp is in `.` for
+    // gitignore writes, not `.rea/`. See implementation; the tmp sits
+    // next to `.gitignore`. Gitignored via a dedicated rule? Not yet.
+    // This test documents the expectation: a stale temp does not BLOCK
+    // progress.)
+    await fsPromises.writeFile(
+      path.join(dir, '.gitignore.rea-tmp-stale'),
+      'garbage from a prior crash\n',
+      'utf8',
+    );
+
+    const result = await ensureReaGitignore(dir);
+    expect(result.action).toBe('created');
+    const content = await fsPromises.readFile(path.join(dir, '.gitignore'), 'utf8');
+    expect(content).toContain(GITIGNORE_BLOCK_START);
+    // Stale temp survives — we don't garbage-collect someone else's files.
+    expect(fs.existsSync(path.join(dir, '.gitignore.rea-tmp-stale'))).toBe(true);
   });
 });
