@@ -82,6 +82,16 @@ export function createAuditMiddleware(
     const autonomyLevel =
       (ctx.metadata.autonomy_level as string) ?? policy?.autonomy_level ?? 'unknown';
 
+    // Cap ctx.error before writing the audit record. A downstream MCP server
+    // can produce arbitrarily long error strings; if the audit record grows
+    // beyond ~64 KiB, `rea status` misreports it as corrupt because the tail
+    // window in summarizeAudit cannot contain the full record. 4096 bytes is
+    // generous for any legitimate error description.
+    const MAX_AUDIT_ERROR_BYTES = 4096;
+    if (ctx.error && ctx.error.length > MAX_AUDIT_ERROR_BYTES) {
+      ctx.error = ctx.error.slice(0, MAX_AUDIT_ERROR_BYTES) + '\u2026[truncated]';
+    }
+
     // Serialize audit writes via a queue to maintain hash chain linearity under concurrency.
     // Each write awaits the previous one before running its lock-scoped append.
     const writePromise = writeQueue.then(async () => {

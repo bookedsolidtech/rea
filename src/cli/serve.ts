@@ -189,17 +189,21 @@ export async function runServe(): Promise<void> {
 
   // ── Observability setup (G5) ─────────────────────────────────────────────
   const sessionId = currentSessionId();
-  // Use only the built-in SECRET_PATTERNS for the logger redactor. Policy
-  // patterns are intentionally excluded: the logger applies regex
-  // synchronously on the event-loop thread with no size cap, and downstream
-  // error messages are attacker-influenced and can be arbitrarily long.
-  // Combining operator-supplied patterns (which may backtrack badly) with
-  // large error strings multiplied across the full pattern set could stall
-  // the event loop during a failure event. The built-in patterns are
-  // anchored and bounded; policy patterns are not guaranteed to be.
-  // Field strings are hard-capped at MAX_LOG_FIELD_BYTES before any regex
-  // runs — see applyRedactor in log.ts.
-  const logRedactor = buildRegexRedactor(SECRET_PATTERNS);
+  // Build the log redactor from both built-in SECRET_PATTERNS and any
+  // operator-defined policy.redact.patterns. This is safe because
+  // applyRedactor in log.ts hard-caps every string field to
+  // MAX_LOG_FIELD_BYTES (4096 bytes) BEFORE running any regex — so
+  // attacker-influenced error strings are already bounded when the patterns
+  // execute. The earlier exclusion of policy patterns was motivated by the
+  // risk of applying operator regexes to unbounded strings; the 4096-byte
+  // cap in applyRedactor eliminates that risk. Policy patterns are validated
+  // as safe-regex at load time (G3), so catastrophic backtracking is already
+  // prevented at the source.
+  const policyLogPatterns = (policy.redact?.patterns ?? []).map((p) => ({
+    name: p.name,
+    pattern: new RegExp(p.regex, p.flags ?? 'g'),
+  }));
+  const logRedactor = buildRegexRedactor([...SECRET_PATTERNS, ...policyLogPatterns]);
   const logger = createLogger({
     level: resolveLogLevel(process.env['REA_LOG_LEVEL']),
     base: { session_id: sessionId },
