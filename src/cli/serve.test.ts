@@ -42,8 +42,8 @@ describe('serve — writeFileAtomic', () => {
     const target = path.join(baseDir, 'file.txt');
     writeFileAtomic(target, 'x');
     const entries = fs.readdirSync(baseDir);
-    // Every leftover temp file matches the `.<base>.<pid>.<ns>.tmp` pattern.
-    const leaks = entries.filter((name) => /^\.file\.txt\.\d+\.\d+\.tmp$/.test(name));
+    // Every leftover temp file matches the `.<base>.<uuid-or-digits>.tmp` pattern.
+    const leaks = entries.filter((name) => /^\.file\.txt\..*\.tmp$/.test(name));
     expect(leaks).toEqual([]);
   });
 

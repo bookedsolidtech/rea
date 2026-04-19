@@ -67,7 +67,7 @@ const AUDIT_TAIL_WINDOW_BYTES = 64 * 1024;
  * Exported so unit tests can assert the exact sanitization behavior.
  */
 export function sanitizeForTerminal(value: string): string {
-  return value.replace(/[\x00-\x1f\x7f]/g, '?');
+  return value.replace(/[\x00-\x1f\x7f\u200b-\u200f\u202a-\u202e\u2028\u2029\u2066-\u2069]/g, '?');
 }
 
 /**

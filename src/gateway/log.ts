@@ -212,7 +212,7 @@ function formatPretty(
   const levelTag = level.toUpperCase().padEnd(5);
   // Strip C0 controls and DEL from disk-sourced strings before terminal output
   // to prevent ANSI/OSC escape injection from compromised MCP error messages.
-  const strip = (s: string) => s.replace(/[\x00-\x1f\x7f]/g, '?');
+  const strip = (s: string) => s.replace(/[\x00-\x1f\x7f\u200b-\u200f\u202a-\u202e\u2028\u2029\u2066-\u2069]/g, '?');
   const event = strip(fields.event);
   const message = strip(fields.message);
   // Extract the well-known fields we already rendered.
@@ -224,7 +224,7 @@ function formatPretty(
   if (server_name !== undefined) extras.push(`server=${strip(String(server_name))}`);
   if (session_id !== undefined) extras.push(`session=${strip(String(session_id)).slice(0, 8)}`);
   for (const [k, v] of Object.entries(rest)) {
-    if (k === 'timestamp' || k === 'level') continue;
+    if (k === 'timestamp' || k === 'level') continue; // trusted-internal: toISOString + enum-derived
     extras.push(`${k}=${typeof v === 'string' ? strip(v) : safeStringifyExtra(v)}`);
   }
   const extrasStr = extras.length > 0 ? ` ${COLOR.dim}${extras.join(' ')}${COLOR.reset}` : '';
@@ -371,11 +371,12 @@ export function buildRegexRedactor(
   return (value: string): string => {
     let out = value;
     for (const { pattern } of patterns) {
-      // Always create a fresh RegExp for global patterns — shared global RegExp
-      // objects carry `lastIndex` state that concurrent callers (e.g. the
-      // SafeRegex worker in the redact middleware) can leave non-zero, causing
-      // String.replace to start mid-string and silently skip leading secrets.
-      const re = pattern.global
+      // Always create a fresh RegExp for global or sticky patterns — shared
+      // stateful RegExp objects carry `lastIndex` that concurrent callers (e.g.
+      // the SafeRegex worker in the redact middleware) can leave non-zero,
+      // causing String.replace to start mid-string and silently skip leading
+      // secrets. The `y` (sticky) flag carries the same hazard as `g`.
+      const re = (pattern.global || pattern.sticky)
         ? new RegExp(pattern.source, pattern.flags)
         : pattern;
       out = out.replace(re, '[REDACTED]');
