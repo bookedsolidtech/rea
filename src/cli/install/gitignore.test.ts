@@ -314,12 +314,18 @@ describe('Codex F7 — adversarial regression fixtures', () => {
     expect(startCount).toBe(1);
   });
 
-  it('F7: concurrent invocations produce exactly one managed block on disk', async () => {
+  it('F7: same-process async overlap lands a single well-formed block (last-rename-wins)', async () => {
+    // NOTE: This test proves what `Promise.all` in a single event loop can
+    // prove — no torn `.gitignore`, distinct crypto-random temp names,
+    // exactly one rename winning. It does NOT prove multi-process race
+    // safety; there is no proper-lockfile around `.gitignore` writes, and
+    // two independent Node processes could last-write-wins and lose the
+    // slower one's additions. That tradeoff is intentional: .gitignore
+    // writes are operator-visible and rare, and consumers would not
+    // appreciate a fresh lock directory landing next to .gitignore.
+    // Codex F3 on the bc2b77b re-review flagged the prior docstring as
+    // overstating this test's coverage.
     const dir = await makeTempDir();
-    // Two writers racing. The atomic temp+rename contract means the last
-    // rename wins, but critically: there is never a torn `.gitignore` on
-    // disk, and there is never more than one managed block after both
-    // resolve.
     await Promise.all([ensureReaGitignore(dir), ensureReaGitignore(dir)]);
 
     const content = await fsPromises.readFile(path.join(dir, '.gitignore'), 'utf8');
@@ -327,7 +333,6 @@ describe('Codex F7 — adversarial regression fixtures', () => {
     const endCount = (content.match(/# === end rea managed ===/g) ?? []).length;
     expect(startCount).toBe(1);
     expect(endCount).toBe(1);
-    // All canonical entries present.
     for (const entry of REA_GITIGNORE_ENTRIES) {
       expect(content).toContain(entry);
     }
@@ -338,14 +343,9 @@ describe('Codex F7 — adversarial regression fixtures', () => {
     // Simulate a prior crash mid-write: stale temp file in-place. The
     // atomic writer uses randomBytes(16), so name collision is
     // astronomically unlikely — but the stale file shouldn't interfere
-    // with a subsequent run either way. This test asserts the target
-    // gitignore ends up correct and the stale file is irrelevant (we
-    // don't require cleanup of unrelated temps — that is gitignored via
-    // `.rea/.gitignore.rea-tmp-*`... but wait, the tmp is in `.` for
-    // gitignore writes, not `.rea/`. See implementation; the tmp sits
-    // next to `.gitignore`. Gitignored via a dedicated rule? Not yet.
-    // This test documents the expectation: a stale temp does not BLOCK
-    // progress.)
+    // with a subsequent run either way. The post-F2 canonical list
+    // includes `.gitignore.rea-tmp-*` at the repo root (where this temp
+    // actually lives), so `git status` will not flag it either.
     await fsPromises.writeFile(
       path.join(dir, '.gitignore.rea-tmp-stale'),
       'garbage from a prior crash\n',
@@ -356,6 +356,8 @@ describe('Codex F7 — adversarial regression fixtures', () => {
     expect(result.action).toBe('created');
     const content = await fsPromises.readFile(path.join(dir, '.gitignore'), 'utf8');
     expect(content).toContain(GITIGNORE_BLOCK_START);
+    // The root-level temp glob is in the canonical list.
+    expect(content).toContain('.gitignore.rea-tmp-*');
     // Stale temp survives — we don't garbage-collect someone else's files.
     expect(fs.existsSync(path.join(dir, '.gitignore.rea-tmp-stale'))).toBe(true);
   });

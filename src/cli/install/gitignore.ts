@@ -22,7 +22,9 @@
  *   - `.rea/*.tmp`                    — serve temp-file-then-rename pattern
  *   - `.rea/*.tmp.*`                  — review-cache pid-salted temp pattern
  *   - `.rea/install-manifest.json.bak` / `.tmp` — fs-safe atomic-replace sidecars
- *   - `.rea/.gitignore.rea-tmp-*`     — this module's own temp files on crash
+ *   - `.gitignore.rea-tmp-*`          — this module's own temp files on crash
+ *                                       (root-level — writeAtomic stages next
+ *                                       to .gitignore, not under .rea/)
  *   - `.rea.lock`                     — proper-lockfile sibling dir (NOT under .rea/)
  *     (Codex F1 on the BUG-010 review caught all three of these last groups.)
  *
@@ -112,7 +114,11 @@ export const REA_GITIGNORE_ENTRIES: readonly string[] = [
   '.rea/*.tmp.*',
   '.rea/install-manifest.json.bak',
   '.rea/install-manifest.json.tmp',
-  '.rea/.gitignore.rea-tmp-*',
+  // This module's own crash-time temp files. `writeAtomic` stages the temp
+  // next to `.gitignore` (i.e. at the repo root), NOT under `.rea/` — so
+  // the glob must live at the repo root too. Codex F2 on the re-review
+  // caught the earlier `.rea/.gitignore.rea-tmp-*` mismatch.
+  '.gitignore.rea-tmp-*',
   // proper-lockfile (audit chain, cache) locks `.rea/` via a SIBLING dir at
   // `.rea.lock` — NOT inside `.rea/`. If this looks wrong to a future
   // maintainer: it is correct, see src/audit/fs.ts.
@@ -228,20 +234,31 @@ async function readGitignoreIfFile(absPath: string): Promise<string | null> {
       `${absPath} is not a regular file (type=${String(lst.mode & 0o170000)}) — refusing to edit.`,
     );
   }
-  // O_NOFOLLOW closes the TOCTOU window between lstat and open.
-  const fd = await fsPromises.open(
-    absPath,
-    fsPromises.constants?.O_RDONLY !== undefined
-      ? fsPromises.constants.O_RDONLY | (fsPromises.constants.O_NOFOLLOW ?? 0)
-      : 'r',
-  ).catch((err: NodeJS.ErrnoException) => {
-    if (err.code === 'ELOOP') {
-      throw new Error(
-        `${absPath} became a symlink between lstat and open — refusing to read.`,
-      );
-    }
-    throw err;
-  });
+  // O_NOFOLLOW closes the TOCTOU window between lstat and open on POSIX.
+  // On Windows O_NOFOLLOW is not defined — refuse to edit an existing
+  // `.gitignore` there rather than silently accept the TOCTOU hole.
+  // (Codex F1 on the bc2b77b re-review.) Consumers who still have a
+  // regular file get the lstat-only protection below; operators who end
+  // up with a symlinked .gitignore get a refusal rather than a splice.
+  const O_NOFOLLOW = fsPromises.constants?.O_NOFOLLOW;
+  const O_RDONLY = fsPromises.constants?.O_RDONLY;
+  if (O_NOFOLLOW === undefined || O_RDONLY === undefined) {
+    throw new Error(
+      `${absPath} exists and this platform lacks O_NOFOLLOW — refusing to edit ` +
+        `an existing .gitignore without symlink-race protection. Delete the ` +
+        `file first if rea should scaffold a fresh one.`,
+    );
+  }
+  const fd = await fsPromises
+    .open(absPath, O_RDONLY | O_NOFOLLOW)
+    .catch((err: NodeJS.ErrnoException) => {
+      if (err.code === 'ELOOP') {
+        throw new Error(
+          `${absPath} became a symlink between lstat and open — refusing to read.`,
+        );
+      }
+      throw err;
+    });
   try {
     return await fd.readFile('utf8');
   } finally {
