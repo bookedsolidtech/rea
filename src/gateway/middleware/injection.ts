@@ -30,13 +30,15 @@ export const INJECTION_PHRASES: readonly string[] = [
   // is what distinguishes injection from ordinary status messages.
   'you are now a ',
   'you are now an ',
-  // G9 follow-up: additional role-reassignment / persona-swap vectors. These
-  // are conservative (English, short, anchored with an article or verb) so
-  // they don't fire on ordinary chat-style prose.
-  'act as a ',
-  'act as an ',
+  // G9 follow-up: additional role-reassignment / persona-swap vectors.
+  // Intentionally NARROW: broader phrases like "act as a" / "act as an"
+  // were considered and dropped because at read-tier any literal hit
+  // escalates to `likely_injection`, which would deny benign prose such
+  // as "this proxy can act as a bridge" or "the service can act as an
+  // intermediary." The phrases below all contain a direct second-person
+  // address ("you") or an explicit roleplay framing ("roleplay as"),
+  // which is rare in ordinary documentation/chat content.
   'pretend you are ',
-  'pretend to be ',
   'roleplay as ',
 ];
 
@@ -155,13 +157,18 @@ export interface InjectionClassifierMetadata {
 
 /**
  * G9 follow-up — zod schema for the `ctx.metadata.injection` record the
- * middleware emits. Every emitted record has a `verdict` field; downstream
- * audit consumers may validate against this schema to catch shape
- * regressions (e.g. the pre-fix behavior where a regex-timeout produced no
- * `verdict` at all).
+ * middleware emits. Every emitted record has a `verdict` field; the schema
+ * exists so internal test code (and a follow-up public surface, once we
+ * decide how to expose audit-record types) can catch shape regressions —
+ * notably the pre-fix behavior where a regex-timeout emitted timing
+ * metadata under a different key without ever writing a verdict.
  *
- * Exported so external consumers (Helix, downstream tooling) can import it
- * and validate the metadata they read off the audit log.
+ * INTERNAL today. Not reachable via the published package `exports` map
+ * (only `.`, `./policy`, `./middleware`, and `./audit` are public). If
+ * downstream consumers (e.g. Helix) need to validate audit records they
+ * read off `.rea/audit.jsonl`, we will promote this to a public entrypoint
+ * in a follow-up (filed as G9.2). Do not rely on this symbol from outside
+ * the rea repo yet.
  */
 export const InjectionMetadataSchema = z
   .object({
