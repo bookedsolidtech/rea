@@ -94,16 +94,24 @@ export interface AuditPolicy {
  * these knobs.
  *
  * `suspicious_blocks_writes` —
- *   `false` (schema default): suspicious matches warn-only (log + audit
- *     metadata, `status: allowed`). Ships narrower default so 0.2.x users are
- *     not silently tightened on upgrade. External profiles
- *     (`open-source`, `client-engagement`, `minimal`, `lit-wc`) inherit this.
- *   `true` (pinned in `bst-internal` and this repo's own policy): suspicious
+ *   `undefined` (omitted): middleware defaults based on `injection_detection`:
+ *     block mode defaults to `true` (0.2.x parity — single literal at
+ *     write/destructive tier still denies); warn mode defaults to `false`
+ *     (preserves 0.2.x warn-only semantics).
+ *   `false` (explicit opt-out): suspicious matches warn-only (log + audit
+ *     metadata, `status: allowed`), regardless of `injection_detection`.
+ *   `true` (pinned in `bst-internal*` and this repo's own policy): suspicious
  *     matches at write/destructive tier deny with verdict `suspicious` in the
  *     audit record.
+ *
+ * G9 follow-up (post-merge Codex finding #1): the pre-patch schema default
+ * of `false` silently loosened 0.2.x `injection_detection: block` behavior
+ * for any consumer who upgraded without adding the `injection:` block.
+ * Making this field optional and defaulting it at the middleware restores
+ * 0.2.x parity.
  */
 export interface InjectionPolicy {
-  suspicious_blocks_writes: boolean;
+  suspicious_blocks_writes?: boolean;
 }
 
 export interface Policy {

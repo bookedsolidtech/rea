@@ -1,3 +1,4 @@
+import { z } from 'zod';
 import type { Middleware, InvocationContext } from './chain.js';
 import { InvocationStatus, Tier } from '../../policy/types.js';
 import { wrapRegex, type SafeRegex } from '../redact-safe/match-timeout.js';
@@ -6,6 +7,17 @@ import { wrapRegex, type SafeRegex } from '../redact-safe/match-timeout.js';
  * Known prompt injection phrases (lowercase for case-insensitive matching).
  * These patterns are commonly used to override system instructions in tool
  * descriptions or resource content returned by downstream MCP servers.
+ *
+ * SECURITY (G9 follow-up): inputs are NFKC-normalized, whitespace-collapsed,
+ * and zero-width-stripped before matching (see `normalizeForMatch`). That
+ * means the phrases below can safely be written with plain ASCII spaces —
+ * the normalizer will fold NBSP, en-space, em-space, zero-width joiners,
+ * etc. into the same form so crafted Unicode variants cannot bypass.
+ *
+ * The pattern library is intentionally terse. Extending it is follow-up
+ * work (G9.1): pattern-set extensibility via policy is out of scope for
+ * this patch. Phrases added here must be short, lowercase, and tolerate
+ * the normalization pipeline (no Unicode, no non-ASCII punctuation).
  */
 export const INJECTION_PHRASES: readonly string[] = [
   'ignore previous instructions',
@@ -18,7 +30,55 @@ export const INJECTION_PHRASES: readonly string[] = [
   // is what distinguishes injection from ordinary status messages.
   'you are now a ',
   'you are now an ',
+  // G9 follow-up: additional role-reassignment / persona-swap vectors. These
+  // are conservative (English, short, anchored with an article or verb) so
+  // they don't fire on ordinary chat-style prose.
+  'act as a ',
+  'act as an ',
+  'pretend you are ',
+  'pretend to be ',
+  'roleplay as ',
 ];
+
+/**
+ * G9 follow-up — Unicode whitespace class covering the most common bypass
+ * vectors for literal-phrase matchers: NBSP (U+00A0), OGHAM SPACE MARK
+ * (U+1680), the EN/EM/THIN/HAIR space family (U+2000..U+200A), NARROW NBSP
+ * (U+202F), MEDIUM MATHEMATICAL SPACE (U+205F), IDEOGRAPHIC SPACE (U+3000).
+ * Collapsed to a single ASCII space before matching.
+ */
+const UNICODE_WHITESPACE_RE = /[\s\u00A0\u1680\u2000-\u200A\u202F\u205F\u3000]+/g;
+
+/**
+ * G9 follow-up — zero-width characters, stripped entirely before matching.
+ * U+200B ZERO WIDTH SPACE, U+200C ZERO WIDTH NON-JOINER, U+200D ZERO WIDTH
+ * JOINER, U+FEFF ZERO WIDTH NO-BREAK SPACE / BOM. Also U+2060 WORD JOINER.
+ */
+const ZERO_WIDTH_RE = /[\u200B-\u200D\u2060\uFEFF]/g;
+
+/**
+ * G9 follow-up — normalize an input string to a canonical form for literal
+ * phrase matching.
+ *
+ *   1. NFKC Unicode normalization — folds compatibility forms (fullwidth
+ *      letters, mathematical alphanumerics) into ASCII equivalents.
+ *   2. Strip zero-width characters — these are invisible and only serve to
+ *      break substring matches.
+ *   3. Collapse any run of Unicode whitespace (including NBSP, en/em space)
+ *      to a single ASCII space.
+ *   4. Lowercase — matches the case-insensitive contract of INJECTION_PHRASES.
+ *
+ * NEVER logs or exports the normalized text; it is used only for match-time
+ * comparison. The audit record still surfaces the PHRASE that matched, not
+ * the normalized input.
+ */
+export function normalizeForMatch(input: string): string {
+  return input
+    .normalize('NFKC')
+    .replace(ZERO_WIDTH_RE, '')
+    .replace(UNICODE_WHITESPACE_RE, ' ')
+    .toLowerCase();
+}
 
 /**
  * Base64-token scanner regex. The only regex the injection middleware runs
@@ -72,19 +132,44 @@ export interface InjectionTimeoutEvent {
  *     - any match at read tier (read-tier is permissive by design — a hit
  *       there is anomalous)
  *     - an unknown/missing tier (fail-closed)
+ *   `error` (G9 follow-up): scanner failure — at least one regex call
+ *     exceeded its worker-bounded timeout. Treated as inconclusive; the
+ *     call is NOT denied on this signal alone, but the metadata record
+ *     carries a stable `verdict` field so downstream audit consumers do
+ *     not receive a timeout event without a verdict shape.
  *
  * `matched_patterns` — the distinct phrase strings from `INJECTION_PHRASES`
  * that matched. Sorted for audit-log determinism. NEVER includes the input
- * text itself (no payload leakage).
+ * text itself (no payload leakage). On `verdict: 'error'` this array may be
+ * empty (the scan was abandoned).
  *
  * `base64_decoded` — true iff at least one match was found in content that
- * was base64-decoded before matching.
+ * was base64-decoded before matching. On `verdict: 'error'` this field
+ * reports whether any base64-decoded match was observed BEFORE the timeout.
  */
 export interface InjectionClassifierMetadata {
-  verdict: 'suspicious' | 'likely_injection';
+  verdict: 'suspicious' | 'likely_injection' | 'error';
   matched_patterns: string[];
   base64_decoded: boolean;
 }
+
+/**
+ * G9 follow-up — zod schema for the `ctx.metadata.injection` record the
+ * middleware emits. Every emitted record has a `verdict` field; downstream
+ * audit consumers may validate against this schema to catch shape
+ * regressions (e.g. the pre-fix behavior where a regex-timeout produced no
+ * `verdict` at all).
+ *
+ * Exported so external consumers (Helix, downstream tooling) can import it
+ * and validate the metadata they read off the audit log.
+ */
+export const InjectionMetadataSchema = z
+  .object({
+    verdict: z.enum(['suspicious', 'likely_injection', 'error']),
+    matched_patterns: z.array(z.string()),
+    base64_decoded: z.boolean(),
+  })
+  .strict();
 
 interface CompiledInjectionPatterns {
   base64Token: SafeRegex;
@@ -252,11 +337,15 @@ export function scanStringForInjection(
 ): void {
   if (!input || typeof input !== 'string') return;
 
-  const lower = input.toLowerCase();
+  // G9 follow-up: normalize before matching so NBSP / zero-width / fullwidth
+  // variants of injection phrases cannot bypass the literal check. The raw
+  // input is still scanned by the base64 tokenizer (SafeRegex expects the
+  // pre-normalization bytes).
+  const normalized = normalizeForMatch(input);
 
   // Literal phrases (indexOf — no regex, no ReDoS surface).
   for (const phrase of INJECTION_PHRASES) {
-    if (lower.includes(phrase)) {
+    if (normalized.includes(phrase)) {
       result.literalMatches.add(phrase);
     }
   }
@@ -268,9 +357,9 @@ export function scanStringForInjection(
   for (const token of base64Tokens) {
     const decoded = tryDecodeBase64(token, safe);
     if (!decoded) continue;
-    const decodedLower = decoded.toLowerCase();
+    const decodedNormalized = normalizeForMatch(decoded);
     for (const phrase of INJECTION_PHRASES) {
-      if (decodedLower.includes(phrase)) {
+      if (decodedNormalized.includes(phrase)) {
         result.base64DecodedMatches.add(phrase);
       }
     }
@@ -412,12 +501,29 @@ export interface InjectionMiddlewareOptions {
   /** Timeout budget for each regex call. Default 100ms. */
   matchTimeoutMs?: number;
   /**
-   * G9 — when true, `suspicious` classifications at write/destructive tier
-   * deny (same behavior as `likely_injection`). When false (schema default),
-   * `suspicious` warns only. `likely_injection` is unconditional deny in
-   * either case.
+   * G9 — governs whether `suspicious` classifications at write/destructive
+   * tier deny. `likely_injection` is ALWAYS deny regardless of this flag.
+   *
+   * Interpreted by `createInjectionMiddleware` with the `action` parameter:
+   *
+   *   - `action: 'warn'` (legacy `injection_detection: warn`): this flag is
+   *     IGNORED. Suspicious stays warn-only, 0.2.x parity. Operators who
+   *     pinned warn mode never get a suspicious-deny, even if a profile
+   *     layer flipped the flag to `true`.
+   *   - `action: 'block'` + flag `true`: suspicious denies.
+   *   - `action: 'block'` + flag `false`: suspicious warns only (explicit
+   *     opt-out). Non-bst consumers who want the looser posture must ask
+   *     for it.
+   *   - `action: 'block'` + flag `undefined` (UNSET): defaults to `true`,
+   *     restoring 0.2.x `injection_detection: block` parity for consumers
+   *     who omit the `injection:` policy block entirely. This was the
+   *     Codex-reported regression in PR #25 — non-bst consumers got
+   *     silently looser behavior on upgrade.
    *
    * Wired from `policy.injection.suspicious_blocks_writes` by the gateway.
+   * When the policy omits the `injection:` block, the field is `undefined`
+   * (the loader schema no longer applies a default) so this middleware can
+   * distinguish "not configured" from "explicitly false".
    */
   suspiciousBlocksWrites?: boolean;
 }
@@ -480,10 +586,20 @@ export function createInjectionMiddleware(
   opts: InjectionMiddlewareOptions = {},
 ): Middleware {
   const timeoutMs = opts.matchTimeoutMs ?? 100;
-  // When the operator explicitly pinned `injection_detection: warn`, honor it
-  // as the fallback for `suspicious` — keeps 0.2.x opt-out behavior intact.
-  // Otherwise the G9 flag governs whether `suspicious` denies.
-  const denyOnSuspicious = action === 'warn' ? false : (opts.suspiciousBlocksWrites ?? false);
+  // G9 follow-up (Codex round-1, finding #1): when `action === 'block'` and
+  // `suspicious_blocks_writes` is unset, default to `true` (strict, matches
+  // 0.2.x). The pre-patch default of `false` silently loosened upgraded
+  // consumers who had `injection_detection: block` pinned — a security
+  // regression masquerading as a refinement.
+  //
+  // Non-bst consumers who want the looser warn-only behavior MUST now opt
+  // out explicitly by setting `injection.suspicious_blocks_writes: false`.
+  // Operators who pinned `injection_detection: warn` still get warn-only by
+  // default (0.2.x warn parity), regardless of this flag.
+  const denyOnSuspicious =
+    action === 'warn'
+      ? false // warn mode hard-overrides suspicious deny — 0.2.x parity with `injection_detection: warn`
+      : (opts.suspiciousBlocksWrites ?? true); // block mode: default true (0.2.x parity)
 
   return async (ctx, next) => {
     await next();
@@ -491,7 +607,14 @@ export function createInjectionMiddleware(
     // Only scan if we have a result to inspect
     if (ctx.result == null) return;
 
+    // G9 follow-up (finding #4): track scanner timeout via a closure flag so
+    // we can emit a stable `verdict: 'error'` metadata record alongside the
+    // existing `injection.regex_timeout` event. Downstream audit consumers
+    // that key off `metadata.injection.verdict` no longer see a bare timing
+    // record with no verdict shape.
+    let scanTimedOut = false;
     const safe = compileInjectionPatterns(timeoutMs, (patternId, input) => {
+      scanTimedOut = true;
       recordInjectionTimeout(ctx, patternId, Buffer.byteLength(input, 'utf8'), timeoutMs);
     });
 
@@ -501,7 +624,47 @@ export function createInjectionMiddleware(
     };
     scanValueForInjection(ctx.result, scan, safe);
 
+    // G9 follow-up (finding #3): second-opinion base64 probe. The inline
+    // probe in `scanStringForInjection` scans tokens extracted from WITHIN
+    // strings. `decodeBase64Strings` is a stricter whole-string probe
+    // (length%4==0, ≥95% printable, no null bytes) that walks the whole
+    // result tree. Pre-patch, this helper was exported but never called —
+    // the G9 changeset advertised a probe that did not exist in the
+    // execution path. Any phrase detected in a decoded whole-string payload
+    // is merged into `base64DecodedMatches`, so classification rule #2
+    // (any base64 match → `likely_injection`) fires.
+    const base64Decoded = decodeBase64Strings(ctx.result);
+    for (const decoded of base64Decoded) {
+      const normalized = normalizeForMatch(decoded);
+      for (const phrase of INJECTION_PHRASES) {
+        if (normalized.includes(phrase)) {
+          scan.base64DecodedMatches.add(phrase);
+        }
+      }
+    }
+
     const classification = classifyInjection(scan, ctx.tier);
+
+    // G9 follow-up (finding #4): on scanner timeout, emit a verdict of
+    // 'error' if we otherwise have no signal. Real matches observed before
+    // the timeout fired still classify normally — the verdict is only
+    // rewritten to 'error' when the scan produced no actionable signal.
+    // Timeouts are NOT a deny signal: the worker was killed, we don't know
+    // what the attacker put in the payload, but we also cannot assume the
+    // worst without evidence. The audit record preserves the signal.
+    if (classification.verdict === 'clean' && scanTimedOut) {
+      const errorMeta: InjectionClassifierMetadata = {
+        verdict: 'error',
+        matched_patterns: [],
+        base64_decoded: false,
+      };
+      ctx.metadata[INJECTION_METADATA_KEY] = errorMeta;
+      process.stderr.write(
+        `[rea] INJECTION-GUARD (error): regex-timeout during scan of tool "${ctx.tool_name}" result; verdict inconclusive\n`,
+      );
+      return;
+    }
+
     if (classification.verdict === 'clean') return;
 
     // Write audit metadata. Export verdict + distinct matched phrases +
@@ -529,7 +692,7 @@ export function createInjectionMiddleware(
 
     // Deny policy:
     //   likely_injection → always deny
-    //   suspicious       → deny iff denyOnSuspicious (policy flag or legacy action='block' is irrelevant here — see construction above)
+    //   suspicious       → deny iff denyOnSuspicious (constructed above)
     const shouldDeny =
       classification.verdict === 'likely_injection' ||
       (classification.verdict === 'suspicious' && denyOnSuspicious);

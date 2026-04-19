@@ -74,20 +74,30 @@ const AuditPolicySchema = z
   .strict();
 
 /**
- * G9: injection tier escalation. `suspicious_blocks_writes` defaults to
- * `false` at the schema layer — this intentionally ships a NARROWER default
- * so 0.2.x users upgrading to 0.3.0 do not silently tighten (single-literal
- * matches at write/destructive tier become warn-only, no longer deny).
+ * G9: injection tier escalation. `suspicious_blocks_writes` is fully
+ * optional at the schema layer — absence is distinguishable from an
+ * explicit `false`. The middleware (`createInjectionMiddleware`) then
+ * applies the action-aware default:
  *
- * The `bst-internal` profile (and this repo's own policy) pins the flag to
- * `true` to preserve the stricter posture for Booked-internal consumers.
+ *   - `injection_detection: block` (default) + flag unset  → `true`
+ *     (0.2.x parity — a single literal match at write/destructive tier
+ *     still denies for upgraded consumers who omit the `injection:` block)
+ *   - `injection_detection: block` + flag explicit `false` → `false`
+ *     (explicit opt-out)
+ *   - `injection_detection: warn`  + flag unset or `false` → `false`
+ *     (warn mode preserves 0.2.x warn-only semantics)
+ *   - flag explicit `true` (pinned in `bst-internal*`)      → `true`
+ *
+ * This avoids the Codex-reported regression in PR #25 where the schema
+ * default of `false` silently loosened `injection_detection: block`
+ * behavior on upgrade for non-bst consumers.
  *
  * `likely_injection` verdicts (multi-literal matches, base64-decoded matches,
  * or any read-tier match) are ALWAYS deny regardless of this flag.
  */
 const InjectionPolicySchema = z
   .object({
-    suspicious_blocks_writes: z.boolean().default(false),
+    suspicious_blocks_writes: z.boolean().optional(),
   })
   .strict();
 
