@@ -269,11 +269,11 @@ describe('rea doctor — collectChecks (G11.4 codex_required)', () => {
     expect(check?.detail).toMatch(/rea init/);
   });
 
-  it('G6: executable-but-foreign active hook → warn, not pass', async () => {
+  it('G6: executable-but-foreign active hook → fail, not pass', async () => {
     // Finding 1 from the Codex post-merge review: an executable pre-push
     // that does NOT reference the review gate used to pass doctor because
     // the check only looked at `exists + executable`. With the governance
-    // requirement threaded through, this is now a warn with guidance.
+    // requirement threaded through, this is now always a fail with guidance.
     const repo = await makeScratchRepo({ codexRequired: true });
     cleanup.push(repo.dir);
     const hookPath = path.join(repo.dir, '.git', 'hooks', 'pre-push');
@@ -293,7 +293,7 @@ describe('rea doctor — collectChecks (G11.4 codex_required)', () => {
     };
     const checks = collectChecks(repo.dir, undefined, state);
     const check = findCheck(checks, 'pre-push hook installed');
-    expect(check?.status).toBe('warn');
+    expect(check?.status).toBe('fail');
     expect(check?.detail).toMatch(/silently bypassed/);
     expect(check?.detail).toMatch(/push-review-gate\.sh/);
   });
@@ -344,8 +344,9 @@ describe('rea doctor — collectChecks (G11.4 codex_required)', () => {
     expect(codexChecks).toHaveLength(0);
   });
 
-  it('G6 strict=false (default): activeForeign yields warn, not fail', async () => {
-    // Finding 2 — default (no-flag) mode: interactive behaviour, warn only.
+  it('G6 strict=false (default): activeForeign yields fail (always)', async () => {
+    // activeForeign is always a fail regardless of strict mode — a foreign hook
+    // that bypasses the review gate is a governance gap, not just a warning.
     const repo = await makeScratchRepo({ codexRequired: true });
     cleanup.push(repo.dir);
     const hookPath = path.join(repo.dir, '.git', 'hooks', 'pre-push');
@@ -363,10 +364,9 @@ describe('rea doctor — collectChecks (G11.4 codex_required)', () => {
         },
       ],
     };
-    // No strict flag → warn.
     const checks = collectChecks(repo.dir, undefined, state);
     const check = findCheck(checks, 'pre-push hook installed');
-    expect(check?.status).toBe('warn');
+    expect(check?.status).toBe('fail');
     expect(check?.detail).toMatch(/silently bypassed/);
   });
 

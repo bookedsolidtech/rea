@@ -256,7 +256,7 @@ function checkCommitMsgHook(baseDir: string): CheckResult {
  * "Executable" is defined by any user/group/other exec bit, matching
  * `checkHooksInstalled`.
  */
-function checkPrePushHook(state: PrePushDoctorState, strict: boolean): CheckResult {
+function checkPrePushHook(state: PrePushDoctorState, _strict: boolean): CheckResult {
   if (state.ok) {
     const active = state.candidates.find((c) => c.path === state.activePath);
     const kind =
@@ -278,12 +278,11 @@ function checkPrePushHook(state: PrePushDoctorState, strict: boolean): CheckResu
     // add the exec line manually or remove it and let `rea init` install
     // the fallback.
     //
-    // In strict mode this is a hard `fail` so CI can catch it. In the
-    // default interactive mode it stays `warn` to avoid blocking local
-    // workflows where a deliberate custom hook exists.
+    // Always fail — a foreign hook that bypasses the review gate is a
+    // governance gap regardless of strict mode.
     return {
       label: 'pre-push hook installed',
-      status: strict ? 'fail' : 'warn',
+      status: 'fail',
       detail:
         `active pre-push at ${state.activePath} is present and executable but does NOT ` +
         `reference \`.claude/hooks/push-review-gate.sh\` — the protected-path ` +
@@ -400,8 +399,7 @@ function codexRequiredFromPolicy(baseDir: string): boolean {
  * both; callers that don't (e.g. unit tests of the existing doctor
  * surface) can omit them and those checks are skipped.
  *
- * `strict` — when true, an `activeForeign` pre-push state is reported as
- * `fail` instead of `warn`. See `RunDoctorOptions.strict`.
+ * `strict` — reserved; `activeForeign` is always `fail` regardless of this flag.
  */
 export function collectChecks(
   baseDir: string,

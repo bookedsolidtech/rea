@@ -183,6 +183,12 @@ export function isReaManagedHuskyGate(content: string): boolean {
  */
 export function referencesReviewGate(content: string): boolean {
   const lines = content.split(/\r?\n/);
+  // Track whether an unconditional exit/return appeared before the gate
+  // invocation. A bare `exit 0` before the invocation makes the gate
+  // unreachable — we must not treat that as "governance present."
+  // This is a conservative heuristic (does not parse if-else), but it
+  // catches the simplest bypass pattern.
+  let exitedBeforeGate = false;
   for (const raw of lines) {
     // Normalize: drop leading whitespace, drop a trailing inline comment
     // (naive — does not account for `#` inside single/double quotes, but
@@ -202,6 +208,16 @@ export function referencesReviewGate(content: string): boolean {
         line = line.slice(0, hashIdx).trimEnd();
       }
     }
+    // Detect bare unconditional exit/return before the gate invocation.
+    // Pattern: `exit` or `exit N` or `return` or `return N` as the sole
+    // command on the line (not inside a function body or if-statement —
+    // we can't parse those without a full shell parser, but catching the
+    // trivial case closes the most obvious bypass).
+    // Use raw (before whitespace stripping) so that indented exits inside
+    // if-blocks are not mistaken for unconditional top-level exits.
+    if (/^(exit|return)(\s+\d+)?$/.test(raw.trimEnd())) {
+      exitedBeforeGate = true;
+    }
     if (!line.includes(GATE_DELEGATION_TOKEN)) continue;
 
     // Candidate line. Require it look like an invocation, not a string
@@ -217,7 +233,7 @@ export function referencesReviewGate(content: string): boolean {
     // This is a pragmatic heuristic, not a full shell parser. It
     // correctly accepts the shapes observed in husky+rea setups and
     // rejects `printf 'hint: ...push-review-gate.sh' >&2` style strings.
-    if (looksLikeGateInvocation(line)) return true;
+    if (looksLikeGateInvocation(line) && !exitedBeforeGate) return true;
   }
   return false;
 }
