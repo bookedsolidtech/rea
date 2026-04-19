@@ -37,7 +37,18 @@ import type { Middleware } from './chain.js';
  * SECURITY: Glob patterns (`*`, `?`) in blocked_paths are interpreted as
  *   single-segment globs (`*` = any chars except `/`, `?` = one non-`/` char).
  * SECURITY: URL-encoded separators and case variants are normalized first.
+ * SECURITY: Double-encoded separators (%252F → %2F → /) are decoded on a
+ *   second pass so they cannot escape the normalizer.
+ * SECURITY: URI scheme prefixes (file://, http://, …) are stripped before
+ *   decoding so scheme-wrapped absolute paths cannot bypass absolute patterns.
+ * SECURITY: C0 control characters (including null bytes) are stripped after
+ *   decoding so they cannot smuggle segment prefixes past equality checks.
  * SECURITY: Malformed URL-escapes are treated as hostile (request blocked).
+ * SECURITY: Paths with `%` that are not full `%XX` sequences (e.g.
+ *   `/builds/50%complete/`) trigger the malformed-escape fail-closed gate.
+ *   This is intentional: such values are structurally ambiguous and treated
+ *   as hostile. Callers that need literal `%` in paths must percent-encode
+ *   it as `%25`.
  * SECURITY: Hot-reloads blocked_paths from policy.yaml when baseDir is given.
  */
 
@@ -349,24 +360,51 @@ function globToRegex(glob: string): RegExp {
 }
 
 /**
- * Normalize a value or pattern: URL-decode, normalize path separators, resolve
- * `.`/`..` segments, lowercase.
+ * Normalize a value or pattern: strip URI scheme, URL-decode (with a second
+ * pass for double-encoded separators), strip C0 control characters, normalize
+ * path separators, resolve `.`/`..` segments, lowercase.
  *
  * IMPORTANT: callers MUST first reject malformed URL-escapes via
  * `hasMalformedEscape()` before calling this on untrusted input. Silently
  * falling back to undecoded content on URIError previously allowed crafted
  * `.rea%ZZ/foo` sequences to bypass the `.rea/` check.
+ *
+ * Step 1 — Strip URI scheme prefix (Finding 3): `file:///etc/passwd` becomes
+ *   `/etc/passwd` so absolute-path patterns match correctly.
+ * Step 2 — First decode pass.
+ * Step 3 — Second decode pass (Finding 1): catches double-encoded separators
+ *   such as `%252F` → `%2F` → `/`. We only run the second pass when the
+ *   first-decoded result still contains a percent-encoded path separator or
+ *   dot (`%2f`, `%5c`, `%2e`).
+ * Step 4 — Strip C0 control characters (Finding 2): removes null bytes and
+ *   other control chars that could smuggle segment prefixes past equality
+ *   checks (e.g. `\x00.gitignore` → `.gitignore`).
  */
 function normalizePath(raw: string): string {
-  let v = raw;
+  // Step 1: strip URI scheme prefix so file:///etc/passwd → /etc/passwd.
+  let v = raw.replace(/^[a-zA-Z][a-zA-Z0-9+\-.]*:\/\/\//g, '/');
+
   try {
-    v = decodeURIComponent(raw);
+    // Step 2: first decode pass.
+    v = decodeURIComponent(v);
+    // Step 3: second decode pass for double-encoded path separators/dots.
+    // %252F → (first pass) %2F → (second pass) /
+    // %252E → (first pass) %2E → (second pass) .
+    // %255C → (first pass) %5C → (second pass) \
+    if (/%2[fFeE]|%5[cC]/i.test(v)) {
+      v = decodeURIComponent(v);
+    }
   } catch {
     // Trusted-pattern fallback: patterns come from policy.yaml and never
     // reach this branch in practice. Untrusted values are filtered upstream
     // by `hasMalformedEscape()`, so this catch is defense in depth for
     // trusted inputs only. Leave value as-is.
   }
+
+  // Step 4: strip C0 control characters (including null bytes \x00–\x1f)
+  // that could prefix a segment and defeat segment-equality matching.
+  v = v.replace(/[\x00-\x1f]/g, '');
+
   v = v.replace(/\\/g, '/');
   v = path.posix.normalize(v);
   return v.toLowerCase();

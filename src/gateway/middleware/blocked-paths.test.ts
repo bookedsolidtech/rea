@@ -406,3 +406,89 @@ describe('blocked-paths middleware — 0.4.0 Codex round-1 regressions', () => {
     });
   });
 });
+
+describe('blocked-paths middleware — Codex round-2 security findings', () => {
+  // Finding 1 (HIGH): double-encoded path separator bypass.
+  // %252F → first decodeURIComponent → %2F → second pass → /
+  // Without the second decode pass, .rea%252Ffoo splits as ['.rea%2ffoo']
+  // and never matches the '.rea/' pattern.
+  describe('Finding 1 — double-encoding bypass (%252F)', () => {
+    it('blocks .rea/ referenced via double-encoded separator (%252F)', async () => {
+      const mw = createBlockedPathsMiddleware(stubPolicy([]));
+      const ctx = freshCtx({ file_path: '.rea%252Ffoo' });
+      await run(mw, ctx);
+      expect(ctx.status).toBe(InvocationStatus.Denied);
+    });
+
+    it('blocks .env referenced via double-encoded separator (%252F)', async () => {
+      const mw = createBlockedPathsMiddleware(stubPolicy(['.env']));
+      const ctx = freshCtx({ file_path: '/project%252F.env' });
+      await run(mw, ctx);
+      expect(ctx.status).toBe(InvocationStatus.Denied);
+    });
+  });
+
+  // Finding 2 (MEDIUM): null-byte prefix evasion.
+  // %00.gitignore → normalizePath decodes to \x00.gitignore → strip C0 → .gitignore
+  // Without C0 stripping, the segment '\x00.gitignore' !== '.gitignore'.
+  describe('Finding 2 — null-byte prefix evasion', () => {
+    it('blocks .rea/ when referenced with a null-byte prefix (%00.rea/foo)', async () => {
+      const mw = createBlockedPathsMiddleware(stubPolicy([]));
+      const ctx = freshCtx({ file_path: '%00.rea/foo' });
+      await run(mw, ctx);
+      expect(ctx.status).toBe(InvocationStatus.Denied);
+    });
+
+    it('blocks .env when value has null-byte prefix (%00.env)', async () => {
+      const mw = createBlockedPathsMiddleware(stubPolicy(['.env']));
+      const ctx = freshCtx({ file_path: '%00.env' });
+      await run(mw, ctx);
+      expect(ctx.status).toBe(InvocationStatus.Denied);
+    });
+  });
+
+  // Finding 3 (MEDIUM): file:// URI scheme bypasses absolute patterns.
+  // file:///etc/passwd → path.posix.normalize → file:/etc/passwd → segs[0]='file:'
+  // Absolute pattern /etc/passwd never matched because 'file:' !== 'etc'.
+  describe('Finding 3 — file:// URI scheme bypass', () => {
+    it('blocks /etc/passwd when referenced as file:///etc/passwd', async () => {
+      const mw = createBlockedPathsMiddleware(stubPolicy(['/etc/passwd']));
+      const ctx = freshCtx({ file_path: 'file:///etc/passwd' });
+      await run(mw, ctx);
+      expect(ctx.status).toBe(InvocationStatus.Denied);
+    });
+
+    it('blocks .rea/ when referenced as file:///project/.rea/policy.yaml', async () => {
+      const mw = createBlockedPathsMiddleware(stubPolicy([]));
+      const ctx = freshCtx({ file_path: 'file:///project/.rea/policy.yaml' });
+      await run(mw, ctx);
+      expect(ctx.status).toBe(InvocationStatus.Denied);
+    });
+  });
+
+  // Finding 4 (MEDIUM): intentional fail-closed behavior for bare % in paths.
+  // /builds/50%complete/ contains `%co` where 'c' is hex but 'o' is not —
+  // hasMalformedEscape returns true and the request is denied. This is
+  // intentional: structurally ambiguous percent sequences are treated as hostile.
+  // Callers that need a literal `%` must encode it as `%25`.
+  describe('Finding 4 — intentional fail-closed on bare % (documented behavior)', () => {
+    it('denies /builds/50%complete/ as a malformed URL-escape (intentional fail-closed)', async () => {
+      const mw = createBlockedPathsMiddleware(stubPolicy([]));
+      const ctx = freshCtx({ file_path: '/builds/50%complete/' });
+      await run(mw, ctx);
+      // Intentional: `%co` is not a valid %XX sequence (o is not hex).
+      // This is known and accepted fail-closed behavior — not a false positive
+      // to be fixed. Callers must percent-encode literal `%` as `%25`.
+      expect(ctx.status).toBe(InvocationStatus.Denied);
+      expect(ctx.error).toMatch(/malformed URL-escape/i);
+    });
+
+    it('allows /builds/50%25complete/ (correctly percent-encoded literal %)', async () => {
+      const mw = createBlockedPathsMiddleware(stubPolicy([]));
+      const ctx = freshCtx({ file_path: '/builds/50%25complete/' });
+      const nextCalled = await run(mw, ctx);
+      expect(nextCalled).toBe(true);
+      expect(ctx.status).toBe(InvocationStatus.Allowed);
+    });
+  });
+});
