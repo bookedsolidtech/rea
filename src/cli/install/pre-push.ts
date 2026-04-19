@@ -130,24 +130,22 @@ export function isReaManagedFallback(content: string): boolean {
  * gate-referencing foreign hook is a legitimate integration point —
  * doctor reports `pass`, install skips.
  *
- * A plain `content.includes(...)` check is NOT enough: a comment that
- * merely mentions the path (`# Hint: run push-review-gate.sh`), a HELP
- * string, or leftover documentation would all false-positive as
- * governance-wired and open the "silent bypass" hole this module exists
- * to close. We require the token to appear on a NON-comment line that
- * looks like an exec/command — either:
- *   - opens with an exec form: `exec "…push-review-gate.sh"`, `exec …`,
- *     `"…push-review-gate.sh" "$@"`, `sh .../push-review-gate.sh …`,
- *     `bash .../push-review-gate.sh …`, `.../push-review-gate.sh "$@"`,
- *   - or is a `source`/`.` inclusion: `source .../push-review-gate.sh`,
- *     `. .../push-review-gate.sh`.
- * Anything else — a comment starting with `#`, a shell string literal in
- * a `printf`/`echo`, a grep log — is rejected.
+ * Uses a positive-match (allowlist) strategy via `looksLikeGateInvocation`:
+ * the gate token must appear as an actual invocation — either as the first
+ * command on a line (bare path) or immediately after one of the explicit
+ * delegation keywords (`exec`, `.`, `source`, `sh`, `bash`, `zsh`).
  *
- * We strip inline comments (`# ...` to EOL) and leading whitespace before
- * matching. We do NOT attempt full shell parsing; the goal is rejecting
- * the obvious false positives Codex flagged, not sandboxing every
- * conceivable legitimate invocation.
+ * Non-invocation references that return `false` include:
+ *   - A comment line starting with `#`
+ *   - A shell test: `[ -x .claude/hooks/push-review-gate.sh ]`
+ *   - A file-existence test: `test -f .claude/hooks/push-review-gate.sh`
+ *   - A chmod: `chmod +x .claude/hooks/push-review-gate.sh`
+ *   - A copy: `cp .claude/hooks/push-review-gate.sh /tmp/`
+ *   - A printf/echo/string literal mentioning the path
+ *
+ * We strip inline comments and leading whitespace before matching. We do
+ * NOT attempt full shell parsing; the goal is reliably accepting the
+ * canonical invocation forms and rejecting the known false-positive shapes.
  */
 export function referencesReviewGate(content: string): boolean {
   const lines = content.split(/\r?\n/);
@@ -191,32 +189,52 @@ export function referencesReviewGate(content: string): boolean {
 }
 
 /**
- * Heuristic: does `line` invoke the gate rather than merely mention it?
+ * Positive-match only: does `line` actually invoke the gate?
  *
- * Accepts:
- *   - `exec <optional-prefix>.claude/hooks/push-review-gate.sh …`
- *   - `sh <path>/push-review-gate.sh …`, `bash <path>/push-review-gate.sh …`
- *   - `source <path>/push-review-gate.sh`, `. <path>/push-review-gate.sh`
- *   - `<path>/push-review-gate.sh "$@"` (bare invocation at line start)
- *   - Variants where the gate path is single/double quoted.
+ * Returns `true` ONLY in two forms:
+ *   1. Bare line-start invocation — the gate path (possibly quoted, possibly
+ *      with a path prefix) is the first token on the line. Examples:
+ *        `.claude/hooks/push-review-gate.sh "$@"`
+ *        `"/abs/path/.claude/hooks/push-review-gate.sh"`
+ *   2. Explicit delegation keyword immediately before the path — exactly one
+ *      of `exec`, `.`, `source`, `sh`, `bash`, or `zsh` followed only by
+ *      whitespace and then the gate path (again, optionally quoted/prefixed).
+ *      Examples:
+ *        `exec .claude/hooks/push-review-gate.sh "$@"`
+ *        `. .claude/hooks/push-review-gate.sh`
+ *        `sh .claude/hooks/push-review-gate.sh`
  *
- * Rejects:
- *   - The token inside a `printf`/`echo`/string literal.
- *   - A comment (already filtered by the caller).
+ * Everything else returns `false`. Specifically, command words like `test`,
+ * `[`, `[[`, `chmod`, `cp`, `mv`, `cat`, `echo`, `printf`, `if`, `while`,
+ * `#` (comment — already filtered by caller) etc. before the gate path are
+ * NOT invocation forms and return `false`.
+ *
+ * This is a deliberate positive-match (allowlist) approach; a blocklist is
+ * insufficient because any new "mention" form would be a false positive until
+ * explicitly blocked. The allowlist is stable: the set of ways to actually
+ * exec a shell script does not grow.
  */
 function looksLikeGateInvocation(line: string): boolean {
-  // Token anywhere on the line. We already confirmed presence in the caller.
-  // Strip leading/trailing quotes around the gate reference for uniform
-  // pattern matching.
-  const tokenRe = /(?:^|[\s;&|(])(?:(?:exec|source|sh|bash|zsh|\.)\s+)?["']?([A-Za-z0-9_./~${}-]*\.claude\/hooks\/push-review-gate\.sh)["']?(?=[\s;&|)"']|$)/;
-  const m = tokenRe.exec(line);
-  if (m === null) return false;
-  // Reject if the match is inside a simple string literal argument to a
-  // known "text output" command. This covers the `printf '... push-review-
-  // gate.sh ...'` false positive without trying to parse shell fully.
-  const before = line.slice(0, m.index).trim();
-  if (/^(printf|echo|cat|tee|logger)\b/.test(before)) return false;
-  return true;
+  // Form 1: gate path is the first thing on the (already-trimmed) line.
+  // The gate reference (optionally quoted, optionally with a path prefix
+  // containing only path-safe characters) must start at position 0.
+  // Characters like `=`, `[`, `(` before the gate token indicate a
+  // non-invocation context and prevent a match.
+  const bareInvocationRe =
+    /^["']?[A-Za-z0-9_./${}~-]*\.claude\/hooks\/push-review-gate\.sh/;
+  if (bareInvocationRe.test(line)) {
+    return true;
+  }
+
+  // Form 2: one of the explicit delegation keywords immediately before the
+  // gate path. Pattern: keyword + one-or-more whitespace + gate-path.
+  const delegationRe =
+    /^(exec|source|sh|bash|zsh|\.)\s+["']?[A-Za-z0-9_./${}~-]*\.claude\/hooks\/push-review-gate\.sh/;
+  if (delegationRe.test(line)) {
+    return true;
+  }
+
+  return false;
 }
 
 /**

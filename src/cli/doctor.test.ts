@@ -343,4 +343,58 @@ describe('rea doctor — collectChecks (G11.4 codex_required)', () => {
     );
     expect(codexChecks).toHaveLength(0);
   });
+
+  it('G6 strict=false (default): activeForeign yields warn, not fail', async () => {
+    // Finding 2 — default (no-flag) mode: interactive behaviour, warn only.
+    const repo = await makeScratchRepo({ codexRequired: true });
+    cleanup.push(repo.dir);
+    const hookPath = path.join(repo.dir, '.git', 'hooks', 'pre-push');
+    const state: PrePushDoctorState = {
+      ok: false,
+      activeForeign: true,
+      activePath: hookPath,
+      candidates: [
+        {
+          path: hookPath,
+          exists: true,
+          executable: true,
+          reaManaged: false,
+          delegatesToGate: false,
+        },
+      ],
+    };
+    // No strict flag → warn.
+    const checks = collectChecks(repo.dir, undefined, state);
+    const check = findCheck(checks, 'pre-push hook installed');
+    expect(check?.status).toBe('warn');
+    expect(check?.detail).toMatch(/silently bypassed/);
+  });
+
+  it('G6 strict=true: activeForeign yields fail, not warn', async () => {
+    // Finding 2 — strict mode: CI must exit non-zero when the active pre-push
+    // hook does not invoke the review gate. This is the governance-absent
+    // state the gate exists to prevent.
+    const repo = await makeScratchRepo({ codexRequired: true });
+    cleanup.push(repo.dir);
+    const hookPath = path.join(repo.dir, '.git', 'hooks', 'pre-push');
+    const state: PrePushDoctorState = {
+      ok: false,
+      activeForeign: true,
+      activePath: hookPath,
+      candidates: [
+        {
+          path: hookPath,
+          exists: true,
+          executable: true,
+          reaManaged: false,
+          delegatesToGate: false,
+        },
+      ],
+    };
+    // strict=true → fail.
+    const checks = collectChecks(repo.dir, undefined, state, true);
+    const check = findCheck(checks, 'pre-push hook installed');
+    expect(check?.status).toBe('fail');
+    expect(check?.detail).toMatch(/silently bypassed/);
+  });
 });

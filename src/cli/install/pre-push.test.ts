@@ -22,6 +22,7 @@ import {
   FALLBACK_MARKER,
   inspectPrePushState,
   installPrePushFallback,
+  referencesReviewGate,
 } from './pre-push.js';
 
 const execFileAsync = promisify(execFile);
@@ -672,5 +673,182 @@ describe('installPrePushFallback — concurrency + temp-file hygiene', () => {
     // And a subsequent call in the same worktree should cleanly refresh.
     const second = await installPrePushFallback(worktreeDir);
     expect(second.decision.action).toBe('refresh');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Finding 1 regression suite — looksLikeGateInvocation positive-match only
+//
+// These tests drive `referencesReviewGate` directly to verify that the
+// refactored positive-match implementation no longer false-positives on
+// non-invocation references to the gate path.
+// ---------------------------------------------------------------------------
+describe('referencesReviewGate — positive-match only (Finding 1 regressions)', () => {
+  const token = '.claude/hooks/push-review-gate.sh';
+
+  // ---- Accepted forms -------------------------------------------------------
+
+  it('bare line-start invocation: returns true', () => {
+    expect(referencesReviewGate(`#!/bin/sh\n${token} "$@"\n`)).toBe(true);
+  });
+
+  it('exec delegation: returns true', () => {
+    expect(referencesReviewGate(`#!/bin/sh\nexec ${token} "$@"\n`)).toBe(true);
+  });
+
+  it('. (dot) delegation: returns true', () => {
+    expect(referencesReviewGate(`#!/bin/sh\n. ${token}\n`)).toBe(true);
+  });
+
+  it('source delegation: returns true', () => {
+    expect(referencesReviewGate(`#!/bin/sh\nsource ${token}\n`)).toBe(true);
+  });
+
+  it('sh delegation: returns true', () => {
+    expect(referencesReviewGate(`#!/bin/sh\nsh ${token}\n`)).toBe(true);
+  });
+
+  it('bash delegation: returns true', () => {
+    expect(referencesReviewGate(`#!/bin/sh\nbash ${token} "$@"\n`)).toBe(true);
+  });
+
+  it('zsh delegation: returns true', () => {
+    expect(referencesReviewGate(`#!/bin/sh\nzsh ${token} "$@"\n`)).toBe(true);
+  });
+
+  it('exec with absolute path prefix: returns true', () => {
+    expect(
+      referencesReviewGate(
+        `#!/bin/sh\nexec /repo/root/${token} "$@"\n`,
+      ),
+    ).toBe(true);
+  });
+
+  it('indented exec delegation: returns true', () => {
+    // Leading whitespace is stripped before matching.
+    expect(
+      referencesReviewGate(`#!/bin/sh\n  exec ${token} "$@"\n`),
+    ).toBe(true);
+  });
+
+  // ---- Rejected forms (false-positive regressions) --------------------------
+
+  it('full-line comment mentioning the path: returns false', () => {
+    // `[ -x .claude/hooks/push-review-gate.sh ] || exit 1`
+    // Wait — this is a test/bracket expression, not a comment. Add the
+    // comment case explicitly.
+    expect(
+      referencesReviewGate(
+        `#!/bin/sh\n# TODO: wire ${token}\n`,
+      ),
+    ).toBe(false);
+  });
+
+  it('shell test [ -x ... ]: returns false', () => {
+    expect(
+      referencesReviewGate(
+        `#!/bin/sh\n[ -x ${token} ] || exit 1\n`,
+      ),
+    ).toBe(false);
+  });
+
+  it('shell test [[ -x ... ]]: returns false', () => {
+    expect(
+      referencesReviewGate(
+        `#!/bin/sh\n[[ -x ${token} ]] || exit 1\n`,
+      ),
+    ).toBe(false);
+  });
+
+  it('test builtin: returns false', () => {
+    expect(
+      referencesReviewGate(
+        `#!/bin/sh\ntest -f ${token}\n`,
+      ),
+    ).toBe(false);
+  });
+
+  it('chmod: returns false', () => {
+    expect(
+      referencesReviewGate(
+        `#!/bin/sh\nchmod +x ${token}\n`,
+      ),
+    ).toBe(false);
+  });
+
+  it('cp: returns false', () => {
+    expect(
+      referencesReviewGate(
+        `#!/bin/sh\ncp ${token} /tmp/\n`,
+      ),
+    ).toBe(false);
+  });
+
+  it('mv: returns false', () => {
+    expect(
+      referencesReviewGate(
+        `#!/bin/sh\nmv ${token} /tmp/gate.sh\n`,
+      ),
+    ).toBe(false);
+  });
+
+  it('printf string literal: returns false', () => {
+    expect(
+      referencesReviewGate(
+        `#!/bin/sh\nprintf 'hint: run ${token}\\n' >&2\n`,
+      ),
+    ).toBe(false);
+  });
+
+  it('echo string literal: returns false', () => {
+    expect(
+      referencesReviewGate(
+        `#!/bin/sh\necho "see ${token} for details"\n`,
+      ),
+    ).toBe(false);
+  });
+
+  it('if condition with -x test: returns false', () => {
+    expect(
+      referencesReviewGate(
+        `#!/bin/sh\nif [ ! -x ${token} ]; then\n  echo missing\nfi\n`,
+      ),
+    ).toBe(false);
+  });
+
+  it('variable assignment: returns false', () => {
+    // GATE=".claude/hooks/push-review-gate.sh" — assignment, not invocation.
+    expect(
+      referencesReviewGate(
+        `#!/bin/sh\nGATE=${token}\n`,
+      ),
+    ).toBe(false);
+  });
+
+  it('gate path appears only inside an if-condition test — no bare exec anywhere: returns false', () => {
+    const content = [
+      '#!/bin/sh',
+      `if [ ! -x ${token} ]; then`,
+      '  echo "gate missing" >&2',
+      '  exit 1',
+      'fi',
+      '',
+    ].join('\n');
+    expect(referencesReviewGate(content)).toBe(false);
+  });
+
+  it('gate path mentioned in a guard block then exec-ed: returns true', () => {
+    // Full pattern from the actual fallback hook: guard test + exec. The
+    // exec on the final line is the real invocation and must return true.
+    const content = [
+      '#!/bin/sh',
+      `if [ ! -x ${token} ]; then`,
+      '  echo "gate missing" >&2',
+      '  exit 1',
+      'fi',
+      `exec ${token} "$@"`,
+      '',
+    ].join('\n');
+    expect(referencesReviewGate(content)).toBe(true);
   });
 });

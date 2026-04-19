@@ -243,19 +243,20 @@ function checkCommitMsgHook(baseDir: string): CheckResult {
  *      unconfigured hooksPath is dead weight; we do NOT treat it as
  *      sufficient.
  *
- * Three possible outcomes:
+ * Three possible outcomes (default / strict):
  *   - `pass`: active hook exists, is executable, and governance-carrying.
- *   - `warn`: active hook exists + is executable but does NOT reference
- *     the review gate (the "silent bypass" case — a lint-only husky hook,
- *     a pre-existing repo hook). We refuse to auto-stomp it, but the gate
- *     is not wired; the user must add a gate `exec` or let `rea init`
- *     install the fallback in a governance-carrying way.
+ *   - `warn` (default) / `fail` (strict): active hook exists + is
+ *     executable but does NOT invoke the review gate (the "silent bypass"
+ *     case — a lint-only husky hook, a pre-existing repo hook). We refuse
+ *     to auto-stomp it, but the gate is not wired; the user must add a
+ *     gate `exec` or let `rea init` install the fallback. CI must run with
+ *     `--strict` so this state causes a non-zero exit code.
  *   - `fail`: no active hook at all (or active file is non-executable).
  *
  * "Executable" is defined by any user/group/other exec bit, matching
  * `checkHooksInstalled`.
  */
-function checkPrePushHook(state: PrePushDoctorState): CheckResult {
+function checkPrePushHook(state: PrePushDoctorState, strict: boolean): CheckResult {
   if (state.ok) {
     const active = state.candidates.find((c) => c.path === state.activePath);
     const kind =
@@ -272,13 +273,17 @@ function checkPrePushHook(state: PrePushDoctorState): CheckResult {
 
   if (state.activeForeign) {
     // Executable file exists at the active path but does not carry
-    // governance. Downgrade to warn — the protected-path gate is not
-    // wired, but we don't have the authority to replace a consumer's hook
-    // silently. Surface the path so they can add the exec line manually
-    // or remove it and let `rea init` install the fallback.
+    // governance. The gate is not wired, but we don't have the authority
+    // to replace a consumer's hook silently. Surface the path so they can
+    // add the exec line manually or remove it and let `rea init` install
+    // the fallback.
+    //
+    // In strict mode this is a hard `fail` so CI can catch it. In the
+    // default interactive mode it stays `warn` to avoid blocking local
+    // workflows where a deliberate custom hook exists.
     return {
       label: 'pre-push hook installed',
-      status: 'warn',
+      status: strict ? 'fail' : 'warn',
       detail:
         `active pre-push at ${state.activePath} is present and executable but does NOT ` +
         `reference \`.claude/hooks/push-review-gate.sh\` — the protected-path ` +
@@ -394,11 +399,15 @@ function codexRequiredFromPolicy(baseDir: string): boolean {
  * Callers that already have fresh state (e.g. `runDoctor`) should pass
  * both; callers that don't (e.g. unit tests of the existing doctor
  * surface) can omit them and those checks are skipped.
+ *
+ * `strict` — when true, an `activeForeign` pre-push state is reported as
+ * `fail` instead of `warn`. See `RunDoctorOptions.strict`.
  */
 export function collectChecks(
   baseDir: string,
   codexProbeState?: CodexProbeState,
   prePushState?: PrePushDoctorState,
+  strict?: boolean,
 ): CheckResult[] {
   const policyPath = reaPath(baseDir, POLICY_FILE);
   const registryPath = reaPath(baseDir, REGISTRY_FILE);
@@ -414,7 +423,7 @@ export function collectChecks(
     checkCommitMsgHook(baseDir),
   ];
   if (prePushState !== undefined) {
-    checks.push(checkPrePushHook(prePushState));
+    checks.push(checkPrePushHook(prePushState, strict === true));
   }
 
   if (codexRequiredFromPolicy(baseDir)) {
@@ -448,6 +457,17 @@ export interface RunDoctorOptions {
    * `rea upgrade` to reconcile).
    */
   drift?: boolean;
+  /**
+   * G6 strict mode — when true, an executable pre-push hook that exists at
+   * the active git hooks path but does NOT invoke the shared review gate is
+   * classified as `fail` rather than `warn`. This is the governance-absent
+   * state the gate is designed to catch; CI should always pass `--strict`
+   * so `rea doctor --strict` exits 1 in that state.
+   *
+   * Default (`false`) keeps the interactive behaviour: `warn` surfaces the
+   * gap without blocking the user's local workflow.
+   */
+  strict?: boolean;
 }
 
 export interface DriftRow {
@@ -666,7 +686,7 @@ export async function runDoctor(opts: RunDoctorOptions = {}): Promise<void> {
     prePushState = undefined;
   }
 
-  const checks = collectChecks(baseDir, probeState, prePushState);
+  const checks = collectChecks(baseDir, probeState, prePushState, opts.strict);
 
   console.log('');
   log(`Doctor — ${baseDir}`);

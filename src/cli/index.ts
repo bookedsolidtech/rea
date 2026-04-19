@@ -144,10 +144,15 @@ async function main(): Promise<void> {
     .description('Validate the install: policy parses, .rea/ layout, hooks, Codex plugin.')
     .option('--metrics', 'also print a 7-day summary of Codex telemetry (G11.5)')
     .option('--drift', 'report drift vs. the install manifest (read-only; does not mutate)')
-    .action(async (opts: { metrics?: boolean; drift?: boolean }) => {
+    .option(
+      '--strict',
+      'treat an active-but-non-governing pre-push hook as a hard fail (use in CI)',
+    )
+    .action(async (opts: { metrics?: boolean; drift?: boolean; strict?: boolean }) => {
       await runDoctor({
         ...(opts.metrics === true ? { metrics: true } : {}),
         ...(opts.drift === true ? { drift: true } : {}),
+        ...(opts.strict === true ? { strict: true } : {}),
       });
     });
 
