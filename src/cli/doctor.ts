@@ -272,30 +272,16 @@ function checkPrePushHook(state: PrePushDoctorState): CheckResult {
   }
 
   if (state.activeForeign) {
-    if (state.activeSuspect) {
-      // Hook mentions the gate path literally but the parser could not
-      // confirm a clean delegating invocation. Usually an unusual-but-
-      // valid shell shape (command substitution, exotic variable
-      // indirection, `eval` forms). Downgrade to a warning so the
-      // operator can verify manually instead of seeing a red-light on
-      // every `rea doctor` run of a governed-but-unparseable hook.
-      //
-      // R12 F2: a parser miss is not proof that governance is absent.
-      return {
-        label: 'pre-push hook installed',
-        status: 'warn',
-        detail:
-          `active pre-push at ${state.activePath} references ` +
-          '`.claude/hooks/push-review-gate.sh` in a form rea cannot verify ' +
-          'automatically. If the hook execs the gate unconditionally, this ' +
-          'is safe — otherwise the protected-path Codex audit gate may be ' +
-          'bypassed. Open the file and confirm the gate runs before any ' +
-          'non-zero exit or status-swallowing operator.',
-      };
-    }
     // Executable file exists at the active path but does not carry
-    // governance AND does not mention the gate path at all. This is the
-    // "silent bypass" state — always a hard fail.
+    // governance — the parser could not confirm the review gate is
+    // invoked unconditionally. Always a hard fail.
+    //
+    // R13 F3: previously, a substring match of the gate path in the hook
+    // downgraded this to WARN. That was unsafe — any comment, echo, or
+    // dead string mentioning the path would mask a silent-bypass hook.
+    // The classifier now fails closed: either the structural parser
+    // (`referencesReviewGate` in `pre-push.ts`) recognizes a real
+    // invocation, or doctor reports fail.
     return {
       label: 'pre-push hook installed',
       status: 'fail',

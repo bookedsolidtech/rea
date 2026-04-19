@@ -208,9 +208,18 @@ export function isReaManagedHuskyGate(content: string): boolean {
  *   - `if [ -f .rea/HALT ]; then :; fi` — no-op stub
  *   - `# check .rea/HALT`               — comment only
  *   - `echo .rea/HALT`                   — print, not enforce
+ *   - `[ -f .rea/HALT ] && exit`         — bare `exit` == `exit 0` on most shells (R13)
+ *   - `[ -f .rea/HALT ] && exit 0`       — exit 0 allows the push (R13)
+ *   - `if [ -f .rea/HALT ]; then exit; fi` — same: no explicit non-zero code (R13)
  *
  * R12 F1: the previous `hasHaltTest` regex allowed a no-op body. We now
  * require proof that the HALT match actually exits the script.
+ *
+ * R13 F1: the R12 regex accepted a bare `\bexit\b` on the HALT path, which
+ * matched both `exit 0` (allow push) and bare `exit` (POSIX: last command's
+ * status — commonly 0). A hook can satisfy R12 and still let pushes through
+ * when HALT is present. Proof of blocking enforcement now REQUIRES an explicit
+ * non-zero positive integer exit code on the HALT path.
  */
 function hasHaltEnforcement(content: string): boolean {
   // Strip comments before scanning so block-form patterns that span lines
@@ -223,57 +232,79 @@ function hasHaltEnforcement(content: string): boolean {
     })
     .join('\n');
 
+  // R13 F1: require `exit N` where N >= 1. Bare `exit` and `exit 0` MUST NOT
+  // qualify — both allow the push. Leading zeros on a positive value (e.g.,
+  // `exit 01`) are still rejected; shell treats the argument as a string and
+  // the spec says "implementation-defined" for values outside 0–255, so we
+  // keep the strict form `[1-9]\d*`.
+  const NONZERO_EXIT = String.raw`\bexit[ \t]+[1-9]\d*\b`;
+
   // Pattern A — short-circuit. The HALT test is followed directly by `&&`
-  // and then an `exit` (optionally wrapped in `{ ... exit ...; }`).
-  const shortCircuit =
-    /(?:\[[ \t]+-f[^\n]*\.rea\/HALT[^\n]*\]|\btest[ \t]+-f[^\n]*\.rea\/HALT)[ \t]*&&[ \t]*(?:\{[^}]*?\bexit\b|\bexit\b)/;
+  // and then a non-zero `exit` (optionally wrapped in `{ ... exit N ...; }`).
+  const shortCircuit = new RegExp(
+    String.raw`(?:\[[ \t]+-f[^\n]*\.rea\/HALT[^\n]*\]|\btest[ \t]+-f[^\n]*\.rea\/HALT)[ \t]*&&[ \t]*(?:\{[^}]*?${NONZERO_EXIT}|${NONZERO_EXIT})`,
+  );
   if (shortCircuit.test(stripped)) return true;
 
   // Pattern B — block form. Match `if <halt-test>` forward (non-greedy) to
-  // the first `fi`, and require `exit` to appear between `then` and `fi`.
+  // the first `fi`, and require a non-zero `exit` between `then` and `fi`.
   // `[\s\S]` instead of `.` so the match spans newlines.
-  const blockForm =
-    /\bif\b[ \t]+(?:\[[ \t]+-f[^\n]*\.rea\/HALT[^\n]*\]|test[ \t]+-f[^\n]*\.rea\/HALT[^\n]*)[\s\S]*?\bthen\b[\s\S]*?\bexit\b[\s\S]*?\bfi\b/;
+  const blockForm = new RegExp(
+    String.raw`\bif\b[ \t]+(?:\[[ \t]+-f[^\n]*\.rea\/HALT[^\n]*\]|test[ \t]+-f[^\n]*\.rea\/HALT[^\n]*)[\s\S]*?\bthen\b[\s\S]*?${NONZERO_EXIT}[\s\S]*?\bfi\b`,
+  );
   if (blockForm.test(stripped)) return true;
 
   return false;
 }
 
 /**
- * True when `content` contains a shell command that CAN FAIL on a missing
- * `codex.review` / `.rea/audit.jsonl` match. A bare `echo` / `printf` of
- * those tokens does NOT count — `echo` always returns 0.
+ * True when `content` contains a shell command that performs a CONTENT match
+ * against the `codex.review` audit record and propagates failure on miss.
  *
- * Check commands accepted (any one of these on a non-comment line that also
- * references `.rea/audit.jsonl` or `codex.review`):
- *   - `grep` / `egrep` / `fgrep`  — classic POSIX pattern match
- *   - `rg`                         — ripgrep
- *   - `awk` / `sed`               — stream editors
- *   - `test` / `[` / `[[`         — POSIX/Bash test conditionals
+ * Commands accepted (any one of these on a non-comment line that also
+ * references `codex.review`, literally or with the backslash-escaped form a
+ * `grep` regex uses):
+ *   - `grep` / `egrep` / `fgrep` — classic POSIX content match
+ *   - `rg`                       — ripgrep
  *
- * R12 F1: the previous `hasAuditReference` regex accepted ANY non-comment
- * mention. The spoof `echo codex.review .rea/audit.jsonl` satisfied it
- * without ever checking the log. We now require pairing with a command
- * that propagates failure when the expected content is absent.
+ * Commands REJECTED (R13 F2):
+ *   - `test -s .rea/audit.jsonl` / `[ -f .rea/audit.jsonl ]` — file existence
+ *     or non-empty test does NOT prove a `codex.review` record is present
+ *     for the current HEAD. A stale audit file from a previous push (or even
+ *     a deliberately-placed empty-JSON line) satisfies these tests.
+ *   - `awk`, `sed` — stream editors. `awk '/pattern/' file` exits 0 whether
+ *     or not the pattern matches any line; `sed -n '/pattern/p'` is the same.
+ *     Their no-match behavior is silent success, which is the inverse of what
+ *     we need.
+ *   - Any line that only mentions `.rea/audit.jsonl` without also mentioning
+ *     `codex.review` — accessing the file is not the same as checking content.
+ *
+ * Why `codex\.review` (literal backslash) is accepted: the shipped
+ * `.husky/pre-push` embeds the token inside a grep -E regex where the `.` is
+ * escaped to match the literal character, so the token appears on disk as
+ * `codex\.review`. The classifier must recognize both forms.
+ *
+ * R12 F1: rejected `echo`-based spoofs by requiring a paired check command.
+ * R13 F2: rejected file-existence-only proofs by requiring a content-match
+ * command AND the `codex.review` token (not just the audit log path).
  */
 function hasAuditCheck(content: string): boolean {
-  const checkCmd = /\b(grep|egrep|fgrep|rg|awk|sed|test)\b|(^|\s)(\[|\[\[)\s/;
-  // `codex\\?\.review` accepts both `codex.review` (literal) and
-  // `codex\.review` (the shape used when the token appears inside a grep
-  // regex, where the dot is escaped for grep's interpretation). The
-  // shipped `.husky/pre-push` uses the latter form.
-  const auditToken = /\.rea\/audit\.jsonl|codex\\?\.review/;
+  // Content-match commands only. `awk` / `sed` / `test` / `[` / `[[` are
+  // deliberately excluded: they do not propagate no-match as non-zero.
+  // `grep -q` and `rg -q` are fine (quiet mode still exits non-zero on miss).
+  const contentMatchCmd = /\b(grep|egrep|fgrep|rg)\b/;
+  // Require `codex.review` specifically (literal or grep-escaped). Mere
+  // mention of `.rea/audit.jsonl` is not enough: a hook that greps the audit
+  // file for an unrelated token (or one the author hand-crafted to always
+  // match) would satisfy a pure-path test without ever checking for a real
+  // review entry.
+  const codexReviewToken = /codex\\?\.review/;
   for (const raw of content.split(/\r?\n/)) {
     const t = raw.trimStart();
     if (t.startsWith('#')) continue;
-    if (!auditToken.test(t)) continue;
-    // The audit token is on this line — require a check command on the
-    // same line. Cross-line pairings (e.g., `AUDIT=.rea/audit.jsonl` then
-    // `grep ... "$AUDIT"`) are not accepted here because the check
-    // command's argument list may not contain the token literal; the
-    // shipped `.husky/pre-push` places both on the same line in at least
-    // two places, so same-line is a reasonable floor.
-    if (checkCmd.test(t)) return true;
+    if (!codexReviewToken.test(t)) continue;
+    if (!contentMatchCmd.test(t)) continue;
+    return true;
   }
   return false;
 }
@@ -1279,20 +1310,6 @@ export interface PrePushDoctorState {
    * a warn. Distinct from `ok=false + absent` (which is a hard fail).
    */
   activeForeign: boolean;
-  /**
-   * True when `activeForeign` is true AND the file mentions the gate path
-   * literally somewhere. The parser could not confirm a clean delegating
-   * invocation, but the hook clearly references the gate — this is usually
-   * an unusual-but-valid invocation shape (exotic variable indirection,
-   * command substitution, etc.). Doctor downgrades these to WARN instead
-   * of hard FAIL so a governed-but-unparseable hook does not cause a
-   * red-light on every `rea doctor` run.
-   *
-   * R12 F2: the parser's no-match verdict is no longer proof that
-   * governance is absent. A mention-but-no-parse signal needs human
-   * review, not a blanket failure.
-   */
-  activeSuspect: boolean;
 }
 
 export async function inspectPrePushState(
@@ -1329,10 +1346,6 @@ export async function inspectPrePushState(
   });
 
   const candidates: PrePushDoctorState['candidates'] = [];
-  // Track which active-candidate files merely MENTION the gate token —
-  // used downstream to populate `activeSuspect` for the doctor warning
-  // downgrade path.
-  const mentionsByPath = new Map<string, boolean>();
   for (const p of uniq) {
     let exists = false;
     let executable = false;
@@ -1347,7 +1360,6 @@ export async function inspectPrePushState(
           const content = await fsPromises.readFile(p, 'utf8');
           reaManaged = isReaManagedFallback(content) || isReaManagedHuskyGate(content);
           delegatesToGate = referencesReviewGate(content);
-          mentionsByPath.set(p, content.includes(GATE_DELEGATION_TOKEN));
         } catch {
           // unreadable — leave both false
         }
@@ -1374,12 +1386,12 @@ export async function inspectPrePushState(
     active !== undefined && (active.reaManaged || active.delegatesToGate);
   const ok = activeExistsExec && activeGoverns;
   const activeForeign = activeExistsExec && !activeGoverns;
-  // Suspect = foreign-by-parse BUT the file literally mentions the gate
-  // path. Most likely an exotic invocation shape our parser could not
-  // confirm (command substitution, eval, unusual indirection). Doctor
-  // downgrades these to WARN instead of hard FAIL.
-  const activeSuspect =
-    activeForeign && mentionsByPath.get(activePath) === true;
-
-  return { candidates, activePath, ok, activeForeign, activeSuspect };
+  // R13 F3: the earlier `activeSuspect` field downgraded active-foreign
+  // doctor results to WARN when the file substring-mentioned the gate path.
+  // That was unsafe: any comment, echo, or dead string mentioning the path
+  // triggered the downgrade, so `rea doctor` could exit 0 on an ungoverned
+  // hook. The classifier must fail closed — either the parser confirms a
+  // real invocation (and `delegatesToGate` is already true) or doctor
+  // reports `fail`.
+  return { candidates, activePath, ok, activeForeign };
 }

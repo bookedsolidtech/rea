@@ -1164,11 +1164,14 @@ describe('isReaManagedHuskyGate — Husky gate marker detection (Finding 2)', ()
     expect(isReaManagedHuskyGate(content)).toBe(true);
   });
 
-  it('R12 F1: test -f form + test audit command: returns true', () => {
+  it('R12 F1: test -f HALT form + grep codex.review: returns true', () => {
+    // R13 F2 tightening: the audit check now requires a `codex.review`
+    // content match by grep/rg, not a file-existence test. The HALT side
+    // still works with the POSIX `test -f` form for detection.
     const content =
       `#!/bin/sh\n${HUSKY_GATE_MARKER}\n` +
       `test -f .rea/HALT && exit 1\n` +
-      `test -s .rea/audit.jsonl\n`;
+      `grep -q '"tool_name":"codex.review"' .rea/audit.jsonl\n`;
     expect(isReaManagedHuskyGate(content)).toBe(true);
   });
 
@@ -1177,6 +1180,121 @@ describe('isReaManagedHuskyGate — Husky gate marker detection (Finding 2)', ()
       `#!/bin/sh\n${HUSKY_GATE_MARKER}\n` +
       `[ -f .rea/HALT ] && exit 1\n` +
       `rg -q codex.review .rea/audit.jsonl\n`;
+    expect(isReaManagedHuskyGate(content)).toBe(true);
+  });
+
+  // R13 F1: `hasHaltEnforcement` must reject `exit 0` and bare `exit` on
+  // the HALT path. Both forms satisfied R12's behavioral signature without
+  // actually blocking the push.
+
+  it('R13 F1: HALT short-circuit with `exit 0`: returns false (push allowed)', () => {
+    const content =
+      `#!/bin/sh\n${HUSKY_GATE_MARKER}\n` +
+      `[ -f .rea/HALT ] && exit 0\n` +
+      `grep -q codex.review .rea/audit.jsonl\n`;
+    expect(isReaManagedHuskyGate(content)).toBe(false);
+  });
+
+  it('R13 F1: HALT short-circuit with bare `exit`: returns false (POSIX last-status, not a block)', () => {
+    const content =
+      `#!/bin/sh\n${HUSKY_GATE_MARKER}\n` +
+      `[ -f .rea/HALT ] && exit\n` +
+      `grep -q codex.review .rea/audit.jsonl\n`;
+    expect(isReaManagedHuskyGate(content)).toBe(false);
+  });
+
+  it('R13 F1: HALT block form with `exit 0`: returns false', () => {
+    const content =
+      `#!/bin/sh\n${HUSKY_GATE_MARKER}\n` +
+      `if [ -f .rea/HALT ]; then exit 0; fi\n` +
+      `grep -q codex.review .rea/audit.jsonl\n`;
+    expect(isReaManagedHuskyGate(content)).toBe(false);
+  });
+
+  it('R13 F1: HALT block form with bare `exit`: returns false', () => {
+    const content =
+      `#!/bin/sh\n${HUSKY_GATE_MARKER}\n` +
+      `if [ -f .rea/HALT ]; then exit; fi\n` +
+      `grep -q codex.review .rea/audit.jsonl\n`;
+    expect(isReaManagedHuskyGate(content)).toBe(false);
+  });
+
+  it('R13 F1: HALT grouped short-circuit with `exit 0` inside braces: returns false', () => {
+    const content =
+      `#!/bin/sh\n${HUSKY_GATE_MARKER}\n` +
+      `[ -f .rea/HALT ] && { echo frozen; exit 0; }\n` +
+      `grep -q codex.review .rea/audit.jsonl\n`;
+    expect(isReaManagedHuskyGate(content)).toBe(false);
+  });
+
+  it('R13 F1: HALT block form with `exit 2` (any non-zero): returns true', () => {
+    // Tightening must not break the legitimate wide-spectrum "any non-zero"
+    // use case. Hooks often exit with codes like 2 to signal specific
+    // error classes, and the governance semantics (fail the push) hold.
+    const content =
+      `#!/bin/sh\n${HUSKY_GATE_MARKER}\n` +
+      `if [ -f .rea/HALT ]; then exit 2; fi\n` +
+      `grep -q codex.review .rea/audit.jsonl\n`;
+    expect(isReaManagedHuskyGate(content)).toBe(true);
+  });
+
+  // R13 F2: `hasAuditCheck` must reject file-existence / edit-style commands
+  // that don't propagate no-match as non-zero, and must require the
+  // `codex.review` token specifically (not just the audit log path).
+
+  it('R13 F2: audit check via `test -s .rea/audit.jsonl`: returns false (file existence only)', () => {
+    const content =
+      `#!/bin/sh\n${HUSKY_GATE_MARKER}\n` +
+      `[ -f .rea/HALT ] && exit 1\n` +
+      `test -s .rea/audit.jsonl\n`;
+    expect(isReaManagedHuskyGate(content)).toBe(false);
+  });
+
+  it('R13 F2: audit check via `[ -f .rea/audit.jsonl ]`: returns false', () => {
+    const content =
+      `#!/bin/sh\n${HUSKY_GATE_MARKER}\n` +
+      `[ -f .rea/HALT ] && exit 1\n` +
+      `[ -f .rea/audit.jsonl ]\n`;
+    expect(isReaManagedHuskyGate(content)).toBe(false);
+  });
+
+  it('R13 F2: audit check via `sed -n /.../p`: returns false (no-match is silent success)', () => {
+    const content =
+      `#!/bin/sh\n${HUSKY_GATE_MARKER}\n` +
+      `[ -f .rea/HALT ] && exit 1\n` +
+      `sed -n '/codex.review/p' .rea/audit.jsonl\n`;
+    expect(isReaManagedHuskyGate(content)).toBe(false);
+  });
+
+  it('R13 F2: audit check via `awk /.../`: returns false (default no-match exit 0)', () => {
+    const content =
+      `#!/bin/sh\n${HUSKY_GATE_MARKER}\n` +
+      `[ -f .rea/HALT ] && exit 1\n` +
+      `awk '/codex.review/' .rea/audit.jsonl\n`;
+    expect(isReaManagedHuskyGate(content)).toBe(false);
+  });
+
+  it('R13 F2: only `.rea/audit.jsonl` mentioned (no codex.review): returns false', () => {
+    const content =
+      `#!/bin/sh\n${HUSKY_GATE_MARKER}\n` +
+      `[ -f .rea/HALT ] && exit 1\n` +
+      `grep -q 'something-else' .rea/audit.jsonl\n`;
+    expect(isReaManagedHuskyGate(content)).toBe(false);
+  });
+
+  it('R13 F2: `grep` of `codex.review` on audit log: returns true', () => {
+    const content =
+      `#!/bin/sh\n${HUSKY_GATE_MARKER}\n` +
+      `[ -f .rea/HALT ] && exit 1\n` +
+      `grep -q codex.review .rea/audit.jsonl\n`;
+    expect(isReaManagedHuskyGate(content)).toBe(true);
+  });
+
+  it('R13 F2: grep-escaped `codex\\.review` shape (matches shipped .husky/pre-push): returns true', () => {
+    const content =
+      `#!/bin/sh\n${HUSKY_GATE_MARKER}\n` +
+      `[ -f .rea/HALT ] && exit 1\n` +
+      `grep -E '"tool_name":"codex\\.review"' .rea/audit.jsonl\n`;
     expect(isReaManagedHuskyGate(content)).toBe(true);
   });
 
@@ -1747,18 +1865,20 @@ describe('inspectPrePushState — Husky gate recognized as rea-managed (Finding 
     expect(active?.reaManaged).toBe(false);
   });
 
-  // R12 F2: when the parser cannot confirm a gate invocation, but the file
-  // DOES mention the gate path literally, doctor must downgrade to warn
-  // (activeSuspect) rather than hard fail (activeForeign && !activeSuspect).
-  // A parser miss is not proof of governance absence.
+  // R13 F3: the previous `activeSuspect` warn downgrade was based on a bare
+  // substring match of the gate path in the hook body. That is unsafe — any
+  // comment, echo, or dead string mentioning the path would mask a silent
+  // bypass. `rea doctor` now fails closed: if the structural parser cannot
+  // confirm a real invocation, the check fails.
 
-  it('R12 F2: hook mentions gate path via unusual indirection: activeSuspect=true, activeForeign=true', async () => {
+  it('R13 F3: hook mentions gate path via unusual indirection: activeForeign=true (fail closed)', async () => {
     await initGitRepo(dir);
     const hooksDir = path.join(dir, '.git', 'hooks');
     await fs.mkdir(hooksDir, { recursive: true });
     // Exotic shape: command substitution assigning a transformed gate
-    // path. Parser doesn't recognize the invocation form, but the file
-    // clearly references the gate — doctor should warn, not fail.
+    // path. Parser doesn't recognize the invocation form — doctor must
+    // fail rather than warn, because the parse miss is not proof that the
+    // gate actually runs.
     const content = [
       '#!/bin/sh',
       'RUNNER=$(printf "%s" .claude/hooks/push-review-gate.sh | tr a-z a-z)',
@@ -1770,10 +1890,31 @@ describe('inspectPrePushState — Husky gate recognized as rea-managed (Finding 
 
     const state = await inspectPrePushState(dir);
     expect(state.activeForeign).toBe(true);
-    expect(state.activeSuspect).toBe(true);
+    expect(state.ok).toBe(false);
   });
 
-  it('R12 F2: hook that has no gate mention at all: activeForeign=true, activeSuspect=false', async () => {
+  it('R13 F3: hook with only an echo/comment mention of the gate: activeForeign=true', async () => {
+    await initGitRepo(dir);
+    const hooksDir = path.join(dir, '.git', 'hooks');
+    await fs.mkdir(hooksDir, { recursive: true });
+    // A dead-string mention (echo of the path) used to downgrade the
+    // doctor verdict to WARN via `activeSuspect`. Now it MUST fail,
+    // because the hook clearly does not invoke the gate.
+    const content = [
+      '#!/bin/sh',
+      'echo "run .claude/hooks/push-review-gate.sh if you want to" >&2',
+      'npm run lint',
+    ].join('\n');
+    await fs.writeFile(path.join(hooksDir, 'pre-push'), content, {
+      mode: 0o755,
+    });
+
+    const state = await inspectPrePushState(dir);
+    expect(state.activeForeign).toBe(true);
+    expect(state.ok).toBe(false);
+  });
+
+  it('R13 F3: hook with no gate mention: activeForeign=true, ok=false', async () => {
     await initGitRepo(dir);
     const hooksDir = path.join(dir, '.git', 'hooks');
     await fs.mkdir(hooksDir, { recursive: true });
@@ -1784,10 +1925,10 @@ describe('inspectPrePushState — Husky gate recognized as rea-managed (Finding 
 
     const state = await inspectPrePushState(dir);
     expect(state.activeForeign).toBe(true);
-    expect(state.activeSuspect).toBe(false);
+    expect(state.ok).toBe(false);
   });
 
-  it('R12 F2: cleanly-governed hook is NOT suspect (activeForeign=false)', async () => {
+  it('R13 F3: cleanly-governed hook passes (activeForeign=false, ok=true)', async () => {
     await initGitRepo(dir);
     const hooksDir = path.join(dir, '.git', 'hooks');
     await fs.mkdir(hooksDir, { recursive: true });
@@ -1802,6 +1943,5 @@ describe('inspectPrePushState — Husky gate recognized as rea-managed (Finding 
     const state = await inspectPrePushState(dir);
     expect(state.ok).toBe(true);
     expect(state.activeForeign).toBe(false);
-    expect(state.activeSuspect).toBe(false);
   });
 });
