@@ -27,10 +27,13 @@ coverage/
 
 # Runtime / ephemeral state (in consumer projects; ignored here too for safety)
 .rea/audit.jsonl
+.rea/audit-*.jsonl
 .rea/HALT
 .rea/metrics.jsonl
 .rea/serve.pid
 .rea/serve.state.json
+.rea/fingerprints.json
+.rea/review-cache.jsonl
 
 # Scratch space
 .scratch/

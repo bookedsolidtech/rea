@@ -184,4 +184,68 @@ describe('rea init — G11.4 codex flags', () => {
     const policy = loadPolicy(dir);
     expect(policy.review?.codex_required).toBe(false);
   });
+
+  it('BUG-010: init scaffolds .gitignore entries for every .rea runtime artifact', async () => {
+    const dir = await makeScratch();
+    cleanup.push(dir);
+    process.chdir(dir);
+
+    await runInit({ yes: true, profile: 'minimal', codex: false });
+
+    const gi = await fs.readFile(path.join(dir, '.gitignore'), 'utf8');
+    expect(gi).toContain('.rea/fingerprints.json');
+    expect(gi).toContain('.rea/review-cache.jsonl');
+    expect(gi).toContain('.rea/audit.jsonl');
+    expect(gi).toContain('.rea/audit-*.jsonl');
+    expect(gi).toContain('.rea/HALT');
+    expect(gi).toContain('.rea/metrics.jsonl');
+    expect(gi).toContain('.rea/serve.pid');
+    expect(gi).toContain('.rea/serve.state.json');
+    // Marker present so re-running init recognizes its own block.
+    expect(gi).toContain('# === rea managed');
+  });
+
+  it('BUG-010: re-running init is idempotent — no duplicate gitignore entries', async () => {
+    const dir = await makeScratch();
+    cleanup.push(dir);
+    process.chdir(dir);
+
+    await runInit({ yes: true, profile: 'minimal', codex: false });
+    const first = await fs.readFile(path.join(dir, '.gitignore'), 'utf8');
+
+    await runInit({ yes: true, profile: 'minimal', codex: false, force: true });
+    const second = await fs.readFile(path.join(dir, '.gitignore'), 'utf8');
+
+    expect(second).toBe(first);
+    // Exactly one managed block.
+    const openMarkers = (second.match(/# === rea managed — do not edit between markers ===/g) ?? []).length;
+    const closeMarkers = (second.match(/# === end rea managed ===/g) ?? []).length;
+    expect(openMarkers).toBe(1);
+    expect(closeMarkers).toBe(1);
+  });
+
+  it('BUG-010: init preserves existing .gitignore content when adding managed block', async () => {
+    const dir = await makeScratch();
+    cleanup.push(dir);
+    process.chdir(dir);
+
+    // Consumer has their own .gitignore before running rea init.
+    const existing = ['node_modules', 'dist', '.env', ''].join('\n');
+    await fs.writeFile(path.join(dir, '.gitignore'), existing, 'utf8');
+
+    await runInit({ yes: true, profile: 'minimal', codex: false });
+
+    const gi = await fs.readFile(path.join(dir, '.gitignore'), 'utf8');
+    // Consumer lines preserved.
+    expect(gi).toContain('node_modules');
+    expect(gi).toContain('dist');
+    expect(gi).toContain('.env');
+    // Managed block appended after.
+    expect(gi).toContain('# === rea managed');
+    expect(gi).toContain('.rea/fingerprints.json');
+    // Consumer content comes before the managed block.
+    const userIdx = gi.indexOf('node_modules');
+    const markerIdx = gi.indexOf('# === rea managed');
+    expect(userIdx).toBeLessThan(markerIdx);
+  });
 });

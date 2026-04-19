@@ -5,6 +5,7 @@ import * as p from '@clack/prompts';
 import { AutonomyLevel } from '../policy/types.js';
 import { HARD_DEFAULTS, loadProfile, mergeProfiles, type Profile } from '../policy/profiles.js';
 import { copyArtifacts } from './install/copy.js';
+import { ensureReaGitignore } from './install/gitignore.js';
 import {
   canonicalSettingsSubsetHash,
   defaultDesiredHooks,
@@ -588,6 +589,11 @@ export async function runInit(options: InitOptions): Promise<void> {
   };
   const mdResult = await writeClaudeMdFragment(targetDir, fragmentInput);
 
+  // BUG-010 — scaffold `.gitignore` entries for every runtime artifact
+  // `rea serve` / `rea cache` / `/freeze` can write under `.rea/`. Idempotent
+  // append (and `rea upgrade` backfills older installs that never got this).
+  const gitignoreResult = await ensureReaGitignore(targetDir);
+
   // G12 — record the install manifest. SHAs are of the files actually on disk
   // after the copy pass, so drift detection compares against real state (not
   // canonical, which may differ if the consumer's copy was aborted mid-run).
@@ -626,6 +632,20 @@ export async function runInit(options: InitOptions): Promise<void> {
   console.log(
     `  ${mdResult.replaced ? '~' : '+'} ${path.relative(targetDir, mdResult.path)} (fragment ${mdResult.replaced ? 'replaced' : 'written'})`,
   );
+  if (gitignoreResult.action === 'created') {
+    console.log(
+      `  + ${path.relative(targetDir, gitignoreResult.path)} (managed block written)`,
+    );
+  } else if (gitignoreResult.action === 'updated') {
+    console.log(
+      `  ~ ${path.relative(targetDir, gitignoreResult.path)} (managed block ${gitignoreResult.addedEntries.length} entr${gitignoreResult.addedEntries.length === 1 ? 'y' : 'ies'} added)`,
+    );
+  } else {
+    console.log(
+      `  · ${path.relative(targetDir, gitignoreResult.path)} (managed block up to date)`,
+    );
+  }
+  for (const w of gitignoreResult.warnings) warn(w);
   console.log(`  + ${path.relative(targetDir, manifestPath)}`);
 
   if (mergeResult.warnings.length > 0) {

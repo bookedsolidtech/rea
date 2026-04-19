@@ -1,7 +1,8 @@
 # Migration — 0.4.x → 0.5.0
 
 Targeted migration guide for consumers of `@bookedsolid/rea`. Focused on the
-paired push-review-gate fixes (BUG-008 + BUG-009) that land in 0.5.0.
+paired push-review-gate fixes (BUG-008 + BUG-009) and the BUG-010
+`.gitignore` scaffolding fix that land in 0.5.0.
 
 ## TL;DR
 
@@ -80,7 +81,39 @@ integrity story; the cache is advisory.
 New policy knob: `review.cache_max_age_seconds` (default 3600s). Entries
 older than the TTL return `{"hit":false}` so a review stays fresh.
 
-### 3. `REA_SKIP_PUSH_REVIEW` — whole-gate escape hatch
+### 3. `.gitignore` scaffolding (BUG-010)
+
+0.3.x/0.4.0 `rea init` never wrote any `.gitignore` entries for the runtime
+artifacts under `.rea/`. As a result, any consumer who ran `rea serve` saw
+`.rea/fingerprints.json` show up as untracked in `git status`, and rotated
+audit archives (`.rea/audit-*.jsonl`, G1) had the same problem.
+
+0.5.0 `rea init` and `rea upgrade` scaffold a marker-bracketed block at the
+end of `.gitignore`:
+
+```
+# === rea managed — do not edit between markers ===
+.rea/audit.jsonl
+.rea/audit-*.jsonl
+.rea/HALT
+.rea/metrics.jsonl
+.rea/serve.pid
+.rea/serve.state.json
+.rea/fingerprints.json
+.rea/review-cache.jsonl
+# === end rea managed ===
+```
+
+The scaffolder is idempotent: running `rea init` or `rea upgrade` twice is
+a no-op on the second run. If you have consumer-authored lines inside the
+managed block (e.g. `.rea/my-local-cache`), they are preserved — missing
+required entries are inserted, existing lines are untouched. A `.gitignore`
+that is a symlink is refused with a warning (supply-chain guard).
+
+**Action for existing installs**: run `rea upgrade`. The backfill happens
+automatically. No manual `.gitignore` edit required.
+
+### 4. `REA_SKIP_PUSH_REVIEW` — whole-gate escape hatch
 
 The existing `REA_SKIP_CODEX_REVIEW` bypasses only the Codex-audit branch.
 0.5.0 adds `REA_SKIP_PUSH_REVIEW=<reason>`, which bypasses the *entire*
