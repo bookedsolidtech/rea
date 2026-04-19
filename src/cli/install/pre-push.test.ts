@@ -733,8 +733,9 @@ describe('referencesReviewGate — positive-match only (Finding 1 regressions)',
     expect(referencesReviewGate(`#!/bin/sh\n. ${token}\n`)).toBe(true);
   });
 
-  it('source delegation: returns true', () => {
-    expect(referencesReviewGate(`#!/bin/sh\nsource ${token}\n`)).toBe(true);
+  it('source delegation: returns false (bash-only, removed from POSIX allowlist)', () => {
+    // R8: `source` is not POSIX sh. Use `.` (dot) instead.
+    expect(referencesReviewGate(`#!/bin/sh\nsource ${token}\n`)).toBe(false);
   });
 
   it('sh delegation: returns true', () => {
@@ -972,15 +973,21 @@ describe('isReaManagedHuskyGate — Husky gate marker detection (Finding 2)', ()
     expect(isReaManagedHuskyGate(`#!/bin/sh\n${HUSKY_GATE_MARKER}\nexit 0\n`)).toBe(false);
   });
 
-  it('marker at line 2 + HALT sentinel but no body marker: returns true (legacy backward-compat)', () => {
-    // R7 backward-compat: rea gates installed before R6 have the header marker
-    // and .rea/HALT but not the body marker. Must return true so existing
-    // governed repos are not reclassified as foreign after upgrading rea.
+  it('marker at line 2 + POSIX HALT test on non-comment line: returns true (legacy backward-compat)', () => {
+    // R7 backward-compat + R8 tightening: pre-R6 gates have the header marker
+    // and an actual [ -f .rea/HALT ] test but no body marker. Must return true.
     expect(
       isReaManagedHuskyGate(
-        `#!/bin/sh\n${HUSKY_GATE_MARKER}\n[ -f .rea/HALT ] && exit 1\nif grep -q codex.review .rea/audit.jsonl; then\n  exit 0\nfi\nexit 1\n`,
+        `#!/bin/sh\n${HUSKY_GATE_MARKER}\nif [ -f "\${REA_ROOT}/.rea/HALT" ]; then exit 1; fi\nif grep -q codex.review .rea/audit.jsonl; then\n  exit 0\nfi\nexit 1\n`,
       ),
     ).toBe(true);
+  });
+
+  it('marker at line 2 + HALT in comment only (no POSIX test): returns false', () => {
+    // R8: comment-mention of .rea/HALT must not satisfy legacy check.
+    expect(
+      isReaManagedHuskyGate(`#!/bin/sh\n${HUSKY_GATE_MARKER}\n# check .rea/HALT here\nexit 0\n`),
+    ).toBe(false);
   });
 
   it('marker at line 2 + no body marker + no HALT sentinel: returns false (stub body)', () => {
@@ -1131,6 +1138,25 @@ describe('referencesReviewGate — depth-tracking exit detection (Finding 2)', (
       'exec .claude/hooks/push-review-gate.sh "$@" || :',
     ].join('\n');
     expect(referencesReviewGate(content)).toBe(false);
+  });
+
+  it('`source` invocation form: returns false (bash-only, not POSIX sh)', () => {
+    // R8: `source` is bash-specific; `#!/bin/sh` hooks must use `.` (dot).
+    // Accepting `source` would silently bypass governance on dash/busybox.
+    const content = [
+      '#!/bin/sh',
+      'source .claude/hooks/push-review-gate.sh "$@"',
+    ].join('\n');
+    expect(referencesReviewGate(content)).toBe(false);
+  });
+
+  it('`. ` (dot-space) POSIX form: returns true', () => {
+    // POSIX equivalent of `source` — must remain accepted.
+    const content = [
+      '#!/bin/sh',
+      '. .claude/hooks/push-review-gate.sh "$@"',
+    ].join('\n');
+    expect(referencesReviewGate(content)).toBe(true);
   });
 
   it('gate invocation with || /bin/true (path-qualified bypass): returns false', () => {

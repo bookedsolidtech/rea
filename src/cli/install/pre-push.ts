@@ -172,10 +172,14 @@ export function isReaManagedHuskyGate(content: string): boolean {
   // `foreign` after upgrading rea. The body marker is added on the next
   // `rea init` or `rea upgrade` run.
   //
-  // Note: as with the two-factor check, this is a best-effort heuristic for
-  // preventing ACCIDENTAL displacement. A determined actor with write access
-  // could construct a matching file — that threat is out of scope here.
-  return content.includes('.rea/HALT');
+  // Require an actual POSIX shell test form (`[ -f ... .rea/HALT` or
+  // `test -f ... .rea/HALT`) on a non-comment line. A raw substring match
+  // would accept `# check .rea/HALT` — a comment mention — as legacy-managed.
+  return lines.some((raw) => {
+    const t = raw.trimStart();
+    if (t.startsWith('#')) return false;
+    return /\[[ \t]+-f[^\n]*\.rea\/HALT/.test(t) || /\btest[ \t]+-f[^\n]*\.rea\/HALT/.test(t);
+  });
 }
 
 /**
@@ -333,8 +337,11 @@ function looksLikeGateInvocation(line: string): boolean {
   // Form 2: one of the explicit delegation keywords immediately before the
   // gate path. Pattern: keyword + one-or-more whitespace + gate-path.
   // Same `.sh` boundary lookahead as Form 1 to prevent suffix bypass.
+  // `source` is bash-specific and not defined by POSIX sh. Hooks use `#!/bin/sh`
+  // so `source` may silently fail on dash/busybox. The POSIX equivalent is `.`
+  // (dot), which is already in the allowlist.
   const delegationRe =
-    /^(exec|source|sh|bash|zsh|\.)\s+["']?[A-Za-z0-9_./${}~-]*\.claude\/hooks\/push-review-gate\.sh(?=\s|$|[;|&"'()])/;
+    /^(exec|sh|bash|zsh|\.)\s+["']?[A-Za-z0-9_./${}~-]*\.claude\/hooks\/push-review-gate\.sh(?=\s|$|[;|&"'()])/;
   if (delegationRe.test(line)) {
     return true;
   }
