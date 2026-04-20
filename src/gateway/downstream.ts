@@ -232,7 +232,8 @@ export class DownstreamConnection {
    * is bounded at assignment time regardless of how many assignment sites
    * exist or where they live. We keep the read-side bound as cheap
    * defense-in-depth (it's a no-op for already-bounded strings and costs
-   * O(length) in the rare case a buggy subclass seeded the backing field).
+   * O(length) only if a future intra-class edit writes directly to the
+   * backing field instead of going through the setter).
    */
   get lastError(): string | null {
     const raw = this.#lastErrorMessage;

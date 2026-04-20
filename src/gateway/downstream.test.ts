@@ -328,7 +328,7 @@ describe('DownstreamConnection reconnect semantics', () => {
     expect(conn.lastError).toBe(recorded);
   });
 
-  it('BUG-014: ES-private field is not reachable from `this` or `as any` casts', () => {
+  it('BUG-014: ES-private backing field is not reachable via `as any` property access', () => {
     const conn = makeConnection([]);
 
     // Fresh connection — no writes have occurred. Property lookups on the
