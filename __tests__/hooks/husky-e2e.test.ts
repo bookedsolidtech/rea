@@ -612,4 +612,193 @@ describe('husky e2e — real git push → .husky/pre-push → exit propagation',
     ).trim();
     expect(lsRemote).toBe('');
   }, 15_000);
+
+  it('blocks a bootstrap push of protected paths to a remote with no tracking refs (Codex 0.7.0 pass-2 finding 1)', async () => {
+    // Regression for the HIGH finding from the second Codex adversarial
+    // review pass on this branch: the bootstrap-scenario `continue` in
+    // `.husky/pre-push` was a real fail-open. An operator whose first push
+    // touched a protected path — and whose remote had no resolved tracking
+    // ref yet (no `origin/HEAD`, no `origin/main`, no `origin/master`) —
+    // would have the gate silently skip the refspec and `exit 0`, letting
+    // the push ship without a `codex.review` receipt. The fix uses the
+    // well-known empty-tree SHA (`4b825dc642cb...`) as the baseline so the
+    // protected-path diff runs over the FULL change set of the push.
+    //
+    // This test builds a scratch repo that mirrors the bootstrap shape:
+    // a bare remote with NO refs of any kind, and a local that has never
+    // pushed to it. The first push targets `feature-protected` (which
+    // touches `hooks/__protected__.sh`). Before the fix, this push
+    // silently succeeded. After the fix, it MUST block.
+    const tmpRoot = await fs.mkdtemp(
+      path.join(os.tmpdir(), 'rea-husky-e2e-bootstrap-'),
+    );
+    cleanup.push(tmpRoot);
+
+    const workDir = path.join(tmpRoot, 'work');
+    const remoteDir = path.join(tmpRoot, 'remote.git');
+
+    await fs.mkdir(workDir, { recursive: true });
+    execFileSync('git', ['init', '--initial-branch=main', '--quiet', workDir], {
+      encoding: 'utf8',
+    });
+    execFileSync('git', ['init', '--bare', '--quiet', remoteDir], {
+      encoding: 'utf8',
+    });
+
+    // Local-only config to avoid polluting $HOME. No hook setup beyond
+    // `.husky/` + `core.hooksPath` — the hook is the shipped file.
+    const git = (cwd: string, ...args: string[]): string =>
+      execFileSync('git', args, { cwd, encoding: 'utf8' }).trim();
+    git(workDir, 'config', 'user.email', 'e2e-bootstrap@rea.test');
+    git(workDir, 'config', 'user.name', 'REA Husky E2E Bootstrap');
+    git(workDir, 'config', 'commit.gpgsign', 'false');
+    git(workDir, 'config', 'core.hooksPath', '.husky');
+    git(workDir, 'remote', 'add', 'origin', remoteDir);
+
+    // Install the SHIPPED hook byte-for-byte.
+    const huskyDir = path.join(workDir, '.husky');
+    await fs.mkdir(huskyDir, { recursive: true });
+    const dest = path.join(huskyDir, 'pre-push');
+    await fs.copyFile(SHIPPED_HUSKY_HOOK, dest);
+    await fs.chmod(dest, 0o755);
+
+    // Mirror dist/ so the policy-field helper resolves.
+    const scratchDist = path.join(workDir, 'dist');
+    await fs.mkdir(scratchDist, { recursive: true });
+    await fs.symlink(REPO_DIST_SCRIPTS, path.join(scratchDist, 'scripts'), 'dir');
+    await fs.symlink(REPO_DIST_AUDIT, path.join(scratchDist, 'audit'), 'dir');
+    await fs.symlink(REPO_DIST_POLICY, path.join(scratchDist, 'policy'), 'dir');
+
+    // Minimal policy: codex_required defaults to true (absent field).
+    const reaDir = path.join(workDir, '.rea');
+    await fs.mkdir(reaDir, { recursive: true });
+    await fs.writeFile(
+      path.join(reaDir, 'policy.yaml'),
+      'profile: minimal\nautonomy_level: L1\n',
+    );
+
+    // Baseline commit on main, plus a feature commit that touches a
+    // protected path. CRUCIALLY, we do NOT push main first. The bare
+    // remote stays empty, so origin/HEAD, origin/main, origin/master
+    // all fail to resolve when the hook tries them.
+    await fs.writeFile(path.join(workDir, 'README.md'), '# bootstrap e2e\n');
+    git(workDir, 'add', 'README.md');
+    git(workDir, 'commit', '-m', 'baseline', '--quiet');
+
+    git(workDir, 'checkout', '-b', 'feature-protected', '--quiet');
+    const protectedDir = path.join(workDir, 'hooks');
+    await fs.mkdir(protectedDir, { recursive: true });
+    await fs.writeFile(
+      path.join(protectedDir, '__protected__.sh'),
+      '#!/bin/sh\necho bootstrap-protected\n',
+    );
+    git(workDir, 'add', 'hooks/__protected__.sh');
+    git(workDir, 'commit', '-m', 'touch protected path', '--quiet');
+    const featureSha = git(workDir, 'rev-parse', 'HEAD');
+
+    // Confirm the remote truly has no refs of any kind — if this assert
+    // fails, the test's premise is broken and the block below could pass
+    // for the wrong reason (e.g. origin/main resolved after all).
+    const remoteRefs = execFileSync('git', ['ls-remote', 'origin'], {
+      cwd: workDir,
+      encoding: 'utf8',
+    }).trim();
+    expect(remoteRefs).toBe('');
+
+    // First push of a protected-path branch to the empty remote. Before
+    // the fix, the hook `continue`d in the bootstrap path and the push
+    // silently succeeded. After the fix, the empty-tree baseline produces
+    // a diff containing `hooks/__protected__.sh` and the protected-path
+    // check fires — exit 1, push blocked.
+    const res = spawnSync(
+      'git',
+      ['push', 'origin', 'feature-protected:feature-protected'],
+      { cwd: workDir, encoding: 'utf8' },
+    );
+
+    expect(res.status).not.toBe(0);
+    expect(res.stderr).toMatch(/PUSH BLOCKED: protected paths changed/);
+
+    // The bare remote must still have no refs — the push did not land.
+    const postRemoteRefs = execFileSync('git', ['ls-remote', 'origin'], {
+      cwd: workDir,
+      encoding: 'utf8',
+    }).trim();
+    expect(postRemoteRefs).toBe('');
+
+    // Sanity: with REA_SKIP_CODEX_REVIEW set, the same bootstrap push is
+    // allowed through. Proves the fix blocks on the INTENDED gate (the
+    // codex-audit requirement), not on a collateral breakage of the
+    // bootstrap path.
+    const skipRes = spawnSync(
+      'git',
+      ['push', 'origin', 'feature-protected:feature-protected'],
+      {
+        cwd: workDir,
+        encoding: 'utf8',
+        env: { ...process.env, REA_SKIP_CODEX_REVIEW: 'bootstrap-e2e-sanity' },
+      },
+    );
+    expect(skipRes.status).toBe(0);
+    const lsRemote = execFileSync(
+      'git',
+      ['ls-remote', 'origin', 'feature-protected'],
+      { cwd: workDir, encoding: 'utf8' },
+    ).trim();
+    expect(lsRemote).toMatch(new RegExp(`^${featureSha}\\s`));
+  }, 20_000);
+
+  it('uses the $1 remote name (not hardcoded origin) for the fallback probe (Codex 0.7.0 pass-2 finding 2)', async () => {
+    // Regression for the MEDIUM finding from the second Codex adversarial
+    // review: `.husky/pre-push` previously hardcoded `refs/remotes/origin/*`
+    // in the fallback probe chain, but git passes the remote name as $1 to
+    // pre-push. A `git push upstream feature` would probe stale or missing
+    // `origin/*` refs even when `upstream/main` existed and would have
+    // given a valid baseline. Combined with finding 1, this could silently
+    // skip a gated push.
+    //
+    // This test creates a repo with `upstream` as the push target and NO
+    // `origin` remote at all. `origin/main` cannot resolve because `origin`
+    // doesn't exist. Pre-fix, the hook probed `origin/*`, found nothing,
+    // and either failed-open (pre-finding-1 fix) or blocked on a refspec
+    // that resolved incorrectly. Post-fix, the hook reads `$1=upstream`
+    // and successfully anchors on `upstream/main`, producing a correct
+    // diff for the protected-path check.
+    const repo = await makeE2ERepo();
+    cleanup.push(path.dirname(repo.workDir));
+
+    // Rename `origin` to `upstream` so the hook must honor $1.
+    execFileSync('git', ['remote', 'rename', 'origin', 'upstream'], {
+      cwd: repo.workDir,
+      encoding: 'utf8',
+    });
+    // Force a fetch so `upstream/main` is a real remote-tracking ref (the
+    // rename preserves it, but be explicit).
+    execFileSync('git', ['fetch', 'upstream', '--quiet'], {
+      cwd: repo.workDir,
+      encoding: 'utf8',
+    });
+
+    execFileSync('git', ['checkout', 'feature-protected', '--quiet'], {
+      cwd: repo.workDir,
+      encoding: 'utf8',
+    });
+
+    const res = spawnSync(
+      'git',
+      ['push', 'upstream', 'feature-protected:feature-protected'],
+      {
+        cwd: repo.workDir,
+        encoding: 'utf8',
+      },
+    );
+
+    // The gate must fire with `upstream/*` as the anchor. Absent the $1
+    // parameterization, the fallback would probe non-existent `origin/*`
+    // and (pre-finding-1 fix) fail-open via bootstrap skip. Post-fix,
+    // `upstream/main` exists → merge-base resolves → diff contains the
+    // protected file → gate blocks.
+    expect(res.status).not.toBe(0);
+    expect(res.stderr).toMatch(/PUSH BLOCKED: protected paths changed/);
+  }, 15_000);
 });

@@ -29,7 +29,21 @@
 
 set -eu
 
+# git passes the remote name as $1 to pre-push. Fall back to `origin` for
+# direct invocation (tests, manual runs). The shared core uses the same
+# argv_remote convention — parity required so a push to `upstream` probes
+# `upstream/main` rather than stale `origin/main`.
+REMOTE="${1:-origin}"
+
 REA_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+
+# Well-known empty-tree SHA: `git hash-object -t tree /dev/null`. Every git
+# installation carries this object implicitly — using it as a merge-base
+# baseline for initial pushes lets `git diff $EMPTY_TREE $local_sha` emit
+# the complete change set against a truly-empty tree. The protected-path
+# check then sees every file in the initial push, so a first push of
+# protected-path changes to a fresh remote is still gated.
+EMPTY_TREE='4b825dc642cb6eb9a060e54bf8d69288fbee4904'
 
 if [ -f "${REA_ROOT}/.rea/HALT" ]; then
   # POSIX `head` does not specify `-c`; use awk for the first line. HALT is
@@ -89,30 +103,32 @@ while IFS=' ' read -r local_ref local_sha remote_ref remote_sha; do
   # diff to empty. Remote-tracking refs are server-authoritative from the
   # last fetch and cannot be tampered with locally.
   #
-  # Fallback order when origin/HEAD is not set (common on shallow or mirror
-  # clones): probe origin/main then origin/master via rev-parse. If neither
-  # exists (bootstrap scenario — first push to an empty remote, or a fresh
-  # clone with no fetch), there is no baseline to diff against, so the
-  # protected-path check has no meaningful work to do. Skip this refspec.
-  # This is NOT fail-open — there is simply no diff to classify. Real
-  # protected-path checks kick in on subsequent pushes once the remote-
-  # tracking ref exists.
+  # Fallback order when $REMOTE/HEAD is not set (common on shallow or mirror
+  # clones): probe $REMOTE/main then $REMOTE/master via rev-parse. If neither
+  # exists — initial push to a fresh remote with no tracking refs yet — use
+  # the well-known EMPTY_TREE as the baseline so the diff covers the FULL
+  # change set. This keeps the protected-path check honest on first push
+  # (prior versions of this patch `continue`d here, which was a fail-open
+  # flagged as HIGH by adversarial review).
   if [ "$remote_sha" = "0000000000000000000000000000000000000000" ]; then
-    default_ref=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null || printf '')
+    default_ref=$(git symbolic-ref "refs/remotes/${REMOTE}/HEAD" 2>/dev/null || printf '')
     if [ -z "${default_ref:-}" ]; then
-      if git rev-parse --verify --quiet refs/remotes/origin/main >/dev/null 2>&1; then
-        default_ref="refs/remotes/origin/main"
-      elif git rev-parse --verify --quiet refs/remotes/origin/master >/dev/null 2>&1; then
-        default_ref="refs/remotes/origin/master"
+      if git rev-parse --verify --quiet "refs/remotes/${REMOTE}/main" >/dev/null 2>&1; then
+        default_ref="refs/remotes/${REMOTE}/main"
+      elif git rev-parse --verify --quiet "refs/remotes/${REMOTE}/master" >/dev/null 2>&1; then
+        default_ref="refs/remotes/${REMOTE}/master"
       else
         default_ref=""
       fi
     fi
-    # Bootstrap: no remote-tracking ref exists at all. Skip this refspec.
-    if [ -z "${default_ref:-}" ]; then
-      continue
+    if [ -n "${default_ref:-}" ]; then
+      base=$(git merge-base "$default_ref" "$local_sha" 2>/dev/null || printf '')
+    else
+      # Bootstrap: no remote-tracking ref exists at all. Use the empty-tree
+      # baseline so the diff covers every file in the push. git diff accepts
+      # a tree SHA as the left-hand side.
+      base="$EMPTY_TREE"
     fi
-    base=$(git merge-base "$default_ref" "$local_sha" 2>/dev/null || printf '')
   else
     base=$(git merge-base "$remote_sha" "$local_sha" 2>/dev/null || printf '')
   fi
@@ -124,8 +140,8 @@ while IFS=' ' read -r local_ref local_sha remote_ref remote_sha; do
   if [ -z "${base:-}" ]; then
     printf 'PUSH BLOCKED: could not resolve merge-base between %s and %s (local_ref=%s remote_ref=%s).\n' \
       "${remote_sha:-<new>}" "${local_sha:-<missing>}" "${local_ref:-<unknown>}" "${remote_ref:-<unknown>}" >&2
-    printf '  Run `git fetch origin` and retry. If the history is genuinely unrelated\n' >&2
-    printf '  to origin (e.g. grafted branch), resolve manually before pushing.\n' >&2
+    printf '  Run `git fetch %s` and retry. If the history is genuinely unrelated\n' "$REMOTE" >&2
+    printf '  to %s (e.g. grafted branch), resolve manually before pushing.\n' "$REMOTE" >&2
     exit 1
   fi
 
