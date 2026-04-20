@@ -37,6 +37,63 @@ set -uo pipefail
 # ── 1. Read ALL stdin immediately ─────────────────────────────────────────────
 INPUT=$(cat)
 
+# ── 1a. Cross-repo guard (must come FIRST — before any rea-scoped check) ──────
+# When CLAUDE_PROJECT_DIR points to the rea repo (the Claude Code session's
+# project directory) but the current working directory is a DIFFERENT
+# repository, this hook is firing for someone else's push. rea's gate only
+# owns pushes from within rea itself — exit 0 so the foreign repo's
+# `git push` proceeds unblocked.
+#
+# MUST run before the jq check and HALT check. Those are rea-scoped concerns:
+# a missing-jq or HALT-frozen state in rea must not block pushes in OTHER
+# repos that merely share a Claude Code session with rea. Fixing that
+# governance-scope leak is half the point of this guard.
+#
+# Also: without this guard, ref-resolution inside `resolve_argv_refspecs`
+# runs `git rev-parse` inside REA_ROOT for refs that only exist in the
+# foreign repo, which hard-fails with "could not resolve source ref". That
+# failure lands BEFORE REA_SKIP_PUSH_REVIEW / REA_SKIP_CODEX_REVIEW can be
+# checked, so consumers are left with no documented way out. Discovered
+# during the 0.6.0 cross-repo consumer upgrade; fixed in 0.6.1.
+#
+# Repo-identity comparison via shared `--git-common-dir`, NOT path-prefix or
+# `--show-toplevel`. Why common-dir: a linked worktree created by
+# `git worktree add` has a different toplevel (different checkout path) but
+# the SAME repository — shared object DB, shared refs, shared HEAD history.
+# Any `.claude/worktrees/*` checkout of rea IS rea and must run the gate.
+# `--show-toplevel` would falsely flag those worktrees as "foreign" and
+# bypass HALT plus every other gate (Codex R3 finding, 0.6.1).
+#
+# `--path-format=absolute` (Git ≥ 2.31, March 2021) normalizes the common
+# dir so the same repo's common-dir is equal regardless of which worktree
+# asked. Engines pin Node ≥20 which ships with a recent-enough Git for dev.
+#
+# Falls back to path-prefix when either cwd or REA_ROOT is not a git
+# checkout (the rea 0.5.1 non-git escape-hatch scenario).
+REA_ROOT="${CLAUDE_PROJECT_DIR:-$(pwd)}"
+if [[ -n "${CLAUDE_PROJECT_DIR:-}" ]]; then
+  CWD_REAL=$(pwd -P 2>/dev/null || pwd)
+  if REA_REAL=$(cd "$REA_ROOT" 2>/dev/null && pwd -P 2>/dev/null); then
+    CWD_COMMON=$(git -C "$CWD_REAL" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)
+    REA_COMMON=$(git -C "$REA_REAL" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)
+    if [[ -n "$CWD_COMMON" && -n "$REA_COMMON" ]]; then
+      # Both sides are git checkouts. Realpath'd common-dirs match IFF they
+      # point at the same underlying repository (main or linked worktree).
+      CWD_COMMON_REAL=$(cd "$CWD_COMMON" 2>/dev/null && pwd -P 2>/dev/null || echo "$CWD_COMMON")
+      REA_COMMON_REAL=$(cd "$REA_COMMON" 2>/dev/null && pwd -P 2>/dev/null || echo "$REA_COMMON")
+      if [[ "$CWD_COMMON_REAL" != "$REA_COMMON_REAL" ]]; then
+        exit 0
+      fi
+    else
+      # Non-git-repo path: literal quoted expansions — no glob expansion.
+      case "$CWD_REAL/" in
+        "$REA_REAL"/*|"$REA_REAL"/) : ;;  # inside rea — run the gate
+        *) exit 0 ;;                       # outside rea — not our gate
+      esac
+    fi
+  fi
+fi
+
 # ── 2. Dependency check ──────────────────────────────────────────────────────
 if ! command -v jq >/dev/null 2>&1; then
   printf 'REA ERROR: jq is required but not installed.\n' >&2
@@ -45,7 +102,6 @@ if ! command -v jq >/dev/null 2>&1; then
 fi
 
 # ── 3. HALT check ────────────────────────────────────────────────────────────
-REA_ROOT="${CLAUDE_PROJECT_DIR:-$(pwd)}"
 HALT_FILE="${REA_ROOT}/.rea/HALT"
 if [ -f "$HALT_FILE" ]; then
   printf 'REA HALT: %s\nAll agent operations suspended. Run: rea unfreeze\n' \

@@ -15,6 +15,39 @@ set -uo pipefail
 # ── 1. Read ALL stdin immediately ─────────────────────────────────────────────
 INPUT=$(cat)
 
+# ── 1a. Cross-repo guard (must come FIRST — before any rea-scoped check) ──────
+# Mirror of push-review-gate.sh. When CLAUDE_PROJECT_DIR points to rea but
+# the current git checkout is a DIFFERENT repository (distinct object DB),
+# exit 0 — rea's gate does not own that commit.
+#
+# Identity via `--git-common-dir` so linked worktrees of rea
+# (`git worktree add`, `.claude/worktrees/*`) are correctly recognized as
+# the SAME repo and kept under the gate — they share object DB, refs, and
+# HEAD history with rea's main checkout. Path-prefix fallback fires
+# when either side is not a git checkout. Must run BEFORE the jq and HALT
+# checks: a missing-jq or HALT-frozen rea must not block commits in other
+# repos that merely share a Claude Code session with rea. Fixed in 0.6.1.
+REA_ROOT="${CLAUDE_PROJECT_DIR:-$(pwd)}"
+if [[ -n "${CLAUDE_PROJECT_DIR:-}" ]]; then
+  CWD_REAL=$(pwd -P 2>/dev/null || pwd)
+  if REA_REAL=$(cd "$REA_ROOT" 2>/dev/null && pwd -P 2>/dev/null); then
+    CWD_COMMON=$(git -C "$CWD_REAL" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)
+    REA_COMMON=$(git -C "$REA_REAL" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)
+    if [[ -n "$CWD_COMMON" && -n "$REA_COMMON" ]]; then
+      CWD_COMMON_REAL=$(cd "$CWD_COMMON" 2>/dev/null && pwd -P 2>/dev/null || echo "$CWD_COMMON")
+      REA_COMMON_REAL=$(cd "$REA_COMMON" 2>/dev/null && pwd -P 2>/dev/null || echo "$REA_COMMON")
+      if [[ "$CWD_COMMON_REAL" != "$REA_COMMON_REAL" ]]; then
+        exit 0
+      fi
+    else
+      case "$CWD_REAL/" in
+        "$REA_REAL"/*|"$REA_REAL"/) : ;;  # inside rea — run the gate
+        *) exit 0 ;;                       # outside rea — not our gate
+      esac
+    fi
+  fi
+fi
+
 # ── 2. Dependency check ──────────────────────────────────────────────────────
 if ! command -v jq >/dev/null 2>&1; then
   printf 'REA ERROR: jq is required but not installed.\n' >&2
@@ -23,7 +56,6 @@ if ! command -v jq >/dev/null 2>&1; then
 fi
 
 # ── 3. HALT check ────────────────────────────────────────────────────────────
-REA_ROOT="${CLAUDE_PROJECT_DIR:-$(pwd)}"
 HALT_FILE="${REA_ROOT}/.rea/HALT"
 if [ -f "$HALT_FILE" ]; then
   printf 'REA HALT: %s\nAll agent operations suspended. Run: rea unfreeze\n' \
