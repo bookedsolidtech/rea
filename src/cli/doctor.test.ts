@@ -70,6 +70,11 @@ async function makeScratchRepo(opts: {
     ['version: "1"', 'servers: []', ''].join('\n'),
   );
 
+  // Simulate a git repo so the non-git escape hatch does NOT kick in for
+  // tests that are exercising the git-hook checks directly. Tests that want
+  // to exercise the non-git path create a scratch dir without `.git/`.
+  await fs.mkdir(path.join(dir, '.git', 'hooks'), { recursive: true });
+
   return { dir };
 }
 
@@ -402,6 +407,208 @@ describe('rea doctor — collectChecks (G11.4 codex_required)', () => {
     const check = findCheck(checks, 'pre-push hook installed');
     expect(check?.status).toBe('fail');
     expect(check?.detail).toMatch(/silently bypassed/);
+  });
+});
+
+describe('rea doctor — non-git escape hatch', () => {
+  const cleanup: string[] = [];
+
+  afterEach(async () => {
+    await Promise.all(
+      cleanup.splice(0).map((d) => fs.rm(d, { recursive: true, force: true })),
+    );
+  });
+
+  async function makeNonGitScratch(): Promise<ScratchRepo> {
+    const dir = await fs.realpath(
+      await fs.mkdtemp(path.join(os.tmpdir(), 'rea-doctor-nongit-')),
+    );
+    await fs.mkdir(path.join(dir, '.rea'), { recursive: true });
+    await fs.writeFile(
+      path.join(dir, '.rea', 'policy.yaml'),
+      [
+        'version: "1"',
+        'profile: "bst-internal"',
+        'installed_by: "test"',
+        'installed_at: "2026-04-19T00:00:00Z"',
+        'autonomy_level: L1',
+        'max_autonomy_level: L2',
+        'promotion_requires_human_approval: true',
+        'block_ai_attribution: true',
+        'blocked_paths:',
+        '  - .env',
+        'notification_channel: ""',
+        'review:',
+        '  codex_required: false',
+        '',
+      ].join('\n'),
+    );
+    await fs.writeFile(
+      path.join(dir, '.rea', 'registry.yaml'),
+      ['version: "1"', 'servers: []', ''].join('\n'),
+    );
+    // Deliberately no `.git/` directory — this is the non-git-repo path.
+    return { dir };
+  }
+
+  it('no .git/ at baseDir: commit-msg + pre-push checks replaced by a single info line', async () => {
+    const repo = await makeNonGitScratch();
+    cleanup.push(repo.dir);
+    const hookPath = path.join(repo.dir, '.git', 'hooks', 'pre-push');
+    const prePushState: PrePushDoctorState = {
+      ok: false,
+      activeForeign: false,
+      activePath: hookPath,
+      candidates: [
+        {
+          path: hookPath,
+          exists: false,
+          executable: false,
+          reaManaged: false,
+          delegatesToGate: false,
+        },
+      ],
+    };
+
+    const checks = collectChecks(repo.dir, undefined, prePushState);
+
+    // Neither git-hook check is present.
+    expect(findCheck(checks, 'commit-msg hook installed')).toBeUndefined();
+    expect(findCheck(checks, 'pre-push hook installed')).toBeUndefined();
+
+    // Exactly one `git hooks` info line explains why.
+    const gitInfo = findCheck(checks, 'git hooks');
+    expect(gitInfo?.status).toBe('info');
+    expect(gitInfo?.detail).toMatch(/not a git repo/);
+  });
+
+  it('no .git/: prePushState is never consulted, regardless of shape (F4)', async () => {
+    // Property under test: when `isGitRepo(baseDir)` is false, `collectChecks`
+    // short-circuits BEFORE touching `prePushState`. So passing a fabricated
+    // state with `activeForeign: true` must NOT emit the "silently bypassed"
+    // fail the git-repo path would emit for that same state. The state
+    // object is physically impossible (foreign active hook in a non-git
+    // dir) precisely to make the short-circuit property easy to assert.
+    const repo = await makeNonGitScratch();
+    cleanup.push(repo.dir);
+    const hookPath = path.join(repo.dir, '.git', 'hooks', 'pre-push');
+    const foreignState: PrePushDoctorState = {
+      ok: false,
+      activeForeign: true,
+      activePath: hookPath,
+      candidates: [
+        {
+          path: hookPath,
+          exists: true,
+          executable: true,
+          reaManaged: false,
+          delegatesToGate: false,
+        },
+      ],
+    };
+
+    const withState = collectChecks(repo.dir, undefined, foreignState);
+    const withoutState = collectChecks(repo.dir, undefined, undefined);
+
+    // The two calls produce identical check labels and statuses — the
+    // short-circuit is total.
+    const shape = (cs: CheckResult[]): Array<{ label: string; status: CheckResult['status'] }> =>
+      cs.map((c) => ({ label: c.label, status: c.status }));
+    expect(shape(withState)).toEqual(shape(withoutState));
+
+    expect(findCheck(withState, 'pre-push hook installed')).toBeUndefined();
+    expect(findCheck(withState, 'git hooks')?.status).toBe('info');
+  });
+
+  it('F4 mirror: git repo + undefined prePushState → commit-msg check present, pre-push check absent (back-compat)', async () => {
+    // When `.git/` exists but the caller omits `prePushState`, the pre-push
+    // check must NOT be emitted (back-compat for older call sites), but the
+    // commit-msg check MUST still run. The non-git escape hatch changed the
+    // branching structure, so lock this property in.
+    const repo = await makeScratchRepo({ codexRequired: true });
+    cleanup.push(repo.dir);
+
+    const checks = collectChecks(repo.dir, undefined, undefined);
+    expect(findCheck(checks, 'commit-msg hook installed')).toBeDefined();
+    expect(findCheck(checks, 'pre-push hook installed')).toBeUndefined();
+    // And no non-git info line, because this IS a git repo.
+    expect(findCheck(checks, 'git hooks')).toBeUndefined();
+  });
+
+  it('broken gitlink: `.git` is a file pointing at a non-existent gitdir → NOT a git repo (F1)', async () => {
+    // A stale submodule or a linked worktree whose main repo was moved/
+    // deleted leaves `.git` as a file with `gitdir: <stale-path>`. Git
+    // itself reports "not a git repository" here; `rea doctor` must do
+    // the same so the non-git escape hatch kicks in. A naive existence
+    // check of `.git` would incorrectly return true and re-introduce the
+    // exact hard-fail 0.5.1 is supposed to eliminate.
+    const repo = await makeNonGitScratch();
+    cleanup.push(repo.dir);
+    const dotGit = path.join(repo.dir, '.git');
+    await fs.writeFile(
+      dotGit,
+      'gitdir: /tmp/this/path/does/not/exist/rea-test-stale-gitlink\n',
+      'utf8',
+    );
+
+    const checks = collectChecks(repo.dir);
+    expect(findCheck(checks, 'commit-msg hook installed')).toBeUndefined();
+    expect(findCheck(checks, 'git hooks')?.status).toBe('info');
+  });
+
+  it('broken gitlink with a RELATIVE target: still NOT a git repo (F1 relative branch)', async () => {
+    // Exercises the `path.join(baseDir, targetPath)` resolution path for a
+    // gitlink target that doesn't exist. The absolute-path version is
+    // covered above; this one locks down the relative-path branch.
+    const repo = await makeNonGitScratch();
+    cleanup.push(repo.dir);
+    await fs.writeFile(
+      path.join(repo.dir, '.git'),
+      'gitdir: ./pruned-does-not-exist\n',
+      'utf8',
+    );
+
+    const checks = collectChecks(repo.dir);
+    expect(findCheck(checks, 'commit-msg hook installed')).toBeUndefined();
+    expect(findCheck(checks, 'git hooks')?.status).toBe('info');
+  });
+
+  it('valid gitlink: `.git` is a file pointing at a real gitdir → treated as a git repo (F1)', async () => {
+    // Positive counter-case: the gitlink parser must follow a valid
+    // absolute or relative `gitdir:` reference and return true.
+    const repo = await makeNonGitScratch();
+    cleanup.push(repo.dir);
+    const realGitDir = path.join(repo.dir, 'real-gitdir');
+    await fs.mkdir(path.join(realGitDir, 'hooks'), { recursive: true });
+    const dotGit = path.join(repo.dir, '.git');
+    // Relative form — same as linked-worktree shape.
+    await fs.writeFile(dotGit, 'gitdir: real-gitdir\n', 'utf8');
+
+    const checks = collectChecks(repo.dir);
+    // Git hooks branch fires; commit-msg check runs (and warns since we
+    // haven't installed the hook).
+    expect(findCheck(checks, 'git hooks')).toBeUndefined();
+    expect(findCheck(checks, 'commit-msg hook installed')).toBeDefined();
+  });
+
+  it('`.git/` exists but `.git/hooks/` does not: commit-msg check warns, does not crash (F2)', async () => {
+    // A partially-initialized repo (e.g. `git init --bare` in an unusual
+    // place, or a manual checkout manipulation) can have `.git/` without
+    // `.git/hooks/`. `isGitRepo` returns true for this shape, so the
+    // git-hook checks run. They must degrade gracefully — not crash — and
+    // report the missing hook as a warn. This matches the pre-0.5.1
+    // behavior and is what consumers running `rea init` next would see.
+    const repo = await makeNonGitScratch();
+    cleanup.push(repo.dir);
+    await fs.mkdir(path.join(repo.dir, '.git'), { recursive: true });
+    // NO `.git/hooks/` directory.
+
+    const checks = collectChecks(repo.dir);
+    const commitMsg = findCheck(checks, 'commit-msg hook installed');
+    expect(commitMsg?.status).toBe('warn');
+    expect(commitMsg?.detail).toMatch(/missing/);
+    // And the non-git info line is NOT emitted because `.git/` exists.
+    expect(findCheck(checks, 'git hooks')).toBeUndefined();
   });
 });
 

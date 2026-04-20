@@ -33,7 +33,18 @@
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
+import fs from 'node:fs/promises';
+import path from 'node:path';
 import { DownstreamPool, splitPrefixed } from './downstream-pool.js';
+import {
+  META_HEALTH_TOOL_NAME,
+  META_SERVER_NAME,
+  META_TOOL_NAME,
+  buildHealthSnapshot,
+  metaHealthToolDescriptor,
+} from './meta/health.js';
+import { appendAuditRecord } from '../audit/append.js';
+import { getPkgVersion } from '../cli/utils.js';
 import { createAuditMiddleware } from './middleware/audit.js';
 import { createKillSwitchMiddleware } from './middleware/kill-switch.js';
 import { createTierMiddleware } from './middleware/tier.js';
@@ -169,12 +180,14 @@ function buildMiddlewareChain(opts: GatewayOptions, deps: ChainDeps): Middleware
 }
 
 export function createGateway(opts: GatewayOptions): GatewayHandle {
-  const { registry } = opts;
+  const { registry, policy, baseDir } = opts;
   const logger = opts.logger ?? createLogger({ base: { session_id: currentSessionId() } });
   const metrics = opts.metrics;
   const pool = new DownstreamPool(registry, logger);
+  const gatewayVersion = getPkgVersion();
+  const startedAtMs = Date.now();
 
-  const server = new Server({ name: 'rea', version: '0.2.0' }, { capabilities: { tools: {} } });
+  const server = new Server({ name: 'rea', version: gatewayVersion }, { capabilities: { tools: {} } });
 
   // Build the circuit breaker with observability hooks wired in — state
   // transitions log a structured record AND update the Prometheus gauge.
@@ -203,22 +216,116 @@ export function createGateway(opts: GatewayOptions): GatewayHandle {
 
   const staticChain = buildMiddlewareChain(opts, { breaker });
 
+  // Read `.rea/HALT` without ever throwing. Returns `{halt, reason}` where
+  // `reason` is the (trimmed) file contents or null when the file is absent
+  // / unreadable. The meta-tool never surfaces I/O errors — health is the one
+  // thing that has to keep working when everything else is broken.
+  async function readHalt(): Promise<{ halt: boolean; reason: string | null }> {
+    try {
+      const contents = await fs.readFile(path.join(baseDir, '.rea', 'HALT'), 'utf8');
+      const trimmed = contents.trim();
+      return { halt: true, reason: trimmed.length > 0 ? trimmed : null };
+    } catch {
+      return { halt: false, reason: null };
+    }
+  }
+
   // ── Handlers ─────────────────────────────────────────────────────────────
   server.setRequestHandler(ListToolsRequestSchema, async () => {
-    if (pool.size === 0) return { tools: [] };
+    // The `__rea__health` meta-tool is ALWAYS advertised, regardless of
+    // downstream state. This is the systemic answer to the "listTools came
+    // back empty, now what?" diagnostic gap — the LLM can always call
+    // health to find out why.
+    const metaTool = metaHealthToolDescriptor();
+    if (pool.size === 0) return { tools: [metaTool] };
     const prefixed = await pool.listAllTools();
     return {
-      tools: prefixed.map((t) => ({
-        name: t.name,
-        description: t.description ?? `${t.server} → ${t.name.slice(t.server.length + 2)}`,
-        inputSchema: t.inputSchema ?? { type: 'object' },
-      })),
+      tools: [
+        metaTool,
+        ...prefixed.map((t) => ({
+          name: t.name,
+          description: t.description ?? `${t.server} → ${t.name.slice(t.server.length + 2)}`,
+          inputSchema: t.inputSchema ?? { type: 'object' },
+        })),
+      ],
     };
   });
 
   server.setRequestHandler(CallToolRequestSchema, async (req) => {
     const prefixed = req.params.name;
     const args = (req.params.arguments ?? {}) as Record<string, unknown>;
+
+    // Short-circuit the `__rea__health` meta-tool BEFORE the middleware chain
+    // and BEFORE splitPrefixed. Reasons:
+    //   - Must be callable while HALT is active (so the operator can
+    //     introspect a frozen gateway). The kill-switch middleware would
+    //     otherwise deny.
+    //   - `deriveBaseTier('health')` defaults to Write, which would deny L0
+    //     callers. Health is pure introspection — tier doesn't apply.
+    //   - There's no downstream to dispatch to. The middleware chain exists
+    //     to reach one safely.
+    // We still write an audit record so invocations remain accountable.
+    // The `__rea__` prefix is reserved for gateway-internal meta-tools.
+    // Reject any unknown name in that namespace with a clear error rather
+    // than letting `splitPrefixed` produce the confusing `unknown downstream
+    // server ""` message for e.g. `__rea__health ` (trailing space) or a
+    // future meta-tool name the client was guessing at.
+    if (prefixed.startsWith('__rea__') && prefixed !== META_HEALTH_TOOL_NAME) {
+      return {
+        isError: true,
+        content: [
+          {
+            type: 'text' as const,
+            text: `reserved meta-namespace: only "${META_HEALTH_TOOL_NAME}" is defined under __rea__`,
+          },
+        ],
+      };
+    }
+    if (prefixed === META_HEALTH_TOOL_NAME) {
+      const startMs = Date.now();
+      const haltState = await readHalt();
+      const snapshot = buildHealthSnapshot({
+        gatewayVersion,
+        startedAtMs,
+        policy,
+        downstreams: pool.healthSnapshot(),
+        halt: haltState.halt,
+        haltReason: haltState.reason,
+      });
+      // Best-effort audit append. Failures here must never prevent the
+      // caller from getting the health response — that would defeat the
+      // whole point of a "works when everything else is broken" tool.
+      try {
+        await appendAuditRecord(baseDir, {
+          tool_name: META_TOOL_NAME,
+          server_name: META_SERVER_NAME,
+          status: InvocationStatus.Allowed,
+          tier: Tier.Read,
+          autonomy_level: String(policy.autonomy_level),
+          session_id: currentSessionId(),
+          duration_ms: Date.now() - startMs,
+          metadata: {
+            halt: snapshot.gateway.halt,
+            downstreams_registered: snapshot.summary.registered,
+            downstreams_healthy: snapshot.summary.healthy,
+          },
+        });
+      } catch (err) {
+        logger.warn({
+          event: 'meta.health.audit_failed',
+          message: 'failed to append audit record for __rea__health; serving response anyway',
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: JSON.stringify(snapshot, null, 2),
+          },
+        ],
+      };
+    }
 
     // Split prefix for downstream dispatch; the terminal middleware uses the
     // full prefixed name to call the pool (which re-splits internally).
@@ -394,8 +501,3 @@ export function createGateway(opts: GatewayOptions): GatewayHandle {
 
   return { server, start, stop, pool, logger, metrics };
 }
-
-// Prevent TS from complaining about the unused `Tier` import when the file is
-// compiled in isolation; keeping the import pins the semantic dependency edge
-// for future middleware that may want to inspect the tier in terminal.
-void Tier;
