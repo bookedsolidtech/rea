@@ -133,6 +133,51 @@ jobs:
       - name: Build
         run: pnpm build
 
+  dist-regression:
+    name: Dist regression
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Class-level guard against the 0.6.0 → 0.6.1 regression: a release that
+    # shipped `dist/` byte-identical to the prior release despite `src/` edits.
+    # BUG-013's changeset-keyed check (scripts/tarball-smoke.sh security-claim
+    # gate) only fires when a changeset carries `[security]`; this gate runs on
+    # EVERY PR and EVERY push:main regardless of changeset markers. If `src/`
+    # has changed vs the last published tag but the rebuilt `dist/` tree hashes
+    # identically to the published tarball, the run fails. The matching
+    # defense-in-depth at release time lives in .github/workflows/release.yml
+    # (rebuild + post-publish hash verify). See scripts/dist-regression-gate.sh
+    # for the algorithm + false-positive surface notes.
+    steps:
+      - name: Checkout
+        # pin: actions/checkout v4.1.7
+        uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332
+        with:
+          # Need fetch-depth: 0 so `git rev-parse v<prev-version>` resolves
+          # without an explicit tag fetch. The gate's fallback `git fetch
+          # --depth=1 origin refs/tags/...` handles shallow CI runs, but
+          # full history keeps the common case fast.
+          fetch-depth: 0
+
+      - name: Setup pnpm
+        # pin: pnpm/action-setup v4.0.0 — version derived from packageManager in package.json
+        uses: pnpm/action-setup@fe02b34f77f8bc703788d5817da081398fad5dd2
+
+      - name: Setup Node
+        # pin: actions/setup-node v4.0.3
+        uses: actions/setup-node@1e60f620b9541d16bece96c5465dc8ee9832be0b
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        run: pnpm build
+
+      - name: Dist regression gate
+        run: scripts/dist-regression-gate.sh
+
   tarball-smoke:
     name: Tarball smoke
     runs-on: ubuntu-latest
