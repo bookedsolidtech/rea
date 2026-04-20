@@ -37,6 +37,63 @@ set -uo pipefail
 # ── 1. Read ALL stdin immediately ─────────────────────────────────────────────
 INPUT=$(cat)
 
+# ── 1a. Cross-repo guard (must come FIRST — before any rea-scoped check) ──────
+# When CLAUDE_PROJECT_DIR points to the rea repo (the Claude Code session's
+# project directory) but the current working directory is a DIFFERENT
+# repository, this hook is firing for someone else's push. rea's gate only
+# owns pushes from within rea itself — exit 0 so the foreign repo's
+# `git push` proceeds unblocked.
+#
+# MUST run before the jq check and HALT check. Those are rea-scoped concerns:
+# a missing-jq or HALT-frozen state in rea must not block pushes in OTHER
+# repos that merely share a Claude Code session with rea. Fixing that
+# governance-scope leak is half the point of this guard.
+#
+# Also: without this guard, ref-resolution inside `resolve_argv_refspecs`
+# runs `git rev-parse` inside REA_ROOT for refs that only exist in the
+# foreign repo, which hard-fails with "could not resolve source ref". That
+# failure lands BEFORE REA_SKIP_PUSH_REVIEW / REA_SKIP_CODEX_REVIEW can be
+# checked, so consumers are left with no documented way out. Discovered
+# during the 0.6.0 cross-repo consumer upgrade; fixed in 0.6.1.
+#
+# Repo-identity comparison via shared `--git-common-dir`, NOT path-prefix or
+# `--show-toplevel`. Why common-dir: a linked worktree created by
+# `git worktree add` has a different toplevel (different checkout path) but
+# the SAME repository — shared object DB, shared refs, shared HEAD history.
+# Any `.claude/worktrees/*` checkout of rea IS rea and must run the gate.
+# `--show-toplevel` would falsely flag those worktrees as "foreign" and
+# bypass HALT plus every other gate (Codex R3 finding, 0.6.1).
+#
+# `--path-format=absolute` (Git ≥ 2.31, March 2021) normalizes the common
+# dir so the same repo's common-dir is equal regardless of which worktree
+# asked. Engines pin Node ≥20 which ships with a recent-enough Git for dev.
+#
+# Falls back to path-prefix when either cwd or REA_ROOT is not a git
+# checkout (the rea 0.5.1 non-git escape-hatch scenario).
+REA_ROOT="${CLAUDE_PROJECT_DIR:-$(pwd)}"
+if [[ -n "${CLAUDE_PROJECT_DIR:-}" ]]; then
+  CWD_REAL=$(pwd -P 2>/dev/null || pwd)
+  if REA_REAL=$(cd "$REA_ROOT" 2>/dev/null && pwd -P 2>/dev/null); then
+    CWD_COMMON=$(git -C "$CWD_REAL" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)
+    REA_COMMON=$(git -C "$REA_REAL" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)
+    if [[ -n "$CWD_COMMON" && -n "$REA_COMMON" ]]; then
+      # Both sides are git checkouts. Realpath'd common-dirs match IFF they
+      # point at the same underlying repository (main or linked worktree).
+      CWD_COMMON_REAL=$(cd "$CWD_COMMON" 2>/dev/null && pwd -P 2>/dev/null || echo "$CWD_COMMON")
+      REA_COMMON_REAL=$(cd "$REA_COMMON" 2>/dev/null && pwd -P 2>/dev/null || echo "$REA_COMMON")
+      if [[ "$CWD_COMMON_REAL" != "$REA_COMMON_REAL" ]]; then
+        exit 0
+      fi
+    else
+      # Non-git-repo path: literal quoted expansions — no glob expansion.
+      case "$CWD_REAL/" in
+        "$REA_REAL"/*|"$REA_REAL"/) : ;;  # inside rea — run the gate
+        *) exit 0 ;;                       # outside rea — not our gate
+      esac
+    fi
+  fi
+fi
+
 # ── 2. Dependency check ──────────────────────────────────────────────────────
 if ! command -v jq >/dev/null 2>&1; then
   printf 'REA ERROR: jq is required but not installed.\n' >&2
@@ -45,7 +102,6 @@ if ! command -v jq >/dev/null 2>&1; then
 fi
 
 # ── 3. HALT check ────────────────────────────────────────────────────────────
-REA_ROOT="${CLAUDE_PROJECT_DIR:-$(pwd)}"
 HALT_FILE="${REA_ROOT}/.rea/HALT"
 if [ -f "$HALT_FILE" ]; then
   printf 'REA HALT: %s\nAll agent operations suspended. Run: rea unfreeze\n' \
@@ -56,8 +112,31 @@ fi
 # ── 4. Parse command ──────────────────────────────────────────────────────────
 CMD=$(printf '%s' "$INPUT" | jq -r '.tool_input.command // empty' 2>/dev/null)
 
+# ── 4a. BUG-008: self-detect git's native pre-push contract ───────────────────
+# When the hook is wired into `.husky/pre-push`, git invokes it with
+#   `$1 = remote name`, `$2 = remote url`
+# and delivers one line per refspec on stdin:
+#   `<local_ref> <local_sha> <remote_ref> <remote_sha>`
+# The Claude Code PreToolUse wrapper instead delivers JSON on stdin, which is
+# what the jq parse above targets. When jq returns empty, the stdin may in
+# fact be git's pre-push ref-list — sniff the first non-blank line, and if it
+# matches the `<ref> <40-hex> <ref> <40-hex>` shape, synthesize CMD as
+# `git push <remote>` (from argv $1) so the remainder of the gate runs
+# through the pre-push parser in step 6 rather than the argv fallback.
+#
+# Any other stdin shape (empty, random JSON, a non-push tool call) still
+# exits 0 here — the gate is a no-op for non-push Bash calls by design.
+FIRST_STDIN_LINE=$(printf '%s' "$INPUT" | awk 'NF { print; exit }')
 if [[ -z "$CMD" ]]; then
-  exit 0
+  if [[ -n "$FIRST_STDIN_LINE" ]] \
+     && printf '%s' "$FIRST_STDIN_LINE" \
+        | grep -qE '^[^[:space:]]+[[:space:]]+[0-9a-f]{40}[[:space:]]+[^[:space:]]+[[:space:]]+[0-9a-f]{40}[[:space:]]*$'; then
+    # Git native pre-push path. Remote comes from argv $1 — falls back to
+    # `origin` for safety if the hook was invoked without arguments.
+    CMD="git push ${1:-origin}"
+  else
+    exit 0
+  fi
 fi
 
 # Only trigger on git push commands
@@ -71,6 +150,167 @@ if [[ -f "$POLICY_FILE" ]]; then
   if grep -qE 'push_review:[[:space:]]*false' "$POLICY_FILE" 2>/dev/null; then
     exit 0
   fi
+fi
+
+# ── 5a. REA_SKIP_PUSH_REVIEW — whole-gate escape hatch ───────────────────────
+# An opt-in bypass for the ENTIRE push-review gate (not just the Codex branch).
+# Exists to unblock consumers when rea itself is broken (as in BUG-009 pre-0.5.0)
+# or a corrupt policy/audit file would otherwise deadlock a push. Requires an
+# explicit non-empty reason; the value of REA_SKIP_PUSH_REVIEW is recorded
+# verbatim in the audit record as the reason.
+#
+# Fail-closed contract matches REA_SKIP_CODEX_REVIEW:
+#   - missing dist/audit/append.js → exit 2
+#   - missing git identity         → exit 2
+#   - Node failure                 → exit 2
+#
+# Audit tool_name is `push.review.skipped`. This is intentionally NOT
+# `codex.review` or `codex.review.skipped` — a skip of the whole gate is a
+# separately-audited event and does not satisfy the Codex-review jq predicate.
+if [[ -n "${REA_SKIP_PUSH_REVIEW:-}" ]]; then
+  SKIP_REASON="$REA_SKIP_PUSH_REVIEW"
+  AUDIT_APPEND_JS="${REA_ROOT}/dist/audit/append.js"
+
+  if [[ ! -f "$AUDIT_APPEND_JS" ]]; then
+    {
+      printf 'PUSH BLOCKED: REA_SKIP_PUSH_REVIEW requires rea to be built.\n'
+      printf '\n'
+      printf '  REA_SKIP_PUSH_REVIEW is set but %s is missing.\n' "$AUDIT_APPEND_JS"
+      printf '  Run: pnpm build\n'
+      printf '\n'
+    } >&2
+    exit 2
+  fi
+
+  # Codex F2: CI-aware refusal. The skip hatch is ambient — any process that
+  # can set env vars can flip the gate off with a forged git identity (git
+  # config is mutable repo config). In a CI context, refuse by default; only
+  # allow if the policy explicitly opted in via review.allow_skip_in_ci=true.
+  if [[ -n "${CI:-}" ]]; then
+    ALLOW_CI_SKIP=""
+    READ_FIELD_JS="${REA_ROOT}/dist/scripts/read-policy-field.js"
+    if [[ -f "$READ_FIELD_JS" ]]; then
+      ALLOW_CI_SKIP=$(REA_ROOT="$REA_ROOT" node "$READ_FIELD_JS" review.allow_skip_in_ci 2>/dev/null || echo "")
+    fi
+    if [[ "$ALLOW_CI_SKIP" != "true" ]]; then
+      {
+        printf 'PUSH BLOCKED: REA_SKIP_PUSH_REVIEW refused in CI context.\n'
+        printf '\n'
+        printf '  CI env var is set. An unauthenticated env-var bypass in a shared\n'
+        printf '  build agent is not trusted. To enable, set\n'
+        printf '    review:\n'
+        printf '      allow_skip_in_ci: true\n'
+        printf '  in .rea/policy.yaml — explicitly authorizing env-var skips in CI.\n'
+        printf '\n'
+      } >&2
+      exit 2
+    fi
+  fi
+
+  SKIP_ACTOR=$(cd "$REA_ROOT" && git config user.email 2>/dev/null || echo "")
+  if [[ -z "$SKIP_ACTOR" ]]; then
+    SKIP_ACTOR=$(cd "$REA_ROOT" && git config user.name 2>/dev/null || echo "")
+  fi
+  if [[ -z "$SKIP_ACTOR" ]]; then
+    {
+      printf 'PUSH BLOCKED: REA_SKIP_PUSH_REVIEW requires a git identity.\n'
+      printf '\n'
+      # shellcheck disable=SC2016  # backticks are literal markdown in user-facing message
+      printf '  Neither `git config user.email` nor `git config user.name`\n'
+      printf '  is set. The skip audit record would have no actor; refusing\n'
+      printf '  to bypass without one.\n'
+      printf '\n'
+    } >&2
+    exit 2
+  fi
+
+  SKIP_BRANCH=$(cd "$REA_ROOT" && git branch --show-current 2>/dev/null || echo "")
+  SKIP_HEAD=$(cd "$REA_ROOT" && git rev-parse HEAD 2>/dev/null || echo "")
+
+  # Codex F2: record OS identity alongside the (mutable, git-sourced) actor so
+  # downstream auditors can reconstruct who REALLY invoked the bypass on a
+  # shared host. None of these are forgeable from inside the push process alone.
+  SKIP_OS_UID=$(id -u 2>/dev/null || echo "")
+  SKIP_OS_WHOAMI=$(whoami 2>/dev/null || echo "")
+  SKIP_OS_HOST=$(hostname 2>/dev/null || echo "")
+  SKIP_OS_PID=$$
+  SKIP_OS_PPID=$PPID
+  SKIP_OS_PPID_CMD=$(ps -o command= -p "$PPID" 2>/dev/null | head -c 512 || echo "")
+  SKIP_OS_TTY=$(tty 2>/dev/null || echo "not-a-tty")
+  SKIP_OS_CI="${CI:-}"
+
+  SKIP_METADATA=$(jq -n \
+    --arg head_sha "$SKIP_HEAD" \
+    --arg branch "$SKIP_BRANCH" \
+    --arg reason "$SKIP_REASON" \
+    --arg actor "$SKIP_ACTOR" \
+    --arg os_uid "$SKIP_OS_UID" \
+    --arg os_whoami "$SKIP_OS_WHOAMI" \
+    --arg os_hostname "$SKIP_OS_HOST" \
+    --arg os_pid "$SKIP_OS_PID" \
+    --arg os_ppid "$SKIP_OS_PPID" \
+    --arg os_ppid_cmd "$SKIP_OS_PPID_CMD" \
+    --arg os_tty "$SKIP_OS_TTY" \
+    --arg os_ci "$SKIP_OS_CI" \
+    '{
+      head_sha: $head_sha,
+      branch: $branch,
+      reason: $reason,
+      actor: $actor,
+      verdict: "skipped",
+      os_identity: {
+        uid: $os_uid,
+        whoami: $os_whoami,
+        hostname: $os_hostname,
+        pid: $os_pid,
+        ppid: $os_ppid,
+        ppid_cmd: $os_ppid_cmd,
+        tty: $os_tty,
+        ci: $os_ci
+      }
+    }' 2>/dev/null)
+
+  if [[ -z "$SKIP_METADATA" ]]; then
+    {
+      printf 'PUSH BLOCKED: REA_SKIP_PUSH_REVIEW could not serialize audit metadata.\n' >&2
+    } >&2
+    exit 2
+  fi
+
+  REA_ROOT="$REA_ROOT" REA_SKIP_METADATA="$SKIP_METADATA" \
+    node --input-type=module -e "
+      const mod = await import(process.env.REA_ROOT + '/dist/audit/append.js');
+      const metadata = JSON.parse(process.env.REA_SKIP_METADATA);
+      await mod.appendAuditRecord(process.env.REA_ROOT, {
+        tool_name: 'push.review.skipped',
+        server_name: 'rea.escape_hatch',
+        status: mod.InvocationStatus.Allowed,
+        tier: mod.Tier.Read,
+        metadata,
+      });
+    " 2>/dev/null
+  NODE_STATUS=$?
+  if [[ "$NODE_STATUS" -ne 0 ]]; then
+    {
+      printf 'PUSH BLOCKED: REA_SKIP_PUSH_REVIEW audit-append failed (node exit %s).\n' "$NODE_STATUS"
+      printf '  Refusing to bypass the push gate without a receipt.\n'
+    } >&2
+    exit 2
+  fi
+
+  {
+    printf '\n'
+    printf '==  PUSH REVIEW GATE SKIPPED via REA_SKIP_PUSH_REVIEW\n'
+    printf '    Reason:  %s\n' "$SKIP_REASON"
+    printf '    Actor:   %s\n' "$SKIP_ACTOR"
+    printf '    Branch:  %s\n' "${SKIP_BRANCH:-<detached>}"
+    printf '    Head:    %s\n' "${SKIP_HEAD:-<unknown>}"
+    printf '    Audited: .rea/audit.jsonl (tool_name=push.review.skipped)\n'
+    printf '\n'
+    printf '    This is a gate weakening. Every invocation is permanently audited.\n'
+    printf '\n'
+  } >&2
+  exit 0
 fi
 
 # ── 6. Determine source/target commits for each refspec ──────────────────────
