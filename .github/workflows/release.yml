@@ -63,6 +63,62 @@ jobs:
       - name: Tarball smoke (pre-publish)
         run: scripts/tarball-smoke.sh
 
+      # BUG-013 defense-in-depth: deterministic rebuild immediately before publish.
+      # 0.6.1 shipped with dist/ byte-identical to 0.6.0 because CI never enforced
+      # a fresh build from the shipping commit. This step removes dist/, rebuilds,
+      # and records a SHA-256 digest of the full dist/ tree to
+      # $RUNNER_TEMP/rea-dist-hash so the post-publish verify step can compare
+      # against what we built here.
+      #
+      # The hash file lives in $RUNNER_TEMP (CI scratch space), NOT the repo
+      # root — changesets/action runs `git add .` when it creates/updates the
+      # Version Packages PR, so any sentinel written to the workspace would
+      # end up committed to the release PR. Writing to $RUNNER_TEMP keeps
+      # the release tree clean.
+      - name: Rebuild dist/ from HEAD before publish
+        run: |
+          rm -rf dist
+          pnpm build
+          find dist -type f -print0 | sort -z | xargs -0 shasum -a 256 | shasum -a 256 > "$RUNNER_TEMP/rea-dist-hash"
+          echo "[release] CI-built dist/ hash:"
+          cat "$RUNNER_TEMP/rea-dist-hash"
+
+      # BUG-013 defense-in-depth (pre-publish local-pack check): pack the
+      # rebuilt workspace with `npm pack` and verify the dist/ inside the
+      # resulting tarball hashes to the same value as the freshly rebuilt
+      # dist/ on disk. This catches packaging bugs — `files:` filter
+      # dropping a path, .npmignore stripping a directory, pack mangling —
+      # BEFORE the tarball is published to npm. The post-publish registry
+      # verification below is still run as a second attestation, but by
+      # then the tarball is already on the public registry; this step is
+      # the one that prevents a bad package from reaching consumers.
+      - name: Verify locally-packed tarball dist/ matches rebuilt dist/
+        run: |
+          WORK="$(mktemp -d -t rea-prepub-verify-XXXXXX)"
+          cd "$WORK"
+          npm pack "$GITHUB_WORKSPACE" --silent > /dev/null
+          TARBALL="$(ls bookedsolid-rea-*.tgz | head -1)"
+          if [ -z "$TARBALL" ]; then
+            echo "::error::npm pack produced no tarball in $WORK"
+            exit 1
+          fi
+          mkdir -p extract
+          tar -xzf "$TARBALL" -C extract
+          if [ ! -d extract/package/dist ]; then
+            echo "::error::locally-packed tarball has no package/dist/"
+            exit 1
+          fi
+          PACKED_HASH="$(cd extract/package && find dist -type f -print0 | sort -z | xargs -0 shasum -a 256 | shasum -a 256 | awk '{print $1}')"
+          REBUILT_HASH="$(awk '{print $1}' "$RUNNER_TEMP/rea-dist-hash")"
+          echo "[release] locally-packed dist/ hash: $PACKED_HASH"
+          echo "[release] rebuilt          dist/ hash: $REBUILT_HASH"
+          if [ "$PACKED_HASH" != "$REBUILT_HASH" ]; then
+            echo "::error::pre-publish mismatch — packed dist/ hash ($PACKED_HASH) != rebuilt dist/ hash ($REBUILT_HASH)"
+            echo "::error::a file that tsc emitted is not reaching the tarball; inspect package.json#files and .npmignore"
+            exit 1
+          fi
+          echo "[release] pre-publish dist/ hash verified — local pack matches rebuild"
+
       - name: Create release PR or publish
         id: changesets
         # pin: changesets/action v1.4.9
@@ -86,3 +142,33 @@ jobs:
           # id-token: write + NPM_CONFIG_PROVENANCE.
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           NPM_CONFIG_PROVENANCE: "true"
+
+      # BUG-013 defense-in-depth: re-pack the just-published tarball from npm
+      # and assert its dist/ tree hash matches what the "Rebuild dist/ from HEAD"
+      # step produced above. A mismatch means the published tarball does not
+      # contain the dist/ that passed the pre-publish tarball-smoke gate, and
+      # the run fails so the npm tag is not treated as authoritative.
+      - name: Verify published tarball dist/ matches CI-built dist/
+        if: steps.changesets.outputs.published == 'true'
+        run: |
+          VERSION="$(jq -r '.version' package.json)"
+          echo "[release] verifying @bookedsolid/rea@$VERSION"
+          WORK="$(mktemp -d -t rea-verify-XXXXXX)"
+          cd "$WORK"
+          npm pack "@bookedsolid/rea@$VERSION" --silent > /dev/null
+          TARBALL="$(ls bookedsolid-rea-*.tgz | head -1)"
+          if [ -z "$TARBALL" ]; then
+            echo "::error::npm pack produced no tarball for @bookedsolid/rea@$VERSION"
+            exit 1
+          fi
+          mkdir -p extract
+          tar -xzf "$TARBALL" -C extract
+          PUBLISHED_HASH="$(cd extract/package && find dist -type f -print0 | sort -z | xargs -0 shasum -a 256 | shasum -a 256 | awk '{print $1}')"
+          LOCAL_HASH="$(awk '{print $1}' "$RUNNER_TEMP/rea-dist-hash")"
+          echo "[release] published dist/ hash: $PUBLISHED_HASH"
+          echo "[release] CI-built  dist/ hash: $LOCAL_HASH"
+          if [ "$PUBLISHED_HASH" != "$LOCAL_HASH" ]; then
+            echo "::error::published tarball dist/ hash ($PUBLISHED_HASH) != CI-built dist/ hash ($LOCAL_HASH)"
+            exit 1
+          fi
+          echo "[release] dist/ hash verified — published tarball contains the rebuilt dist/"

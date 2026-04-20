@@ -255,29 +255,98 @@ describe('DownstreamConnection reconnect semantics', () => {
     expect(r2).toEqual({ ok: 'after-reconnect-2' });
   });
 
-  it('clears lastError after a successful call on the same connection (Codex F2)', async () => {
-    // Regression for Codex F2: the happy path of callTool must clear any
-    // lingering lastError. Without this, a future code path that sets
-    // lastErrorMessage (e.g. a listTools failure, or an operator-visible
-    // transient) combined with a subsequent successful call would leave
-    // the snapshot showing a stale error alongside a healthy downstream.
+  it('clears lastError after reconnect-success (Codex F2)', async () => {
+    // Regression for Codex F2: a successful callTool must clear any lingering
+    // lastError. Without this, a connection that failed once and recovered
+    // on reconnect would forever report the old error via `__rea__health`,
+    // misleading operators about live state.
     //
-    // We simulate the "lingering error" state by seeding the private field
-    // directly, then asserting a successful call wipes it.
-    const stub = makeStubClient(() => Promise.resolve({ ok: 'pong' }));
-    const conn = makeConnection([stub]);
+    // Natural failure path: first callTool on `s1` rejects → catch branch
+    // stamps `#lastErrorMessage`, then reconnect pops `s2` which succeeds —
+    // the reconnect-success branch (downstream.ts line ~355) clears the
+    // field. We assert via the public getter that clear happened.
+    const s1 = makeStubClient(() => Promise.reject(new Error('transient blip')));
+    const s2 = makeStubClient(() => Promise.resolve({ ok: 'pong' }));
+    // `s2` is the ONLY queued stub — `s1` is primed directly so the initial
+    // callTool path hits it, and after close() the reconnect pops s2.
+    const conn = makeConnection([s2]);
 
-    // Prime the connection so `this.client !== null` and no reconnect fires.
+    // Prime the connection to `s1` (client != null, skip initial connect()).
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (conn as any).client = stub;
+    (conn as any).client = s1;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (conn as any).health = 'healthy';
-    // Seed a stale error as if a prior call or listTools had set one.
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (conn as any).lastErrorMessage = 'prior blip — should be cleared';
 
     const result = await conn.callTool('ping', {});
     expect(result).toEqual({ ok: 'pong' });
+    // Reconnect succeeded → lastError cleared.
+    expect(conn.lastError).toBeNull();
+  });
+
+  it('BUG-014: bound is applied at assignment (no-reconnect flap-window path)', async () => {
+    // 0.6.2 bound-at-read: every write site stored raw strings, `get
+    // lastError` truncated on the way out. 0.7.0 moves the bound into the
+    // `set #lastErrorMessage` setter — every write produces a bounded
+    // stored value regardless of how many assignment sites exist.
+    //
+    // Natural write path (no test seam): use the flap-window branch, which
+    // goes `this.#lastErrorMessage = message; throw`. First callTool
+    // succeeds via reconnect (stamps `lastReconnectAt`), then a second
+    // callTool within the flap window hits the `else` branch at
+    // downstream.ts line ~379 and writes a HUGE string to the field.
+    vi.setSystemTime(new Date('2026-04-18T00:00:00Z'));
+
+    const s1 = makeStubClient(() => Promise.reject(new Error('first fail')));
+    const s2 = makeStubClient(() => Promise.resolve({ ok: 'ok' }));
+    // `s2` is the ONLY queued stub — `s1` is primed so callTool hits it
+    // first, then reconnect pops s2 and the retry succeeds.
+    const conn = makeConnection([s2]);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (conn as any).client = s1;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (conn as any).health = 'healthy';
+
+    // Episode 1: fail + reconnect + success — stamps lastReconnectAt.
+    await conn.callTool('ping', {});
+
+    // Within flap window: swap in a failing client with a HUGE error.
+    vi.setSystemTime(new Date('2026-04-18T00:00:05Z'));
+    const HUGE = 'x'.repeat(10_000);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (conn as any).client = makeStubClient(() => Promise.reject(new Error(HUGE)));
+
+    await expect(conn.callTool('ping', {})).rejects.toThrow(/call failed/);
+
+    // BUG-014 structural property: the stored string is bounded at write.
+    // The getter applies a second bound as defense-in-depth, but the
+    // invariant under test is that the underlying write was already capped.
+    const recorded = conn.lastError!;
+    expect(recorded.length).toBeLessThanOrEqual(4096);
+    // Reading twice must be idempotent — if the backing store were raw, the
+    // getter would return a bounded prefix; since the backing store IS
+    // bounded, the getter returns the stored value unchanged.
+    expect(conn.lastError).toBe(recorded);
+  });
+
+  it('BUG-014: ES-private backing field is not reachable via `as any` property access', () => {
+    const conn = makeConnection([]);
+
+    // Fresh connection — no writes have occurred. Property lookups on the
+    // instance do NOT hit `#lastErrorBacking` because `#`-prefixed names are
+    // not string-indexable properties.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const asAny = conn as any;
+    expect(asAny.lastErrorMessage).toBeUndefined(); // pre-0.7.0 TS-private name: gone
+    expect(asAny.lastErrorBacking).toBeUndefined(); // backing, no # prefix: not a property
+    expect(asAny['#lastErrorBacking']).toBeUndefined(); // literal # prefix: not a property
+    expect(Object.keys(conn)).not.toContain('#lastErrorBacking');
+    expect(Object.keys(conn)).not.toContain('lastErrorMessage');
+
+    // A consumer attempting to forge lastError via `as any` assignment
+    // succeeds in creating a public property but does NOT reach the ES-
+    // private field — the public getter is unaffected by the forged value.
+    asAny.lastErrorMessage = 'forged';
+    asAny.lastErrorBacking = 'also forged';
     expect(conn.lastError).toBeNull();
   });
 

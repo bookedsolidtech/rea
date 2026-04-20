@@ -47,6 +47,14 @@ async function installPushHook(dir: string): Promise<string> {
   const dest = path.join(destDir, 'push-review-gate.sh');
   await fs.copyFile(HOOK_SRC, dest);
   await fs.chmod(dest, 0o755);
+  // BUG-008 cleanup (0.7.0): adapter sources `_lib/push-review-core.sh` —
+  // copy the core next to the adapter to mirror the installed topology.
+  const libDir = path.join(destDir, '_lib');
+  await fs.mkdir(libDir, { recursive: true });
+  const coreSrc = path.join(REPO_ROOT, 'hooks', '_lib', 'push-review-core.sh');
+  const coreDest = path.join(libDir, 'push-review-core.sh');
+  await fs.copyFile(coreSrc, coreDest);
+  await fs.chmod(coreDest, 0o755);
   const policyDir = path.join(dir, '.rea');
   await fs.mkdir(policyDir, { recursive: true });
   const policyPath = path.join(policyDir, 'policy.yaml');
@@ -70,6 +78,12 @@ interface ScratchRepo {
   dir: string;
   headSha: string;
   mergeBaseSha: string;
+  /**
+   * Bare-remote path (`origin`). Tracked on the record so `afterEach` can
+   * clean it up — it lives as a sibling of `dir` (not inside it), so
+   * removing `dir` alone would leak a `<dir>.git` directory per test run.
+   */
+  bareRemote: string;
 }
 
 /**
@@ -104,6 +118,19 @@ async function makeScratchRepo(opts: {
   git('add', 'README.md');
   git('commit', '-m', 'baseline', '--quiet');
   const mergeBaseSha = git('rev-parse', 'HEAD');
+
+  // Add a bare remote as `origin` and push `main` so `refs/remotes/origin/main`
+  // exists in the local ref DB. The gate's new-branch merge-base resolution
+  // (shared core) anchors on the remote-tracking ref to close the pusher-
+  // controlled-local-main bypass, so a scratch repo without origin/main
+  // fails-closed at merge-base resolution before any protected-path check
+  // runs. Setting up origin makes the test repo a realistic consumer shape.
+  const bareRemote = path.join(dir, '..', path.basename(dir) + '.git');
+  execFileSync('git', ['init', '--bare', '--initial-branch=main', '--quiet', bareRemote], {
+    encoding: 'utf8',
+  });
+  git('remote', 'add', 'origin', bareRemote);
+  git('push', 'origin', 'main', '--quiet');
 
   git('checkout', '-b', 'feature', '--quiet');
   await fs.mkdir(path.join(dir, 'hooks'), { recursive: true });
@@ -144,7 +171,7 @@ async function makeScratchRepo(opts: {
 
   await installPushHook(dir);
 
-  return { dir, headSha, mergeBaseSha };
+  return { dir, headSha, mergeBaseSha, bareRemote };
 }
 
 interface HookResult {
@@ -214,17 +241,22 @@ function policyYaml(codexRequired: boolean | undefined): string {
 }
 
 describe('push-review-gate.sh — G11.4 review.codex_required honored', () => {
-  const dists: string[] = [];
+  const scratchPaths: string[] = [];
 
   beforeEach(() => {
-    dists.length = 0;
+    scratchPaths.length = 0;
   });
 
   afterEach(async () => {
     await Promise.all(
-      dists.map((d) => fs.rm(d, { recursive: true, force: true })),
+      scratchPaths.map((d) => fs.rm(d, { recursive: true, force: true })),
     );
   });
+
+  function track(repo: ScratchRepo): void {
+    scratchPaths.push(repo.dir);
+    scratchPaths.push(repo.bareRemote);
+  }
 
   it('dist/scripts/read-policy-field.js is built (sanity)', async () => {
     const exists = await fs
@@ -240,7 +272,7 @@ describe('push-review-gate.sh — G11.4 review.codex_required honored', () => {
     const repo = await makeScratchRepo({
       policyContent: policyYaml(false),
     });
-    dists.push(repo.dir);
+    track(repo);
 
     const res = runHook(repo, { PATH: process.env.PATH ?? '' });
 
@@ -265,7 +297,7 @@ describe('push-review-gate.sh — G11.4 review.codex_required honored', () => {
     const repo = await makeScratchRepo({
       policyContent: policyYaml(false),
     });
-    dists.push(repo.dir);
+    track(repo);
 
     const res = runHook(repo, {
       REA_SKIP_CODEX_REVIEW: 'should-be-ignored',
@@ -289,7 +321,7 @@ describe('push-review-gate.sh — G11.4 review.codex_required honored', () => {
     const repo = await makeScratchRepo({
       policyContent: policyYaml(true),
     });
-    dists.push(repo.dir);
+    track(repo);
 
     const res = runHook(repo, { PATH: process.env.PATH ?? '' });
 
@@ -304,7 +336,7 @@ describe('push-review-gate.sh — G11.4 review.codex_required honored', () => {
     const repo = await makeScratchRepo({
       policyContent: policyYaml(undefined),
     });
-    dists.push(repo.dir);
+    track(repo);
 
     const res = runHook(repo, { PATH: process.env.PATH ?? '' });
 
@@ -319,7 +351,7 @@ describe('push-review-gate.sh — G11.4 review.codex_required honored', () => {
     // helper exits 1 (missing) and the shell treats this as the default
     // (codex required).
     const repo = await makeScratchRepo({});
-    dists.push(repo.dir);
+    track(repo);
 
     const res = runHook(repo, { PATH: process.env.PATH ?? '' });
 
@@ -339,7 +371,7 @@ describe('push-review-gate.sh — G11.4 review.codex_required honored', () => {
     );
 
     const repo = await makeScratchRepo({ policyContent: malformed });
-    dists.push(repo.dir);
+    track(repo);
 
     const res = runHook(repo, { PATH: process.env.PATH ?? '' });
 

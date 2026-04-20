@@ -39,6 +39,14 @@ async function installPushHook(dir: string): Promise<string> {
   const dest = path.join(destDir, 'push-review-gate.sh');
   await fs.copyFile(HOOK_SRC, dest);
   await fs.chmod(dest, 0o755);
+  // BUG-008 cleanup (0.7.0): adapter sources `_lib/push-review-core.sh` —
+  // copy the core next to the adapter to mirror the installed topology.
+  const libDir = path.join(destDir, '_lib');
+  await fs.mkdir(libDir, { recursive: true });
+  const coreSrc = path.join(REPO_ROOT, 'hooks', '_lib', 'push-review-core.sh');
+  const coreDest = path.join(libDir, 'push-review-core.sh');
+  await fs.copyFile(coreSrc, coreDest);
+  await fs.chmod(coreDest, 0o755);
   const policyDir = path.join(dir, '.rea');
   await fs.mkdir(policyDir, { recursive: true });
   const policyPath = path.join(policyDir, 'policy.yaml');
@@ -62,6 +70,12 @@ interface ScratchRepo {
   dir: string;
   headSha: string;
   mergeBaseSha: string;
+  /**
+   * Bare-remote path (`origin`). Tracked on the record so `afterEach` can
+   * clean it up — it lives as a sibling of `dir` (not inside it), so
+   * removing `dir` alone would leak a `<dir>.git` directory per test run.
+   */
+  bareRemote: string;
 }
 
 async function makeScratchRepo(opts: {
@@ -86,6 +100,18 @@ async function makeScratchRepo(opts: {
   git('add', 'README.md');
   git('commit', '-m', 'baseline', '--quiet');
   const mergeBaseSha = git('rev-parse', 'HEAD');
+
+  // Add a bare origin and push main so `refs/remotes/origin/main` exists.
+  // The gate's new-branch merge-base resolution anchors on remote-tracking
+  // refs (to close the pusher-controlled-local-main bypass); a scratch
+  // repo without origin/main fails-closed before any protected-path check
+  // runs. See shared core `pr_core_run` new-branch branch for the anchor.
+  const bareRemote = path.join(dir, '..', path.basename(dir) + '.git');
+  execFileSync('git', ['init', '--bare', '--initial-branch=main', '--quiet', bareRemote], {
+    encoding: 'utf8',
+  });
+  git('remote', 'add', 'origin', bareRemote);
+  git('push', 'origin', 'main', '--quiet');
 
   git('checkout', '-b', 'feature', '--quiet');
   await fs.mkdir(path.join(dir, 'hooks'), { recursive: true });
@@ -128,7 +154,7 @@ async function makeScratchRepo(opts: {
 
   await installPushHook(dir);
 
-  return { dir, headSha, mergeBaseSha };
+  return { dir, headSha, mergeBaseSha, bareRemote };
 }
 
 interface HookResult {
@@ -184,11 +210,16 @@ describe('push-review-gate.sh — REA_SKIP_PUSH_REVIEW whole-gate escape hatch',
     );
   });
 
+  function track(repo: ScratchRepo): void {
+    cleanup.push(repo.dir);
+    cleanup.push(repo.bareRemote);
+  }
+
   it('requires dist/audit/append.js to exist (fail-closed)', async () => {
     if (!jqExists()) return;
 
     const repo = await makeScratchRepo({ linkDist: false });
-    cleanup.push(repo.dir);
+    track(repo);
 
     const res = runHook(repo, {
       REA_SKIP_PUSH_REVIEW: 'ci-test',
@@ -206,7 +237,7 @@ describe('push-review-gate.sh — REA_SKIP_PUSH_REVIEW whole-gate escape hatch',
       userEmail: null,
       userName: null,
     });
-    cleanup.push(repo.dir);
+    track(repo);
 
     const res = runHook(repo, {
       REA_SKIP_PUSH_REVIEW: 'ci-test',
@@ -224,7 +255,7 @@ describe('push-review-gate.sh — REA_SKIP_PUSH_REVIEW whole-gate escape hatch',
       userEmail: 'operator@example.test',
       userName: 'Operator',
     });
-    cleanup.push(repo.dir);
+    track(repo);
 
     const res = runHook(repo, {
       REA_SKIP_PUSH_REVIEW: 'rea-cache-subcommand-broken',
@@ -262,7 +293,7 @@ describe('push-review-gate.sh — REA_SKIP_PUSH_REVIEW whole-gate escape hatch',
     if (!jqExists()) return;
 
     const repo = await makeScratchRepo({});
-    cleanup.push(repo.dir);
+    track(repo);
 
     const res = runHook(repo, {
       REA_SKIP_PUSH_REVIEW: '1',
@@ -282,7 +313,7 @@ describe('push-review-gate.sh — REA_SKIP_PUSH_REVIEW whole-gate escape hatch',
     if (!jqExists()) return;
 
     const repo = await makeScratchRepo({});
-    cleanup.push(repo.dir);
+    track(repo);
 
     runHook(repo, {
       REA_SKIP_PUSH_REVIEW: 'testing',
@@ -312,7 +343,7 @@ describe('push-review-gate.sh — REA_SKIP_PUSH_REVIEW whole-gate escape hatch',
     if (!jqExists()) return;
 
     const repo = await makeScratchRepo({});
-    cleanup.push(repo.dir);
+    track(repo);
 
     const res = runHook(repo, {
       REA_SKIP_PUSH_REVIEW: '',
@@ -334,7 +365,7 @@ describe('push-review-gate.sh — REA_SKIP_PUSH_REVIEW whole-gate escape hatch',
     if (!jqExists()) return;
 
     const repo = await makeScratchRepo({});
-    cleanup.push(repo.dir);
+    track(repo);
 
     await fs.mkdir(path.join(repo.dir, '.rea'), { recursive: true });
     await fs.writeFile(
@@ -373,7 +404,7 @@ describe('push-review-gate.sh — REA_SKIP_PUSH_REVIEW whole-gate escape hatch',
     if (!jqExists()) return;
 
     const repo = await makeScratchRepo({});
-    cleanup.push(repo.dir);
+    track(repo);
 
     const res = runHook(repo, {
       REA_SKIP_PUSH_REVIEW: 'ci-attempted-skip',
@@ -394,7 +425,7 @@ describe('push-review-gate.sh — REA_SKIP_PUSH_REVIEW whole-gate escape hatch',
     const repo = await makeScratchRepo({
       userEmail: 'ci-operator@example.test',
     });
-    cleanup.push(repo.dir);
+    track(repo);
 
     await fs.mkdir(path.join(repo.dir, '.rea'), { recursive: true });
     const policyYaml = [
@@ -438,7 +469,7 @@ describe('push-review-gate.sh — REA_SKIP_PUSH_REVIEW whole-gate escape hatch',
     const repo = await makeScratchRepo({
       userEmail: 'operator@example.test',
     });
-    cleanup.push(repo.dir);
+    track(repo);
 
     const res = runHook(repo, {
       REA_SKIP_PUSH_REVIEW: 'audit-os-identity',
@@ -471,7 +502,7 @@ describe('push-review-gate.sh — REA_SKIP_PUSH_REVIEW whole-gate escape hatch',
       userEmail: 'operator@example.test',
       userName: 'Operator',
     });
-    cleanup.push(repo.dir);
+    track(repo);
 
     // Simulate git's native pre-push invocation: argv has remote+url, stdin
     // has refspec lines. BUG-008's self-detect synthesizes a CMD; the

@@ -37,6 +37,14 @@ async function installPushHook(dir: string): Promise<string> {
   const dest = path.join(destDir, 'push-review-gate.sh');
   await fs.copyFile(HOOK_SRC, dest);
   await fs.chmod(dest, 0o755);
+  // BUG-008 cleanup (0.7.0): adapter sources `_lib/push-review-core.sh` —
+  // copy the core next to the adapter to mirror the installed topology.
+  const libDir = path.join(destDir, '_lib');
+  await fs.mkdir(libDir, { recursive: true });
+  const coreSrc = path.join(REPO_ROOT, 'hooks', '_lib', 'push-review-core.sh');
+  const coreDest = path.join(libDir, 'push-review-core.sh');
+  await fs.copyFile(coreSrc, coreDest);
+  await fs.chmod(coreDest, 0o755);
   const policyDir = path.join(dir, '.rea');
   await fs.mkdir(policyDir, { recursive: true });
   const policyPath = path.join(policyDir, 'policy.yaml');
@@ -61,6 +69,12 @@ interface ScratchRepo {
   dir: string;
   headSha: string;
   mergeBaseSha: string;
+  /**
+   * Bare-remote path (`origin`). Tracked on the record so `afterEach` can
+   * clean it up — it lives as a sibling of `dir` (not inside it), so
+   * removing `dir` alone would leak a `<dir>.git` directory per test run.
+   */
+  bareRemote: string;
 }
 
 /**
@@ -101,6 +115,18 @@ async function makeScratchRepo(opts: {
   git('commit', '-m', 'baseline', '--quiet');
   const mergeBaseSha = git('rev-parse', 'HEAD');
 
+  // Add a bare origin and push main so `refs/remotes/origin/main` exists.
+  // The gate's new-branch merge-base resolution anchors on remote-tracking
+  // refs (to close the pusher-controlled-local-main bypass); a scratch
+  // repo without origin/main fails-closed before any protected-path check
+  // runs. See shared core `pr_core_run` new-branch branch for the anchor.
+  const bareRemote = path.join(dir, '..', path.basename(dir) + '.git');
+  execFileSync('git', ['init', '--bare', '--initial-branch=main', '--quiet', bareRemote], {
+    encoding: 'utf8',
+  });
+  git('remote', 'add', 'origin', bareRemote);
+  git('push', 'origin', 'main', '--quiet');
+
   // Commit 2: on a feature branch, modify a protected path. Keeping `main`
   // at the baseline ensures the hook sees a real diff from feature → main.
   git('checkout', '-b', 'feature', '--quiet');
@@ -138,7 +164,7 @@ async function makeScratchRepo(opts: {
 
   await installPushHook(dir);
 
-  return { dir, headSha, mergeBaseSha };
+  return { dir, headSha, mergeBaseSha, bareRemote };
 }
 
 interface HookResult {
@@ -186,23 +212,28 @@ function jqExists(): boolean {
 }
 
 describe('push-review-gate.sh — REA_SKIP_CODEX_REVIEW escape hatch', () => {
-  let dists: string[] = [];
+  let scratchPaths: string[] = [];
 
   beforeEach(() => {
-    dists = [];
+    scratchPaths = [];
   });
 
   afterEach(async () => {
     await Promise.all(
-      dists.map((d) => fs.rm(d, { recursive: true, force: true })),
+      scratchPaths.map((d) => fs.rm(d, { recursive: true, force: true })),
     );
   });
+
+  function track(repo: ScratchRepo): void {
+    scratchPaths.push(repo.dir);
+    scratchPaths.push(repo.bareRemote);
+  }
 
   it('requires dist/audit/append.js to exist (fail-closed)', async () => {
     if (!jqExists()) return;
 
     const repo = await makeScratchRepo({ linkDist: false });
-    dists.push(repo.dir);
+    track(repo);
 
     const res = runHook(repo, {
       REA_SKIP_CODEX_REVIEW: 'ci-test',
@@ -220,7 +251,7 @@ describe('push-review-gate.sh — REA_SKIP_CODEX_REVIEW escape hatch', () => {
       userEmail: null,
       userName: null,
     });
-    dists.push(repo.dir);
+    track(repo);
 
     const res = runHook(repo, {
       REA_SKIP_CODEX_REVIEW: 'ci-test',
@@ -238,7 +269,7 @@ describe('push-review-gate.sh — REA_SKIP_CODEX_REVIEW escape hatch', () => {
       userEmail: 'skipper@example.test',
       userName: 'Skipper',
     });
-    dists.push(repo.dir);
+    track(repo);
 
     const res = runHook(repo, {
       REA_SKIP_CODEX_REVIEW: 'codex-rate-limited-ci-burst',
@@ -269,15 +300,23 @@ describe('push-review-gate.sh — REA_SKIP_CODEX_REVIEW escape hatch', () => {
     expect(meta['reason']).toBe('codex-rate-limited-ci-burst');
     expect(meta['actor']).toBe('skipper@example.test');
     expect(meta['verdict']).toBe('skipped');
-    expect(typeof meta['files_changed']).toBe('number');
-    expect(meta['files_changed']).toBeGreaterThan(0);
+    // files_changed is intentionally null for skip records — we bypass
+    // ref-resolution (that's the whole point), so there's no authoritative
+    // push window to count against. Recording a local proxy here would
+    // mislead auditors correlating skips to actual pushed commits.
+    expect(meta['files_changed']).toBeNull();
+    // metadata_source documents whether head_sha/target came from the
+    // pre-push stdin contract (authoritative) or a local HEAD fallback
+    // (PreToolUse Bash-wrapper invocation — stdin carries tool_input JSON,
+    // not refspec lines).
+    expect(['prepush-stdin', 'local-fallback']).toContain(meta['metadata_source']);
   });
 
   it('reason is literally the env-var value (no default)', async () => {
     if (!jqExists()) return;
 
     const repo = await makeScratchRepo({});
-    dists.push(repo.dir);
+    track(repo);
 
     const res = runHook(repo, {
       REA_SKIP_CODEX_REVIEW: '1',
@@ -298,7 +337,7 @@ describe('push-review-gate.sh — REA_SKIP_CODEX_REVIEW escape hatch', () => {
     if (!jqExists()) return;
 
     const repo = await makeScratchRepo({});
-    dists.push(repo.dir);
+    track(repo);
 
     // Invoke escape hatch.
     runHook(repo, {
@@ -331,7 +370,7 @@ describe('push-review-gate.sh — REA_SKIP_CODEX_REVIEW escape hatch', () => {
     if (!jqExists()) return;
 
     const repo = await makeScratchRepo({});
-    dists.push(repo.dir);
+    track(repo);
 
     const res = runHook(repo, {
       PATH: process.env.PATH ?? '',
@@ -355,11 +394,120 @@ describe('push-review-gate.sh — REA_SKIP_CODEX_REVIEW escape hatch', () => {
     }
   });
 
+  // #77 (0.7.0) — regression: the skip hatch must fire even when
+  // ref-resolution would otherwise fail. Prior to 0.7.0 the hatch lived
+  // inside the protected-path branch, which only runs AFTER ref-resolution.
+  // A stale checkout (missing remote object) or an unresolvable source ref
+  // exited the hook with status 2 before the hatch had a chance to fire,
+  // stranding an operator who had explicitly committed to the bypass.
+  //
+  // This test simulates the missing-remote-object scenario by synthesizing
+  // the pre-push stdin contract with a remote_sha that does not exist in
+  // the local object DB. The hook must consume the hatch and exit 0 with
+  // a `codex.review.skipped` audit record.
+  it('fires even when ref-resolution would fail (stale checkout / missing remote object)', async () => {
+    if (!jqExists()) return;
+
+    const repo = await makeScratchRepo({
+      userEmail: 'stale@example.test',
+      userName: 'Stale',
+    });
+    track(repo);
+
+    // Build a pre-push stdin payload whose remote_sha is a plausibly-shaped
+    // 40-hex that is NOT in the local object DB. In the old ordering this
+    // hit the `git cat-file -e` probe in section 6 and exit 2'd before the
+    // hatch could fire.
+    const BOGUS_SHA = 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef';
+    const prepushStdin = `refs/heads/feature ${repo.headSha} refs/heads/main ${BOGUS_SHA}\n`;
+
+    const res = spawnSync('bash', [installedHookPath(repo.dir), 'origin'], {
+      cwd: repo.dir,
+      env: {
+        REA_SKIP_CODEX_REVIEW: 'stale-checkout-unblock',
+        PATH: process.env.PATH ?? '',
+        CLAUDE_PROJECT_DIR: repo.dir,
+      },
+      input: prepushStdin,
+      encoding: 'utf8',
+    });
+
+    expect(res.status).toBe(0);
+    expect(res.stderr).toMatch(/CODEX REVIEW SKIPPED/);
+    expect(res.stderr).toContain('stale-checkout-unblock');
+
+    const lines = await readAuditLines(repo.dir);
+    const skip = lines.find((r) => r['tool_name'] === 'codex.review.skipped');
+    expect(skip).toBeDefined();
+    const meta = skip!['metadata'] as Record<string, unknown>;
+    expect(meta['reason']).toBe('stale-checkout-unblock');
+    expect(meta['verdict']).toBe('skipped');
+
+    // Finding #1 regression: skip metadata must describe the PUSH, not the
+    // checkout. head_sha must equal the local_sha from the pre-push stdin
+    // (here repo.headSha — same value, but derived via stdin parsing, not
+    // `git rev-parse HEAD` fallback), and target must equal the remote_ref
+    // minus `refs/heads/`. Source tag = "prepush-stdin" proves we parsed
+    // the stdin rather than falling back to local HEAD.
+    expect(meta['head_sha']).toBe(repo.headSha);
+    expect(meta['target']).toBe('main');
+    expect(meta['metadata_source']).toBe('prepush-stdin');
+    expect(meta['files_changed']).toBeNull();
+  });
+
+  it('Finding #1 regression: skip metadata reflects the pushed ref, not the checkout', async () => {
+    if (!jqExists()) return;
+
+    const repo = await makeScratchRepo({
+      userEmail: 'hotfix@example.test',
+      userName: 'Hotfix Operator',
+    });
+    track(repo);
+
+    // Simulate `git push origin hotfix:release/2026-q2` from a `feature`
+    // checkout. The checkout's HEAD is repo.headSha ("feature" branch), but
+    // the pushed commit is a DIFFERENT SHA — we stand in a fake one that
+    // wouldn't resolve locally (the whole point: the skip records what the
+    // push claims, not what the working tree has).
+    const PUSHED_SHA = 'cafebabecafebabecafebabecafebabecafebabe';
+    const REMOTE_SHA = '1234567812345678123456781234567812345678';
+    const prepushStdin = `refs/heads/hotfix ${PUSHED_SHA} refs/heads/release/2026-q2 ${REMOTE_SHA}\n`;
+
+    const res = spawnSync('bash', [installedHookPath(repo.dir), 'origin'], {
+      cwd: repo.dir,
+      env: {
+        REA_SKIP_CODEX_REVIEW: 'verified-by-other-channel',
+        PATH: process.env.PATH ?? '',
+        CLAUDE_PROJECT_DIR: repo.dir,
+      },
+      input: prepushStdin,
+      encoding: 'utf8',
+    });
+
+    expect(res.status).toBe(0);
+
+    const lines = await readAuditLines(repo.dir);
+    const skip = lines.find((r) => r['tool_name'] === 'codex.review.skipped');
+    expect(skip).toBeDefined();
+    const meta = skip!['metadata'] as Record<string, unknown>;
+
+    // The key assertion: head_sha is the LOCAL_SHA from pre-push stdin
+    // (the "what is actually being pushed" SHA), NOT repo.headSha (the
+    // working-tree HEAD, which would be misleading in a push-from-other-ref
+    // scenario).
+    expect(meta['head_sha']).toBe(PUSHED_SHA);
+    expect(meta['head_sha']).not.toBe(repo.headSha);
+    // target is the remote_ref with refs/heads/ stripped — so release/2026-q2
+    // (not "main" and not the upstream of the current branch).
+    expect(meta['target']).toBe('release/2026-q2');
+    expect(meta['metadata_source']).toBe('prepush-stdin');
+  });
+
   it('leaves the gate alone when REA_SKIP_CODEX_REVIEW is set to empty string', async () => {
     if (!jqExists()) return;
 
     const repo = await makeScratchRepo({});
-    dists.push(repo.dir);
+    track(repo);
 
     const res = runHook(repo, {
       REA_SKIP_CODEX_REVIEW: '',

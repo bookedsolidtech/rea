@@ -278,6 +278,9 @@ const KNOWN_LEGACY_HUSKY_SHA256: ReadonlySet<string> = new Set([
   '9d4885b64f50dd91887c2c6b4d17e3aa91b0be5da8e842ca8915bec1bf369de5',
   // Initial publication (commit b513760, G6 MVP).
   '1ee21164ccce628a1ef85c313d09afdcdb8560efd761ec64b046cca6cc319cba',
+  // 0.7.0 — Codex pass-2 empty-tree baseline + $1 remote honoring +
+  // fail-closed on empty merge-base when a remote ref did resolve.
+  '84449e17a04986f3a6580eeb6fb9192cc6d8fabb099cd41cab0574a800c82056',
 ]);
 
 /**
