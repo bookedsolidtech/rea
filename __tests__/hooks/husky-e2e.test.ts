@@ -45,6 +45,8 @@ const SHIPPED_HUSKY_HOOK = path.join(REPO_ROOT, '.husky', 'pre-push');
 const REPO_DIST_SCRIPTS = path.join(REPO_ROOT, 'dist', 'scripts');
 const REPO_DIST_AUDIT = path.join(REPO_ROOT, 'dist', 'audit');
 const REPO_DIST_POLICY = path.join(REPO_ROOT, 'dist', 'policy');
+const NATIVE_GIT_ADAPTER = path.join(REPO_ROOT, 'hooks', 'push-review-gate-git.sh');
+const SHARED_CORE = path.join(REPO_ROOT, 'hooks', '_lib', 'push-review-core.sh');
 
 /**
  * Hard precondition. The shipped husky hook and the compiled
@@ -99,6 +101,8 @@ interface E2ERepo {
   protectedFeatureSha: string;
   /** Head of the feature branch, clean variant (docs-only). */
   cleanFeatureSha: string;
+  /** Head of the feature branch that touches `.claude/hooks/`. */
+  claudeHooksFeatureSha: string;
 }
 
 async function makeE2ERepo(): Promise<E2ERepo> {
@@ -187,12 +191,31 @@ async function makeE2ERepo(): Promise<E2ERepo> {
   git(workDir, 'commit', '-m', 'docs only', '--quiet');
   const cleanFeatureSha = git(workDir, 'rev-parse', 'HEAD');
 
+  // Feature branch 3: .claude/hooks/ change. This alternative of the
+  // anchored PROTECTED_RE exists specifically because the consumer-install
+  // copy of a hook is just as security-relevant as the source copy under
+  // `hooks/` — a tampered `.claude/hooks/push-review-gate.sh` disables
+  // the gate. Without this branch, the `^[.]claude/hooks/` anchor in the
+  // shared core / .husky/pre-push has no e2e coverage.
+  git(workDir, 'checkout', 'main', '--quiet');
+  git(workDir, 'checkout', '-b', 'feature-claude-hooks', '--quiet');
+  const scratchClaudeHooks = path.join(workDir, '.claude', 'hooks');
+  await fs.mkdir(scratchClaudeHooks, { recursive: true });
+  await fs.writeFile(
+    path.join(scratchClaudeHooks, '__protected__.sh'),
+    '#!/bin/sh\necho claude hooks path change\n',
+  );
+  git(workDir, 'add', '.claude/hooks/__protected__.sh');
+  git(workDir, 'commit', '-m', 'touch .claude/hooks/', '--quiet');
+  const claudeHooksFeatureSha = git(workDir, 'rev-parse', 'HEAD');
+
   return {
     workDir,
     remoteDir,
     mainSha,
     protectedFeatureSha,
     cleanFeatureSha,
+    claudeHooksFeatureSha,
   };
 }
 
@@ -438,6 +461,76 @@ describe('husky e2e — real git push → .husky/pre-push → exit propagation',
     expect(lsRemote).toMatch(new RegExp(`^${repo.protectedFeatureSha}\\s`));
   }, 15_000);
 
+  it('blocks a real `git push` for a manual native-adapter wrapper (shape-guard for future installer path)', async () => {
+    // Task #50 shipped `hooks/push-review-gate-git.sh` — a thin adapter
+    // that sources `hooks/_lib/push-review-core.sh`. The recommended
+    // MANUAL install is a small `.husky/pre-push` wrapper that execs the
+    // adapter directly rather than going through the generic JSON-parsing
+    // `push-review-gate.sh`. That path has unit coverage
+    // (`push-review-gate-git-adapter.test.ts`) but synthesizes stdin via
+    // spawnSync — no real `git push`. This test closes the e2e gap.
+    //
+    // IMPORTANT: `rea init` does NOT currently emit this wrapper — today
+    // the installer writes the full in-line gate as `.husky/pre-push`
+    // (see `src/cli/install/pre-push.ts`). This test exists as a
+    // shape-guard for (a) consumers who manually configure the wrapper
+    // and (b) a future installer revision that may switch to the
+    // wrapper-plus-adapter topology. If the adapter, the shared core, or
+    // the install wiring regresses, a REAL push goes through instead of
+    // being blocked and this test flips red.
+    const repo = await makeE2ERepo();
+    cleanup.push(path.dirname(repo.workDir));
+
+    // Overwrite `.husky/pre-push` with the recommended adapter wrapper.
+    // The adapter and its shared core live under `.claude/hooks/` to
+    // mirror the consumer install topology (copied in by `rea init`).
+    const claudeHooks = path.join(repo.workDir, '.claude', 'hooks');
+    await fs.mkdir(path.join(claudeHooks, '_lib'), { recursive: true });
+    const adapterDest = path.join(claudeHooks, 'push-review-gate-git.sh');
+    await fs.copyFile(NATIVE_GIT_ADAPTER, adapterDest);
+    await fs.chmod(adapterDest, 0o755);
+    const coreDest = path.join(claudeHooks, '_lib', 'push-review-core.sh');
+    await fs.copyFile(SHARED_CORE, coreDest);
+    await fs.chmod(coreDest, 0o755);
+
+    const wrapper = [
+      '#!/bin/sh',
+      'REA_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)',
+      'exec "$REA_ROOT/.claude/hooks/push-review-gate-git.sh" "$@"',
+      '',
+    ].join('\n');
+    const huskyHook = path.join(repo.workDir, '.husky', 'pre-push');
+    await fs.writeFile(huskyHook, wrapper);
+    await fs.chmod(huskyHook, 0o755);
+
+    execFileSync('git', ['checkout', 'feature-protected', '--quiet'], {
+      cwd: repo.workDir,
+      encoding: 'utf8',
+    });
+
+    const res = spawnSync(
+      'git',
+      ['push', 'origin', 'feature-protected:feature-protected'],
+      {
+        cwd: repo.workDir,
+        encoding: 'utf8',
+      },
+    );
+
+    // Adapter routes through the shared core, which emits the same
+    // "PUSH BLOCKED: protected paths changed" banner as the standalone
+    // husky hook does. Non-zero exit + remote ref not advanced.
+    expect(res.status).not.toBe(0);
+    expect(res.stderr).toMatch(/PUSH BLOCKED: protected paths changed/);
+
+    const lsRemote = execFileSync(
+      'git',
+      ['ls-remote', 'origin', 'feature-protected'],
+      { cwd: repo.workDir, encoding: 'utf8' },
+    ).trim();
+    expect(lsRemote).toBe('');
+  }, 15_000);
+
   it('regression: BUG-008 — a pre-push hook that silently exits 0 would fail THIS test', async () => {
     // Sanity check — prove the above "blocks" assertion is load-bearing by
     // installing a deliberately-broken noop hook and showing the bare
@@ -477,5 +570,46 @@ describe('husky e2e — real git push → .husky/pre-push → exit propagation',
       { cwd: repo.workDir, encoding: 'utf8' },
     ).trim();
     expect(lsRemote).toMatch(new RegExp(`^${repo.protectedFeatureSha}\\s`));
+  }, 15_000);
+
+  it('blocks a real `git push` that touches `.claude/hooks/` (PROTECTED_RE `^[.]claude/hooks/` alternative)', async () => {
+    // Codex review #3 (2026-04-20) pointed out that the anchored
+    // PROTECTED_RE in the shared core and in the standalone .husky/pre-push
+    // has five alternatives but only three were e2e-covered before this
+    // test: `^hooks/` (feature-protected), docs paths in the negative
+    // sense (feature-clean), and the codex-required=false opt-out. The
+    // `^[.]claude/hooks/` alternative — which exists specifically because
+    // the consumer-install copy of a hook is as security-relevant as the
+    // source under `hooks/` — had no real-push coverage. A regex that
+    // anchored the other alternatives but not this one (e.g. dropping the
+    // `^` in front of `[.]claude/hooks/`) would now match foreign paths
+    // like `src/[.]claude/hooks/...` while missing the intended surface,
+    // and nothing in this suite would flip. This test closes that gap.
+    const repo = await makeE2ERepo();
+    cleanup.push(path.dirname(repo.workDir));
+
+    execFileSync('git', ['checkout', 'feature-claude-hooks', '--quiet'], {
+      cwd: repo.workDir,
+      encoding: 'utf8',
+    });
+
+    const res = spawnSync(
+      'git',
+      ['push', 'origin', 'feature-claude-hooks:feature-claude-hooks'],
+      {
+        cwd: repo.workDir,
+        encoding: 'utf8',
+      },
+    );
+
+    expect(res.status).not.toBe(0);
+    expect(res.stderr).toMatch(/PUSH BLOCKED: protected paths changed/);
+
+    const lsRemote = execFileSync(
+      'git',
+      ['ls-remote', 'origin', 'feature-claude-hooks'],
+      { cwd: repo.workDir, encoding: 'utf8' },
+    ).trim();
+    expect(lsRemote).toBe('');
   }, 15_000);
 });

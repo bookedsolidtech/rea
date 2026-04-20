@@ -81,14 +81,53 @@ while IFS=' ' read -r local_ref local_sha remote_ref remote_sha; do
 
   # Determine merge base. If remote is new (remote_sha is zeros), diff against
   # the default branch; else against remote_sha.
+  #
+  # Anchor on a REMOTE-TRACKING ref (refs/remotes/<remote>/<name>), NOT a bare
+  # branch name. A bare `main` resolves to refs/heads/main, which the pusher
+  # controls locally — a local main fast-forwarded to the feature tip would
+  # give merge-base main <local_sha> == local_sha and silently collapse the
+  # diff to empty. Remote-tracking refs are server-authoritative from the
+  # last fetch and cannot be tampered with locally.
+  #
+  # Fallback order when origin/HEAD is not set (common on shallow or mirror
+  # clones): probe origin/main then origin/master via rev-parse. If neither
+  # exists (bootstrap scenario — first push to an empty remote, or a fresh
+  # clone with no fetch), there is no baseline to diff against, so the
+  # protected-path check has no meaningful work to do. Skip this refspec.
+  # This is NOT fail-open — there is simply no diff to classify. Real
+  # protected-path checks kick in on subsequent pushes once the remote-
+  # tracking ref exists.
   if [ "$remote_sha" = "0000000000000000000000000000000000000000" ]; then
-    default_branch=$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|^origin/||')
-    [ -z "${default_branch:-}" ] && default_branch="main"
-    base=$(git merge-base "$default_branch" "$local_sha" 2>/dev/null || printf '')
+    default_ref=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null || printf '')
+    if [ -z "${default_ref:-}" ]; then
+      if git rev-parse --verify --quiet refs/remotes/origin/main >/dev/null 2>&1; then
+        default_ref="refs/remotes/origin/main"
+      elif git rev-parse --verify --quiet refs/remotes/origin/master >/dev/null 2>&1; then
+        default_ref="refs/remotes/origin/master"
+      else
+        default_ref=""
+      fi
+    fi
+    # Bootstrap: no remote-tracking ref exists at all. Skip this refspec.
+    if [ -z "${default_ref:-}" ]; then
+      continue
+    fi
+    base=$(git merge-base "$default_ref" "$local_sha" 2>/dev/null || printf '')
   else
     base=$(git merge-base "$remote_sha" "$local_sha" 2>/dev/null || printf '')
   fi
-  [ -z "${base:-}" ] && continue
+  # Fail CLOSED on empty merge-base when a remote ref DID resolve. The
+  # 0.4.0..0.6.2 behavior here was to `continue` — a silent bypass. A push
+  # whose history is unrelated to origin (or any transient git failure at
+  # merge-base resolution) would pass through without the protected-path
+  # check ever running. Refuse instead and force the operator to resolve it.
+  if [ -z "${base:-}" ]; then
+    printf 'PUSH BLOCKED: could not resolve merge-base between %s and %s (local_ref=%s remote_ref=%s).\n' \
+      "${remote_sha:-<new>}" "${local_sha:-<missing>}" "${local_ref:-<unknown>}" "${remote_ref:-<unknown>}" >&2
+    printf '  Run `git fetch origin` and retry. If the history is genuinely unrelated\n' >&2
+    printf '  to origin (e.g. grafted branch), resolve manually before pushing.\n' >&2
+    exit 1
+  fi
 
   # Check if the diff touches protected paths.
   if git diff --name-only "$base" "$local_sha" 2>/dev/null | grep -qE "$PROTECTED_RE"; then

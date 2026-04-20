@@ -46,11 +46,13 @@
 - **Husky e2e regression guard:** new
   `__tests__/hooks/husky-e2e.test.ts` invokes a REAL `git push` against
   a bare remote via `core.hooksPath=.husky`, with the SHIPPED
-  `.husky/pre-push` in place. The six-test matrix validates the full
+  `.husky/pre-push` in place. The eight-test matrix validates the full
   plumbing (protected-path block, clean pass, HALT, waiver,
-  `review.codex_required: false`, counterfactual noop hook) — the
-  kind of BUG-008 silent-exit-0 regression that slipped past
-  synthesized-stdin unit tests through 0.4.0 would now fail loudly.
+  `review.codex_required: false`, counterfactual noop hook,
+  native-adapter wrapper shape, `.claude/hooks/` PROTECTED_RE
+  alternative) — the kind of BUG-008 silent-exit-0 regression that
+  slipped past synthesized-stdin unit tests through 0.4.0 would now
+  fail loudly.
 - **push-review-gate ordering (0.7.0 follow-up to BUG-009):**
   `REA_SKIP_CODEX_REVIEW` now resolves before ref-resolution, so the
   bypass works on stale checkouts where the remote ref has gone
@@ -65,6 +67,30 @@
   `files_changed` in skip records is `null` (authoritative push window
   is unavailable pre-ref-resolution); a new `metadata_source` field
   tags the record as `prepush-stdin` or `local-fallback`.
+- **Master-default fork support (C1):** new-branch push (remote SHA =
+  zero) now probes `origin/HEAD` → `origin/main` → `origin/master` via
+  `git rev-parse --verify` before falling back. Earlier versions
+  hard-coded `origin/main` as the merge-base anchor, which fails-closed
+  noisy on master-default forks. `.husky/pre-push` and
+  `hooks/_lib/push-review-core.sh` share the same probe order.
+- **Fail-closed on empty merge-base (`.husky/pre-push`):** a genuine
+  merge-base resolution failure between two known SHAs (e.g. unrelated
+  histories, transient git failure) now blocks the push with a
+  diagnostic instead of silently continuing. The bootstrap scenario —
+  first push to an empty remote with no remote-tracking ref — is
+  distinguished from the failure path and skipped cleanly, since there
+  is no baseline to diff against.
+- **Zero-SHA regression coverage (C2):** three new tests in
+  `push-review-gate-git-adapter.test.ts` exercise the new-branch
+  zero-SHA path (`refs/heads/feature <sha> refs/heads/feature 0000...`)
+  across all probe permutations — `origin/HEAD` set, `origin/HEAD`
+  absent with `origin/main` present, and `origin/HEAD` + `origin/main`
+  both absent with `origin/master` present (C1 fallback).
+- **Bare-remote tempdir cleanup (C3):** three push-review-gate test
+  suites (`no-codex`, `escape-hatch`, `skip-push-review`) now track
+  both the scratch repo and its bare remote in the cleanup list. Prior
+  versions only cleaned the scratch repo; the bare remote leaked across
+  CI runs. A `track(repo)` helper centralizes the pattern.
 - **THREAT_MODEL §5.2a:** documents `CLAUDE_PROJECT_DIR` as
   advisory-only — the script-anchor idiom owns the trust decision,
   the env var is kept only for diagnostic signal.

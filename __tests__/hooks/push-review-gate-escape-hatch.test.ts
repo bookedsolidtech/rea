@@ -69,6 +69,12 @@ interface ScratchRepo {
   dir: string;
   headSha: string;
   mergeBaseSha: string;
+  /**
+   * Bare-remote path (`origin`). Tracked on the record so `afterEach` can
+   * clean it up — it lives as a sibling of `dir` (not inside it), so
+   * removing `dir` alone would leak a `<dir>.git` directory per test run.
+   */
+  bareRemote: string;
 }
 
 /**
@@ -109,6 +115,18 @@ async function makeScratchRepo(opts: {
   git('commit', '-m', 'baseline', '--quiet');
   const mergeBaseSha = git('rev-parse', 'HEAD');
 
+  // Add a bare origin and push main so `refs/remotes/origin/main` exists.
+  // The gate's new-branch merge-base resolution anchors on remote-tracking
+  // refs (to close the pusher-controlled-local-main bypass); a scratch
+  // repo without origin/main fails-closed before any protected-path check
+  // runs. See shared core `pr_core_run` new-branch branch for the anchor.
+  const bareRemote = path.join(dir, '..', path.basename(dir) + '.git');
+  execFileSync('git', ['init', '--bare', '--initial-branch=main', '--quiet', bareRemote], {
+    encoding: 'utf8',
+  });
+  git('remote', 'add', 'origin', bareRemote);
+  git('push', 'origin', 'main', '--quiet');
+
   // Commit 2: on a feature branch, modify a protected path. Keeping `main`
   // at the baseline ensures the hook sees a real diff from feature → main.
   git('checkout', '-b', 'feature', '--quiet');
@@ -146,7 +164,7 @@ async function makeScratchRepo(opts: {
 
   await installPushHook(dir);
 
-  return { dir, headSha, mergeBaseSha };
+  return { dir, headSha, mergeBaseSha, bareRemote };
 }
 
 interface HookResult {
@@ -194,23 +212,28 @@ function jqExists(): boolean {
 }
 
 describe('push-review-gate.sh — REA_SKIP_CODEX_REVIEW escape hatch', () => {
-  let dists: string[] = [];
+  let scratchPaths: string[] = [];
 
   beforeEach(() => {
-    dists = [];
+    scratchPaths = [];
   });
 
   afterEach(async () => {
     await Promise.all(
-      dists.map((d) => fs.rm(d, { recursive: true, force: true })),
+      scratchPaths.map((d) => fs.rm(d, { recursive: true, force: true })),
     );
   });
+
+  function track(repo: ScratchRepo): void {
+    scratchPaths.push(repo.dir);
+    scratchPaths.push(repo.bareRemote);
+  }
 
   it('requires dist/audit/append.js to exist (fail-closed)', async () => {
     if (!jqExists()) return;
 
     const repo = await makeScratchRepo({ linkDist: false });
-    dists.push(repo.dir);
+    track(repo);
 
     const res = runHook(repo, {
       REA_SKIP_CODEX_REVIEW: 'ci-test',
@@ -228,7 +251,7 @@ describe('push-review-gate.sh — REA_SKIP_CODEX_REVIEW escape hatch', () => {
       userEmail: null,
       userName: null,
     });
-    dists.push(repo.dir);
+    track(repo);
 
     const res = runHook(repo, {
       REA_SKIP_CODEX_REVIEW: 'ci-test',
@@ -246,7 +269,7 @@ describe('push-review-gate.sh — REA_SKIP_CODEX_REVIEW escape hatch', () => {
       userEmail: 'skipper@example.test',
       userName: 'Skipper',
     });
-    dists.push(repo.dir);
+    track(repo);
 
     const res = runHook(repo, {
       REA_SKIP_CODEX_REVIEW: 'codex-rate-limited-ci-burst',
@@ -293,7 +316,7 @@ describe('push-review-gate.sh — REA_SKIP_CODEX_REVIEW escape hatch', () => {
     if (!jqExists()) return;
 
     const repo = await makeScratchRepo({});
-    dists.push(repo.dir);
+    track(repo);
 
     const res = runHook(repo, {
       REA_SKIP_CODEX_REVIEW: '1',
@@ -314,7 +337,7 @@ describe('push-review-gate.sh — REA_SKIP_CODEX_REVIEW escape hatch', () => {
     if (!jqExists()) return;
 
     const repo = await makeScratchRepo({});
-    dists.push(repo.dir);
+    track(repo);
 
     // Invoke escape hatch.
     runHook(repo, {
@@ -347,7 +370,7 @@ describe('push-review-gate.sh — REA_SKIP_CODEX_REVIEW escape hatch', () => {
     if (!jqExists()) return;
 
     const repo = await makeScratchRepo({});
-    dists.push(repo.dir);
+    track(repo);
 
     const res = runHook(repo, {
       PATH: process.env.PATH ?? '',
@@ -389,7 +412,7 @@ describe('push-review-gate.sh — REA_SKIP_CODEX_REVIEW escape hatch', () => {
       userEmail: 'stale@example.test',
       userName: 'Stale',
     });
-    dists.push(repo.dir);
+    track(repo);
 
     // Build a pre-push stdin payload whose remote_sha is a plausibly-shaped
     // 40-hex that is NOT in the local object DB. In the old ordering this
@@ -439,7 +462,7 @@ describe('push-review-gate.sh — REA_SKIP_CODEX_REVIEW escape hatch', () => {
       userEmail: 'hotfix@example.test',
       userName: 'Hotfix Operator',
     });
-    dists.push(repo.dir);
+    track(repo);
 
     // Simulate `git push origin hotfix:release/2026-q2` from a `feature`
     // checkout. The checkout's HEAD is repo.headSha ("feature" branch), but
@@ -484,7 +507,7 @@ describe('push-review-gate.sh — REA_SKIP_CODEX_REVIEW escape hatch', () => {
     if (!jqExists()) return;
 
     const repo = await makeScratchRepo({});
-    dists.push(repo.dir);
+    track(repo);
 
     const res = runHook(repo, {
       REA_SKIP_CODEX_REVIEW: '',

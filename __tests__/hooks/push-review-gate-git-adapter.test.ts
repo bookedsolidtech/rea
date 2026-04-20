@@ -515,6 +515,139 @@ describe('push-review-gate-git.sh — native git pre-push adapter (task #50)', (
     expect(modes.get(sourceRel)).toBe(modes.get(mirrorRel));
   }
 
+  /**
+   * Codex 0.7.0 review — C1/C2 regression. The shared-core new-branch path
+   * (remote_sha == ZERO_SHA) resolves the default branch by probing:
+   *
+   *     refs/remotes/<remote>/HEAD  →  refs/remotes/<remote>/main
+   *                                →  refs/remotes/<remote>/master   (C1)
+   *
+   * Before 0.7.0 the fallback only tried `main`, so a first push of a
+   * protected-path branch against a `master`-default fork would silently
+   * fail-closed at merge-base resolution before the protected-path gate
+   * even ran — operators would see a generic "could not resolve merge-
+   * base" block instead of the specific "protected paths changed" banner,
+   * and the zero-SHA code path went un-tested.
+   *
+   * This suite pushes a new branch (`remote_sha == ZERO_SHA`) against three
+   * setups and asserts the protected-path gate fires in every one:
+   *
+   *   1. origin/HEAD symbolically points at origin/main (modern git default)
+   *   2. origin/HEAD missing, origin/main present (mirror-clone shape)
+   *   3. origin/HEAD missing, origin/main missing, origin/master present
+   *      (the `master`-default fork path — C1 regression coverage)
+   */
+  describe('new-branch zero-SHA path (Codex 0.7.0 C1 + C2)', () => {
+    async function setRemoteTrackingRef(
+      repoDir: string,
+      branch: string,
+      sha: string,
+    ): Promise<void> {
+      await fs.mkdir(
+        path.join(repoDir, '.git', 'refs', 'remotes', 'origin'),
+        { recursive: true },
+      );
+      await fs.writeFile(
+        path.join(repoDir, '.git', 'refs', 'remotes', 'origin', branch),
+        `${sha}\n`,
+      );
+    }
+
+    async function clearRemoteTrackingRef(
+      repoDir: string,
+      branch: string,
+    ): Promise<void> {
+      await fs
+        .rm(path.join(repoDir, '.git', 'refs', 'remotes', 'origin', branch), {
+          force: true,
+        })
+        .catch(() => undefined);
+    }
+
+    async function setOriginHead(repoDir: string, target: string): Promise<void> {
+      await fs.writeFile(
+        path.join(repoDir, '.git', 'refs', 'remotes', 'origin', 'HEAD'),
+        `ref: refs/remotes/origin/${target}\n`,
+      );
+    }
+
+    async function clearOriginHead(repoDir: string): Promise<void> {
+      await fs
+        .rm(path.join(repoDir, '.git', 'refs', 'remotes', 'origin', 'HEAD'), {
+          force: true,
+        })
+        .catch(() => undefined);
+    }
+
+    const ZERO = '0000000000000000000000000000000000000000';
+
+    it('origin/HEAD → origin/main: fires protected-path gate on new-branch push', async () => {
+      const repo = await makeRepo();
+      cleanup.push(repo.dir);
+
+      // makeRepo seeds origin/main. Add origin/HEAD pointing at it so the
+      // shared-core `git symbolic-ref refs/remotes/origin/HEAD` call succeeds
+      // — this is the happy path (modern git default after `git clone`).
+      await setOriginHead(repo.dir, 'main');
+
+      const prepushLine = `refs/heads/feature ${repo.featureSha} refs/heads/feature ${ZERO}\n`;
+      const res = spawnSync('bash', [repo.gitHook, 'origin'], {
+        cwd: repo.dir,
+        env: { ...process.env, CLAUDE_PROJECT_DIR: repo.dir },
+        input: prepushLine,
+        encoding: 'utf8',
+      });
+
+      expect(res.status).toBe(2);
+      expect(res.stderr).toMatch(/protected paths changed/);
+    });
+
+    it('origin/HEAD missing, origin/main present: fallback still fires gate', async () => {
+      const repo = await makeRepo();
+      cleanup.push(repo.dir);
+
+      // No origin/HEAD seeded — the shared-core symbolic-ref call fails and
+      // the fallback probe must land on origin/main via `rev-parse --verify`.
+      await clearOriginHead(repo.dir);
+
+      const prepushLine = `refs/heads/feature ${repo.featureSha} refs/heads/feature ${ZERO}\n`;
+      const res = spawnSync('bash', [repo.gitHook, 'origin'], {
+        cwd: repo.dir,
+        env: { ...process.env, CLAUDE_PROJECT_DIR: repo.dir },
+        input: prepushLine,
+        encoding: 'utf8',
+      });
+
+      expect(res.status).toBe(2);
+      expect(res.stderr).toMatch(/protected paths changed/);
+    });
+
+    it('origin/HEAD missing, origin/main missing, origin/master present: C1 master fallback fires gate', async () => {
+      const repo = await makeRepo();
+      cleanup.push(repo.dir);
+
+      // Rebuild the remote-tracking state so the ONLY available default is
+      // master. Before C1 this would fall through to a bare `origin/main`
+      // that git cannot resolve, producing an empty merge-base that (under
+      // the shared-core fail-closed rule) blocks with a generic "could not
+      // resolve" banner instead of the specific protected-path banner.
+      await clearOriginHead(repo.dir);
+      await setRemoteTrackingRef(repo.dir, 'master', repo.mainSha);
+      await clearRemoteTrackingRef(repo.dir, 'main');
+
+      const prepushLine = `refs/heads/feature ${repo.featureSha} refs/heads/feature ${ZERO}\n`;
+      const res = spawnSync('bash', [repo.gitHook, 'origin'], {
+        cwd: repo.dir,
+        env: { ...process.env, CLAUDE_PROJECT_DIR: repo.dir },
+        input: prepushLine,
+        encoding: 'utf8',
+      });
+
+      expect(res.status).toBe(2);
+      expect(res.stderr).toMatch(/protected paths changed/);
+    });
+  });
+
   it('byte+mode parity: hooks/push-review-gate-git.sh matches .claude/hooks/push-review-gate-git.sh', async () => {
     await expectPairParity(
       'hooks/push-review-gate-git.sh',

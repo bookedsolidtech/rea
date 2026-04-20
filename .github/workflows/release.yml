@@ -83,6 +83,42 @@ jobs:
           echo "[release] CI-built dist/ hash:"
           cat "$RUNNER_TEMP/rea-dist-hash"
 
+      # BUG-013 defense-in-depth (pre-publish local-pack check): pack the
+      # rebuilt workspace with `npm pack` and verify the dist/ inside the
+      # resulting tarball hashes to the same value as the freshly rebuilt
+      # dist/ on disk. This catches packaging bugs — `files:` filter
+      # dropping a path, .npmignore stripping a directory, pack mangling —
+      # BEFORE the tarball is published to npm. The post-publish registry
+      # verification below is still run as a second attestation, but by
+      # then the tarball is already on the public registry; this step is
+      # the one that prevents a bad package from reaching consumers.
+      - name: Verify locally-packed tarball dist/ matches rebuilt dist/
+        run: |
+          WORK="$(mktemp -d -t rea-prepub-verify-XXXXXX)"
+          cd "$WORK"
+          npm pack "$GITHUB_WORKSPACE" --silent > /dev/null
+          TARBALL="$(ls bookedsolid-rea-*.tgz | head -1)"
+          if [ -z "$TARBALL" ]; then
+            echo "::error::npm pack produced no tarball in $WORK"
+            exit 1
+          fi
+          mkdir -p extract
+          tar -xzf "$TARBALL" -C extract
+          if [ ! -d extract/package/dist ]; then
+            echo "::error::locally-packed tarball has no package/dist/"
+            exit 1
+          fi
+          PACKED_HASH="$(cd extract/package && find dist -type f -print0 | sort -z | xargs -0 shasum -a 256 | shasum -a 256 | awk '{print $1}')"
+          REBUILT_HASH="$(awk '{print $1}' "$RUNNER_TEMP/rea-dist-hash")"
+          echo "[release] locally-packed dist/ hash: $PACKED_HASH"
+          echo "[release] rebuilt          dist/ hash: $REBUILT_HASH"
+          if [ "$PACKED_HASH" != "$REBUILT_HASH" ]; then
+            echo "::error::pre-publish mismatch — packed dist/ hash ($PACKED_HASH) != rebuilt dist/ hash ($REBUILT_HASH)"
+            echo "::error::a file that tsc emitted is not reaching the tarball; inspect package.json#files and .npmignore"
+            exit 1
+          fi
+          echo "[release] pre-publish dist/ hash verified — local pack matches rebuild"
+
       - name: Create release PR or publish
         id: changesets
         # pin: changesets/action v1.4.9

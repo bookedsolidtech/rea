@@ -750,10 +750,42 @@ pr_core_run() {
         exit 2
       fi
     else
-      mb=$(cd "$REA_ROOT" && git merge-base "$target" "$local_sha" 2>/dev/null || echo "")
-      if [[ -z "$mb" ]]; then
-        mb=$(cd "$REA_ROOT" && git merge-base main "$local_sha" 2>/dev/null || echo "")
+      # New branch (remote_sha == ZERO). `target` is the REMOTE ref name (the
+      # branch being created on origin), not a sensible merge-base anchor:
+      # if the local repo already has a branch by that name pointing at
+      # `local_sha`, `git merge-base <target> <local_sha>` returns `local_sha`
+      # — collapsing the reviewable diff to empty and silently bypassing the
+      # gate.
+      #
+      # We MUST anchor on a REMOTE-TRACKING ref (e.g. refs/remotes/origin/main),
+      # not the bare branch name. Bare `main` resolves to the local short ref
+      # `refs/heads/main`, which the pusher controls — a local `main` that has
+      # been fast-forwarded to contain the feature tip (or a rebased topic
+      # branch) would give `merge-base main <local_sha> == local_sha`, silently
+      # passing the gate. Remote-tracking refs are server-authoritative from
+      # the most recent fetch, so they cannot be tampered with locally.
+      #
+      # argv_remote is set from the adapter's argv (git passes the remote name
+      # as $1 on pre-push); defaults to "origin" when absent (BUG-008 sniff).
+      local default_ref default_ref_status
+      default_ref=$(cd "$REA_ROOT" && git symbolic-ref "refs/remotes/${argv_remote}/HEAD" 2>/dev/null)
+      default_ref_status=$?
+      if [[ "$default_ref_status" -ne 0 || -z "$default_ref" ]]; then
+        # symbolic-ref failed (common on shallow or mirror clones where
+        # origin/HEAD was never set). Probe the common default-branch names in
+        # order: main, then master. Both are remote-tracking refs and still
+        # server-authoritative; the order matters only for projects that still
+        # default to `master` (older internal forks), where without this
+        # fallback the first push of a new branch would fail closed.
+        if cd "$REA_ROOT" && git rev-parse --verify --quiet "refs/remotes/${argv_remote}/main" >/dev/null 2>&1; then
+          default_ref="refs/remotes/${argv_remote}/main"
+        elif cd "$REA_ROOT" && git rev-parse --verify --quiet "refs/remotes/${argv_remote}/master" >/dev/null 2>&1; then
+          default_ref="refs/remotes/${argv_remote}/master"
+        else
+          default_ref="refs/remotes/${argv_remote}/main"
+        fi
       fi
+      mb=$(cd "$REA_ROOT" && git merge-base "$default_ref" "$local_sha" 2>/dev/null || echo "")
     fi
     if [[ -z "$mb" ]]; then
       continue
@@ -825,8 +857,19 @@ pr_core_run() {
   # If the diff touches governance-critical directories, require a
   # codex.review audit entry for the current HEAD.
   #
-  # [.]github instead of \.github: GNU awk warns on `\.` inside an ERE.
-  local PROTECTED_RE='(src/gateway/middleware/|hooks/|src/policy/|[.]github/workflows/)'
+  # Anchor every alternative with `^` so a legitimate file like
+  # `docs/hooks-guide.md`, `src/thirdparty/src/policy/loader.c`, or — most
+  # relevantly — `__tests__/hooks/*.test.ts` is not mistaken for a
+  # protected path.
+  #
+  # [.]github / [.]claude instead of \.github / \.claude: GNU awk warns
+  # on `\.` inside an ERE.
+  #
+  # `.claude/hooks/` matches `.husky/pre-push` PROTECTED_RE so a consumer
+  # editing their own installed copies of the shipped hooks cannot sneak
+  # past the gate. Without this, the shared core had a protection gap vs.
+  # the standalone husky script.
+  local PROTECTED_RE='^(src/gateway/middleware/|hooks/|[.]claude/hooks/|src/policy/|[.]github/workflows/)'
 
   local PROTECTED_HITS PROTECTED_DIFF_STATUS
   PROTECTED_HITS=$(cd "$REA_ROOT" && git diff --name-status "${MERGE_BASE}...${SOURCE_SHA}" 2>/dev/null)
@@ -873,6 +916,7 @@ pr_core_run() {
         printf '  Diff touches one of:\n'
         printf '    - src/gateway/middleware/\n'
         printf '    - hooks/\n'
+        printf '    - .claude/hooks/\n'
         printf '    - src/policy/\n'
         printf '    - .github/workflows/\n'
         printf '\n'
