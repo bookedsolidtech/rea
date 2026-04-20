@@ -9,13 +9,23 @@
 #   2 = block (needs review, or escape hatch invoked but audit-append failed)
 #
 # ── Escape hatch: REA_SKIP_CODEX_REVIEW ──────────────────────────────────────
-# Env var `REA_SKIP_CODEX_REVIEW=<reason>` bypasses the protected-path Codex
-# adversarial-review requirement. Set to any non-empty value; the value IS
-# the reason recorded in the audit record (no default reason is supplied —
-# if the operator sets `REA_SKIP_CODEX_REVIEW=1` the reason is literally "1").
+# Env var `REA_SKIP_CODEX_REVIEW=<reason>` bypasses the Codex adversarial-
+# review requirement. Set to any non-empty value; the value IS the reason
+# recorded in the audit record (no default reason is supplied — if the
+# operator sets `REA_SKIP_CODEX_REVIEW=1` the reason is literally "1").
 #
-# The hatch ONLY applies when the diff would otherwise require Codex review
-# (i.e. touches a protected path). Unprotected pushes are not affected.
+# ORDERING (0.7.0): the hatch fires AFTER the HALT check but BEFORE ref-
+# resolution and protected-path detection. Prior to 0.7.0 the check ran
+# inside the protected-path branch and only fired when the diff touched a
+# protected path — which meant an operator who wanted to skip Codex review
+# got blocked by a transient ref-resolution failure (missing remote object,
+# unresolvable source ref, etc.) before the skip ever fired. The new
+# ordering mirrors REA_SKIP_PUSH_REVIEW: if the operator has committed to
+# the bypass (accepting the audit record), ref-resolution failures should
+# not strand the skip. Tradeoff: the skip now fires on every push when set,
+# not just protected-path pushes. The audit receipt makes the operator
+# accountable either way, and REA_SKIP_CODEX_REVIEW keeps its distinct
+# tool_name so it never satisfies the `codex.review` jq predicate.
 #
 # Every invocation appends a `tool_name: "codex.review.skipped"` record to
 # `.rea/audit.jsonl` via the public audit helper. This record is intentionally
@@ -353,6 +363,157 @@ if [[ -n "${REA_SKIP_PUSH_REVIEW:-}" ]]; then
     printf '    Branch:  %s\n' "${SKIP_BRANCH:-<detached>}"
     printf '    Head:    %s\n' "${SKIP_HEAD:-<unknown>}"
     printf '    Audited: .rea/audit.jsonl (tool_name=push.review.skipped)\n'
+    printf '\n'
+    printf '    This is a gate weakening. Every invocation is permanently audited.\n'
+    printf '\n'
+  } >&2
+  exit 0
+fi
+
+# ── 5b. Resolve review.codex_required (hoisted from section 7a) ──────────────
+# We need this BEFORE the REA_SKIP_CODEX_REVIEW check so G11.4 first-class
+# no-Codex mode stays a clean no-op: when the policy says Codex is not
+# required at all, there is nothing to skip, and setting REA_SKIP_CODEX_REVIEW
+# must not write a skip audit record (a skip record with no gate to skip is
+# noise at best and misleading at worst).
+#
+# Fail-closed: a malformed/unparseable policy is treated as codex_required=true
+# so we never silently drop the Codex gate on a broken policy file.
+READ_FIELD_JS="${REA_ROOT}/dist/scripts/read-policy-field.js"
+CODEX_REQUIRED="true"
+if [[ -f "$READ_FIELD_JS" ]]; then
+  FIELD_VALUE=$(REA_ROOT="$REA_ROOT" node "$READ_FIELD_JS" review.codex_required 2>/dev/null)
+  FIELD_STATUS=$?
+  case "$FIELD_STATUS" in
+    0)
+      if [[ "$FIELD_VALUE" == "false" ]]; then
+        CODEX_REQUIRED="false"
+      elif [[ "$FIELD_VALUE" == "true" ]]; then
+        CODEX_REQUIRED="true"
+      else
+        printf 'REA WARN: review.codex_required resolved to non-boolean %q — treating as true\n' "$FIELD_VALUE" >&2
+        CODEX_REQUIRED="true"
+      fi
+      ;;
+    1)
+      CODEX_REQUIRED="true"
+      ;;
+    *)
+      printf 'REA WARN: read-policy-field exited %s — treating review.codex_required as true (fail-closed)\n' "$FIELD_STATUS" >&2
+      CODEX_REQUIRED="true"
+      ;;
+  esac
+fi
+
+# ── 5c. REA_SKIP_CODEX_REVIEW — Codex-review bypass ──────────────────────────
+# Runs here (before ref-resolution) so ref-resolution failures in section 6
+# do not strand an operator who has committed to the skip. See the file-top
+# docstring for the ordering rationale (0.7.0).
+#
+# Gated on CODEX_REQUIRED=true (from section 5b): if policy explicitly opts
+# into no-Codex mode, the skip is a no-op — nothing to skip, no audit noise.
+#
+# Distinct from REA_SKIP_PUSH_REVIEW: different audit tool_name
+# (`codex.review.skipped` vs `push.review.skipped`). A Codex-skip receipt
+# satisfies the Codex-review gate accounting but NOT the generic
+# push.review.skipped predicate, and vice versa — two hatches, two trails.
+if [[ -n "${REA_SKIP_CODEX_REVIEW:-}" && "$CODEX_REQUIRED" == "true" ]]; then
+  SKIP_REASON="$REA_SKIP_CODEX_REVIEW"
+  AUDIT_APPEND_JS="${REA_ROOT}/dist/audit/append.js"
+
+  if [[ ! -f "$AUDIT_APPEND_JS" ]]; then
+    {
+      printf 'PUSH BLOCKED: escape hatch requires rea to be built.\n'
+      printf '\n'
+      printf '  REA_SKIP_CODEX_REVIEW is set but %s is missing.\n' "$AUDIT_APPEND_JS"
+      printf '  Run: pnpm build\n'
+      printf '\n'
+    } >&2
+    exit 2
+  fi
+
+  SKIP_ACTOR=$(cd "$REA_ROOT" && git config user.email 2>/dev/null || echo "")
+  if [[ -z "$SKIP_ACTOR" ]]; then
+    SKIP_ACTOR=$(cd "$REA_ROOT" && git config user.name 2>/dev/null || echo "")
+  fi
+  if [[ -z "$SKIP_ACTOR" ]]; then
+    {
+      printf 'PUSH BLOCKED: escape hatch requires a git identity.\n'
+      printf '\n'
+      # shellcheck disable=SC2016  # backticks are literal markdown in user-facing message
+      printf '  Neither `git config user.email` nor `git config user.name`\n'
+      printf '  is set. The skip audit record would have no actor; refusing\n'
+      printf '  to bypass without one.\n'
+      printf '\n'
+    } >&2
+    exit 2
+  fi
+
+  # Best-effort metadata: we haven't run ref-resolution yet, so HEAD SHA is
+  # the closest proxy for "what is being pushed". files_changed is computed
+  # from the last commit (HEAD~1..HEAD) — if that fails, we emit 0 rather
+  # than fail the skip (the operator already committed to the bypass).
+  SKIP_HEAD=$(cd "$REA_ROOT" && git rev-parse HEAD 2>/dev/null || echo "")
+  SKIP_UPSTREAM=$(cd "$REA_ROOT" && git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null || echo "")
+  SKIP_TARGET="main"
+  if [[ -n "$SKIP_UPSTREAM" && "$SKIP_UPSTREAM" == */* ]]; then
+    SKIP_TARGET="${SKIP_UPSTREAM#*/}"
+  fi
+  SKIP_FILES_CHANGED=$(cd "$REA_ROOT" && git diff --name-only HEAD~1..HEAD 2>/dev/null | awk 'NF { n++ } END { print n+0 }' 2>/dev/null || echo "0")
+  if [[ -z "$SKIP_FILES_CHANGED" ]]; then
+    SKIP_FILES_CHANGED=0
+  fi
+
+  SKIP_METADATA=$(jq -n \
+    --arg head_sha "$SKIP_HEAD" \
+    --arg target "$SKIP_TARGET" \
+    --arg reason "$SKIP_REASON" \
+    --arg actor "$SKIP_ACTOR" \
+    --argjson files_changed "$SKIP_FILES_CHANGED" \
+    '{
+      head_sha: $head_sha,
+      target: $target,
+      reason: $reason,
+      actor: $actor,
+      verdict: "skipped",
+      files_changed: $files_changed
+    }' 2>/dev/null)
+
+  if [[ -z "$SKIP_METADATA" ]]; then
+    {
+      printf 'PUSH BLOCKED: escape hatch could not serialize audit metadata.\n' >&2
+    } >&2
+    exit 2
+  fi
+
+  REA_ROOT="$REA_ROOT" REA_SKIP_METADATA="$SKIP_METADATA" \
+    node --input-type=module -e "
+      const mod = await import(process.env.REA_ROOT + '/dist/audit/append.js');
+      const metadata = JSON.parse(process.env.REA_SKIP_METADATA);
+      await mod.appendAuditRecord(process.env.REA_ROOT, {
+        tool_name: 'codex.review.skipped',
+        server_name: 'rea.escape_hatch',
+        status: mod.InvocationStatus.Allowed,
+        tier: mod.Tier.Read,
+        metadata,
+      });
+    " 2>/dev/null
+  NODE_STATUS=$?
+  if [[ "$NODE_STATUS" -ne 0 ]]; then
+    {
+      printf 'PUSH BLOCKED: escape hatch audit-append failed (node exit %s).\n' "$NODE_STATUS"
+      printf '  Refusing to bypass the Codex-review gate without a receipt.\n'
+    } >&2
+    exit 2
+  fi
+
+  {
+    printf '\n'
+    printf '==  CODEX REVIEW SKIPPED via REA_SKIP_CODEX_REVIEW\n'
+    printf '    Reason:   %s\n' "$SKIP_REASON"
+    printf '    Actor:    %s\n' "$SKIP_ACTOR"
+    printf '    Head SHA: %s\n' "${SKIP_HEAD:-<unknown>}"
+    printf '    Audited:  .rea/audit.jsonl (tool_name=codex.review.skipped)\n'
     printf '\n'
     printf '    This is a gate weakening. Every invocation is permanently audited.\n'
     printf '\n'
@@ -743,44 +904,11 @@ LINE_COUNT=$(printf '%s' "$DIFF_FULL" | grep -cE '^\+[^+]|^-[^-]' 2>/dev/null ||
 # would satisfy two independent greps. Match on the parsed structure instead.
 #
 # ── G11.4: honor review.codex_required ───────────────────────────────────────
-# When policy.review.codex_required is explicitly false, the operator has
-# opted into first-class no-Codex mode. Skip this whole branch — no audit
-# entry is required, the escape-hatch is not relevant, and we fall through
-# to the normal (non-Codex) push validation. The selector in
-# src/gateway/reviewers/select.ts makes the same call for the reviewer pick.
-#
-# Fail-closed: if the helper fails to parse the policy, treat the field as
-# true (safer default) and log a warning. A malformed policy file is an
-# operator problem, not a reason to silently weaken the Codex gate.
-READ_FIELD_JS="${REA_ROOT}/dist/scripts/read-policy-field.js"
-CODEX_REQUIRED="true"
-if [[ -f "$READ_FIELD_JS" ]]; then
-  FIELD_VALUE=$(REA_ROOT="$REA_ROOT" node "$READ_FIELD_JS" review.codex_required 2>/dev/null)
-  FIELD_STATUS=$?
-  case "$FIELD_STATUS" in
-    0)
-      # Field is present and a scalar. Accept only literal `true` / `false`.
-      # Anything else is a malformed scalar; fail closed.
-      if [[ "$FIELD_VALUE" == "false" ]]; then
-        CODEX_REQUIRED="false"
-      elif [[ "$FIELD_VALUE" == "true" ]]; then
-        CODEX_REQUIRED="true"
-      else
-        printf 'REA WARN: review.codex_required resolved to non-boolean %q — treating as true\n' "$FIELD_VALUE" >&2
-        CODEX_REQUIRED="true"
-      fi
-      ;;
-    1)
-      # Field absent (or policy file missing). Documented default is true.
-      CODEX_REQUIRED="true"
-      ;;
-    *)
-      # Malformed policy, unexpected helper exit. Fail closed.
-      printf 'REA WARN: read-policy-field exited %s — treating review.codex_required as true (fail-closed)\n' "$FIELD_STATUS" >&2
-      CODEX_REQUIRED="true"
-      ;;
-  esac
-fi
+# CODEX_REQUIRED was already resolved in section 5b (hoisted there so the
+# REA_SKIP_CODEX_REVIEW hatch could gate on it). No re-resolve here; the
+# value is fresh because nothing between 5b and here mutates the policy file.
+# If codex_required=false the operator opted into first-class no-Codex mode
+# and we fall through to the normal (non-Codex) push validation.
 
 # [.]github instead of \.github: GNU awk warns on `\.` inside an ERE (it
 # treats the escape as plain `.`), which dirties stderr and makes tests that
@@ -819,117 +947,9 @@ if [[ "$CODEX_REQUIRED" == "true" ]] && printf '%s\n' "$PROTECTED_HITS" | awk -v
   # must match a Codex review of `hotfix`, not of `foo`.
   REVIEW_SHA="$SOURCE_SHA"
 
-  # ── 7a.1 Escape hatch: REA_SKIP_CODEX_REVIEW ──────────────────────────────
-  # Consume the hatch ONLY when we would otherwise require Codex review (i.e.
-  # we are inside the protected-path branch). This preserves the gate for
-  # every non-protected push.
-  #
-  # Audit record is written BEFORE the stderr banner and BEFORE exit 0. If
-  # the audit write fails (missing dist/ build, missing git identity, Node
-  # failure), we fail closed — exit 2 — so an operator cannot silently slip
-  # a protected-path push with no receipt.
-  if [[ -n "${REA_SKIP_CODEX_REVIEW:-}" ]]; then
-    SKIP_REASON="$REA_SKIP_CODEX_REVIEW"
-    AUDIT_APPEND_JS="${REA_ROOT}/dist/audit/append.js"
-
-    if [[ ! -f "$AUDIT_APPEND_JS" ]]; then
-      {
-        printf 'PUSH BLOCKED: escape hatch requires rea to be built.\n'
-        printf '\n'
-        printf '  REA_SKIP_CODEX_REVIEW is set but %s is missing.\n' "$AUDIT_APPEND_JS"
-        printf '  Run: pnpm build\n'
-        printf '\n'
-      } >&2
-      exit 2
-    fi
-
-    # Actor: prefer git user.email, fall back to user.name. Empty → fail closed.
-    SKIP_ACTOR=$(cd "$REA_ROOT" && git config user.email 2>/dev/null || echo "")
-    if [[ -z "$SKIP_ACTOR" ]]; then
-      SKIP_ACTOR=$(cd "$REA_ROOT" && git config user.name 2>/dev/null || echo "")
-    fi
-    if [[ -z "$SKIP_ACTOR" ]]; then
-      {
-        printf 'PUSH BLOCKED: escape hatch requires a git identity.\n'
-        printf '\n'
-        # shellcheck disable=SC2016  # backticks are literal markdown in user-facing message
-        printf '  Neither `git config user.email` nor `git config user.name`\n'
-        printf '  is set. The skip audit record would have no actor; refusing\n'
-        printf '  to bypass without one.\n'
-        printf '\n'
-      } >&2
-      exit 2
-    fi
-
-    # files_changed is a count only (not a list). The raw name-status stream
-    # is already processed elsewhere in the hook; paths may be path-sensitive
-    # or leak info we'd rather keep out of the audit line.
-    SKIP_FILES_CHANGED=$(printf '%s\n' "$PROTECTED_HITS" | awk 'NF { n++ } END { print n+0 }')
-
-    # Build the metadata JSON via jq so any weird characters in reason/actor
-    # are properly escaped. All values are passed as --arg (strings) except
-    # files_changed which is --argjson (number).
-    SKIP_METADATA=$(jq -n \
-      --arg head_sha "$SOURCE_SHA" \
-      --arg target "$TARGET_BRANCH" \
-      --arg reason "$SKIP_REASON" \
-      --arg actor "$SKIP_ACTOR" \
-      --argjson files_changed "$SKIP_FILES_CHANGED" \
-      '{
-        head_sha: $head_sha,
-        target: $target,
-        reason: $reason,
-        actor: $actor,
-        verdict: "skipped",
-        files_changed: $files_changed
-      }' 2>/dev/null)
-
-    if [[ -z "$SKIP_METADATA" ]]; then
-      {
-        printf 'PUSH BLOCKED: escape hatch could not serialize audit metadata.\n' >&2
-      } >&2
-      exit 2
-    fi
-
-    # Write the audit record via the built helper. Pass REA_ROOT and the
-    # metadata JSON through env vars (avoids quoting the values into the
-    # one-liner; reason may contain literal double-quotes or backslashes).
-    REA_ROOT="$REA_ROOT" REA_SKIP_METADATA="$SKIP_METADATA" \
-      node --input-type=module -e "
-        const mod = await import(process.env.REA_ROOT + '/dist/audit/append.js');
-        const metadata = JSON.parse(process.env.REA_SKIP_METADATA);
-        await mod.appendAuditRecord(process.env.REA_ROOT, {
-          tool_name: 'codex.review.skipped',
-          server_name: 'rea.escape_hatch',
-          status: mod.InvocationStatus.Allowed,
-          tier: mod.Tier.Read,
-          metadata,
-        });
-      " 2>/dev/null
-    NODE_STATUS=$?
-    if [[ "$NODE_STATUS" -ne 0 ]]; then
-      {
-        printf 'PUSH BLOCKED: escape hatch audit-append failed (node exit %s).\n' "$NODE_STATUS"
-        printf '  Refusing to bypass the Codex-review gate without a receipt.\n'
-      } >&2
-      exit 2
-    fi
-
-    # Audit record is durable on disk. Emit the loud stderr banner and allow
-    # the push.
-    {
-      printf '\n'
-      printf '==  CODEX REVIEW SKIPPED via REA_SKIP_CODEX_REVIEW\n'
-      printf '    Reason:   %s\n' "$SKIP_REASON"
-      printf '    Actor:    %s\n' "$SKIP_ACTOR"
-      printf '    Head SHA: %s\n' "$SOURCE_SHA"
-      printf '    Audited:  .rea/audit.jsonl (tool_name=codex.review.skipped)\n'
-      printf '\n'
-      printf '    This is a gate weakening. Every invocation is permanently audited.\n'
-      printf '\n'
-    } >&2
-    exit 0
-  fi
+  # REA_SKIP_CODEX_REVIEW was consumed earlier (section 5b, before ref-
+  # resolution). If control reaches this branch the skip was NOT set — we
+  # must require a real Codex-review audit entry.
 
   AUDIT="${REA_ROOT}/.rea/audit.jsonl"
   CODEX_OK=0

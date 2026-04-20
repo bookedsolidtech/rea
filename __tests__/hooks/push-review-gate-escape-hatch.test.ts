@@ -355,6 +355,56 @@ describe('push-review-gate.sh — REA_SKIP_CODEX_REVIEW escape hatch', () => {
     }
   });
 
+  // #77 (0.7.0) — regression: the skip hatch must fire even when
+  // ref-resolution would otherwise fail. Prior to 0.7.0 the hatch lived
+  // inside the protected-path branch, which only runs AFTER ref-resolution.
+  // A stale checkout (missing remote object) or an unresolvable source ref
+  // exited the hook with status 2 before the hatch had a chance to fire,
+  // stranding an operator who had explicitly committed to the bypass.
+  //
+  // This test simulates the missing-remote-object scenario by synthesizing
+  // the pre-push stdin contract with a remote_sha that does not exist in
+  // the local object DB. The hook must consume the hatch and exit 0 with
+  // a `codex.review.skipped` audit record.
+  it('fires even when ref-resolution would fail (stale checkout / missing remote object)', async () => {
+    if (!jqExists()) return;
+
+    const repo = await makeScratchRepo({
+      userEmail: 'stale@example.test',
+      userName: 'Stale',
+    });
+    dists.push(repo.dir);
+
+    // Build a pre-push stdin payload whose remote_sha is a plausibly-shaped
+    // 40-hex that is NOT in the local object DB. In the old ordering this
+    // hit the `git cat-file -e` probe in section 6 and exit 2'd before the
+    // hatch could fire.
+    const BOGUS_SHA = 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef';
+    const prepushStdin = `refs/heads/feature ${repo.headSha} refs/heads/main ${BOGUS_SHA}\n`;
+
+    const res = spawnSync('bash', [installedHookPath(repo.dir), 'origin'], {
+      cwd: repo.dir,
+      env: {
+        REA_SKIP_CODEX_REVIEW: 'stale-checkout-unblock',
+        PATH: process.env.PATH ?? '',
+        CLAUDE_PROJECT_DIR: repo.dir,
+      },
+      input: prepushStdin,
+      encoding: 'utf8',
+    });
+
+    expect(res.status).toBe(0);
+    expect(res.stderr).toMatch(/CODEX REVIEW SKIPPED/);
+    expect(res.stderr).toContain('stale-checkout-unblock');
+
+    const lines = await readAuditLines(repo.dir);
+    const skip = lines.find((r) => r['tool_name'] === 'codex.review.skipped');
+    expect(skip).toBeDefined();
+    const meta = skip!['metadata'] as Record<string, unknown>;
+    expect(meta['reason']).toBe('stale-checkout-unblock');
+    expect(meta['verdict']).toBe('skipped');
+  });
+
   it('leaves the gate alone when REA_SKIP_CODEX_REVIEW is set to empty string', async () => {
     if (!jqExists()) return;
 
