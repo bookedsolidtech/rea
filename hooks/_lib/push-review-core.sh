@@ -782,10 +782,25 @@ pr_core_run() {
         elif cd "$REA_ROOT" && git rev-parse --verify --quiet "refs/remotes/${argv_remote}/master" >/dev/null 2>&1; then
           default_ref="refs/remotes/${argv_remote}/master"
         else
-          default_ref="refs/remotes/${argv_remote}/main"
+          default_ref=""
         fi
       fi
-      mb=$(cd "$REA_ROOT" && git merge-base "$default_ref" "$local_sha" 2>/dev/null || echo "")
+      if [[ -n "$default_ref" ]]; then
+        mb=$(cd "$REA_ROOT" && git merge-base "$default_ref" "$local_sha" 2>/dev/null || echo "")
+      else
+        # Bootstrap: no remote-tracking ref resolved. Use the well-known
+        # empty-tree SHA as the merge-base baseline so the per-refspec diff
+        # covers the full push content and the protected-path selection
+        # below still runs. Prior behavior silently `continue`d here, which
+        # — combined with the longest-diff selection accumulator at
+        # :807-812 — let a bootstrap protected-path refspec bypass the gate
+        # whenever a second, well-anchored refspec in the same push was
+        # selected as BEST instead. Flagged as HIGH parity gap vs the
+        # .husky/pre-push fix in 701b631 by Codex pass-3. `git diff` accepts
+        # a tree SHA as LHS, so :838 `git diff "$MERGE_BASE...$SOURCE_SHA"`
+        # works transparently with this baseline.
+        mb='4b825dc642cb6eb9a060e54bf8d69288fbee4904'
+      fi
     fi
     if [[ -z "$mb" ]]; then
       continue
@@ -834,12 +849,20 @@ pr_core_run() {
   fi
 
   # Capture git diff exit status explicitly.
+  #
+  # Use two-dot (`A..B`) rather than three-dot (`A...B`). Three-dot form
+  # computes an implicit merge-base between A and B, which FAILS when A
+  # is a tree (e.g. the empty-tree baseline used on bootstrap refspecs
+  # — see pr_parse_prepush_stdin's new-branch block). Two-dot accepts
+  # any revision on the left and is equivalent to `A...B` here because
+  # MERGE_BASE is ALREADY the merge-base of the two commit cases, so the
+  # implicit merge-base in three-dot would be redundant.
   local DIFF_FULL DIFF_STATUS
-  DIFF_FULL=$(cd "$REA_ROOT" && git diff "${MERGE_BASE}...${SOURCE_SHA}" 2>/dev/null)
+  DIFF_FULL=$(cd "$REA_ROOT" && git diff "${MERGE_BASE}..${SOURCE_SHA}" 2>/dev/null)
   DIFF_STATUS=$?
   if [[ "$DIFF_STATUS" -ne 0 ]]; then
     {
-      printf 'PUSH BLOCKED: git diff %s...%s failed (exit %s)\n' \
+      printf 'PUSH BLOCKED: git diff %s..%s failed (exit %s)\n' \
         "${MERGE_BASE:0:12}" "${SOURCE_SHA:0:12}" "$DIFF_STATUS"
       printf '  Cannot compute reviewable diff; refusing to pass.\n'
     } >&2
@@ -871,8 +894,9 @@ pr_core_run() {
   # the standalone husky script.
   local PROTECTED_RE='^(src/gateway/middleware/|hooks/|[.]claude/hooks/|src/policy/|[.]github/workflows/)'
 
+  # Two-dot diff (same reason as :863 — three-dot breaks on empty-tree LHS).
   local PROTECTED_HITS PROTECTED_DIFF_STATUS
-  PROTECTED_HITS=$(cd "$REA_ROOT" && git diff --name-status "${MERGE_BASE}...${SOURCE_SHA}" 2>/dev/null)
+  PROTECTED_HITS=$(cd "$REA_ROOT" && git diff --name-status "${MERGE_BASE}..${SOURCE_SHA}" 2>/dev/null)
   PROTECTED_DIFF_STATUS=$?
   if [[ "$PROTECTED_DIFF_STATUS" -ne 0 ]]; then
     {
