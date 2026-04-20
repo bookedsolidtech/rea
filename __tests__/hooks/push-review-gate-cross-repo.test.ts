@@ -38,6 +38,15 @@ async function installHooks(reaDir: string): Promise<void> {
     await fs.copyFile(src, dest);
     await fs.chmod(dest, 0o755);
   }
+  // BUG-008 cleanup (0.7.0): push-review-gate.sh is now a thin adapter that
+  // sources `_lib/push-review-core.sh`. Mirror the installed topology by
+  // copying the core next to the adapter.
+  const libDir = path.join(destDir, '_lib');
+  await fs.mkdir(libDir, { recursive: true });
+  const coreSrc = path.join(REPO_ROOT, 'hooks', '_lib', 'push-review-core.sh');
+  const coreDest = path.join(libDir, 'push-review-core.sh');
+  await fs.copyFile(coreSrc, coreDest);
+  await fs.chmod(coreDest, 0o755);
 }
 
 function installedHookPath(reaDir: string, hookName: string): string {
@@ -465,6 +474,14 @@ describe('push-review-gate.sh — cross-repo guard (0.6.1 regression)', () => {
       sourceHook,
     );
     await fs.chmod(sourceHook, 0o755);
+    // BUG-008 cleanup (0.7.0): adapter sources `_lib/push-review-core.sh`.
+    const sourceLibDir = path.join(sourceDir, '_lib');
+    await fs.mkdir(sourceLibDir, { recursive: true });
+    await fs.copyFile(
+      path.join(REPO_ROOT, 'hooks', '_lib', 'push-review-core.sh'),
+      path.join(sourceLibDir, 'push-review-core.sh'),
+    );
+    await fs.chmod(path.join(sourceLibDir, 'push-review-core.sh'), 0o755);
 
     // Freeze the synthetic rea. If the hook mis-anchors to the filesystem
     // grandparent, it reads the wrong .rea/HALT and never fires.
@@ -503,6 +520,16 @@ describe('push-review-gate.sh — cross-repo guard (0.6.1 regression)', () => {
       strayHook,
     );
     await fs.chmod(strayHook, 0o755);
+    // BUG-008 cleanup (0.7.0): the adapter sources `_lib/push-review-core.sh`
+    // from its own directory; mirror that even for the stray-install case so
+    // the failure path under test is the anchor walk-up (not a missing lib).
+    const strayLibDir = path.join(strayDir, '_lib');
+    await fs.mkdir(strayLibDir, { recursive: true });
+    await fs.copyFile(
+      path.join(REPO_ROOT, 'hooks', '_lib', 'push-review-core.sh'),
+      path.join(strayLibDir, 'push-review-core.sh'),
+    );
+    await fs.chmod(path.join(strayLibDir, 'push-review-core.sh'), 0o755);
 
     const res = spawnSync('bash', [strayHook], {
       cwd: strayDir,

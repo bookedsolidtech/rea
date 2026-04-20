@@ -37,6 +37,14 @@ async function installPushHook(dir: string): Promise<string> {
   const dest = path.join(destDir, 'push-review-gate.sh');
   await fs.copyFile(HOOK_SRC, dest);
   await fs.chmod(dest, 0o755);
+  // BUG-008 cleanup (0.7.0): adapter sources `_lib/push-review-core.sh` —
+  // copy the core next to the adapter to mirror the installed topology.
+  const libDir = path.join(destDir, '_lib');
+  await fs.mkdir(libDir, { recursive: true });
+  const coreSrc = path.join(REPO_ROOT, 'hooks', '_lib', 'push-review-core.sh');
+  const coreDest = path.join(libDir, 'push-review-core.sh');
+  await fs.copyFile(coreSrc, coreDest);
+  await fs.chmod(coreDest, 0o755);
   const policyDir = path.join(dir, '.rea');
   await fs.mkdir(policyDir, { recursive: true });
   const policyPath = path.join(policyDir, 'policy.yaml');
