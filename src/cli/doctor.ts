@@ -265,6 +265,70 @@ function checkSettingsJson(baseDir: string): CheckResult {
   }
 }
 
+/**
+ * Detect whether `baseDir` is a git repository. Returns true for the three
+ * shapes git itself accepts:
+ *
+ *   1. `.git/` is a directory (vanilla repo).
+ *   2. `.git` is a file with `gitdir: <path>` (linked worktree, submodule).
+ *      The target gitdir is resolved and must exist on disk — a stale or
+ *      orphaned gitlink (submodule whose parent moved, worktree whose main
+ *      repo was deleted) is NOT a git repo and must return false, otherwise
+ *      doctor short-circuits the non-git escape hatch and hard-fails on the
+ *      pre-push check against a `.git/hooks/` that doesn't exist (F1 from
+ *      Codex review of 0.5.1).
+ *   3. Anything else (including a plain file a user accidentally named
+ *      `.git`, or a symlink to nowhere) → false.
+ *
+ * Filesystem-shape predicate only. Deliberately does not consult `GIT_DIR`
+ * or shell out to `git rev-parse` — `rea doctor` already checks things
+ * inside `baseDir/.git/hooks/`, so the shape-on-disk is the right question
+ * for the escape hatch. A GIT_DIR-aware secondary signal is a follow-up.
+ *
+ * Security note (F3): removing `.git/` does NOT bypass governance. The
+ * governance artifact is the pre-push hook; a directory with no `.git/`
+ * has no commits to push and no pre-push event to bypass. The escape
+ * hatch is a UX predicate for knowledge repos and non-source directories,
+ * NOT a trust boundary. Do not key security decisions on the return value.
+ */
+export function isGitRepo(baseDir: string): boolean {
+  const dotGit = path.join(baseDir, '.git');
+  let stat: fs.Stats;
+  try {
+    // statSync follows symlinks, so a `.git` symlink to a real gitdir is
+    // treated like the real thing; a dangling symlink throws ENOENT and
+    // falls into the catch → false.
+    stat = fs.statSync(dotGit);
+  } catch {
+    return false;
+  }
+  if (stat.isDirectory()) return true;
+  if (!stat.isFile()) return false;
+  // Gitlink file: `gitdir: <absolute-or-relative-path>`. Read and verify
+  // the target resolves. If the target is missing, git itself would fail
+  // in this directory, so we treat it as non-git.
+  let content: string;
+  try {
+    content = fs.readFileSync(dotGit, 'utf8');
+  } catch {
+    return false;
+  }
+  // `\s*$` on the old shape was inert (greedy `.+` consumed trailing spaces
+  // and `\s ⊂ .`) — the `.trim()` below did all the work. Tighten to
+  // `(\S.*?)` with an explicit trailing-space class so the captured group
+  // starts at the first non-whitespace char and stops before trailing
+  // whitespace. Still handles CRLF, leading tabs, and path-internal spaces.
+  const match = /^gitdir:\s*(\S.*?)[ \t]*\r?$/m.exec(content);
+  const rawTarget = match?.[1];
+  if (rawTarget === undefined) return false;
+  const targetPath = rawTarget;
+  if (targetPath.length === 0) return false;
+  const resolved = path.isAbsolute(targetPath)
+    ? targetPath
+    : path.join(baseDir, targetPath);
+  return fs.existsSync(resolved);
+}
+
 function checkCommitMsgHook(baseDir: string): CheckResult {
   const hookPath = path.join(baseDir, '.git', 'hooks', 'commit-msg');
   if (!fs.existsSync(hookPath)) {
@@ -479,10 +543,24 @@ export function collectChecks(
     checkAgentsPresent(baseDir),
     checkHooksInstalled(baseDir),
     checkSettingsJson(baseDir),
-    checkCommitMsgHook(baseDir),
   ];
-  if (prePushState !== undefined) {
-    checks.push(checkPrePushHook(prePushState));
+
+  // Non-git escape hatch: when `.git/` is absent, both git-hook checks are
+  // meaningless (commit-msg + pre-push can't be invoked without git). Emit
+  // one informational line so `rea doctor` exits 0 in knowledge repos and
+  // other non-source-code directories that consume rea governance.
+  if (isGitRepo(baseDir)) {
+    checks.push(checkCommitMsgHook(baseDir));
+    if (prePushState !== undefined) {
+      checks.push(checkPrePushHook(prePushState));
+    }
+  } else {
+    checks.push({
+      label: 'git hooks',
+      status: 'info',
+      detail:
+        'no `.git/` at baseDir — commit-msg / pre-push checks skipped (not a git repo)',
+    });
   }
 
   if (codexRequiredFromPolicy(baseDir)) {
