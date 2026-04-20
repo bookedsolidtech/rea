@@ -66,15 +66,22 @@ jobs:
       # BUG-013 defense-in-depth: deterministic rebuild immediately before publish.
       # 0.6.1 shipped with dist/ byte-identical to 0.6.0 because CI never enforced
       # a fresh build from the shipping commit. This step removes dist/, rebuilds,
-      # and records a SHA-256 digest of the full dist/ tree to .rea-dist-hash so
-      # the post-publish verify step can compare against what we built here.
+      # and records a SHA-256 digest of the full dist/ tree to
+      # $RUNNER_TEMP/rea-dist-hash so the post-publish verify step can compare
+      # against what we built here.
+      #
+      # The hash file lives in $RUNNER_TEMP (CI scratch space), NOT the repo
+      # root — changesets/action runs `git add .` when it creates/updates the
+      # Version Packages PR, so any sentinel written to the workspace would
+      # end up committed to the release PR. Writing to $RUNNER_TEMP keeps
+      # the release tree clean.
       - name: Rebuild dist/ from HEAD before publish
         run: |
           rm -rf dist
           pnpm build
-          find dist -type f -print0 | sort -z | xargs -0 shasum -a 256 | shasum -a 256 > .rea-dist-hash
+          find dist -type f -print0 | sort -z | xargs -0 shasum -a 256 | shasum -a 256 > "$RUNNER_TEMP/rea-dist-hash"
           echo "[release] CI-built dist/ hash:"
-          cat .rea-dist-hash
+          cat "$RUNNER_TEMP/rea-dist-hash"
 
       - name: Create release PR or publish
         id: changesets
@@ -121,7 +128,7 @@ jobs:
           mkdir -p extract
           tar -xzf "$TARBALL" -C extract
           PUBLISHED_HASH="$(cd extract/package && find dist -type f -print0 | sort -z | xargs -0 shasum -a 256 | shasum -a 256 | awk '{print $1}')"
-          LOCAL_HASH="$(awk '{print $1}' "$GITHUB_WORKSPACE/.rea-dist-hash")"
+          LOCAL_HASH="$(awk '{print $1}' "$RUNNER_TEMP/rea-dist-hash")"
           echo "[release] published dist/ hash: $PUBLISHED_HASH"
           echo "[release] CI-built  dist/ hash: $LOCAL_HASH"
           if [ "$PUBLISHED_HASH" != "$LOCAL_HASH" ]; then

@@ -183,6 +183,16 @@ export class DownstreamConnection {
     return this.#lastErrorBacking;
   }
   set #lastErrorMessage(msg: string | null) {
+    if (msg !== null && typeof msg !== 'string') {
+      // BUG-014 defense-in-depth: the TS type gate is strict, but a future
+      // refactor (or an `as unknown as string` cast) could slip a non-string
+      // through. `boundedDiagnosticString` calls `.length` / `.slice` on the
+      // input — a non-string would throw or silently corrupt the field. Fail
+      // loud instead.
+      throw new TypeError(
+        `DownstreamConnection#lastErrorMessage: expected string | null, got ${typeof msg}`,
+      );
+    }
     this.#lastErrorBacking =
       msg === null ? null : boundedDiagnosticString(msg);
   }
@@ -228,21 +238,6 @@ export class DownstreamConnection {
     const raw = this.#lastErrorMessage;
     if (raw === null) return null;
     return boundedDiagnosticString(raw);
-  }
-
-  /**
-   * Test-only seam: seed `#lastErrorMessage` via the bounded setter so
-   * regression tests can assert "clear-on-success" semantics without having
-   * to stage a real transport failure episode. Routes through the setter
-   * (not the backing field) so the BUG-014 structural bound still applies —
-   * calling this with a 10MB string still yields a truncated stored value.
-   *
-   * Do NOT call this outside `*.test.ts`. If product code wants to set
-   * lastError, use the assignment sites inside `connect` / `callTool` — they
-   * already go through the bounded setter.
-   */
-  _testOnly_seedLastError(msg: string | null): void {
-    this.#lastErrorMessage = msg;
   }
 
   async connect(): Promise<void> {

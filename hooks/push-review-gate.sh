@@ -449,19 +449,51 @@ if [[ -n "${REA_SKIP_CODEX_REVIEW:-}" && "$CODEX_REQUIRED" == "true" ]]; then
     exit 2
   fi
 
-  # Best-effort metadata: we haven't run ref-resolution yet, so HEAD SHA is
-  # the closest proxy for "what is being pushed". files_changed is computed
-  # from the last commit (HEAD~1..HEAD) — if that fails, we emit 0 rather
-  # than fail the skip (the operator already committed to the bypass).
-  SKIP_HEAD=$(cd "$REA_ROOT" && git rev-parse HEAD 2>/dev/null || echo "")
-  SKIP_UPSTREAM=$(cd "$REA_ROOT" && git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null || echo "")
-  SKIP_TARGET="main"
-  if [[ -n "$SKIP_UPSTREAM" && "$SKIP_UPSTREAM" == */* ]]; then
-    SKIP_TARGET="${SKIP_UPSTREAM#*/}"
-  fi
-  SKIP_FILES_CHANGED=$(cd "$REA_ROOT" && git diff --name-only HEAD~1..HEAD 2>/dev/null | awk 'NF { n++ } END { print n+0 }' 2>/dev/null || echo "0")
-  if [[ -z "$SKIP_FILES_CHANGED" ]]; then
-    SKIP_FILES_CHANGED=0
+  # Metadata source of truth: the pre-push stdin contract
+  # (`<local_ref> <local_sha> <remote_ref> <remote_sha>`, one line per
+  # refspec). Parse the FIRST well-formed refspec line from the captured
+  # INPUT so the skip audit record describes the actual push, not the
+  # checkout that happened to be active. This matters for forensics: a
+  # skip receipt that names an unrelated local HEAD makes the audit trail
+  # misleading when someone later correlates against pushed commits.
+  #
+  # We intentionally do NOT call `git rev-parse <remote_sha>` to compute a
+  # files_changed count here — the whole reason this skip runs before
+  # ref-resolution is that the remote SHA may be unresolvable (stale
+  # checkout, pruned remote ref). Record files_changed as JSON null rather
+  # than a local proxy that lies about the push window.
+  SKIP_HEAD=""
+  SKIP_TARGET=""
+  SKIP_SOURCE=""   # "prepush-stdin" when parsed from stdin, "local-fallback" otherwise.
+
+  # Parse first valid refspec line from stdin. Accept lines with exactly 4
+  # whitespace-separated fields where field 2 (local_sha) is 40 hex chars.
+  # `read -r` consumes one line at a time; we take the first match and stop.
+  while IFS= read -r __line; do
+    # shellcheck disable=SC2034  # field-splitting into named vars is the intent
+    read -r __lref __lsha __rref __rsha __rest <<< "$__line"
+    if [[ -z "$__rest" && "$__lsha" =~ ^[0-9a-f]{40}$ && -n "$__rref" ]]; then
+      SKIP_HEAD="$__lsha"
+      # Strip `refs/heads/` prefix if present so target reads naturally.
+      SKIP_TARGET="${__rref#refs/heads/}"
+      SKIP_SOURCE="prepush-stdin"
+      break
+    fi
+  done <<< "$INPUT"
+  unset __line __lref __lsha __rref __rsha __rest
+
+  # Fallback: hook invoked outside a real `git push` (manual test, PreToolUse
+  # Bash wrapper where stdin carries the tool_input JSON). Record HEAD so the
+  # audit receipt is still actionable, but tag it so auditors know the metadata
+  # is a local proxy rather than the authoritative push refspec.
+  if [[ -z "$SKIP_HEAD" ]]; then
+    SKIP_HEAD=$(cd "$REA_ROOT" && git rev-parse HEAD 2>/dev/null || echo "")
+    SKIP_UPSTREAM=$(cd "$REA_ROOT" && git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null || echo "")
+    SKIP_TARGET="main"
+    if [[ -n "$SKIP_UPSTREAM" && "$SKIP_UPSTREAM" == */* ]]; then
+      SKIP_TARGET="${SKIP_UPSTREAM#*/}"
+    fi
+    SKIP_SOURCE="local-fallback"
   fi
 
   SKIP_METADATA=$(jq -n \
@@ -469,14 +501,15 @@ if [[ -n "${REA_SKIP_CODEX_REVIEW:-}" && "$CODEX_REQUIRED" == "true" ]]; then
     --arg target "$SKIP_TARGET" \
     --arg reason "$SKIP_REASON" \
     --arg actor "$SKIP_ACTOR" \
-    --argjson files_changed "$SKIP_FILES_CHANGED" \
+    --arg source "$SKIP_SOURCE" \
     '{
       head_sha: $head_sha,
       target: $target,
       reason: $reason,
       actor: $actor,
       verdict: "skipped",
-      files_changed: $files_changed
+      files_changed: null,
+      metadata_source: $source
     }' 2>/dev/null)
 
   if [[ -z "$SKIP_METADATA" ]]; then

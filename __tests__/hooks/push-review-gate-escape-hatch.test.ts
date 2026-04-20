@@ -269,8 +269,16 @@ describe('push-review-gate.sh — REA_SKIP_CODEX_REVIEW escape hatch', () => {
     expect(meta['reason']).toBe('codex-rate-limited-ci-burst');
     expect(meta['actor']).toBe('skipper@example.test');
     expect(meta['verdict']).toBe('skipped');
-    expect(typeof meta['files_changed']).toBe('number');
-    expect(meta['files_changed']).toBeGreaterThan(0);
+    // files_changed is intentionally null for skip records — we bypass
+    // ref-resolution (that's the whole point), so there's no authoritative
+    // push window to count against. Recording a local proxy here would
+    // mislead auditors correlating skips to actual pushed commits.
+    expect(meta['files_changed']).toBeNull();
+    // metadata_source documents whether head_sha/target came from the
+    // pre-push stdin contract (authoritative) or a local HEAD fallback
+    // (PreToolUse Bash-wrapper invocation — stdin carries tool_input JSON,
+    // not refspec lines).
+    expect(['prepush-stdin', 'local-fallback']).toContain(meta['metadata_source']);
   });
 
   it('reason is literally the env-var value (no default)', async () => {
@@ -403,6 +411,65 @@ describe('push-review-gate.sh — REA_SKIP_CODEX_REVIEW escape hatch', () => {
     const meta = skip!['metadata'] as Record<string, unknown>;
     expect(meta['reason']).toBe('stale-checkout-unblock');
     expect(meta['verdict']).toBe('skipped');
+
+    // Finding #1 regression: skip metadata must describe the PUSH, not the
+    // checkout. head_sha must equal the local_sha from the pre-push stdin
+    // (here repo.headSha — same value, but derived via stdin parsing, not
+    // `git rev-parse HEAD` fallback), and target must equal the remote_ref
+    // minus `refs/heads/`. Source tag = "prepush-stdin" proves we parsed
+    // the stdin rather than falling back to local HEAD.
+    expect(meta['head_sha']).toBe(repo.headSha);
+    expect(meta['target']).toBe('main');
+    expect(meta['metadata_source']).toBe('prepush-stdin');
+    expect(meta['files_changed']).toBeNull();
+  });
+
+  it('Finding #1 regression: skip metadata reflects the pushed ref, not the checkout', async () => {
+    if (!jqExists()) return;
+
+    const repo = await makeScratchRepo({
+      userEmail: 'hotfix@example.test',
+      userName: 'Hotfix Operator',
+    });
+    dists.push(repo.dir);
+
+    // Simulate `git push origin hotfix:release/2026-q2` from a `feature`
+    // checkout. The checkout's HEAD is repo.headSha ("feature" branch), but
+    // the pushed commit is a DIFFERENT SHA — we stand in a fake one that
+    // wouldn't resolve locally (the whole point: the skip records what the
+    // push claims, not what the working tree has).
+    const PUSHED_SHA = 'cafebabecafebabecafebabecafebabecafebabe';
+    const REMOTE_SHA = '1234567812345678123456781234567812345678';
+    const prepushStdin = `refs/heads/hotfix ${PUSHED_SHA} refs/heads/release/2026-q2 ${REMOTE_SHA}\n`;
+
+    const res = spawnSync('bash', [installedHookPath(repo.dir), 'origin'], {
+      cwd: repo.dir,
+      env: {
+        REA_SKIP_CODEX_REVIEW: 'verified-by-other-channel',
+        PATH: process.env.PATH ?? '',
+        CLAUDE_PROJECT_DIR: repo.dir,
+      },
+      input: prepushStdin,
+      encoding: 'utf8',
+    });
+
+    expect(res.status).toBe(0);
+
+    const lines = await readAuditLines(repo.dir);
+    const skip = lines.find((r) => r['tool_name'] === 'codex.review.skipped');
+    expect(skip).toBeDefined();
+    const meta = skip!['metadata'] as Record<string, unknown>;
+
+    // The key assertion: head_sha is the LOCAL_SHA from pre-push stdin
+    // (the "what is actually being pushed" SHA), NOT repo.headSha (the
+    // working-tree HEAD, which would be misleading in a push-from-other-ref
+    // scenario).
+    expect(meta['head_sha']).toBe(PUSHED_SHA);
+    expect(meta['head_sha']).not.toBe(repo.headSha);
+    // target is the remote_ref with refs/heads/ stripped — so release/2026-q2
+    // (not "main" and not the upstream of the current branch).
+    expect(meta['target']).toBe('release/2026-q2');
+    expect(meta['metadata_source']).toBe('prepush-stdin');
   });
 
   it('leaves the gate alone when REA_SKIP_CODEX_REVIEW is set to empty string', async () => {
