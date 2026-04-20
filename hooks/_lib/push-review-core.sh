@@ -787,23 +787,104 @@ pr_core_run() {
       fi
       if [[ -n "$default_ref" ]]; then
         mb=$(cd "$REA_ROOT" && git merge-base "$default_ref" "$local_sha" 2>/dev/null || echo "")
+        if [[ -z "$mb" ]]; then
+          # default_ref resolved but merge-base came back empty (unrelated
+          # histories, grafted branch, or transient git failure). Mirror the
+          # `.husky/pre-push` fix in 701b631 by falling through to the
+          # empty-tree baseline rather than silently `continue`-ing (the
+          # pre-pass-4 behavior). `continue` here combined with the
+          # longest-diff selection below let a protected-path refspec with
+          # an empty merge-base silently bypass the gate whenever another
+          # refspec in the same push was selected as BEST. Flagged HIGH by
+          # Codex pass-4 finding #1.
+          mb='4b825dc642cb6eb9a060e54bf8d69288fbee4904'
+        fi
       else
         # Bootstrap: no remote-tracking ref resolved. Use the well-known
         # empty-tree SHA as the merge-base baseline so the per-refspec diff
-        # covers the full push content and the protected-path selection
-        # below still runs. Prior behavior silently `continue`d here, which
-        # — combined with the longest-diff selection accumulator at
-        # :807-812 — let a bootstrap protected-path refspec bypass the gate
+        # covers the full push content and the per-refspec protected-path
+        # check below still runs. Prior behavior silently `continue`d here,
+        # which — combined with the longest-diff selection accumulator at
+        # :822-828 — let a bootstrap protected-path refspec bypass the gate
         # whenever a second, well-anchored refspec in the same push was
-        # selected as BEST instead. Flagged as HIGH parity gap vs the
-        # .husky/pre-push fix in 701b631 by Codex pass-3. `git diff` accepts
-        # a tree SHA as LHS, so :838 `git diff "$MERGE_BASE...$SOURCE_SHA"`
-        # works transparently with this baseline.
+        # selected as BEST instead. Flagged HIGH by Codex pass-3 and fixed
+        # for the `.husky/pre-push` side in 701b631. `git diff` accepts a
+        # tree SHA as LHS, so :861 `git diff "${MERGE_BASE}..${SOURCE_SHA}"`
+        # (two-dot is required — three-dot would compute an implicit
+        # merge-base with the tree on LHS and fail) works transparently
+        # with this baseline.
         mb='4b825dc642cb6eb9a060e54bf8d69288fbee4904'
       fi
     fi
     if [[ -z "$mb" ]]; then
       continue
+    fi
+
+    # Per-refspec protected-path check (Codex pass-4 finding #2). The
+    # BEST_COUNT accumulator below selects a single winning refspec for
+    # the general push-review gate, but the protected-path Codex audit
+    # requirement must run on EVERY refspec — otherwise a multi-refspec
+    # push like `git push origin big-feature:big-feature hotfix:main` can
+    # hide a small protected-path refspec behind a larger, non-protected
+    # one (husky's per-refspec loop at .husky/pre-push:89-175 blocks this
+    # case; pre-pass-4 shared core did not).
+    if [[ "$CODEX_REQUIRED" == "true" ]]; then
+      local _refspec_hits _refspec_diff_status
+      _refspec_hits=$(cd "$REA_ROOT" && git diff --name-status "${mb}..${local_sha}" 2>/dev/null)
+      _refspec_diff_status=$?
+      if [[ "$_refspec_diff_status" -ne 0 ]]; then
+        {
+          printf 'PUSH BLOCKED: git diff --name-status %s..%s failed (exit %s)\n' \
+            "${mb:0:12}" "${local_sha:0:12}" "$_refspec_diff_status"
+          printf '  Refspec: %s\n' "${local_ref:-<unknown>}"
+          printf '  Cannot determine whether protected paths changed; refusing to pass.\n'
+        } >&2
+        exit 2
+      fi
+      if printf '%s\n' "$_refspec_hits" | awk -v re='^(src/gateway/middleware/|hooks/|[.]claude/hooks/|src/policy/|[.]github/workflows/)' '
+          {
+            status = $1
+            if (status !~ /^[ACDMRTU]/) next
+            for (i = 2; i <= NF; i++) {
+              if ($i ~ re) { found = 1; next }
+            }
+          }
+          END { exit found ? 0 : 1 }
+        '; then
+        local _audit="${REA_ROOT}/.rea/audit.jsonl"
+        local _codex_ok=0
+        if [[ -f "$_audit" ]]; then
+          if jq -e --arg sha "$local_sha" '
+              select(
+                .tool_name == "codex.review"
+                and .metadata.head_sha == $sha
+                and (.metadata.verdict == "pass" or .metadata.verdict == "concerns")
+              )
+            ' "$_audit" >/dev/null 2>&1; then
+            _codex_ok=1
+          fi
+        fi
+        if [[ "$_codex_ok" -eq 0 ]]; then
+          {
+            printf 'PUSH BLOCKED: protected paths changed — /codex-review required for %s\n' "$local_sha"
+            printf '\n'
+            printf '  Source ref: %s\n' "${local_ref:-<unknown>}"
+            printf '  Diff touches one of:\n'
+            printf '    - src/gateway/middleware/\n'
+            printf '    - hooks/\n'
+            printf '    - .claude/hooks/\n'
+            printf '    - src/policy/\n'
+            printf '    - .github/workflows/\n'
+            printf '\n'
+            printf '  Run /codex-review against %s, then retry the push.\n' "$local_sha"
+            printf '  The codex-adversarial agent emits the required audit entry.\n'
+            # shellcheck disable=SC2016  # backticks are literal markdown in user-facing message
+            printf '  Only `pass` or `concerns` verdicts satisfy this gate.\n'
+            printf '\n'
+          } >&2
+          exit 2
+        fi
+      fi
     fi
 
     count=$(cd "$REA_ROOT" && git rev-list --count "${mb}..${local_sha}" 2>/dev/null)
@@ -877,82 +958,12 @@ pr_core_run() {
   LINE_COUNT=$(printf '%s' "$DIFF_FULL" | grep -cE '^\+[^+]|^-[^-]' 2>/dev/null || echo "0")
 
   # ── 7a. Protected-path Codex adversarial review gate ──────────────────────
-  # If the diff touches governance-critical directories, require a
-  # codex.review audit entry for the current HEAD.
-  #
-  # Anchor every alternative with `^` so a legitimate file like
-  # `docs/hooks-guide.md`, `src/thirdparty/src/policy/loader.c`, or — most
-  # relevantly — `__tests__/hooks/*.test.ts` is not mistaken for a
-  # protected path.
-  #
-  # [.]github / [.]claude instead of \.github / \.claude: GNU awk warns
-  # on `\.` inside an ERE.
-  #
-  # `.claude/hooks/` matches `.husky/pre-push` PROTECTED_RE so a consumer
-  # editing their own installed copies of the shipped hooks cannot sneak
-  # past the gate. Without this, the shared core had a protection gap vs.
-  # the standalone husky script.
-  local PROTECTED_RE='^(src/gateway/middleware/|hooks/|[.]claude/hooks/|src/policy/|[.]github/workflows/)'
-
-  # Two-dot diff (same reason as :863 — three-dot breaks on empty-tree LHS).
-  local PROTECTED_HITS PROTECTED_DIFF_STATUS
-  PROTECTED_HITS=$(cd "$REA_ROOT" && git diff --name-status "${MERGE_BASE}..${SOURCE_SHA}" 2>/dev/null)
-  PROTECTED_DIFF_STATUS=$?
-  if [[ "$PROTECTED_DIFF_STATUS" -ne 0 ]]; then
-    {
-      printf 'PUSH BLOCKED: git diff --name-status failed (exit %s)\n' "$PROTECTED_DIFF_STATUS"
-      printf '  Base: %s\n' "$MERGE_BASE"
-      printf '  Cannot determine whether protected paths changed; refusing to pass.\n'
-    } >&2
-    exit 2
-  fi
-
-  if [[ "$CODEX_REQUIRED" == "true" ]] && printf '%s\n' "$PROTECTED_HITS" | awk -v re="$PROTECTED_RE" '
-      {
-        status = $1
-        if (status !~ /^[ACDMRTU]/) next
-        for (i = 2; i <= NF; i++) {
-          if ($i ~ re) { found = 1; next }
-        }
-      }
-      END { exit found ? 0 : 1 }
-    '; then
-    local REVIEW_SHA="$SOURCE_SHA"
-
-    local AUDIT="${REA_ROOT}/.rea/audit.jsonl"
-    local CODEX_OK=0
-    if [[ -f "$AUDIT" ]]; then
-      if jq -e --arg sha "$REVIEW_SHA" '
-          select(
-            .tool_name == "codex.review"
-            and .metadata.head_sha == $sha
-            and (.metadata.verdict == "pass" or .metadata.verdict == "concerns")
-          )
-        ' "$AUDIT" >/dev/null 2>&1; then
-        CODEX_OK=1
-      fi
-    fi
-    if [[ "$CODEX_OK" -eq 0 ]]; then
-      {
-        printf 'PUSH BLOCKED: protected paths changed — /codex-review required for %s\n' "$REVIEW_SHA"
-        printf '\n'
-        printf '  Source ref: %s\n' "${SOURCE_REF:-HEAD}"
-        printf '  Diff touches one of:\n'
-        printf '    - src/gateway/middleware/\n'
-        printf '    - hooks/\n'
-        printf '    - .claude/hooks/\n'
-        printf '    - src/policy/\n'
-        printf '    - .github/workflows/\n'
-        printf '\n'
-        printf '  Run /codex-review against %s, then retry the push.\n' "$REVIEW_SHA"
-        printf '  The codex-adversarial agent emits the required audit entry.\n'
-        # shellcheck disable=SC2016  # backticks are literal markdown in user-facing message
-        printf '  Only `pass` or `concerns` verdicts satisfy this gate.\n'
-        printf '\n'
-      } >&2
-      exit 2
-    fi
-  fi
+  # The per-refspec check runs inside the main loop (section 7, above) so
+  # that a multi-refspec push cannot hide a protected-path refspec behind
+  # a larger, non-protected one. See Codex pass-4 finding #2. If any
+  # protected-path refspec lacked a valid Codex audit, the loop already
+  # exited with code 2; reaching this point means every protected-path
+  # refspec was either clean or had an acceptable audit.
 
   # ── 8. Check review cache ─────────────────────────────────────────────────
   local PUSH_SHA
@@ -992,7 +1003,7 @@ pr_core_run() {
     printf '  Scope: %s files changed, %s lines\n' "$FILE_COUNT" "$LINE_COUNT"
     printf '\n'
     printf '  Action required:\n'
-    printf '  1. Spawn a code-reviewer agent to review: git diff %s...%s\n' "$MERGE_BASE" "$SOURCE_SHA"
+    printf '  1. Spawn a code-reviewer agent to review: git diff %s..%s\n' "$MERGE_BASE" "$SOURCE_SHA"
     printf '  2. Spawn a security-engineer agent for security review\n'
     printf '  3. After both pass, cache the result:\n'
     printf '     rea cache set %s pass --branch %s --base %s\n' "$PUSH_SHA" "$CURRENT_BRANCH" "$TARGET_BRANCH"

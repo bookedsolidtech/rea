@@ -646,6 +646,55 @@ describe('push-review-gate-git.sh — native git pre-push adapter (task #50)', (
       expect(res.status).toBe(2);
       expect(res.stderr).toMatch(/protected paths changed/);
     });
+
+    // Codex 0.7.0 pass-4 finding #3 — regression coverage for the shared
+    // core's bootstrap fallback. All three remote-tracking refs absent
+    // (HEAD + main + master) is the permutation fixed by pass-3 via the
+    // empty-tree baseline at hooks/_lib/push-review-core.sh:800-803. The
+    // husky-e2e suite already exercises this through .husky/pre-push, but
+    // the shared-core adapter had no direct regression test — so a future
+    // refactor could silently reintroduce the fail-open for operators
+    // hitting the gate via push-review-gate-git.sh / push-review-gate.sh
+    // and only husky-e2e would catch it.
+    it('origin/HEAD + main + master all missing: empty-tree fallback fires gate (pass-3 regression)', async () => {
+      const repo = await makeRepo();
+      cleanup.push(repo.dir);
+
+      // Strip every remote-tracking ref so neither symbolic-ref nor either
+      // rev-parse probe can resolve a default branch. The shared core must
+      // then fall through to the empty-tree baseline and still run the
+      // protected-path check against the full refspec content.
+      await clearOriginHead(repo.dir);
+      await clearRemoteTrackingRef(repo.dir, 'main');
+      await clearRemoteTrackingRef(repo.dir, 'master');
+
+      const prepushLine = `refs/heads/feature ${repo.featureSha} refs/heads/feature ${ZERO}\n`;
+      const res = spawnSync('bash', [repo.gitHook, 'origin'], {
+        cwd: repo.dir,
+        env: { ...process.env, CLAUDE_PROJECT_DIR: repo.dir },
+        input: prepushLine,
+        encoding: 'utf8',
+      });
+
+      expect(res.status).toBe(2);
+      expect(res.stderr).toMatch(/protected paths changed/);
+
+      // Sanity: the REA_SKIP_CODEX_REVIEW escape hatch still lets the
+      // same push through — proves the block above fired on the
+      // protected-path gate (not a ref-resolution failure earlier). Same
+      // pattern as the husky-e2e bootstrap regression.
+      const bypass = spawnSync('bash', [repo.gitHook, 'origin'], {
+        cwd: repo.dir,
+        env: {
+          ...process.env,
+          CLAUDE_PROJECT_DIR: repo.dir,
+          REA_SKIP_CODEX_REVIEW: 'pass-4-regression-bootstrap',
+        },
+        input: prepushLine,
+        encoding: 'utf8',
+      });
+      expect(bypass.status).toBe(0);
+    });
   });
 
   it('byte+mode parity: hooks/push-review-gate-git.sh matches .claude/hooks/push-review-gate-git.sh', async () => {
