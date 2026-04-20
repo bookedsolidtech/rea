@@ -697,6 +697,48 @@ describe('push-review-gate-git.sh — native git pre-push adapter (task #50)', (
     });
   });
 
+  // Codex 0.7.0 pass-4 finding #2 regression. Before pass-4 the
+  // protected-path check ran once on the BEST_COUNT-selected refspec,
+  // so a multi-refspec push where a SMALL protected-path refspec was
+  // hidden behind a LARGER non-protected one would bypass the gate —
+  // the non-protected refspec's larger diff won BEST_COUNT, and its
+  // clean diff satisfied the single check. Pass-4 moved the protected-
+  // path check inside the per-refspec loop, requiring the Codex audit
+  // entry to match EACH protected refspec's own local_sha. This test
+  // locks in that semantic — if a future refactor moves the check back
+  // outside the loop or accidentally short-circuits after BEST, it will
+  // fail loudly.
+  it('multi-refspec: small protected refspec cannot hide behind a bigger non-protected one (Codex pass-4 finding #2 regression)', async () => {
+    const repo = await makeRepo();
+    cleanup.push(repo.dir);
+
+    // Two refspecs in the same push:
+    //   1. clean-feature → main  (non-protected, touches only README.md)
+    //   2. feature       → main  (protected, touches hooks/)
+    // Pre-pass-4 shared core would pick whichever refspec has the
+    // larger rev-list count as BEST and only check that one; because
+    // the clean refspec is at least as big as the feature refspec
+    // (both descend from main), the BEST selection was non-
+    // deterministic but protected-path coverage could be skipped.
+    // The per-refspec loop now inspects BOTH — the protected-path
+    // refspec's local_sha has no Codex audit, so the gate must fire.
+    const prepushLines =
+      `refs/heads/clean-feature ${repo.cleanFeatureSha} refs/heads/clean ${repo.mainSha}\n` +
+      `refs/heads/feature ${repo.featureSha} refs/heads/main ${repo.mainSha}\n`;
+    const res = spawnSync('bash', [repo.gitHook, 'origin'], {
+      cwd: repo.dir,
+      env: { ...process.env, CLAUDE_PROJECT_DIR: repo.dir },
+      input: prepushLines,
+      encoding: 'utf8',
+    });
+
+    expect(res.status).toBe(2);
+    expect(res.stderr).toMatch(/protected paths changed/);
+    // The block must name the PROTECTED refspec's sha, not the clean
+    // refspec's — proves the per-refspec check caught the right one.
+    expect(res.stderr).toContain(repo.featureSha);
+  });
+
   it('byte+mode parity: hooks/push-review-gate-git.sh matches .claude/hooks/push-review-gate-git.sh', async () => {
     await expectPairParity(
       'hooks/push-review-gate-git.sh',
