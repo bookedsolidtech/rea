@@ -220,6 +220,11 @@ describe('push-review-gate-git.sh — native git pre-push adapter (task #50)', (
         ...process.env,
         CLAUDE_PROJECT_DIR: repo.dir,
         REA_SKIP_PUSH_REVIEW: 'task50-adapter-smoke',
+        // Codex F2: REA_SKIP_PUSH_REVIEW is refused in CI unless the policy
+        // opts in. This test validates the non-CI bypass path, so clear any
+        // inherited CI var from the test runner (GitHub Actions sets CI=true).
+        CI: '',
+        GITHUB_ACTIONS: '',
       },
       input: prepushLine,
       encoding: 'utf8',
@@ -388,7 +393,14 @@ describe('push-review-gate-git.sh — native git pre-push adapter (task #50)', (
       const { viaGit, viaGeneric } = await runBoth(repo, {
         input: prepushLine,
         args: ['origin'],
-        env: { REA_SKIP_PUSH_REVIEW: 'parity-matrix-skip-push' },
+        env: {
+          REA_SKIP_PUSH_REVIEW: 'parity-matrix-skip-push',
+          // Codex F2: clear inherited CI env so the non-CI bypass path runs.
+          // GitHub Actions sets CI=true; without this, the shared core
+          // refuses the skip unless policy opts in via allow_skip_in_ci.
+          CI: '',
+          GITHUB_ACTIONS: '',
+        },
       });
 
       expect(viaGit.status).toBe(viaGeneric.status);
