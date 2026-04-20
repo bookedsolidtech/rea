@@ -164,8 +164,28 @@ export class DownstreamConnection {
    * failure). Surfaced via `__rea__health` so callers can diagnose an empty
    * tool catalog without digging through stderr logs. Set to `null` after a
    * successful connect/reconnect.
+   *
+   * BUG-014 (0.7.0): true ECMAScript private field + private accessor pair.
+   * Every internal write `this.#lastErrorMessage = x` goes through the
+   * setter, which applies `boundedDiagnosticString` at assignment time.
+   * This converts the prior "bound-at-read" invariant (see `get lastError`
+   * below, which was the single chokepoint before 0.7.0) into a structural
+   * property: no matter how many assignment sites exist, every one produces
+   * a bounded string. A future refactor can add new sites without needing
+   * to know the bound exists — the setter enforces it.
+   *
+   * The backing field `#lastErrorBacking` is the raw storage; only the
+   * setter writes to it. External code cannot reach either name because
+   * both are ES-private (`#`), not TS-private.
    */
-  private lastErrorMessage: string | null = null;
+  #lastErrorBacking: string | null = null;
+  get #lastErrorMessage(): string | null {
+    return this.#lastErrorBacking;
+  }
+  set #lastErrorMessage(msg: string | null) {
+    this.#lastErrorBacking =
+      msg === null ? null : boundedDiagnosticString(msg);
+  }
 
   constructor(
     private readonly config: RegistryServer,
@@ -194,17 +214,35 @@ export class DownstreamConnection {
    * Last error observed, or null if the connection has never failed (or fully
    * recovered).
    *
-   * BUG-011 (0.6.2): cap exposure via `boundedDiagnosticString`. An
-   * adversarial downstream MCP can throw `new Error(huge_string)`, and that
-   * raw message flows from `err.message` into `lastErrorMessage` at the
-   * assignment sites below. Bounding here means every consumer of the
-   * getter — the `__rea__health` snapshot, diagnostic logs, future status
-   * dashboards — sees a bounded, UTF-16-safe string. `sanitizeHealthSnapshot`
-   * applies the same cap for defense-in-depth.
+   * BUG-011 (0.6.2) → BUG-014 (0.7.0): cap exposure via
+   * `boundedDiagnosticString`. 0.6.2 applied the bound at *read*, which
+   * meant every assignment site was trusted to eventually flow through
+   * this getter. 0.7.0 moves the bound to the private *setter* above, so
+   * the invariant is structural — every `this.#lastErrorMessage = x` write
+   * is bounded at assignment time regardless of how many assignment sites
+   * exist or where they live. We keep the read-side bound as cheap
+   * defense-in-depth (it's a no-op for already-bounded strings and costs
+   * O(length) in the rare case a buggy subclass seeded the backing field).
    */
   get lastError(): string | null {
-    if (this.lastErrorMessage === null) return null;
-    return boundedDiagnosticString(this.lastErrorMessage);
+    const raw = this.#lastErrorMessage;
+    if (raw === null) return null;
+    return boundedDiagnosticString(raw);
+  }
+
+  /**
+   * Test-only seam: seed `#lastErrorMessage` via the bounded setter so
+   * regression tests can assert "clear-on-success" semantics without having
+   * to stage a real transport failure episode. Routes through the setter
+   * (not the backing field) so the BUG-014 structural bound still applies —
+   * calling this with a 10MB string still yields a truncated stored value.
+   *
+   * Do NOT call this outside `*.test.ts`. If product code wants to set
+   * lastError, use the assignment sites inside `connect` / `callTool` — they
+   * already go through the bounded setter.
+   */
+  _testOnly_seedLastError(msg: string | null): void {
+    this.#lastErrorMessage = msg;
   }
 
   async connect(): Promise<void> {
@@ -227,13 +265,13 @@ export class DownstreamConnection {
     } catch (err) {
       this.health = 'unhealthy';
       const msg = `failed to resolve env for downstream "${this.config.name}": ${err instanceof Error ? err.message : err}`;
-      this.lastErrorMessage = msg;
+      this.#lastErrorMessage = msg;
       throw new Error(msg);
     }
 
     if (built.missing.length > 0) {
       this.health = 'unhealthy';
-      this.lastErrorMessage = `missing env: ${built.missing.join(', ')}`;
+      this.#lastErrorMessage = `missing env: ${built.missing.join(', ')}`;
       // One line per missing var so grep/jq users can find the exact gap.
       // We intentionally do NOT log the env key name's VALUE (there is none —
       // it's unresolved) nor any other env values.
@@ -261,11 +299,11 @@ export class DownstreamConnection {
       await client.connect(transport);
       this.client = client;
       this.health = 'healthy';
-      this.lastErrorMessage = null;
+      this.#lastErrorMessage = null;
     } catch (err) {
       this.health = 'unhealthy';
       const msg = `failed to connect to downstream "${this.config.name}" (${this.config.command}): ${err instanceof Error ? err.message : err}`;
-      this.lastErrorMessage = msg;
+      this.#lastErrorMessage = msg;
       throw new Error(msg);
     }
   }
@@ -293,7 +331,7 @@ export class DownstreamConnection {
       // this, a connection that failed once and then recovered on the very
       // next call (same client, no reconnect) would forever report the old
       // error via `__rea__health`, misleading operators about live state.
-      this.lastErrorMessage = null;
+      this.#lastErrorMessage = null;
       return result;
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -317,7 +355,7 @@ export class DownstreamConnection {
           // stamp the reconnect time so flap-guard can refuse rapid repeats.
           this.reconnectAttempted = false;
           this.lastReconnectAt = Date.now();
-          this.lastErrorMessage = null;
+          this.#lastErrorMessage = null;
           this.logger?.info({
             event: 'downstream.reconnected',
             server_name: this.config.name,
@@ -327,7 +365,7 @@ export class DownstreamConnection {
         } catch (reconnectErr) {
           this.health = 'unhealthy';
           const errMsg = reconnectErr instanceof Error ? reconnectErr.message : String(reconnectErr);
-          this.lastErrorMessage = errMsg;
+          this.#lastErrorMessage = errMsg;
           this.logger?.error({
             event: 'downstream.reconnect_failed',
             server_name: this.config.name,
@@ -340,7 +378,7 @@ export class DownstreamConnection {
         }
       }
       this.health = 'unhealthy';
-      this.lastErrorMessage = message;
+      this.#lastErrorMessage = message;
       this.logger?.error({
         event: 'downstream.call_failed',
         server_name: this.config.name,

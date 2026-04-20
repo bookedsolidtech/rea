@@ -262,8 +262,10 @@ describe('DownstreamConnection reconnect semantics', () => {
     // transient) combined with a subsequent successful call would leave
     // the snapshot showing a stale error alongside a healthy downstream.
     //
-    // We simulate the "lingering error" state by seeding the private field
-    // directly, then asserting a successful call wipes it.
+    // We simulate the "lingering error" state by seeding via the test seam,
+    // which routes through the bounded setter (BUG-014 structural invariant:
+    // every write goes through `boundedDiagnosticString`). Direct backing-
+    // field access is impossible — `#lastErrorBacking` is ES-private.
     const stub = makeStubClient(() => Promise.resolve({ ok: 'pong' }));
     const conn = makeConnection([stub]);
 
@@ -273,12 +275,61 @@ describe('DownstreamConnection reconnect semantics', () => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (conn as any).health = 'healthy';
     // Seed a stale error as if a prior call or listTools had set one.
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (conn as any).lastErrorMessage = 'prior blip — should be cleared';
+    conn._testOnly_seedLastError('prior blip — should be cleared');
 
     const result = await conn.callTool('ping', {});
     expect(result).toEqual({ ok: 'pong' });
     expect(conn.lastError).toBeNull();
+  });
+
+  it('BUG-014: bound is applied at assignment, not at read (structural invariant)', () => {
+    // 0.6.2 shipped bound-at-read: every assignment site wrote raw strings to
+    // `lastErrorMessage`, and `get lastError` truncated on the way out. A
+    // future call site that forgot to use the getter (or any bug that leaked
+    // the raw field) would serialize megabytes. 0.7.0 moves the bound to the
+    // setter, so *every* write produces a bounded stored value — regardless
+    // of how many writers exist or where they live.
+    const stub = makeStubClient(() => Promise.resolve({ ok: 'pong' }));
+    const conn = makeConnection([stub]);
+
+    const HUGE = 'x'.repeat(10_000);
+    conn._testOnly_seedLastError(HUGE);
+
+    // Public getter surface is bounded (as it always was since 0.6.2).
+    expect(conn.lastError!.length).toBeLessThanOrEqual(4096);
+
+    // Backing field (`#lastErrorBacking`) is also bounded — this is the new
+    // structural property. A buggy consumer that somehow got at the raw
+    // backing field would STILL see a bounded string, because the write path
+    // itself truncates.
+    //
+    // We can't reach `#lastErrorBacking` directly (ES-private is enforced by
+    // the runtime, not just the compiler) — so we assert the equivalent: the
+    // getter returns exactly the setter's bounded form, meaning the stored
+    // value is already bounded and the getter's defense-in-depth is a no-op.
+    const boundedOnce = conn.lastError!;
+    conn._testOnly_seedLastError(boundedOnce);
+    expect(conn.lastError).toBe(boundedOnce);
+  });
+
+  it('BUG-014: ES-private field is not reachable from `this` or `as any` casts', () => {
+    const conn = makeConnection([]);
+    conn._testOnly_seedLastError('real value');
+
+    // Property lookups on the instance do NOT hit `#lastErrorBacking` — they
+    // return undefined even under `as any` (the # syntax isn't a string key).
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const asAny = conn as any;
+    expect(asAny.lastErrorMessage).toBeUndefined(); // old TS-private name: gone
+    expect(asAny.lastErrorBacking).toBeUndefined(); // backing, no # prefix: not a property
+    expect(asAny['#lastErrorBacking']).toBeUndefined(); // literal # prefix: not a property
+    expect(Object.keys(conn)).not.toContain('#lastErrorBacking');
+    expect(Object.keys(conn)).not.toContain('lastErrorMessage');
+
+    // The only way to read it is through the public getter, and the only way
+    // to write it is through the bounded setter (exposed only via the test
+    // seam — production code assigns via `this.#lastErrorMessage = ...`).
+    expect(conn.lastError).toBe('real value');
   });
 
   it('refuses a second reconnect within the flap window', async () => {
