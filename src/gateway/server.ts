@@ -37,11 +37,13 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { DownstreamPool, splitPrefixed } from './downstream-pool.js';
 import {
+  boundedDiagnosticString,
   META_HEALTH_TOOL_NAME,
   META_SERVER_NAME,
   META_TOOL_NAME,
   buildHealthSnapshot,
   metaHealthToolDescriptor,
+  sanitizeHealthSnapshot,
 } from './meta/health.js';
 import { appendAuditRecord } from '../audit/append.js';
 import { getPkgVersion } from '../cli/utils.js';
@@ -187,6 +189,12 @@ export function createGateway(opts: GatewayOptions): GatewayHandle {
   const gatewayVersion = getPkgVersion();
   const startedAtMs = Date.now();
 
+  // BUG-011 (0.6.2) — process-lifetime counter of failed audit appends from
+  // the `__rea__health` short-circuit. Exposed on the health snapshot as
+  // `summary.audit_fail_count` so operators can detect the silent-audit-gap
+  // condition without parsing stderr.
+  let healthAuditFailCount = 0;
+
   const server = new Server({ name: 'rea', version: gatewayVersion }, { capabilities: { tools: {} } });
 
   // Build the circuit breaker with observability hooks wired in — state
@@ -224,7 +232,13 @@ export function createGateway(opts: GatewayOptions): GatewayHandle {
     try {
       const contents = await fs.readFile(path.join(baseDir, '.rea', 'HALT'), 'utf8');
       const trimmed = contents.trim();
-      return { halt: true, reason: trimmed.length > 0 ? trimmed : null };
+      // Hard-cap the raw read at the diagnostic string budget before it
+      // enters the snapshot. An oversize HALT file (operator accident or
+      // local attacker) must not cause an O(size) allocation on every
+      // `__rea__health` call. `sanitizeHealthSnapshot` also truncates,
+      // but capping at ingestion keeps the snapshot itself bounded.
+      const bounded = boundedDiagnosticString(trimmed);
+      return { halt: true, reason: bounded.length > 0 ? bounded : null };
     } catch {
       return { halt: false, reason: null };
     }
@@ -284,14 +298,23 @@ export function createGateway(opts: GatewayOptions): GatewayHandle {
     if (prefixed === META_HEALTH_TOOL_NAME) {
       const startMs = Date.now();
       const haltState = await readHalt();
-      const snapshot = buildHealthSnapshot({
+      // Internal snapshot carries the raw diagnostic strings — used by the
+      // audit record below so operators have the full text in the log even
+      // when the MCP response has them stripped/redacted.
+      const internalSnapshot = buildHealthSnapshot({
         gatewayVersion,
         startedAtMs,
         policy,
         downstreams: pool.healthSnapshot(),
         halt: haltState.halt,
         haltReason: haltState.reason,
+        auditFailCount: healthAuditFailCount,
       });
+      // BUG-011 (0.6.2) — sanitize BEFORE serializing to the wire. Strips
+      // `halt_reason` + per-downstream `last_error` by default; when
+      // `gateway.health.expose_diagnostics: true` applies redactSecrets +
+      // injection-scan and replaces any non-clean string with the sentinel.
+      const wireSnapshot = sanitizeHealthSnapshot(internalSnapshot, policy);
       // Best-effort audit append. Failures here must never prevent the
       // caller from getting the health response — that would defeat the
       // whole point of a "works when everything else is broken" tool.
@@ -305,23 +328,44 @@ export function createGateway(opts: GatewayOptions): GatewayHandle {
           session_id: currentSessionId(),
           duration_ms: Date.now() - startMs,
           metadata: {
-            halt: snapshot.gateway.halt,
-            downstreams_registered: snapshot.summary.registered,
-            downstreams_healthy: snapshot.summary.healthy,
+            halt: internalSnapshot.gateway.halt,
+            // BUG-011 (0.6.2) — N-3: the audit log is the authoritative
+            // trusted-operator sink for full diagnostic text. Strings are
+            // already bounded at ingestion (halt-file read + downstream
+            // lastError getter) via `boundedDiagnosticString`, and the
+            // audit file is on local disk with hash-chained append-only
+            // semantics — not LLM-reachable. Log the pre-sanitize strings
+            // here so the `rea doctor` / audit-tail path preserves the
+            // text the MCP wire strips under the default policy.
+            halt_reason: internalSnapshot.gateway.halt_reason,
+            downstreams_registered: internalSnapshot.summary.registered,
+            downstreams_healthy: internalSnapshot.summary.healthy,
+            downstream_errors: internalSnapshot.downstreams
+              .filter((d) => d.last_error !== null)
+              .map((d) => ({ name: d.name, last_error: d.last_error })),
           },
         });
       } catch (err) {
-        logger.warn({
+        // BUG-011 (0.6.2) — elevated from `warn` to `error`. A dropped
+        // meta.health audit entry is an observability gap: the response
+        // still goes out but the record of it is missing, which defeats
+        // the forensic value of the hash chain for that call. Also bump a
+        // process-lifetime counter surfaced on the next snapshot's
+        // `summary.audit_fail_count` so operators can detect the condition
+        // without parsing stderr.
+        healthAuditFailCount += 1;
+        logger.error({
           event: 'meta.health.audit_failed',
           message: 'failed to append audit record for __rea__health; serving response anyway',
           error: err instanceof Error ? err.message : String(err),
+          audit_fail_count: healthAuditFailCount,
         });
       }
       return {
         content: [
           {
             type: 'text' as const,
-            text: JSON.stringify(snapshot, null, 2),
+            text: JSON.stringify(wireSnapshot, null, 2),
           },
         ],
       };

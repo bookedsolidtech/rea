@@ -38,61 +38,108 @@ set -uo pipefail
 INPUT=$(cat)
 
 # ── 1a. Cross-repo guard (must come FIRST — before any rea-scoped check) ──────
-# When CLAUDE_PROJECT_DIR points to the rea repo (the Claude Code session's
-# project directory) but the current working directory is a DIFFERENT
-# repository, this hook is firing for someone else's push. rea's gate only
-# owns pushes from within rea itself — exit 0 so the foreign repo's
-# `git push` proceeds unblocked.
+# BUG-012 (0.6.2) — anchor the install to the SCRIPT'S OWN LOCATION on disk.
+# The hook knows where it lives: installed at `<root>/.claude/hooks/<name>.sh`,
+# so `<root>` is two levels up from `BASH_SOURCE[0]`. No caller-controlled
+# env var participates in the trust decision.
 #
-# MUST run before the jq check and HALT check. Those are rea-scoped concerns:
-# a missing-jq or HALT-frozen state in rea must not block pushes in OTHER
-# repos that merely share a Claude Code session with rea. Fixing that
-# governance-scope leak is half the point of this guard.
+# WHY THIS CHANGED in 0.6.2
+# The 0.6.1 guard read `REA_ROOT="${CLAUDE_PROJECT_DIR:-$(pwd)}"` before the
+# jq/HALT checks. That made `CLAUDE_PROJECT_DIR` a trust boundary: any process
+# that could set it to a foreign path bypassed HALT and every other rea
+# gate. CLAUDE_PROJECT_DIR is documentation/UX — it tells the wrapper which
+# project directory the user opened. It is NOT authentication. Authorization
+# must come from something the caller cannot forge, hence the script-path
+# anchor. See THREAT_MODEL.md § CLAUDE_PROJECT_DIR.
 #
-# Also: without this guard, ref-resolution inside `resolve_argv_refspecs`
-# runs `git rev-parse` inside REA_ROOT for refs that only exist in the
-# foreign repo, which hard-fails with "could not resolve source ref". That
-# failure lands BEFORE REA_SKIP_PUSH_REVIEW / REA_SKIP_CODEX_REVIEW can be
-# checked, so consumers are left with no documented way out. Discovered
-# during the 0.6.0 cross-repo consumer upgrade; fixed in 0.6.1.
+# BEHAVIOR UNDER EACH INSTALL TOPOLOGY
+#   Consumer install:  <consumer>/.claude/hooks/push-review-gate.sh
+#                      → REA_ROOT = <consumer>
+#                      → Guard runs against <consumer>/.rea/policy.yaml.
+#   rea dogfood:       /…/rea/.claude/hooks/push-review-gate.sh
+#                      → REA_ROOT = /…/rea (this repo itself)
+#                      → Guard runs against rea's own policy.yaml.
+#
+# CLAUDE_PROJECT_DIR, if set, is still TREATED AS ADVISORY: if it names a
+# different path, we emit a one-line stderr note and continue with the
+# script-derived REA_ROOT. We never short-circuit based on comparing the
+# env var against the script location — that would re-open the bypass.
 #
 # Repo-identity comparison via shared `--git-common-dir`, NOT path-prefix or
-# `--show-toplevel`. Why common-dir: a linked worktree created by
-# `git worktree add` has a different toplevel (different checkout path) but
-# the SAME repository — shared object DB, shared refs, shared HEAD history.
-# Any `.claude/worktrees/*` checkout of rea IS rea and must run the gate.
-# `--show-toplevel` would falsely flag those worktrees as "foreign" and
-# bypass HALT plus every other gate (Codex R3 finding, 0.6.1).
-#
+# `--show-toplevel`. A linked worktree created by `git worktree add` has a
+# different toplevel but the SAME repository (shared object DB / refs /
+# history). Any worktree of rea IS rea and must run the gate.
 # `--path-format=absolute` (Git ≥ 2.31, March 2021) normalizes the common
 # dir so the same repo's common-dir is equal regardless of which worktree
 # asked. Engines pin Node ≥20 which ships with a recent-enough Git for dev.
 #
-# Falls back to path-prefix when either cwd or REA_ROOT is not a git
-# checkout (the rea 0.5.1 non-git escape-hatch scenario).
-REA_ROOT="${CLAUDE_PROJECT_DIR:-$(pwd)}"
+# BUG-012 fail-closed: when ONE side is a git checkout and the other is not
+# (or the `--git-common-dir` probe errored), we run the gate (treat as
+# same-repo). Fail open on probe failure is what 0.6.1 did and it meant a
+# transient git quirk inside a legitimate rea worktree could bypass HALT.
+# The path-prefix fallback is ONLY used when BOTH sides are non-git — the
+# documented 0.5.1 non-git escape-hatch scenario (`data/`, `figgy`).
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" && pwd -P 2>/dev/null)"
+# Walk up from SCRIPT_DIR looking for `.rea/policy.yaml`. This resolves
+# correctly for every reasonable topology — installed copy at
+# `<root>/.claude/hooks/<name>.sh` (2 up), source-of-truth copy at
+# `<root>/hooks/<name>.sh` (1 up, used when rea dogfoods itself or a
+# developer runs `bash hooks/push-review-gate.sh` to smoke-test), and any
+# future `hooks/_lib/` nesting. A hard-coded `../..` breaks the source-path
+# invocation and silently reads .rea state from the WRONG directory.
+# Cap at 4 levels so a stray hook dropped in the wrong spot fails fast
+# instead of walking to the filesystem root.
+REA_ROOT=""
+_anchor_candidate="$SCRIPT_DIR"
+for _ in 1 2 3 4; do
+  _anchor_candidate="$(cd -- "$_anchor_candidate/.." && pwd -P 2>/dev/null || true)"
+  if [[ -n "$_anchor_candidate" && -f "$_anchor_candidate/.rea/policy.yaml" ]]; then
+    REA_ROOT="$_anchor_candidate"
+    break
+  fi
+done
+if [[ -z "$REA_ROOT" ]]; then
+  printf 'rea-hook: no .rea/policy.yaml found within 4 parents of %s\n' \
+    "$SCRIPT_DIR" >&2
+  printf 'rea-hook:   is this an installed rea hook, or is `.rea/policy.yaml`\n' >&2
+  printf 'rea-hook:   nested more than 4 directories above the hook script?\n' >&2
+  exit 2
+fi
+unset _anchor_candidate
+
+# Advisory-only: warn if the caller set CLAUDE_PROJECT_DIR to a path that
+# does not match the script anchor. Never let the env var override the
+# decision.
 if [[ -n "${CLAUDE_PROJECT_DIR:-}" ]]; then
-  CWD_REAL=$(pwd -P 2>/dev/null || pwd)
-  if REA_REAL=$(cd "$REA_ROOT" 2>/dev/null && pwd -P 2>/dev/null); then
-    CWD_COMMON=$(git -C "$CWD_REAL" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)
-    REA_COMMON=$(git -C "$REA_REAL" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)
-    if [[ -n "$CWD_COMMON" && -n "$REA_COMMON" ]]; then
-      # Both sides are git checkouts. Realpath'd common-dirs match IFF they
-      # point at the same underlying repository (main or linked worktree).
-      CWD_COMMON_REAL=$(cd "$CWD_COMMON" 2>/dev/null && pwd -P 2>/dev/null || echo "$CWD_COMMON")
-      REA_COMMON_REAL=$(cd "$REA_COMMON" 2>/dev/null && pwd -P 2>/dev/null || echo "$REA_COMMON")
-      if [[ "$CWD_COMMON_REAL" != "$REA_COMMON_REAL" ]]; then
-        exit 0
-      fi
-    else
-      # Non-git-repo path: literal quoted expansions — no glob expansion.
-      case "$CWD_REAL/" in
-        "$REA_REAL"/*|"$REA_REAL"/) : ;;  # inside rea — run the gate
-        *) exit 0 ;;                       # outside rea — not our gate
-      esac
-    fi
+  CPD_REAL=$(cd -- "${CLAUDE_PROJECT_DIR}" 2>/dev/null && pwd -P 2>/dev/null || true)
+  if [[ -n "$CPD_REAL" && "$CPD_REAL" != "$REA_ROOT" ]]; then
+    printf 'rea-hook: ignoring CLAUDE_PROJECT_DIR=%s — anchoring to script location %s\n' \
+      "$CLAUDE_PROJECT_DIR" "$REA_ROOT" >&2
   fi
 fi
+
+CWD_REAL=$(pwd -P 2>/dev/null || pwd)
+CWD_COMMON=$(git -C "$CWD_REAL" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)
+REA_COMMON=$(git -C "$REA_ROOT" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)
+if [[ -n "$CWD_COMMON" && -n "$REA_COMMON" ]]; then
+  # Both sides are git checkouts. Realpath'd common-dirs match IFF they
+  # point at the same underlying repository (main or linked worktree).
+  CWD_COMMON_REAL=$(cd "$CWD_COMMON" 2>/dev/null && pwd -P 2>/dev/null || echo "$CWD_COMMON")
+  REA_COMMON_REAL=$(cd "$REA_COMMON" 2>/dev/null && pwd -P 2>/dev/null || echo "$REA_COMMON")
+  if [[ "$CWD_COMMON_REAL" != "$REA_COMMON_REAL" ]]; then
+    exit 0
+  fi
+elif [[ -z "$CWD_COMMON" && -z "$REA_COMMON" ]]; then
+  # Both sides non-git: legitimate 0.5.1 non-git escape-hatch. Fall back to
+  # a literal path-prefix match. Quoted expansions prevent glob expansion.
+  case "$CWD_REAL/" in
+    "$REA_ROOT"/*|"$REA_ROOT"/) : ;;  # inside rea — run the gate
+    *) exit 0 ;;                       # outside rea — not our gate
+  esac
+fi
+# Mixed state (one side git, other not) or either probe failed → fail
+# CLOSED: run the gate. A transient `--git-common-dir` probe failure in a
+# legitimate rea worktree must not silently bypass HALT.
 
 # ── 2. Dependency check ──────────────────────────────────────────────────────
 if ! command -v jq >/dev/null 2>&1; then

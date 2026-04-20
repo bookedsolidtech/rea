@@ -24,7 +24,30 @@ import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 const REPO_ROOT = path.resolve(__dirname, '..', '..');
-const HOOK_PATH = path.join(REPO_ROOT, 'hooks', 'push-review-gate.sh');
+const HOOK_SRC = path.join(REPO_ROOT, 'hooks', 'push-review-gate.sh');
+
+// BUG-012 (0.6.2): hook anchors REA_ROOT via script-on-disk location.
+// Install into `<repoDir>/.claude/hooks/` and invoke from there.
+async function installPushHook(dir: string): Promise<string> {
+  const destDir = path.join(dir, '.claude', 'hooks');
+  await fs.mkdir(destDir, { recursive: true });
+  const dest = path.join(destDir, 'push-review-gate.sh');
+  await fs.copyFile(HOOK_SRC, dest);
+  await fs.chmod(dest, 0o755);
+  const policyDir = path.join(dir, '.rea');
+  await fs.mkdir(policyDir, { recursive: true });
+  const policyPath = path.join(policyDir, 'policy.yaml');
+  try {
+    await fs.access(policyPath);
+  } catch {
+    await fs.writeFile(policyPath, 'profile: minimal\nautonomy_level: L1\n');
+  }
+  return dest;
+}
+
+function installedHookPath(dir: string): string {
+  return path.join(dir, '.claude', 'hooks', 'push-review-gate.sh');
+}
 
 interface ScratchRepo {
   dir: string;
@@ -74,6 +97,8 @@ async function makeRepo(): Promise<ScratchRepo> {
     `${mainSha}\n`,
   );
 
+  await installPushHook(dir);
+
   return { dir, featureSha, mainSha };
 }
 
@@ -105,7 +130,7 @@ describe('push-review-gate.sh — BUG-008 pre-push stdin self-detect', () => {
     //   `<local_ref> <local_sha> <remote_ref> <remote_sha>`
     const prepushLine = `refs/heads/feature ${repo.featureSha} refs/heads/main ${repo.mainSha}\n`;
 
-    const res = spawnSync('bash', [HOOK_PATH, 'origin', 'git@example.test:foo/bar.git'], {
+    const res = spawnSync('bash', [installedHookPath(repo.dir), 'origin', 'git@example.test:foo/bar.git'], {
       cwd: repo.dir,
       env: { ...process.env, CLAUDE_PROJECT_DIR: repo.dir },
       input: prepushLine,
@@ -125,7 +150,7 @@ describe('push-review-gate.sh — BUG-008 pre-push stdin self-detect', () => {
     const repo = await makeRepo();
     cleanup.push(repo.dir);
 
-    const res = spawnSync('bash', [HOOK_PATH], {
+    const res = spawnSync('bash', [installedHookPath(repo.dir)], {
       cwd: repo.dir,
       env: { ...process.env, CLAUDE_PROJECT_DIR: repo.dir },
       input: 'not-a-tool-call\nnot-pre-push-format\n',
@@ -142,7 +167,7 @@ describe('push-review-gate.sh — BUG-008 pre-push stdin self-detect', () => {
     cleanup.push(repo.dir);
 
     const json = JSON.stringify({ tool_input: { command: 'git push origin feature:main' } });
-    const res = spawnSync('bash', [HOOK_PATH], {
+    const res = spawnSync('bash', [installedHookPath(repo.dir)], {
       cwd: repo.dir,
       env: { ...process.env, CLAUDE_PROJECT_DIR: repo.dir },
       input: json,
@@ -160,7 +185,7 @@ describe('push-review-gate.sh — BUG-008 pre-push stdin self-detect', () => {
     cleanup.push(repo.dir);
 
     const json = JSON.stringify({ tool_input: { command: 'ls -la' } });
-    const res = spawnSync('bash', [HOOK_PATH], {
+    const res = spawnSync('bash', [installedHookPath(repo.dir)], {
       cwd: repo.dir,
       env: { ...process.env, CLAUDE_PROJECT_DIR: repo.dir },
       input: json,
@@ -183,7 +208,7 @@ describe('push-review-gate.sh — BUG-008 pre-push stdin self-detect', () => {
     );
 
     const prepushLine = `refs/heads/feature ${repo.featureSha} refs/heads/main ${repo.mainSha}\n`;
-    const res = spawnSync('bash', [HOOK_PATH, 'origin'], {
+    const res = spawnSync('bash', [installedHookPath(repo.dir), 'origin'], {
       cwd: repo.dir,
       env: { ...process.env, CLAUDE_PROJECT_DIR: repo.dir },
       input: prepushLine,

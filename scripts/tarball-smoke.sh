@@ -181,6 +181,121 @@ echo "[smoke]   → $AGENT_COUNT agents, $HOOK_COUNT hooks, $COMMAND_COUNT comma
 echo "[smoke] rea doctor"
 ./node_modules/.bin/rea doctor
 
+# ---------------------------------------------------------------------------
+# BUG-013 — security-claim content gate.
+#
+# If any changeset carries the `[security]` marker, the tarball MUST ship
+# compiled evidence of the claimed fix. The rule:
+#
+#   1. Find every `.changeset/*.md` in the source tree that contains `[security]`
+#   2. Assert AT LEAST ONE `*sanitize*.test.ts` or `*security*.test.ts` exists
+#      under `src/` (a "security-claim" changeset without a matching regression
+#      test is a marketing bullet, not a shipped fix)
+#   3. For every such test file, extract the symbols it imports from the
+#      module under test (named imports from relative paths) and assert each
+#      symbol appears somewhere under `dist/`. Tests are excluded from the
+#      npm build (tsconfig.build.json), so a stale dist/ from a prior release
+#      would not contain the new symbol that the test exercises — this catches
+#      the 0.6.0→0.6.1 byte-identical dist/ regression that motivated BUG-013.
+#
+# Bypass-resistant: the gate keys on the changeset marker, not a flag the
+# release author chooses. Narrow: no-op when no `[security]` changesets exist.
+#
+# Known limits (called out honestly rather than papered over):
+#   - The gate asserts the imported SYMBOLS are present in dist/. It does
+#     NOT assert those symbols are NEW vs. the previous published release.
+#     A test that imports only pre-existing symbols would satisfy the gate
+#     against a stale dist/. The two defense-in-depth layers that close
+#     this gap — `Rebuild dist/ from HEAD before publish` and
+#     `Verify published tarball dist/ matches CI-built dist/` — live in
+#     `.github/workflows/release.yml` (see `.rea/drafts-0.6.2/` for the
+#     pending hand-apply patch). The content gate here catches the
+#     0.6.0→0.6.1 class of regression in the common case; the workflow
+#     hash check catches the adversarial case.
+#   - The gate does not tie a specific changeset to a specific test file.
+#     If a security changeset names BUG-X but the shipping security test
+#     covers BUG-Y, the gate passes. Mitigation is the same: the workflow
+#     hash verification plus human review of the changeset at PR time.
+# ---------------------------------------------------------------------------
+SEC_CHANGESETS="$(grep -l '\[security\]' "$REPO_ROOT"/.changeset/*.md 2>/dev/null || true)"
+if [ -n "$SEC_CHANGESETS" ]; then
+  echo "[smoke] security-claim gate: $(printf '%s\n' "$SEC_CHANGESETS" | wc -l | awk '{print $1}') changeset(s) tagged [security]"
+
+  SEC_SRC_TESTS="$(cd "$REPO_ROOT" && find src -type f \( -name '*sanitize*.test.ts' -o -name '*security*.test.ts' \) 2>/dev/null | sort)"
+  if [ -z "$SEC_SRC_TESTS" ]; then
+    echo "[smoke] FAIL — [security] changeset present but no *sanitize*.test.ts or *security*.test.ts under src/" >&2
+    echo "[smoke]        a security-claim changeset with no matching regression test is a trust violation" >&2
+    exit 2
+  fi
+
+  # For each security test, collect the named imports pulled from relative
+  # paths — those are the symbols under test and must be compiled into dist/.
+  # Example line we want to match:
+  #   import { sanitizeHealthSnapshot, INJECTION_REDACTED_PLACEHOLDER } from './health';
+  # We ignore imports from bare package names ('vitest', 'node:fs', etc.).
+  MISSING_SYMBOLS=""
+  SYMBOL_COUNT=0
+  while IFS= read -r src_test; do
+    [ -z "$src_test" ] && continue
+    # Collect named imports from relative-path sources using perl for a
+    # multi-line regex. Output: one symbol per line.
+    # We intentionally skip:
+    #   - `import type { ... }`      — entire clause is type-only
+    #   - `{ ..., type Foo, ... }`   — inline type-only marker on a member
+    # TypeScript erases both at compile time, so asserting them against dist/
+    # would false-positive. Also skip `as` aliases (the aliased symbol is a
+    # local rebind, not the exported one we want to grep).
+    SYMBOLS="$(perl -0777 -ne '
+      while (/import(\s+type)?\s*\{([^}]+)\}\s*from\s*[\x27"](\.[^\x27"]+)[\x27"]/sg) {
+        next if $1;  # whole clause is `import type { ... }` — skip
+        my $group = $2;
+        $group =~ s/\s+/ /g;
+        for my $sym (split /,/, $group) {
+          $sym =~ s/^\s+|\s+$//g;
+          next if $sym =~ /^type\s+/;  # inline `type Foo` — skip
+          $sym =~ s/\s+as\s+\w+$//;
+          next unless $sym =~ /^\w+$/;
+          print "$sym\n";
+        }
+      }
+    ' "$REPO_ROOT/$src_test" | sort -u)"
+
+    while IFS= read -r sym; do
+      [ -z "$sym" ] && continue
+      SYMBOL_COUNT=$((SYMBOL_COUNT + 1))
+      # grep -r across dist/ — if the symbol does not appear anywhere, the
+      # build did not include the fix the test covers.
+      if ! grep -r --include='*.js' -l -F -w "$sym" "$REPO_ROOT/dist" >/dev/null 2>&1; then
+        MISSING_SYMBOLS="$MISSING_SYMBOLS
+  $sym (imported by $src_test)"
+      fi
+    done <<< "$SYMBOLS"
+  done <<< "$SEC_SRC_TESTS"
+
+  if [ -n "$MISSING_SYMBOLS" ]; then
+    echo "[smoke] FAIL — [security] changeset present but symbols under test are MISSING from dist/:" >&2
+    echo "[smoke]        (dist/ may be stale — rebuild before publishing)" >&2
+    printf '%s\n' "$MISSING_SYMBOLS" >&2
+    exit 2
+  fi
+
+  # Codex review blocker #1 (2026-04-20) — a test file written with
+  # namespace/default/dynamic imports, or one that only imports from bare
+  # packages, produces zero symbols to check. Before this guard, the gate
+  # would pass with "0 symbols all present in dist/", re-opening the
+  # byte-identical-dist/ regression that BUG-013 was written to catch.
+  if [ "$SYMBOL_COUNT" -eq 0 ]; then
+    echo "[smoke] FAIL — [security] changeset present but no checkable symbols extracted" >&2
+    echo "[smoke]        one or more src/**/(*sanitize*|*security*).test.ts files must use" >&2
+    echo "[smoke]        the \`import { Named } from './relative'\` shape so the gate can" >&2
+    echo "[smoke]        verify the symbol under test appears in compiled dist/." >&2
+    echo "[smoke]        (namespace/default/dynamic-only imports can't be verified)" >&2
+    exit 2
+  fi
+
+  echo "[smoke]   → $(printf '%s\n' "$SEC_SRC_TESTS" | wc -l | awk '{print $1}') security regression test(s), $SYMBOL_COUNT imported symbol(s) all present in dist/"
+fi
+
 # Verify every declared public export resolves. If the exports map points at a
 # file that didn't ship in `files:`, this is where we catch it.
 echo "[smoke] resolve exports"

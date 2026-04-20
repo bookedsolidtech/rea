@@ -22,8 +22,27 @@ import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 const REPO_ROOT = path.resolve(__dirname, '..', '..');
-const PUSH_HOOK = path.join(REPO_ROOT, 'hooks', 'push-review-gate.sh');
-const COMMIT_HOOK = path.join(REPO_ROOT, 'hooks', 'commit-review-gate.sh');
+const PUSH_HOOK_NAME = 'push-review-gate.sh';
+const COMMIT_HOOK_NAME = 'commit-review-gate.sh';
+
+// BUG-012 (0.6.2): the hooks now anchor REA_ROOT to their own on-disk
+// location (SCRIPT_DIR=`<root>/.claude/hooks/` → REA_ROOT is two levels
+// up). The test harness must mirror the installed topology: copy the hook
+// into `<reaDir>/.claude/hooks/<name>.sh` before invocation.
+async function installHooks(reaDir: string): Promise<void> {
+  const destDir = path.join(reaDir, '.claude', 'hooks');
+  await fs.mkdir(destDir, { recursive: true });
+  for (const name of [PUSH_HOOK_NAME, COMMIT_HOOK_NAME]) {
+    const src = path.join(REPO_ROOT, 'hooks', name);
+    const dest = path.join(destDir, name);
+    await fs.copyFile(src, dest);
+    await fs.chmod(dest, 0o755);
+  }
+}
+
+function installedHookPath(reaDir: string, hookName: string): string {
+  return path.join(reaDir, '.claude', 'hooks', hookName);
+}
 
 function git(cwd: string, ...args: string[]): string {
   return execFileSync('git', args, { cwd, encoding: 'utf8' }).trim();
@@ -69,6 +88,7 @@ async function makeTwoRepos(): Promise<TwoRepos> {
   await commitFile(reaDir, 'README.md', '# rea\n', 'rea baseline');
   await fs.mkdir(path.join(reaDir, '.rea'), { recursive: true });
   await fs.writeFile(path.join(reaDir, '.rea', 'policy.yaml'), 'profile: test\n');
+  await installHooks(reaDir);
 
   await initRepo(consumerDir);
   await commitFile(
@@ -89,6 +109,29 @@ async function makeTwoRepos(): Promise<TwoRepos> {
   return { base, reaDir, consumerDir, consumerBranch };
 }
 
+interface NonGitLayout {
+  base: string;
+  reaDir: string;
+  outsideDir: string;
+}
+
+// Both-non-git scenario: neither the script-anchored REA_ROOT nor the cwd
+// is a git repo. This is the documented 0.5.1 path-prefix escape hatch
+// (the ONLY codepath still exercising the fallback after BUG-012).
+async function makeNonGitLayout(): Promise<NonGitLayout> {
+  const base = await fs.realpath(
+    await fs.mkdtemp(path.join(os.tmpdir(), 'rea-cross-repo-')),
+  );
+  const reaDir = path.join(base, 'rea');
+  const outsideDir = path.join(base, 'outside');
+  await fs.mkdir(reaDir, { recursive: true });
+  await fs.mkdir(outsideDir, { recursive: true });
+  await fs.mkdir(path.join(reaDir, '.rea'), { recursive: true });
+  await fs.writeFile(path.join(reaDir, '.rea', 'policy.yaml'), 'profile: test\n');
+  await installHooks(reaDir);
+  return { base, reaDir, outsideDir };
+}
+
 function toolInput(command: string): string {
   return JSON.stringify({ tool_input: { command } });
 }
@@ -99,12 +142,14 @@ function jqExists(): boolean {
 }
 
 function runHook(
-  hook: string,
+  hookName: string,
+  reaDir: string,
   cwd: string,
   claudeProjectDir: string,
   command: string,
 ): { status: number; stdout: string; stderr: string } {
-  const res = spawnSync('bash', [hook], {
+  const hookPath = installedHookPath(reaDir, hookName);
+  const res = spawnSync('bash', [hookPath], {
     cwd,
     env: {
       PATH: process.env.PATH ?? '',
@@ -139,7 +184,8 @@ describe('push-review-gate.sh — cross-repo guard (0.6.1 regression)', () => {
     cleanup.push(base);
 
     const res = runHook(
-      PUSH_HOOK,
+      PUSH_HOOK_NAME,
+      reaDir,
       consumerDir,
       reaDir,
       `git push origin ${consumerBranch}`,
@@ -167,7 +213,8 @@ describe('push-review-gate.sh — cross-repo guard (0.6.1 regression)', () => {
     await commitFile(nested, 'a.txt', 'x\n', 'change');
 
     const res = runHook(
-      PUSH_HOOK,
+      PUSH_HOOK_NAME,
+      reaDir,
       nested,
       reaDir,
       `git push origin ${consumerBranch}`,
@@ -195,7 +242,8 @@ describe('push-review-gate.sh — cross-repo guard (0.6.1 regression)', () => {
     // ref resolver runs inside REA_ROOT and hard-fails with its specific
     // error.
     const res = runHook(
-      PUSH_HOOK,
+      PUSH_HOOK_NAME,
+      reaDir,
       worktree,
       reaDir,
       'git push origin refs/heads/no-such-ref-exists',
@@ -218,7 +266,8 @@ describe('push-review-gate.sh — cross-repo guard (0.6.1 regression)', () => {
     // correctly lets control through (inside rea), step 7 runs and emits
     // its error. That distinguishes guard-fired-wrongly from guard-skipped.
     const res = runHook(
-      PUSH_HOOK,
+      PUSH_HOOK_NAME,
+      reaDir,
       reaDir,
       reaDir,
       'git push origin refs/heads/no-such-ref-exists',
@@ -243,7 +292,8 @@ describe('push-review-gate.sh — cross-repo guard (0.6.1 regression)', () => {
     // if the guard wrongly allows it through — proving same-repo is not
     // short-circuited.
     const res = runHook(
-      PUSH_HOOK,
+      PUSH_HOOK_NAME,
+      reaDir,
       sub,
       reaDir,
       'git push origin refs/heads/no-such-ref-exists',
@@ -263,9 +313,12 @@ describe('push-review-gate.sh — cross-repo guard (0.6.1 regression)', () => {
 
     // CLAUDE_PROJECT_DIR is the symlink; cwd is the consumer repo.
     // `pwd -P` on both sides resolves to realpath — consumer is still a
-    // distinct repo, guard must exit 0.
+    // distinct repo, guard must exit 0. CLAUDE_PROJECT_DIR is advisory
+    // only after BUG-012; the script-dir anchor resolves via realpath too,
+    // so the two paths agree and no advisory warning is emitted.
     const res = runHook(
-      PUSH_HOOK,
+      PUSH_HOOK_NAME,
+      reaDir,
       consumerDir,
       symlink,
       `git push origin ${consumerBranch}`,
@@ -275,20 +328,18 @@ describe('push-review-gate.sh — cross-repo guard (0.6.1 regression)', () => {
     expect(res.stderr).not.toMatch(/could not resolve source ref/i);
   });
 
-  it('path-prefix fallback: non-git-repo cwd with CLAUDE_PROJECT_DIR set', async () => {
+  it('path-prefix fallback: both cwd and REA_ROOT are non-git (both-non-git escape hatch)', async () => {
     if (!jqExists()) return;
-    const { base, reaDir } = await makeTwoRepos();
+    // 0.5.1 documented non-git escape hatch. After BUG-012 (0.6.2) the
+    // fallback fires ONLY when BOTH sides are non-git; mixed state
+    // (one git, one non-git) now fails CLOSED and runs the gate.
+    const { base, reaDir, outsideDir } = await makeNonGitLayout();
     cleanup.push(base);
 
-    // cwd is not a git repo at all (no .git); REA_ROOT is a git repo.
-    // First branch of the guard (both toplevels populated) is skipped;
-    // fall-through path-prefix check applies. cwd is outside rea → exit 0.
-    const notGit = path.join(base, 'not-a-repo');
-    await fs.mkdir(notGit, { recursive: true });
-
     const res = runHook(
-      PUSH_HOOK,
-      notGit,
+      PUSH_HOOK_NAME,
+      reaDir,
+      outsideDir,
       reaDir,
       'git push origin main',
     );
@@ -310,7 +361,8 @@ describe('push-review-gate.sh — cross-repo guard (0.6.1 regression)', () => {
     );
 
     const res = runHook(
-      PUSH_HOOK,
+      PUSH_HOOK_NAME,
+      reaDir,
       consumerDir,
       reaDir,
       `git push origin ${consumerBranch}`,
@@ -332,7 +384,8 @@ describe('push-review-gate.sh — cross-repo guard (0.6.1 regression)', () => {
     );
 
     const res = runHook(
-      PUSH_HOOK,
+      PUSH_HOOK_NAME,
+      reaDir,
       reaDir,
       reaDir,
       'git push origin main',
@@ -341,6 +394,125 @@ describe('push-review-gate.sh — cross-repo guard (0.6.1 regression)', () => {
     // When cwd is rea itself, guard does NOT fire; HALT kicks in.
     expect(res.status).toBe(2);
     expect(res.stderr).toMatch(/REA HALT/);
+  });
+
+  it('BUG-012: foreign CLAUDE_PROJECT_DIR does NOT bypass HALT (script-anchor owns the trust decision)', async () => {
+    // Pre-0.6.2 regression. The 0.6.1 cross-repo guard trusted the
+    // caller-controlled CLAUDE_PROJECT_DIR env var to decide whether to
+    // run. Any process setting it to a foreign path bypassed the guard
+    // and HALT. The 0.6.2 anchor uses the hook's own filesystem location
+    // (SCRIPT_DIR → REA_ROOT two levels up) as the authoritative source;
+    // CLAUDE_PROJECT_DIR is advisory only and cannot widen trust.
+    if (!jqExists()) return;
+    const { base, reaDir } = await makeTwoRepos();
+    cleanup.push(base);
+
+    // Freeze rea. If CLAUDE_PROJECT_DIR were still trusted, the foreign
+    // path below would short-circuit the guard and HALT would never fire.
+    await fs.writeFile(
+      path.join(reaDir, '.rea', 'HALT'),
+      'BUG-012 regression: halted\n',
+    );
+
+    const foreign = path.join(base, 'foreign-attacker');
+    await fs.mkdir(foreign, { recursive: true });
+
+    // cwd = rea itself; CLAUDE_PROJECT_DIR = foreign path. Script anchor
+    // pegs REA_ROOT = reaDir regardless of env.
+    const res = runHook(
+      PUSH_HOOK_NAME,
+      reaDir,
+      reaDir,
+      foreign,
+      'git push origin main',
+    );
+
+    // HALT must still fire — the env var cannot disable it.
+    expect(res.status).toBe(2);
+    expect(res.stderr).toMatch(/REA HALT/);
+    // Advisory warning should surface on stderr to document the ignored env.
+    expect(res.stderr).toMatch(/ignoring CLAUDE_PROJECT_DIR/i);
+  });
+
+  it('Codex blocker: hook invoked from source-of-truth hooks/ path anchors REA_ROOT to repo, not filesystem parent', async () => {
+    // 2026-04-20 adversarial review: the 0.6.2 anchor originally used a
+    // hard-coded `SCRIPT_DIR/../..`. That assumed the INSTALLED topology
+    // (`<root>/.claude/hooks/<name>.sh` → 2 up). For the source-of-truth
+    // `<root>/hooks/<name>.sh` path, `../..` lands at the grandparent of
+    // the rea repo — the HALT check would silently read from the wrong
+    // `.rea/HALT` (or miss it entirely). The walk-up anchor must find the
+    // repo via `.rea/policy.yaml` regardless of whether the script was
+    // invoked from `.claude/hooks/` or the source `hooks/` directory.
+    if (!jqExists()) return;
+    const { base, reaDir } = await makeTwoRepos();
+    cleanup.push(base);
+
+    // Seed .rea/policy.yaml on the synthetic rea root (makeTwoRepos
+    // does not create one by default).
+    await fs.mkdir(path.join(reaDir, '.rea'), { recursive: true });
+    await fs.writeFile(
+      path.join(reaDir, '.rea', 'policy.yaml'),
+      'profile: minimal\nautonomy_level: L1\n',
+    );
+
+    // Mirror the source-of-truth layout inside the synthetic rea root:
+    // <reaDir>/hooks/push-review-gate.sh — one level up, not two.
+    const sourceDir = path.join(reaDir, 'hooks');
+    await fs.mkdir(sourceDir, { recursive: true });
+    const sourceHook = path.join(sourceDir, PUSH_HOOK_NAME);
+    await fs.copyFile(
+      path.join(REPO_ROOT, 'hooks', PUSH_HOOK_NAME),
+      sourceHook,
+    );
+    await fs.chmod(sourceHook, 0o755);
+
+    // Freeze the synthetic rea. If the hook mis-anchors to the filesystem
+    // grandparent, it reads the wrong .rea/HALT and never fires.
+    await fs.writeFile(
+      path.join(reaDir, '.rea', 'HALT'),
+      'source-path anchor regression: halted\n',
+    );
+
+    const res = spawnSync('bash', [sourceHook], {
+      cwd: reaDir,
+      env: { ...process.env, CLAUDE_PROJECT_DIR: reaDir },
+      input: JSON.stringify({ tool_input: { command: 'git push origin main' } }),
+      encoding: 'utf8',
+    });
+
+    // HALT must fire — proves the walk-up anchor found the real REA_ROOT
+    // even though SCRIPT_DIR/../.. would have pointed elsewhere.
+    expect(res.status).toBe(2);
+    expect(res.stderr).toMatch(/REA HALT/);
+  });
+
+  it('Codex blocker: hook invoked from outside any rea install fails closed with a diagnostic', async () => {
+    // No `.rea/policy.yaml` anywhere up the tree — the walk-up finds
+    // nothing, so the hook exits 2 with a clear error. Prevents a
+    // silent HALT-read from the wrong directory when someone drops
+    // the hook somewhere stray.
+    if (!jqExists()) return;
+    const { base } = await makeTwoRepos();
+    cleanup.push(base);
+
+    const strayDir = path.join(base, 'stray', 'hooks');
+    await fs.mkdir(strayDir, { recursive: true });
+    const strayHook = path.join(strayDir, PUSH_HOOK_NAME);
+    await fs.copyFile(
+      path.join(REPO_ROOT, 'hooks', PUSH_HOOK_NAME),
+      strayHook,
+    );
+    await fs.chmod(strayHook, 0o755);
+
+    const res = spawnSync('bash', [strayHook], {
+      cwd: strayDir,
+      env: { ...process.env },
+      input: JSON.stringify({ tool_input: { command: 'git push origin main' } }),
+      encoding: 'utf8',
+    });
+
+    expect(res.status).toBe(2);
+    expect(res.stderr).toMatch(/no \.rea\/policy\.yaml found/);
   });
 
   it('foreign push is NOT blocked when jq is missing (guard runs before jq check)', async () => {
@@ -353,7 +525,9 @@ describe('push-review-gate.sh — cross-repo guard (0.6.1 regression)', () => {
     // guard at step 1a must short-circuit before that.
     const shadowPath = path.join(base, 'shadow-path');
     await fs.mkdir(shadowPath, { recursive: true });
-    for (const bin of ['cat', 'git', 'pwd']) {
+    // `dirname` is invoked by the script-location anchor (BUG-012) before
+    // the jq check runs; `printf` + `cd`/`pwd` are bash builtins.
+    for (const bin of ['cat', 'git', 'pwd', 'dirname']) {
       // `which`-style resolution — try common paths, symlink the first hit.
       for (const root of ['/usr/bin', '/bin', '/usr/local/bin']) {
         try {
@@ -367,7 +541,7 @@ describe('push-review-gate.sh — cross-repo guard (0.6.1 regression)', () => {
     }
 
     // Absolute bash path — the shadow PATH doesn't contain bash itself.
-    const res = spawnSync('/bin/bash', [PUSH_HOOK], {
+    const res = spawnSync('/bin/bash', [installedHookPath(reaDir, PUSH_HOOK_NAME)], {
       cwd: consumerDir,
       env: {
         PATH: shadowPath,
@@ -411,7 +585,8 @@ describe('commit-review-gate.sh — cross-repo guard (0.6.1 mirror)', () => {
     git(consumerDir, 'add', '.claude/settings.json');
 
     const res = runHook(
-      COMMIT_HOOK,
+      COMMIT_HOOK_NAME,
+      reaDir,
       consumerDir,
       reaDir,
       'git commit -m "upgrade rea"',
@@ -437,7 +612,8 @@ describe('commit-review-gate.sh — cross-repo guard (0.6.1 mirror)', () => {
     git(nested, 'add', '.claude/settings.json');
 
     const res = runHook(
-      COMMIT_HOOK,
+      COMMIT_HOOK_NAME,
+      reaDir,
       nested,
       reaDir,
       'git commit -m "x"',
