@@ -41,6 +41,7 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { interpolateEnv } from '../registry/interpolate.js';
 import type { RegistryServer } from '../registry/types.js';
 import type { Logger } from './log.js';
+import { boundedDiagnosticString } from './meta/health.js';
 
 export interface DownstreamToolInfo {
   name: string;
@@ -189,9 +190,21 @@ export class DownstreamConnection {
     return this.client !== null;
   }
 
-  /** Last error observed, or null if the connection has never failed (or fully recovered). */
+  /**
+   * Last error observed, or null if the connection has never failed (or fully
+   * recovered).
+   *
+   * BUG-011 (0.6.2): cap exposure via `boundedDiagnosticString`. An
+   * adversarial downstream MCP can throw `new Error(huge_string)`, and that
+   * raw message flows from `err.message` into `lastErrorMessage` at the
+   * assignment sites below. Bounding here means every consumer of the
+   * getter — the `__rea__health` snapshot, diagnostic logs, future status
+   * dashboards — sees a bounded, UTF-16-safe string. `sanitizeHealthSnapshot`
+   * applies the same cap for defense-in-depth.
+   */
   get lastError(): string | null {
-    return this.lastErrorMessage;
+    if (this.lastErrorMessage === null) return null;
+    return boundedDiagnosticString(this.lastErrorMessage);
   }
 
   async connect(): Promise<void> {

@@ -28,8 +28,31 @@ import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 const REPO_ROOT = path.resolve(__dirname, '..', '..');
-const HOOK_PATH = path.join(REPO_ROOT, 'hooks', 'push-review-gate.sh');
+const HOOK_SRC = path.join(REPO_ROOT, 'hooks', 'push-review-gate.sh');
 const DIST_AUDIT_PATH = path.join(REPO_ROOT, 'dist', 'audit', 'append.js');
+
+// BUG-012 (0.6.2): hook anchors REA_ROOT via script-on-disk location.
+// Install into `<repoDir>/.claude/hooks/` and invoke from there.
+async function installPushHook(dir: string): Promise<string> {
+  const destDir = path.join(dir, '.claude', 'hooks');
+  await fs.mkdir(destDir, { recursive: true });
+  const dest = path.join(destDir, 'push-review-gate.sh');
+  await fs.copyFile(HOOK_SRC, dest);
+  await fs.chmod(dest, 0o755);
+  const policyDir = path.join(dir, '.rea');
+  await fs.mkdir(policyDir, { recursive: true });
+  const policyPath = path.join(policyDir, 'policy.yaml');
+  try {
+    await fs.access(policyPath);
+  } catch {
+    await fs.writeFile(policyPath, 'profile: minimal\nautonomy_level: L1\n');
+  }
+  return dest;
+}
+
+function installedHookPath(dir: string): string {
+  return path.join(dir, '.claude', 'hooks', 'push-review-gate.sh');
+}
 
 function toolInput(command: string): string {
   return JSON.stringify({ tool_input: { command } });
@@ -103,6 +126,8 @@ async function makeScratchRepo(opts: {
     );
   }
 
+  await installPushHook(dir);
+
   return { dir, headSha, mergeBaseSha };
 }
 
@@ -117,7 +142,7 @@ function runHook(
   env: NodeJS.ProcessEnv,
   command = 'git push origin feature:main',
 ): HookResult {
-  const res = spawnSync('bash', [HOOK_PATH], {
+  const res = spawnSync('bash', [installedHookPath(repo.dir)], {
     cwd: repo.dir,
     env: { ...env, CLAUDE_PROJECT_DIR: repo.dir },
     input: toolInput(command),
@@ -455,7 +480,7 @@ describe('push-review-gate.sh — REA_SKIP_PUSH_REVIEW whole-gate escape hatch',
     const prepushLine = `refs/heads/feature ${repo.headSha} refs/heads/main ${repo.mergeBaseSha}\n`;
     const res = spawnSync(
       'bash',
-      [HOOK_PATH, 'origin', 'git@example.test:foo/bar.git'],
+      [installedHookPath(repo.dir), 'origin', 'git@example.test:foo/bar.git'],
       {
         cwd: repo.dir,
         env: {

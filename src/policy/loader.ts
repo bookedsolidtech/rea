@@ -103,6 +103,22 @@ const InjectionPolicySchema = z
   })
   .strict();
 
+/**
+ * BUG-011 (0.6.2) — gateway-level policy. Currently only the `health`
+ * sub-block is defined; kept strict so typos (`gateway.heath`) fail loudly.
+ */
+const GatewayHealthPolicySchema = z
+  .object({
+    expose_diagnostics: z.boolean().optional(),
+  })
+  .strict();
+
+const GatewayPolicySchema = z
+  .object({
+    health: GatewayHealthPolicySchema.optional(),
+  })
+  .strict();
+
 const PolicySchema = z
   .object({
     version: z.string(),
@@ -121,6 +137,7 @@ const PolicySchema = z
     review: ReviewPolicySchema.optional(),
     redact: RedactPolicySchema.optional(),
     audit: AuditPolicySchema.optional(),
+    gateway: GatewayPolicySchema.optional(),
   })
   .strict();
 

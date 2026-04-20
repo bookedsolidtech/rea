@@ -205,7 +205,14 @@ describe('__rea__health through the gateway', () => {
     expect(snap.summary.healthy).toBe(0);
     expect(snap.summary.connected).toBe(0);
     expect(snap.downstreams[0]!.name).toBe('brokencfg');
-    expect(snap.downstreams[0]!.last_error).toMatch(/REA_HEALTH_TEST_MISSING_VAR_XYZ|missing env/);
+    // BUG-011 (0.6.2): last_error is stripped to null by default — the
+    // upstream error string can contain secrets or injection payloads.
+    // Full text still flows to `rea doctor` (reads pool.healthSnapshot()
+    // pre-sanitize) and into the meta-tool audit record
+    // (`metadata.downstream_errors[].last_error`). Opt-in via
+    // `gateway.health.expose_diagnostics: true` to get the redacted string
+    // on the MCP wire itself (covered by health-sanitize.test.ts).
+    expect(snap.downstreams[0]!.last_error).toBeNull();
     // Codex F1 regression: a dead downstream must report tools_count: null,
     // not a stale cached count from some prior successful listing.
     expect(snap.downstreams[0]!.tools_count).toBeNull();
@@ -238,7 +245,11 @@ describe('__rea__health through the gateway', () => {
       gateway: { halt: boolean; halt_reason: string | null };
     };
     expect(snap.gateway.halt).toBe(true);
-    expect(snap.gateway.halt_reason).toBe('snapshot diagnostic');
+    // BUG-011 (0.6.2): halt_reason is stripped to null by default. The
+    // kill-switch bypass behavior (short-circuit still responds under HALT)
+    // is what this test exists to prove — and it does, because
+    // `gateway.halt: true` is still surfaced.
+    expect(snap.gateway.halt_reason).toBeNull();
 
     await client.close();
     await handle.stop();

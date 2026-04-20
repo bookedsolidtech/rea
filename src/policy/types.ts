@@ -134,6 +134,35 @@ export interface InjectionPolicy {
   suspicious_blocks_writes?: boolean;
 }
 
+/**
+ * BUG-011 (0.6.2) — gateway-level policy knobs.
+ *
+ * `health.expose_diagnostics` governs whether `__rea__health` emits
+ * `halt_reason` and per-downstream `last_error` strings in its MCP response
+ * (vs. dropping them to `null`). The short-circuit responds BEFORE the
+ * middleware chain — so it bypasses `redact` and `injection` middleware by
+ * design (the tool must stay callable under HALT). That means downstream
+ * error strings, which are populated verbatim from `err.message`, can carry
+ * secrets or injection payloads all the way to the caller unless we
+ * sanitize in the short-circuit path itself.
+ *
+ * Default `false` (fields emitted as `null`). The Helix team's explicit
+ * preference was "strip, don't redact" — a smaller trust ask than trusting
+ * our secret/injection pattern coverage. Operators who accept that trade-off
+ * (e.g. single-tenant dev boxes) can flip `expose_diagnostics: true`, at
+ * which point the short-circuit applies the same `redactSecrets` +
+ * `classifyInjection` pass the middleware chain would. The full untouched
+ * values always flow into the audit log regardless — diagnostics remain
+ * available via `rea doctor`, just not over the MCP wire.
+ */
+export interface GatewayHealthPolicy {
+  expose_diagnostics?: boolean;
+}
+
+export interface GatewayPolicy {
+  health?: GatewayHealthPolicy;
+}
+
 export interface Policy {
   version: string;
   profile: string;
@@ -151,4 +180,5 @@ export interface Policy {
   review?: ReviewPolicy;
   redact?: RedactPolicy;
   audit?: AuditPolicy;
+  gateway?: GatewayPolicy;
 }
