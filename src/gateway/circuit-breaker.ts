@@ -29,7 +29,14 @@ export interface CircuitStatus {
   retryAt?: string;
 }
 
-interface CircuitEntry {
+/**
+ * Internal per-server circuit state. Exported so observability consumers
+ * (live-state publisher, tests) can read `openedAt` and `cooldownMs` to
+ * compute a `retry_at` timestamp without duplicating the arithmetic.
+ * Treat fields as read-only from outside the breaker — mutating them
+ * breaks the invariants `recordSuccess` / `recordFailure` enforce.
+ */
+export interface CircuitEntry {
   state: CircuitState;
   consecutiveFailures: number;
   openedAt: number | null;

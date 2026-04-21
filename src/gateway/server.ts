@@ -62,11 +62,13 @@ import { executeChain, type InvocationContext, type Middleware } from './middlew
 import { RateLimiter } from './rate-limiter.js';
 import { CircuitBreaker } from './circuit-breaker.js';
 import { currentSessionId } from './session.js';
+import { SessionBlockerTracker, type SessionBlockerEvent } from './session-blocker.js';
+import { LiveStatePublisher } from './live-state.js';
 import type { Registry } from '../registry/types.js';
 import type { Policy } from '../policy/types.js';
 import { InvocationStatus, Tier } from '../policy/types.js';
 import { log } from '../cli/utils.js';
-import { createLogger, type Logger } from './log.js';
+import { createLogger, type FieldRedactor, type Logger } from './log.js';
 import { CIRCUIT_GAUGE, type MetricsRegistry } from './observability/metrics.js';
 
 export interface GatewayOptions {
@@ -86,6 +88,36 @@ export interface GatewayOptions {
    * tests without bringing in the metrics surface.
    */
   metrics?: MetricsRegistry;
+  /**
+   * 0.9.0 — when provided, the gateway attaches a live-state publisher that
+   * rewrites `.rea/serve.state.json` on circuit-breaker and supervisor
+   * events so `rea status --json` can report per-downstream circuit state.
+   * Tests that don't care about the state file simply omit this; the
+   * gateway still tracks circuit state internally for routing decisions.
+   */
+  liveStateFilePath?: string;
+  /**
+   * 0.9.0 — boot-time metadata propagated into `serve.state.json` so
+   * `rea status` can surface them alongside the new downstream block.
+   * Used only when `liveStateFilePath` is supplied.
+   */
+  liveStateSessionId?: string;
+  liveStateStartedAt?: string;
+  liveStateMetricsPort?: number | null;
+  /**
+   * 0.9.0 pass-7 — optional redactor applied to every downstream
+   * `last_error` before it is written into `.rea/serve.state.json`. When
+   * omitted, error strings are persisted verbatim (length-bounded and
+   * control-char-stripped at display time, but CONTENT unredacted).
+   *
+   * `rea serve` wires this to the same pattern set the gateway logger
+   * uses, so a misbehaving downstream that echoes `AWS_SECRET_ACCESS_KEY`
+   * or similar into an error message has the secret replaced with
+   * `[REDACTED]` before it reaches the operator's terminal via
+   * `rea status`. Direct `createGateway` consumers may omit this if they
+   * have their own redaction pipeline or are in a test environment.
+   */
+  liveStateLastErrorRedactor?: FieldRedactor;
 }
 
 export interface GatewayHandle {
@@ -101,6 +133,17 @@ export interface GatewayHandle {
   logger: Logger;
   /** Optional metrics registry (undefined when the caller did not supply one). */
   metrics: MetricsRegistry | undefined;
+  /**
+   * 0.9.0 — exposed for tests + serve.ts shutdown path so the final flush
+   * can be forced before the state file is ownership-cleaned. `null` when
+   * the caller did not provide `liveStateFilePath`.
+   */
+  livePublisher: LiveStatePublisher | null;
+  /**
+   * 0.9.0 — per-session blocker tracker. Exposed so tests can observe
+   * emissions and so a future reload path can reset counters on SIGHUP.
+   */
+  sessionBlocker: SessionBlockerTracker;
 }
 
 /**
@@ -189,6 +232,41 @@ export function createGateway(opts: GatewayOptions): GatewayHandle {
   const gatewayVersion = getPkgVersion();
   const startedAtMs = Date.now();
 
+  // 0.9.0 — SESSION_BLOCKER tracker. One per gateway process. The audit
+  // sink wraps `appendAuditRecord` so a fired record lands in the hash
+  // chain for forensic inspection.
+  const sessionBlocker = new SessionBlockerTracker(
+    currentSessionId(),
+    {},
+    logger,
+    async (event: SessionBlockerEvent) => {
+      try {
+        await appendAuditRecord(baseDir, {
+          tool_name: 'session_blocker',
+          server_name: event.server_name,
+          status: InvocationStatus.Error,
+          tier: Tier.Read,
+          autonomy_level: String(policy.autonomy_level),
+          session_id: event.session_id,
+          duration_ms: 0,
+          metadata: {
+            event: event.event,
+            open_transitions: event.open_transitions,
+            threshold: event.threshold,
+            emitted_at: event.emitted_at,
+          },
+        });
+      } catch (err) {
+        logger.error({
+          event: 'session_blocker.audit_failed',
+          server_name: event.server_name,
+          message: 'failed to append SESSION_BLOCKER audit record — log remains the sole record',
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    },
+  );
+
   // BUG-011 (0.6.2) — process-lifetime counter of failed audit appends from
   // the `__rea__health` short-circuit. Exposed on the health snapshot as
   // `summary.audit_fail_count` so operators can detect the silent-audit-gap
@@ -199,6 +277,9 @@ export function createGateway(opts: GatewayOptions): GatewayHandle {
 
   // Build the circuit breaker with observability hooks wired in — state
   // transitions log a structured record AND update the Prometheus gauge.
+  // 0.9.0: also feed SESSION_BLOCKER tracker and live-state publisher so
+  // `rea status` and the audit chain surface per-session outages.
+  let livePublisher: LiveStatePublisher | null = null;
   const breaker = new CircuitBreaker({
     onStateChange: (event) => {
       const level = event.to === 'open' ? 'warn' : 'info';
@@ -219,10 +300,58 @@ export function createGateway(opts: GatewayOptions): GatewayHandle {
           metrics?.setCircuitState(event.server, CIRCUIT_GAUGE.open);
           break;
       }
+      sessionBlocker.recordCircuitTransition({
+        server: event.server,
+        from: event.from,
+        to: event.to,
+      });
+      livePublisher?.scheduleUpdate();
     },
   });
 
   const staticChain = buildMiddlewareChain(opts, { breaker });
+
+  // Pool supervisor events → live-state publisher. Covers three kinds:
+  //   - `child_died_unexpectedly` — child exited outside a caller-initiated
+  //     close(). Session-blocker counts this indirectly through the breaker
+  //     transition it eventually triggers.
+  //   - `respawned` — successful reconnect. Forwarded to session-blocker as
+  //     an intentional no-op (see `recordRespawn` JSDoc): respawn is NOT
+  //     equivalent to circuit recovery, so we do NOT clear blocker state
+  //     on reconnect. The method exists to make the wiring site obvious
+  //     on the call graph and to give us one place to change if the
+  //     semantics ever shift — but today it deliberately records nothing.
+  //   - `health_changed` — a non-transition mutation of a field surfaced in
+  //     `rea status` (health, last_error, tools_count). Codex 0.9.0 pass-2
+  //     P2a: without this, the first failure below the breaker threshold
+  //     or a successful `listTools` count change never reached the
+  //     publisher, leaving `rea status` showing stale downstream data.
+  // `scheduleUpdate()` is debounced (250 ms default) so storm bursts
+  // coalesce to one write.
+  pool.onSupervisorEvent((event) => {
+    if (event.kind === 'respawned') sessionBlocker.recordRespawn(event.server);
+    livePublisher?.scheduleUpdate();
+  });
+
+  if (opts.liveStateFilePath !== undefined) {
+    // Build options defensively — exactOptionalPropertyTypes refuses
+    // `lastErrorRedactor: undefined` against `lastErrorRedactor?: FieldRedactor`.
+    const publisherOpts = {
+      baseDir,
+      stateFilePath: opts.liveStateFilePath,
+      sessionId: opts.liveStateSessionId ?? currentSessionId(),
+      startedAt: opts.liveStateStartedAt ?? new Date(startedAtMs).toISOString(),
+      metricsPort: opts.liveStateMetricsPort ?? null,
+      pool,
+      breaker,
+      sessionBlocker,
+      logger,
+      ...(opts.liveStateLastErrorRedactor !== undefined
+        ? { lastErrorRedactor: opts.liveStateLastErrorRedactor }
+        : {}),
+    };
+    livePublisher = new LiveStatePublisher(publisherOpts);
+  }
 
   // Read `.rea/HALT` without ever throwing. Returns `{halt, reason}` where
   // `reason` is the (trimmed) file contents or null when the file is absent
@@ -529,12 +658,21 @@ export function createGateway(opts: GatewayOptions): GatewayHandle {
 
     const activeTransport = transport ?? new StdioServerTransport();
     await server.connect(activeTransport as Parameters<typeof server.connect>[0]);
+    // Publish the initial live-state snapshot so `rea status` sees the
+    // `downstreams` block from the first moment the gateway is up, not
+    // only after the first circuit transition.
+    livePublisher?.flushNow();
   }
 
   async function stop(): Promise<void> {
     if (stopping) return;
     stopping = true;
     logger.info({ event: 'gateway.shutdown', message: 'gateway stop requested' });
+    // Final flush BEFORE we drop the publisher so any last-moment transition
+    // (e.g. a circuit closing as pool.close() quiesces it) is reflected on
+    // disk for the very last `rea status` after shutdown.
+    livePublisher?.flushNow();
+    livePublisher?.stop();
     try {
       await server.close();
     } catch {
@@ -543,5 +681,14 @@ export function createGateway(opts: GatewayOptions): GatewayHandle {
     await pool.close();
   }
 
-  return { server, start, stop, pool, logger, metrics };
+  return {
+    server,
+    start,
+    stop,
+    pool,
+    logger,
+    metrics,
+    livePublisher,
+    sessionBlocker,
+  };
 }

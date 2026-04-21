@@ -36,10 +36,18 @@ import {
  * later `rea serve` that has raced in and rewritten the breadcrumbs
  * is never unexpectedly unlinked.
  */
+/**
+ * Serve-state file shape. 0.9.0 added the `downstreams` block; older code
+ * that reads the state file treats a missing `downstreams` as "no live
+ * view available" and falls back to the pre-0.9 fields. `session_id` is
+ * the ownership key used by `cleanupStateIfOwned` during shutdown.
+ */
 interface ServeState {
   session_id: string;
   started_at: string;
   metrics_port: number | null;
+  /** 0.9.0 — populated after the gateway starts; absent on this initial write. */
+  downstreams?: unknown[];
 }
 
 /**
@@ -282,12 +290,31 @@ export async function runServe(): Promise<void> {
     process.exit(1);
   }
 
+  // Metadata we'll also stamp into the state file below so `rea status`
+  // sees the session-id and start time alongside the new downstream block.
+  const startedAt = new Date().toISOString();
+  const statePath = reaPath(baseDir, SERVE_STATE_FILE);
+
   const handle = createGateway({
     baseDir,
     policy,
     registry: gatedRegistry,
     logger,
     metrics: metricsRegistry,
+    // 0.9.0 — let the gateway own live writes to serve.state.json so
+    // circuit-breaker transitions and supervisor events are reflected on
+    // disk for `rea status --json`. Legacy shape (session_id, started_at,
+    // metrics_port) is preserved for backward compatibility.
+    liveStateFilePath: statePath,
+    liveStateSessionId: sessionId,
+    liveStateStartedAt: startedAt,
+    liveStateMetricsPort: metricsServer?.port() ?? null,
+    // 0.9.0 pass-7 — reuse the gateway log redactor so downstream error
+    // strings are scrubbed for secret-shaped content BEFORE hitting
+    // serve.state.json or the operator's terminal via `rea status`.
+    // The redactor already incorporates SECRET_PATTERNS plus any
+    // operator-defined policy.redact.patterns loaded above.
+    liveStateLastErrorRedactor: logRedactor,
   });
 
   // ── HALT acknowledgement at startup (G5) ─────────────────────────────────
@@ -319,13 +346,21 @@ export async function runServe(): Promise<void> {
   }
 
   // ── Pidfile + state (AFTER metrics boot so we persist the real port) ─────
-  const startedAt = new Date().toISOString();
+  //
+  // 0.9.0: the gateway's LiveStatePublisher owns all writes to
+  // serve.state.json, including the boot-time snapshot. Earlier drafts
+  // used the legacy `writeStateFile()` here to cover the bootstrap window
+  // between now and `handle.start()`'s first flush, but that write
+  // bypassed the sidecar-lock protocol and reintroduced the TOCTOU race
+  // P2b was designed to close (Codex 0.9.0 pass-3 P1: an overlapping
+  // older `rea serve` could clobber this unprotected write and the
+  // newer instance would later cleanup its own file during shutdown).
+  //
+  // Routing the boot write through `handle.livePublisher.flushNow()`
+  // means the boot snapshot is guarded by the same lock as every
+  // subsequent flush; overlapping gateways serialize cleanly.
   const pidPath = writePidfile(baseDir);
-  const statePath = writeStateFile(baseDir, {
-    session_id: sessionId,
-    started_at: startedAt,
-    metrics_port: metricsServer?.port() ?? null,
-  });
+  handle.livePublisher?.flushNow();
 
   let shuttingDown = false;
   const shutdown = async (signal: string): Promise<void> => {

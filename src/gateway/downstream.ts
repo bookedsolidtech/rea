@@ -30,6 +30,26 @@
  * successful reconnect — in that case we mark the connection unhealthy and
  * let the circuit breaker take over.
  *
+ * ## Supervisor / child-death detection (0.9.0, BUG-002..003)
+ *
+ * The SDK `StdioClientTransport` exposes `onclose` + `onerror` callbacks that
+ * fire when the child process exits or the stdio pipe errors outside a
+ * caller-initiated `close()`. We wire both and treat an unexpected close as
+ * "child is dead" — the next `callTool` must force a fresh connect rather
+ * than calling into a stale `Client` that will reply `Not connected`.
+ *
+ * Before 0.9.0 the supervisor was reactive only: a dead child was not noticed
+ * until the NEXT tool call tried to use it, at which point the circuit could
+ * flap open → half-open → open with the child still dead because the
+ * half-open probe re-used the zombie client. 0.9.0 makes death detection
+ * eager: `onclose` nulls `this.client` so the very next call takes the
+ * `connect()` branch and actually respawns the child.
+ *
+ * "Not connected" error messages from the SDK (our in-flight fallback) are
+ * now also treated as fatal for the current client — we null it before the
+ * one-shot reconnect path so we spawn fresh rather than retrying with the
+ * same dead handle.
+ *
  * ## Why not request-level retries
  *
  * MCP tool calls are not idempotent by default. Retrying `send_message` after
@@ -147,8 +167,80 @@ export function buildChildEnv(
   return { env: out, missing: interp.missing, secretKeys: interp.secretKeys };
 }
 
+/**
+ * Event emitted by {@link DownstreamConnection} when the supervisor observes
+ * a lifecycle transition worth surfacing. Consumers (the pool, the
+ * SESSION_BLOCKER tracker, observability sinks) subscribe via
+ * {@link DownstreamConnection.onSupervisorEvent}.
+ *
+ * The `kind` is a narrow closed set so sinks can switch exhaustively. `reason`
+ * carries the operator-readable detail; it is already bounded by
+ * `boundedDiagnosticString` at the call site.
+ */
+export type DownstreamSupervisorEvent =
+  | {
+      kind: 'child_died_unexpectedly';
+      server: string;
+      reason: string;
+    }
+  | {
+      kind: 'respawned';
+      server: string;
+    }
+  | {
+      /**
+       * A non-transition health change. Fires whenever a visible field in
+       * {@link DownstreamHealth} (health, last_error, tools_count) mutates
+       * WITHOUT being accompanied by a breaker transition or respawn event.
+       *
+       * Codex 0.9.0 pass-2 P2a: without this event, the first failed call/
+       * reconnect below the breaker threshold (or a successful `listTools`
+       * that updates the cached tool count) never reaches the live state
+       * publisher, so `rea status` would show stale data until some later,
+       * unrelated circuit or respawn event finally flushed a snapshot.
+       *
+       * Firing is best-effort from the connection class; the pool additionally
+       * emits this kind after `listAllTools` updates `lastToolsCount` so a
+       * tool-catalog change is always visible in the next debounced snapshot.
+       */
+      kind: 'health_changed';
+      server: string;
+    };
+
+/**
+ * Substring marker for "the SDK thinks the client is still alive but the
+ * child transport is already gone" errors. Matches the exact message the
+ * MCP SDK throws from `Client` method calls after `onclose` has fired but
+ * before our own code has re-connected. Kept as a constant so tests can
+ * assert against it without string duplication.
+ */
+const NOT_CONNECTED_MARKER = 'Not connected';
+
 export class DownstreamConnection {
   private client: Client | null = null;
+  /**
+   * Handle to the currently active transport, so our `onclose`/`onerror`
+   * hooks can tell "this is the transport we care about" vs "a stale callback
+   * firing after we already swapped to a new transport". Cleared in `close()`
+   * BEFORE we invoke `client.close()` so our own tear-down does not race the
+   * supervisor path.
+   */
+  private activeTransport: StdioClientTransport | null = null;
+  /**
+   * Set of transports currently being torn down by an in-flight `close()`.
+   * `onclose` / `onerror` callbacks that fire for a transport in this set
+   * must NOT be promoted to an "unexpected child death" — they are our own
+   * tear-down signal.
+   *
+   * Codex P2 (0.9.0 review): the earlier `closingIntentionally` boolean was
+   * connection-wide. Under concurrent calls, one call's `await this.close()`
+   * could overlap with another call's reconnect that had already installed
+   * a NEW transport. A genuine `onclose` from the new transport would hit
+   * the boolean guard and be silently ignored, reintroducing the stale-
+   * handle bug the patch targeted. Per-transport scoping eliminates the
+   * race: only the exact transport we asked to close is silenced.
+   */
+  private readonly closingTransports = new Set<StdioClientTransport>();
   /**
    * Whether a reconnect has already been attempted in the CURRENT failure
    * episode. Resets to `false` after a reconnect succeeds (so a later,
@@ -158,7 +250,30 @@ export class DownstreamConnection {
   private reconnectAttempted = false;
   /** Epoch ms of the last successful reconnect. Used by the flapping guard. */
   private lastReconnectAt = 0;
+  /**
+   * Epoch ms of the most recent unexpected child-death event. Stamped by
+   * `handleUnexpectedClose()`. 0 means "never died unexpectedly".
+   *
+   * Codex 0.9.0 pass-5 P2b: when `handleUnexpectedClose` nulls `this.client`,
+   * the very next `callTool` takes the top-level `client === null` branch,
+   * which normally bypasses the flap-window check entirely (that check lives
+   * in the catch branch below, conditioned on `lastReconnectAt`). A downstream
+   * that crashes immediately after every spawn would therefore be respawned
+   * unconditionally on every incoming call — exactly the loop the flap
+   * window is supposed to suppress. Consulting this timestamp in the
+   * `client === null` branch lets us refuse the respawn when the previous
+   * death is within the flap window, and the caller gets a clear error
+   * instead of watching the child die again.
+   */
+  private unexpectedDeathAt = 0;
   private health: Health = 'healthy';
+  /**
+   * Optional supervisor-event listener. Set via
+   * {@link onSupervisorEvent}. A single subscriber is sufficient — the pool
+   * is the one consumer. Listener failures are swallowed; a broken consumer
+   * must never break the connection lifecycle.
+   */
+  private supervisorListener: ((event: DownstreamSupervisorEvent) => void) | null = null;
   /**
    * The most recent error observed on this connection (connect or call
    * failure). Surfaced via `__rea__health` so callers can diagnose an empty
@@ -221,6 +336,127 @@ export class DownstreamConnection {
   }
 
   /**
+   * Register a supervisor-event listener. Intended for the pool to wire up
+   * SESSION_BLOCKER tracking + observability hooks without the connection
+   * class having to know about either. Only one listener is supported — a
+   * second call replaces the first. Pass `null` to detach.
+   */
+  onSupervisorEvent(listener: ((event: DownstreamSupervisorEvent) => void) | null): void {
+    this.supervisorListener = listener;
+  }
+
+  /**
+   * Invoke the supervisor listener if registered. Swallows listener errors —
+   * a broken observer must never break the connection state machine.
+   */
+  private emitSupervisorEvent(event: DownstreamSupervisorEvent): void {
+    const listener = this.supervisorListener;
+    if (listener === null) return;
+    try {
+      listener(event);
+    } catch {
+      // Intentionally swallowed. See JSDoc.
+    }
+  }
+
+  /**
+   * Emit a `health_changed` event. Called from every site that mutates a
+   * health/last_error/tools_count-visible field WITHOUT firing one of the
+   * louder supervisor events (`child_died_unexpectedly` / `respawned`).
+   * Addresses Codex 0.9.0 pass-2 P2a — live-state was only scheduled from
+   * breaker transitions and respawns, so transient errors below the breaker
+   * threshold would leave `rea status` showing stale data.
+   */
+  private emitHealthChanged(): void {
+    this.emitSupervisorEvent({ kind: 'health_changed', server: this.config.name });
+  }
+
+  /**
+   * Handle an unexpected transport close. Fires when the child process exits
+   * outside a caller-initiated `close()`, or when the stdio pipe errors in a
+   * way the SDK surfaces as a close event.
+   *
+   * Contract:
+   *   - Only runs for the currently-active transport (stale callbacks from
+   *     an already-swapped transport are ignored).
+   *   - Does NOT run when WE initiated the close (the transport is a member
+   *     of `closingTransports` for the duration of our own `close()` call).
+   *   - Nulls `this.client` so the next `callTool` takes the `connect()`
+   *     branch and actually respawns the child.
+   *   - Marks the connection unhealthy so the pool knows not to route
+   *     traffic to it while we wait for the next call.
+   *   - Emits a `child_died_unexpectedly` supervisor event so the pool's
+   *     SESSION_BLOCKER tracker can count this even though no callTool has
+   *     failed yet (the child may die mid-idle).
+   */
+  private handleUnexpectedClose(transport: StdioClientTransport, reason: string): void {
+    // Stale callback: a previous transport's onclose firing after we've
+    // already swapped in a new one. Ignore — the new transport is live and
+    // we don't want to clobber it.
+    if (this.activeTransport !== transport) return;
+    // Per-transport intentional-close filter. Codex P2 (0.9.0 review): a
+    // connection-wide boolean would let a late `onclose` from a newly
+    // reconnected transport be silenced while an earlier `close()` on the
+    // PREVIOUS transport was still in flight. Scoping by transport
+    // identity means only the exact transport we asked to close is
+    // silenced — a real death on any other transport fires normally.
+    if (this.closingTransports.has(transport)) return;
+
+    this.client = null;
+    this.activeTransport = null;
+    this.health = 'unhealthy';
+    this.#lastErrorMessage = `child process exited unexpectedly: ${reason}`;
+    // Codex 0.9.0 pass-5 P2b: stamp the death time so `callTool`'s
+    // `client === null` branch can consult the flap window and refuse a
+    // respawn if the child died within `RECONNECT_FLAP_WINDOW_MS`. Without
+    // this, the top-level respawn path bypasses the flap guard entirely.
+    this.unexpectedDeathAt = Date.now();
+    this.logger?.warn({
+      event: 'downstream.child_died',
+      server_name: this.config.name,
+      message: `downstream "${this.config.name}" child died unexpectedly — next call will respawn`,
+      reason,
+    });
+    this.emitSupervisorEvent({
+      kind: 'child_died_unexpectedly',
+      server: this.config.name,
+      reason,
+    });
+  }
+
+  /**
+   * Handle a transport-layer protocol error. onerror does NOT always imply
+   * close — the SDK emits it for protocol errors too. We record the error
+   * text but leave connection invalidation to the eventual onclose callback,
+   * which is guaranteed to follow a fatal transport error on stdio.
+   *
+   * Codex 0.9.0 pass-6 P2: filter stale/intentional-close callbacks the
+   * same way `handleUnexpectedClose` does. Without this, a delayed
+   * onerror from a PREVIOUSLY-ACTIVE transport (one we've already torn
+   * down or replaced) can clobber the HEALTHY replacement connection's
+   * last_error and emit a spurious health_changed, leaving `rea status`
+   * showing a stale error on a perfectly live child. The `onclose`
+   * hook already enforced this filter; the `onerror` hook did not.
+   */
+  private handleTransportError(transport: StdioClientTransport, err: Error): void {
+    if (this.activeTransport !== transport) return;
+    if (this.closingTransports.has(transport)) return;
+    this.#lastErrorMessage = err.message;
+    this.logger?.warn({
+      event: 'downstream.transport_error',
+      server_name: this.config.name,
+      message: `downstream "${this.config.name}" transport error`,
+      error: err.message,
+    });
+    // Codex 0.9.0 pass-4 P2: surface the new last_error to the live-state
+    // publisher immediately. Before this emit, a protocol-level transport
+    // error that did NOT trigger a subsequent onclose would update
+    // last_error in memory but leave `rea status` showing the previous
+    // (stale) value until some unrelated circuit/respawn event flushed.
+    this.emitHealthChanged();
+  }
+
+  /**
    * Last error observed, or null if the connection has never failed (or fully
    * recovered).
    *
@@ -262,12 +498,14 @@ export class DownstreamConnection {
       this.health = 'unhealthy';
       const msg = `failed to resolve env for downstream "${this.config.name}": ${err instanceof Error ? err.message : err}`;
       this.#lastErrorMessage = msg;
+      this.emitHealthChanged();
       throw new Error(msg);
     }
 
     if (built.missing.length > 0) {
       this.health = 'unhealthy';
       this.#lastErrorMessage = `missing env: ${built.missing.join(', ')}`;
+      this.emitHealthChanged();
       // One line per missing var so grep/jq users can find the exact gap.
       // We intentionally do NOT log the env key name's VALUE (there is none —
       // it's unresolved) nor any other env values.
@@ -287,6 +525,17 @@ export class DownstreamConnection {
       args: this.config.args,
       env: built.env,
     });
+    // BUG-002/003: wire supervisor hooks BEFORE connect so we never miss a
+    // close event that fires during the initial handshake. The hooks only
+    // act on the transport we hand them — a stale callback from a previous
+    // transport is ignored in `handleUnexpectedClose`.
+    transport.onclose = (): void => {
+      this.handleUnexpectedClose(transport, 'transport closed');
+    };
+    transport.onerror = (err: Error): void => {
+      this.handleTransportError(transport, err);
+    };
+
     const client = new Client(
       { name: `rea-gateway-client:${this.config.name}`, version: '0.2.0' },
       { capabilities: {} },
@@ -294,12 +543,22 @@ export class DownstreamConnection {
     try {
       await client.connect(transport);
       this.client = client;
+      this.activeTransport = transport;
       this.health = 'healthy';
       this.#lastErrorMessage = null;
+      this.emitHealthChanged();
     } catch (err) {
       this.health = 'unhealthy';
       const msg = `failed to connect to downstream "${this.config.name}" (${this.config.command}): ${err instanceof Error ? err.message : err}`;
       this.#lastErrorMessage = msg;
+      // The transport may have partially started and set up child pipes —
+      // tell the SDK to tear it down so we don't leak the zombie child.
+      try {
+        await transport.close();
+      } catch {
+        // Best-effort.
+      }
+      this.emitHealthChanged();
       throw new Error(msg);
     }
   }
@@ -319,7 +578,40 @@ export class DownstreamConnection {
    */
   async callTool(toolName: string, args: Record<string, unknown>): Promise<unknown> {
     if (this.client === null) {
+      // Codex 0.9.0 pass-5 P2b: if the previous death was inside the flap
+      // window, refuse the respawn and surface the flap-window error instead.
+      // This keeps a crash-on-spawn child from being respawned on every
+      // incoming call — the same guarantee the `catch` branch provides for
+      // transport errors on a live client. The timestamp is stamped by
+      // `handleUnexpectedClose`; if the client was nulled by some other
+      // path (our own `close()`, initial cold start, etc.) `unexpectedDeathAt`
+      // is 0 and the check is a no-op.
+      const deathWithinFlapWindow =
+        this.unexpectedDeathAt !== 0 &&
+        Date.now() - this.unexpectedDeathAt < RECONNECT_FLAP_WINDOW_MS;
+      if (deathWithinFlapWindow) {
+        this.health = 'unhealthy';
+        const msg =
+          `downstream "${this.config.name}" unhealthy — child died within ` +
+          `flap window, refusing to respawn`;
+        this.#lastErrorMessage = msg;
+        this.logger?.error({
+          event: 'downstream.respawn_refused_flap',
+          server_name: this.config.name,
+          message: msg,
+          last_death_ms_ago: Date.now() - this.unexpectedDeathAt,
+        });
+        this.emitHealthChanged();
+        throw new Error(msg);
+      }
       await this.connect();
+      // A successful spawn after a death ends the episode — clear the stamp
+      // so future unrelated deaths get their own flap window rather than
+      // inheriting this one.
+      this.unexpectedDeathAt = 0;
+      // Successful respawn counts as recovery for the supervisor — emit it
+      // so observability sinks can reset per-server session-blocker counts.
+      this.emitSupervisorEvent({ kind: 'respawned', server: this.config.name });
     }
     try {
       const result = await this.client!.callTool({ name: toolName, arguments: args });
@@ -327,12 +619,39 @@ export class DownstreamConnection {
       // this, a connection that failed once and then recovered on the very
       // next call (same client, no reconnect) would forever report the old
       // error via `__rea__health`, misleading operators about live state.
+      //
+      // Codex 0.9.0 pass-2 P2a: only emit `health_changed` when we actually
+      // cleared something — the common success path runs through here every
+      // call, so noisy emission would burn debounced writes. A same-value
+      // write is a no-op for live-state purposes.
+      const hadError = this.#lastErrorMessage !== null;
       this.#lastErrorMessage = null;
+      if (hadError) this.emitHealthChanged();
       return result;
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       const withinFlapWindow =
         this.lastReconnectAt !== 0 && Date.now() - this.lastReconnectAt < RECONNECT_FLAP_WINDOW_MS;
+
+      // BUG-003: "Not connected" means the SDK's idea of the client state
+      // has diverged from reality — usually because the child exited between
+      // calls and the `onclose` hook hasn't fired yet (or raced this call).
+      // Force a proper tear-down NOW so the next branch either reconnects
+      // against a clean slate (reconnect branch) or leaves a null client so
+      // the NEXT callTool's guard spawns fresh (terminal branch). Codex
+      // 0.9.0 pass-3 P2: an earlier implementation nulled `this.client` +
+      // `this.activeTransport` inline here, which made the subsequent
+      // `await this.close()` below a no-op (`c` was already null) — the
+      // stale child would leak until gateway shutdown. Calling `close()`
+      // eagerly ensures the transport is actually closed.
+      if (message.includes(NOT_CONNECTED_MARKER)) {
+        try {
+          await this.close();
+        } catch {
+          // Best-effort — close() already swallows transport close errors,
+          // but belt-and-braces for any unexpected throw.
+        }
+      }
 
       if (!this.reconnectAttempted && !withinFlapWindow) {
         this.reconnectAttempted = true;
@@ -344,8 +663,12 @@ export class DownstreamConnection {
           reason: message,
         });
         try {
+          // For non-NOT_CONNECTED paths we still need to tear down the old
+          // client. When we DID take the NOT_CONNECTED branch above, `close()`
+          // is idempotent: `c === null` short-circuits cleanly.
           await this.close();
           await this.connect();
+          this.emitSupervisorEvent({ kind: 'respawned', server: this.config.name });
           const result = await this.client!.callTool({ name: toolName, arguments: args });
           // Success: episode closed. Reset for the NEXT unrelated failure and
           // stamp the reconnect time so flap-guard can refuse rapid repeats.
@@ -368,6 +691,7 @@ export class DownstreamConnection {
             message: `downstream "${this.config.name}" unhealthy after one reconnect`,
             error: errMsg,
           });
+          this.emitHealthChanged();
           throw new Error(
             `downstream "${this.config.name}" unhealthy after one reconnect: ${errMsg}`,
           );
@@ -381,18 +705,37 @@ export class DownstreamConnection {
         message: `downstream "${this.config.name}" call failed`,
         error: message,
       });
+      this.emitHealthChanged();
       throw new Error(`downstream "${this.config.name}" call failed: ${message}`);
     }
   }
 
   async close(): Promise<void> {
     const c = this.client;
+    // Capture the transport being closed BEFORE we null `activeTransport`,
+    // so a synchronously-firing `onclose` during `c.close()` can be matched
+    // against this specific transport instead of whichever transport is
+    // "current" at the moment the callback lands. Codex P2 (0.9.0 review):
+    // the earlier implementation used a connection-wide boolean, which
+    // under concurrent calls could silence a legitimate death event for a
+    // newer transport while we were still tearing down an older one.
+    const closingTransport = this.activeTransport;
+    if (closingTransport !== null) {
+      this.closingTransports.add(closingTransport);
+    }
     this.client = null;
-    if (c === null) return;
+    this.activeTransport = null;
     try {
-      await c.close();
-    } catch {
-      // Best-effort close — child may already be gone.
+      if (c === null) return;
+      try {
+        await c.close();
+      } catch {
+        // Best-effort close — child may already be gone.
+      }
+    } finally {
+      if (closingTransport !== null) {
+        this.closingTransports.delete(closingTransport);
+      }
     }
   }
 }

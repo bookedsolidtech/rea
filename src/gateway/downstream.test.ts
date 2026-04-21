@@ -350,6 +350,287 @@ describe('DownstreamConnection reconnect semantics', () => {
     expect(conn.lastError).toBeNull();
   });
 
+  it('BUG-003: "Not connected" error nulls the client and takes the respawn branch', async () => {
+    // Before 0.9.0, a `Not connected` error went through the ordinary
+    // reconnect path which called `close() + connect()` — fine, but relied
+    // on `close()` to tear down a client that was already dead. The 0.9.0
+    // change is defensive: we null the client eagerly on this specific
+    // marker so the reconnect unambiguously spawns a new child.
+    const s1 = makeStubClient(() => Promise.reject(new Error('Not connected')));
+    const s2 = makeStubClient(() => Promise.resolve({ ok: 'respawned' }));
+    const conn = makeConnection([s2]);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (conn as any).client = s1;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (conn as any).health = 'healthy';
+
+    const result = await conn.callTool('ping', {});
+    expect(result).toEqual({ ok: 'respawned' });
+    // lastError cleared on reconnect success.
+    expect(conn.lastError).toBeNull();
+  });
+
+  it('BUG-003 / Codex pass-3 P2: "Not connected" still closes the stale client (no transport leak)', async () => {
+    // Regression for Codex 0.9.0 pass-3 P2: an earlier fix nulled
+    // `this.client` + `this.activeTransport` BEFORE the reconnect branch's
+    // `await this.close()`, so close() saw `c === null` and returned
+    // without tearing down the transport — the stale child leaked until
+    // gateway shutdown. The current code calls `close()` inline on the
+    // NOT_CONNECTED branch so the tear-down actually happens.
+    let s1Closed = false;
+    const s1 = {
+      callTool: () => Promise.reject(new Error('Not connected')),
+      close: async (): Promise<void> => {
+        s1Closed = true;
+      },
+    };
+    const s2 = makeStubClient(() => Promise.resolve({ ok: 'respawned' }));
+    const conn = makeConnection([s2]);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (conn as any).client = s1;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (conn as any).activeTransport = { id: 's1-transport' };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (conn as any).health = 'healthy';
+
+    const result = await conn.callTool('ping', {});
+    expect(result).toEqual({ ok: 'respawned' });
+    // The stale client was actually closed — no transport leak.
+    expect(s1Closed).toBe(true);
+  });
+
+  it('BUG-002: supervisor event fires on unexpected transport close', () => {
+    // Unit-level: exercise handleUnexpectedClose via the supervisor event
+    // plumbing to confirm the contract (null client, unhealthy, emit) rather
+    // than relying on a real child-process crash in the unit suite.
+    const conn = new DownstreamConnection(baseServer());
+    // Install a synthetic transport + client pair so handleUnexpectedClose
+    // can see an "active" connection to tear down.
+    const fakeTransport = { marker: 'fake' } as unknown;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (conn as any).client = makeStubClient(() => Promise.resolve(null));
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (conn as any).activeTransport = fakeTransport;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (conn as any).health = 'healthy';
+
+    const events: Array<{ kind: string; server: string }> = [];
+    conn.onSupervisorEvent((e) => {
+      events.push({ kind: e.kind, server: e.server });
+    });
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (conn as any).handleUnexpectedClose(fakeTransport, 'test-reason');
+
+    expect(conn.isConnected).toBe(false);
+    expect(conn.isHealthy).toBe(false);
+    expect(conn.lastError).toMatch(/child process exited unexpectedly: test-reason/);
+    expect(events).toEqual([{ kind: 'child_died_unexpectedly', server: 'mock' }]);
+  });
+
+  it('BUG-002: intentional close() does NOT fire a death event', async () => {
+    const conn = new DownstreamConnection(baseServer());
+    const fakeTransport = { marker: 'fake' } as unknown;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (conn as any).client = makeStubClient(() => Promise.resolve(null));
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (conn as any).activeTransport = fakeTransport;
+
+    const events: Array<{ kind: string }> = [];
+    conn.onSupervisorEvent((e) => {
+      events.push({ kind: e.kind });
+    });
+
+    // close() must clear activeTransport BEFORE the client's close resolves so
+    // a transport.onclose firing during tear-down is recognized as ours.
+    await conn.close();
+
+    // Fire a synthetic onclose after close() completed — it must be ignored
+    // because activeTransport is already null.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (conn as any).handleUnexpectedClose(fakeTransport, 'late-callback');
+
+    expect(events).toEqual([]);
+  });
+
+  it('BUG-002: stale transport onclose from prior episode is ignored', () => {
+    const conn = new DownstreamConnection(baseServer());
+    const priorTransport = { id: 'prior' } as unknown;
+    const currentTransport = { id: 'current' } as unknown;
+
+    // Simulate: priorTransport was active, then we reconnected and swapped
+    // to currentTransport. A late onclose from priorTransport must NOT
+    // invalidate currentTransport's client.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (conn as any).client = makeStubClient(() => Promise.resolve(null));
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (conn as any).activeTransport = currentTransport;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (conn as any).health = 'healthy';
+
+    const events: Array<unknown> = [];
+    conn.onSupervisorEvent((e) => events.push(e));
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (conn as any).handleUnexpectedClose(priorTransport, 'stale');
+
+    expect(conn.isConnected).toBe(true);
+    expect(conn.isHealthy).toBe(true);
+    expect(events).toEqual([]);
+  });
+
+  it('BUG-004 / Codex P2a: health_changed fires on terminal call failure (no breaker transition)', async () => {
+    // Below-threshold failures never reach the breaker's onStateChange, so
+    // without a health_changed event the live-state publisher would never
+    // flush — `rea status` would show stale healthy=true + last_error=null
+    // while the connection was actually in an unhealthy state.
+    const s1 = makeStubClient(() => Promise.reject(new Error('transient blip')));
+    const s2 = makeStubClient(() =>
+      Promise.reject(new Error('reconnect failure — within flap')),
+    );
+    const conn = makeConnection([s2]);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (conn as any).client = s1;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (conn as any).health = 'healthy';
+
+    const events: Array<{ kind: string; server: string }> = [];
+    conn.onSupervisorEvent((e) => events.push({ kind: e.kind, server: e.server }));
+
+    // Episode 1: first attempt fails → reconnect attempts, also fails → terminal.
+    await expect(conn.callTool('ping', {})).rejects.toThrow(/unhealthy after one reconnect/);
+
+    // The reconnect-failure path must emit health_changed so the publisher
+    // sees the unhealthy state even before any breaker transition.
+    const healthChanges = events.filter((e) => e.kind === 'health_changed');
+    expect(healthChanges.length).toBeGreaterThanOrEqual(1);
+    expect(healthChanges.every((e) => e.server === 'mock')).toBe(true);
+    expect(conn.isHealthy).toBe(false);
+  });
+
+  it('BUG-004 / Codex P2a: health_changed on success clears stale lastError', async () => {
+    // Recovery path: a previous failure stamped lastError; the next
+    // successful call must both clear it AND emit health_changed so the
+    // publisher flushes the recovery to disk. Without the event, a user
+    // reading `rea status` would see a stale `last_error` for an already-
+    // healthy server.
+    const s2 = makeStubClient(() => Promise.resolve({ ok: 'recovered' }));
+    const conn = makeConnection([]); // no stubs — we won't trigger reconnect
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (conn as any).client = s2;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (conn as any).health = 'healthy';
+    // Seed a stale lastError via the natural write path: route a terminal
+    // call failure through callTool — the reconnect-attempted + flap-window
+    // branch takes the else-terminal branch that writes lastError.
+    const badClient = makeStubClient(() => Promise.reject(new Error('seed stale')));
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (conn as any).client = badClient;
+    // Hit a terminal failure without reconnect: set reconnectAttempted true
+    // and within flap window so we take the "else" terminal branch that
+    // writes lastError and emits health_changed.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (conn as any).reconnectAttempted = true;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (conn as any).lastReconnectAt = Date.now();
+    await expect(conn.callTool('ping', {})).rejects.toThrow(/call failed/);
+    expect(conn.lastError).not.toBeNull();
+
+    // Swap in the recovering client and subscribe AFTER the seed phase so we
+    // only observe the recovery emission.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (conn as any).client = s2;
+    const events: string[] = [];
+    conn.onSupervisorEvent((e) => events.push(e.kind));
+
+    const result = await conn.callTool('ping', {});
+    expect(result).toEqual({ ok: 'recovered' });
+    expect(conn.lastError).toBeNull();
+    expect(events).toContain('health_changed');
+  });
+
+  it('BUG-004 / Codex P2a: repeated success does NOT spam health_changed', async () => {
+    // Once lastError is null, successive successful callTools must not
+    // emit health_changed — emitting per-call would burn the debounced
+    // write budget for no state change.
+    const client = makeStubClient(() => Promise.resolve({ ok: 1 }));
+    const conn = makeConnection([]);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (conn as any).client = client;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (conn as any).health = 'healthy';
+
+    const events: string[] = [];
+    conn.onSupervisorEvent((e) => events.push(e.kind));
+
+    await conn.callTool('ping', {});
+    await conn.callTool('ping', {});
+    await conn.callTool('ping', {});
+
+    expect(events).toEqual([]); // no emission on steady-state success
+  });
+
+  it('Codex pass-5 P2b: refuses a respawn when the child died within the flap window', async () => {
+    // The `client === null` branch at the top of callTool used to respawn
+    // unconditionally. If a downstream crashes immediately after each spawn,
+    // every incoming call would respawn the zombie without consulting the
+    // flap window, reintroducing the reconnect loop the class is supposed
+    // to suppress. Pass-5 adds an `unexpectedDeathAt` stamp set by
+    // `handleUnexpectedClose` and consulted here.
+    //
+    // Natural drive: call succeeds, then simulate an unexpected close (via
+    // the private method — the alternative is to wire a real transport
+    // which unit tests deliberately avoid). A callTool within the flap
+    // window must be refused without popping a new stub.
+    const s1 = makeStubClient(() => Promise.resolve({ ok: 'first' }));
+    const surpriseStub = makeStubClient(() => Promise.resolve({ ok: 'SHOULD-NOT-RESPAWN' }));
+    const conn = makeConnection([s1, surpriseStub]);
+
+    vi.setSystemTime(new Date('2026-04-18T00:00:00Z'));
+    const r1 = await conn.callTool('ping', {});
+    expect(r1).toEqual({ ok: 'first' });
+
+    // Simulate the SDK reporting an unexpected child death. We invoke the
+    // private handler directly; the real transport-layer wiring is what
+    // production uses, but the handler is the single chokepoint we care
+    // about for this test.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const fakeTransport = {} as any;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (conn as any).activeTransport = fakeTransport;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (conn as any).handleUnexpectedClose(fakeTransport, 'simulated SIGKILL');
+
+    // Only 1 ms has passed — well within the 30 s flap window. The next
+    // call MUST refuse to respawn.
+    vi.setSystemTime(new Date('2026-04-18T00:00:00.001Z'));
+    await expect(conn.callTool('ping', {})).rejects.toThrow(/flap window|refusing to respawn/i);
+    expect(conn.isHealthy).toBe(false);
+  });
+
+  it('Codex pass-5 P2b: accepts respawn once the flap window has elapsed after a death', async () => {
+    // Complement to the previous test: outside the flap window, a death is
+    // no longer "rapid" — the next call should respawn normally.
+    const s1 = makeStubClient(() => Promise.resolve({ ok: 'first' }));
+    const s2 = makeStubClient(() => Promise.resolve({ ok: 'respawned-after-window' }));
+    const conn = makeConnection([s1, s2]);
+
+    vi.setSystemTime(new Date('2026-04-18T00:00:00Z'));
+    await conn.callTool('ping', {});
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const fakeTransport = {} as any;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (conn as any).activeTransport = fakeTransport;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (conn as any).handleUnexpectedClose(fakeTransport, 'simulated SIGKILL');
+
+    // Advance 60 s — well beyond the 30 s flap window.
+    vi.setSystemTime(new Date('2026-04-18T00:01:00Z'));
+    const r = await conn.callTool('ping', {});
+    expect(r).toEqual({ ok: 'respawned-after-window' });
+  });
+
   it('refuses a second reconnect within the flap window', async () => {
     const firstClient = makeStubClient(() => Promise.reject(new Error('transport closed #1')));
     const secondClient = makeStubClient(() => Promise.resolve({ ok: 'reconnect-1-retry' }));

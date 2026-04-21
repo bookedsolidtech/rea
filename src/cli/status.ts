@@ -83,6 +83,25 @@ export interface StatusOptions {
   json?: boolean | undefined;
 }
 
+/**
+ * Per-downstream live state surfaced in both JSON and pretty outputs
+ * (0.9.0, BUG-005). Mirrors `LiveDownstreamState` in
+ * `src/gateway/live-state.ts`; duplicated here to keep the CLI surface
+ * independent of gateway internals (the CLI can be built without the
+ * gateway module in a trimmed install).
+ */
+export interface LiveDownstreamSnapshot {
+  name: string;
+  connected: boolean;
+  healthy: boolean;
+  circuit_state: 'closed' | 'open' | 'half-open';
+  retry_at: string | null;
+  last_error: string | null;
+  tools_count: number | null;
+  open_transitions: number;
+  session_blocker_emitted: boolean;
+}
+
 interface ServeLiveness {
   running: boolean;
   pid: number | null;
@@ -92,6 +111,13 @@ interface ServeLiveness {
   session_id: string | null;
   started_at: string | null;
   metrics_port: number | null;
+  /**
+   * 0.9.0 — per-downstream live block, or `null` when the state file was
+   * written by an older gateway version that did not include it. A
+   * zero-length array means "gateway is running with no downstreams
+   * configured", which is a distinct signal from "unknown".
+   */
+  downstreams: LiveDownstreamSnapshot[] | null;
 }
 
 interface AuditStats {
@@ -151,17 +177,63 @@ interface ServeStateOnDisk {
   session_id?: unknown;
   started_at?: unknown;
   metrics_port?: unknown;
+  downstreams?: unknown;
+}
+
+/**
+ * Parse a single downstream entry from `serve.state.json`. Every field is
+ * validated — an unexpected type yields a null for that field rather than
+ * poisoning the whole entry, because the state file is touched on a hot
+ * path and we would rather surface a half-useful snapshot than a
+ * "corrupt, try again" error to the operator.
+ *
+ * Returns `null` when the entry's `name` is missing or not a string, since
+ * a downstream with no name is unusable for display.
+ */
+function parseDownstreamEntry(raw: unknown): LiveDownstreamSnapshot | null {
+  if (typeof raw !== 'object' || raw === null) return null;
+  const r = raw as Record<string, unknown>;
+  if (typeof r.name !== 'string' || r.name.length === 0) return null;
+  const circuit =
+    r.circuit_state === 'open' || r.circuit_state === 'half-open' || r.circuit_state === 'closed'
+      ? (r.circuit_state as 'closed' | 'open' | 'half-open')
+      : 'closed';
+  return {
+    name: r.name,
+    connected: typeof r.connected === 'boolean' ? r.connected : false,
+    healthy: typeof r.healthy === 'boolean' ? r.healthy : false,
+    circuit_state: circuit,
+    retry_at: typeof r.retry_at === 'string' ? r.retry_at : null,
+    last_error: typeof r.last_error === 'string' ? r.last_error : null,
+    tools_count:
+      typeof r.tools_count === 'number' && Number.isInteger(r.tools_count) ? r.tools_count : null,
+    open_transitions:
+      typeof r.open_transitions === 'number' && Number.isInteger(r.open_transitions)
+        ? r.open_transitions
+        : 0,
+    session_blocker_emitted:
+      typeof r.session_blocker_emitted === 'boolean' ? r.session_blocker_emitted : false,
+  };
 }
 
 function readServeState(baseDir: string): {
   session_id: string | null;
   started_at: string | null;
   metrics_port: number | null;
+  downstreams: LiveDownstreamSnapshot[] | null;
 } {
   const p = reaPath(baseDir, SERVE_STATE_FILE);
   try {
     const raw = fs.readFileSync(p, 'utf8');
     const parsed = JSON.parse(raw) as ServeStateOnDisk;
+    let downstreams: LiveDownstreamSnapshot[] | null = null;
+    if (Array.isArray(parsed.downstreams)) {
+      downstreams = [];
+      for (const entry of parsed.downstreams) {
+        const ds = parseDownstreamEntry(entry);
+        if (ds !== null) downstreams.push(ds);
+      }
+    }
     return {
       session_id: typeof parsed.session_id === 'string' ? parsed.session_id : null,
       started_at: typeof parsed.started_at === 'string' ? parsed.started_at : null,
@@ -169,9 +241,10 @@ function readServeState(baseDir: string): {
         typeof parsed.metrics_port === 'number' && Number.isInteger(parsed.metrics_port)
           ? parsed.metrics_port
           : null,
+      downstreams,
     };
   } catch {
-    return { session_id: null, started_at: null, metrics_port: null };
+    return { session_id: null, started_at: null, metrics_port: null, downstreams: null };
   }
 }
 
@@ -186,6 +259,7 @@ function probeServe(baseDir: string): ServeLiveness {
       session_id: null,
       started_at: null,
       metrics_port: null,
+      downstreams: null,
     };
   }
   const alive = isProcessAlive(pid);
@@ -197,6 +271,7 @@ function probeServe(baseDir: string): ServeLiveness {
     session_id: state.session_id,
     started_at: state.started_at,
     metrics_port: state.metrics_port,
+    downstreams: state.downstreams,
   };
 }
 
@@ -419,6 +494,45 @@ function printPretty(payload: StatusPayload): void {
     }
   }
   console.log('');
+
+  // 0.9.0 — per-downstream block. Only shown when the serve process is
+  // believed to be running AND the state file carried the new array. An
+  // older gateway version that predates the publisher leaves `downstreams`
+  // null; we print an explanatory hint instead of rendering an empty
+  // table that looks like "zero downstreams".
+  if (s.running) {
+    console.log('  Downstreams');
+    if (s.downstreams === null) {
+      console.log(`    (state file has no downstream block — upgrade gateway to ≥0.9.0)`);
+    } else if (s.downstreams.length === 0) {
+      console.log(`    (no downstream servers declared in .rea/registry.yaml)`);
+    } else {
+      for (const d of s.downstreams) {
+        const name = sanitizeForTerminal(d.name);
+        const lastErr = safePretty(d.last_error);
+        const retryAt = safePretty(d.retry_at);
+        const healthToken = d.healthy ? (d.connected ? 'healthy' : 'connecting') : 'UNHEALTHY';
+        const circuit = d.circuit_state.toUpperCase();
+        console.log(`    ${name}`);
+        console.log(`      Health:           ${healthToken}`);
+        console.log(`      Circuit:          ${circuit}`);
+        if (retryAt !== null && d.circuit_state === 'open') {
+          console.log(`      Retry at:         ${retryAt}`);
+        }
+        if (d.tools_count !== null) {
+          console.log(`      Tools advertised: ${d.tools_count}`);
+        }
+        if (d.open_transitions > 0) {
+          const blockerSuffix = d.session_blocker_emitted ? ' (SESSION_BLOCKER fired)' : '';
+          console.log(`      Open transitions: ${d.open_transitions}${blockerSuffix}`);
+        }
+        if (lastErr !== null) {
+          console.log(`      Last error:       ${lastErr}`);
+        }
+      }
+    }
+    console.log('');
+  }
 
   console.log('  Audit log');
   if (!a.present) {
