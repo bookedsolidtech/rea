@@ -355,4 +355,89 @@ describe('LiveStatePublisher', () => {
     const afterY = JSON.parse(fs.readFileSync(statePath, 'utf8')) as Record<string, unknown>;
     expect(afterY.session_id).toBe('S-X');
   });
+
+  it('Codex pass-5 P2a: after yielding, eventually reclaims when the live peer exits', () => {
+    // The original pass-4 work closed the "new gateway strands forever when
+    // the previous crash leaves a dead owner_pid" bug. This test covers the
+    // still-live peer case: a yield must not be terminal — once the peer
+    // exits, the new gateway must actually publish its own snapshot on the
+    // next retry tick.
+    //
+    // We simulate the peer exit by swapping `owner_pid` from a live PID to
+    // a dead PID between the first flushNow (which yields and schedules a
+    // retry) and the second flushNow (which must reclaim).
+    const liveOwned = {
+      session_id: 'S-LIVE-PEER',
+      started_at: '2026-04-20T00:00:00Z',
+      metrics_port: null,
+      downstreams: [],
+      updated_at: '2026-04-20T00:00:00Z',
+      owner_pid: process.pid, // alive — new gateway must yield
+    };
+    fs.writeFileSync(statePath, JSON.stringify(liveOwned) + '\n');
+
+    const { publisher } = makePublisher(['alpha']);
+    // First flush yields: peer PID is alive.
+    publisher.flushNow();
+    let raw = JSON.parse(fs.readFileSync(statePath, 'utf8')) as Record<string, unknown>;
+    expect(raw.session_id).toBe('S-LIVE-PEER');
+
+    // Simulate the peer exiting by rewriting the owner_pid to a PID that
+    // cannot possibly be running.
+    const deadPid = 2 ** 22;
+    const deadOwned = { ...liveOwned, owner_pid: deadPid };
+    fs.writeFileSync(statePath, JSON.stringify(deadOwned) + '\n');
+
+    // A subsequent flushNow must now reclaim — this is what the yield-retry
+    // path triggers in production. We invoke it directly here because vitest
+    // doesn't need to wait for the 2s retry interval; we just verify the
+    // reclaim PATH works. (The timer itself is exercised via
+    // scheduleYieldRetry in the next test.)
+    publisher.flushNow();
+    raw = JSON.parse(fs.readFileSync(statePath, 'utf8')) as Record<string, unknown>;
+    expect(raw.session_id).toBe('S-TEST');
+    expect(raw.owner_pid).toBe(process.pid);
+  });
+
+  it('Codex pass-5 P2a: scheduleYieldRetry fires flushNow after the retry interval', async () => {
+    // Validate that the yield path actually re-arms a timer. Without the
+    // retry, the yield is terminal and `rea status` shows stale data until
+    // some other event lands a scheduleUpdate — which may be never on an
+    // idle gateway.
+    vi.useFakeTimers();
+    try {
+      const liveOwned = {
+        session_id: 'S-LIVE-PEER',
+        started_at: '2026-04-20T00:00:00Z',
+        metrics_port: null,
+        downstreams: [],
+        updated_at: '2026-04-20T00:00:00Z',
+        owner_pid: process.pid,
+      };
+      fs.writeFileSync(statePath, JSON.stringify(liveOwned) + '\n');
+
+      const { publisher } = makePublisher(['alpha']);
+      publisher.flushNow(); // yields + schedules retry
+
+      // Swap to a dead PID so the retry's flushNow reclaims.
+      const deadPid = 2 ** 22;
+      fs.writeFileSync(
+        statePath,
+        JSON.stringify({ ...liveOwned, owner_pid: deadPid }) + '\n',
+      );
+
+      // Advance fake timers past the retry interval (2s). Before the pass-5
+      // fix, nothing was scheduled and this advancement is a no-op.
+      vi.advanceTimersByTime(2_100);
+
+      const raw = JSON.parse(fs.readFileSync(statePath, 'utf8')) as Record<string, unknown>;
+      expect(raw.session_id).toBe('S-TEST');
+
+      // Clean up the publisher so the retry timer doesn't leak past the
+      // test (stop() clears yieldRetryTimer).
+      publisher.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

@@ -250,6 +250,22 @@ export class DownstreamConnection {
   private reconnectAttempted = false;
   /** Epoch ms of the last successful reconnect. Used by the flapping guard. */
   private lastReconnectAt = 0;
+  /**
+   * Epoch ms of the most recent unexpected child-death event. Stamped by
+   * `handleUnexpectedClose()`. 0 means "never died unexpectedly".
+   *
+   * Codex 0.9.0 pass-5 P2b: when `handleUnexpectedClose` nulls `this.client`,
+   * the very next `callTool` takes the top-level `client === null` branch,
+   * which normally bypasses the flap-window check entirely (that check lives
+   * in the catch branch below, conditioned on `lastReconnectAt`). A downstream
+   * that crashes immediately after every spawn would therefore be respawned
+   * unconditionally on every incoming call — exactly the loop the flap
+   * window is supposed to suppress. Consulting this timestamp in the
+   * `client === null` branch lets us refuse the respawn when the previous
+   * death is within the flap window, and the caller gets a clear error
+   * instead of watching the child die again.
+   */
+  private unexpectedDeathAt = 0;
   private health: Health = 'healthy';
   /**
    * Optional supervisor-event listener. Set via
@@ -390,6 +406,11 @@ export class DownstreamConnection {
     this.activeTransport = null;
     this.health = 'unhealthy';
     this.#lastErrorMessage = `child process exited unexpectedly: ${reason}`;
+    // Codex 0.9.0 pass-5 P2b: stamp the death time so `callTool`'s
+    // `client === null` branch can consult the flap window and refuse a
+    // respawn if the child died within `RECONNECT_FLAP_WINDOW_MS`. Without
+    // this, the top-level respawn path bypasses the flap guard entirely.
+    this.unexpectedDeathAt = Date.now();
     this.logger?.warn({
       event: 'downstream.child_died',
       server_name: this.config.name,
@@ -541,7 +562,37 @@ export class DownstreamConnection {
    */
   async callTool(toolName: string, args: Record<string, unknown>): Promise<unknown> {
     if (this.client === null) {
+      // Codex 0.9.0 pass-5 P2b: if the previous death was inside the flap
+      // window, refuse the respawn and surface the flap-window error instead.
+      // This keeps a crash-on-spawn child from being respawned on every
+      // incoming call — the same guarantee the `catch` branch provides for
+      // transport errors on a live client. The timestamp is stamped by
+      // `handleUnexpectedClose`; if the client was nulled by some other
+      // path (our own `close()`, initial cold start, etc.) `unexpectedDeathAt`
+      // is 0 and the check is a no-op.
+      const deathWithinFlapWindow =
+        this.unexpectedDeathAt !== 0 &&
+        Date.now() - this.unexpectedDeathAt < RECONNECT_FLAP_WINDOW_MS;
+      if (deathWithinFlapWindow) {
+        this.health = 'unhealthy';
+        const msg =
+          `downstream "${this.config.name}" unhealthy — child died within ` +
+          `flap window, refusing to respawn`;
+        this.#lastErrorMessage = msg;
+        this.logger?.error({
+          event: 'downstream.respawn_refused_flap',
+          server_name: this.config.name,
+          message: msg,
+          last_death_ms_ago: Date.now() - this.unexpectedDeathAt,
+        });
+        this.emitHealthChanged();
+        throw new Error(msg);
+      }
       await this.connect();
+      // A successful spawn after a death ends the episode — clear the stamp
+      // so future unrelated deaths get their own flap window rather than
+      // inheriting this one.
+      this.unexpectedDeathAt = 0;
       // Successful respawn counts as recovery for the supervisor — emit it
       // so observability sinks can reset per-server session-blocker counts.
       this.emitSupervisorEvent({ kind: 'respawned', server: this.config.name });

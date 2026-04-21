@@ -137,9 +137,34 @@ interface ResolvedLiveStateOptions {
   logger?: Logger;
 }
 
+/**
+ * Backoff for the yield-retry path. When a newly-started publisher finds the
+ * state file owned by a live peer, we log once and then poll at this interval
+ * so that the moment the peer exits (ESRCH on the next `isStaleLock` check
+ * or `ownsStateFile` reclaim path), we actually publish our snapshot.
+ *
+ * Intentionally far longer than the normal debounce — this is the worst-case
+ * "two `rea serve` processes are up at once" path, not the hot path. Kept in
+ * seconds-scale so `rea status` eventually reflects the new session without
+ * hammering the sidecar lock.
+ *
+ * Codex 0.9.0 pass-5 P2a: before this retry existed, `flushNow()` yielded
+ * silently and never re-tried. The new gateway therefore never published its
+ * own snapshot while the old one was still alive; once the old one exited,
+ * nothing triggered a fresh write unless an unrelated supervisor event
+ * happened to land, leaving `rea status` stuck on a stale view.
+ */
+const YIELD_RETRY_MS = 2_000;
+
 export class LiveStatePublisher {
   private readonly opts: ResolvedLiveStateOptions;
   private timer: NodeJS.Timeout | null = null;
+  /**
+   * Separate timer for the yield-retry path. Kept distinct from `timer` so a
+   * scheduled debounce doesn't cancel the retry and vice-versa — they serve
+   * different purposes (coalesce vs. poll). Cleared by `stop()`.
+   */
+  private yieldRetryTimer: NodeJS.Timeout | null = null;
   private stopped = false;
 
   constructor(opts: LiveStateOptions) {
@@ -232,6 +257,13 @@ export class LiveStatePublisher {
           message:
             'another rea serve session owns serve.state.json — yielding live-state writes for this process',
         });
+        // Codex 0.9.0 pass-5 P2a: schedule a longer-interval retry so that
+        // when the live peer exits, this process DOES eventually publish
+        // its own snapshot instead of leaving `rea status` stuck on the
+        // previous owner's session. Without this, the only way a yielding
+        // gateway ever reclaims is if some unrelated event happens to land
+        // a `scheduleUpdate()` — which may be never on an idle gateway.
+        this.scheduleYieldRetry();
         return;
       }
       const snapshot = this.buildSnapshot();
@@ -439,6 +471,29 @@ export class LiveStatePublisher {
   }
 
   /**
+   * Schedule a longer-interval retry of `flushNow`. Used by the yield path
+   * so a new gateway waiting on a live peer eventually reclaims the file
+   * when the peer exits. Idempotent — if a retry is already pending, this
+   * call is a no-op.
+   *
+   * Distinct from `scheduleUpdate()` because:
+   *   - The debounce timer coalesces rapid events; this timer polls at a
+   *     slow cadence for ownership changes.
+   *   - Scheduling yield retries on the debounce timer would mean one
+   *     supervisor event during the wait cancels the retry, and the
+   *     debounce timer ALSO can't be re-scheduled while `timer !== null`.
+   */
+  private scheduleYieldRetry(): void {
+    if (this.stopped) return;
+    if (this.yieldRetryTimer !== null) return;
+    this.yieldRetryTimer = setTimeout(() => {
+      this.yieldRetryTimer = null;
+      this.flushNow();
+    }, YIELD_RETRY_MS);
+    if (typeof this.yieldRetryTimer.unref === 'function') this.yieldRetryTimer.unref();
+  }
+
+  /**
    * Stop further scheduled writes. Called from the gateway shutdown path
    * AFTER the final flush. Clears any pending timer; no more writes will
    * occur after this returns.
@@ -448,6 +503,10 @@ export class LiveStatePublisher {
     if (this.timer !== null) {
       clearTimeout(this.timer);
       this.timer = null;
+    }
+    if (this.yieldRetryTimer !== null) {
+      clearTimeout(this.yieldRetryTimer);
+      this.yieldRetryTimer = null;
     }
   }
 

@@ -570,6 +570,67 @@ describe('DownstreamConnection reconnect semantics', () => {
     expect(events).toEqual([]); // no emission on steady-state success
   });
 
+  it('Codex pass-5 P2b: refuses a respawn when the child died within the flap window', async () => {
+    // The `client === null` branch at the top of callTool used to respawn
+    // unconditionally. If a downstream crashes immediately after each spawn,
+    // every incoming call would respawn the zombie without consulting the
+    // flap window, reintroducing the reconnect loop the class is supposed
+    // to suppress. Pass-5 adds an `unexpectedDeathAt` stamp set by
+    // `handleUnexpectedClose` and consulted here.
+    //
+    // Natural drive: call succeeds, then simulate an unexpected close (via
+    // the private method — the alternative is to wire a real transport
+    // which unit tests deliberately avoid). A callTool within the flap
+    // window must be refused without popping a new stub.
+    const s1 = makeStubClient(() => Promise.resolve({ ok: 'first' }));
+    const surpriseStub = makeStubClient(() => Promise.resolve({ ok: 'SHOULD-NOT-RESPAWN' }));
+    const conn = makeConnection([s1, surpriseStub]);
+
+    vi.setSystemTime(new Date('2026-04-18T00:00:00Z'));
+    const r1 = await conn.callTool('ping', {});
+    expect(r1).toEqual({ ok: 'first' });
+
+    // Simulate the SDK reporting an unexpected child death. We invoke the
+    // private handler directly; the real transport-layer wiring is what
+    // production uses, but the handler is the single chokepoint we care
+    // about for this test.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const fakeTransport = {} as any;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (conn as any).activeTransport = fakeTransport;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (conn as any).handleUnexpectedClose(fakeTransport, 'simulated SIGKILL');
+
+    // Only 1 ms has passed — well within the 30 s flap window. The next
+    // call MUST refuse to respawn.
+    vi.setSystemTime(new Date('2026-04-18T00:00:00.001Z'));
+    await expect(conn.callTool('ping', {})).rejects.toThrow(/flap window|refusing to respawn/i);
+    expect(conn.isHealthy).toBe(false);
+  });
+
+  it('Codex pass-5 P2b: accepts respawn once the flap window has elapsed after a death', async () => {
+    // Complement to the previous test: outside the flap window, a death is
+    // no longer "rapid" — the next call should respawn normally.
+    const s1 = makeStubClient(() => Promise.resolve({ ok: 'first' }));
+    const s2 = makeStubClient(() => Promise.resolve({ ok: 'respawned-after-window' }));
+    const conn = makeConnection([s1, s2]);
+
+    vi.setSystemTime(new Date('2026-04-18T00:00:00Z'));
+    await conn.callTool('ping', {});
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const fakeTransport = {} as any;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (conn as any).activeTransport = fakeTransport;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (conn as any).handleUnexpectedClose(fakeTransport, 'simulated SIGKILL');
+
+    // Advance 60 s — well beyond the 30 s flap window.
+    vi.setSystemTime(new Date('2026-04-18T00:01:00Z'));
+    const r = await conn.callTool('ping', {});
+    expect(r).toEqual({ ok: 'respawned-after-window' });
+  });
+
   it('refuses a second reconnect within the flap window', async () => {
     const firstClient = makeStubClient(() => Promise.reject(new Error('transport closed #1')));
     const secondClient = makeStubClient(() => Promise.resolve({ ok: 'reconnect-1-retry' }));
