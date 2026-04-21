@@ -320,11 +320,12 @@ describe('push-review-gate-git.sh — native git pre-push adapter (task #50)', (
    * The cases exercise every branch `pr_core_run` exposes:
    *   - HALT wins over everything (exit 2, HALT banner)
    *   - REA_SKIP_PUSH_REVIEW bypass (exit 0, audit receipt)
-   *   - REA_SKIP_CODEX_REVIEW bypass (exit 0 after writing a
-   *     `codex.review.skipped` audit record). Note: despite the name, this
-   *     hatch is currently a whole-gate bypass — it `exit 0`s before
-   *     section 6's ref resolution and section 7a's protected-path gate
-   *     ever run. See task #85 for the semantic debt.
+   *   - REA_SKIP_CODEX_REVIEW waiver (writes `codex.review.skipped` audit
+   *     receipt, satisfies the protected-path check only; HALT, ref-
+   *     resolution, and push-review cache still run). Under #85 (0.8.0)
+   *     the waiver narrowed from whole-gate bypass to Codex-only — exit 2
+   *     on cache miss, exit 0 only when a valid push-review cache entry
+   *     satisfies the general gate too.
    *   - Empty stdin + no argv (no pre-push shape, no JSON) → exit 0
    *   - Non-protected-path push → exit 0
    */
@@ -407,7 +408,7 @@ describe('push-review-gate-git.sh — native git pre-push adapter (task #50)', (
       expect(viaGit.status).toBe(0);
     });
 
-    it('REA_SKIP_CODEX_REVIEW bypass fires identically via both adapters', async () => {
+    it('REA_SKIP_CODEX_REVIEW waiver fires identically via both adapters (#85)', async () => {
       const repo = await makeRepo();
       cleanup.push(repo.dir);
 
@@ -419,14 +420,16 @@ describe('push-review-gate-git.sh — native git pre-push adapter (task #50)', (
       });
 
       expect(viaGit.status).toBe(viaGeneric.status);
-      // Current implementation (0.7.0): the Codex hatch is a whole-gate
-      // bypass — section 5c writes a `codex.review.skipped` audit record
-      // and exits 0 before ref-resolution (section 6) or protected-path
-      // detection (section 7a) run. Both adapters inherit that. Task #85
-      // tracks narrowing the hatch to a true Codex-only waiver.
-      expect(viaGit.status).toBe(0);
-      expect(viaGit.stderr).toMatch(/CODEX REVIEW SKIPPED/);
-      expect(viaGeneric.stderr).toMatch(/CODEX REVIEW SKIPPED/);
+      // #85 (0.8.0): the waiver narrowed from whole-gate bypass to a
+      // Codex-only waiver. Section 5c still writes the skip audit record
+      // and prints the WAIVER banner (parity assertion), but ref-resolution
+      // and the general review-required gate still run. With no cache
+      // entry, section 9 blocks both adapters with exit 2.
+      expect(viaGit.status).toBe(2);
+      expect(viaGit.stderr).toMatch(/CODEX REVIEW WAIVER active/);
+      expect(viaGeneric.stderr).toMatch(/CODEX REVIEW WAIVER active/);
+      expect(viaGit.stderr).toMatch(/PUSH REVIEW GATE: Review required/);
+      expect(viaGeneric.stderr).toMatch(/PUSH REVIEW GATE: Review required/);
 
       const audit = await fs
         .readFile(path.join(repo.dir, '.rea', 'audit.jsonl'), 'utf8')
@@ -691,10 +694,12 @@ describe('push-review-gate-git.sh — native git pre-push adapter (task #50)', (
       expect(res.status).toBe(2);
       expect(res.stderr).toMatch(/protected paths changed/);
 
-      // Sanity: the REA_SKIP_CODEX_REVIEW escape hatch still lets the
-      // same push through — proves the block above fired on the
-      // protected-path gate (not a ref-resolution failure earlier). Same
-      // pattern as the husky-e2e bootstrap regression.
+      // Sanity: the REA_SKIP_CODEX_REVIEW waiver satisfies the
+      // protected-path check but the general review-required gate still
+      // blocks (cache miss). Proves the block above fired on the
+      // protected-path gate (not a ref-resolution failure earlier) — if
+      // ref-resolution were failing, the waiver wouldn't reach section 9
+      // to print the general gate banner.
       const bypass = spawnSync('bash', [repo.gitHook, 'origin'], {
         cwd: repo.dir,
         env: {
@@ -705,7 +710,10 @@ describe('push-review-gate-git.sh — native git pre-push adapter (task #50)', (
         input: prepushLine,
         encoding: 'utf8',
       });
-      expect(bypass.status).toBe(0);
+      expect(bypass.status).toBe(2);
+      expect(bypass.stderr).toMatch(/CODEX REVIEW WAIVER active/);
+      expect(bypass.stderr).not.toMatch(/protected paths changed/);
+      expect(bypass.stderr).toMatch(/PUSH REVIEW GATE: Review required/);
     });
   });
 

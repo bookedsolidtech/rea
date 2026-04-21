@@ -281,7 +281,7 @@ describe('push-review-gate.sh — G11.4 review.codex_required honored', () => {
     // message is DISTINCT from the Codex-required banner.
     expect(res.stderr).not.toMatch(/protected paths changed/);
     expect(res.stderr).not.toMatch(/\/codex-review required/);
-    expect(res.stderr).not.toMatch(/CODEX REVIEW SKIPPED/);
+    expect(res.stderr).not.toMatch(/CODEX REVIEW (SKIPPED|WAIVER)/);
 
     // And no audit skip record was written — a skip is only meaningful when
     // Codex is required.
@@ -305,7 +305,7 @@ describe('push-review-gate.sh — G11.4 review.codex_required honored', () => {
     });
 
     // No Codex banner, no skip banner.
-    expect(res.stderr).not.toMatch(/CODEX REVIEW SKIPPED/);
+    expect(res.stderr).not.toMatch(/CODEX REVIEW (SKIPPED|WAIVER)/);
     expect(res.stderr).not.toMatch(/protected paths changed/);
 
     // No skip audit record.

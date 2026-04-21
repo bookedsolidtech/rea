@@ -22,24 +22,39 @@
 # so in practice a consumer can wire THIS file into `.husky/pre-push` and it
 # just works. The `-git` adapter exists for clarity of install intent.
 #
-# ── Escape hatch: REA_SKIP_CODEX_REVIEW ──────────────────────────────────────
-# Env var `REA_SKIP_CODEX_REVIEW=<reason>` bypasses the Codex adversarial-
-# review requirement. Set to any non-empty value; the value IS the reason
-# recorded in the audit record (no default reason is supplied — if the
-# operator sets `REA_SKIP_CODEX_REVIEW=1` the reason is literally "1").
+# ── Codex-only waiver: REA_SKIP_CODEX_REVIEW ─────────────────────────────────
+# Env var `REA_SKIP_CODEX_REVIEW=<reason>` waives the Codex adversarial-
+# review requirement (section 7 protected-path check). Set to any non-empty
+# value; the value IS the reason recorded in the audit record (no default
+# reason is supplied — if the operator sets `REA_SKIP_CODEX_REVIEW=1` the
+# reason is literally "1").
 #
-# ORDERING (0.7.0): the hatch fires AFTER the HALT check but BEFORE ref-
-# resolution and protected-path detection. Prior to 0.7.0 the check ran
-# inside the protected-path branch and only fired when the diff touched a
-# protected path — which meant an operator who wanted to skip Codex review
-# got blocked by a transient ref-resolution failure (missing remote object,
-# unresolvable source ref, etc.) before the skip ever fired. The new
-# ordering mirrors REA_SKIP_PUSH_REVIEW: if the operator has committed to
-# the bypass (accepting the audit record), ref-resolution failures should
-# not strand the skip. Tradeoff: the skip now fires on every push when set,
-# not just protected-path pushes. The audit receipt makes the operator
-# accountable either way, and REA_SKIP_CODEX_REVIEW keeps its distinct
-# tool_name so it never satisfies the `codex.review` jq predicate.
+# SCOPE (0.8.0, #85): Codex-only. The waiver only satisfies the
+# protected-path Codex-audit requirement. Every other gate this hook
+# runs still runs:
+#   • HALT (.rea/HALT) — still blocks.
+#   • Cross-repo guard — still blocks.
+#   • Ref-resolution failures — still block.
+#   • Push-review cache — a miss still falls through to section 9's general
+#     review-required block.
+# (Blocked-paths enforcement is a separate hook on Edit/Write tiers, not
+# this push hook — it was never gated by REA_SKIP_CODEX_REVIEW.)
+#
+# For a full-gate bypass, use `REA_SKIP_PUSH_REVIEW=<reason>` (section 5a).
+# The 0.7.0 semantic (whole-gate bypass via the Codex hatch) was misleading
+# — operators reached for REA_SKIP_CODEX_REVIEW to silence a transient
+# Codex unavailability and accidentally bypassed every other check too.
+# 0.8.0 narrows it to what the name implies.
+#
+# ORDERING: the waiver fires AFTER the HALT check but BEFORE ref-resolution.
+# Prior to 0.7.0 the check ran inside the protected-path branch and only
+# fired when the diff touched a protected path — which meant an operator
+# who wanted to skip Codex review got blocked by a transient ref-resolution
+# failure (missing remote object, unresolvable source ref, etc.) before the
+# skip ever fired. The current ordering preserves the skip audit record
+# even when downstream gates (ref-resolution, cache) block: the operator's
+# commitment to waive is durable, even if the push itself is blocked on
+# another gate.
 #
 # Every invocation appends a `tool_name: "codex.review.skipped"` record to
 # `.rea/audit.jsonl` via the public audit helper. This record is intentionally
