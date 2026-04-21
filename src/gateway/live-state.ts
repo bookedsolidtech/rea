@@ -172,23 +172,50 @@ export class LiveStatePublisher {
    * shutdown (to flush any pending updates before the state file is
    * ownership-cleaned).
    *
-   * Codex P1 (0.9.0 review): before writing, check the on-disk file's
-   * `session_id`. If it carries a DIFFERENT session id, a newer
-   * `rea serve` instance has already claimed the breadcrumb — we must
-   * NOT overwrite it with our (older) payload. Doing so would feed
-   * `cleanupStateIfOwned` an old session id and cause the newer
-   * instance's shutdown to nuke the file that matches it. When our
-   * session id matches, or when the file is absent / malformed (first
-   * write), proceed normally.
+   * ## Ownership handoff (Codex P1 + P2b)
+   *
+   * The ownership check + rename is performed under a sidecar lockfile
+   * (`serve.state.json.lock`) created with `O_EXCL` (`wx`). This converts
+   * what was two non-atomic steps into a serialized critical section.
+   *
+   * Flow:
+   *
+   *   1. Acquire the lock (`open(path, 'wx')`). If EEXIST, a concurrent
+   *      writer — either another publisher in THIS process (not possible
+   *      given the debounce, but cheap to defend against) or another
+   *      `rea serve` instance with overlapping lifetime — holds it. Skip
+   *      this flush silently; the debounce timer will try again, and on
+   *      shutdown the concurrent writer's own state will be authoritative.
+   *   2. Under the lock: re-read the on-disk `session_id`. If it belongs
+   *      to a DIFFERENT session, another instance has already claimed the
+   *      breadcrumb. Release the lock and yield (log-only).
+   *   3. Under the lock: atomically rename our temp file over the target.
+   *      Because the concurrent writer cannot execute step 3 until we
+   *      release the lock, and we only reach step 3 after confirming the
+   *      on-disk session matches ours, the "older clobbers newer"
+   *      race Codex flagged is closed.
+   *   4. Release the lock (unlink the sidecar) in a finally block.
+   *
+   * Stale locks from a crashed process with the same PID would deadlock
+   * the critical section forever — so the acquire step checks the lock
+   * file's contents (written as our PID + random nonce) and, if the
+   * owning PID is no longer running, steals it. The steal path is
+   * intentionally narrow (PID-check only, no timestamp TTL) because
+   * holding the lock longer than a single flushNow invocation is a bug.
    */
   flushNow(): void {
     if (this.stopped) return;
+    let lockFd: number | null = null;
     try {
+      lockFd = this.acquireLock();
+      if (lockFd === null) {
+        // A concurrent writer holds the lock. Skip this flush; a later
+        // debounced scheduleUpdate or the shutdown flushNow will retry.
+        return;
+      }
       if (!this.ownsStateFile()) {
-        // A different session has stamped the file. This is the overlap
-        // case: another `rea serve` raced in and claimed the breadcrumb.
-        // Yield ownership silently; the newer instance's publisher is the
-        // authoritative writer from here on.
+        // A different session has stamped the file. Yield ownership
+        // silently; the newer instance is the authoritative writer.
         this.opts.logger?.info({
           event: 'live_state.yielded',
           message:
@@ -207,6 +234,106 @@ export class LiveStatePublisher {
         message: 'failed to update serve.state.json — rea status may show stale downstream data',
         error: err instanceof Error ? err.message : String(err),
       });
+    } finally {
+      if (lockFd !== null) this.releaseLock(lockFd);
+    }
+  }
+
+  /** Path to the sidecar lockfile. Resolved once per call; trivial cost. */
+  private lockFilePath(): string {
+    return `${this.opts.stateFilePath}.lock`;
+  }
+
+  /**
+   * Try to acquire the sidecar lock. Returns the lock file descriptor on
+   * success, or `null` on contention. Throws only on unexpected I/O errors
+   * (permissions, disk full) — those propagate out of `flushNow`'s try
+   * block and land in the `write_failed` log path.
+   *
+   * Stale-lock recovery: if a lockfile exists but its recorded PID is not
+   * currently running, the file is unlinked and one retry is issued. This
+   * covers the case where a previous `rea serve` SIGKILL'd mid-flush and
+   * left a dangling lockfile.
+   */
+  private acquireLock(): number | null {
+    const lockPath = this.lockFilePath();
+    const payload = `${process.pid} ${crypto.randomUUID()}\n`;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const fd = fs.openSync(lockPath, 'wx', 0o600);
+        fs.writeSync(fd, payload);
+        return fd;
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code !== 'EEXIST') throw err;
+        // Someone holds the lock. Check if the holder is a live process;
+        // if not, steal it exactly once.
+        if (attempt === 0 && this.isStaleLock(lockPath)) {
+          try {
+            fs.unlinkSync(lockPath);
+          } catch {
+            // Best-effort; another racer may have already unlinked. Loop
+            // around and attempt the open again regardless.
+          }
+          continue;
+        }
+        return null;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Release the sidecar lock. Best-effort — if the unlink fails, the next
+   * flushNow will see a dangling lock and the stale-lock recovery path
+   * will clean it up. We MUST still close the fd so we don't leak it.
+   */
+  private releaseLock(fd: number): void {
+    try {
+      fs.closeSync(fd);
+    } catch {
+      /* ignored */
+    }
+    try {
+      fs.unlinkSync(this.lockFilePath());
+    } catch {
+      /* ignored — stale-lock recovery on next flush will handle it */
+    }
+  }
+
+  /**
+   * Returns true iff the lock file's recorded PID is not currently alive.
+   * Uses `process.kill(pid, 0)` which sends no signal but errors with
+   * ESRCH when the PID is gone. Any parse error or unexpected kill error
+   * is treated as "not stale" to err on the side of NOT stealing a live
+   * peer's lock.
+   */
+  private isStaleLock(lockPath: string): boolean {
+    let raw: string;
+    try {
+      raw = fs.readFileSync(lockPath, 'utf8');
+    } catch {
+      return false;
+    }
+    const match = /^(\d+)\s/.exec(raw);
+    if (match === null) return false;
+    const pid = Number(match[1]);
+    if (!Number.isFinite(pid) || pid <= 0) return false;
+    if (pid === process.pid) {
+      // Our own process already holds the lock — this should be impossible
+      // given `flushNow` runs single-threaded on the event loop, but don't
+      // steal from ourselves.
+      return false;
+    }
+    try {
+      process.kill(pid, 0);
+      return false; // Process is alive — lock is not stale.
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      // ESRCH: no such process. EPERM: process exists but we can't signal
+      // it (different uid) — treat as NOT stale because the holder is
+      // alive from someone else's perspective.
+      return code === 'ESRCH';
     }
   }
 

@@ -186,6 +186,25 @@ export type DownstreamSupervisorEvent =
   | {
       kind: 'respawned';
       server: string;
+    }
+  | {
+      /**
+       * A non-transition health change. Fires whenever a visible field in
+       * {@link DownstreamHealth} (health, last_error, tools_count) mutates
+       * WITHOUT being accompanied by a breaker transition or respawn event.
+       *
+       * Codex 0.9.0 pass-2 P2a: without this event, the first failed call/
+       * reconnect below the breaker threshold (or a successful `listTools`
+       * that updates the cached tool count) never reaches the live state
+       * publisher, so `rea status` would show stale data until some later,
+       * unrelated circuit or respawn event finally flushed a snapshot.
+       *
+       * Firing is best-effort from the connection class; the pool additionally
+       * emits this kind after `listAllTools` updates `lastToolsCount` so a
+       * tool-catalog change is always visible in the next debounced snapshot.
+       */
+      kind: 'health_changed';
+      server: string;
     };
 
 /**
@@ -325,6 +344,18 @@ export class DownstreamConnection {
   }
 
   /**
+   * Emit a `health_changed` event. Called from every site that mutates a
+   * health/last_error/tools_count-visible field WITHOUT firing one of the
+   * louder supervisor events (`child_died_unexpectedly` / `respawned`).
+   * Addresses Codex 0.9.0 pass-2 P2a — live-state was only scheduled from
+   * breaker transitions and respawns, so transient errors below the breaker
+   * threshold would leave `rea status` showing stale data.
+   */
+  private emitHealthChanged(): void {
+    this.emitSupervisorEvent({ kind: 'health_changed', server: this.config.name });
+  }
+
+  /**
    * Handle an unexpected transport close. Fires when the child process exits
    * outside a caller-initiated `close()`, or when the stdio pipe errors in a
    * way the SDK surfaces as a close event.
@@ -414,12 +445,14 @@ export class DownstreamConnection {
       this.health = 'unhealthy';
       const msg = `failed to resolve env for downstream "${this.config.name}": ${err instanceof Error ? err.message : err}`;
       this.#lastErrorMessage = msg;
+      this.emitHealthChanged();
       throw new Error(msg);
     }
 
     if (built.missing.length > 0) {
       this.health = 'unhealthy';
       this.#lastErrorMessage = `missing env: ${built.missing.join(', ')}`;
+      this.emitHealthChanged();
       // One line per missing var so grep/jq users can find the exact gap.
       // We intentionally do NOT log the env key name's VALUE (there is none —
       // it's unresolved) nor any other env values.
@@ -470,6 +503,7 @@ export class DownstreamConnection {
       this.activeTransport = transport;
       this.health = 'healthy';
       this.#lastErrorMessage = null;
+      this.emitHealthChanged();
     } catch (err) {
       this.health = 'unhealthy';
       const msg = `failed to connect to downstream "${this.config.name}" (${this.config.command}): ${err instanceof Error ? err.message : err}`;
@@ -481,6 +515,7 @@ export class DownstreamConnection {
       } catch {
         // Best-effort.
       }
+      this.emitHealthChanged();
       throw new Error(msg);
     }
   }
@@ -511,7 +546,14 @@ export class DownstreamConnection {
       // this, a connection that failed once and then recovered on the very
       // next call (same client, no reconnect) would forever report the old
       // error via `__rea__health`, misleading operators about live state.
+      //
+      // Codex 0.9.0 pass-2 P2a: only emit `health_changed` when we actually
+      // cleared something — the common success path runs through here every
+      // call, so noisy emission would burn debounced writes. A same-value
+      // write is a no-op for live-state purposes.
+      const hadError = this.#lastErrorMessage !== null;
       this.#lastErrorMessage = null;
+      if (hadError) this.emitHealthChanged();
       return result;
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -564,6 +606,7 @@ export class DownstreamConnection {
             message: `downstream "${this.config.name}" unhealthy after one reconnect`,
             error: errMsg,
           });
+          this.emitHealthChanged();
           throw new Error(
             `downstream "${this.config.name}" unhealthy after one reconnect: ${errMsg}`,
           );
@@ -577,6 +620,7 @@ export class DownstreamConnection {
         message: `downstream "${this.config.name}" call failed`,
         error: message,
       });
+      this.emitHealthChanged();
       throw new Error(`downstream "${this.config.name}" call failed: ${message}`);
     }
   }

@@ -450,6 +450,97 @@ describe('DownstreamConnection reconnect semantics', () => {
     expect(events).toEqual([]);
   });
 
+  it('BUG-004 / Codex P2a: health_changed fires on terminal call failure (no breaker transition)', async () => {
+    // Below-threshold failures never reach the breaker's onStateChange, so
+    // without a health_changed event the live-state publisher would never
+    // flush — `rea status` would show stale healthy=true + last_error=null
+    // while the connection was actually in an unhealthy state.
+    const s1 = makeStubClient(() => Promise.reject(new Error('transient blip')));
+    const s2 = makeStubClient(() =>
+      Promise.reject(new Error('reconnect failure — within flap')),
+    );
+    const conn = makeConnection([s2]);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (conn as any).client = s1;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (conn as any).health = 'healthy';
+
+    const events: Array<{ kind: string; server: string }> = [];
+    conn.onSupervisorEvent((e) => events.push({ kind: e.kind, server: e.server }));
+
+    // Episode 1: first attempt fails → reconnect attempts, also fails → terminal.
+    await expect(conn.callTool('ping', {})).rejects.toThrow(/unhealthy after one reconnect/);
+
+    // The reconnect-failure path must emit health_changed so the publisher
+    // sees the unhealthy state even before any breaker transition.
+    const healthChanges = events.filter((e) => e.kind === 'health_changed');
+    expect(healthChanges.length).toBeGreaterThanOrEqual(1);
+    expect(healthChanges.every((e) => e.server === 'mock')).toBe(true);
+    expect(conn.isHealthy).toBe(false);
+  });
+
+  it('BUG-004 / Codex P2a: health_changed on success clears stale lastError', async () => {
+    // Recovery path: a previous failure stamped lastError; the next
+    // successful call must both clear it AND emit health_changed so the
+    // publisher flushes the recovery to disk. Without the event, a user
+    // reading `rea status` would see a stale `last_error` for an already-
+    // healthy server.
+    const s2 = makeStubClient(() => Promise.resolve({ ok: 'recovered' }));
+    const conn = makeConnection([]); // no stubs — we won't trigger reconnect
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (conn as any).client = s2;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (conn as any).health = 'healthy';
+    // Seed a stale lastError via the natural write path: route a terminal
+    // call failure through callTool — the reconnect-attempted + flap-window
+    // branch takes the else-terminal branch that writes lastError.
+    const badClient = makeStubClient(() => Promise.reject(new Error('seed stale')));
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (conn as any).client = badClient;
+    // Hit a terminal failure without reconnect: set reconnectAttempted true
+    // and within flap window so we take the "else" terminal branch that
+    // writes lastError and emits health_changed.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (conn as any).reconnectAttempted = true;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (conn as any).lastReconnectAt = Date.now();
+    await expect(conn.callTool('ping', {})).rejects.toThrow(/call failed/);
+    expect(conn.lastError).not.toBeNull();
+
+    // Swap in the recovering client and subscribe AFTER the seed phase so we
+    // only observe the recovery emission.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (conn as any).client = s2;
+    const events: string[] = [];
+    conn.onSupervisorEvent((e) => events.push(e.kind));
+
+    const result = await conn.callTool('ping', {});
+    expect(result).toEqual({ ok: 'recovered' });
+    expect(conn.lastError).toBeNull();
+    expect(events).toContain('health_changed');
+  });
+
+  it('BUG-004 / Codex P2a: repeated success does NOT spam health_changed', async () => {
+    // Once lastError is null, successive successful callTools must not
+    // emit health_changed — emitting per-call would burn the debounced
+    // write budget for no state change.
+    const client = makeStubClient(() => Promise.resolve({ ok: 1 }));
+    const conn = makeConnection([]);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (conn as any).client = client;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (conn as any).health = 'healthy';
+
+    const events: string[] = [];
+    conn.onSupervisorEvent((e) => events.push(e.kind));
+
+    await conn.callTool('ping', {});
+    await conn.callTool('ping', {});
+    await conn.callTool('ping', {});
+
+    expect(events).toEqual([]); // no emission on steady-state success
+  });
+
   it('refuses a second reconnect within the flap window', async () => {
     const firstClient = makeStubClient(() => Promise.reject(new Error('transport closed #1')));
     const secondClient = makeStubClient(() => Promise.resolve({ ok: 'reconnect-1-retry' }));

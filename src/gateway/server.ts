@@ -297,10 +297,19 @@ export function createGateway(opts: GatewayOptions): GatewayHandle {
 
   const staticChain = buildMiddlewareChain(opts, { breaker });
 
-  // Pool supervisor events (child death + respawn) → live-state publisher.
-  // The tracker's own respawn handler is currently a no-op by design; we
-  // route the event here so a future policy change (e.g. reset on
-  // respawn-after-timeout) has a single wiring site.
+  // Pool supervisor events → live-state publisher. Covers three kinds:
+  //   - `child_died_unexpectedly` — child exited outside a caller-initiated
+  //     close(). Session-blocker counts this indirectly through the breaker
+  //     transition it eventually triggers.
+  //   - `respawned` — successful reconnect. Informs session-blocker so a
+  //     recovered server doesn't stay blocker-emitted forever.
+  //   - `health_changed` — a non-transition mutation of a field surfaced in
+  //     `rea status` (health, last_error, tools_count). Codex 0.9.0 pass-2
+  //     P2a: without this, the first failure below the breaker threshold
+  //     or a successful `listTools` count change never reached the
+  //     publisher, leaving `rea status` showing stale downstream data.
+  // `scheduleUpdate()` is debounced (250 ms default) so storm bursts
+  // coalesce to one write.
   pool.onSupervisorEvent((event) => {
     if (event.kind === 'respawned') sessionBlocker.recordRespawn(event.server);
     livePublisher?.scheduleUpdate();

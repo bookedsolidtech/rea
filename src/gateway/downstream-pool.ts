@@ -111,7 +111,17 @@ export class DownstreamPool {
       if (!conn.isHealthy) continue;
       try {
         const tools = await conn.listTools();
+        // Codex 0.9.0 pass-2 P2a: emit a `health_changed` supervisor event
+        // whenever the cached tools count actually changes. Without this,
+        // a successful listTools would update the value in memory but the
+        // live-state publisher would never flush the change — `rea status`
+        // would keep reporting a stale `tools_count` until some unrelated
+        // circuit/respawn event flushed a snapshot.
+        const prev = this.lastToolsCount.get(server);
         this.lastToolsCount.set(server, tools.length);
+        if (prev !== tools.length) {
+          this.supervisorListener?.({ kind: 'health_changed', server });
+        }
         for (const t of tools) {
           const prefixed: PrefixedTool = {
             ...t,

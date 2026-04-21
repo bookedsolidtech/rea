@@ -164,4 +164,124 @@ describe('LiveStatePublisher', () => {
       spy.mockRestore();
     }
   });
+
+  // ---------------------------------------------------------------------------
+  // Codex 0.9.0 pass-2 P2b: lock-guarded ownership handoff
+  //
+  // The earlier P1 fix read serve.state.json to check session ownership, but
+  // the read-then-rename pair was still a TOCTOU — an older and a newer
+  // instance could both pass the check, and whichever rename landed last
+  // would clobber the winner. P2b closes that window by serializing the
+  // critical section behind an O_EXCL sidecar lock file.
+  // ---------------------------------------------------------------------------
+
+  it('acquires the sidecar lock during flushNow and releases it on success', () => {
+    const { publisher } = makePublisher(['alpha']);
+    publisher.flushNow();
+
+    // Post-flush the lock must NOT linger.
+    expect(fs.existsSync(`${statePath}.lock`)).toBe(false);
+    // And the payload landed.
+    expect(fs.existsSync(statePath)).toBe(true);
+  });
+
+  it('yields silently when another session owns the on-disk state file', () => {
+    // Pre-seed the state file with a DIFFERENT session id to simulate a
+    // newer `rea serve` having already claimed the breadcrumb.
+    const foreign = {
+      session_id: 'S-OTHER',
+      started_at: '2026-04-20T00:00:00Z',
+      metrics_port: 9091,
+      downstreams: [],
+      updated_at: '2026-04-20T00:00:00Z',
+    };
+    fs.writeFileSync(statePath, JSON.stringify(foreign) + '\n');
+
+    const { publisher } = makePublisher(['alpha']);
+    publisher.flushNow();
+
+    // Yield: on-disk file MUST still be the foreign payload.
+    const raw = JSON.parse(fs.readFileSync(statePath, 'utf8')) as Record<string, unknown>;
+    expect(raw.session_id).toBe('S-OTHER');
+    // Lock must be released even on yield.
+    expect(fs.existsSync(`${statePath}.lock`)).toBe(false);
+  });
+
+  it('skips the flush cleanly when the sidecar lock is already held by a live process', () => {
+    // Seed a lockfile claiming the CURRENT pid, which `isStaleLock` refuses
+    // to steal from. flushNow must then return without error and without
+    // overwriting the target file.
+    fs.writeFileSync(`${statePath}.lock`, `${process.pid} manual-seed\n`);
+    const pre = fs.existsSync(statePath);
+    const { publisher } = makePublisher(['alpha']);
+    publisher.flushNow();
+
+    // No write happened; the seeded lock is still there (we don't own it).
+    expect(fs.existsSync(`${statePath}.lock`)).toBe(true);
+    expect(fs.existsSync(statePath)).toBe(pre);
+  });
+
+  it('steals a stale lockfile whose recorded PID no longer exists', () => {
+    // Seed a lockfile with a PID that is essentially guaranteed to be
+    // missing. Node exposes `process.kill(pid, 0)` which errors with ESRCH
+    // when the PID is gone — the stale-lock recovery path should unlink
+    // and retry.
+    const deadPid = 2 ** 22; // far above any live Unix pid
+    fs.writeFileSync(`${statePath}.lock`, `${deadPid} stale-seed\n`);
+
+    const { publisher } = makePublisher(['alpha']);
+    publisher.flushNow();
+
+    // Stolen + written + released.
+    expect(fs.existsSync(`${statePath}.lock`)).toBe(false);
+    expect(fs.existsSync(statePath)).toBe(true);
+    const raw = JSON.parse(fs.readFileSync(statePath, 'utf8')) as Record<string, unknown>;
+    expect(raw.session_id).toBe('S-TEST');
+  });
+
+  it('does NOT clobber a newer session even if our own lock acquire succeeds mid-race', () => {
+    // Hard case: BOTH the lock acquire AND the stale-check pass — this
+    // simulates the "older gateway came alive, newer gateway wrote, older
+    // flushNow runs" window. The ownership re-read under the lock must
+    // catch the mismatch and yield.
+    //
+    // Sequence:
+    //   1. No lock exists, no state file exists.
+    //   2. Publisher X (session S-X) acquires lock, reads absent state file
+    //      (own-it=true via ENOENT), writes its snapshot, releases lock.
+    //   3. Publisher Y (session S-Y) acquires lock, reads the S-X snapshot,
+    //      own-it=false → yields.
+    const publisherX = new LiveStatePublisher({
+      baseDir: dir,
+      stateFilePath: statePath,
+      sessionId: 'S-X',
+      startedAt: '2026-04-20T00:00:00Z',
+      metricsPort: null,
+      pool: new DownstreamPool(makeRegistry(['alpha'])),
+      breaker: new CircuitBreaker({ cooldownMs: 10_000, failureThreshold: 3 }),
+      sessionBlocker: new SessionBlockerTracker('S-X'),
+      debounceMs: 20,
+    });
+    const publisherY = new LiveStatePublisher({
+      baseDir: dir,
+      stateFilePath: statePath,
+      sessionId: 'S-Y',
+      startedAt: '2026-04-20T00:00:01Z',
+      metricsPort: null,
+      pool: new DownstreamPool(makeRegistry(['alpha'])),
+      breaker: new CircuitBreaker({ cooldownMs: 10_000, failureThreshold: 3 }),
+      sessionBlocker: new SessionBlockerTracker('S-Y'),
+      debounceMs: 20,
+    });
+
+    publisherX.flushNow();
+    expect(
+      (JSON.parse(fs.readFileSync(statePath, 'utf8')) as Record<string, unknown>).session_id,
+    ).toBe('S-X');
+
+    publisherY.flushNow();
+    // The on-disk file must still be S-X's — Y yielded because X owns it.
+    const afterY = JSON.parse(fs.readFileSync(statePath, 'utf8')) as Record<string, unknown>;
+    expect(afterY.session_id).toBe('S-X');
+  });
 });
