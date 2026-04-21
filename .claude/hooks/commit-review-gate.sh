@@ -171,17 +171,44 @@ fi
 
 # ── 10. Check review cache for all non-trivial commits ────────────────────────
 # Compute SHA and branch here so both standard and significant tiers share them.
-STAGED_SHA=$(cd "$REA_ROOT" && git diff --cached | shasum -a 256 | cut -d' ' -f1 2>/dev/null || echo "")
+#
+# Defect L (rea#63) sibling: `shasum` is not installed on Alpine, distroless,
+# or most minimal Linux CI images — only `sha256sum` is. The prior chain
+# silently produced an empty STAGED_SHA, which the cache block then skipped
+# AND the banner at §11 rendered as `rea cache set  pass` — a dead-end the
+# agent cannot execute. Portable chain mirrors push-review-core.sh §8:
+# sha256sum → shasum → openssl. The openssl branch uses `awk '{print $NF}'`
+# WITHOUT `-r` to stay compatible with OpenSSL 1.1.x (Debian 11, Ubuntu
+# 20.04, RHEL 8, Amazon Linux 2, Alpine 3.13–3.14).
+STAGED_SHA=""
+if command -v sha256sum >/dev/null 2>&1; then
+  STAGED_SHA=$(printf '%s' "$DIFF_FULL" | sha256sum 2>/dev/null | awk '{print $1}')
+elif command -v shasum >/dev/null 2>&1; then
+  STAGED_SHA=$(printf '%s' "$DIFF_FULL" | shasum -a 256 2>/dev/null | awk '{print $1}')
+elif command -v openssl >/dev/null 2>&1; then
+  STAGED_SHA=$(printf '%s' "$DIFF_FULL" | openssl dgst -sha256 2>/dev/null | awk '{print $NF}')
+else
+  printf 'rea commit-review: WARN no sha256 hasher found (sha256sum/shasum/openssl); cache disabled\n' >&2
+fi
+if [[ -n "$STAGED_SHA" && ! "$STAGED_SHA" =~ ^[0-9a-f]{64}$ ]]; then
+  printf 'rea commit-review: WARN hasher returned invalid output; cache disabled\n' >&2
+  STAGED_SHA=""
+fi
 BRANCH=$(cd "$REA_ROOT" && git branch --show-current 2>/dev/null || echo "")
 CACHE_FILE="${REA_ROOT}/.rea/review-cache.json"
 
 if [[ -n "$STAGED_SHA" ]]; then
   CACHE_HIT=false
 
-  # Primary: use CLI when available — handles TTL, expiry, and branch-scoped keys
+  # Primary: use CLI when available — handles TTL, expiry, and branch-scoped keys.
+  # Cache predicate must require BOTH `.hit == true` AND `.result == "pass"` —
+  # a cached `fail` verdict would otherwise satisfy `.hit == true` and let the
+  # commit proceed despite a recorded negative review. Mirrors the push-gate
+  # predicate at push-review-core.sh §8; the §191-199 direct-cache fallback
+  # already enforces `result == "pass"`, so the two paths must agree.
   if [[ ${#REA_CLI_ARGS[@]} -gt 0 ]]; then
     CACHE_RESULT=$("${REA_CLI_ARGS[@]}" cache check "$STAGED_SHA" --branch "$BRANCH" 2>/dev/null || echo '{"hit":false}')
-    if printf '%s' "$CACHE_RESULT" | jq -e '.hit == true' >/dev/null 2>&1; then
+    if printf '%s' "$CACHE_RESULT" | jq -e '.hit == true and .result == "pass"' >/dev/null 2>&1; then
       CACHE_HIT=true
     fi
   fi
@@ -219,8 +246,22 @@ fi
   printf '  1. Inspect:  git diff --cached\n'
   printf '  2. Decide:   Is this safe to commit? (initial commits, refactors, and\n'
   printf '               feature work are normal — use judgement, not ceremony)\n'
-  printf '  3. Approve:  rea cache set %s pass\n' "$STAGED_SHA"
-  printf '  4. Retry the git commit command\n'
+  # Defect L follow-up: when no sha256 hasher is available STAGED_SHA is empty
+  # and `rea cache set  pass` is a dead-end the CLI rejects. Branch the banner
+  # to surface an actionable path instead. Unlike push-review-core.sh there is
+  # no `REA_SKIP_COMMIT_REVIEW` env escape hatch (the commit gate only fires
+  # under Claude Code's Bash `PreToolUse` matcher, so a human direct-shell
+  # commit bypasses it entirely). The only remediation is to install a sha256
+  # hasher or ask the user to commit directly.
+  if [[ -n "$STAGED_SHA" ]]; then
+    printf '  3. Approve:  rea cache set %s pass\n' "$STAGED_SHA"
+    printf '  4. Retry the git commit command\n'
+  else
+    printf '  3. Cache is DISABLED on this host (no sha256 hasher found).\n'
+    printf '     Install one of: sha256sum (Linux coreutils), shasum (perl-core),\n'
+    printf '     or openssl — then retry. Without a hasher the cache path cannot\n'
+    printf '     complete; escalate to the user if no hasher can be installed.\n'
+  fi
   printf '\n'
   printf '  Only escalate to the user if you find a genuine problem in the diff.\n'
 } >&2

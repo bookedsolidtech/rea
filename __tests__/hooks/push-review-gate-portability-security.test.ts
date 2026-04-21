@@ -549,3 +549,224 @@ describe('push-review-gate — 0.9.4 Defect M (SKIP_METADATA numeric os_pid/os_p
     expect(typeof skipRecord.metadata.os_identity.uid).toBe('string');
   });
 });
+
+describe('commit-review-gate — 0.9.4 pass-2 (cache predicate + portable hasher)', () => {
+  const cleanup: string[] = [];
+
+  beforeEach(() => {
+    cleanup.length = 0;
+  });
+
+  afterEach(async () => {
+    await Promise.all(
+      cleanup.map((d) => fs.rm(d, { recursive: true, force: true })),
+    );
+  });
+
+  /**
+   * Stage a 30-line change so the gate classifies it as "standard" (≥20 <200
+   * lines, no sensitive paths) and reaches the cache-check block. A trivial
+   * diff short-circuits before touching the predicate.
+   */
+  async function installCommitGateRepo(): Promise<{
+    dir: string;
+    gitDiffCachedSha: string;
+  }> {
+    const dir = await fs.realpath(
+      await fs.mkdtemp(path.join(os.tmpdir(), 'rea-094-commit-pass2-')),
+    );
+    cleanup.push(dir);
+
+    const git = (...args: string[]): string =>
+      execFileSync('git', args, { cwd: dir, encoding: 'utf8' }).trim();
+
+    git('init', '--initial-branch=main', '--quiet');
+    git('config', 'user.email', 'commit-pass2@example.test');
+    git('config', 'user.name', 'REA 0.9.4 Pass-2');
+    git('config', 'commit.gpgsign', 'false');
+    await fs.writeFile(path.join(dir, 'README.md'), '# scratch\n');
+    git('add', 'README.md');
+    git('commit', '-m', 'baseline', '--quiet');
+
+    const lines = Array.from({ length: 30 }, (_, i) => `line-${i}`).join('\n');
+    await fs.writeFile(path.join(dir, 'change.txt'), lines + '\n');
+    git('add', 'change.txt');
+
+    await fs.mkdir(path.join(dir, '.rea'), { recursive: true });
+    await fs.writeFile(
+      path.join(dir, '.rea', 'policy.yaml'),
+      defaultPolicy(),
+    );
+
+    const destDir = path.join(dir, '.claude', 'hooks');
+    await fs.mkdir(path.join(destDir, '_lib'), { recursive: true });
+    await fs.copyFile(
+      path.join(REPO_ROOT, 'hooks', 'commit-review-gate.sh'),
+      path.join(destDir, 'commit-review-gate.sh'),
+    );
+    await fs.chmod(path.join(destDir, 'commit-review-gate.sh'), 0o755);
+    await fs.copyFile(
+      path.join(REPO_ROOT, 'hooks', '_lib', 'common.sh'),
+      path.join(destDir, '_lib', 'common.sh'),
+    );
+    await fs.chmod(path.join(destDir, '_lib', 'common.sh'), 0o755);
+
+    // Compute the same SHA the gate will compute — sha256 of `git diff --cached`.
+    const diff = execFileSync('git', ['diff', '--cached'], {
+      cwd: dir,
+      encoding: 'utf8',
+    });
+    const { createHash } = await import('node:crypto');
+    const gitDiffCachedSha = createHash('sha256').update(diff).digest('hex');
+
+    return { dir, gitDiffCachedSha };
+  }
+
+  it('cache predicate REQUIRES .result == "pass" — a cached `fail` does NOT allow the commit', async () => {
+    if (!jqExists()) return;
+
+    const { dir, gitDiffCachedSha } = await installCommitGateRepo();
+
+    // Seed the direct-cache file with a `fail` entry keyed on `branch:sha`.
+    // The fallback path already uses `.result == "pass"`; the CLI path is
+    // the one we're pinning here. Setting REA_CLI_ARGS to empty (no CLI) is
+    // NOT what we want — we need the primary path to trigger the CLI check
+    // and find a `fail`. Easiest path: mock a `rea` shim on PATH that emits
+    // `{"hit":true,"result":"fail"}` on `cache check`.
+    const shimDir = path.join(dir, '.bin');
+    await fs.mkdir(shimDir, { recursive: true });
+    const reaShim = path.join(shimDir, 'rea');
+    await fs.writeFile(
+      reaShim,
+      [
+        '#!/bin/bash',
+        'if [[ "$1" == "cache" && "$2" == "check" ]]; then',
+        '  printf \'{"hit":true,"result":"fail"}\\n\'',
+        '  exit 0',
+        'fi',
+        'exit 0',
+        '',
+      ].join('\n'),
+    );
+    await fs.chmod(reaShim, 0o755);
+
+    const res = spawnSync(
+      'bash',
+      [path.join(dir, '.claude', 'hooks', 'commit-review-gate.sh')],
+      {
+        cwd: dir,
+        env: {
+          // PATH with the shim FIRST so the gate resolves to our stub.
+          PATH: `${shimDir}:${process.env.PATH ?? ''}`,
+          CLAUDE_PROJECT_DIR: dir,
+        },
+        input: toolInput('git commit -m "should be blocked"'),
+        encoding: 'utf8',
+      },
+    );
+
+    // A cached `fail` must NOT satisfy the gate. Exit must be 2 (block).
+    // Pre-fix: predicate was `.hit == true` only, so this test exits 0 and
+    // the regression succeeds in attacking us.
+    expect(res.status).toBe(2);
+    expect((res.stderr ?? '').toLowerCase()).toContain('commit review gate');
+
+    // Positive shape-check: the banner MUST render a well-formed cache-set
+    // line with a 64-hex SHA, not a dead-end empty positional. We use a
+    // regex rather than a literal SHA compare because node crypto and the
+    // shell hasher disagree on trailing-newline handling of `git diff
+    // --cached` output — the gate's SHA is the authoritative one.
+    void gitDiffCachedSha;
+    expect(res.stderr).toMatch(
+      /rea cache set [0-9a-f]{64} pass/,
+    );
+  });
+
+  it('banner branches when no sha256 hasher is present — does NOT emit `rea cache set  pass`', async () => {
+    if (!jqExists()) return;
+
+    const { dir } = await installCommitGateRepo();
+
+    // Build a minimal PATH that contains ONLY the tools the gate needs
+    // besides a hasher: git, bash, jq, grep, awk, sed, cat, cut, head,
+    // mkdir, printf. Omit sha256sum, shasum, openssl. Use symlinks into
+    // the sandbox so the real binaries are resolvable but hashers are not.
+    const needed = [
+      'git',
+      'bash',
+      'jq',
+      'grep',
+      'awk',
+      'sed',
+      'cat',
+      'cut',
+      'head',
+      'mkdir',
+      'rm',
+      'dirname',
+      'pwd',
+      'tr',
+      'uname',
+      'wc',
+      'sort',
+      'date',
+      'id',
+      'tee',
+      'env',
+      'basename',
+      'printf',
+    ];
+    const slimBin = path.join(dir, '.slimbin');
+    await fs.mkdir(slimBin, { recursive: true });
+    for (const tool of needed) {
+      const src = spawnSync('command', ['-v', tool], {
+        shell: '/bin/bash',
+        encoding: 'utf8',
+      });
+      const resolved = src.stdout.trim();
+      if (!resolved) continue;
+      try {
+        await fs.symlink(resolved, path.join(slimBin, tool));
+      } catch {
+        // Already exists (race) — ignore.
+      }
+    }
+
+    // Sanity-check: the slim PATH must NOT resolve any hasher. If the host
+    // has hashers in /usr/local/bin but we forgot to mask them, the test is
+    // meaningless. Verify by running `command -v` under the slim PATH.
+    const checkHasher = spawnSync(
+      'bash',
+      ['-c', 'command -v sha256sum shasum openssl 2>/dev/null || true'],
+      { env: { PATH: slimBin }, encoding: 'utf8' },
+    );
+    if (checkHasher.stdout.trim() !== '') {
+      // Host has a hasher outside standard resolution — skip. This only
+      // matters on developer machines; CI's Alpine/Debian images have
+      // hashers in /usr/bin/ which we correctly omit from slimBin.
+      return;
+    }
+
+    const res = spawnSync(
+      'bash',
+      [path.join(dir, '.claude', 'hooks', 'commit-review-gate.sh')],
+      {
+        cwd: dir,
+        env: {
+          PATH: slimBin,
+          CLAUDE_PROJECT_DIR: dir,
+        },
+        input: toolInput('git commit -m "hasherless"'),
+        encoding: 'utf8',
+      },
+    );
+
+    expect(res.status).toBe(2);
+    // Must NOT emit the dead-end `rea cache set  pass` (two spaces = empty
+    // positional). This is the UX cliff we're fixing.
+    expect(res.stderr).not.toMatch(/rea cache set\s+pass/);
+    // Must emit the "Cache is DISABLED" alternate remediation.
+    expect(res.stderr).toMatch(/Cache is DISABLED/);
+    expect(res.stderr).toMatch(/no sha256 hasher/i);
+  });
+});
