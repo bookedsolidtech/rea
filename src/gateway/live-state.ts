@@ -171,10 +171,31 @@ export class LiveStatePublisher {
    * Called on boot (to publish the initial downstream block) and on
    * shutdown (to flush any pending updates before the state file is
    * ownership-cleaned).
+   *
+   * Codex P1 (0.9.0 review): before writing, check the on-disk file's
+   * `session_id`. If it carries a DIFFERENT session id, a newer
+   * `rea serve` instance has already claimed the breadcrumb — we must
+   * NOT overwrite it with our (older) payload. Doing so would feed
+   * `cleanupStateIfOwned` an old session id and cause the newer
+   * instance's shutdown to nuke the file that matches it. When our
+   * session id matches, or when the file is absent / malformed (first
+   * write), proceed normally.
    */
   flushNow(): void {
     if (this.stopped) return;
     try {
+      if (!this.ownsStateFile()) {
+        // A different session has stamped the file. This is the overlap
+        // case: another `rea serve` raced in and claimed the breadcrumb.
+        // Yield ownership silently; the newer instance's publisher is the
+        // authoritative writer from here on.
+        this.opts.logger?.info({
+          event: 'live_state.yielded',
+          message:
+            'another rea serve session owns serve.state.json — yielding live-state writes for this process',
+        });
+        return;
+      }
       const snapshot = this.buildSnapshot();
       writeFileAtomic(this.opts.stateFilePath, JSON.stringify(snapshot, null, 2) + '\n');
     } catch (err) {
@@ -186,6 +207,42 @@ export class LiveStatePublisher {
         message: 'failed to update serve.state.json — rea status may show stale downstream data',
         error: err instanceof Error ? err.message : String(err),
       });
+    }
+  }
+
+  /**
+   * Returns true iff the on-disk state file either (a) does not exist,
+   * (b) cannot be parsed, or (c) carries a `session_id` matching ours.
+   * Returning `true` on unparseable/missing is deliberate — the very first
+   * boot write HAS to proceed, and a corrupt legacy file is better
+   * overwritten by a valid new one than preserved indefinitely.
+   *
+   * Reading the file on every flush is acceptable cost: writes are
+   * debounced to ~4 Hz maximum, the file is tiny (few hundred bytes), and
+   * the check avoids the "older instance clobbers newer instance's
+   * breadcrumb" hazard Codex flagged.
+   */
+  private ownsStateFile(): boolean {
+    let raw: string;
+    try {
+      raw = fs.readFileSync(this.opts.stateFilePath, 'utf8');
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      // ENOENT is expected on the very first write.
+      if (code === 'ENOENT') return true;
+      // Any other read error (permissions, EIO) — fall through and try to
+      // write; the write will surface the real error via the outer
+      // try/catch. We do NOT want to silently suppress writes on a
+      // transient read hiccup.
+      return true;
+    }
+    try {
+      const parsed = JSON.parse(raw) as { session_id?: unknown };
+      if (typeof parsed.session_id !== 'string') return true;
+      return parsed.session_id === this.opts.sessionId;
+    } catch {
+      // Unparseable file — treat as "not owned by anyone", safe to overwrite.
+      return true;
     }
   }
 

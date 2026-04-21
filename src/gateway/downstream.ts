@@ -208,12 +208,20 @@ export class DownstreamConnection {
    */
   private activeTransport: StdioClientTransport | null = null;
   /**
-   * True while `close()` is actively being executed. `onclose` / `onerror`
-   * callbacks that fire during our own tear-down must NOT promote the close
-   * to an "unexpected child death" — that would double-count failures and
-   * confuse the SESSION_BLOCKER tracker.
+   * Set of transports currently being torn down by an in-flight `close()`.
+   * `onclose` / `onerror` callbacks that fire for a transport in this set
+   * must NOT be promoted to an "unexpected child death" — they are our own
+   * tear-down signal.
+   *
+   * Codex P2 (0.9.0 review): the earlier `closingIntentionally` boolean was
+   * connection-wide. Under concurrent calls, one call's `await this.close()`
+   * could overlap with another call's reconnect that had already installed
+   * a NEW transport. A genuine `onclose` from the new transport would hit
+   * the boolean guard and be silently ignored, reintroducing the stale-
+   * handle bug the patch targeted. Per-transport scoping eliminates the
+   * race: only the exact transport we asked to close is silenced.
    */
-  private closingIntentionally = false;
+  private readonly closingTransports = new Set<StdioClientTransport>();
   /**
    * Whether a reconnect has already been attempted in the CURRENT failure
    * episode. Resets to `false` after a reconnect succeeds (so a later,
@@ -324,7 +332,8 @@ export class DownstreamConnection {
    * Contract:
    *   - Only runs for the currently-active transport (stale callbacks from
    *     an already-swapped transport are ignored).
-   *   - Does NOT run when WE initiated the close (closingIntentionally=true).
+   *   - Does NOT run when WE initiated the close (the transport is a member
+   *     of `closingTransports` for the duration of our own `close()` call).
    *   - Nulls `this.client` so the next `callTool` takes the `connect()`
    *     branch and actually respawns the child.
    *   - Marks the connection unhealthy so the pool knows not to route
@@ -338,8 +347,13 @@ export class DownstreamConnection {
     // already swapped in a new one. Ignore — the new transport is live and
     // we don't want to clobber it.
     if (this.activeTransport !== transport) return;
-    // Our own tear-down is running — onclose is expected, not a death event.
-    if (this.closingIntentionally) return;
+    // Per-transport intentional-close filter. Codex P2 (0.9.0 review): a
+    // connection-wide boolean would let a late `onclose` from a newly
+    // reconnected transport be silenced while an earlier `close()` on the
+    // PREVIOUS transport was still in flight. Scoping by transport
+    // identity means only the exact transport we asked to close is
+    // silenced — a real death on any other transport fires normally.
+    if (this.closingTransports.has(transport)) return;
 
     this.client = null;
     this.activeTransport = null;
@@ -569,11 +583,17 @@ export class DownstreamConnection {
 
   async close(): Promise<void> {
     const c = this.client;
-    // Set the intentional-close gate BEFORE nulling client/transport so any
-    // transport `onclose` callback that fires synchronously during `c.close()`
-    // (the SDK can emit close from within close()) is recognized as our
-    // tear-down rather than a child death.
-    this.closingIntentionally = true;
+    // Capture the transport being closed BEFORE we null `activeTransport`,
+    // so a synchronously-firing `onclose` during `c.close()` can be matched
+    // against this specific transport instead of whichever transport is
+    // "current" at the moment the callback lands. Codex P2 (0.9.0 review):
+    // the earlier implementation used a connection-wide boolean, which
+    // under concurrent calls could silence a legitimate death event for a
+    // newer transport while we were still tearing down an older one.
+    const closingTransport = this.activeTransport;
+    if (closingTransport !== null) {
+      this.closingTransports.add(closingTransport);
+    }
     this.client = null;
     this.activeTransport = null;
     try {
@@ -584,7 +604,9 @@ export class DownstreamConnection {
         // Best-effort close — child may already be gone.
       }
     } finally {
-      this.closingIntentionally = false;
+      if (closingTransport !== null) {
+        this.closingTransports.delete(closingTransport);
+      }
     }
   }
 }
