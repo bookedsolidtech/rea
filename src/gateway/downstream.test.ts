@@ -370,6 +370,35 @@ describe('DownstreamConnection reconnect semantics', () => {
     expect(conn.lastError).toBeNull();
   });
 
+  it('BUG-003 / Codex pass-3 P2: "Not connected" still closes the stale client (no transport leak)', async () => {
+    // Regression for Codex 0.9.0 pass-3 P2: an earlier fix nulled
+    // `this.client` + `this.activeTransport` BEFORE the reconnect branch's
+    // `await this.close()`, so close() saw `c === null` and returned
+    // without tearing down the transport — the stale child leaked until
+    // gateway shutdown. The current code calls `close()` inline on the
+    // NOT_CONNECTED branch so the tear-down actually happens.
+    let s1Closed = false;
+    const s1 = {
+      callTool: () => Promise.reject(new Error('Not connected')),
+      close: async (): Promise<void> => {
+        s1Closed = true;
+      },
+    };
+    const s2 = makeStubClient(() => Promise.resolve({ ok: 'respawned' }));
+    const conn = makeConnection([s2]);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (conn as any).client = s1;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (conn as any).activeTransport = { id: 's1-transport' };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (conn as any).health = 'healthy';
+
+    const result = await conn.callTool('ping', {});
+    expect(result).toEqual({ ok: 'respawned' });
+    // The stale client was actually closed — no transport leak.
+    expect(s1Closed).toBe(true);
+  });
+
   it('BUG-002: supervisor event fires on unexpected transport close', () => {
     // Unit-level: exercise handleUnexpectedClose via the supervisor event
     // plumbing to confirm the contract (null client, unhealthy, emit) rather

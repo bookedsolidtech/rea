@@ -341,16 +341,20 @@ export async function runServe(): Promise<void> {
 
   // ── Pidfile + state (AFTER metrics boot so we persist the real port) ─────
   //
-  // 0.9.0: the gateway's LiveStatePublisher owns subsequent writes to
-  // serve.state.json. We still do one boot-time write here so `rea status`
-  // returns useful data during the window between now and the publisher's
-  // first flush inside `handle.start()`.
+  // 0.9.0: the gateway's LiveStatePublisher owns all writes to
+  // serve.state.json, including the boot-time snapshot. Earlier drafts
+  // used the legacy `writeStateFile()` here to cover the bootstrap window
+  // between now and `handle.start()`'s first flush, but that write
+  // bypassed the sidecar-lock protocol and reintroduced the TOCTOU race
+  // P2b was designed to close (Codex 0.9.0 pass-3 P1: an overlapping
+  // older `rea serve` could clobber this unprotected write and the
+  // newer instance would later cleanup its own file during shutdown).
+  //
+  // Routing the boot write through `handle.livePublisher.flushNow()`
+  // means the boot snapshot is guarded by the same lock as every
+  // subsequent flush; overlapping gateways serialize cleanly.
   const pidPath = writePidfile(baseDir);
-  writeStateFile(baseDir, {
-    session_id: sessionId,
-    started_at: startedAt,
-    metrics_port: metricsServer?.port() ?? null,
-  });
+  handle.livePublisher?.flushNow();
 
   let shuttingDown = false;
   const shutdown = async (signal: string): Promise<void> => {

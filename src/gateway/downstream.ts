@@ -560,15 +560,24 @@ export class DownstreamConnection {
       const withinFlapWindow =
         this.lastReconnectAt !== 0 && Date.now() - this.lastReconnectAt < RECONNECT_FLAP_WINDOW_MS;
 
-      // BUG-003: "Not connected" means the SDK's idea of the client state has
-      // diverged from reality — usually because the child exited between
+      // BUG-003: "Not connected" means the SDK's idea of the client state
+      // has diverged from reality — usually because the child exited between
       // calls and the `onclose` hook hasn't fired yet (or raced this call).
-      // Treat the current client as dead: null it so the reconnect branch
-      // below forces a full respawn rather than retrying with the same
-      // stale handle.
+      // Force a proper tear-down NOW so the next branch either reconnects
+      // against a clean slate (reconnect branch) or leaves a null client so
+      // the NEXT callTool's guard spawns fresh (terminal branch). Codex
+      // 0.9.0 pass-3 P2: an earlier implementation nulled `this.client` +
+      // `this.activeTransport` inline here, which made the subsequent
+      // `await this.close()` below a no-op (`c` was already null) — the
+      // stale child would leak until gateway shutdown. Calling `close()`
+      // eagerly ensures the transport is actually closed.
       if (message.includes(NOT_CONNECTED_MARKER)) {
-        this.client = null;
-        this.activeTransport = null;
+        try {
+          await this.close();
+        } catch {
+          // Best-effort — close() already swallows transport close errors,
+          // but belt-and-braces for any unexpected throw.
+        }
       }
 
       if (!this.reconnectAttempted && !withinFlapWindow) {
@@ -581,6 +590,9 @@ export class DownstreamConnection {
           reason: message,
         });
         try {
+          // For non-NOT_CONNECTED paths we still need to tear down the old
+          // client. When we DID take the NOT_CONNECTED branch above, `close()`
+          // is idempotent: `c === null` short-circuits cleanly.
           await this.close();
           await this.connect();
           this.emitSupervisorEvent({ kind: 'respawned', server: this.config.name });
