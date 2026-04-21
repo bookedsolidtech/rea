@@ -78,12 +78,16 @@ describe('policy middleware — rea-subcommand tier reclassification (Defect E)'
     expect(ctx.tier).toBe(Tier.Read);
   });
 
-  it('allows `npx rea doctor` at L0 (Read tier)', async () => {
+  it('denies `npx rea doctor` at L0 (weak trust post-pass-3 — no Read downgrade)', async () => {
+    // Pass-3 Codex Finding 2: `npx` on a cache-cold machine is download +
+    // install + execute, which is not Read-tier. `npx rea …` is now weak-trust
+    // just like bare `rea`; L0 agents must use an absolute install path
+    // (`/usr/local/bin/rea`, `/…/node_modules/.bin/rea`) to get the Read
+    // downgrade.
     const mw = createPolicyMiddleware(stubPolicy(AutonomyLevel.L0));
     const ctx = bashCtx('npx rea doctor');
-    const nextCalled = await run(mw, ctx);
-    expect(nextCalled).toBe(true);
-    expect(ctx.tier).toBe(Tier.Read);
+    await run(mw, ctx);
+    expect(ctx.status).toBe(InvocationStatus.Denied);
   });
 
   it('denies bare `rea cache check` at L0 (weak trust, no downgrade)', async () => {

@@ -174,40 +174,56 @@ export function isToolBlocked(
 const REA_SHELL_METACHAR_RE = /[;&|`\n\r<>]|\$\(|>\(|<\(/;
 
 /**
- * Path suffixes recognized as trusted `rea` CLI entry points.
+ * Returns true iff `first` is an invocation shape we trust for Read-tier
+ * downgrade. Implemented as a function because the trust rules are not pure
+ * suffix matching — pass-3 Codex review surfaced two P1 bypasses in the old
+ * suffix-only model:
  *
- * SECURITY: we deliberately do NOT accept the bare token `rea`. An attacker
- * with control over `$PATH` (e.g. a shim earlier on the search path, or a
- * command executed from a directory containing a malicious `./rea`) can
- * defeat name-only matching. The classifier requires a `/` in the first
- * token AND a suffix match from the list below. That combination rejects:
+ *   1. A repo-authored `./bin/rea` script satisfied `endsWith('/bin/rea')`
+ *      and classified as Read at L0 → RCE via repo content.
+ *   2. A repo-authored `./dist/cli/index.js` satisfied
+ *      `endsWith('/dist/cli/index.js')` → same.
  *
- *   - bare `rea`, `rea-helper`, `evil-rea`            (no `/`, PATH-spoofable)
- *   - `./rea`, `/opt/evil-rea`, `./evil-rea`          (has `/`, no matching suffix)
+ * The rules now require:
+ *   - The first token is **absolute** (starts with `/`). Relative paths are
+ *     attacker-influenced via CWD and repo content, so they never get the
+ *     Read-tier downgrade. Callers MAY still run relative-path rea — they
+ *     just fall through to weak-trust (bare `rea`) semantics: Destructive
+ *     subcommands still upgrade; Read/Write fall back to the generic Bash
+ *     Write tier.
+ *   - The path matches one of the two *strong* install shapes:
+ *       (a) contains `/node_modules/.bin/rea` anywhere (unambiguous marker
+ *           of an npm install directory tree);
+ *       (b) starts with `/usr/` or `/opt/` AND ends with `/bin/rea`
+ *           (classic root-write system install location). `/home/…/bin/rea`
+ *           is intentionally NOT honored — `/home/<user>/` is writable
+ *           without root, so an attacker with local shell access could
+ *           pre-seed a trusted-looking path there.
  *
- * And accepts:
- *
- *   - `npx rea …` / `npx @bookedsolid/rea …`         (npx is handled separately)
- *   - `/usr/local/bin/rea` (global install)           (absolute, ends in /bin/rea)
- *   - `./node_modules/.bin/rea`                       (project install, matches)
- *   - `/opt/app/node_modules/.bin/rea`                (bespoke install, matches)
- *   - `node ./dist/cli/index.js` — handled via suffix /dist/cli/index.js when
- *     the first token is the script path (e.g. from the source tree)
+ * The old `/dist/cli/index.js` suffix is gone entirely. The legitimate
+ * developer invocation `node ./dist/cli/index.js` has `first === 'node'`
+ * which never matches; only a filesystem-marked-executable
+ * `./dist/cli/index.js` would have hit the old suffix, and that shape was
+ * always attacker-authorable inside a repo. Similarly, `/.bin/rea` (exactly
+ * `/.bin/rea`, at filesystem root) was an accident of suffix matching, not
+ * a real install location; it is gone.
  */
-const REA_TRUSTED_PATH_SUFFIXES = [
-  '/node_modules/.bin/rea',
-  '/dist/cli/index.js',
-  '/bin/rea',
-  '/.bin/rea',
-];
-
 function isTrustedReaPath(first: string): boolean {
-  // Reject bare names to close PATH-spoofing. A trusted invocation must be
-  // explicit about where the binary lives.
-  if (!first.includes('/')) return false;
-  for (const suffix of REA_TRUSTED_PATH_SUFFIXES) {
-    if (first === suffix || first.endsWith(suffix)) return true;
+  if (!first.startsWith('/')) return false;
+
+  // npm install marker — absolute path whose tail is `/node_modules/.bin/rea`.
+  // This is unambiguous: an attacker can only seed this path by having already
+  // run a real npm install, at which point they already had execution.
+  if (first.endsWith('/node_modules/.bin/rea')) return true;
+
+  // Classic global install — absolute path rooted at a system prefix that
+  // requires root write (so attacker-seeded files are out-of-scope for the
+  // repo-content threat model).
+  if (first.endsWith('/bin/rea')) {
+    if (first.startsWith('/usr/')) return true;
+    if (first.startsWith('/opt/')) return true;
   }
+
   return false;
 }
 
@@ -227,13 +243,24 @@ export function reaCommandTier(command: string): Tier | null {
   const first = tokens[0];
   if (first === undefined) return null;
 
-  // Classify the invocation's trust posture. The ONLY fully-trusted shapes
-  // are (a) `npx rea …` / `npx @bookedsolid/rea …`, and (b) a first token
-  // that contains `/` and ends with a known rea entry-point suffix. Bare
-  // `rea` is accepted as a *weak-trust* shape: we still recognize the
-  // subcommand for the sake of destructive-tier UPGRADES (e.g. `rea freeze`
-  // at L1 should be blocked whether or not we can prove the binary is ours),
-  // but we refuse to DOWNGRADE anything for a PATH-spoofable name.
+  // Classify the invocation's trust posture. The ONLY fully-trusted shape is
+  // an absolute-path invocation that `isTrustedReaPath()` recognizes as a
+  // strong install marker (npm `/node_modules/.bin/rea` or a root-write
+  // system global under `/usr/` or `/opt/`). Everything else — bare `rea`,
+  // `npx rea …`, relative paths — is treated as *weak trust*: we still
+  // recognize the subcommand for the sake of destructive-tier UPGRADES
+  // (e.g. `rea freeze` at L1 should be blocked whether or not we can prove
+  // the binary is ours), but we refuse to DOWNGRADE anything that could be
+  // piggybacking on a PATH-spoofable name or an `npx` network/install
+  // side-effect.
+  //
+  // npx note (pass-3 Codex Finding 2): `npx rea …` on a machine without the
+  // package locally cached downloads the tarball, writes to the npm cache,
+  // and executes — explicitly not Read-tier semantics. Treating npx as weak
+  // trust forces agents to commit to a deterministic install path (absolute
+  // `/usr/local/bin/rea` from `npm i -g`, or the fully-resolved
+  // `/…/node_modules/.bin/rea` from a project install) if they want the
+  // Read-tier downgrade.
   let idx = 0;
   let trust: 'trusted' | 'weak' = 'trusted';
   if (first === 'npx') {
@@ -241,9 +268,16 @@ export function reaCommandTier(command: string): Tier | null {
     const second = tokens[1];
     if (second !== 'rea' && second !== '@bookedsolid/rea') return null;
     idx = 2;
+    trust = 'weak';
   } else if (isTrustedReaPath(first)) {
     idx = 1;
-  } else if (first === 'rea') {
+  } else if (first === 'rea' || first.split('/').pop() === 'rea') {
+    // Bare `rea` OR any path (relative/absolute) whose tail is literally
+    // `rea`. This captures `./bin/rea`, `./node_modules/.bin/rea`,
+    // `/home/user/.npm-global/bin/rea`, `/tmp/fake/rea`, etc. — none of
+    // these are full-trust under `isTrustedReaPath()`, but we still want
+    // Destructive subcommands (`freeze`) to UPGRADE from Bash Write even
+    // here, because destructive intent is invocation-shape-independent.
     idx = 1;
     trust = 'weak';
   } else {

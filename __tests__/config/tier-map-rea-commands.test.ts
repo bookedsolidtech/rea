@@ -9,15 +9,19 @@
  * ...` and `rea audit record codex-review ...`). The helper fixes the
  * self-consistency break by classifying each subcommand by its own semantics.
  *
- * Trust model (post-Codex review):
- *   - FULL trust: `npx rea …`, `npx @bookedsolid/rea …`, or a first token
- *     that contains `/` and ends with a known entry-point suffix
- *     (`/node_modules/.bin/rea`, `/bin/rea`, `/.bin/rea`, `/dist/cli/index.js`).
- *     Full trust returns the natural tier for each subcommand.
- *   - WEAK trust: bare `rea` token (PATH-spoofable). Returns `Destructive`
- *     for `freeze` (upgrade preserved — block at L1 even if we cannot prove
- *     the binary is ours), returns `null` otherwise (no downgrade — defers
- *     to the generic Bash Write default).
+ * Trust model (post-Codex pass 3 review):
+ *   - FULL trust: first token is absolute AND either (a) ends with
+ *     `/node_modules/.bin/rea`, or (b) starts with `/usr/` or `/opt/` AND
+ *     ends with `/bin/rea`. Relative paths (`./node_modules/.bin/rea`,
+ *     `./bin/rea`), paths in `/home/`, paths in `/tmp/`, and paths that
+ *     only coincidentally end in `/bin/rea` or `/dist/cli/index.js` are
+ *     NOT trusted (pass-3 Codex Finding 1).
+ *   - WEAK trust: bare `rea`, `npx rea …`, and `npx @bookedsolid/rea …`.
+ *     `npx` is weak because a first-run download+execute is not Read-tier
+ *     semantics (pass-3 Codex Finding 2). Returns `Destructive` for
+ *     `freeze` so `rea freeze` at L1 still blocks regardless of invocation
+ *     shape; returns `null` otherwise (no downgrade — defers to the
+ *     generic Bash Write default).
  *   - No trust: returns `null` for any non-rea first token.
  */
 
@@ -25,40 +29,37 @@ import { describe, expect, it } from 'vitest';
 import { reaCommandTier } from '../../src/config/tier-map.js';
 import { Tier } from '../../src/policy/types.js';
 
-describe('reaCommandTier — fully-trusted invocations (path-prefixed / npx)', () => {
+describe('reaCommandTier — fully-trusted invocations (absolute path only)', () => {
   it.each([
     ['/usr/local/bin/rea check', Tier.Read],
     ['/usr/local/bin/rea doctor', Tier.Read],
     ['/usr/local/bin/rea status', Tier.Read],
-    ['./node_modules/.bin/rea cache check abc --branch feat/x --base main', Tier.Read],
-    ['./node_modules/.bin/rea cache list', Tier.Read],
+    ['/usr/bin/rea check', Tier.Read],
+    ['/opt/homebrew/bin/rea doctor', Tier.Read],
     ['/opt/app/node_modules/.bin/rea cache get abc', Tier.Read],
+    ['/Users/me/project/node_modules/.bin/rea cache check abc --branch feat/x --base main', Tier.Read],
     ['/usr/local/bin/rea audit verify', Tier.Read],
     ['/usr/local/bin/rea audit record codex-review --head-sha abc --verdict pass', Tier.Read],
-    ['npx rea check', Tier.Read],
-    ['npx rea cache check abc --branch a --base main', Tier.Read],
-    ['npx @bookedsolid/rea doctor', Tier.Read],
   ])('%s → Read', (cmd, expected) => {
     expect(reaCommandTier(cmd)).toBe(expected);
   });
 
   it.each([
     ['/usr/local/bin/rea cache set abc pass --branch feat/x --base main', Tier.Write],
-    ['./node_modules/.bin/rea cache clear abc', Tier.Write],
+    ['/opt/app/node_modules/.bin/rea cache clear abc', Tier.Write],
     ['/usr/local/bin/rea audit rotate', Tier.Write],
     ['/usr/local/bin/rea init --yes', Tier.Write],
     ['/usr/local/bin/rea serve', Tier.Write],
     ['/usr/local/bin/rea upgrade --yes', Tier.Write],
     ['/usr/local/bin/rea unfreeze --yes', Tier.Write],
     ['/usr/local/bin/rea something-unrecognized', Tier.Write],
-    ['npx rea init --yes', Tier.Write],
   ])('%s → Write', (cmd, expected) => {
     expect(reaCommandTier(cmd)).toBe(expected);
   });
 
   it.each([
     ['/usr/local/bin/rea freeze --reason halt', Tier.Destructive],
-    ['npx rea freeze --reason halt', Tier.Destructive],
+    ['/opt/app/node_modules/.bin/rea freeze --reason halt', Tier.Destructive],
   ])('%s → Destructive', (cmd, expected) => {
     expect(reaCommandTier(cmd)).toBe(expected);
   });
@@ -72,10 +73,11 @@ describe('reaCommandTier — fully-trusted invocations (path-prefixed / npx)', (
   });
 });
 
-describe('reaCommandTier — weak-trust bare `rea` (PATH-spoofable)', () => {
+describe('reaCommandTier — weak trust (bare `rea`, `npx rea`, relative paths)', () => {
   // Weak-trust: no Read downgrade. These would be Read under full trust but
-  // bare `rea` defers to the generic Bash Write default (returns null).
+  // weak-trust invocations defer to the generic Bash Write default (null).
   it.each([
+    // Bare name — PATH-spoofable.
     'rea check',
     'rea doctor',
     'rea status',
@@ -83,6 +85,19 @@ describe('reaCommandTier — weak-trust bare `rea` (PATH-spoofable)', () => {
     'rea audit verify',
     'rea audit record codex-review --head-sha abc --verdict pass',
     'rea',
+    // npx — pass-3 Codex Finding 2. npx on a cache-cold machine
+    // downloads + writes + executes, which is not Read-tier.
+    'npx rea check',
+    'npx rea doctor',
+    'npx rea cache check abc --branch a --base main',
+    'npx @bookedsolid/rea doctor',
+    // Relative paths — attacker-influenced via CWD.
+    './node_modules/.bin/rea check',
+    './node_modules/.bin/rea cache check abc',
+    './node_modules/.bin/rea doctor',
+    // /home/ paths — writable without root, not honored.
+    '/home/user/.npm-global/bin/rea check',
+    '/home/user/.local/bin/rea doctor',
   ])('%s → null (defers to generic Bash Write)', (cmd) => {
     expect(reaCommandTier(cmd)).toBeNull();
   });
@@ -92,14 +107,22 @@ describe('reaCommandTier — weak-trust bare `rea` (PATH-spoofable)', () => {
     'rea cache set abc pass',
     'rea init --yes',
     'rea upgrade --yes',
+    'npx rea init --yes',
+    './node_modules/.bin/rea cache set abc pass',
   ])('%s → null (write fall-through)', (cmd) => {
     expect(reaCommandTier(cmd)).toBeNull();
   });
 
   // Weak-trust: Destructive upgrade IS preserved. `rea freeze` at L1 must
   // block regardless of whether the binary on PATH is ours.
-  it('rea freeze → Destructive even under weak trust', () => {
-    expect(reaCommandTier('rea freeze --reason "stop"')).toBe(Tier.Destructive);
+  it.each([
+    'rea freeze --reason "stop"',
+    'npx rea freeze --reason halt',
+    'npx @bookedsolid/rea freeze --reason halt',
+    './node_modules/.bin/rea freeze --reason halt',
+    '/home/user/.npm-global/bin/rea freeze',
+  ])('%s → Destructive (upgrade preserved even under weak trust)', (cmd) => {
+    expect(reaCommandTier(cmd)).toBe(Tier.Destructive);
   });
 });
 
@@ -175,19 +198,27 @@ describe('reaCommandTier — shell-metacharacter bypass (Codex HIGH)', () => {
     // Bare name — PATH-spoofable. Weak-trust; Read downgrade denied.
     'rea check',
     'rea doctor',
-    // Relative paths outside the trusted suffix list.
+    // Relative paths — not absolute, so never full-trust.
     './evil-rea freeze',
     './rea check',
-    // Absolute paths not matching any trusted suffix.
+    './bin/rea check',
+    './dist/cli/index.js doctor',
+    // Absolute paths not matching any trusted install marker.
     '/opt/evil-rea check',
     '/tmp/not-the-real-rea doctor',
+    // Pass-3 Codex Finding 1: these previously classified as trusted via
+    // suffix match. They are now rejected because (a) relative, or (b) in
+    // an attacker-writable absolute path.
+    '/tmp/repo/bin/rea doctor',
+    '/tmp/repo/dist/cli/index.js check',
+    '/home/user/repo/bin/rea check',
   ])('returns null for weak/untrusted path-based "rea" invocations: %s', (cmd) => {
     expect(reaCommandTier(cmd)).toBeNull();
   });
 
   it.each([
     ['/usr/local/bin/rea doctor', Tier.Read],
-    ['./node_modules/.bin/rea cache check abc', Tier.Read],
+    ['/usr/bin/rea check', Tier.Read],
     ['/opt/app/node_modules/.bin/rea audit record codex-review', Tier.Read],
   ])('keeps classification for trusted paths: %s', (cmd, expected) => {
     expect(reaCommandTier(cmd)).toBe(expected);
