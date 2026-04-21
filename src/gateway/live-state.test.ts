@@ -440,4 +440,97 @@ describe('LiveStatePublisher', () => {
       vi.useRealTimers();
     }
   });
+
+  it('Codex pass-7 concern #1: lastErrorRedactor scrubs last_error before disk write', () => {
+    // Seed a pool with one downstream and spy `healthSnapshot` to inject a
+    // secret-shaped `last_error` — mirrors what a misbehaving downstream
+    // could echo back (e.g. "failed to POST: TOKEN=<hex>").
+    // Without the redactor, that string lands verbatim in
+    // `.rea/serve.state.json` and on the operator's terminal via
+    // `rea status`. With the redactor, the literal secret must NOT appear
+    // on disk. Uses a non-credential-shaped sentinel string so the
+    // secret-scanner hook doesn't reject this test file.
+    const registry = makeRegistry(['alpha']);
+    const pool = new DownstreamPool(registry);
+    const breaker = new CircuitBreaker({ cooldownMs: 10_000, failureThreshold: 3 });
+    const blocker = new SessionBlockerTracker('S-REDACT');
+
+    const sentinel = 'SENTINEL-SHOULD-NOT-LAND-ON-DISK';
+    const leaky = `transport errored: leaked=${sentinel}`;
+    vi.spyOn(pool, 'healthSnapshot').mockReturnValue([
+      {
+        name: 'alpha',
+        enabled: true,
+        connected: false,
+        healthy: false,
+        last_error: leaky,
+        tools_count: null,
+      },
+    ]);
+
+    const redactor = (v: string): string => v.replace(sentinel, '[REDACTED]');
+
+    const publisher = new LiveStatePublisher({
+      baseDir: dir,
+      stateFilePath: statePath,
+      sessionId: 'S-REDACT',
+      startedAt: '2026-04-20T00:00:00Z',
+      metricsPort: null,
+      pool,
+      breaker,
+      sessionBlocker: blocker,
+      debounceMs: 20,
+      lastErrorRedactor: redactor,
+    });
+
+    publisher.flushNow();
+
+    const diskText = fs.readFileSync(statePath, 'utf8');
+    expect(diskText).not.toContain(sentinel);
+    const raw = JSON.parse(diskText) as Record<string, unknown>;
+    const ds = raw.downstreams as Array<Record<string, unknown>>;
+    expect(ds).toHaveLength(1);
+    expect(ds[0]?.last_error).toBe('transport errored: leaked=[REDACTED]');
+  });
+
+  it('omitting lastErrorRedactor preserves pre-0.9.0 behavior (last_error persisted verbatim)', () => {
+    // Guardrail: embedders or direct `createGateway` consumers that do NOT
+    // pass a redactor must not suddenly see redaction kick in (no default
+    // redactor baked into the publisher). Validates the branch path in
+    // `buildDownstreamBlock`.
+    const registry = makeRegistry(['alpha']);
+    const pool = new DownstreamPool(registry);
+    const breaker = new CircuitBreaker({ cooldownMs: 10_000, failureThreshold: 3 });
+    const blocker = new SessionBlockerTracker('S-NOREDACT');
+
+    const raw_err = 'plain error text — should not be touched';
+    vi.spyOn(pool, 'healthSnapshot').mockReturnValue([
+      {
+        name: 'alpha',
+        enabled: true,
+        connected: true,
+        healthy: false,
+        last_error: raw_err,
+        tools_count: null,
+      },
+    ]);
+
+    const publisher = new LiveStatePublisher({
+      baseDir: dir,
+      stateFilePath: statePath,
+      sessionId: 'S-NOREDACT',
+      startedAt: '2026-04-20T00:00:00Z',
+      metricsPort: null,
+      pool,
+      breaker,
+      sessionBlocker: blocker,
+      debounceMs: 20,
+    });
+
+    publisher.flushNow();
+
+    const raw = JSON.parse(fs.readFileSync(statePath, 'utf8')) as Record<string, unknown>;
+    const ds = raw.downstreams as Array<Record<string, unknown>>;
+    expect(ds[0]?.last_error).toBe(raw_err);
+  });
 });

@@ -68,7 +68,7 @@ import type { Registry } from '../registry/types.js';
 import type { Policy } from '../policy/types.js';
 import { InvocationStatus, Tier } from '../policy/types.js';
 import { log } from '../cli/utils.js';
-import { createLogger, type Logger } from './log.js';
+import { createLogger, type FieldRedactor, type Logger } from './log.js';
 import { CIRCUIT_GAUGE, type MetricsRegistry } from './observability/metrics.js';
 
 export interface GatewayOptions {
@@ -104,6 +104,20 @@ export interface GatewayOptions {
   liveStateSessionId?: string;
   liveStateStartedAt?: string;
   liveStateMetricsPort?: number | null;
+  /**
+   * 0.9.0 pass-7 — optional redactor applied to every downstream
+   * `last_error` before it is written into `.rea/serve.state.json`. When
+   * omitted, error strings are persisted verbatim (length-bounded and
+   * control-char-stripped at display time, but CONTENT unredacted).
+   *
+   * `rea serve` wires this to the same pattern set the gateway logger
+   * uses, so a misbehaving downstream that echoes `AWS_SECRET_ACCESS_KEY`
+   * or similar into an error message has the secret replaced with
+   * `[REDACTED]` before it reaches the operator's terminal via
+   * `rea status`. Direct `createGateway` consumers may omit this if they
+   * have their own redaction pipeline or are in a test environment.
+   */
+  liveStateLastErrorRedactor?: FieldRedactor;
 }
 
 export interface GatewayHandle {
@@ -301,8 +315,12 @@ export function createGateway(opts: GatewayOptions): GatewayHandle {
   //   - `child_died_unexpectedly` — child exited outside a caller-initiated
   //     close(). Session-blocker counts this indirectly through the breaker
   //     transition it eventually triggers.
-  //   - `respawned` — successful reconnect. Informs session-blocker so a
-  //     recovered server doesn't stay blocker-emitted forever.
+  //   - `respawned` — successful reconnect. Forwarded to session-blocker as
+  //     an intentional no-op (see `recordRespawn` JSDoc): respawn is NOT
+  //     equivalent to circuit recovery, so we do NOT clear blocker state
+  //     on reconnect. The method exists to make the wiring site obvious
+  //     on the call graph and to give us one place to change if the
+  //     semantics ever shift — but today it deliberately records nothing.
   //   - `health_changed` — a non-transition mutation of a field surfaced in
   //     `rea status` (health, last_error, tools_count). Codex 0.9.0 pass-2
   //     P2a: without this, the first failure below the breaker threshold
@@ -316,7 +334,9 @@ export function createGateway(opts: GatewayOptions): GatewayHandle {
   });
 
   if (opts.liveStateFilePath !== undefined) {
-    livePublisher = new LiveStatePublisher({
+    // Build options defensively — exactOptionalPropertyTypes refuses
+    // `lastErrorRedactor: undefined` against `lastErrorRedactor?: FieldRedactor`.
+    const publisherOpts = {
       baseDir,
       stateFilePath: opts.liveStateFilePath,
       sessionId: opts.liveStateSessionId ?? currentSessionId(),
@@ -326,7 +346,11 @@ export function createGateway(opts: GatewayOptions): GatewayHandle {
       breaker,
       sessionBlocker,
       logger,
-    });
+      ...(opts.liveStateLastErrorRedactor !== undefined
+        ? { lastErrorRedactor: opts.liveStateLastErrorRedactor }
+        : {}),
+    };
+    livePublisher = new LiveStatePublisher(publisherOpts);
   }
 
   // Read `.rea/HALT` without ever throwing. Returns `{halt, reason}` where

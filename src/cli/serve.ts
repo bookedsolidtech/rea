@@ -309,6 +309,12 @@ export async function runServe(): Promise<void> {
     liveStateSessionId: sessionId,
     liveStateStartedAt: startedAt,
     liveStateMetricsPort: metricsServer?.port() ?? null,
+    // 0.9.0 pass-7 — reuse the gateway log redactor so downstream error
+    // strings are scrubbed for secret-shaped content BEFORE hitting
+    // serve.state.json or the operator's terminal via `rea status`.
+    // The redactor already incorporates SECRET_PATTERNS plus any
+    // operator-defined policy.redact.patterns loaded above.
+    liveStateLastErrorRedactor: logRedactor,
   });
 
   // ── HALT acknowledgement at startup (G5) ─────────────────────────────────

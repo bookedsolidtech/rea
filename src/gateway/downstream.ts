@@ -425,6 +425,38 @@ export class DownstreamConnection {
   }
 
   /**
+   * Handle a transport-layer protocol error. onerror does NOT always imply
+   * close — the SDK emits it for protocol errors too. We record the error
+   * text but leave connection invalidation to the eventual onclose callback,
+   * which is guaranteed to follow a fatal transport error on stdio.
+   *
+   * Codex 0.9.0 pass-6 P2: filter stale/intentional-close callbacks the
+   * same way `handleUnexpectedClose` does. Without this, a delayed
+   * onerror from a PREVIOUSLY-ACTIVE transport (one we've already torn
+   * down or replaced) can clobber the HEALTHY replacement connection's
+   * last_error and emit a spurious health_changed, leaving `rea status`
+   * showing a stale error on a perfectly live child. The `onclose`
+   * hook already enforced this filter; the `onerror` hook did not.
+   */
+  private handleTransportError(transport: StdioClientTransport, err: Error): void {
+    if (this.activeTransport !== transport) return;
+    if (this.closingTransports.has(transport)) return;
+    this.#lastErrorMessage = err.message;
+    this.logger?.warn({
+      event: 'downstream.transport_error',
+      server_name: this.config.name,
+      message: `downstream "${this.config.name}" transport error`,
+      error: err.message,
+    });
+    // Codex 0.9.0 pass-4 P2: surface the new last_error to the live-state
+    // publisher immediately. Before this emit, a protocol-level transport
+    // error that did NOT trigger a subsequent onclose would update
+    // last_error in memory but leave `rea status` showing the previous
+    // (stale) value until some unrelated circuit/respawn event flushed.
+    this.emitHealthChanged();
+  }
+
+  /**
    * Last error observed, or null if the connection has never failed (or fully
    * recovered).
    *
@@ -501,23 +533,7 @@ export class DownstreamConnection {
       this.handleUnexpectedClose(transport, 'transport closed');
     };
     transport.onerror = (err: Error): void => {
-      // onerror does NOT always imply close — the SDK emits it for protocol
-      // errors too. We record the error text but leave connection
-      // invalidation to the eventual onclose callback, which is guaranteed
-      // to follow a fatal transport error on stdio.
-      this.#lastErrorMessage = err.message;
-      this.logger?.warn({
-        event: 'downstream.transport_error',
-        server_name: this.config.name,
-        message: `downstream "${this.config.name}" transport error`,
-        error: err.message,
-      });
-      // Codex 0.9.0 pass-4 P2: surface the new last_error to the live-state
-      // publisher immediately. Before this emit, a protocol-level transport
-      // error that did NOT trigger a subsequent onclose would update
-      // last_error in memory but leave `rea status` showing the previous
-      // (stale) value until some unrelated circuit/respawn event flushed.
-      this.emitHealthChanged();
+      this.handleTransportError(transport, err);
     };
 
     const client = new Client(

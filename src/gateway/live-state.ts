@@ -44,7 +44,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import type { CircuitBreaker, CircuitState } from './circuit-breaker.js';
 import type { DownstreamPool } from './downstream-pool.js';
-import type { Logger } from './log.js';
+import type { FieldRedactor, Logger } from './log.js';
 import type { SessionBlockerTracker } from './session-blocker.js';
 
 export interface LiveStateOptions {
@@ -62,6 +62,19 @@ export interface LiveStateOptions {
    * can force immediate flushes.
    */
   debounceMs?: number;
+  /**
+   * Redactor applied to `last_error` strings before they are written to
+   * `serve.state.json`. `rea serve` wires this to the same
+   * `buildRegexRedactor` instance the gateway logger uses (policy
+   * `redact.patterns` + built-in `SECRET_PATTERNS`) so a credential that
+   * leaked into a downstream error message does not end up on disk or on
+   * an operator's terminal via `rea status`.
+   *
+   * Omitting the redactor preserves pre-0.9.0 behavior (no last_error
+   * redaction at the publisher layer). Direct embedders of `createGateway`
+   * that pass their own logger redactor should also pass this.
+   */
+  lastErrorRedactor?: FieldRedactor;
 }
 
 /**
@@ -135,6 +148,7 @@ interface ResolvedLiveStateOptions {
   sessionBlocker: SessionBlockerTracker;
   debounceMs: number;
   logger?: Logger;
+  lastErrorRedactor?: FieldRedactor;
 }
 
 /**
@@ -170,8 +184,9 @@ export class LiveStatePublisher {
   constructor(opts: LiveStateOptions) {
     // Build the resolved options defensively. `exactOptionalPropertyTypes`
     // refuses to accept `logger: undefined` against `logger?: Logger`, so
-    // we branch on presence instead of assigning `undefined`.
-    const base: Omit<ResolvedLiveStateOptions, 'logger'> = {
+    // we branch on presence instead of assigning `undefined`. Same treatment
+    // for `lastErrorRedactor`.
+    const base: Omit<ResolvedLiveStateOptions, 'logger' | 'lastErrorRedactor'> = {
       baseDir: opts.baseDir,
       stateFilePath: opts.stateFilePath,
       sessionId: opts.sessionId,
@@ -182,7 +197,12 @@ export class LiveStatePublisher {
       sessionBlocker: opts.sessionBlocker,
       debounceMs: opts.debounceMs ?? 250,
     };
-    this.opts = opts.logger !== undefined ? { ...base, logger: opts.logger } : base;
+    const withLogger: Omit<ResolvedLiveStateOptions, 'lastErrorRedactor'> =
+      opts.logger !== undefined ? { ...base, logger: opts.logger } : base;
+    this.opts =
+      opts.lastErrorRedactor !== undefined
+        ? { ...withLogger, lastErrorRedactor: opts.lastErrorRedactor }
+        : withLogger;
   }
 
   /**
@@ -544,13 +564,19 @@ export class LiveStatePublisher {
         retryAt = new Date(circuitEntry.openedAt + circuitEntry.cooldownMs).toISOString();
       }
       const blocker = blockerSnapshot.get(h.name);
+      // Run `last_error` through the optional redactor before persistence.
+      // Null passes through unchanged; absent redactor = pre-0.9.0 behavior.
+      const lastError =
+        h.last_error !== null && this.opts.lastErrorRedactor
+          ? this.opts.lastErrorRedactor(h.last_error)
+          : h.last_error;
       out.push({
         name: h.name,
         connected: h.connected,
         healthy: h.healthy,
         circuit_state: circuitState,
         retry_at: retryAt,
-        last_error: h.last_error,
+        last_error: lastError,
         tools_count: h.tools_count,
         open_transitions: blocker?.open_transitions ?? 0,
         session_blocker_emitted: blocker?.emitted ?? false,
