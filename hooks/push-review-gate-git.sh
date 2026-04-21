@@ -45,13 +45,15 @@
 # generic Claude Code adapter.
 #
 # ── Escape hatches ────────────────────────────────────────────────────────────
-#   REA_SKIP_CODEX_REVIEW=<reason>  — bypass the Codex adversarial-review
-#                                     requirement for this push. Audit record
+#   REA_SKIP_CODEX_REVIEW=<reason>  — Codex-only waiver. Since 0.8.0 (#85)
+#                                     this ONLY satisfies the protected-path
+#                                     Codex-audit requirement. HALT, cross-
+#                                     repo guard, ref-resolution, and the
+#                                     push-review cache still run. See the
+#                                     authoritative docstring in
+#                                     `push-review-gate.sh` for the full
+#                                     scope description. Audit record
 #                                     `tool_name: "codex.review.skipped"`.
-#                                     Currently a whole-gate bypass (see
-#                                     task #85); the distinct audit tool_name
-#                                     keeps it from satisfying the Codex-
-#                                     review jq predicate.
 #   REA_SKIP_PUSH_REVIEW=<reason>   — bypass the WHOLE gate for this push.
 #                                     Audit record
 #                                     `tool_name: "push.review.skipped"`.

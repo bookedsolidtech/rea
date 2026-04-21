@@ -213,6 +213,14 @@ pr_core_run() {
   # typically unset. Default to `origin` for BUG-008 sniff consistency.
   local argv_remote="${1:-origin}"
 
+  # 0.8.0 (#85): when REA_SKIP_CODEX_REVIEW is set, this flag flips to 1
+  # in section 5c. The protected-path Codex-audit check (section 7) then
+  # treats the requirement as satisfied — but every other gate (HALT,
+  # cross-repo guard, ref-resolution, push-review cache, blocked-paths)
+  # still runs. Full-gate bypass moved to REA_SKIP_PUSH_REVIEW a release
+  # cycle ago; this narrows REA_SKIP_CODEX_REVIEW to what its name implies.
+  local CODEX_WAIVER_ACTIVE=0
+
   # ── 1a. Cross-repo guard (must come FIRST — before any rea-scoped check) ──
   # BUG-012 (0.6.2) — anchor the install to the SCRIPT'S OWN LOCATION on disk.
   # The hook knows where it lives: installed at `<root>/.claude/hooks/<name>.sh`,
@@ -653,16 +661,23 @@ pr_core_run() {
 
     {
       printf '\n'
-      printf '==  CODEX REVIEW SKIPPED via REA_SKIP_CODEX_REVIEW\n'
+      printf '==  CODEX REVIEW WAIVER active (REA_SKIP_CODEX_REVIEW)\n'
       printf '    Reason:   %s\n' "$SKIP_REASON"
       printf '    Actor:    %s\n' "$SKIP_ACTOR"
       printf '    Head SHA: %s\n' "${SKIP_HEAD:-<unknown>}"
       printf '    Audited:  .rea/audit.jsonl (tool_name=codex.review.skipped)\n'
       printf '\n'
-      printf '    This is a gate weakening. Every invocation is permanently audited.\n'
+      printf '    Scope:    waives the protected-path Codex-audit requirement only.\n'
+      printf '    Still active: HALT, cross-repo guard, ref-resolution,\n'
+      printf '                  push-review cache. For a full-gate bypass\n'
+      # shellcheck disable=SC2016  # backticks are literal markdown in user-facing message
+      printf '                  use `REA_SKIP_PUSH_REVIEW=<reason>`.\n'
+      printf '\n'
+      printf '    This is a gate weakening. The waiver receipt is written BEFORE\n'
+      printf '    this banner — seeing this banner means the audit is durable.\n'
       printf '\n'
     } >&2
-    exit 0
+    CODEX_WAIVER_ACTIVE=1
   fi
 
   # ── 6. Determine source/target commits for each refspec ───────────────────
@@ -853,7 +868,13 @@ pr_core_run() {
         '; then
         local _audit="${REA_ROOT}/.rea/audit.jsonl"
         local _codex_ok=0
-        if [[ -f "$_audit" ]]; then
+        # 0.8.0 (#85): Codex-only waiver satisfies this check without a real
+        # audit entry. Every other gate still ran — HALT, cross-repo guard,
+        # ref-resolution, push-review cache — and the waiver itself is
+        # already recorded in .rea/audit.jsonl as tool_name=codex.review.skipped.
+        if [[ "$CODEX_WAIVER_ACTIVE" == "1" ]]; then
+          _codex_ok=1
+        elif [[ -f "$_audit" ]]; then
           if jq -e --arg sha "$local_sha" '
               select(
                 .tool_name == "codex.review"
@@ -977,15 +998,38 @@ pr_core_run() {
     REA_CLI_ARGS=(node "${REA_ROOT}/dist/cli/index.js")
   fi
 
+  # Cache-branch derivation (Codex 0.8.0 pass-2 finding #2, pass-3 finding #1):
+  # Use the PUSHED source ref (from pre-push stdin / bootstrap walk), not the
+  # checkout branch. `git push origin hotfix:main` from a `feature` checkout
+  # must look up a cache entry keyed on `hotfix`, not `feature`. Strip the
+  # `refs/heads/` prefix.
+  #
+  # Fall back to the checkout branch when SOURCE_REF is:
+  #   • unset (defence-in-depth, not reached on any observed path), or
+  #   • the literal string "HEAD" — emitted by pr_resolve_argv_refspecs for a
+  #     bare `git push` with no explicit refspec. Keying a cache lookup on
+  #     "HEAD" would force a miss on every bare push; the checkout branch
+  #     name is the right lookup key for that workflow.
+  local SOURCE_BRANCH="${SOURCE_REF#refs/heads/}"
+  if [[ -z "$SOURCE_BRANCH" || "$SOURCE_BRANCH" == "HEAD" ]]; then
+    SOURCE_BRANCH="$CURRENT_BRANCH"
+  fi
+
   if [[ -n "$PUSH_SHA" ]] && [[ ${#REA_CLI_ARGS[@]} -gt 0 ]]; then
     local CACHE_RESULT
-    CACHE_RESULT=$("${REA_CLI_ARGS[@]}" cache check "$PUSH_SHA" --branch "$CURRENT_BRANCH" --base "$TARGET_BRANCH" 2>/dev/null || echo '{"hit":false}')
-    if printf '%s' "$CACHE_RESULT" | jq -e '.hit == true' >/dev/null 2>&1; then
+    CACHE_RESULT=$("${REA_CLI_ARGS[@]}" cache check "$PUSH_SHA" --branch "$SOURCE_BRANCH" --base "$TARGET_BRANCH" 2>/dev/null || echo '{"hit":false}')
+    # Require BOTH hit == true AND result == "pass". A cached `fail` verdict
+    # (Codex 0.8.0 pass-2 finding #1) must NOT satisfy the gate — cache.ts
+    # serializes `result` verbatim, so a negative verdict would otherwise
+    # slip through. Under the #85 narrowed semantic the cache is the ONLY
+    # way a waiver-using operator reaches exit 0, so a permissive predicate
+    # here would be a real security regression.
+    if printf '%s' "$CACHE_RESULT" | jq -e '.hit == true and .result == "pass"' >/dev/null 2>&1; then
       local DISCORD_LIB="${REA_ROOT}/hooks/_lib/discord.sh"
       if [ -f "$DISCORD_LIB" ]; then
         # shellcheck source=/dev/null
         source "$DISCORD_LIB"
-        discord_notify "dev" "Push passed quality gates on \`${CURRENT_BRANCH}\` -- $(cd "$REA_ROOT" && git log -1 --oneline 2>/dev/null)" "green"
+        discord_notify "dev" "Push passed quality gates on \`${SOURCE_BRANCH}\` -- $(cd "$REA_ROOT" && git log -1 --oneline 2>/dev/null)" "green"
       fi
       exit 0
     fi
@@ -1006,7 +1050,7 @@ pr_core_run() {
     printf '  1. Spawn a code-reviewer agent to review: git diff %s..%s\n' "$MERGE_BASE" "$SOURCE_SHA"
     printf '  2. Spawn a security-engineer agent for security review\n'
     printf '  3. After both pass, cache the result:\n'
-    printf '     rea cache set %s pass --branch %s --base %s\n' "$PUSH_SHA" "$CURRENT_BRANCH" "$TARGET_BRANCH"
+    printf '     rea cache set %s pass --branch %s --base %s\n' "$PUSH_SHA" "$SOURCE_BRANCH" "$TARGET_BRANCH"
     printf '\n'
   } >&2
   exit 2
