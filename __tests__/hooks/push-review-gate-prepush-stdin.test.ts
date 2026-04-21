@@ -203,9 +203,14 @@ describe('push-review-gate.sh — BUG-008 pre-push stdin self-detect', () => {
     expect(res.status).toBe(0);
   });
 
-  it('honors push_review: false policy even under pre-push stdin', async () => {
+  it('push_review: false policy does NOT bypass the gate under pre-push stdin (0.9.3 Defect B)', async () => {
     if (!jqExists()) return;
 
+    // Pre-0.9.3 this policy line short-circuited the gate to exit 0. The
+    // bypass was unauditable — any process able to write `.rea/policy.yaml`
+    // could silence the gate. Post-0.9.3 the grep bypass is removed; the
+    // only supported escape hatch is the env-var `REA_SKIP_PUSH_REVIEW`
+    // which writes a `push.review.skipped` audit record.
     const repo = await makeRepo();
     cleanup.push(repo.dir);
 
@@ -223,6 +228,15 @@ describe('push-review-gate.sh — BUG-008 pre-push stdin self-detect', () => {
       encoding: 'utf8',
     });
 
-    expect(res.status).toBe(0);
+    // The gate must run past the (now-removed) grep short-circuit. The
+    // feature diff in this fixture touches a protected path (under
+    // `hooks/`), so the Codex protected-path banner fires — confirmation
+    // that control reached the protected-path matcher, not the deleted §5
+    // exit. A specific banner assertion (not just `not.toBe(0)`) blocks
+    // future accidental regressions that would exit non-zero for an
+    // unrelated reason.
+    expect(res.status).toBe(2);
+    expect(res.stderr).toMatch(/protected paths changed/);
+    expect(res.stderr).toMatch(/codex-review required/);
   });
 });

@@ -222,17 +222,134 @@ if [ -n "$SEC_CHANGESETS" ]; then
   echo "[smoke] security-claim gate: $(printf '%s\n' "$SEC_CHANGESETS" | wc -l | awk '{print $1}') changeset(s) tagged [security]"
 
   SEC_SRC_TESTS="$(cd "$REPO_ROOT" && find src -type f \( -name '*sanitize*.test.ts' -o -name '*security*.test.ts' \) 2>/dev/null | sort)"
-  if [ -z "$SEC_SRC_TESTS" ]; then
-    echo "[smoke] FAIL — [security] changeset present but no *sanitize*.test.ts or *security*.test.ts under src/" >&2
+  # 0.9.3 extension — some security hotfixes touch ONLY shell hooks (no TS/dist
+  # symbols), so the compiled-symbol gate above doesn't apply. For those, the
+  # regression proof lives under __tests__/hooks/*{security,bypass,injection,
+  # sanitize}*.test.ts and the tarball must ship the hook file(s) the test
+  # exercises. This block runs IN ADDITION to the src/ symbol gate — either
+  # layer alone can satisfy a [security] changeset, but at least one MUST.
+  SEC_HOOK_TESTS="$(cd "$REPO_ROOT" && find __tests__/hooks -type f \( -name '*security*.test.ts' -o -name '*bypass*.test.ts' -o -name '*sanitize*.test.ts' -o -name '*injection*.test.ts' \) 2>/dev/null | sort)"
+
+  if [ -z "$SEC_SRC_TESTS" ] && [ -z "$SEC_HOOK_TESTS" ]; then
+    echo "[smoke] FAIL — [security] changeset present but no matching regression test found:" >&2
+    echo "[smoke]        - src/**/(*sanitize*|*security*).test.ts — for compiled-symbol fixes" >&2
+    echo "[smoke]        - __tests__/hooks/(*security*|*bypass*|*sanitize*|*injection*).test.ts — for hook fixes" >&2
     echo "[smoke]        a security-claim changeset with no matching regression test is a trust violation" >&2
     exit 2
   fi
 
-  # For each security test, collect the named imports pulled from relative
+  # Hook-level gate: for each hook-security test FILE, extract the hook
+  # file path(s) it installs/exercises (relative to REPO_ROOT) and assert
+  # the tarball ships that hook under node_modules/@bookedsolid/rea/hooks/
+  # AND that `rea init` fanned it out to $SMOKE_DIR/.claude/hooks/.
+  #
+  # Known narrowness (called out honestly rather than papered over):
+  #   - Granularity is per-test-file, not per-`it()` block. A file may
+  #     contain multiple `it(...)` cases; the extractor scans the whole
+  #     file body. In practice a [security]-claim test file should focus
+  #     on one defect class; mixing unrelated `it()` cases with different
+  #     hook refs dilutes the proof. PR review is the mitigation.
+  #   - A [security] file with zero extractable refs fails LOUDLY (see
+  #     EMPTY_REF_TESTS below). The narrowness only applies to files that
+  #     do extract refs but don't scope them per `it()`.
+  if [ -n "$SEC_HOOK_TESTS" ]; then
+    HOOK_MISSING=""
+    HOOK_COUNT=0
+    EMPTY_REF_TESTS=""
+    while IFS= read -r hook_test; do
+      [ -z "$hook_test" ] && continue
+      # Pull hook paths referenced by the test. Matches forms like:
+      #   'hooks', 'push-review-gate.sh'
+      #   'hooks', '_lib', 'push-review-core.sh'
+      #   'hooks', 'commit-review-gate.sh'
+      HOOK_REFS="$(perl -0777 -ne '
+        while (/path\.join\(\s*REPO_ROOT\s*,\s*[\x27"]hooks[\x27"](?:\s*,\s*[\x27"]([^\x27"]+)[\x27"])*\s*\)/sg) {
+          my $all = $&;
+          my @parts;
+          while ($all =~ /[\x27"]([^\x27"]+)[\x27"]/g) {
+            push @parts, $1 unless $1 eq "REPO_ROOT";
+          }
+          print join("/", @parts), "\n" if @parts;
+        }
+      ' "$REPO_ROOT/$hook_test" 2>/dev/null | sort -u)"
+
+      # Per-test failure: a [security] hook-test that yields zero extractable
+      # refs (e.g. uses template literals, dynamic concatenation, or helper
+      # indirection) is invisible to this gate. Fail loud so the author is
+      # forced to use the extractable path.join(REPO_ROOT, 'hooks', ...) shape,
+      # rather than having a lone extractable neighbor test silently satisfy
+      # the whole gate.
+      if [ -z "$HOOK_REFS" ]; then
+        EMPTY_REF_TESTS="$EMPTY_REF_TESTS
+  $hook_test"
+        continue
+      fi
+
+      while IFS= read -r rel; do
+        [ -z "$rel" ] && continue
+        HOOK_COUNT=$((HOOK_COUNT + 1))
+        # `rel` already includes the leading `hooks/` segment from perl. It
+        # looks like `hooks/push-review-gate.sh` or
+        # `hooks/_lib/push-review-core.sh`. The tarball ships hooks under
+        # `node_modules/@bookedsolid/rea/hooks/` and `rea init` fans them out
+        # to `$SMOKE_DIR/.claude/hooks/`. Assert BOTH — the tarball
+        # source-of-truth AND the post-init install surface.
+        rel_no_prefix="${rel#hooks/}"
+        TARBALL_HOOK="$SMOKE_DIR/node_modules/@bookedsolid/rea/hooks/$rel_no_prefix"
+        INSTALLED_HOOK="$SMOKE_DIR/.claude/hooks/$rel_no_prefix"
+        if [ ! -f "$TARBALL_HOOK" ] || [ ! -f "$INSTALLED_HOOK" ]; then
+          HOOK_MISSING="$HOOK_MISSING
+  $rel (exercised by $hook_test)"
+        fi
+      done <<< "$HOOK_REFS"
+    done <<< "$SEC_HOOK_TESTS"
+
+    if [ -n "$HOOK_MISSING" ]; then
+      echo "[smoke] FAIL — [security] hook-test gate: hook file(s) under test are MISSING from tarball:" >&2
+      printf '%s\n' "$HOOK_MISSING" >&2
+      exit 2
+    fi
+
+    if [ -n "$EMPTY_REF_TESTS" ]; then
+      echo "[smoke] FAIL — [security] hook-test gate: one or more hook-security tests yielded zero extractable hook references:" >&2
+      printf '%s\n' "$EMPTY_REF_TESTS" >&2
+      echo "[smoke]        hook-security tests MUST reference hook files via the literal shape" >&2
+      echo "[smoke]        path.join(REPO_ROOT, 'hooks', '<name>.sh')  (or with a nested '_lib' arg)" >&2
+      echo "[smoke]        Template literals, dynamic concatenation, and helper indirection are" >&2
+      echo "[smoke]        invisible to this gate and would let hook changes ship unverified." >&2
+      exit 2
+    fi
+
+    if [ "$HOOK_COUNT" -eq 0 ]; then
+      echo "[smoke] FAIL — [security] hook-test gate: no checkable hook references extracted" >&2
+      echo "[smoke]        hook-security tests must reference hook files via path.join(REPO_ROOT, 'hooks', ...)" >&2
+      echo "[smoke]        so the gate can verify the hook ships in the tarball" >&2
+      exit 2
+    fi
+
+    echo "[smoke]   → $(printf '%s\n' "$SEC_HOOK_TESTS" | wc -l | awk '{print $1}') hook-security test(s), $HOOK_COUNT hook ref(s) all present in tarball"
+  fi
+
+  # The compiled-symbol gate below only runs when src/ security tests exist.
+  # A hook-only hotfix satisfies via the block above. Flag the src/ gate to
+  # skip gracefully — the remaining smoke checks (export resolution, tree
+  # equality) still run unconditionally below.
+  SKIP_SRC_SYMBOL_GATE=0
+  if [ -z "$SEC_SRC_TESTS" ]; then
+    SKIP_SRC_SYMBOL_GATE=1
+  fi
+
+  # For each src security test, collect the named imports pulled from relative
   # paths — those are the symbols under test and must be compiled into dist/.
   # Example line we want to match:
   #   import { sanitizeHealthSnapshot, INJECTION_REDACTED_PLACEHOLDER } from './health';
   # We ignore imports from bare package names ('vitest', 'node:fs', etc.).
+  #
+  # Skipped when only __tests__/hooks/ security tests exist (hook-only hotfix);
+  # the hook-test gate above is authoritative for that case.
+  if [ "$SKIP_SRC_SYMBOL_GATE" = "1" ]; then
+    echo "[smoke]   → src/ symbol gate skipped (no src/*{security,sanitize}*.test.ts — hook-test gate is authoritative)"
+  else
   MISSING_SYMBOLS=""
   SYMBOL_COUNT=0
   while IFS= read -r src_test; do
@@ -294,6 +411,7 @@ if [ -n "$SEC_CHANGESETS" ]; then
   fi
 
   echo "[smoke]   → $(printf '%s\n' "$SEC_SRC_TESTS" | wc -l | awk '{print $1}') security regression test(s), $SYMBOL_COUNT imported symbol(s) all present in dist/"
+  fi  # SKIP_SRC_SYMBOL_GATE
 fi
 
 # Verify every declared public export resolves. If the exports map points at a

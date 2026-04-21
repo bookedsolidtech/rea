@@ -341,15 +341,7 @@ pr_core_run() {
     exit 0
   fi
 
-  # ── 5. Check if quality gates are enabled ─────────────────────────────────
-  local POLICY_FILE="${REA_ROOT}/.rea/policy.yaml"
-  if [[ -f "$POLICY_FILE" ]]; then
-    if grep -qE 'push_review:[[:space:]]*false' "$POLICY_FILE" 2>/dev/null; then
-      exit 0
-    fi
-  fi
-
-  # ── 5a. REA_SKIP_PUSH_REVIEW — whole-gate escape hatch ────────────────────
+  # ── 5. REA_SKIP_PUSH_REVIEW — whole-gate escape hatch ─────────────────────
   # An opt-in bypass for the ENTIRE push-review gate (not just the Codex
   # branch). Exists to unblock consumers when rea itself is broken or a
   # corrupt policy/audit file would otherwise deadlock a push. Requires an
@@ -856,7 +848,7 @@ pr_core_run() {
         } >&2
         exit 2
       fi
-      if printf '%s\n' "$_refspec_hits" | awk -v re='^(src/gateway/middleware/|hooks/|[.]claude/hooks/|src/policy/|[.]github/workflows/)' '
+      if printf '%s\n' "$_refspec_hits" | awk -v re='^(src/gateway/middleware/|hooks/|[.]claude/hooks/|src/policy/|[.]github/workflows/|[.]rea/|[.]husky/)' '
           {
             status = $1
             if (status !~ /^[ACDMRTU]/) next
@@ -896,6 +888,8 @@ pr_core_run() {
             printf '    - .claude/hooks/\n'
             printf '    - src/policy/\n'
             printf '    - .github/workflows/\n'
+            printf '    - .rea/\n'
+            printf '    - .husky/\n'
             printf '\n'
             printf '  Run /codex-review against %s, then retry the push.\n' "$local_sha"
             printf '  The codex-adversarial agent emits the required audit entry.\n'

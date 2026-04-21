@@ -103,18 +103,7 @@ if printf '%s' "$CMD" | grep -qiE 'git[[:space:]]+commit.*--amend'; then
   exit 0
 fi
 
-# ── 5. Check if quality gates are enabled ─────────────────────────────────────
-# Fail-open if policy doesn't exist or doesn't have quality_gates
-POLICY_FILE="${REA_ROOT}/.rea/policy.yaml"
-if [[ -f "$POLICY_FILE" ]]; then
-  if grep -qE '^quality_gates:' "$POLICY_FILE" 2>/dev/null; then
-    if grep -qE 'commit_review:[[:space:]]*false' "$POLICY_FILE" 2>/dev/null; then
-      exit 0
-    fi
-  fi
-fi
-
-# ── 6. Compute diff stats ────────────────────────────────────────────────────
+# ── 5. Compute diff stats ────────────────────────────────────────────────────
 # Get staged diff (what would be committed)
 DIFF_OUTPUT=$(cd "$REA_ROOT" && git diff --cached --stat 2>/dev/null || echo "")
 DIFF_FULL=$(cd "$REA_ROOT" && git diff --cached 2>/dev/null || echo "")

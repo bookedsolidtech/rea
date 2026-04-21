@@ -10,7 +10,8 @@
  *      same protected-path block as the generic adapter does via the
  *      BUG-008 sniff.
  *   3. Whole-gate escape hatch (`REA_SKIP_PUSH_REVIEW`) honors husky inputs.
- *   4. `push_review: false` policy honored under husky inputs.
+ *   4. `push_review: false` policy is NOT a bypass under husky inputs
+ *      (0.9.3 Defect B — the grep short-circuit was removed).
  *   5. Missing core library fails closed (exit 2) with a diagnostic — the
  *      adapter never silently degrades to a no-op pre-push gate.
  *   6. Parity matrix: the git adapter and the generic adapter produce the
@@ -238,7 +239,11 @@ describe('push-review-gate-git.sh — native git pre-push adapter (task #50)', (
     expect(audit).toMatch(/task50-adapter-smoke/);
   });
 
-  it('push_review: false policy short-circuits the git adapter to exit 0', async () => {
+  it('push_review: false policy does NOT short-circuit the git adapter (0.9.3 Defect B)', async () => {
+    // Pre-0.9.3 the grep bypass in `push-review-core.sh` §5 would return
+    // exit 0 on this policy content. The bypass was unauditable and the
+    // only supported opt-out contract is `REA_SKIP_PUSH_REVIEW=<reason>`
+    // which writes a skip audit record. This test pins the removal.
     const repo = await makeRepo();
     cleanup.push(repo.dir);
 
@@ -255,7 +260,16 @@ describe('push-review-gate-git.sh — native git pre-push adapter (task #50)', (
       encoding: 'utf8',
     });
 
-    expect(res.status).toBe(0);
+    // Gate must run past the removed short-circuit. The feature branch in
+    // `makeRepo()` touches `hooks/__test__.sh` — a protected path — so
+    // the Codex protected-path banner fires as confirmation that control
+    // reached the protected-path matcher and did not exit at the deleted
+    // §5. A specific banner assertion (not just `not.toBe(0)`) blocks
+    // future accidental regressions that would exit non-zero for an
+    // unrelated reason.
+    expect(res.status).toBe(2);
+    expect(res.stderr).toMatch(/protected paths changed/);
+    expect(res.stderr).toMatch(/codex-review required/);
   });
 
   it('fails closed (exit 2) when the shared core library is missing', async () => {
