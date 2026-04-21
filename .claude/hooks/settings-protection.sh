@@ -59,8 +59,15 @@ normalize_path() {
     p="${p#$root/}"
   fi
 
-  # URL decode common sequences
-  p=$(printf '%s' "$p" | sed 's/%2[Ff]/\//g; s/%2[Ee]/./g; s/%20/ /g')
+  # URL decode common sequences. Include %5C (`\`) so Windows-style or
+  # percent-encoded back-slash traversal (`..%5C`, `\..\`) normalizes to the
+  # forward-slash form the §5a detector sees.
+  p=$(printf '%s' "$p" \
+    | sed 's/%2[Ff]/\//g; s/%2[Ee]/./g; s/%20/ /g; s/%5[Cc]/\\/g')
+
+  # Translate any backslash separators to forward slashes. Keeps the traversal
+  # check in §5a working for `.claude\hooks\..\settings.json`-style inputs.
+  p=$(printf '%s' "$p" | tr '\\\\' '/')
 
   # Strip leading ./ components only. We intentionally do NOT strip interior
   # ./ sequences — that transformation corrupts `..` traversals (e.g. `.../`
@@ -76,8 +83,16 @@ normalize_path() {
 # Strip C0/C1 control characters from a string to prevent terminal escape
 # injection when we echo protected paths back to the operator. Escape sequences
 # in file names could otherwise rewrite lines above the deny message.
+#
+# Byte ranges stripped:
+#   \000-\037  — C0 controls (BEL, BS, HT, LF, CR, ESC, …)
+#   \177       — DEL
+#   \200-\237  — C1 controls (CSI 0x9B, OSC 0x9D, …). Many terminals still
+#                interpret these as single-byte CSI introducers; without
+#                stripping, a UTF-8 file name whose bytes fall in this range
+#                could still drive the cursor on older emulators.
 sanitize_for_stderr() {
-  printf '%s' "$1" | LC_ALL=C tr -d '\000-\037\177'
+  printf '%s' "$1" | LC_ALL=C tr -d '\000-\037\177\200-\237'
 }
 
 NORMALIZED=$(normalize_path "$FILE_PATH")
@@ -91,8 +106,13 @@ SAFE_NORMALIZED=$(sanitize_for_stderr "$NORMALIZED")
 # refers to `.claude/settings.json`. We refuse any path that contains a `..`
 # segment in either the raw input OR the normalized form. The request must
 # be reissued with a canonical path.
+#
+# For the raw-input check, translate backslashes first so a Windows-style
+# `.claude\hooks\..\settings.json` is rejected at the raw stage too (the
+# normalized form also catches it — this is defense in depth).
+RAW_PATH_SLASHED=$(printf '%s' "$FILE_PATH" | tr '\\\\' '/')
 raw_has_traversal=0
-case "/$FILE_PATH/" in
+case "/$RAW_PATH_SLASHED/" in
   */../*) raw_has_traversal=1 ;;
 esac
 norm_has_traversal=0
@@ -235,7 +255,6 @@ if [[ -n "${REA_HOOK_PATCH_SESSION:-}" ]]; then
     # Audit record via the TypeScript chain so the hash chain stays intact.
     # If the append fails, block the edit — silent failure would let an
     # attacker disable audit logging and then patch hooks unobserved.
-    AUDIT_FILE="${REA_ROOT}/.rea/audit.jsonl"
     SHA_BEFORE=""
     if [[ -f "$FILE_PATH" ]]; then
       if command -v sha256sum >/dev/null 2>&1; then
@@ -250,6 +269,7 @@ if [[ -n "${REA_HOOK_PATCH_SESSION:-}" ]]; then
     ACTOR_EMAIL=$(git -C "$REA_ROOT" config user.email 2>/dev/null || printf 'unknown')
 
     AUDIT_PAYLOAD=$(
+      cd "$REA_ROOT" 2>/dev/null || true
       REA_AUDIT_REASON="${REA_HOOK_PATCH_SESSION}" \
       REA_AUDIT_FILE="$NORMALIZED" \
       REA_AUDIT_SHA="$SHA_BEFORE" \
@@ -258,10 +278,32 @@ if [[ -n "${REA_HOOK_PATCH_SESSION:-}" ]]; then
       REA_AUDIT_PID="$$" \
       REA_AUDIT_PPID="$PPID" \
       REA_AUDIT_SESSION="${CLAUDE_SESSION_ID:-external}" \
+      REA_AUDIT_ROOT="$REA_ROOT" \
       node --input-type=module -e '
-        import("'"${REA_ROOT}"'/dist/audit/append.js").then(async (mod) => {
+        const root = process.env.REA_AUDIT_ROOT;
+        async function loadMod() {
+          // Consumer path: `@bookedsolid/rea` resolvable via node_modules
+          // (how `rea init`-installed consumers reach the published package)
+          // or via package self-reference when the hook runs inside the rea
+          // source repo itself.
           try {
-            await mod.appendAuditRecord("'"${REA_ROOT}"'", {
+            return await import("@bookedsolid/rea/audit");
+          } catch (e1) {
+            // Dev path: direct file import from the source repos dist/.
+            try {
+              return await import(root + "/dist/audit/append.js");
+            } catch (e2) {
+              process.stderr.write(
+                "audit import failed: package=" + (e1 && e1.message ? e1.message : e1) +
+                "; dist=" + (e2 && e2.message ? e2.message : e2) + "\n");
+              process.exit(1);
+            }
+          }
+        }
+        (async () => {
+          const mod = await loadMod();
+          try {
+            await mod.appendAuditRecord(root, {
               session_id: process.env.REA_AUDIT_SESSION,
               tool_name: "hooks.patch.session",
               server_name: "rea",
@@ -286,53 +328,25 @@ if [[ -n "${REA_HOOK_PATCH_SESSION:-}" ]]; then
             process.stderr.write("audit append failed: " + (e && e.message ? e.message : e) + "\n");
             process.exit(1);
           }
-        }).catch((e) => {
-          process.stderr.write("audit import failed: " + (e && e.message ? e.message : e) + "\n");
-          process.exit(1);
-        });
+        })();
       ' 2>&1
     )
     AUDIT_EXIT=$?
     if [[ "$AUDIT_EXIT" -ne 0 ]]; then
-      # dist may not be present (fresh checkout, install-time). Fall back to
-      # a jq-formatted append ONLY to keep the hook usable in those cases —
-      # but still refuse to allow the edit if neither path produces an entry.
-      if [[ -d "$(dirname "$AUDIT_FILE")" ]] && command -v jq >/dev/null 2>&1; then
-        TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%S.000Z")
-        if jq -n -c \
-          --arg ts "$TIMESTAMP" \
-          --arg session "${CLAUDE_SESSION_ID:-external}" \
-          --arg tool "hooks.patch.session" \
-          --arg server "rea" \
-          --arg reason "${REA_HOOK_PATCH_SESSION}" \
-          --arg file "$NORMALIZED" \
-          --arg sha_before "$SHA_BEFORE" \
-          --arg actor_name "$ACTOR_NAME" \
-          --arg actor_email "$ACTOR_EMAIL" \
-          --argjson pid "$$" \
-          --argjson ppid "$PPID" \
-          '{timestamp:$ts, session_id:$session, tool_name:$tool, server_name:$server,
-            tier:"write", status:"allowed", autonomy_level:"unknown", duration_ms:0,
-            metadata:{reason:$reason, file:$file, sha_before:$sha_before,
-                      actor:{name:$actor_name, email:$actor_email}, pid:$pid, ppid:$ppid,
-                      fallback:"no-dist"}}' \
-          >> "$AUDIT_FILE" 2>/dev/null; then
-          :
-        else
-          {
-            printf 'SETTINGS PROTECTION: audit-append failed; refusing hook-patch edit\n'
-            printf '  File: %s\n' "$SAFE_FILE_PATH"
-          } >&2
-          exit 2
-        fi
-      else
-        {
-          printf 'SETTINGS PROTECTION: audit-append failed; refusing hook-patch edit\n'
-          printf '  File: %s\n' "$SAFE_FILE_PATH"
-          printf '  Detail: %s\n' "$(sanitize_for_stderr "$AUDIT_PAYLOAD")"
-        } >&2
-        exit 2
-      fi
+      # Fail closed. We deliberately do NOT fall back to a raw `jq … >> audit`
+      # write: that path skips prev_hash/hash computation and would silently
+      # degrade the hash-chain integrity the rest of REA (and `rea audit verify`)
+      # relies on. If the TypeScript chain is unavailable (no `dist/`, missing
+      # Node, broken import), refuse the hook-patch edit and surface why. The
+      # operator resolves by building the package (`pnpm build`) or running
+      # against a published install that ships `dist/`.
+      {
+        printf 'SETTINGS PROTECTION: audit-append failed; refusing hook-patch edit\n'
+        printf '  File: %s\n' "$SAFE_FILE_PATH"
+        printf '  Rule: hash-chained audit is required; no raw-jq fallback.\n'
+        printf '  Detail: %s\n' "$(sanitize_for_stderr "$AUDIT_PAYLOAD")"
+      } >&2
+      exit 2
     fi
     printf 'REA_HOOK_PATCH_SESSION: allowing edit to %s (reason: %s)\n' \
       "$SAFE_NORMALIZED" "$SAFE_REASON" >&2

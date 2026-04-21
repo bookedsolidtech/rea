@@ -255,8 +255,10 @@ if [[ -n "$STAGED_SHA" ]]; then
     CACHE_STDERR=$(cat "$CACHE_STDERR_FILE" 2>/dev/null || true)
     rm -f "$CACHE_STDERR_FILE"
     if [[ "$CACHE_EXIT" -ne 0 ]]; then
-      # SECURITY (Codex LOW 5): strip control chars before echoing CLI stderr.
-      CACHE_STDERR_SAFE=$(printf '%s' "$CACHE_STDERR" | LC_ALL=C tr -d '\000-\037\177')
+      # SECURITY (Codex LOW 5): strip C0/C1 control chars before echoing CLI
+      # stderr. Includes 0x80-0x9F because some terminals interpret bare C1
+      # bytes (CSI 0x9B, OSC 0x9D) as escape introducers.
+      CACHE_STDERR_SAFE=$(printf '%s' "$CACHE_STDERR" | LC_ALL=C tr -d '\000-\037\177\200-\237')
       printf 'rea commit-review: CACHE CHECK FAILED (exit=%d): %s\n' "$CACHE_EXIT" "$CACHE_STDERR_SAFE" >&2
       printf 'rea commit-review: treating as miss; file bookedsolidtech/rea issue if unexpected.\n' >&2
       CACHE_RESULT='{"hit":false,"reason":"query_error"}'

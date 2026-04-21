@@ -63,6 +63,20 @@ function jqExists(): boolean {
   return spawnSync('jq', ['--version'], { encoding: 'utf8' }).status === 0;
 }
 
+// Shared helper — symlinks REPO_ROOT/dist into the test temp dir so the
+// hook's `${REA_ROOT}/dist/audit/append.js` import succeeds. Returns true on
+// success, false if dist/ is not built (caller should skip).
+async function symlinkDist(dir: string): Promise<boolean> {
+  const repoDist = path.join(REPO_ROOT, 'dist');
+  try {
+    await fs.access(path.join(repoDist, 'audit', 'append.js'));
+  } catch {
+    return false;
+  }
+  await fs.symlink(repoDist, path.join(dir, 'dist'), 'dir');
+  return true;
+}
+
 describe('settings-protection.sh — REA_HOOK_PATCH_SESSION env var (Defect I)', () => {
   let dir: string;
 
@@ -92,6 +106,7 @@ describe('settings-protection.sh — REA_HOOK_PATCH_SESSION env var (Defect I)',
 
   it('allows edits to .claude/hooks/* when REA_HOOK_PATCH_SESSION is set', async () => {
     if (!jqExists()) return;
+    if (!(await symlinkDist(dir))) return;
 
     const target = path.join(dir, '.claude', 'hooks', 'custom-hook.sh');
     await fs.writeFile(target, '#!/bin/bash\necho hi\n');
@@ -166,10 +181,10 @@ describe('settings-protection.sh — REA_HOOK_PATCH_SESSION env var (Defect I)',
 
   it('writes a hooks.patch.session audit record on each allowed edit', async () => {
     if (!jqExists()) return;
+    if (!(await symlinkDist(dir))) return;
 
     const target = path.join(dir, '.claude', 'hooks', 'custom.sh');
     await fs.writeFile(target, '#!/bin/bash\noriginal\n');
-    // Ensure audit file directory exists so the jq append can write.
     const auditFile = path.join(dir, '.rea', 'audit.jsonl');
 
     const res = runHook(dir, target, {
@@ -192,6 +207,8 @@ describe('settings-protection.sh — REA_HOOK_PATCH_SESSION env var (Defect I)',
         pid: number;
         ppid: number;
       };
+      hash: string;
+      prev_hash: string;
     };
     expect(rec.tool_name).toBe('hooks.patch.session');
     expect(rec.server_name).toBe('rea');
@@ -201,6 +218,26 @@ describe('settings-protection.sh — REA_HOOK_PATCH_SESSION env var (Defect I)',
     expect(rec.metadata.sha_before).toMatch(/^[0-9a-f]{64}$/);
     expect(typeof rec.metadata.pid).toBe('number');
     expect(typeof rec.metadata.ppid).toBe('number');
+    // Hash-chain integrity: the TS append MUST populate hash + prev_hash.
+    // This is the guarantee Codex's Finding 1 called out.
+    expect(rec.hash).toMatch(/^[0-9a-f]{64}$/);
+    expect(rec.prev_hash).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it('fails closed when neither @bookedsolid/rea/audit nor dist/audit/append.js is reachable', async () => {
+    if (!jqExists()) return;
+
+    // Deliberately do NOT symlink dist/. The temp dir has no node_modules
+    // either. Both import paths must fail. Hook must exit 2 rather than
+    // silently allowing the edit without an audit entry (Codex Finding 1).
+    const target = path.join(dir, '.claude', 'hooks', 'custom.sh');
+    await fs.writeFile(target, '#!/bin/bash\n');
+
+    const res = runHook(dir, target, {
+      REA_HOOK_PATCH_SESSION: 'no dist available',
+    });
+    expect(res.status).toBe(2);
+    expect(res.stderr).toMatch(/audit-append failed/);
   });
 });
 

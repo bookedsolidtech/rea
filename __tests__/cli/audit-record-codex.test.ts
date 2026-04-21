@@ -11,8 +11,9 @@
  *   2. Required fields (--head-sha, --branch, --target, --finding-count) are
  *      validated at the CLI boundary — empty or negative values exit non-zero
  *      without writing anything.
- *   3. `--also-set-cache` emits the cache entry atomically after the audit
- *      record, with the verdict correctly mapped
+ *   3. `--also-set-cache` emits the cache entry in the same invocation
+ *      as the audit record (two sequential appends in one process — not a
+ *      two-phase commit), with the verdict correctly mapped
  *      (pass→pass, concerns→pass, blocking→fail, error→fail).
  *   4. `--summary` lands as `metadata.summary` when provided; omitted otherwise.
  *   5. `--session-id` is attributed when set.

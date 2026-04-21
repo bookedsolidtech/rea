@@ -64,44 +64,71 @@ async function run(
 }
 
 describe('policy middleware — rea-subcommand tier reclassification (Defect E)', () => {
-  it('allows `rea cache check` at L0 (Read tier)', async () => {
+  // Post-Codex review: fully-trusted invocations require an absolute path
+  // matching a known entry-point suffix (or `npx rea …`). Bare `rea …` is
+  // PATH-spoofable and treated as weak trust — Read subcommands fall through
+  // to the generic Bash Write default; destructive subcommands keep the
+  // upgrade defensively.
+  it('allows `/usr/local/bin/rea cache check` at L0 (Read tier)', async () => {
     const mw = createPolicyMiddleware(stubPolicy(AutonomyLevel.L0));
-    const ctx = bashCtx('rea cache check abc --branch feat/x --base main');
+    const ctx = bashCtx('/usr/local/bin/rea cache check abc --branch feat/x --base main');
     const nextCalled = await run(mw, ctx);
     expect(nextCalled).toBe(true);
     expect(ctx.status).toBe(InvocationStatus.Allowed);
     expect(ctx.tier).toBe(Tier.Read);
   });
 
-  it('allows `rea doctor` at L0 (Read tier)', async () => {
+  it('allows `npx rea doctor` at L0 (Read tier)', async () => {
     const mw = createPolicyMiddleware(stubPolicy(AutonomyLevel.L0));
-    const ctx = bashCtx('rea doctor');
+    const ctx = bashCtx('npx rea doctor');
     const nextCalled = await run(mw, ctx);
     expect(nextCalled).toBe(true);
     expect(ctx.tier).toBe(Tier.Read);
   });
 
-  it('allows `rea audit record codex-review ...` at L1 (Read tier, not Write)', async () => {
+  it('denies bare `rea cache check` at L0 (weak trust, no downgrade)', async () => {
+    // Weak-trust invocations no longer downgrade to Read — an L0 agent must
+    // use npx or an absolute path. This closes PATH-spoofing attacks where
+    // `./rea` or a malicious shim earlier on PATH could impersonate rea.
+    const mw = createPolicyMiddleware(stubPolicy(AutonomyLevel.L0));
+    const ctx = bashCtx('rea cache check abc --branch feat/x --base main');
+    await run(mw, ctx);
+    expect(ctx.status).toBe(InvocationStatus.Denied);
+  });
+
+  it('allows `/usr/local/bin/rea audit record codex-review ...` at L1 (Read tier)', async () => {
     const mw = createPolicyMiddleware(stubPolicy(AutonomyLevel.L1));
     const ctx = bashCtx(
-      'rea audit record codex-review --head-sha abc --branch feat/x --target main --verdict pass --finding-count 0',
+      '/usr/local/bin/rea audit record codex-review --head-sha abc --branch feat/x --target main --verdict pass --finding-count 0',
     );
     const nextCalled = await run(mw, ctx);
     expect(nextCalled).toBe(true);
     expect(ctx.tier).toBe(Tier.Read);
   });
 
-  it('allows `rea cache set ... pass` at L1 (Write tier)', async () => {
+  it('allows `/usr/local/bin/rea cache set ... pass` at L1 (Write tier)', async () => {
     const mw = createPolicyMiddleware(stubPolicy(AutonomyLevel.L1));
-    const ctx = bashCtx('rea cache set abc pass --branch feat/x --base main');
+    const ctx = bashCtx('/usr/local/bin/rea cache set abc pass --branch feat/x --base main');
     const nextCalled = await run(mw, ctx);
     expect(nextCalled).toBe(true);
     expect(ctx.tier).toBe(Tier.Write);
   });
 
-  it('denies `rea freeze` at L1 (Destructive exceeds ceiling)', async () => {
+  it('denies `rea freeze` at L1 even under weak trust (Destructive upgrade preserved)', async () => {
+    // Critical: weak-trust bare `rea` STILL classifies `freeze` as Destructive
+    // so the L1 ceiling blocks it, regardless of whether the binary on PATH
+    // is provably ours. Otherwise `rea freeze` at L1 would fall through to
+    // the generic Bash Write default — a regression.
     const mw = createPolicyMiddleware(stubPolicy(AutonomyLevel.L1));
     const ctx = bashCtx('rea freeze --reason "stopping"');
+    await run(mw, ctx);
+    expect(ctx.status).toBe(InvocationStatus.Denied);
+    expect(ctx.tier).toBe(Tier.Destructive);
+  });
+
+  it('denies `/usr/local/bin/rea freeze` at L1 (Destructive exceeds ceiling)', async () => {
+    const mw = createPolicyMiddleware(stubPolicy(AutonomyLevel.L1));
+    const ctx = bashCtx('/usr/local/bin/rea freeze --reason "stopping"');
     await run(mw, ctx);
     expect(ctx.status).toBe(InvocationStatus.Denied);
     expect(ctx.tier).toBe(Tier.Destructive);
@@ -180,7 +207,7 @@ describe('policy middleware — live policy reload (existing behavior preserved)
     await writePolicyFile(AutonomyLevel.L1);
     const mw = createPolicyMiddleware(stubPolicy(AutonomyLevel.L1), undefined, baseDir);
 
-    const ctx = bashCtx('rea cache check abc --branch feat/x --base main');
+    const ctx = bashCtx('/usr/local/bin/rea cache check abc --branch feat/x --base main');
     const nextCalled = await run(mw, ctx);
     expect(nextCalled).toBe(true);
     expect(ctx.tier).toBe(Tier.Read);

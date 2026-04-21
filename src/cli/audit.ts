@@ -284,11 +284,14 @@ export interface AuditRecordCodexReviewOptions {
  * (the agent's name) instead of `codex.review` (the event type), which the
  * gate's jq predicate silently missed.
  *
- * `--also-set-cache` is an atomic combined update: write the audit record
- * AND write the review-cache entry mapped through {@link codexVerdictToCacheResult}.
- * This eliminates the two-step race where the audit lands, `rea cache set`
- * is denied by permission middleware (Defect E), and the gate sees
- * "audit present but cache cold".
+ * `--also-set-cache` performs the audit record AND the review-cache write
+ * in one invocation — two sequential appends in a single process, not a
+ * two-phase commit. A crash between them leaves the audit entry without
+ * a cache row; the cache is recomputable from audit, the audit chain is
+ * the source of truth. What this DOES eliminate is the two-step race where
+ * `rea cache set` is denied by permission middleware (Defect E) after the
+ * audit has already been emitted, leaving the gate stuck on "audit present
+ * but cache cold" with no way forward.
  */
 export async function runAuditRecordCodexReview(
   options: AuditRecordCodexReviewOptions,

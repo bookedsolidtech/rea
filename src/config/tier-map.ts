@@ -167,12 +167,32 @@ export function isToolBlocked(
  * generic Write-tier Bash default, which is what the operator expects for
  * any command they did not explicitly model here.
  */
-const REA_SHELL_METACHAR_RE = /[;&|`\n\r]|\$\(|>\(|<\(/;
+// Reject redirection and chaining operators. Bare `rea check > /etc/passwd`
+// still executes a write the classifier cannot reason about; same for
+// heredocs (`<<`), pipe-process-substitution (`>(`, `<(`), and the
+// chain/substitute operators the prior pass already covered.
+const REA_SHELL_METACHAR_RE = /[;&|`\n\r<>]|\$\(|>\(|<\(/;
 
 /**
- * Path suffixes recognized as trusted `rea` CLI entry points when the first
- * token is a file-path invocation like `./node_modules/.bin/rea`. Arbitrary
- * `evil-rea`-ending names should NOT satisfy the subcommand classification.
+ * Path suffixes recognized as trusted `rea` CLI entry points.
+ *
+ * SECURITY: we deliberately do NOT accept the bare token `rea`. An attacker
+ * with control over `$PATH` (e.g. a shim earlier on the search path, or a
+ * command executed from a directory containing a malicious `./rea`) can
+ * defeat name-only matching. The classifier requires a `/` in the first
+ * token AND a suffix match from the list below. That combination rejects:
+ *
+ *   - bare `rea`, `rea-helper`, `evil-rea`            (no `/`, PATH-spoofable)
+ *   - `./rea`, `/opt/evil-rea`, `./evil-rea`          (has `/`, no matching suffix)
+ *
+ * And accepts:
+ *
+ *   - `npx rea …` / `npx @bookedsolid/rea …`         (npx is handled separately)
+ *   - `/usr/local/bin/rea` (global install)           (absolute, ends in /bin/rea)
+ *   - `./node_modules/.bin/rea`                       (project install, matches)
+ *   - `/opt/app/node_modules/.bin/rea`                (bespoke install, matches)
+ *   - `node ./dist/cli/index.js` — handled via suffix /dist/cli/index.js when
+ *     the first token is the script path (e.g. from the source tree)
  */
 const REA_TRUSTED_PATH_SUFFIXES = [
   '/node_modules/.bin/rea',
@@ -182,7 +202,9 @@ const REA_TRUSTED_PATH_SUFFIXES = [
 ];
 
 function isTrustedReaPath(first: string): boolean {
-  if (first === 'rea') return true;
+  // Reject bare names to close PATH-spoofing. A trusted invocation must be
+  // explicit about where the binary lives.
+  if (!first.includes('/')) return false;
   for (const suffix of REA_TRUSTED_PATH_SUFFIXES) {
     if (first === suffix || first.endsWith(suffix)) return true;
   }
@@ -192,9 +214,9 @@ function isTrustedReaPath(first: string): boolean {
 export function reaCommandTier(command: string): Tier | null {
   if (typeof command !== 'string' || command.length === 0) return null;
 
-  // Refuse to classify commands that chain/substitute — the trailing shell
-  // payload is arbitrary, so the prefix's read-tier status tells us nothing
-  // about what the shell will actually execute.
+  // Refuse to classify commands that chain/substitute/redirect — the trailing
+  // shell payload is arbitrary, so the prefix's read-tier status tells us
+  // nothing about what the shell will actually execute.
   if (REA_SHELL_METACHAR_RE.test(command)) return null;
 
   const trimmed = command.trim();
@@ -205,7 +227,15 @@ export function reaCommandTier(command: string): Tier | null {
   const first = tokens[0];
   if (first === undefined) return null;
 
+  // Classify the invocation's trust posture. The ONLY fully-trusted shapes
+  // are (a) `npx rea …` / `npx @bookedsolid/rea …`, and (b) a first token
+  // that contains `/` and ends with a known rea entry-point suffix. Bare
+  // `rea` is accepted as a *weak-trust* shape: we still recognize the
+  // subcommand for the sake of destructive-tier UPGRADES (e.g. `rea freeze`
+  // at L1 should be blocked whether or not we can prove the binary is ours),
+  // but we refuse to DOWNGRADE anything for a PATH-spoofable name.
   let idx = 0;
+  let trust: 'trusted' | 'weak' = 'trusted';
   if (first === 'npx') {
     if (tokens.length < 2) return null;
     const second = tokens[1];
@@ -213,40 +243,62 @@ export function reaCommandTier(command: string): Tier | null {
     idx = 2;
   } else if (isTrustedReaPath(first)) {
     idx = 1;
+  } else if (first === 'rea') {
+    idx = 1;
+    trust = 'weak';
   } else {
     return null;
   }
 
   const sub = tokens[idx];
   if (sub === undefined) {
-    return Tier.Read;
+    // `rea` with no subcommand is help/version under `commander` — a read.
+    // Under weak trust, we refuse to downgrade; fall back to generic Write.
+    return trust === 'trusted' ? Tier.Read : null;
   }
   const sub2 = tokens[idx + 1];
 
-  switch (sub) {
-    case 'check':
-    case 'doctor':
-    case 'status':
-      return Tier.Read;
-    case 'cache': {
-      if (sub2 === 'check' || sub2 === 'list' || sub2 === 'get') return Tier.Read;
-      if (sub2 === 'set' || sub2 === 'clear') return Tier.Write;
-      return Tier.Write;
+  const subcommandTier: Tier | null = ((): Tier | null => {
+    switch (sub) {
+      case 'check':
+      case 'doctor':
+      case 'status':
+        return Tier.Read;
+      case 'cache': {
+        if (sub2 === 'check' || sub2 === 'list' || sub2 === 'get') return Tier.Read;
+        if (sub2 === 'set' || sub2 === 'clear') return Tier.Write;
+        return Tier.Write;
+      }
+      case 'audit': {
+        if (sub2 === 'verify') return Tier.Read;
+        if (sub2 === 'record') return Tier.Read;
+        if (sub2 === 'rotate') return Tier.Write;
+        return Tier.Write;
+      }
+      case 'init':
+      case 'serve':
+      case 'upgrade':
+      case 'unfreeze':
+        return Tier.Write;
+      case 'freeze':
+        return Tier.Destructive;
+      default:
+        return null;
     }
-    case 'audit': {
-      if (sub2 === 'verify') return Tier.Read;
-      if (sub2 === 'record') return Tier.Read;
-      if (sub2 === 'rotate') return Tier.Write;
-      return Tier.Write;
-    }
-    case 'init':
-    case 'serve':
-    case 'upgrade':
-    case 'unfreeze':
-      return Tier.Write;
-    case 'freeze':
-      return Tier.Destructive;
-    default:
-      return Tier.Write;
+  })();
+
+  // Trusted path — return whatever the subcommand semantics say.
+  // Unknown subcommand: default Write (safer than Read).
+  if (trust === 'trusted') {
+    return subcommandTier ?? Tier.Write;
   }
+
+  // Weak trust (bare `rea`) — only honor upgrades above Write.
+  // Read/Write subcommands: return null so the middleware applies the generic
+  // Bash Write default (same as the pre-helper behavior, no downgrade).
+  // Destructive subcommands: KEEP the upgrade — `rea freeze` at L1 must block
+  // even if we cannot prove the binary on PATH is ours.
+  if (subcommandTier === Tier.Destructive) return Tier.Destructive;
+  return null;
 }
+

@@ -153,7 +153,7 @@ async function main(): Promise<void> {
   auditRecord
     .command('codex-review')
     .description(
-      'Append a codex.review audit entry the push-review cache gate recognizes. Optionally sets the review-cache in one atomic invocation.',
+      'Append a codex.review audit entry the push-review cache gate recognizes. With --also-set-cache, writes the review cache in the same invocation (two sequential appends in one process — not a two-phase commit).',
     )
     .requiredOption('--head-sha <sha>', 'git HEAD SHA the review covers')
     .requiredOption('--branch <branch>', 'feature branch under review')
@@ -170,7 +170,7 @@ async function main(): Promise<void> {
     .option('--session-id <id>', 'session id to attribute (defaults to "external")')
     .option(
       '--also-set-cache',
-      'atomically update .rea/review-cache.jsonl to reflect this verdict (recommended for post-review push flow)',
+      'also update .rea/review-cache.jsonl to reflect this verdict, in the same invocation (recommended for post-review push flow)',
     )
     .action(
       async (opts: {

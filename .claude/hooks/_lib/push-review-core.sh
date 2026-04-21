@@ -1085,9 +1085,11 @@ pr_core_run() {
       # SECURITY (Codex LOW 5): strip C0/C1 control characters from CLI
       # stderr before echoing to the terminal. A tampered dist/ or hostile
       # CLI could otherwise emit OSC/CSI sequences that rewrite lines above
-      # the deny message and mislead the operator.
+      # the deny message and mislead the operator. We strip both C0 + DEL
+      # AND C1 (0x80-0x9F) — some terminal emulators still honor bare C1
+      # bytes as CSI introducers (0x9B) or OSC (0x9D).
       local CACHE_STDERR_SAFE
-      CACHE_STDERR_SAFE=$(printf '%s' "$CACHE_STDERR" | LC_ALL=C tr -d '\000-\037\177')
+      CACHE_STDERR_SAFE=$(printf '%s' "$CACHE_STDERR" | LC_ALL=C tr -d '\000-\037\177\200-\237')
       printf 'rea push-review: CACHE CHECK FAILED (exit=%d): %s\n' "$CACHE_EXIT" "$CACHE_STDERR_SAFE" >&2
       printf 'rea push-review: treating as miss; file bookedsolidtech/rea issue if unexpected.\n' >&2
       CACHE_RESULT='{"hit":false,"reason":"query_error"}'
