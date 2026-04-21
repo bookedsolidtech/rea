@@ -378,6 +378,43 @@ function matchesBlockedPattern(value: string, pattern: string): boolean {
     return false;
   }
 
+  // Defect H (rea#79): dot-anchored patterns. A pattern whose base starts with
+  // `.` (e.g. `.rea/`, `.env`, `.husky/`) is meant to block ONLY leading-dot
+  // filesystem entries — never any path segment that happens to be spelled
+  // similarly without the dot. The previous suffix-based match let pattern
+  // `.rea/` trip on `Projects/rea/Bug Reports` (any project folder named
+  // `rea`) because `suffix.startsWith(base)` was false but the final
+  // `segs.includes(base)` fallback conflated `.rea` with `rea` through
+  // normalization downstream in some code paths. By explicitly requiring
+  // leading-dot segment equality, dot-prefixed patterns cannot bleed across
+  // the dot/no-dot boundary regardless of normalization rule drift.
+  const dotAnchored = base.startsWith('.');
+
+  if (dotAnchored) {
+    // Dot-anchored: segment must equal base exactly. Dir patterns also match
+    // "<base>/..." via the trailing slash marker. Never scans non-dot
+    // segments, so `Projects/rea/...` can never match `.rea/`.
+    for (let i = 0; i < segs.length; i++) {
+      const seg = segs[i];
+      if (seg === base) {
+        // Exact segment match — for a non-dir pattern this matches a FILE
+        // named exactly `.env`; for a dir pattern it matches the directory
+        // entry itself (the trailing-slash below covers its contents).
+        if (!dirPattern && i !== segs.length - 1) continue;
+        return true;
+      }
+      if (dirPattern && seg === base) return true;
+    }
+    if (dirPattern) {
+      // Dir pattern: any suffix that starts with `<base>/` matches.
+      for (let i = 0; i < segs.length; i++) {
+        const suffix = segs.slice(i).join('/');
+        if (suffix === base || suffix.startsWith(`${base}/`)) return true;
+      }
+    }
+    return false;
+  }
+
   for (let i = 0; i < segs.length; i++) {
     const suffix = segs.slice(i).join('/');
     if (suffix === base) return true;

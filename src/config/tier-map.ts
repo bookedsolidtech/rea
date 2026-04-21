@@ -131,3 +131,87 @@ export function isToolBlocked(
   const override = serverConfig?.tool_overrides?.[toolName];
   return override?.blocked === true;
 }
+
+/**
+ * Classify a `rea <subcommand>` Bash invocation by its own semantics rather
+ * than the generic Bash default.
+ *
+ * Defect E (rea#78): REA's own governance CLI must not be denied by REA's own
+ * middleware. The gate's error messages literally say "Run `rea cache set
+ * <sha> pass --branch <x> --base <y>`" — then the agent is denied at autonomy
+ * L1 because `Bash` is classified Write and the downstream middleware can't
+ * see that the Write is just appending a line to `.rea/review-cache.jsonl`.
+ *
+ * This helper returns the tier appropriate to the rea subcommand when the
+ * command parses as `rea <sub>` or `npx rea <sub>`. Returns `null` if the
+ * command is not a rea invocation — callers then fall back to the generic
+ * Bash tier.
+ *
+ * Tier mapping:
+ *   - Read:        `cache check|list|get`, `audit verify`,
+ *                  `audit record codex-review`, `check`, `doctor`, `status`
+ *   - Write:       `cache set|clear`, `audit rotate`, `init`,
+ *                  `serve`, `upgrade`, `unfreeze`
+ *   - Destructive: `freeze` (writes `.rea/HALT`, suspends the session)
+ *
+ * `audit record codex-review` is Read-tier because it is REA's own append-only
+ * audit surface — the whole point of the command is to let an L1 agent satisfy
+ * the push-review gate without a human in the loop. Write-tier here would
+ * reintroduce exactly the deadlock Defect D/E close.
+ */
+export function reaCommandTier(command: string): Tier | null {
+  if (typeof command !== 'string' || command.length === 0) return null;
+
+  const trimmed = command.trim();
+  if (trimmed.length === 0) return null;
+
+  const tokens = trimmed.split(/\s+/);
+  if (tokens.length === 0) return null;
+  const first = tokens[0];
+  if (first === undefined) return null;
+
+  let idx = 0;
+  if (first === 'npx') {
+    if (tokens.length < 2) return null;
+    const second = tokens[1];
+    if (second !== 'rea' && second !== '@bookedsolid/rea') return null;
+    idx = 2;
+  } else if (first === 'rea' || first.endsWith('/rea')) {
+    idx = 1;
+  } else {
+    return null;
+  }
+
+  const sub = tokens[idx];
+  if (sub === undefined) {
+    return Tier.Read;
+  }
+  const sub2 = tokens[idx + 1];
+
+  switch (sub) {
+    case 'check':
+    case 'doctor':
+    case 'status':
+      return Tier.Read;
+    case 'cache': {
+      if (sub2 === 'check' || sub2 === 'list' || sub2 === 'get') return Tier.Read;
+      if (sub2 === 'set' || sub2 === 'clear') return Tier.Write;
+      return Tier.Write;
+    }
+    case 'audit': {
+      if (sub2 === 'verify') return Tier.Read;
+      if (sub2 === 'record') return Tier.Read;
+      if (sub2 === 'rotate') return Tier.Write;
+      return Tier.Write;
+    }
+    case 'init':
+    case 'serve':
+    case 'upgrade':
+    case 'unfreeze':
+      return Tier.Write;
+    case 'freeze':
+      return Tier.Destructive;
+    default:
+      return Tier.Write;
+  }
+}

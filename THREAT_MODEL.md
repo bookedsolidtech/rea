@@ -1,6 +1,6 @@
 # Threat Model — REA Gateway and Hook Layer
 
-Version: 0.9.x | Last updated: 2026-04-21
+Version: 0.10.x | Last updated: 2026-04-21
 
 ---
 
@@ -474,6 +474,23 @@ Ref: `src/registry/fingerprint.ts` (`canonicalize()`, `fingerprintServer()`), `s
 **Residual risk:** Semantic injection in natural-language descriptions — a well-phrased instruction that no pattern catalog will catch — is not mitigated by pattern matching. This is the general limitation acknowledged in §5.1; the three-tier classifier narrows the footgun (by making "write under suspicion" a conscious policy decision) but does not eliminate it.
 
 Ref: `src/gateway/middleware/injection.ts`, `src/gateway/middleware/injection.test.ts`.
+
+### 5.22 Hook-Patch Session Env Var (0.10.0, Defect I)
+
+**Threat:** `settings-protection.sh` blanket-blocks edits under `.claude/hooks/` and `hooks/`. That is the correct default (agents must not silently rewrite safety infrastructure) but it leaves no documented path for applying upstream-sourced CodeRabbit/Codex findings on hook scripts during a live session. Before 0.10.0, operators reached for `!`-bash to sidestep the hook entirely, which dodged every audit surface — a worse outcome than the block it was working around.
+
+**Mitigations:**
+
+- `REA_HOOK_PATCH_SESSION=<reason>` is a **session-scoped**, **self-revoking** bypass. When set to a non-empty value, `settings-protection.sh` (`hooks/settings-protection.sh:86-130`) allows edits ONLY to paths under `.claude/hooks/` and `hooks/`. Every other protected path (`.rea/policy.yaml`, `.rea/HALT`, `.claude/settings.json`, `.claude/settings.local.json`) remains blocked — this is a hook-maintenance escape hatch, not a policy-editing one.
+- The session boundary IS the expiry. A new shell requires a fresh opt-in. There is no auto-expiry countdown to race, no policy-file flag that can silently linger across sessions, no CI refusal — the env var lives and dies with the process that set it.
+- Every allowed edit emits a `hooks.patch.session` audit record to `.rea/audit.jsonl` carrying: `metadata.reason` (the env-var value verbatim), `metadata.file` (normalized path), `metadata.sha_before` (pre-edit SHA-256 of the file, captured via the portable `sha256sum`/`shasum`/`openssl` fallback chain), `metadata.actor.{name,email}` (from `git config`), `metadata.pid`, `metadata.ppid`. Auditors can correlate a `hooks.patch.session` entry with a subsequent commit to prove the edit was declared before it landed.
+- The audit emission is best-effort (shell append under `2>/dev/null || true`): the audit trail is advisory, not gating. A failed audit write does not block the edit. This matches the rest of the shell-hook audit idiom — the hook must not deadlock if the JSON writer errors — while the Node-side audit chain remains the authoritative surface.
+
+**Trust boundary:** `REA_HOOK_PATCH_SESSION` is advisory for the tool-gate bypass only. It does not raise the autonomy level, does not disable any other hook, and does not relax blocked-paths, attribution, or secret-scanning enforcement. The gateway-layer middleware chain does not read this env var — it only affects the shell hook that guards `.claude/hooks/`. A malicious agent that set the env var for itself without human intent would gain the ability to mutate hooks, but every such mutation is auditable and the session ends with the shell; there is no persistent escalation path.
+
+**Residual risk:** An operator who declares a reason and then forgets to unset the variable carries the bypass across every subsequent hook edit in that shell. Mitigation: treat the env var as a one-use stand and unset it immediately after the intended patch; the audit trail will show repeated `hooks.patch.session` records if the lifetime leaks. A follow-up hardening could scope the var to a single edit by tying it to a nonce committed to the audit record and invalidating on next append — not shipped in 0.10.0 because the session-boundary model matches how operators actually reason about the feature.
+
+Ref: `hooks/settings-protection.sh:77-130`, `.claude/hooks/settings-protection.sh` (dogfood mirror), `__tests__/hooks/settings-protection-patch-session.test.ts`.
 
 ---
 

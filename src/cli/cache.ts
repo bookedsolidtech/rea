@@ -29,6 +29,7 @@ import {
   lookup,
   type CacheResult,
 } from '../cache/review-cache.js';
+import type { CodexVerdict } from '../audit/codex-event.js';
 import { err, log } from './utils.js';
 
 export interface CacheCheckOptions {
@@ -142,9 +143,59 @@ export async function runCacheList(options: CacheListOptions): Promise<void> {
   }
 }
 
-/** Parse-and-validate helper for `set` — surfaces a clean error on bad input. */
+/** Parse-and-validate helper for `set` — surfaces a clean error on bad input.
+ *
+ * Accepts the two historical cache values (`pass`, `fail`) AND the four
+ * canonical Codex verdicts (`pass`, `concerns`, `blocking`, `error`) per
+ * Defect D (rea#77). Codex verdicts are mapped to cache semantics at the CLI
+ * boundary: `pass|concerns` → gate-satisfying `pass`; `blocking|error` →
+ * gate-failing `fail`. The cache internal vocabulary stays binary
+ * (`pass`/`fail` = "gate-satisfying?") while the CLI accepts the full Codex
+ * vocabulary so agents can copy the `/codex-review` verdict verbatim.
+ */
 export function parseCacheResult(raw: string): CacheResult {
   if (raw === 'pass' || raw === 'fail') return raw;
-  err(`result must be 'pass' or 'fail'; got ${JSON.stringify(raw)}`);
+  if (raw === 'concerns') return 'pass';
+  if (raw === 'blocking' || raw === 'error') return 'fail';
+  err(
+    `result must be 'pass', 'fail', 'concerns', 'blocking', or 'error'; got ${JSON.stringify(
+      raw,
+    )}`,
+  );
   process.exit(1);
+}
+
+/** Shape returned by {@link codexVerdictToCacheResult}: the binary cache result
+ * plus an optional machine-readable `reason` string that records the source
+ * Codex verdict. `reason` is populated for non-`pass` verdicts so downstream
+ * listings expose WHY a cache fail was recorded. */
+export interface CodexVerdictCacheEffect {
+  result: CacheResult;
+  reason?: string | undefined;
+}
+
+/** Map a Codex verdict to the binary cache result the gate compares against.
+ *
+ * Mapping rationale:
+ *   - `pass` → cache `pass` (clean review, gate should pass)
+ *   - `concerns` → cache `pass` (non-blocking findings, gate should pass;
+ *     reviewer captured concerns in the audit record `metadata.summary`)
+ *   - `blocking` → cache `fail` (must address findings before merge)
+ *   - `error` → cache `fail` (Codex itself errored; no clean-bill-of-health)
+ *
+ * Kept separate from `parseCacheResult` so callers that already have a typed
+ * `CodexVerdict` (e.g. `rea audit record codex-review --also-set-cache`) don't
+ * round-trip through string parsing.
+ */
+export function codexVerdictToCacheResult(verdict: CodexVerdict): CodexVerdictCacheEffect {
+  switch (verdict) {
+    case 'pass':
+      return { result: 'pass' };
+    case 'concerns':
+      return { result: 'pass', reason: 'codex:concerns' };
+    case 'blocking':
+      return { result: 'fail', reason: 'codex:blocking' };
+    case 'error':
+      return { result: 'fail', reason: 'codex:error' };
+  }
 }

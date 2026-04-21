@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { Command } from 'commander';
-import { runAuditRotate, runAuditVerify } from './audit.js';
+import { runAuditRecordCodexReview, runAuditRotate, runAuditVerify } from './audit.js';
 import {
   parseCacheResult,
   runCacheCheck,
@@ -146,6 +146,66 @@ async function main(): Promise<void> {
       await runAuditVerify({ ...(opts.since !== undefined ? { since: opts.since } : {}) });
     });
 
+  const auditRecord = audit
+    .command('record')
+    .description('Emit a structured audit record (D).');
+
+  auditRecord
+    .command('codex-review')
+    .description(
+      'Append a codex.review audit entry the push-review cache gate recognizes. Optionally sets the review-cache in one atomic invocation.',
+    )
+    .requiredOption('--head-sha <sha>', 'git HEAD SHA the review covers')
+    .requiredOption('--branch <branch>', 'feature branch under review')
+    .requiredOption('--target <target>', 'base ref or SHA diffed against (e.g. main)')
+    .requiredOption('--verdict <verdict>', 'one of: pass | concerns | blocking | error')
+    .requiredOption('--finding-count <N>', 'non-negative integer finding count', (raw) => {
+      const n = Number.parseInt(raw, 10);
+      if (!Number.isFinite(n) || n < 0) {
+        throw new Error(`--finding-count must be a non-negative integer; got ${JSON.stringify(raw)}`);
+      }
+      return n;
+    })
+    .option('--summary <text>', 'one-sentence review summary (optional)')
+    .option('--session-id <id>', 'session id to attribute (defaults to "external")')
+    .option(
+      '--also-set-cache',
+      'atomically update .rea/review-cache.jsonl to reflect this verdict (recommended for post-review push flow)',
+    )
+    .action(
+      async (opts: {
+        headSha: string;
+        branch: string;
+        target: string;
+        verdict: string;
+        findingCount: number;
+        summary?: string;
+        sessionId?: string;
+        alsoSetCache?: boolean;
+      }) => {
+        if (
+          opts.verdict !== 'pass' &&
+          opts.verdict !== 'concerns' &&
+          opts.verdict !== 'blocking' &&
+          opts.verdict !== 'error'
+        ) {
+          throw new Error(
+            `--verdict must be one of pass|concerns|blocking|error; got ${JSON.stringify(opts.verdict)}`,
+          );
+        }
+        await runAuditRecordCodexReview({
+          headSha: opts.headSha,
+          branch: opts.branch,
+          target: opts.target,
+          verdict: opts.verdict,
+          findingCount: opts.findingCount,
+          ...(opts.summary !== undefined ? { summary: opts.summary } : {}),
+          ...(opts.sessionId !== undefined ? { sessionId: opts.sessionId } : {}),
+          ...(opts.alsoSetCache === true ? { alsoSetCache: true } : {}),
+        });
+      },
+    );
+
   const cache = program
     .command('cache')
     .description(
@@ -166,7 +226,7 @@ async function main(): Promise<void> {
   cache
     .command('set <sha> <result>')
     .description(
-      'Record a review outcome. <result> must be "pass" or "fail". Idempotent line-per-invocation; last write wins on (sha, branch, base).',
+      'Record a review outcome. <result> accepts pass|fail (historical) or pass|concerns|blocking|error (Codex verdicts). concerns→pass, blocking|error→fail. Idempotent line-per-invocation; last write wins on (sha, branch, base).',
     )
     .requiredOption('--branch <branch>', 'feature branch being pushed')
     .requiredOption('--base <base>', 'base branch the feature targets')

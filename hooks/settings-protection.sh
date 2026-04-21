@@ -74,6 +74,61 @@ normalize_path() {
 
 NORMALIZED=$(normalize_path "$FILE_PATH")
 
+# ── 5b. Hook-patch session (Defect I / rea#76) ───────────────────────────────
+# When REA_HOOK_PATCH_SESSION is set to a non-empty reason, allow edits under
+# .claude/hooks/ and hooks/ for this session. The session boundary IS the
+# expiry — a new shell requires a fresh opt-in. Every allowed edit is audited
+# as hooks.patch.session so the bypass is never silent.
+#
+# Only unblocks hook directories. .rea/policy.yaml, .rea/HALT,
+# .claude/settings.json, and .claude/settings.local.json remain protected —
+# this is a hook-maintenance escape hatch, not a policy-editing one.
+if [[ -n "${REA_HOOK_PATCH_SESSION:-}" ]]; then
+  case "$NORMALIZED" in
+    .claude/hooks/*|hooks/*)
+      # Emit audit record before allowing the edit. Best-effort: if jq or the
+      # audit file writer fails, still allow — the audit trail is advisory,
+      # not gating. Captures sha_before when the file exists so the audit
+      # surface shows what was on disk prior to the edit.
+      AUDIT_FILE="${REA_ROOT}/.rea/audit.jsonl"
+      SHA_BEFORE=""
+      if [[ -f "$FILE_PATH" ]]; then
+        if command -v sha256sum >/dev/null 2>&1; then
+          SHA_BEFORE=$(sha256sum "$FILE_PATH" 2>/dev/null | awk '{print $1}')
+        elif command -v shasum >/dev/null 2>&1; then
+          SHA_BEFORE=$(shasum -a 256 "$FILE_PATH" 2>/dev/null | awk '{print $1}')
+        elif command -v openssl >/dev/null 2>&1; then
+          SHA_BEFORE=$(openssl dgst -sha256 "$FILE_PATH" 2>/dev/null | awk '{print $NF}')
+        fi
+      fi
+      if [[ -d "$(dirname "$AUDIT_FILE")" ]] && command -v jq >/dev/null 2>&1; then
+        TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%S.000Z")
+        ACTOR_NAME=$(git -C "$REA_ROOT" config user.name 2>/dev/null || printf 'unknown')
+        ACTOR_EMAIL=$(git -C "$REA_ROOT" config user.email 2>/dev/null || printf 'unknown')
+        jq -n -c \
+          --arg ts "$TIMESTAMP" \
+          --arg session "${CLAUDE_SESSION_ID:-external}" \
+          --arg tool "hooks.patch.session" \
+          --arg server "rea" \
+          --arg reason "${REA_HOOK_PATCH_SESSION}" \
+          --arg file "$NORMALIZED" \
+          --arg sha_before "$SHA_BEFORE" \
+          --arg actor_name "$ACTOR_NAME" \
+          --arg actor_email "$ACTOR_EMAIL" \
+          --argjson pid "$$" \
+          --argjson ppid "$PPID" \
+          '{timestamp:$ts, session_id:$session, tool_name:$tool, server_name:$server,
+            tier:"write", status:"allowed", autonomy_level:"unknown", duration_ms:0,
+            metadata:{reason:$reason, file:$file, sha_before:$sha_before,
+                      actor:{name:$actor_name, email:$actor_email}, pid:$pid, ppid:$ppid}}' \
+          >> "$AUDIT_FILE" 2>/dev/null || true
+      fi
+      printf 'REA_HOOK_PATCH_SESSION: allowing edit to %s (reason: %s)\n' "$NORMALIZED" "${REA_HOOK_PATCH_SESSION}" >&2
+      exit 0
+      ;;
+  esac
+fi
+
 # ── 6. Protected path patterns ────────────────────────────────────────────────
 PROTECTED_PATTERNS=(
   '.claude/settings.json'

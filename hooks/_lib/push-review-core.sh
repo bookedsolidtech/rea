@@ -1059,8 +1059,29 @@ pr_core_run() {
   fi
 
   if [[ -n "$PUSH_SHA" ]] && [[ ${#REA_CLI_ARGS[@]} -gt 0 ]]; then
+    # Defect F (rea#75): distinguish cache-miss from cache-error. Prior version
+    # swallowed all non-zero exits and stderr into a silent `{hit:false}`, which
+    # masked Defect A (0.9.2 `node <shim>` SyntaxError) for weeks. Now we
+    # capture stderr + exit code separately and emit a visible WARN with an
+    # actionable filename when the CLI failed.
     local CACHE_RESULT
-    CACHE_RESULT=$("${REA_CLI_ARGS[@]}" cache check "$PUSH_SHA" --branch "$SOURCE_BRANCH" --base "$TARGET_BRANCH" 2>/dev/null || echo '{"hit":false}')
+    local CACHE_STDOUT=""
+    local CACHE_STDERR_FILE
+    CACHE_STDERR_FILE=$(mktemp -t rea-cache-err.XXXXXX 2>/dev/null || printf '/tmp/rea-cache-err.%d' "$$")
+    local CACHE_EXIT=0
+    CACHE_STDOUT=$("${REA_CLI_ARGS[@]}" cache check "$PUSH_SHA" --branch "$SOURCE_BRANCH" --base "$TARGET_BRANCH" 2>"$CACHE_STDERR_FILE") || CACHE_EXIT=$?
+    local CACHE_STDERR=""
+    CACHE_STDERR=$(cat "$CACHE_STDERR_FILE" 2>/dev/null || true)
+    rm -f "$CACHE_STDERR_FILE"
+    if [[ "$CACHE_EXIT" -ne 0 ]]; then
+      printf 'rea push-review: CACHE CHECK FAILED (exit=%d): %s\n' "$CACHE_EXIT" "$CACHE_STDERR" >&2
+      printf 'rea push-review: treating as miss; file bookedsolidtech/rea issue if unexpected.\n' >&2
+      CACHE_RESULT='{"hit":false,"reason":"query_error"}'
+    elif [[ -z "$CACHE_STDOUT" ]]; then
+      CACHE_RESULT='{"hit":false,"reason":"cold"}'
+    else
+      CACHE_RESULT="$CACHE_STDOUT"
+    fi
     # Require BOTH hit == true AND result == "pass". A cached `fail` verdict
     # (Codex 0.8.0 pass-2 finding #1) must NOT satisfy the gate — cache.ts
     # serializes `result` verbatim, so a negative verdict would otherwise
