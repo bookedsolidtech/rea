@@ -6,7 +6,11 @@
  * contain `__` in their name continue to work because the split is one-shot.
  */
 
-import { DownstreamConnection, type DownstreamToolInfo } from './downstream.js';
+import {
+  DownstreamConnection,
+  type DownstreamSupervisorEvent,
+  type DownstreamToolInfo,
+} from './downstream.js';
 import type { Registry } from '../registry/types.js';
 import type { Logger } from './log.js';
 
@@ -48,12 +52,31 @@ export class DownstreamPool {
    * or is skipped. Stale but truthful > absent.
    */
   private readonly lastToolsCount = new Map<string, number>();
+  /**
+   * Optional supervisor event listener wired by the gateway. The pool
+   * re-emits per-connection events through this single sink so the
+   * SESSION_BLOCKER tracker + state publisher only need to subscribe once.
+   */
+  private supervisorListener: ((event: DownstreamSupervisorEvent) => void) | null = null;
 
   constructor(registry: Registry, logger?: Logger) {
     for (const server of registry.servers) {
       if (!server.enabled) continue;
-      this.connections.set(server.name, new DownstreamConnection(server, logger));
+      const conn = new DownstreamConnection(server, logger);
+      conn.onSupervisorEvent((event) => {
+        this.supervisorListener?.(event);
+      });
+      this.connections.set(server.name, conn);
     }
+  }
+
+  /**
+   * Register a supervisor-event sink. Replaces any previously registered
+   * listener. Intended for the gateway to wire the SESSION_BLOCKER tracker
+   * and live state publisher.
+   */
+  onSupervisorEvent(listener: ((event: DownstreamSupervisorEvent) => void) | null): void {
+    this.supervisorListener = listener;
   }
 
   get size(): number {

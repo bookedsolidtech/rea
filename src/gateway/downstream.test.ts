@@ -350,6 +350,106 @@ describe('DownstreamConnection reconnect semantics', () => {
     expect(conn.lastError).toBeNull();
   });
 
+  it('BUG-003: "Not connected" error nulls the client and takes the respawn branch', async () => {
+    // Before 0.9.0, a `Not connected` error went through the ordinary
+    // reconnect path which called `close() + connect()` — fine, but relied
+    // on `close()` to tear down a client that was already dead. The 0.9.0
+    // change is defensive: we null the client eagerly on this specific
+    // marker so the reconnect unambiguously spawns a new child.
+    const s1 = makeStubClient(() => Promise.reject(new Error('Not connected')));
+    const s2 = makeStubClient(() => Promise.resolve({ ok: 'respawned' }));
+    const conn = makeConnection([s2]);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (conn as any).client = s1;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (conn as any).health = 'healthy';
+
+    const result = await conn.callTool('ping', {});
+    expect(result).toEqual({ ok: 'respawned' });
+    // lastError cleared on reconnect success.
+    expect(conn.lastError).toBeNull();
+  });
+
+  it('BUG-002: supervisor event fires on unexpected transport close', () => {
+    // Unit-level: exercise handleUnexpectedClose via the supervisor event
+    // plumbing to confirm the contract (null client, unhealthy, emit) rather
+    // than relying on a real child-process crash in the unit suite.
+    const conn = new DownstreamConnection(baseServer());
+    // Install a synthetic transport + client pair so handleUnexpectedClose
+    // can see an "active" connection to tear down.
+    const fakeTransport = { marker: 'fake' } as unknown;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (conn as any).client = makeStubClient(() => Promise.resolve(null));
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (conn as any).activeTransport = fakeTransport;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (conn as any).health = 'healthy';
+
+    const events: Array<{ kind: string; server: string }> = [];
+    conn.onSupervisorEvent((e) => {
+      events.push({ kind: e.kind, server: e.server });
+    });
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (conn as any).handleUnexpectedClose(fakeTransport, 'test-reason');
+
+    expect(conn.isConnected).toBe(false);
+    expect(conn.isHealthy).toBe(false);
+    expect(conn.lastError).toMatch(/child process exited unexpectedly: test-reason/);
+    expect(events).toEqual([{ kind: 'child_died_unexpectedly', server: 'mock' }]);
+  });
+
+  it('BUG-002: intentional close() does NOT fire a death event', async () => {
+    const conn = new DownstreamConnection(baseServer());
+    const fakeTransport = { marker: 'fake' } as unknown;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (conn as any).client = makeStubClient(() => Promise.resolve(null));
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (conn as any).activeTransport = fakeTransport;
+
+    const events: Array<{ kind: string }> = [];
+    conn.onSupervisorEvent((e) => {
+      events.push({ kind: e.kind });
+    });
+
+    // close() must clear activeTransport BEFORE the client's close resolves so
+    // a transport.onclose firing during tear-down is recognized as ours.
+    await conn.close();
+
+    // Fire a synthetic onclose after close() completed — it must be ignored
+    // because activeTransport is already null.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (conn as any).handleUnexpectedClose(fakeTransport, 'late-callback');
+
+    expect(events).toEqual([]);
+  });
+
+  it('BUG-002: stale transport onclose from prior episode is ignored', () => {
+    const conn = new DownstreamConnection(baseServer());
+    const priorTransport = { id: 'prior' } as unknown;
+    const currentTransport = { id: 'current' } as unknown;
+
+    // Simulate: priorTransport was active, then we reconnected and swapped
+    // to currentTransport. A late onclose from priorTransport must NOT
+    // invalidate currentTransport's client.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (conn as any).client = makeStubClient(() => Promise.resolve(null));
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (conn as any).activeTransport = currentTransport;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (conn as any).health = 'healthy';
+
+    const events: Array<unknown> = [];
+    conn.onSupervisorEvent((e) => events.push(e));
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (conn as any).handleUnexpectedClose(priorTransport, 'stale');
+
+    expect(conn.isConnected).toBe(true);
+    expect(conn.isHealthy).toBe(true);
+    expect(events).toEqual([]);
+  });
+
   it('refuses a second reconnect within the flap window', async () => {
     const firstClient = makeStubClient(() => Promise.reject(new Error('transport closed #1')));
     const secondClient = makeStubClient(() => Promise.resolve({ ok: 'reconnect-1-retry' }));

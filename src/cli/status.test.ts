@@ -164,6 +164,101 @@ describe('rea status — computeStatusPayload', () => {
     expect(afterUsed - before).toBeLessThan(50 * 1024 * 1024);
   });
 
+  it('parses the 0.9.0 downstreams block from serve.state.json', async () => {
+    await writeBasePolicy(baseDir);
+    await fs.writeFile(path.join(baseDir, '.rea', 'serve.pid'), String(process.pid), 'utf8');
+    await fs.writeFile(
+      path.join(baseDir, '.rea', 'serve.state.json'),
+      JSON.stringify({
+        session_id: 'test-session-9',
+        started_at: '2026-04-20T12:00:00Z',
+        metrics_port: 9464,
+        downstreams: [
+          {
+            name: 'helixir',
+            connected: false,
+            healthy: false,
+            circuit_state: 'open',
+            retry_at: '2026-04-20T12:05:00Z',
+            last_error: 'connection closed',
+            tools_count: null,
+            open_transitions: 4,
+            session_blocker_emitted: true,
+          },
+          {
+            name: 'obsidian',
+            connected: true,
+            healthy: true,
+            circuit_state: 'closed',
+            retry_at: null,
+            last_error: null,
+            tools_count: 12,
+            open_transitions: 0,
+            session_blocker_emitted: false,
+          },
+        ],
+      }),
+      'utf8',
+    );
+
+    const payload = computeStatusPayload(baseDir);
+    expect(payload.serve.downstreams).not.toBeNull();
+    const ds = payload.serve.downstreams!;
+    expect(ds).toHaveLength(2);
+    const helixir = ds.find((d) => d.name === 'helixir');
+    const obsidian = ds.find((d) => d.name === 'obsidian');
+    expect(helixir?.circuit_state).toBe('open');
+    expect(helixir?.retry_at).toBe('2026-04-20T12:05:00Z');
+    expect(helixir?.session_blocker_emitted).toBe(true);
+    expect(helixir?.open_transitions).toBe(4);
+    expect(obsidian?.circuit_state).toBe('closed');
+    expect(obsidian?.tools_count).toBe(12);
+  });
+
+  it('treats a missing downstreams field as null (legacy state file)', async () => {
+    await writeBasePolicy(baseDir);
+    await fs.writeFile(path.join(baseDir, '.rea', 'serve.pid'), String(process.pid), 'utf8');
+    // Legacy pre-0.9.0 state file shape — no downstreams key.
+    await fs.writeFile(
+      path.join(baseDir, '.rea', 'serve.state.json'),
+      JSON.stringify({
+        session_id: 'legacy',
+        started_at: '2026-04-18T00:00:00Z',
+        metrics_port: null,
+      }),
+      'utf8',
+    );
+
+    const payload = computeStatusPayload(baseDir);
+    expect(payload.serve.downstreams).toBeNull();
+  });
+
+  it('skips malformed downstream entries but keeps the valid ones', async () => {
+    await writeBasePolicy(baseDir);
+    await fs.writeFile(path.join(baseDir, '.rea', 'serve.pid'), String(process.pid), 'utf8');
+    await fs.writeFile(
+      path.join(baseDir, '.rea', 'serve.state.json'),
+      JSON.stringify({
+        session_id: 'mixed',
+        started_at: '2026-04-20T12:00:00Z',
+        metrics_port: null,
+        downstreams: [
+          { name: 'good', connected: true, healthy: true, circuit_state: 'closed' },
+          { not_a_name: 'whatever' },
+          null,
+          'garbage',
+          { name: '', circuit_state: 'closed' },
+        ],
+      }),
+      'utf8',
+    );
+
+    const payload = computeStatusPayload(baseDir);
+    const ds = payload.serve.downstreams!;
+    expect(ds).toHaveLength(1);
+    expect(ds[0]?.name).toBe('good');
+  });
+
   it('reflects review.codex_required = true when the profile demands it', async () => {
     // Overwrite with a codex-required policy.
     const yaml = `version: "1"
