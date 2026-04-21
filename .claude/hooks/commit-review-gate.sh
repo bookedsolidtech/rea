@@ -197,6 +197,36 @@ fi
 BRANCH=$(cd "$REA_ROOT" && git branch --show-current 2>/dev/null || echo "")
 CACHE_FILE="${REA_ROOT}/.rea/review-cache.json"
 
+# Codex pass-3 finding #1: `rea cache check` and `rea cache set` both declare
+# `--base` as a `requiredOption` in src/cli/index.ts. Prior versions of this
+# gate omitted `--base`, so (a) the CLI path exited non-zero and the
+# `|| echo '{"hit":false}'` fallback quietly masked the contract error, and
+# (b) the section-11 banner instructed the agent to run `rea cache set <sha>
+# pass` — also missing `--base`, rejected by the CLI on every retry. A
+# successful cache flow was unreachable.
+#
+# Resolve BASE_BRANCH by the same preference order the push-gate uses in
+# push-review-core.sh §7 (lines 778-794): origin/HEAD → origin/main →
+# origin/master → empty. If nothing resolves, disable the cache (the
+# alternative is emitting a cache command the CLI rejects on every call).
+BASE_BRANCH=""
+_origin_head=$(cd "$REA_ROOT" && git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null || true)
+if [[ -n "$_origin_head" ]]; then
+  BASE_BRANCH="${_origin_head#refs/remotes/origin/}"
+fi
+if [[ -z "$BASE_BRANCH" ]]; then
+  if cd "$REA_ROOT" && git rev-parse --verify --quiet refs/remotes/origin/main >/dev/null 2>&1; then
+    BASE_BRANCH="main"
+  elif cd "$REA_ROOT" && git rev-parse --verify --quiet refs/remotes/origin/master >/dev/null 2>&1; then
+    BASE_BRANCH="master"
+  fi
+fi
+if [[ -z "$BASE_BRANCH" && -n "$STAGED_SHA" ]]; then
+  printf 'rea commit-review: WARN could not resolve base branch (no origin/HEAD, no origin/main, no origin/master); cache disabled\n' >&2
+  STAGED_SHA=""
+fi
+unset _origin_head
+
 if [[ -n "$STAGED_SHA" ]]; then
   CACHE_HIT=false
 
@@ -204,10 +234,10 @@ if [[ -n "$STAGED_SHA" ]]; then
   # Cache predicate must require BOTH `.hit == true` AND `.result == "pass"` —
   # a cached `fail` verdict would otherwise satisfy `.hit == true` and let the
   # commit proceed despite a recorded negative review. Mirrors the push-gate
-  # predicate at push-review-core.sh §8; the §191-199 direct-cache fallback
+  # predicate at push-review-core.sh §8; the §218-226 direct-cache fallback
   # already enforces `result == "pass"`, so the two paths must agree.
   if [[ ${#REA_CLI_ARGS[@]} -gt 0 ]]; then
-    CACHE_RESULT=$("${REA_CLI_ARGS[@]}" cache check "$STAGED_SHA" --branch "$BRANCH" 2>/dev/null || echo '{"hit":false}')
+    CACHE_RESULT=$("${REA_CLI_ARGS[@]}" cache check "$STAGED_SHA" --branch "$BRANCH" --base "$BASE_BRANCH" 2>/dev/null || echo '{"hit":false}')
     if printf '%s' "$CACHE_RESULT" | jq -e '.hit == true and .result == "pass"' >/dev/null 2>&1; then
       CACHE_HIT=true
     fi
@@ -254,13 +284,16 @@ fi
   # commit bypasses it entirely). The only remediation is to install a sha256
   # hasher or ask the user to commit directly.
   if [[ -n "$STAGED_SHA" ]]; then
-    printf '  3. Approve:  rea cache set %s pass\n' "$STAGED_SHA"
+    printf '  3. Approve:  rea cache set %s pass --branch %s --base %s\n' \
+      "$STAGED_SHA" "$BRANCH" "$BASE_BRANCH"
     printf '  4. Retry the git commit command\n'
   else
-    printf '  3. Cache is DISABLED on this host (no sha256 hasher found).\n'
-    printf '     Install one of: sha256sum (Linux coreutils), shasum (perl-core),\n'
-    printf '     or openssl — then retry. Without a hasher the cache path cannot\n'
-    printf '     complete; escalate to the user if no hasher can be installed.\n'
+    printf '  3. Cache is DISABLED on this host (no sha256 hasher or no base\n'
+    printf '     branch resolvable). Install one of: sha256sum (Linux coreutils),\n'
+    printf '     shasum (perl-core), or openssl; or ensure origin/HEAD is set so\n'
+    printf '     the gate can identify the merge target. Without these the cache\n'
+    printf '     path cannot complete — escalate to the user if neither can be\n'
+    printf '     provided.\n'
   fi
   printf '\n'
   printf '  Only escalate to the user if you find a genuine problem in the diff.\n'

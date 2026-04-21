@@ -567,9 +567,15 @@ describe('commit-review-gate — 0.9.4 pass-2 (cache predicate + portable hasher
    * Stage a 30-line change so the gate classifies it as "standard" (≥20 <200
    * lines, no sensitive paths) and reaches the cache-check block. A trivial
    * diff short-circuits before touching the predicate.
+   *
+   * Also sets up a bare origin remote with main fetched so the gate's new
+   * BASE_BRANCH probe (`refs/remotes/origin/HEAD` → `origin/main` →
+   * `origin/master`) resolves. Without this the Codex pass-3 #1 fix would
+   * disable the cache outright and skip every assertion below.
    */
   async function installCommitGateRepo(): Promise<{
     dir: string;
+    bareRemote: string;
     gitDiffCachedSha: string;
   }> {
     const dir = await fs.realpath(
@@ -587,6 +593,19 @@ describe('commit-review-gate — 0.9.4 pass-2 (cache predicate + portable hasher
     await fs.writeFile(path.join(dir, 'README.md'), '# scratch\n');
     git('add', 'README.md');
     git('commit', '-m', 'baseline', '--quiet');
+
+    const bareRemote = path.join(dir, '..', path.basename(dir) + '.git');
+    execFileSync(
+      'git',
+      ['init', '--bare', '--initial-branch=main', '--quiet', bareRemote],
+      { encoding: 'utf8' },
+    );
+    git('remote', 'add', 'origin', bareRemote);
+    git('push', 'origin', 'main', '--quiet');
+    // Set origin/HEAD so the commit-gate's BASE_BRANCH probe resolves to
+    // "main". Matches the default `git clone` would produce.
+    git('symbolic-ref', 'refs/remotes/origin/HEAD', 'refs/remotes/origin/main');
+    cleanup.push(bareRemote);
 
     const lines = Array.from({ length: 30 }, (_, i) => `line-${i}`).join('\n');
     await fs.writeFile(path.join(dir, 'change.txt'), lines + '\n');
@@ -619,7 +638,7 @@ describe('commit-review-gate — 0.9.4 pass-2 (cache predicate + portable hasher
     const { createHash } = await import('node:crypto');
     const gitDiffCachedSha = createHash('sha256').update(diff).digest('hex');
 
-    return { dir, gitDiffCachedSha };
+    return { dir, bareRemote, gitDiffCachedSha };
   }
 
   it('cache predicate REQUIRES .result == "pass" — a cached `fail` does NOT allow the commit', async () => {
@@ -629,17 +648,22 @@ describe('commit-review-gate — 0.9.4 pass-2 (cache predicate + portable hasher
 
     // Seed the direct-cache file with a `fail` entry keyed on `branch:sha`.
     // The fallback path already uses `.result == "pass"`; the CLI path is
-    // the one we're pinning here. Setting REA_CLI_ARGS to empty (no CLI) is
-    // NOT what we want — we need the primary path to trigger the CLI check
-    // and find a `fail`. Easiest path: mock a `rea` shim on PATH that emits
-    // `{"hit":true,"result":"fail"}` on `cache check`.
+    // the one we're pinning here. Mock a `rea` shim on PATH that emits
+    // `{"hit":true,"result":"fail"}` on `cache check` AND records its argv
+    // so we can pin the CLI contract (Codex pass-3 #2 — a happy stub that
+    // accepts any argv hides the --base omission).
     const shimDir = path.join(dir, '.bin');
     await fs.mkdir(shimDir, { recursive: true });
+    const argvLogPath = path.join(dir, '.shim-argv.log');
     const reaShim = path.join(shimDir, 'rea');
     await fs.writeFile(
       reaShim,
       [
         '#!/bin/bash',
+        '# Record every argv the gate sends, one arg per line, so the test',
+        '# can assert the CLI contract (required options --branch and --base).',
+        `printf '%s\\n' "$@" >> ${JSON.stringify(argvLogPath)}`,
+        `printf '\\n---END---\\n' >> ${JSON.stringify(argvLogPath)}`,
         'if [[ "$1" == "cache" && "$2" == "check" ]]; then',
         '  printf \'{"hit":true,"result":"fail"}\\n\'',
         '  exit 0',
@@ -666,20 +690,40 @@ describe('commit-review-gate — 0.9.4 pass-2 (cache predicate + portable hasher
     );
 
     // A cached `fail` must NOT satisfy the gate. Exit must be 2 (block).
-    // Pre-fix: predicate was `.hit == true` only, so this test exits 0 and
-    // the regression succeeds in attacking us.
+    // Pre-fix (pass-2): predicate was `.hit == true` only, so this test
+    // exits 0 without the fix.
     expect(res.status).toBe(2);
     expect((res.stderr ?? '').toLowerCase()).toContain('commit review gate');
 
     // Positive shape-check: the banner MUST render a well-formed cache-set
-    // line with a 64-hex SHA, not a dead-end empty positional. We use a
-    // regex rather than a literal SHA compare because node crypto and the
-    // shell hasher disagree on trailing-newline handling of `git diff
-    // --cached` output — the gate's SHA is the authoritative one.
+    // line with a 64-hex SHA AND the required `--branch`/`--base` flags.
+    // Pre-fix (pass-3 #1): the banner omitted both flags and rendered a
+    // command the real CLI rejects. Regex rather than literal SHA because
+    // node crypto and the shell hasher disagree on trailing-newline
+    // handling of `git diff --cached`.
     void gitDiffCachedSha;
     expect(res.stderr).toMatch(
-      /rea cache set [0-9a-f]{64} pass/,
+      /rea cache set [0-9a-f]{64} pass --branch \S+ --base \S+/,
     );
+
+    // CLI contract assertion (Codex pass-3 #2): the gate's actual invocation
+    // of `rea cache check` MUST include `--base`. Pre-fix (pass-3 #1) the
+    // gate only passed `--branch`, which commander's requiredOption rejects
+    // with a non-zero exit — silently swallowed by `|| echo '{"hit":false}'`.
+    const argvLog = await fs.readFile(argvLogPath, 'utf8');
+    const invocations = argvLog
+      .split('---END---')
+      .map((s) => s.trim())
+      .filter(Boolean)
+      .map((s) => s.split('\n'));
+    const cacheCheckInvocations = invocations.filter(
+      (argv) => argv[0] === 'cache' && argv[1] === 'check',
+    );
+    expect(cacheCheckInvocations.length).toBeGreaterThan(0);
+    for (const argv of cacheCheckInvocations) {
+      expect(argv).toContain('--branch');
+      expect(argv).toContain('--base');
+    }
   });
 
   it('banner branches when no sha256 hasher is present — does NOT emit `rea cache set  pass`', async () => {
