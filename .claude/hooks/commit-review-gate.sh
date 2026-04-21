@@ -215,9 +215,14 @@ if [[ -n "$_origin_head" ]]; then
   BASE_BRANCH="${_origin_head#refs/remotes/origin/}"
 fi
 if [[ -z "$BASE_BRANCH" ]]; then
-  if cd "$REA_ROOT" && git rev-parse --verify --quiet refs/remotes/origin/main >/dev/null 2>&1; then
+  # Use `git -C` so the current-shell cwd is never mutated — matches the
+  # cross-repo guard at §1a and keeps the file's dominant idiom. Raw
+  # `cd "$REA_ROOT" && git …` would leave the hook process sitting in
+  # $REA_ROOT, which is safe today but breaks silently if a future edit
+  # adds a relative-path command downstream.
+  if git -C "$REA_ROOT" rev-parse --verify --quiet refs/remotes/origin/main >/dev/null 2>&1; then
     BASE_BRANCH="main"
-  elif cd "$REA_ROOT" && git rev-parse --verify --quiet refs/remotes/origin/master >/dev/null 2>&1; then
+  elif git -C "$REA_ROOT" rev-parse --verify --quiet refs/remotes/origin/master >/dev/null 2>&1; then
     BASE_BRANCH="master"
   fi
 fi
