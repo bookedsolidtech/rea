@@ -93,6 +93,17 @@ export interface LiveServeState {
   downstreams: LiveDownstreamState[];
   /** ISO timestamp of this snapshot. Separate from `started_at`. */
   updated_at: string;
+  /**
+   * PID of the process that wrote this snapshot. Added in 0.9.0 pass-4 so
+   * a NEW `rea serve` can detect an ABANDONED state file (writer crashed,
+   * no one cleaned up) and take over ownership. Without this field,
+   * the pass-2 session_id-only ownership check was strictly safer but
+   * also strictly one-directional: once an older session wrote, no new
+   * session could ever claim the file, and `rea status` would stall on
+   * the dead session forever. Optional for backward compatibility with
+   * pre-0.9.0 snapshots that lack the field.
+   */
+  owner_pid?: number;
 }
 
 /** Atomic write helper — duplicated from serve.ts intentionally to keep this module standalone. */
@@ -338,16 +349,35 @@ export class LiveStatePublisher {
   }
 
   /**
-   * Returns true iff the on-disk state file either (a) does not exist,
-   * (b) cannot be parsed, or (c) carries a `session_id` matching ours.
-   * Returning `true` on unparseable/missing is deliberate — the very first
-   * boot write HAS to proceed, and a corrupt legacy file is better
-   * overwritten by a valid new one than preserved indefinitely.
+   * Returns true iff this publisher is allowed to write the on-disk state
+   * file on behalf of its session. The check runs under the sidecar lock
+   * (see `flushNow`) so the read + subsequent rename form one serialized
+   * critical section.
    *
-   * Reading the file on every flush is acceptable cost: writes are
-   * debounced to ~4 Hz maximum, the file is tiny (few hundred bytes), and
-   * the check avoids the "older instance clobbers newer instance's
-   * breadcrumb" hazard Codex flagged.
+   * Ownership resolves against three buckets:
+   *
+   *   1. **Safe-to-write**: the file is absent, corrupt, or has a missing/
+   *      malformed `session_id`. No competing session is on disk, so we
+   *      write without hesitation.
+   *   2. **We own it**: the stored `session_id` matches ours. Normal
+   *      steady-state — every flush lands here.
+   *   3. **Another session owns it**: the stored `session_id` differs
+   *      from ours. Before 0.9.0 pass-4 this was an unconditional yield,
+   *      which was strictly safer but broke the crash-recovery case —
+   *      a NEW `rea serve` launched after an unclean shutdown would
+   *      observe the crashed session's id and yield forever, leaving
+   *      `rea status` permanently stuck. Codex pass-4 P1 flagged this.
+   *
+   *      The 0.9.0 `owner_pid` field exists exactly to disambiguate this
+   *      bucket. If `owner_pid` is alive, an overlapping writer is still
+   *      running and we yield (silent). If `owner_pid` is gone (ESRCH)
+   *      or missing from the payload (pre-0.9.0 file or same-process
+   *      write), we treat the file as abandoned and take over.
+   *
+   * `process.kill(pid, 0)` returns ESRCH for a missing PID, EPERM for a
+   * live PID we cannot signal. We treat EPERM as "alive from someone's
+   * perspective" and yield — never steal a file the kernel is uncertain
+   * about.
    */
   private ownsStateFile(): boolean {
     let raw: string;
@@ -363,13 +393,48 @@ export class LiveStatePublisher {
       // transient read hiccup.
       return true;
     }
+    let parsed: { session_id?: unknown; owner_pid?: unknown };
     try {
-      const parsed = JSON.parse(raw) as { session_id?: unknown };
-      if (typeof parsed.session_id !== 'string') return true;
-      return parsed.session_id === this.opts.sessionId;
+      parsed = JSON.parse(raw) as { session_id?: unknown; owner_pid?: unknown };
     } catch {
       // Unparseable file — treat as "not owned by anyone", safe to overwrite.
       return true;
+    }
+    if (typeof parsed.session_id !== 'string') return true;
+    if (parsed.session_id === this.opts.sessionId) return true;
+    // Foreign session_id. Use owner_pid to decide whether to yield or steal.
+    if (typeof parsed.owner_pid !== 'number' || !Number.isFinite(parsed.owner_pid) || parsed.owner_pid <= 0) {
+      // Pre-0.9.0 file (no owner_pid recorded) or malformed value. We
+      // cannot prove the writer is alive, and refusing to write forever
+      // is the bigger hazard — claim the file. This is the same
+      // conservative "better a stale snapshot gets replaced by a valid
+      // one" rule the old code applied to unparseable files.
+      this.opts.logger?.info({
+        event: 'live_state.reclaimed',
+        message:
+          'serve.state.json has a foreign session_id without owner_pid — treating as abandoned',
+      });
+      return true;
+    }
+    const ownerPid = parsed.owner_pid;
+    try {
+      process.kill(ownerPid, 0);
+      // PID is alive — another `rea serve` instance is still writing.
+      return false;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === 'ESRCH') {
+        // Writer is gone. File is abandoned; steal ownership.
+        this.opts.logger?.info({
+          event: 'live_state.reclaimed',
+          message: `serve.state.json previous owner pid ${ownerPid} is gone — reclaiming for session ${this.opts.sessionId}`,
+        });
+        return true;
+      }
+      // EPERM or any other signal error — the PID exists but we can't
+      // signal it. Err on the side of yielding; do not steal from a
+      // possibly-live peer.
+      return false;
     }
   }
 
@@ -395,6 +460,10 @@ export class LiveStatePublisher {
       metrics_port: this.opts.metricsPort,
       downstreams,
       updated_at: new Date().toISOString(),
+      // Stamp the owning PID so a future `rea serve` can distinguish
+      // "another live session is writing this file" from "the previous
+      // writer crashed and left orphaned breadcrumbs". See `ownsStateFile`.
+      owner_pid: process.pid,
     };
   }
 

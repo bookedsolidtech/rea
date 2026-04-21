@@ -491,6 +491,12 @@ export class DownstreamConnection {
         message: `downstream "${this.config.name}" transport error`,
         error: err.message,
       });
+      // Codex 0.9.0 pass-4 P2: surface the new last_error to the live-state
+      // publisher immediately. Before this emit, a protocol-level transport
+      // error that did NOT trigger a subsequent onclose would update
+      // last_error in memory but leave `rea status` showing the previous
+      // (stale) value until some unrelated circuit/respawn event flushed.
+      this.emitHealthChanged();
     };
 
     const client = new Client(

@@ -185,15 +185,19 @@ describe('LiveStatePublisher', () => {
     expect(fs.existsSync(statePath)).toBe(true);
   });
 
-  it('yields silently when another session owns the on-disk state file', () => {
-    // Pre-seed the state file with a DIFFERENT session id to simulate a
-    // newer `rea serve` having already claimed the breadcrumb.
+  it('yields silently when another LIVE session owns the on-disk state file', () => {
+    // Pre-seed the state file with a DIFFERENT session id backed by our
+    // own PID (which is by definition alive) so the steal path refuses.
+    // Before the pass-4 abandon-detection fix this test used no owner_pid
+    // at all; under the new logic that is the "reclaim it" case, so we
+    // must include a live owner_pid to exercise the yield path.
     const foreign = {
       session_id: 'S-OTHER',
       started_at: '2026-04-20T00:00:00Z',
       metrics_port: 9091,
       downstreams: [],
       updated_at: '2026-04-20T00:00:00Z',
+      owner_pid: process.pid,
     };
     fs.writeFileSync(statePath, JSON.stringify(foreign) + '\n');
 
@@ -235,6 +239,73 @@ describe('LiveStatePublisher', () => {
     // Stolen + written + released.
     expect(fs.existsSync(`${statePath}.lock`)).toBe(false);
     expect(fs.existsSync(statePath)).toBe(true);
+    const raw = JSON.parse(fs.readFileSync(statePath, 'utf8')) as Record<string, unknown>;
+    expect(raw.session_id).toBe('S-TEST');
+  });
+
+  it('Codex pass-4 P1: reclaims serve.state.json after an abandoned crash (dead owner_pid)', () => {
+    // Seed a foreign session with a PID that doesn't exist — simulates the
+    // "previous rea serve SIGKILL'd, left breadcrumb behind, operator
+    // restarts" flow. Before the pass-4 fix the new publisher would yield
+    // forever and `rea status` would stall on the dead session.
+    const deadPid = 2 ** 22;
+    const abandoned = {
+      session_id: 'S-CRASHED',
+      started_at: '2026-04-20T00:00:00Z',
+      metrics_port: null,
+      downstreams: [],
+      updated_at: '2026-04-20T00:00:00Z',
+      owner_pid: deadPid,
+    };
+    fs.writeFileSync(statePath, JSON.stringify(abandoned) + '\n');
+
+    const { publisher } = makePublisher(['alpha']);
+    publisher.flushNow();
+
+    const raw = JSON.parse(fs.readFileSync(statePath, 'utf8')) as Record<string, unknown>;
+    expect(raw.session_id).toBe('S-TEST');
+    expect(raw.owner_pid).toBe(process.pid);
+  });
+
+  it('Codex pass-4 P1: yields when a foreign session is backed by a LIVE pid', () => {
+    // Use our own pid as the foreign owner — it IS alive, so the steal
+    // path must refuse. This is the contract: never clobber a file when
+    // the recorded owner_pid corresponds to a live peer.
+    const owned = {
+      session_id: 'S-OTHER-LIVE',
+      started_at: '2026-04-20T00:00:00Z',
+      metrics_port: null,
+      downstreams: [],
+      updated_at: '2026-04-20T00:00:00Z',
+      owner_pid: process.pid,
+    };
+    fs.writeFileSync(statePath, JSON.stringify(owned) + '\n');
+
+    const { publisher } = makePublisher(['alpha']);
+    publisher.flushNow();
+
+    const raw = JSON.parse(fs.readFileSync(statePath, 'utf8')) as Record<string, unknown>;
+    expect(raw.session_id).toBe('S-OTHER-LIVE');
+  });
+
+  it('Codex pass-4 P1: pre-0.9.0 snapshot without owner_pid is treated as abandoned', () => {
+    // Backward compat: a state file written by an older rea version that
+    // predates owner_pid must not strand a new gateway. Without the pass-4
+    // fix, operators upgrading `rea` in place with a dangling old
+    // serve.state.json would see `rea status` yield forever.
+    const legacy = {
+      session_id: 'S-LEGACY',
+      started_at: '2026-04-19T00:00:00Z',
+      metrics_port: null,
+      downstreams: [],
+      updated_at: '2026-04-19T00:00:00Z',
+      // no owner_pid
+    };
+    fs.writeFileSync(statePath, JSON.stringify(legacy) + '\n');
+
+    const { publisher } = makePublisher(['alpha']);
+    publisher.flushNow();
+
     const raw = JSON.parse(fs.readFileSync(statePath, 'utf8')) as Record<string, unknown>;
     expect(raw.session_id).toBe('S-TEST');
   });
