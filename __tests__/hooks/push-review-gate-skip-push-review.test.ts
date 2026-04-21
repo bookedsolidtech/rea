@@ -489,8 +489,11 @@ describe('push-review-gate.sh — REA_SKIP_PUSH_REVIEW whole-gate escape hatch',
     expect((osIdentity['whoami'] as string).length).toBeGreaterThan(0);
     expect(typeof osIdentity['hostname']).toBe('string');
     expect((osIdentity['hostname'] as string).length).toBeGreaterThan(0);
-    expect(typeof osIdentity['pid']).toBe('string');
-    expect(typeof osIdentity['ppid']).toBe('string');
+    // 0.9.4 Defect M (rea#64): pid/ppid are emitted as numbers (via `jq
+    // --argjson`) so downstream auditors querying `.metadata.os_identity.pid
+    // == 1234` match correctly. Pre-0.9.4 this was a string.
+    expect(typeof osIdentity['pid']).toBe('number');
+    expect(typeof osIdentity['ppid']).toBe('number');
     expect('tty' in osIdentity).toBe(true);
     expect('ci' in osIdentity).toBe(true);
   });

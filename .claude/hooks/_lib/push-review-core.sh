@@ -435,8 +435,8 @@ pr_core_run() {
       --arg os_uid "$SKIP_OS_UID" \
       --arg os_whoami "$SKIP_OS_WHOAMI" \
       --arg os_hostname "$SKIP_OS_HOST" \
-      --arg os_pid "$SKIP_OS_PID" \
-      --arg os_ppid "$SKIP_OS_PPID" \
+      --argjson os_pid "$SKIP_OS_PID" \
+      --argjson os_ppid "$SKIP_OS_PPID" \
       --arg os_ppid_cmd "$SKIP_OS_PPID_CMD" \
       --arg os_tty "$SKIP_OS_TTY" \
       --arg os_ci "$SKIP_OS_CI" \
@@ -924,17 +924,26 @@ pr_core_run() {
     fi
   done
 
+  # Defect J (rea#61): branch-deletion guard MUST fail closed regardless of
+  # whether another refspec in the same push resolved a SOURCE_SHA. A mixed
+  # push like `git push origin safe:safe :main` iterates both refspecs; the
+  # safe refspec sets SOURCE_SHA from its local_sha, and the deletion refspec
+  # sets only HAS_DELETE=1 via its `continue` branch. If we check HAS_DELETE
+  # INSIDE the `-z SOURCE_SHA` fallback, the delete slips through unchecked.
+  # Hoist the check above the fallback so any deletion anywhere in the push
+  # blocks the entire push.
+  if [[ "$HAS_DELETE" -eq 1 ]]; then
+    {
+      printf 'PUSH BLOCKED: refspec is a branch deletion.\n'
+      printf '\n'
+      printf '  Branch deletions are sensitive operations and require explicit\n'
+      printf '  human action outside the agent. Perform the deletion manually.\n'
+      printf '\n'
+    } >&2
+    exit 2
+  fi
+
   if [[ -z "$SOURCE_SHA" || -z "$MERGE_BASE" ]]; then
-    if [[ "$HAS_DELETE" -eq 1 ]]; then
-      {
-        printf 'PUSH BLOCKED: refspec is a branch deletion.\n'
-        printf '\n'
-        printf '  Branch deletions are sensitive operations and require explicit\n'
-        printf '  human action outside the agent. Perform the deletion manually.\n'
-        printf '\n'
-      } >&2
-      exit 2
-    fi
     {
       printf 'PUSH BLOCKED: could not resolve a merge-base for any push refspec.\n'
       printf '\n'
@@ -969,8 +978,13 @@ pr_core_run() {
     exit 0
   fi
 
+  # Defect K (rea#62): `grep -c ... || echo "0"` captures `0\n0` when grep
+  # exits non-zero on no-match — grep still prints its own `0` to stdout before
+  # exiting, and the `|| echo "0"` branch appends another. `|| true` swallows
+  # the non-zero exit, and `${LINE_COUNT:-0}` defaults an empty result to 0.
   local LINE_COUNT
-  LINE_COUNT=$(printf '%s' "$DIFF_FULL" | grep -cE '^\+[^+]|^-[^-]' 2>/dev/null || echo "0")
+  LINE_COUNT=$(printf '%s' "$DIFF_FULL" | grep -cE '^\+[^+]|^-[^-]' 2>/dev/null || true)
+  LINE_COUNT="${LINE_COUNT:-0}"
 
   # ── 7a. Protected-path Codex adversarial review gate ──────────────────────
   # The per-refspec check runs inside the main loop (section 7, above) so
@@ -981,8 +995,36 @@ pr_core_run() {
   # refspec was either clean or had an acceptable audit.
 
   # ── 8. Check review cache ─────────────────────────────────────────────────
-  local PUSH_SHA
-  PUSH_SHA=$(printf '%s' "$DIFF_FULL" | shasum -a 256 | cut -d' ' -f1 2>/dev/null || echo "")
+  # Defect L (rea#63): `shasum` is not installed on Alpine, distroless, or
+  # most minimal Linux CI images — only `sha256sum` is. The prior `shasum -a
+  # 256 ... || echo ""` chain silently produced an empty PUSH_SHA, which the
+  # rest of the gate treats as "no cache entry" rather than "hasher missing".
+  # Combined with the silent-cache-miss fallback (Defect F), every push from
+  # such a runner burned a full fresh codex review invisibly.
+  #
+  # Portable chain: sha256sum → shasum → openssl. The openssl branch uses
+  # `awk '{print $NF}'` WITHOUT `-r` — `-r` was added in OpenSSL 3.0 /
+  # LibreSSL 3.3+; on OpenSSL 1.1.1 (Debian 11, Ubuntu 20.04, RHEL 8,
+  # Amazon Linux 2, Alpine 3.13–3.14) `-r` is rejected and stdout is empty.
+  # `$NF` handles BOTH default output shapes: `(stdin)= <hex>` (1.1.x) and
+  # `<hex> *stdin` (3.x/LibreSSL coreutils-style).
+  #
+  # Hex-64 validation catches broken pipes, partial reads, or unexpected
+  # hasher output that would otherwise be silently cached as garbage.
+  local PUSH_SHA=""
+  if command -v sha256sum >/dev/null 2>&1; then
+    PUSH_SHA=$(printf '%s' "$DIFF_FULL" | sha256sum 2>/dev/null | awk '{print $1}')
+  elif command -v shasum >/dev/null 2>&1; then
+    PUSH_SHA=$(printf '%s' "$DIFF_FULL" | shasum -a 256 2>/dev/null | awk '{print $1}')
+  elif command -v openssl >/dev/null 2>&1; then
+    PUSH_SHA=$(printf '%s' "$DIFF_FULL" | openssl dgst -sha256 2>/dev/null | awk '{print $NF}')
+  else
+    printf 'rea push-review: WARN no sha256 hasher found (sha256sum/shasum/openssl); cache disabled\n' >&2
+  fi
+  if [[ -n "$PUSH_SHA" && ! "$PUSH_SHA" =~ ^[0-9a-f]{64}$ ]]; then
+    printf 'rea push-review: WARN hasher returned invalid output; cache disabled\n' >&2
+    PUSH_SHA=""
+  fi
 
   local -a REA_CLI_ARGS
   REA_CLI_ARGS=()
@@ -1037,8 +1079,10 @@ pr_core_run() {
   fi
 
   # ── 9. Block and request review ───────────────────────────────────────────
+  # Defect K (rea#62): same `0\n0` bug as LINE_COUNT above.
   local FILE_COUNT
-  FILE_COUNT=$(printf '%s' "$DIFF_FULL" | grep -c '^\+\+\+ ' 2>/dev/null || echo "0")
+  FILE_COUNT=$(printf '%s' "$DIFF_FULL" | grep -c '^\+\+\+ ' 2>/dev/null || true)
+  FILE_COUNT="${FILE_COUNT:-0}"
 
   {
     printf 'PUSH REVIEW GATE: Review required before pushing\n'
