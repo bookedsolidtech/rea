@@ -37,6 +37,9 @@ Changes:
   key degrade to a null field and a hint to upgrade the gateway.
 
 No API removals. New gateway options (`liveStateFilePath`,
-`liveStateSessionId`, `liveStateStartedAt`, `liveStateMetricsPort`) and new
-`GatewayHandle` fields (`livePublisher`, `sessionBlocker`) are additive
-and optional.
+`liveStateSessionId`, `liveStateStartedAt`, `liveStateMetricsPort`,
+`liveStateLastErrorRedactor`) and new `GatewayHandle` fields
+(`livePublisher`, `sessionBlocker`) are additive and optional.
+`liveStateLastErrorRedactor` scrubs downstream error strings before they
+land in `serve.state.json`; `rea serve` wires it automatically to the
+same `buildRegexRedactor` the gateway logger uses.
