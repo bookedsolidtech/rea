@@ -131,3 +131,208 @@ export function isToolBlocked(
   const override = serverConfig?.tool_overrides?.[toolName];
   return override?.blocked === true;
 }
+
+/**
+ * Classify a `rea <subcommand>` Bash invocation by its own semantics rather
+ * than the generic Bash default.
+ *
+ * Defect E (rea#78): REA's own governance CLI must not be denied by REA's own
+ * middleware. The gate's error messages literally say "Run `rea cache set
+ * <sha> pass --branch <x> --base <y>`" — then the agent is denied at autonomy
+ * L1 because `Bash` is classified Write and the downstream middleware can't
+ * see that the Write is just appending a line to `.rea/review-cache.jsonl`.
+ *
+ * This helper returns the tier appropriate to the rea subcommand when the
+ * command parses as `rea <sub>` or `npx rea <sub>`. Returns `null` if the
+ * command is not a rea invocation — callers then fall back to the generic
+ * Bash tier.
+ *
+ * Tier mapping:
+ *   - Read:        `cache check|list|get`, `audit verify`,
+ *                  `audit record codex-review`, `check`, `doctor`, `status`
+ *   - Write:       `cache set|clear`, `audit rotate`, `init`,
+ *                  `serve`, `upgrade`, `unfreeze`
+ *   - Destructive: `freeze` (writes `.rea/HALT`, suspends the session)
+ *
+ * `audit record codex-review` is Read-tier because it is REA's own append-only
+ * audit surface — the whole point of the command is to let an L1 agent satisfy
+ * the push-review gate without a human in the loop. Write-tier here would
+ * reintroduce exactly the deadlock Defect D/E close.
+ *
+ * SECURITY: returns `null` for any command containing shell metacharacters
+ * that would let an attacker piggyback arbitrary commands onto an allowed
+ * prefix (e.g. `rea check && rm -rf ~`). Bash tokenizes on whitespace, but
+ * the shell itself dispatches the full command string — token[0] matching
+ * is not a sufficient trust decision. Falling back to `null` forces the
+ * generic Write-tier Bash default, which is what the operator expects for
+ * any command they did not explicitly model here.
+ */
+// Reject redirection and chaining operators. Bare `rea check > /etc/passwd`
+// still executes a write the classifier cannot reason about; same for
+// heredocs (`<<`), pipe-process-substitution (`>(`, `<(`), and the
+// chain/substitute operators the prior pass already covered.
+const REA_SHELL_METACHAR_RE = /[;&|`\n\r<>]|\$\(|>\(|<\(/;
+
+/**
+ * Returns true iff `first` is an invocation shape we trust for Read-tier
+ * downgrade. Implemented as a function because the trust rules are not pure
+ * suffix matching — pass-3 Codex review surfaced two P1 bypasses in the old
+ * suffix-only model:
+ *
+ *   1. A repo-authored `./bin/rea` script satisfied `endsWith('/bin/rea')`
+ *      and classified as Read at L0 → RCE via repo content.
+ *   2. A repo-authored `./dist/cli/index.js` satisfied
+ *      `endsWith('/dist/cli/index.js')` → same.
+ *
+ * The rules now require:
+ *   - The first token is **absolute** (starts with `/`). Relative paths are
+ *     attacker-influenced via CWD and repo content, so they never get the
+ *     Read-tier downgrade. Callers MAY still run relative-path rea — they
+ *     just fall through to weak-trust (bare `rea`) semantics: Destructive
+ *     subcommands still upgrade; Read/Write fall back to the generic Bash
+ *     Write tier.
+ *   - The path matches one of the two *strong* install shapes:
+ *       (a) contains `/node_modules/.bin/rea` anywhere (unambiguous marker
+ *           of an npm install directory tree);
+ *       (b) starts with `/usr/` or `/opt/` AND ends with `/bin/rea`
+ *           (classic root-write system install location). `/home/…/bin/rea`
+ *           is intentionally NOT honored — `/home/<user>/` is writable
+ *           without root, so an attacker with local shell access could
+ *           pre-seed a trusted-looking path there.
+ *
+ * The old `/dist/cli/index.js` suffix is gone entirely. The legitimate
+ * developer invocation `node ./dist/cli/index.js` has `first === 'node'`
+ * which never matches; only a filesystem-marked-executable
+ * `./dist/cli/index.js` would have hit the old suffix, and that shape was
+ * always attacker-authorable inside a repo. Similarly, `/.bin/rea` (exactly
+ * `/.bin/rea`, at filesystem root) was an accident of suffix matching, not
+ * a real install location; it is gone.
+ */
+function isTrustedReaPath(first: string): boolean {
+  if (!first.startsWith('/')) return false;
+
+  // npm install marker — absolute path whose tail is `/node_modules/.bin/rea`.
+  // This is unambiguous: an attacker can only seed this path by having already
+  // run a real npm install, at which point they already had execution.
+  if (first.endsWith('/node_modules/.bin/rea')) return true;
+
+  // Classic global install — absolute path rooted at a system prefix that
+  // requires root write (so attacker-seeded files are out-of-scope for the
+  // repo-content threat model).
+  if (first.endsWith('/bin/rea')) {
+    if (first.startsWith('/usr/')) return true;
+    if (first.startsWith('/opt/')) return true;
+  }
+
+  return false;
+}
+
+export function reaCommandTier(command: string): Tier | null {
+  if (typeof command !== 'string' || command.length === 0) return null;
+
+  // Refuse to classify commands that chain/substitute/redirect — the trailing
+  // shell payload is arbitrary, so the prefix's read-tier status tells us
+  // nothing about what the shell will actually execute.
+  if (REA_SHELL_METACHAR_RE.test(command)) return null;
+
+  const trimmed = command.trim();
+  if (trimmed.length === 0) return null;
+
+  const tokens = trimmed.split(/\s+/);
+  if (tokens.length === 0) return null;
+  const first = tokens[0];
+  if (first === undefined) return null;
+
+  // Classify the invocation's trust posture. The ONLY fully-trusted shape is
+  // an absolute-path invocation that `isTrustedReaPath()` recognizes as a
+  // strong install marker (npm `/node_modules/.bin/rea` or a root-write
+  // system global under `/usr/` or `/opt/`). Everything else — bare `rea`,
+  // `npx rea …`, relative paths — is treated as *weak trust*: we still
+  // recognize the subcommand for the sake of destructive-tier UPGRADES
+  // (e.g. `rea freeze` at L1 should be blocked whether or not we can prove
+  // the binary is ours), but we refuse to DOWNGRADE anything that could be
+  // piggybacking on a PATH-spoofable name or an `npx` network/install
+  // side-effect.
+  //
+  // npx note (pass-3 Codex Finding 2): `npx rea …` on a machine without the
+  // package locally cached downloads the tarball, writes to the npm cache,
+  // and executes — explicitly not Read-tier semantics. Treating npx as weak
+  // trust forces agents to commit to a deterministic install path (absolute
+  // `/usr/local/bin/rea` from `npm i -g`, or the fully-resolved
+  // `/…/node_modules/.bin/rea` from a project install) if they want the
+  // Read-tier downgrade.
+  let idx = 0;
+  let trust: 'trusted' | 'weak' = 'trusted';
+  if (first === 'npx') {
+    if (tokens.length < 2) return null;
+    const second = tokens[1];
+    if (second !== 'rea' && second !== '@bookedsolid/rea') return null;
+    idx = 2;
+    trust = 'weak';
+  } else if (isTrustedReaPath(first)) {
+    idx = 1;
+  } else if (first === 'rea' || first.split('/').pop() === 'rea') {
+    // Bare `rea` OR any path (relative/absolute) whose tail is literally
+    // `rea`. This captures `./bin/rea`, `./node_modules/.bin/rea`,
+    // `/home/user/.npm-global/bin/rea`, `/tmp/fake/rea`, etc. — none of
+    // these are full-trust under `isTrustedReaPath()`, but we still want
+    // Destructive subcommands (`freeze`) to UPGRADE from Bash Write even
+    // here, because destructive intent is invocation-shape-independent.
+    idx = 1;
+    trust = 'weak';
+  } else {
+    return null;
+  }
+
+  const sub = tokens[idx];
+  if (sub === undefined) {
+    // `rea` with no subcommand is help/version under `commander` — a read.
+    // Under weak trust, we refuse to downgrade; fall back to generic Write.
+    return trust === 'trusted' ? Tier.Read : null;
+  }
+  const sub2 = tokens[idx + 1];
+
+  const subcommandTier: Tier | null = ((): Tier | null => {
+    switch (sub) {
+      case 'check':
+      case 'doctor':
+      case 'status':
+        return Tier.Read;
+      case 'cache': {
+        if (sub2 === 'check' || sub2 === 'list' || sub2 === 'get') return Tier.Read;
+        if (sub2 === 'set' || sub2 === 'clear') return Tier.Write;
+        return Tier.Write;
+      }
+      case 'audit': {
+        if (sub2 === 'verify') return Tier.Read;
+        if (sub2 === 'record') return Tier.Read;
+        if (sub2 === 'rotate') return Tier.Write;
+        return Tier.Write;
+      }
+      case 'init':
+      case 'serve':
+      case 'upgrade':
+      case 'unfreeze':
+        return Tier.Write;
+      case 'freeze':
+        return Tier.Destructive;
+      default:
+        return null;
+    }
+  })();
+
+  // Trusted path — return whatever the subcommand semantics say.
+  // Unknown subcommand: default Write (safer than Read).
+  if (trust === 'trusted') {
+    return subcommandTier ?? Tier.Write;
+  }
+
+  // Weak trust (bare `rea`) — only honor upgrades above Write.
+  // Read/Write subcommands: return null so the middleware applies the generic
+  // Bash Write default (same as the pre-helper behavior, no downgrade).
+  // Destructive subcommands: KEEP the upgrade — `rea freeze` at L1 must block
+  // even if we cannot prove the binary on PATH is ours.
+  if (subcommandTier === Tier.Destructive) return Tier.Destructive;
+  return null;
+}
+

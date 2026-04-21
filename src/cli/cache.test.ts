@@ -325,12 +325,18 @@ describe('runCacheSet + runCacheList + runCacheClear', () => {
 });
 
 describe('parseCacheResult', () => {
-  it('accepts pass and fail', () => {
+  it('accepts historical pass and fail', () => {
     expect(parseCacheResult('pass')).toBe('pass');
     expect(parseCacheResult('fail')).toBe('fail');
   });
 
-  it('exits on any other value', () => {
+  it('maps Codex verdicts to the binary cache vocabulary', () => {
+    expect(parseCacheResult('concerns')).toBe('pass');
+    expect(parseCacheResult('blocking')).toBe('fail');
+    expect(parseCacheResult('error')).toBe('fail');
+  });
+
+  it('exits on values outside the accepted set', () => {
     const exitSpy = vi.spyOn(process, 'exit').mockImplementation(((_code?: number) => {
       throw new Error('exit called');
     }) as never);

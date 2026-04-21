@@ -14,9 +14,18 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { forceRotate } from '../gateway/audit/rotator.js';
+import {
+  appendAuditRecord,
+  CODEX_REVIEW_SERVER_NAME,
+  CODEX_REVIEW_TOOL_NAME,
+  type CodexVerdict,
+} from '../audit/append.js';
 import { computeHash, GENESIS_HASH } from '../audit/fs.js';
 import type { AuditRecord } from '../gateway/middleware/audit-types.js';
+import { appendEntry as appendCacheEntry } from '../cache/review-cache.js';
 import { AUDIT_FILE, REA_DIR, err, log, reaPath } from './utils.js';
+import { Tier, InvocationStatus } from '../policy/types.js';
+import { codexVerdictToCacheResult, type CodexVerdictCacheEffect } from './cache.js';
 
 /**
  * Reserved for future rotate knobs (e.g. `--retain N` to prune old rotated
@@ -252,4 +261,95 @@ export async function runAuditVerify(options: AuditVerifyOptions): Promise<void>
   log(
     `Audit chain verified: ${totalRecords} records across ${filesToVerify.length} file(s) — clean.`,
   );
+}
+
+export interface AuditRecordCodexReviewOptions {
+  headSha: string;
+  branch: string;
+  target: string;
+  verdict: CodexVerdict;
+  findingCount: number;
+  summary?: string | undefined;
+  sessionId?: string | undefined;
+  alsoSetCache?: boolean | undefined;
+}
+
+/**
+ * `rea audit record codex-review` (Defect D / rea#77). Emits the single audit
+ * event the push-review cache gate looks up by `tool_name == "codex.review"` +
+ * `metadata.head_sha == <sha>` + `metadata.verdict in {pass, concerns}`. Prior
+ * to this command, agents had to reverse-engineer the canonical `tool_name`
+ * string, the hash-chain append path, and the `CodexReviewMetadata` shape —
+ * the most common failure mode was emitting `tool_name: "codex-adversarial-review"`
+ * (the agent's name) instead of `codex.review` (the event type), which the
+ * gate's jq predicate silently missed.
+ *
+ * `--also-set-cache` performs the audit record AND the review-cache write
+ * in one invocation — two sequential appends in a single process, not a
+ * two-phase commit. A crash between them leaves the audit entry without
+ * a cache row; the cache is recomputable from audit, the audit chain is
+ * the source of truth. What this DOES eliminate is the two-step race where
+ * `rea cache set` is denied by permission middleware (Defect E) after the
+ * audit has already been emitted, leaving the gate stuck on "audit present
+ * but cache cold" with no way forward.
+ */
+export async function runAuditRecordCodexReview(
+  options: AuditRecordCodexReviewOptions,
+): Promise<void> {
+  if (options.headSha.length === 0) {
+    err('--head-sha must not be empty');
+    process.exit(1);
+  }
+  if (options.branch.length === 0) {
+    err('--branch must not be empty');
+    process.exit(1);
+  }
+  if (options.target.length === 0) {
+    err('--target must not be empty');
+    process.exit(1);
+  }
+  if (!Number.isFinite(options.findingCount) || options.findingCount < 0) {
+    err(`--finding-count must be a non-negative integer; got ${options.findingCount}`);
+    process.exit(1);
+  }
+
+  const baseDir = process.cwd();
+  const metadata: Record<string, unknown> = {
+    head_sha: options.headSha,
+    target: options.target,
+    finding_count: options.findingCount,
+    verdict: options.verdict,
+  };
+  if (options.summary !== undefined && options.summary.length > 0) {
+    metadata.summary = options.summary;
+  }
+
+  await appendAuditRecord(baseDir, {
+    tool_name: CODEX_REVIEW_TOOL_NAME,
+    server_name: CODEX_REVIEW_SERVER_NAME,
+    tier: Tier.Read,
+    status: InvocationStatus.Allowed,
+    ...(options.sessionId !== undefined ? { session_id: options.sessionId } : {}),
+    metadata,
+  });
+
+  log(
+    `Recorded codex.review (${options.verdict}, ${options.findingCount} finding${
+      options.findingCount === 1 ? '' : 's'
+    }) for ${options.headSha.slice(0, 12)}.`,
+  );
+
+  if (options.alsoSetCache === true) {
+    const effect: CodexVerdictCacheEffect = codexVerdictToCacheResult(options.verdict);
+    const cacheEntry = await appendCacheEntry(baseDir, {
+      sha: options.headSha,
+      branch: options.branch,
+      base: options.target,
+      result: effect.result,
+      ...(effect.reason !== undefined ? { reason: effect.reason } : {}),
+    });
+    log(
+      `Cached ${cacheEntry.result} for ${cacheEntry.sha.slice(0, 12)} (${cacheEntry.branch} → ${cacheEntry.base}).`,
+    );
+  }
 }

@@ -242,7 +242,31 @@ if [[ -n "$STAGED_SHA" ]]; then
   # predicate at push-review-core.sh §8; the §218-226 direct-cache fallback
   # already enforces `result == "pass"`, so the two paths must agree.
   if [[ ${#REA_CLI_ARGS[@]} -gt 0 ]]; then
-    CACHE_RESULT=$("${REA_CLI_ARGS[@]}" cache check "$STAGED_SHA" --branch "$BRANCH" --base "$BASE_BRANCH" 2>/dev/null || echo '{"hit":false}')
+    # Defect F (rea#75): surface cache-query errors instead of treating them as
+    # legitimate misses. See hooks/_lib/push-review-core.sh for the rationale.
+    # SECURITY (Codex LOW 4): require mktemp. Predictable /tmp paths are a
+    # TOCTOU surface on shared hosts; fall-loud instead of fall-back.
+    if ! CACHE_STDERR_FILE=$(mktemp -t rea-commit-cache-err.XXXXXX 2>/dev/null); then
+      printf 'rea commit-review: mktemp unavailable; cannot capture cache-check stderr. Aborting.\n' >&2
+      exit 2
+    fi
+    CACHE_EXIT=0
+    CACHE_STDOUT=$("${REA_CLI_ARGS[@]}" cache check "$STAGED_SHA" --branch "$BRANCH" --base "$BASE_BRANCH" 2>"$CACHE_STDERR_FILE") || CACHE_EXIT=$?
+    CACHE_STDERR=$(cat "$CACHE_STDERR_FILE" 2>/dev/null || true)
+    rm -f "$CACHE_STDERR_FILE"
+    if [[ "$CACHE_EXIT" -ne 0 ]]; then
+      # SECURITY (Codex LOW 5): strip C0/C1 control chars before echoing CLI
+      # stderr. Includes 0x80-0x9F because some terminals interpret bare C1
+      # bytes (CSI 0x9B, OSC 0x9D) as escape introducers.
+      CACHE_STDERR_SAFE=$(printf '%s' "$CACHE_STDERR" | LC_ALL=C tr -d '\000-\037\177\200-\237')
+      printf 'rea commit-review: CACHE CHECK FAILED (exit=%d): %s\n' "$CACHE_EXIT" "$CACHE_STDERR_SAFE" >&2
+      printf 'rea commit-review: treating as miss; file bookedsolidtech/rea issue if unexpected.\n' >&2
+      CACHE_RESULT='{"hit":false,"reason":"query_error"}'
+    elif [[ -z "$CACHE_STDOUT" ]]; then
+      CACHE_RESULT='{"hit":false,"reason":"cold"}'
+    else
+      CACHE_RESULT="$CACHE_STDOUT"
+    fi
     if printf '%s' "$CACHE_RESULT" | jq -e '.hit == true and .result == "pass"' >/dev/null 2>&1; then
       CACHE_HIT=true
     fi

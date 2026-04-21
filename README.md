@@ -480,6 +480,111 @@ and `ClaudeSelfReviewer` is the in-process fallback (tagged
 `degraded: true` in the audit record so self-review is visible and
 countable).
 
+## Agent push workflow — satisfying the push-review gate
+
+When `git push` is blocked by `push-review-gate.sh` the gate prints
+remediation steps. This section is the canonical one-command flow the
+steps reduce to. Agents should copy-paste this verbatim; humans should
+expect agents to.
+
+### 1. Run the adversarial review
+
+```bash
+# From an interactive Claude Code session:
+/codex-review
+```
+
+This invokes the `codex-adversarial` agent, which records a
+`codex.review` audit entry with `verdict: pass | concerns | blocking |
+error` and a `finding_count`. The push gate looks up that entry by
+`head_sha + verdict ∈ {pass, concerns}`.
+
+### 2. Record-and-cache in one CLI call
+
+If you already have a review verdict (from `/codex-review`, or from a
+manual Codex run, or from an offline review) emit the audit record AND
+update the push-review cache with a single command:
+
+```bash
+rea audit record codex-review \
+  --head-sha "$(git rev-parse HEAD)" \
+  --branch   "$(git rev-parse --abbrev-ref HEAD)" \
+  --target   main \
+  --verdict  pass \
+  --finding-count 0 \
+  --summary  "no findings" \
+  --also-set-cache
+```
+
+`--also-set-cache` writes both `.rea/audit.jsonl` and
+`.rea/review-cache.jsonl` in the same invocation (two sequential
+appends, not a two-phase commit — but close enough in practice that the
+push-gate lookup cannot see the audit record without the cache entry
+unless a crash lands between them). Without it, the audit record lands
+but the cache stays cold — and the next `git push` pays for a re-review
+even though the audit trail already shows the review happened.
+`--also-set-cache` is what the gate's remediation text should be reduced
+to.
+
+Verdict mapping for the cache leg:
+
+| `--verdict`  | Cache `result` | Cache `reason` |
+| ------------ | -------------- | -------------- |
+| `pass`       | `pass`         | — (omitted) |
+| `concerns`   | `pass`         | `codex:concerns` |
+| `blocking`   | `fail`         | `codex:blocking` |
+| `error`      | `fail`         | `codex:error` |
+
+### 3. Push
+
+```bash
+git push
+```
+
+The gate hits the cache, sees `{"hit":true,"result":"pass"}`, and exits
+0 on the first attempt. No `!`-bash escapes, no manual audit writing,
+no separate `rea cache set` invocation.
+
+### SDK alternative
+
+When embedding the flow in a TypeScript tool instead of shelling out,
+import the public audit helper:
+
+```ts
+import {
+  appendAuditRecord,
+  CODEX_REVIEW_SERVER_NAME,
+  CODEX_REVIEW_TOOL_NAME,
+  InvocationStatus,
+  Tier,
+} from '@bookedsolid/rea/audit';
+
+await appendAuditRecord(process.cwd(), {
+  tool_name: CODEX_REVIEW_TOOL_NAME,
+  server_name: CODEX_REVIEW_SERVER_NAME,
+  tier: Tier.Read,
+  status: InvocationStatus.Allowed,
+  metadata: {
+    head_sha: headSha,
+    target: 'main',
+    finding_count: 0,
+    verdict: 'pass',
+  },
+});
+```
+
+The CLI wraps exactly this — use the CLI unless the host is already a
+TypeScript process that wants to avoid the subprocess roundtrip.
+
+### Agent autonomy self-consistency
+
+At autonomy `L1`, `rea cache check`, `rea audit record codex-review`,
+`rea doctor`, and `rea status` are classified **Read tier** — they
+cannot be denied by REA's own middleware. `rea cache set` is Write
+tier and is still allowed at L1. `rea freeze` is Destructive tier and
+is denied at L1 (deny-reason includes the subcommand, e.g.
+`Bash (rea freeze)`, not just `Bash`).
+
 ## Hooks
 
 Fourteen hooks. Each does one thing.
