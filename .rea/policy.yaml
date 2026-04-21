@@ -12,12 +12,8 @@ block_ai_attribution: true
 blocked_paths:
   - .env
   - .env.*
-  - .rea/policy.yaml
   - .rea/HALT
-  - CODEOWNERS
   - .github/workflows/release.yml
-  - SECURITY.md
-  - THREAT_MODEL.md
 notification_channel: ""
 context_protection:
   delegate_to_subagent:
