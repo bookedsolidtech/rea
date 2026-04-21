@@ -6,13 +6,22 @@
  *
  * `rea status` is the LIVE view: is a gateway running for this cwd? What is
  * its session id? What does the audit chain look like right now? Is HALT
- * active?
+ * active? Which downstreams are connected / healthy / tripped?
  *
  * Detection strategy for "is serve running":
  *   1. Read `.rea/serve.pid`.
  *   2. If the pidfile exists, `kill(pid, 0)` to check liveness.
  *   3. If kill throws ESRCH or EPERM, the pid is stale — treat as not-running
  *      and surface that nuance in the output.
+ *
+ * 0.9.0 — per-downstream live block. `readServeState` parses the
+ * `downstreams: [...]` array from `.rea/serve.state.json` (written by the
+ * live-state publisher on every circuit transition + supervisor event).
+ * Each entry carries `name`, `connected`, `healthy`, `circuit_state`,
+ * `retry_at`, `last_error` (redacted by the publisher), `tools_count`,
+ * `open_transitions`, and `session_blocker_emitted`. State files written
+ * by a pre-0.9.0 gateway degrade gracefully: `downstreams` surfaces as
+ * `null` with a hint to upgrade.
  *
  * Output modes:
  *   - Default: human-pretty, matching the spacing used by `rea check`.
@@ -23,6 +32,11 @@
  * `rea audit verify` is the authoritative check and is expensive on large
  * chains; here we just report line count, last timestamp, and a cheap "last
  * record's stored hash is non-empty" heuristic as an integrity smoke signal.
+ *
+ * Every disk-sourced string field flows through `sanitizeForTerminal` on the
+ * pretty-print path — JSON mode relies on `JSON.stringify` to escape control
+ * chars safely — so a malicious `halt_reason` or `last_error` cannot inject
+ * ANSI/OSC escapes into the operator's terminal.
  */
 
 import fs from 'node:fs';

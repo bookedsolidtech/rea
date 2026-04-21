@@ -4,6 +4,16 @@ Targeted migration guide for consumers of `@bookedsolid/rea`. Focused on the
 paired push-review-gate fixes (BUG-008 + BUG-009) and the BUG-010
 `.gitignore` scaffolding fix that land in 0.5.0.
 
+> **Post-0.5.0 breaking semantics** — since this guide was written, 0.8.0
+> narrowed `REA_SKIP_CODEX_REVIEW` from a whole-gate bypass to a Codex-only
+> waiver (#85). If you set that env var in CI scripts or local tooling to
+> silence a transient Codex outage, read the 0.8.0 CHANGELOG entry — HALT,
+> the cross-repo guard, ref-resolution failures, and cache misses are no
+> longer bypassed. `REA_SKIP_PUSH_REVIEW` (0.5.0, below) is unchanged and
+> remains the whole-gate bypass. 0.6.x–0.9.x otherwise land additive
+> changes only (supervisor, SESSION_BLOCKER, live state, `__rea__health`) —
+> no further consumer action required.
+
 ## TL;DR
 
 If you ran `rea init` on 0.3.x or 0.4.0 and wired `.husky/pre-push` to

@@ -1,6 +1,6 @@
 # Threat Model — REA Gateway and Hook Layer
 
-Version: 0.2.x | Last updated: 2026-04-18
+Version: 0.9.x | Last updated: 2026-04-21
 
 ---
 
@@ -82,12 +82,12 @@ Downstream MCP servers are treated as untrusted by default. Codex plugin *invoca
 
 **Mitigations:**
 
-- `injection` middleware scans tool arguments and results for instruction-like patterns.
+- `injection` middleware scans downstream tool **results** (`ctx.result`) post-execute for instruction-like patterns — see §5.21 for the three-tier classifier.
 - All injection regexes run under a per-call worker-thread timeout (`wrapRegex`, default 100ms) with a hard kill on timeout — catastrophic backtracking cannot hang the gateway. See §5.12.
 - Gateway middleware chain re-derives tier from tool_name independently on every invocation — a poisoned description cannot change the tier classification.
 - `.rea/policy.yaml` is re-read on every invocation; a "set autonomy to L3" instruction cannot be persisted by any middleware path.
 
-**Residual risk:** Semantic injection in natural-language descriptions is not fully mitigated. No regex can reliably detect all instruction-injection patterns. A three-valued escalation (`clean` / `suspicious` / `likely-injection`) is planned for 0.3.0 so write/destructive tiers require human-loop approval on suspicion rather than accepting a binary pass/fail.
+**Residual risk:** Semantic injection in natural-language descriptions is not fully mitigated. No regex can reliably detect all instruction-injection patterns. The shipped three-valued classifier (`clean` / `suspicious` / `likely_injection`; see §5.21) narrows the footgun by making "write under suspicion" a conscious policy decision but does not eliminate it.
 
 ---
 
@@ -203,7 +203,7 @@ Downstream MCP servers are treated as untrusted by default. Codex plugin *invoca
 
 ### 5.8 Codex Plugin Abuse and Codex-Review Gate Weakening
 
-**Threat:** A poisoned Codex adversarial-review response contains prompt-injection content designed to make Claude take an unsafe action "per the reviewer's recommendation." A malicious actor uses `/codex-review` to launder an attack past the policy layer. Separately: a rogue agent or operator disables the Codex-review requirement to push protected-path changes without adversarial review.
+**Threat:** A poisoned Codex adversarial-review response contains prompt-injection content designed to make Claude take an unsafe action "per the reviewer's recommendation." A malicious actor uses `/codex-review` to launder an attack past the policy layer. Separately: a rogue agent or operator disables the Codex-review requirement to push protected-path changes without adversarial review, or uses the escape hatch to bypass far more than the Codex requirement.
 
 **Mitigations:**
 
@@ -212,12 +212,27 @@ Downstream MCP servers are treated as untrusted by default. Codex plugin *invoca
 - Codex never receives `.rea/policy.yaml` content in its prompt; Codex reviews diffs, not policy.
 - The `codex-adversarial` agent cannot by itself modify policy, trigger writes, or bypass blocked paths — it is a review tool, not an actor.
 - **Pluggable reviewer** (0.2.0, G11.2): when Codex is unreachable, `ClaudeSelfReviewer` is the fallback. Claude-on-Claude review is explicitly tagged `degraded: true` in the audit record so self-review is visible and countable.
-- **Audited escape hatch** (0.2.0, G11.1): `REA_SKIP_CODEX_REVIEW=<reason>` bypasses the protected-path Codex requirement but writes a `codex.review.skipped` audit record carrying the verbatim reason, the operator's git identity, the head_sha, and the files-changed count. Fail-closed on missing `dist/audit/append.js` or missing git identity — the gate never silently disables. Skip records use `tool_name: "codex.review.skipped"` so a skip cannot satisfy a future Codex-review requirement on the same HEAD.
-- **First-class no-Codex mode** (0.2.0, G11.4): `policy.review.codex_required: false` skips the protected-path Codex requirement entirely. In that mode `REA_SKIP_CODEX_REVIEW` becomes a no-op (skipping a review that isn't required has no meaning), and no skip record is emitted. Both `.claude/hooks/push-review-gate.sh` (Claude Code path) and `.husky/pre-push` (terminal path) honor this knob.
+- **First-class no-Codex mode** (0.2.0, G11.4): `policy.review.codex_required: false` skips the protected-path Codex requirement entirely. In that mode `REA_SKIP_CODEX_REVIEW` becomes a no-op (skipping a review that isn't required has no meaning), and no skip record is emitted. Both the Claude-Code adapter (`.claude/hooks/push-review-gate.sh`) and the native git adapter (`.claude/hooks/push-review-gate-git.sh`, sharing `hooks/_lib/push-review-core.sh`) honor this knob.
 - **Availability probe** (0.2.0, G11.3): `rea serve` runs an initial `codex --version` probe on startup when `codex_required` ≠ false. A failed probe emits a single stderr warn — startup never fail-closes on a Codex miss.
 - **Reviewer telemetry** (0.2.0, G11.5): `ClaudeSelfReviewer.review()` writes a row to `.rea/metrics.jsonl` with invocation counts, estimated tokens (chars/4), latency, and a `rate_limited` signal parsed from stderr. Payloads are NEVER stored; a unit test asserts that marker strings in inputs never appear in the metrics file.
 
-**Residual risk:** Semantic injection in Codex responses (e.g., reviewer recommends a specific code change that is itself malicious) cannot be fully detected. Mitigation is defense-in-depth: the middleware still runs on any subsequent write that Claude attempts based on the review. A `rea doctor` abuse signal on escape-hatch frequency (≥3 invocations per rolling 7 days) is proposed for 0.3.0.
+**`REA_SKIP_CODEX_REVIEW` — Codex-only waiver (0.8.0, #85).** Through 0.7.0 this env var short-circuited the **entire** push-review gate after writing its skip audit record — equivalent in scope to `REA_SKIP_PUSH_REVIEW`. Operators reached for it to silence a transient Codex unavailability and accidentally bypassed HALT, the cross-repo guard, ref-resolution, and the push-review cache. 0.8.0 narrows it to what the name implies: the waiver satisfies **only** the protected-path Codex-audit requirement. Every other gate still runs:
+
+- **HALT** (`.rea/HALT`) — still blocks.
+- **Cross-repo guard** — still blocks.
+- **Ref-resolution failures** (missing remote object, unresolvable source ref) — still block, but the skip audit record is written first so the operator's commitment to waive is durable.
+- **Push-review cache** — a miss still falls through to the general "Review required" block.
+
+The skip audit record is still named `codex.review.skipped` and still fails the `codex.review` jq predicate. Banner text changed from `CODEX REVIEW SKIPPED` to `CODEX REVIEW WAIVER active` to reflect the narrower scope. Fail-closed contract preserved: missing `dist/audit/append.js` (rea unbuilt) or missing git identity → exit 2.
+
+**Cache gate hardening (0.8.0, same release).** The review cache is a separate, later check in the core (`hooks/_lib/push-review-core.sh` §8) — it governs the general push-review gate for non-protected-path pushes, not the protected-path Codex audit itself. Two composition bugs in that cache layer became load-bearing once the Codex waiver no longer papered over cache behavior, so they were fixed in the same release:
+
+- The cache-hit predicate now requires `.hit == true and .result == "pass"`. Previously `.hit == true` alone was sufficient, which meant a cached `fail` verdict would silently satisfy the gate. The permissive predicate was a real exposure once the Codex-only waiver stopped short-circuiting subsequent checks.
+- The cache key is derived from the PUSHED source ref (from pre-push stdin), not from the checkout branch. `git push origin hotfix:main` from a `feature` checkout now correctly looks up the `hotfix` cache entry.
+
+**`REA_SKIP_PUSH_REVIEW` — whole-gate bypass (0.5.0).** The recovery path for consumers deadlocked on a broken rea install. Writes `tool_name: "push.review.skipped"` with an `os_identity` sub-object (uid, whoami, hostname, pid, ppid, ppid_cmd, tty, ci) so auditors can distinguish a real operator from a forged git-config actor. Refuses with exit 2 on CI runners (`CI` env var set) unless `review.allow_skip_in_ci: true` is opted in via policy — closes the ambient-env-var bypass surface on shared build agents. HALT check runs before the skip branch: `.rea/HALT` cannot be bypassed by either hatch.
+
+**Residual risk:** Semantic injection in Codex responses (e.g., reviewer recommends a specific code change that is itself malicious) cannot be fully detected. Mitigation is defense-in-depth: the middleware still runs on any subsequent write that Claude attempts based on the review. A `rea doctor` abuse signal on escape-hatch frequency (≥3 invocations per rolling 7 days) remains tracked.
 
 ---
 
@@ -300,22 +315,185 @@ Downstream MCP servers are treated as untrusted by default. Codex plugin *invoca
 
 ---
 
+### 5.14 Supervisor Trust Boundary (0.9.0, BUG-002..003)
+
+**Threat:** A downstream MCP child process crashes unexpectedly — OS OOM-kill, unhandled exception in the child, stdio pipe error outside a caller-initiated close — and the gateway keeps a stale `Client` handle around. Every subsequent `callTool` hits the zombie, receives `Not connected`, the circuit breaker flaps open → half-open → open against the same dead handle, and the child is never respawned. From the operator's perspective the gateway is "up" but nothing works.
+
+**Mitigations:**
+
+- `DownstreamConnection` wires the MCP SDK `StdioClientTransport`'s `onclose` and `onerror` callbacks on a **per-transport** basis (never global) and treats an unexpected close as "child is dead": the client and transport fields are nulled before the next call. The next `callTool` takes the `connect()` branch and actually respawns the child.
+- Intentional `close()` sets a local flag before calling into the SDK, so the same `onclose` callback does not double-count a graceful shutdown as an unexpected death.
+- "Not connected" errors from the SDK (the in-flight fallback path) are promoted to the respawn path with the same eager invalidation — a stale client is invalidated before the one-shot reconnect fires, so we spawn fresh rather than retrying with the same dead handle.
+- A 30-second flapping guard (`RECONNECT_FLAP_WINDOW_MS`) refuses a second reconnect that lands too quickly after the previous successful one — the child is clearly unhealthy and the circuit breaker is a better place to handle it.
+- `DownstreamConnection.lastError` is bounded **at write** via `boundedDiagnosticString` on a true ES-private `#lastErrorMessage` setter (0.7.0, BUG-014). The invariant is structural: every write produces a bounded stored value regardless of assignment-site count. Non-string inputs raise `TypeError` instead of silently corrupting the field.
+- Error strings published to `serve.state.json` flow through the same `buildRegexRedactor` the gateway logger uses (policy `redact.patterns` + built-in `SECRET_PATTERNS`) via the `lastErrorRedactor` option on the live-state publisher — a credential that leaked into a downstream error message is scrubbed before it lands on disk or on an operator's terminal via `rea status`.
+
+**Residual risk:** A child that advertises tools but then returns malicious responses on every call is not a supervisor-layer concern — it is handled by the standard middleware chain (injection, redact, result-size-cap). A child that alternates between healthy and malicious responses more slowly than the circuit breaker can trip is a limitation of any breaker-based approach; detection depends on `.rea/metrics.jsonl` anomalies.
+
+Ref: `src/gateway/downstream.ts`, `src/gateway/downstream.test.ts`.
+
+---
+
+### 5.15 SESSION_BLOCKER Audit Semantics (0.9.0, BUG-004)
+
+**Threat:** A persistently failing downstream produces a log stream full of identical circuit-open records. Operators miss the signal because it looks like normal circuit-breaker churn, or alert-fatigue kicks in and they tune it out entirely.
+
+**Mitigations:**
+
+- `SessionBlockerTracker` subscribes to circuit-breaker `onStateChange` events and counts circuit-open transitions per `(session_id, server_name)`. It tracks **open-level** failures per session, not wire-hot call-level failures — every circuit-open transition counts as one, so a downstream that flaps `open→closed→open` three times in ten minutes crosses the threshold once.
+- On threshold crossing (default: 3), exactly **one** `SESSION_BLOCKER` event fires: a LOUD structured log record plus an audit append via `appendAuditRecord`. The counter keeps incrementing but subsequent opens do **not** re-fire.
+- Recovery (transition to `closed`) resets the counter and re-arms the emit flag — a later threshold crossing fires a fresh record.
+- A new session (new `rea serve` process / new `session_id`) drops every counter and starts fresh.
+- Audit append is best-effort; log-side emission happens first and unconditionally. A broken audit pipeline must never break state tracking.
+- `SESSION_BLOCKER` is an **audit event**, not a gateway exception. The gateway keeps serving traffic; the event is the forensic signal an operator can search for in `audit.jsonl`.
+
+**Residual risk:** A downstream that flaps fast enough to hit the threshold on every session but recovers quickly in between can still generate a record per session. This is the intended behavior — the operator should see it every session and fix the downstream.
+
+Ref: `src/gateway/session-blocker.ts`, `src/gateway/session-blocker.test.ts`.
+
+---
+
+### 5.16 `.rea/serve.state.json` Lock / Ownership Handoff (0.9.0, BUG-005)
+
+**Threat:** A crashed `rea serve` leaves `serve.state.json` and `serve.pid` behind. A new `rea serve` instance either (a) refuses to start because ownership-by-session-id locks the file forever, or (b) silently takes over without verifying the predecessor is dead — letting two live gateways race on writes.
+
+**Mitigations:**
+
+- Writes use atomic temp-file + rename (`writeFileAtomic`) with a `.<filename>.<randomUUID>.tmp` suffix, so a reader never sees a torn intermediate.
+- The snapshot carries both `session_id` (boot-time ownership key) and `owner_pid` (0.9.0 pass-4). A newly-started `rea serve` whose predecessor crashed can detect the abandoned file — `kill(owner_pid, 0)` returns ESRCH — and take over ownership rather than stalling.
+- The session-id check runs first; `owner_pid` is a secondary lock-guarded field used only to distinguish "abandoned" from "actively owned by a different session." The combination preserves the safety invariant (no silent takeover of a live gateway's file) while avoiding the pass-2 strict-one-directional lock.
+- Consumers (`rea status`, `rea check`) read the file **only**. They never write and never clean up stale state — the serve process is the only writer. Pre-0.9.0 snapshots without `downstreams` or `owner_pid` degrade to `null` fields with a hint to upgrade.
+- Writes are debounced through a 250 ms trailing timer so a flap storm (open → half-open → open → half-open in rapid succession) doesn't spam the filesystem.
+
+**Residual risk:** A pathological PID reuse (the OS recycled the crashed gateway's PID onto an unrelated process before the new gateway boots) would cause the `kill(pid, 0)` probe to report "alive" spuriously. The session-id check catches this — a live process with a different session_id is distinguishable from an abandoned file — but the first-boot window where session_id is also unchanged is a theoretical corner. Operators who suspect this should `rm .rea/serve.pid .rea/serve.state.json` and restart.
+
+Ref: `src/gateway/live-state.ts`, `src/gateway/server.ts`.
+
+---
+
+### 5.17 Health Payload Sanitization (0.6.2, BUG-011)
+
+**Threat:** The `__rea__health` meta-tool short-circuits the middleware chain (intentionally — so it stays callable under HALT) and previously serialized `halt_reason` plus every `downstreams[].last_error` verbatim. Error strings from upstream MCPs can contain secrets (API keys, tokens) or prompt-injection payloads, neither of which the `redact` or `injection` middleware would see because the short-circuit response skips the chain entirely. Net effect: a redact + injection-sanitizer bypass, callable precisely when HALT should be holding the line.
+
+**Mitigations:**
+
+- `sanitizeHealthSnapshot()` runs on the short-circuit response before it reaches the MCP wire. Default behavior: `halt_reason = null` and every `downstreams[].last_error = null`. The operator-visible wire response carries no downstream-controlled diagnostic strings.
+- Full diagnostic detail still flows into the meta-tool audit record. The record written for `__rea__health` carries the unsanitized `metadata.halt_reason` and `metadata.downstream_errors[]` (sourced pre-sanitize from `pool.healthSnapshot()` inside `server.ts`) alongside the existing counts. Audit is on local disk, hash-chained, append-only, and not LLM-reachable — the correct sink for trusted-operator diagnostic text.
+- Operators who need error strings on the MCP wire can opt in via `.rea/policy.yaml`:
+
+  ```yaml
+  gateway:
+    health:
+      expose_diagnostics: true
+  ```
+
+  Opt-in mode still runs the full sanitizer pass: `redactSecrets` replaces known secret patterns with `[REDACTED:*]`, `classifyInjection` replaces any non-`clean` diagnostic string (verdicts `suspicious` or `likely_injection`) with the exported `INJECTION_REDACTED_PLACEHOLDER` token (`<redacted: suspected injection>`), and the redact-timeout sentinel `[REDACTED: pattern timeout]` is filtered from the wire so a caller cannot distinguish "pattern timed out" from "pattern matched."
+
+- Diagnostic strings are bounded at 4096 UTF-16 code units before any scanning runs, via a UTF-8-safe truncate that drops trailing lone surrogates — an adversarial downstream cannot DoS the tool by throwing oversize errors.
+- `meta.health.audit_failed` log level was elevated from `warn` to `error` and `summary.audit_fail_count` is exposed in the snapshot so operators can detect an audit-sink failure without parsing stderr.
+
+**Residual risk:** `expose_diagnostics: true` is still operator-controlled text on an LLM-reachable surface. The sanitizer is best-effort defense-in-depth — a secret pattern not in the catalog, or an injection pattern that `classifyInjection` rates `clean`, will pass through unchanged.
+
+Ref: `src/gateway/meta/health.ts`, `src/gateway/meta/health-sanitize.test.ts`.
+
+---
+
+### 5.18 Script-Anchor Hook Trust Boundary (0.6.2, BUG-012)
+
+**Threat:** The `push-review-gate.sh` and `commit-review-gate.sh` hooks need to know the rea repository root for (a) the cross-repo short-circuit when invoked from a consumer repository, and (b) HALT / policy enforcement against the correct policy file. Prior to 0.6.2, `REA_ROOT=${CLAUDE_PROJECT_DIR:-$(pwd)}`. `CLAUDE_PROJECT_DIR` is caller-controlled — any process invoking the hook can set it to a foreign path, which the guard would treat as rea. Result: HALT silently bypassed, cross-repo short-circuit fires on the wrong comparison, policy read from a directory the caller chose.
+
+**Mitigations:**
+
+- Hooks derive `REA_ROOT` from their own on-disk location using `BASH_SOURCE[0]` + `pwd -P`, then walk up to 4 parent directories looking for `.rea/policy.yaml` as the authoritative install marker. Install topology is fixed (`<root>/.claude/hooks/<name>.sh`), so the anchor is forge-resistant — a caller cannot relocate the hook without filesystem write access to the rea install, which is already protected by `settings-protection.sh` and `blocked-paths` enforcement.
+- `CLAUDE_PROJECT_DIR` is retained only as an advisory signal. When set and the realpath differs from the script-derived `REA_ROOT`, the hook emits a stderr advisory and continues using the script-derived value. It is never compared for short-circuit, never used to select the policy file, and never used to locate HALT.
+- The cross-repo guard (0.6.1) compares `git rev-parse --git-common-dir` on both sides (not path prefixes). Mixed state (one side git, one non-git) fails **closed** — the gate runs — rather than falling through to path-prefix. Only the both-non-git case uses path-prefix, matching the documented 0.5.1 non-git escape hatch.
+- The 0.7.0 BUG-008 cleanup extracted the shared logic into `hooks/_lib/push-review-core.sh` so both the Claude-Code PreToolUse adapter (`push-review-gate.sh`) and the native git adapter (`push-review-gate-git.sh`) share a single anchor-walk implementation — a fix lands in one place.
+
+**Residual risk:** If a local attacker has write access to the rea install directory they can move or replace the hook file, which would change `SCRIPT_DIR` and therefore `REA_ROOT`. This is equivalent to tampering with any other hook contents (`settings-protection.sh` already addresses it) and lies outside the `CLAUDE_PROJECT_DIR` threat class.
+
+Ref: `hooks/_lib/push-review-core.sh`, `__tests__/hooks/push-review-gate-cross-repo.test.ts` "BUG-012: foreign CLAUDE_PROJECT_DIR does NOT bypass HALT".
+
+---
+
+### 5.19 Tarball-Smoke Security-Claim Gate (0.6.2, BUG-013)
+
+**Threat:** A changeset file claims a security fix (`[security]` marker), the release workflow merges and publishes, but the shipping `dist/` is byte-identical to the previous release — the claimed fix never made it into the compiled output. The 0.6.0 → 0.6.1 regression is the canonical example: `src/` changed, `dist/` did not. Without a pipeline gate that rebuilds `dist/` from the shipping commit and verifies the published tarball contents, no future security changeset can be trusted.
+
+**Mitigations (shipped across 0.6.2 + 0.7.0):**
+
+- `scripts/tarball-smoke.sh` (0.6.2) enforces a **content-based security-claim gate**. When any `.changeset/*.md` contains the `[security]` marker, the smoke requires at least one `src/**/*(sanitize|security)*.test.ts` file exists **and** every named-import symbol it pulls from a relative path is present in the compiled `dist/` tree. The gate fails loudly (exit 2) if the marker is present but no testable security symbols are extractable.
+- `.github/workflows/release.yml` (0.7.0) rebuilds `dist/` from the shipping HEAD immediately before `changesets/action`, records the SHA-256 tree hash to `$RUNNER_TEMP/rea-dist-hash` (CI scratch space — cannot be accidentally committed by `changesets/action`'s `git add .`), and post-publish re-packs the just-published tarball from npm and fails the release if the published `dist/` tree hash doesn't match.
+- `scripts/dist-regression-gate.sh` (0.7.0) + the `dist-regression` CI job run on every PR and every push-to-main. If `src/` has changed vs the last published tag but the rebuilt `dist/` tree hashes identically to the published tarball, CI fails — the "src changed, dist didn't" regression class is caught **before** the release branch, not only at publish time.
+- Husky e2e regression guard (`__tests__/hooks/husky-e2e.test.ts`, 0.7.0) invokes a REAL `git push` against a bare remote via `core.hooksPath=.husky` with the SHIPPED `.husky/pre-push` in place (the standalone inline body emitted by `src/cli/install/pre-push.ts`). The ten-test matrix covers: nine cases that exercise the inline body's HALT, protected-path, Codex-waiver, `review.codex_required: false`, and bootstrap-push branches, plus one case that swaps in a wrapper around `hooks/push-review-gate-git.sh` as a shape-guard for the future installer path. The kind of BUG-008 silent-exit-0 regression that slipped past synthesized-stdin unit tests through 0.4.0 would now fail loudly.
+
+**Residual risk:** A security claim whose fix is purely a deletion (no new symbols, no new test file) cannot be validated by the symbol-extraction gate. The `dist-regression` job catches this as a byte-identity failure, but the gate has no positive evidence of the fix's presence. Manual maintainer review on `[security]`-labeled PRs remains the compensating control.
+
+Ref: `scripts/tarball-smoke.sh`, `scripts/dist-regression-gate.sh`, `.github/workflows/release.yml`.
+
+---
+
+### 5.20 Registry TOFU Pinning (0.3.0, G7)
+
+**Threat:** An attacker who lands a malicious template via `rea init`, or who patches `.rea/registry.yaml` out-of-band (compromised dependency postinstall, CI-bot misconfig, editor plugin writing through stale buffers), can silently swap a downstream server's `command`, `args`, or `env` keys. The gateway would spawn the new child at next startup and proxy it without challenge.
+
+**Mitigations:**
+
+- On first successful connect, the gateway records a SHA-256 fingerprint of each downstream's **canonicalized registry config path** — `name`, `command`, `args`, the sorted KEY SET of `env` (values excluded so secret rotation doesn't trip drift), `env_passthrough`, and `tier_overrides` — to `.rea/fingerprints.json`. Trust-On-First-Use (TOFU) by config-path hash, not by tool-surface or binary hash.
+- Subsequent connects re-compute the fingerprint and compare. A mismatch is a **hard fail**: the downstream is marked unhealthy, a structured log + audit record names the drift, and the gateway refuses to route calls to it. The operator must inspect the registry delta and either clear the fingerprint entry (re-pin) or acknowledge the drift via one-shot `REA_ACCEPT_DRIFT=<name>`.
+- `fingerprints.json` is gitignored by default via the `.rea/` managed block so a local re-pin does not pollute history.
+- Scope is explicitly **path-only, not binary, and not tool-surface**. Binary hashing would turn TOFU into a slow-boot tax and would trip false-positive drift on every legitimate MCP server upgrade. Tool-surface hashing was considered and deferred — see residual risk below.
+
+**Residual risk:** Two classes remain uncovered by G7:
+
+1. **Catalog drift from a legitimately-configured downstream.** A downstream whose registry config is unchanged but whose `tools/list` response changes between connects (new tool, renamed tool, modified description, modified input schema) is **not** detected by the config-path fingerprint. An attacker who compromises the downstream binary at `config.command` without changing the registry entry, or a legitimate upstream MCP server that silently expands its tool catalog in a patch release, both fall through this gate. See §6 "Catalog drift by downstream not detected on reconnect" — this is an active, tracked residual risk, not a mitigated one. The redact + injection middleware running on every proxied result is the compensating control, not a substitute.
+2. **Host compromise with config-matching binary substitution.** An attacker who swaps the on-disk binary at `config.command` but leaves `.rea/registry.yaml` untouched is outside the G7 threat model — that is a host-integrity / supply-chain class, not a registry-tampering class.
+
+Ref: `src/registry/fingerprint.ts` (`canonicalize()`, `fingerprintServer()`), `src/gateway/downstream-pool.ts` fingerprint-probe path.
+
+---
+
+### 5.21 G9 Three-Tier Injection Classifier (0.3.0)
+
+**Threat:** A binary pass/fail injection detector is either too permissive (known instruction patterns slip through) or too strict (every tool description flags and the gateway becomes unusable). Either failure mode eventually trains operators to ignore the signal.
+
+**Mitigations:**
+
+- `classifyInjection()` returns one of three verdicts: `clean`, `suspicious`, or `likely_injection`. The verdict is derived from weighted matches against the shipped pattern catalog, tuned so legitimate tool descriptions rate `clean` by default.
+- Escalation rules (first match wins, per `src/gateway/middleware/injection.ts:450-527`):
+  1. No literal and no base64-decoded match → `clean`.
+  2. Any base64-decoded match, regardless of tier → `likely_injection`.
+  3. ≥2 distinct literal matches, regardless of tier → `likely_injection`.
+  4. Any match at read-tier (or unknown tier — fail closed) → `likely_injection`.
+  5. Exactly one literal match at write/destructive tier → `suspicious`.
+- `likely_injection` → always deny. No opt-out at policy level. (Note: because of rule 4, ANY injection match at read-tier is denied — the "warn but permit" path only exists for single-literal matches at write/destructive tier.)
+- `suspicious` on a write/destructive tier → **policy-controlled**. `injection.suspicious_blocks_writes: true` (shipped in `bst-internal` and `bst-internal-no-codex` profiles — internal posture) denies. The schema default is `false` — external profiles (`open-source`, `client-engagement`, `minimal`, `lit-wc`) inherit the looser behavior so upgrading 0.2.x consumers are not silently tightened.
+- **Regex timeout / oversize-result `error` verdict is mode-dependent** (`src/gateway/middleware/injection.ts:654-728`). Under `injection_detection: block` (all profiles except `warn`), any scan timeout or oversize input denies unconditionally — the partial scan cannot prove the unscanned suffix is safe, so block mode fails closed. Under `injection_detection: warn`, a timeout on an otherwise-clean partial scan is recorded as `metadata.injection.verdict = 'error'` and let through — this matches the 0.2.x `warn` semantics (fail-open by design) and operators opting into `warn` must accept this trade-off. Operators who want fail-closed everywhere should stay on `block`.
+- The opt-in strict flag is honored at both the middleware layer (write/destructive deny) and the sanitizer layer (health payload replacement — the `<redacted: suspected injection>` placeholder collapses **any** non-`clean` diagnostic, so `suspicious` and `likely_injection` strings are both replaced on the `__rea__health` wire under `expose_diagnostics: true`).
+- Every non-`clean` invocation records a nested `ctx.metadata.injection = { verdict, matched_patterns, base64_decoded }` object on the audit row (`src/gateway/middleware/injection.ts:733-740`). Consumers must read the nested shape — there is no top-level `injection_verdict` / `injection_match_count` field. The matched-patterns array contains the distinct phrase names only; the original input text is never exported.
+
+**Residual risk:** Semantic injection in natural-language descriptions — a well-phrased instruction that no pattern catalog will catch — is not mitigated by pattern matching. This is the general limitation acknowledged in §5.1; the three-tier classifier narrows the footgun (by making "write under suspicion" a conscious policy decision) but does not eliminate it.
+
+Ref: `src/gateway/middleware/injection.ts`, `src/gateway/middleware/injection.test.ts`.
+
+---
+
 ## 6. Residual Risks and Open Issues
 
-| Risk                                                          | Severity | Tracking                       |
+| Risk                                                          | Severity | Status / Tracking              |
 | ------------------------------------------------------------- | -------- | ------------------------------ |
-| Semantic prompt injection via tool descriptions               | High     | 0.3.0 G9 (tier escalation)     |
+| Semantic prompt injection via tool descriptions               | High     | Partially mitigated — G9 three-tier classifier (§5.21) narrows the footgun via pattern matching, but semantic/natural-language injection that no catalog entry will catch is still unmitigated by design |
 | Semantic injection via Codex adversarial-review responses     | High     | No issue filed (defense in depth via middleware) |
-| Double-URL-encoding bypass for blocked paths                  | Medium   | Planned fix                    |
-| No real-time alert on audit hash chain break                  | Medium   | 0.3.0 G1 + G5                  |
-| Concurrent audit writers can race at fsync                    | Medium   | 0.3.0 G1 (proper-lockfile)     |
+| Concurrent audit writers can race at fsync                    | Medium   | Mitigated — proper-lockfile shipped 0.3.0 (G1) |
+| Catalog drift by downstream not detected on reconnect         | Medium   | Active — G7 TOFU (§5.20) pins registry CONFIG (name/command/args/env keys), not the `tools/list` response. A downstream that silently expands or alters its tool catalog without a registry edit is not caught by the fingerprint; compensating control is the per-result redact + injection middleware. Tool-surface TOFU is a planned follow-up. |
+| Post-publish tarball smoke not in CI                          | Medium   | Mitigated — tarball-smoke shipped 0.3.0, security-claim gate 0.6.2 (§5.19) |
+| No real-time alert on audit hash chain break                  | Medium   | Mitigated — audit-rotation + verify-on-append shipped 0.3.0 (G1 + G5) |
+| OIDC trusted publisher not yet migrated (`NODE_AUTH_TOKEN` still in use) | Medium | Deferred past 0.5.0 per MIGRATION-0.5.0.md; current path is `--provenance` with `NODE_AUTH_TOKEN` |
+| Double-URL-encoding bypass for blocked paths                  | Medium   | Planned fix (iterative decode to fixed-point) |
 | SBOM not automated in publish pipeline                        | Medium   | Planned                        |
 | Secret pattern gaps (custom token formats, encoding variants) | Medium   | No issue filed                 |
-| Post-publish tarball smoke not in CI                          | Medium   | 0.3.0 CI hardening             |
-| Escape-hatch abuse signal not surfaced in `rea doctor`        | Low      | 0.3.0 (threshold: ≥3 / 7d)     |
-| Catalog drift by downstream not detected on reconnect         | Medium   | 0.3.0 G7 (fingerprint + drift) |
-| OIDC trusted publisher not yet migrated (`NODE_AUTH_TOKEN` still in use) | Medium | 0.3.0 G8                 |
+| Escape-hatch abuse signal not surfaced in `rea doctor`        | Low      | Tracked (threshold: ≥3 / 7d)   |
 | Local user can escalate policy.yaml outside gateway           | Low      | By design (trusted actor)      |
+| Registry pin mismatch → hard fail (no rollback) on TOFU       | Low      | By design — operator clears `.rea/fingerprints.json` to re-pin |
 
 ---
 
@@ -323,8 +501,8 @@ Downstream MCP servers are treated as untrusted by default. Codex plugin *invoca
 
 REA operates two independent layers. Bypassing one does not disable the other.
 
-**Hook layer** (development-time): 13 Claude Code hooks intercept tool calls before execution at the Claude Code level. Hooks enforce: secret scanning, dangerous command interception, blocked path enforcement, settings protection, attribution advisory, dependency audit, commit/push review gates, PR issue linking, architecture review, env file protection, changeset security gates, and security-disclosure gates.
+**Hook layer** (development-time): 14 shell scripts ship. 12 are wired into Claude Code's `PreToolUse` / `PostToolUse` events via the default `.claude/settings.json`. Two are shipped but NOT registered by default: `commit-review-gate.sh` is a `PreToolUse: Bash` hook that matches `git commit` for operators who opt into commit-time review by adding a rule, and `push-review-gate-git.sh` is a native-git adapter that sources `hooks/_lib/push-review-core.sh` (the same shared core the Claude-Code `push-review-gate.sh` sources), shipped for consumers who wire a wrapper-based `.husky/pre-push` that execs it directly. `rea init` currently emits a standalone inline `.husky/pre-push` body (`src/cli/install/pre-push.ts`) rather than a wrapper; unifying the husky installer on the shared-core adapter is tracked as follow-up hardening. Hooks enforce: secret scanning, dangerous command interception, blocked path enforcement, settings protection, attribution advisory, dependency audit, push review gate (Claude-Code-JSON adapter registered; native `.husky/pre-push` adapter opt-in), PR issue linking, architecture review, env file protection, changeset security, and security-disclosure routing. The review-gate hooks (`push-review-gate.sh`, `push-review-gate-git.sh`, `commit-review-gate.sh`) anchor their trust decision on their own on-disk script location (BUG-012, §5.18), not on caller-controlled env vars. The remaining hooks still derive `REA_ROOT` from `${CLAUDE_PROJECT_DIR:-$(pwd)}`; extending the script-anchor idiom across the full hook set is a tracked hardening follow-up.
 
-**Gateway layer** (runtime, `rea serve`): A middleware chain processes every proxied MCP tool call. Middleware enforces: audit, kill switch, policy/autonomy level, tier classification, blocked paths, rate limit, circuit breaker, prompt injection detection, secret redaction (pre and post), and result size cap.
+**Gateway layer** (runtime, `rea serve`): A middleware chain processes every proxied MCP tool call. Middleware enforces: audit, kill switch, policy/autonomy level, tier classification, blocked paths, rate limit, circuit breaker, prompt-injection classification (§5.21), secret redaction (pre and post), and result size cap. The gateway also supervises downstream child processes (§5.14), emits a `SESSION_BLOCKER` audit event on persistent failure (§5.15), and publishes a live per-downstream state snapshot to `.rea/serve.state.json` (§5.16) that `rea status` reads read-only. The `__rea__health` meta-tool short-circuits the chain for callability under HALT and runs a dedicated sanitizer on its response (§5.17).
 
 Both layers fail closed: on read failure, parse error, unknown errno on HALT, regex timeout, or any unexpected condition, the default action is deny (or for redaction specifically: replace with a sentinel — the content never escapes unscanned).

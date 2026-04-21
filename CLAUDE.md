@@ -99,7 +99,7 @@ Project-level instructions for AI agents working in the rea repository.
 - **GitHub**: https://github.com/bookedsolidtech/rea (**public from day one**)
 - **npm**: https://www.npmjs.com/package/@bookedsolid/rea
 - **License**: MIT
-- **Status**: `0.1.0` published 2026-04-18 with npm provenance
+- **Status**: `0.9.x` published to npm with provenance (see CHANGELOG.md for per-release notes)
 - **This repo dogfoods itself** — rea's governance layer enforces rea's own commit, hook, and attribution rules. The install under `.rea/`, `.claude/`, and `.husky/` is the reference example of the `bst-internal` profile.
 
 ## Stack
@@ -120,7 +120,8 @@ Project-level instructions for AI agents working in the rea repository.
 
 - `src/` — TypeScript source
   - `src/cli/` — CLI entry and commands (`rea init`, `rea serve`, `rea freeze`, `rea doctor`)
-  - `src/gateway/middleware/` — 12-layer middleware chain (audit, kill-switch, tier, policy, blocked-paths, rate-limit, circuit-breaker, redact, injection, result-size-cap)
+  - `src/gateway/middleware/` — middleware chain (audit, kill-switch, tier, policy, blocked-paths, rate-limit, circuit-breaker, injection, redact, result-size-cap)
+  - `src/gateway/` — supervisor, live-state publisher, SESSION_BLOCKER tracker, `__rea__health` meta-tool
   - `src/policy/` — policy loader, zod schema, types
 - `hooks/` — shipped shell hooks (source of truth — `rea init` copies from here)
 - `agents/` — curated 10-agent roster (source of truth — `rea init` copies from here)
@@ -157,20 +158,22 @@ This repo is **public from the first commit**. Extra rules apply because everyth
 
 ## Hook & Command Reference
 
-Hooks at `.claude/hooks/` (copied from `hooks/`, pinned by `.claude/settings.json`):
+Hooks at `.claude/hooks/` (copied from `hooks/` by `rea init`). 14 ship in the package; 12 are registered in the default `.claude/settings.json` and fire on Claude Code tool-invocation events. Two (`commit-review-gate.sh` and `push-review-gate-git.sh`) are shipped ready-to-wire but intentionally NOT registered by default:
 
 - `dangerous-bash-interceptor.sh` — blocks destructive commands (`rm -rf`, `git reset --hard`, `--no-verify`, etc.)
 - `env-file-protection.sh` — blocks reads of `.env*`
 - `dependency-audit-gate.sh` — verifies packages exist before install
-- `security-disclosure-gate.sh` — checks disclosure policy compliance
-- `pr-issue-link-gate.sh` — requires issue reference on PR creation
+- `security-disclosure-gate.sh` — routes security-keyword `gh issue create` to private disclosure
+- `pr-issue-link-gate.sh` — advisory warn when `gh pr create` has no linked issue
 - `attribution-advisory.sh` — blocks AI attribution in commits/PRs
 - `secret-scanner.sh` — scans writes/edits for credentials
-- `settings-protection.sh` — guards `.claude/settings.json` edits
+- `settings-protection.sh` — guards `.claude/settings.json` and `.claude/hooks/*` edits
 - `blocked-paths-enforcer.sh` — enforces `blocked_paths` from policy
-- `changeset-security-gate.sh` — checks changesets for secret leakage
+- `changeset-security-gate.sh` — checks changesets for GHSA leaks and malformed frontmatter
 - `architecture-review-gate.sh` — post-write architectural impact check
-- `commit-review-gate.sh`, `push-review-gate.sh` — pre-commit/pre-push review gates
+- `commit-review-gate.sh` — `PreToolUse: Bash` matcher for `git commit`; shipped ready-to-wire but NOT registered by default (operators opt in by adding a rule)
+- `push-review-gate.sh` — pre-push review gate (Claude-Code PreToolUse adapter)
+- `push-review-gate-git.sh` — pre-push review gate (native-git adapter; sources `hooks/_lib/push-review-core.sh`, shipped for wrapper-based `.husky/pre-push` installs. `rea init`'s default installer emits a standalone inline `.husky/pre-push` body instead of a wrapper)
 
 Slash commands at `.claude/commands/`:
 
@@ -202,7 +205,7 @@ Slash commands at `.claude/commands/`:
 
 - **Policy**: `.rea/policy.yaml` — profile `bst-internal`
 - **Autonomy**: `L1` (ceiling `L2`)
-- **Blocked paths**: 8 entries — see the policy file
+- **Blocked paths**: 4 entries — see the policy file
 - **block_ai_attribution**: `true` (enforced by commit-msg hook)
 
 Protected-path changes (`src/gateway/middleware/`, `hooks/`, `src/policy/`,

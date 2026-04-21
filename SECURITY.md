@@ -2,10 +2,16 @@
 
 ## Supported Versions
 
-| Version | Supported |
-| ------- | --------- |
-| 0.1.x   | Yes       |
-| < 0.1   | No (pre-release) |
+Security fixes land on the latest minor line. Older minors receive fixes only
+when the issue is critical and a backport is tractable.
+
+| Version | Supported                                   |
+| ------- | ------------------------------------------- |
+| 0.9.x   | Yes — active line                           |
+| 0.8.x   | Critical fixes only, 30 days from 0.9.0     |
+| 0.7.x   | No — superseded; upgrade recommended        |
+| ≤ 0.6.x | No — superseded; upgrade recommended        |
+| < 0.1   | No (pre-release)                            |
 
 ## Reporting a Vulnerability
 
@@ -85,10 +91,21 @@ REA's security model is defense-in-depth across two independent layers:
 
 **Hook layer** (development-time, Claude Code hooks):
 
-- 11 Claude Code hooks enforce security at the point of tool invocation
-- `security-disclosure-gate` blocks public issue creation for security topics
+- 14 shell scripts ship in the hook layer. 12 are wired into Claude Code's
+  `PreToolUse` / `PostToolUse` events via the default `.claude/settings.json`.
+  Two are shipped but NOT registered by default: `commit-review-gate.sh`
+  is a `PreToolUse: Bash` hook that matches `git commit` for operators who
+  opt into commit-time review by adding a rule, and `push-review-gate-git.sh`
+  is a native-git adapter that sources `hooks/_lib/push-review-core.sh`
+  (the same shared core used by the Claude-Code push-review adapter),
+  shipped for consumers who wire a wrapper-based `.husky/pre-push` that
+  execs it directly. `rea init`'s default installer emits a standalone
+  inline `.husky/pre-push` body rather than a wrapper; unifying the
+  husky installer on the adapter is tracked as a follow-up
+- `security-disclosure-gate` routes public security-keyword issue creation to private disclosure
 - `settings-protection` prevents agents from modifying their own safety rails
 - `dangerous-bash-interceptor` blocks categories of destructive shell commands
+- `push-review-gate` and the shared-core adapter (`push-review-gate-git.sh` sourcing `hooks/_lib/push-review-core.sh`) anchor trust on the hook's own on-disk location via `BASH_SOURCE` rather than caller-controlled env vars; see `THREAT_MODEL.md §5.18`. The shipped inline `.husky/pre-push` body uses `git rev-parse --show-toplevel` to locate `REA_ROOT` — extending the script-anchor idiom to the inline path is tracked follow-up hardening
 
 Both layers operate independently — compromising one does not disable the other.
 
@@ -99,6 +116,6 @@ Both layers operate independently — compromising one does not disable the othe
 - Policy parsing is strict zod schema — unknown fields rejected, not ignored
 - Path traversal protection on profile loading (regex + path containment check)
 - CI publish pipeline includes gitleaks secret scanning, npm provenance attestation via OIDC, SBOM generation, and payload validation
-- All shell hooks use `set -euo pipefail` with explicit variable quoting
+- All shell hooks set fail-fast flags with explicit variable quoting (`set -euo pipefail`, or `set -uo pipefail` for hooks that consume stdin JSON where a single `jq`-path miss must not abort before the conditional branches run)
 - Commits are signed and DCO-signed-off; `main` branch protection requires passing checks and review
 - npm publish uses OIDC provenance; no long-lived NPM tokens in CI
