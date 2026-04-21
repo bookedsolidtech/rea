@@ -1067,14 +1067,28 @@ pr_core_run() {
     local CACHE_RESULT
     local CACHE_STDOUT=""
     local CACHE_STDERR_FILE
-    CACHE_STDERR_FILE=$(mktemp -t rea-cache-err.XXXXXX 2>/dev/null || printf '/tmp/rea-cache-err.%d' "$$")
+    # SECURITY (Codex LOW 4): require mktemp. A predictable /tmp path like
+    # /tmp/rea-cache-err.$PID is a TOCTOU attack surface on shared hosts —
+    # another user can pre-create a symlink from that name to a file they
+    # want us to clobber. If mktemp is unavailable, fail loudly rather than
+    # silently falling back to a predictable path.
+    if ! CACHE_STDERR_FILE=$(mktemp -t rea-cache-err.XXXXXX 2>/dev/null); then
+      printf 'rea push-review: mktemp unavailable; cannot capture cache-check stderr. Aborting.\n' >&2
+      return 2
+    fi
     local CACHE_EXIT=0
     CACHE_STDOUT=$("${REA_CLI_ARGS[@]}" cache check "$PUSH_SHA" --branch "$SOURCE_BRANCH" --base "$TARGET_BRANCH" 2>"$CACHE_STDERR_FILE") || CACHE_EXIT=$?
     local CACHE_STDERR=""
     CACHE_STDERR=$(cat "$CACHE_STDERR_FILE" 2>/dev/null || true)
     rm -f "$CACHE_STDERR_FILE"
     if [[ "$CACHE_EXIT" -ne 0 ]]; then
-      printf 'rea push-review: CACHE CHECK FAILED (exit=%d): %s\n' "$CACHE_EXIT" "$CACHE_STDERR" >&2
+      # SECURITY (Codex LOW 5): strip C0/C1 control characters from CLI
+      # stderr before echoing to the terminal. A tampered dist/ or hostile
+      # CLI could otherwise emit OSC/CSI sequences that rewrite lines above
+      # the deny message and mislead the operator.
+      local CACHE_STDERR_SAFE
+      CACHE_STDERR_SAFE=$(printf '%s' "$CACHE_STDERR" | LC_ALL=C tr -d '\000-\037\177')
+      printf 'rea push-review: CACHE CHECK FAILED (exit=%d): %s\n' "$CACHE_EXIT" "$CACHE_STDERR_SAFE" >&2
       printf 'rea push-review: treating as miss; file bookedsolidtech/rea issue if unexpected.\n' >&2
       CACHE_RESULT='{"hit":false,"reason":"query_error"}'
     elif [[ -z "$CACHE_STDOUT" ]]; then

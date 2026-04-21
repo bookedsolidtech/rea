@@ -73,9 +73,11 @@ rea audit record codex-review \
 ```
 
 `--also-set-cache` writes the audit record AND the review-cache entry in one
-atomic invocation. Without it, the audit record lands but the cache stays
-cold — the next `git push` pays for a re-review even though the audit trail
-already shows the review happened.
+invocation (two sequential writes in-process — not a two-phase commit, but
+tight enough that crash windows are vanishingly small in practice). Without
+it, the audit record lands but the cache stays cold — the next `git push`
+pays for a re-review even though the audit trail already shows the review
+happened.
 
 The command is Read-tier. It works at L1 without further escalation. Do not
 wrap it in `!`-bash; that dodges the audit surface and breaks the gate's
@@ -117,10 +119,19 @@ in-session (rare — it's almost always a human task), the operator can set:
 export REA_HOOK_PATCH_SESSION="applying PR #NNNN finding"
 ```
 
-This allows edits under `.claude/hooks/` and `hooks/` for that shell. Every
-allowed edit emits a `hooks.patch.session` audit record. The session
-boundary IS the expiry — a new shell requires a fresh opt-in. `.rea/policy.yaml`,
-`.rea/HALT`, and `.claude/settings.json` remain protected regardless.
+This allows edits under the runtime hook directory `.claude/hooks/` for that
+shell. Every allowed edit emits a `hooks.patch.session` audit record
+(routed through REA's hash-chained `appendAuditRecord`, not a bare jq
+append — the hook refuses the edit if the audit chain cannot be extended).
+The session boundary IS the expiry — a new shell requires a fresh opt-in.
+`.rea/policy.yaml`, `.rea/HALT`, and `.claude/settings.json` remain
+protected regardless, and any path containing a `..` segment is rejected
+outright so traversal cannot smuggle a runtime edit into a policy file.
+
+The source-of-truth `hooks/` directory is editable by default (it is the
+authoring surface; `rea init` is what copies it into `.claude/hooks/` to
+take effect). Operators who want to gate source edits can add `hooks/` to
+`blocked_paths` in `.rea/policy.yaml`.
 
 Do not set this env var yourself. It's an operator-declared posture.
 

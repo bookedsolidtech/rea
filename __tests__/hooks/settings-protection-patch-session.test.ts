@@ -104,15 +104,16 @@ describe('settings-protection.sh — REA_HOOK_PATCH_SESSION env var (Defect I)',
     expect(res.stderr).toMatch(/applying CodeRabbit finding/);
   });
 
-  it('allows edits to hooks/* (non-dogfood variant) when env var is set', async () => {
+  it('hooks/ (source-of-truth) is editable without env var — only runtime .claude/hooks/ is patch-session-scoped', async () => {
     if (!jqExists()) return;
 
     const target = path.join(dir, 'hooks', 'example.sh');
     await fs.writeFile(target, '#!/bin/bash\necho hi\n');
 
-    const res = runHook(dir, target, {
-      REA_HOOK_PATCH_SESSION: 'upstream sync',
-    });
+    // No env var set — still allowed because hooks/ is source-of-truth,
+    // not a runtime attack surface. rea init copies hooks/ → .claude/hooks/
+    // so an edit to hooks/ only takes effect after rea init.
+    const res = runHook(dir, target);
     expect(res.status).toBe(0);
   });
 
@@ -200,5 +201,77 @@ describe('settings-protection.sh — REA_HOOK_PATCH_SESSION env var (Defect I)',
     expect(rec.metadata.sha_before).toMatch(/^[0-9a-f]{64}$/);
     expect(typeof rec.metadata.pid).toBe('number');
     expect(typeof rec.metadata.ppid).toBe('number');
+  });
+});
+
+/**
+ * Codex HIGH 1 regression — path-traversal bypass of the patch-session
+ * allowlist.
+ *
+ * Before the fix, normalize_path() stripped interior ./ sequences and the
+ * patch-session case-glob matched `.claude/hooks/*` textually. Paths like
+ * `.claude/hooks/../settings.json` slipped through both checks and reached
+ * .claude/settings.json on disk with the env var set.
+ *
+ * The fix rejects any path that contains a `..` segment BEFORE any match
+ * runs, and reorders so hard-protected paths (.rea/policy.yaml, .rea/HALT,
+ * .claude/settings.json) are denied before the patch-session allowlist is
+ * consulted.
+ */
+describe('settings-protection.sh — path-traversal bypass (Codex HIGH 1)', () => {
+  let dir: string;
+
+  beforeEach(async () => {
+    dir = await fs.realpath(
+      await fs.mkdtemp(path.join(os.tmpdir(), 'rea-traversal-')),
+    );
+    await fs.mkdir(path.join(dir, '.rea'), { recursive: true });
+    await fs.mkdir(path.join(dir, '.claude', 'hooks'), { recursive: true });
+    await fs.mkdir(path.join(dir, 'hooks'), { recursive: true });
+  });
+
+  afterEach(async () => {
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
+  it.each([
+    '.claude/hooks/../settings.json',
+    '.claude/hooks/../../.rea/HALT',
+    '.claude/hooks/./../settings.json',
+    'hooks/../.rea/policy.yaml',
+  ])('rejects traversal "%s" even with REA_HOOK_PATCH_SESSION set', async (suffix) => {
+    if (!jqExists()) return;
+
+    // Absolute path form (CLAUDE_PROJECT_DIR + traversal)
+    const abs = path.join(dir, suffix);
+    const res = runHook(dir, abs, {
+      REA_HOOK_PATCH_SESSION: 'attempt bypass',
+    });
+    expect(res.status).toBe(2);
+    expect(res.stderr).toMatch(/SETTINGS PROTECTION/);
+  });
+
+  it('rejects traversal even without env var set (defense in depth)', async () => {
+    if (!jqExists()) return;
+
+    const abs = path.join(dir, '.claude/hooks/../settings.json');
+    const res = runHook(dir, abs);
+    expect(res.status).toBe(2);
+    expect(res.stderr).toMatch(/SETTINGS PROTECTION/);
+  });
+
+  it('hard-protected paths are blocked BEFORE patch-session allowlist is consulted', async () => {
+    if (!jqExists()) return;
+
+    // Direct target (no traversal) but hard-protected.
+    // With patch-session env set, the old code consulted the allowlist first;
+    // the new code runs hard-protected denies first so no allowlist detour.
+    const target = path.join(dir, '.claude', 'settings.json');
+    await fs.writeFile(target, '{}');
+    const res = runHook(dir, target, {
+      REA_HOOK_PATCH_SESSION: 'should not matter',
+    });
+    expect(res.status).toBe(2);
+    expect(res.stderr).toMatch(/SETTINGS PROTECTION/);
   });
 });

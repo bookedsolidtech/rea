@@ -158,9 +158,44 @@ export function isToolBlocked(
  * audit surface — the whole point of the command is to let an L1 agent satisfy
  * the push-review gate without a human in the loop. Write-tier here would
  * reintroduce exactly the deadlock Defect D/E close.
+ *
+ * SECURITY: returns `null` for any command containing shell metacharacters
+ * that would let an attacker piggyback arbitrary commands onto an allowed
+ * prefix (e.g. `rea check && rm -rf ~`). Bash tokenizes on whitespace, but
+ * the shell itself dispatches the full command string — token[0] matching
+ * is not a sufficient trust decision. Falling back to `null` forces the
+ * generic Write-tier Bash default, which is what the operator expects for
+ * any command they did not explicitly model here.
  */
+const REA_SHELL_METACHAR_RE = /[;&|`\n\r]|\$\(|>\(|<\(/;
+
+/**
+ * Path suffixes recognized as trusted `rea` CLI entry points when the first
+ * token is a file-path invocation like `./node_modules/.bin/rea`. Arbitrary
+ * `evil-rea`-ending names should NOT satisfy the subcommand classification.
+ */
+const REA_TRUSTED_PATH_SUFFIXES = [
+  '/node_modules/.bin/rea',
+  '/dist/cli/index.js',
+  '/bin/rea',
+  '/.bin/rea',
+];
+
+function isTrustedReaPath(first: string): boolean {
+  if (first === 'rea') return true;
+  for (const suffix of REA_TRUSTED_PATH_SUFFIXES) {
+    if (first === suffix || first.endsWith(suffix)) return true;
+  }
+  return false;
+}
+
 export function reaCommandTier(command: string): Tier | null {
   if (typeof command !== 'string' || command.length === 0) return null;
+
+  // Refuse to classify commands that chain/substitute — the trailing shell
+  // payload is arbitrary, so the prefix's read-tier status tells us nothing
+  // about what the shell will actually execute.
+  if (REA_SHELL_METACHAR_RE.test(command)) return null;
 
   const trimmed = command.trim();
   if (trimmed.length === 0) return null;
@@ -176,7 +211,7 @@ export function reaCommandTier(command: string): Tier | null {
     const second = tokens[1];
     if (second !== 'rea' && second !== '@bookedsolid/rea') return null;
     idx = 2;
-  } else if (first === 'rea' || first.endsWith('/rea')) {
+  } else if (isTrustedReaPath(first)) {
     idx = 1;
   } else {
     return null;

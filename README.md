@@ -499,7 +499,7 @@ This invokes the `codex-adversarial` agent, which records a
 error` and a `finding_count`. The push gate looks up that entry by
 `head_sha + verdict ∈ {pass, concerns}`.
 
-### 2. Record-and-cache in one atomic CLI call
+### 2. Record-and-cache in one CLI call
 
 If you already have a review verdict (from `/codex-review`, or from a
 manual Codex run, or from an offline review) emit the audit record AND
@@ -517,11 +517,14 @@ rea audit record codex-review \
 ```
 
 `--also-set-cache` writes both `.rea/audit.jsonl` and
-`.rea/review-cache.jsonl` in the same invocation. Without it, the audit
-record lands but the cache stays cold — and the next `git push` pays
-for a re-review even though the audit trail already shows the review
-happened. `--also-set-cache` is what the gate's remediation text should
-be reduced to.
+`.rea/review-cache.jsonl` in the same invocation (two sequential
+appends, not a two-phase commit — but close enough in practice that the
+push-gate lookup cannot see the audit record without the cache entry
+unless a crash lands between them). Without it, the audit record lands
+but the cache stays cold — and the next `git push` pays for a re-review
+even though the audit trail already shows the review happened.
+`--also-set-cache` is what the gate's remediation text should be reduced
+to.
 
 Verdict mapping for the cache leg:
 

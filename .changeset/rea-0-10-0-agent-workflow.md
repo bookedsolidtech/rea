@@ -9,8 +9,11 @@ Agent push-workflow unblock — self-consistent gate, public CLI, anchored path 
   --verdict pass|concerns|blocking|error --finding-count <N> [--summary ...]
   [--session-id ...] [--also-set-cache]`. Thin wrapper around the public
   `appendAuditRecord()` helper with the canonical `tool_name: "codex.review"`
-  and `server_name: "codex"` baked in. `--also-set-cache` atomically updates
-  `.rea/review-cache.jsonl` via the Codex-verdict mapping (`pass|concerns →
+  and `server_name: "codex"` baked in. `--also-set-cache` updates
+  `.rea/review-cache.jsonl` in the same invocation (sequential writes,
+  not 2PC — but close enough that push-gate lookups cannot observe the
+  audit-without-cache state except across a crash) via the
+  Codex-verdict mapping (`pass|concerns →
   pass`, `blocking|error → fail`). `rea cache set` now also accepts the four
   canonical Codex verdicts at the CLI boundary. Kills the two-step race
   where the audit record landed but the cache stayed cold.
@@ -46,13 +49,19 @@ Agent push-workflow unblock — self-consistent gate, public CLI, anchored path 
   matching and did not need the change.
 
 - **I: `REA_HOOK_PATCH_SESSION` env var for session-scoped hook patching.**
-  Setting `REA_HOOK_PATCH_SESSION=<reason>` allows edits under
-  `.claude/hooks/` and `hooks/` for that shell session. Every allowed edit
-  emits a `hooks.patch.session` audit record with the operator-declared
-  reason, file, pre-edit SHA, actor identity, pid, and ppid. Session boundary
-  is the expiry — a new shell requires a fresh opt-in. `.rea/policy.yaml`,
-  `.rea/HALT`, and settings JSONs remain blocked regardless. See new
-  THREAT_MODEL §5.22.
+  Setting `REA_HOOK_PATCH_SESSION=<reason>` allows edits under the runtime
+  hook directory `.claude/hooks/` for that shell session. Every allowed
+  edit emits a `hooks.patch.session` audit record (routed through the REA
+  hash-chained `appendAuditRecord`; if the chain cannot be extended the
+  edit is refused) with operator-declared reason, file, pre-edit SHA,
+  actor identity, pid, and ppid. Session boundary is the expiry — a new
+  shell requires a fresh opt-in. `.rea/policy.yaml`, `.rea/HALT`, and
+  settings JSONs remain blocked regardless. Paths containing `..`
+  segments are rejected before any match runs, closing a traversal
+  bypass (`.claude/hooks/../settings.json`) surfaced by an adversarial
+  Codex pass pre-merge. The source-of-truth `hooks/` directory remains
+  editable by default; operators who want to gate it can add it to
+  `blocked_paths`. See new THREAT_MODEL §5.22.
 
 - **Docs:** new README "Agent push workflow" section with copy-paste CLI
   + SDK examples; new `AGENTS.md` at repo root as canonical agent
