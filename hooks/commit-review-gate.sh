@@ -114,7 +114,16 @@ if [[ -z "$DIFF_OUTPUT" ]]; then
 fi
 
 # Count changed lines (additions + deletions)
-LINE_COUNT=$(printf '%s' "$DIFF_FULL" | grep -cE '^\+[^+]|^-[^-]' 2>/dev/null || echo "0")
+# Defect K (rea#62) sibling: `|| echo "0"` captures "0\n0" into LINE_COUNT
+# when grep exits non-zero on a no-match — grep still prints its own `0` and
+# `echo "0"` appends another. At this site the concatenated `"0\n0"` is then
+# evaluated as arithmetic (`-gt $SIGNIFICANT_THRESHOLD`, `-ge $TRIVIAL_THRESHOLD`
+# below) and bash emits a "syntax error in expression" at runtime on any
+# rename-only / mode-only / empty-file-add diff. `|| true` + bash-default
+# expansion fixes both the banner cosmetic and the arithmetic-unsafe control
+# flow in one shot.
+LINE_COUNT=$(printf '%s' "$DIFF_FULL" | grep -cE '^\+[^+]|^-[^-]' 2>/dev/null || true)
+LINE_COUNT="${LINE_COUNT:-0}"
 
 # Check for sensitive paths
 SENSITIVE=0
@@ -162,17 +171,79 @@ fi
 
 # ── 10. Check review cache for all non-trivial commits ────────────────────────
 # Compute SHA and branch here so both standard and significant tiers share them.
-STAGED_SHA=$(cd "$REA_ROOT" && git diff --cached | shasum -a 256 | cut -d' ' -f1 2>/dev/null || echo "")
+#
+# Defect L (rea#63) sibling: `shasum` is not installed on Alpine, distroless,
+# or most minimal Linux CI images — only `sha256sum` is. The prior chain
+# silently produced an empty STAGED_SHA, which the cache block then skipped
+# AND the banner at §11 rendered as `rea cache set  pass` — a dead-end the
+# agent cannot execute. Portable chain mirrors push-review-core.sh §8:
+# sha256sum → shasum → openssl. The openssl branch uses `awk '{print $NF}'`
+# WITHOUT `-r` to stay compatible with OpenSSL 1.1.x (Debian 11, Ubuntu
+# 20.04, RHEL 8, Amazon Linux 2, Alpine 3.13–3.14).
+STAGED_SHA=""
+if command -v sha256sum >/dev/null 2>&1; then
+  STAGED_SHA=$(printf '%s' "$DIFF_FULL" | sha256sum 2>/dev/null | awk '{print $1}')
+elif command -v shasum >/dev/null 2>&1; then
+  STAGED_SHA=$(printf '%s' "$DIFF_FULL" | shasum -a 256 2>/dev/null | awk '{print $1}')
+elif command -v openssl >/dev/null 2>&1; then
+  STAGED_SHA=$(printf '%s' "$DIFF_FULL" | openssl dgst -sha256 2>/dev/null | awk '{print $NF}')
+else
+  printf 'rea commit-review: WARN no sha256 hasher found (sha256sum/shasum/openssl); cache disabled\n' >&2
+fi
+if [[ -n "$STAGED_SHA" && ! "$STAGED_SHA" =~ ^[0-9a-f]{64}$ ]]; then
+  printf 'rea commit-review: WARN hasher returned invalid output; cache disabled\n' >&2
+  STAGED_SHA=""
+fi
 BRANCH=$(cd "$REA_ROOT" && git branch --show-current 2>/dev/null || echo "")
 CACHE_FILE="${REA_ROOT}/.rea/review-cache.json"
+
+# Codex pass-3 finding #1: `rea cache check` and `rea cache set` both declare
+# `--base` as a `requiredOption` in src/cli/index.ts. Prior versions of this
+# gate omitted `--base`, so (a) the CLI path exited non-zero and the
+# `|| echo '{"hit":false}'` fallback quietly masked the contract error, and
+# (b) the section-11 banner instructed the agent to run `rea cache set <sha>
+# pass` — also missing `--base`, rejected by the CLI on every retry. A
+# successful cache flow was unreachable.
+#
+# Resolve BASE_BRANCH by the same preference order the push-gate uses in
+# push-review-core.sh §7 (lines 778-794): origin/HEAD → origin/main →
+# origin/master → empty. If nothing resolves, disable the cache (the
+# alternative is emitting a cache command the CLI rejects on every call).
+BASE_BRANCH=""
+_origin_head=$(cd "$REA_ROOT" && git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null || true)
+if [[ -n "$_origin_head" ]]; then
+  BASE_BRANCH="${_origin_head#refs/remotes/origin/}"
+fi
+if [[ -z "$BASE_BRANCH" ]]; then
+  # Use `git -C` so the current-shell cwd is never mutated — matches the
+  # cross-repo guard at §1a and keeps the file's dominant idiom. Raw
+  # `cd "$REA_ROOT" && git …` would leave the hook process sitting in
+  # $REA_ROOT, which is safe today but breaks silently if a future edit
+  # adds a relative-path command downstream.
+  if git -C "$REA_ROOT" rev-parse --verify --quiet refs/remotes/origin/main >/dev/null 2>&1; then
+    BASE_BRANCH="main"
+  elif git -C "$REA_ROOT" rev-parse --verify --quiet refs/remotes/origin/master >/dev/null 2>&1; then
+    BASE_BRANCH="master"
+  fi
+fi
+if [[ -z "$BASE_BRANCH" && -n "$STAGED_SHA" ]]; then
+  printf 'rea commit-review: WARN could not resolve base branch (no origin/HEAD, no origin/main, no origin/master); cache disabled\n' >&2
+  STAGED_SHA=""
+fi
+unset _origin_head
 
 if [[ -n "$STAGED_SHA" ]]; then
   CACHE_HIT=false
 
-  # Primary: use CLI when available — handles TTL, expiry, and branch-scoped keys
+  # Primary: use CLI when available — handles TTL, expiry, and branch-scoped keys.
+  # Cache predicate must require BOTH `.hit == true` AND `.result == "pass"` —
+  # a cached `fail` verdict would otherwise satisfy `.hit == true` and let the
+  # commit proceed despite a recorded negative review. Mirrors the push-gate
+  # predicate at push-review-core.sh §8; the §218-226 direct-cache fallback
+  # already enforces `result == "pass"`, so the two paths must agree.
   if [[ ${#REA_CLI_ARGS[@]} -gt 0 ]]; then
-    CACHE_RESULT=$("${REA_CLI_ARGS[@]}" cache check "$STAGED_SHA" --branch "$BRANCH" 2>/dev/null || echo '{"hit":false}')
-    if printf '%s' "$CACHE_RESULT" | jq -e '.hit == true' >/dev/null 2>&1; then
+    CACHE_RESULT=$("${REA_CLI_ARGS[@]}" cache check "$STAGED_SHA" --branch "$BRANCH" --base "$BASE_BRANCH" 2>/dev/null || echo '{"hit":false}')
+    if printf '%s' "$CACHE_RESULT" | jq -e '.hit == true and .result == "pass"' >/dev/null 2>&1; then
       CACHE_HIT=true
     fi
   fi
@@ -210,8 +281,25 @@ fi
   printf '  1. Inspect:  git diff --cached\n'
   printf '  2. Decide:   Is this safe to commit? (initial commits, refactors, and\n'
   printf '               feature work are normal — use judgement, not ceremony)\n'
-  printf '  3. Approve:  rea cache set %s pass\n' "$STAGED_SHA"
-  printf '  4. Retry the git commit command\n'
+  # Defect L follow-up: when no sha256 hasher is available STAGED_SHA is empty
+  # and `rea cache set  pass` is a dead-end the CLI rejects. Branch the banner
+  # to surface an actionable path instead. Unlike push-review-core.sh there is
+  # no `REA_SKIP_COMMIT_REVIEW` env escape hatch (the commit gate only fires
+  # under Claude Code's Bash `PreToolUse` matcher, so a human direct-shell
+  # commit bypasses it entirely). The only remediation is to install a sha256
+  # hasher or ask the user to commit directly.
+  if [[ -n "$STAGED_SHA" ]]; then
+    printf '  3. Approve:  rea cache set %s pass --branch %s --base %s\n' \
+      "$STAGED_SHA" "$BRANCH" "$BASE_BRANCH"
+    printf '  4. Retry the git commit command\n'
+  else
+    printf '  3. Cache is DISABLED on this host (no sha256 hasher or no base\n'
+    printf '     branch resolvable). Install one of: sha256sum (Linux coreutils),\n'
+    printf '     shasum (perl-core), or openssl; or ensure origin/HEAD is set so\n'
+    printf '     the gate can identify the merge target. Without these the cache\n'
+    printf '     path cannot complete — escalate to the user if neither can be\n'
+    printf '     provided.\n'
+  fi
   printf '\n'
   printf '  Only escalate to the user if you find a genuine problem in the diff.\n'
 } >&2
