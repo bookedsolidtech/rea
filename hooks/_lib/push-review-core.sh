@@ -1094,8 +1094,23 @@ pr_core_run() {
     printf '  Action required:\n'
     printf '  1. Spawn a code-reviewer agent to review: git diff %s..%s\n' "$MERGE_BASE" "$SOURCE_SHA"
     printf '  2. Spawn a security-engineer agent for security review\n'
-    printf '  3. After both pass, cache the result:\n'
-    printf '     rea cache set %s pass --branch %s --base %s\n' "$PUSH_SHA" "$SOURCE_BRANCH" "$TARGET_BRANCH"
+    # Defect L (rea#63) follow-up: when no sha256 hasher is available the
+    # cache is disabled and PUSH_SHA is empty. Emitting `rea cache set <blank>
+    # pass ...` would be a dead-end — the CLI rejects the empty positional.
+    # Print an alternate completion path in that case. The Codex-adversarial
+    # review concerns list flagged this UX cliff in the 0.9.4 pass.
+    if [[ -n "$PUSH_SHA" ]]; then
+      printf '  3. After both pass, cache the result:\n'
+      printf '     rea cache set %s pass --branch %s --base %s\n' "$PUSH_SHA" "$SOURCE_BRANCH" "$TARGET_BRANCH"
+    else
+      printf '  3. Cache is DISABLED on this host (no sha256 hasher found).\n'
+      printf '     After both reviews pass, bypass the push-review gate with:\n'
+      printf '       REA_SKIP_PUSH_REVIEW="<reason>" git push ...\n'
+      printf '     The bypass is audited as push.review.skipped — this is the\n'
+      printf '     documented escape hatch when cache is unavailable.\n'
+      printf '     To restore the cache path, install one of: sha256sum,\n'
+      printf '     shasum (Perl Digest::SHA), or openssl.\n'
+    fi
     printf '\n'
   } >&2
   exit 2

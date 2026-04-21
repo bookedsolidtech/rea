@@ -114,7 +114,16 @@ if [[ -z "$DIFF_OUTPUT" ]]; then
 fi
 
 # Count changed lines (additions + deletions)
-LINE_COUNT=$(printf '%s' "$DIFF_FULL" | grep -cE '^\+[^+]|^-[^-]' 2>/dev/null || echo "0")
+# Defect K (rea#62) sibling: `|| echo "0"` captures "0\n0" into LINE_COUNT
+# when grep exits non-zero on a no-match — grep still prints its own `0` and
+# `echo "0"` appends another. At this site the concatenated `"0\n0"` is then
+# evaluated as arithmetic (`-gt $SIGNIFICANT_THRESHOLD`, `-ge $TRIVIAL_THRESHOLD`
+# below) and bash emits a "syntax error in expression" at runtime on any
+# rename-only / mode-only / empty-file-add diff. `|| true` + bash-default
+# expansion fixes both the banner cosmetic and the arithmetic-unsafe control
+# flow in one shot.
+LINE_COUNT=$(printf '%s' "$DIFF_FULL" | grep -cE '^\+[^+]|^-[^-]' 2>/dev/null || true)
+LINE_COUNT="${LINE_COUNT:-0}"
 
 # Check for sensitive paths
 SENSITIVE=0

@@ -310,29 +310,119 @@ describe('push-review-gate — 0.9.4 Defect K (LINE_COUNT/FILE_COUNT "0\\n0" ren
     cleanup.push(repo.bareRemote);
   }
 
-  it('does NOT emit "0\\n0" in the Scope banner when the diff has zero added/removed content-lines', async () => {
+  it('does NOT emit "0\\n0" in the Scope banner on an empty-file diff (true no-match branch)', async () => {
     if (!jqExists()) return;
 
-    // Edge case: a commit that adds only a file without any `+content` /
-    // `-content` lines (e.g., rename-only or pure empty file). We still hit
-    // the banner path — and we must not see "0\n0".
+    // Codex 0.9.4 pass-1 #3: the prior fixture added a file with content
+    // (`minor\n`), so `grep -cE '^\+[^+]|^-[^-]'` matched 1 and never took
+    // the no-match branch where `|| echo "0"` produced the `0\n0`
+    // concatenation — the assertions passed even without the fix.
+    //
+    // An empty-file-add produces a diff with zero `+content` / `-content`
+    // lines (only the file-header lines, which begin with `+++ ` / `--- `
+    // and are excluded by the regex). That forces grep's non-zero exit and
+    // the no-match path.
     const repo = await makeScratchRepo({
-      featureFiles: [
-        // A trivial safe file — small diff, non-protected path.
-        { path: 'changelog.md', contents: 'minor\n' },
-      ],
+      featureFiles: [{ path: 'empty-marker.txt', contents: '' }],
     });
     track(repo);
 
     const res = runPushHook(repo, {}, 'git push origin feature:feature');
 
-    // Either exit 0 (cached/clean) or exit 2 (review required) — we only
-    // care that the banner stderr never embeds a literal "0\n0" sequence.
     const combined = res.stdout + res.stderr;
-    // Match a literal newline-separated 0-then-0 inside a single field,
-    // or two 0s bracketing a newline (the exact defect shape).
     expect(combined).not.toMatch(/0\n0 files changed/);
     expect(combined).not.toMatch(/0\n0 lines/);
+    // Positive assertion: the banner DOES render Scope with a single-line
+    // numeric pair (the fix's desired shape). Accept any two numbers — the
+    // point is that they're not newline-mangled. The banner may be absent
+    // entirely if the gate exits earlier (HALT / deletion); in that case
+    // we skip the positive assertion, the negative above already locks
+    // the regression.
+    const m = combined.match(/Scope: (\d+) files changed, (\d+) lines/);
+    if (m) {
+      expect(Number.isInteger(Number(m[1]))).toBe(true);
+      expect(Number.isInteger(Number(m[2]))).toBe(true);
+    }
+  });
+});
+
+describe('commit-review-gate — 0.9.4 Defect K sibling (arithmetic-safe LINE_COUNT)', () => {
+  const cleanup: string[] = [];
+
+  beforeEach(() => {
+    cleanup.length = 0;
+  });
+
+  afterEach(async () => {
+    await Promise.all(
+      cleanup.map((d) => fs.rm(d, { recursive: true, force: true })),
+    );
+  });
+
+  it('LINE_COUNT is arithmetic-safe on a diff with zero content-lines (empty file stage)', async () => {
+    if (!jqExists()) return;
+
+    const dir = await fs.realpath(
+      await fs.mkdtemp(path.join(os.tmpdir(), 'rea-094-commit-k-')),
+    );
+    cleanup.push(dir);
+
+    const git = (...args: string[]): string =>
+      execFileSync('git', args, { cwd: dir, encoding: 'utf8' }).trim();
+
+    git('init', '--initial-branch=main', '--quiet');
+    git('config', 'user.email', 'commit-k@example.test');
+    git('config', 'user.name', 'REA 0.9.4 K Sibling');
+    git('config', 'commit.gpgsign', 'false');
+    await fs.writeFile(path.join(dir, 'README.md'), '# scratch\n');
+    git('add', 'README.md');
+    git('commit', '-m', 'baseline', '--quiet');
+
+    // Stage an empty file — the staged diff has zero +content/-content lines,
+    // which forces grep's no-match branch in the commit-gate's LINE_COUNT.
+    await fs.writeFile(path.join(dir, 'empty.txt'), '');
+    git('add', 'empty.txt');
+
+    await fs.mkdir(path.join(dir, '.rea'), { recursive: true });
+    await fs.writeFile(
+      path.join(dir, '.rea', 'policy.yaml'),
+      defaultPolicy(),
+    );
+
+    // Install the commit-gate + its common.sh dep.
+    const destDir = path.join(dir, '.claude', 'hooks');
+    await fs.mkdir(path.join(destDir, '_lib'), { recursive: true });
+    await fs.copyFile(
+      path.join(REPO_ROOT, 'hooks', 'commit-review-gate.sh'),
+      path.join(destDir, 'commit-review-gate.sh'),
+    );
+    await fs.chmod(path.join(destDir, 'commit-review-gate.sh'), 0o755);
+    await fs.copyFile(
+      path.join(REPO_ROOT, 'hooks', '_lib', 'common.sh'),
+      path.join(destDir, '_lib', 'common.sh'),
+    );
+    await fs.chmod(path.join(destDir, '_lib', 'common.sh'), 0o755);
+
+    const res = spawnSync(
+      'bash',
+      [path.join(destDir, 'commit-review-gate.sh')],
+      {
+        cwd: dir,
+        env: {
+          PATH: process.env.PATH ?? '',
+          CLAUDE_PROJECT_DIR: dir,
+        },
+        input: toolInput('git commit -m "stage empty"'),
+        encoding: 'utf8',
+      },
+    );
+
+    // Pre-fix: `LINE_COUNT=$'0\n0'` tripped a bash syntax error at the
+    // `-gt`/`-ge` arithmetic comparisons. Post-fix: clean integer comparison.
+    expect(res.stderr ?? '').not.toMatch(/syntax error in expression/i);
+    // The gate should return a real exit code (0 allow, 2 block) — never a
+    // bash arithmetic crash code (>1, non-2).
+    expect([0, 2]).toContain(res.status ?? -1);
   });
 });
 
