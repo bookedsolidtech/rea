@@ -232,14 +232,37 @@ Merge each phase to `main`, publish the patch release (0.10.2, 0.10.3, 0.10.4 fo
 
 0.10.x branch receives critical-only fixes for 60 days after 0.11.0 ships. Non-critical defects land only on 0.11.x.
 
-## 11. Open questions (to resolve before phase 1 implementation)
+## 11. Open-question decisions (resolved 2026-04-22, pre-phase-1)
 
-1. Should the shim stub at `hooks/_lib/push-review-core.sh` forward-compat to `rea hook push-review-gate`, or be removed cleanly in 0.11.0? (Trade-off: forward-compat preserves pinned-path installs; clean remove is honest about the contract.)
-2. Does `rea hook commit-review-gate` get ported in the same rollout, or is that a separate G2? (The commit gate is 330 LOC, same class of risk, same test surface.)
-3. Phase 4's 0.11.0 cut — does the minor bump also bundle the T self-check widen (audit.ts middleware + rotator.ts)? Both are deferred 0.10.1 followups; bundling makes 0.11.0 the "finish 0.10.1 plus the G port" release.
-4. Cache-key compat fixtures — recorded now at 0.10.1 or recomputed at each phase boundary? (Record once at 0.10.1 is simpler but risks regression in phases 1–3 going unnoticed until phase 4.)
+Closed with ship-fast defaults. Each decision is binding for phases 1–4; revisit only if a phase surfaces concrete evidence the default is wrong.
 
-These are answered before phase 1 starts implementation.
+1. **Shim stub after phase 4 — CLEAN REMOVE.** `hooks/_lib/push-review-core.sh` is deleted in phase 4. No forward-compat stub. Operators with pinned paths get the deprecation notice via `rea doctor` at upgrade time (see §10.3). Rationale: every forward-compat surface is future-defect surface. The CLI subcommand (`rea hook push-review-gate`) is the stable contract; shims that used to bypass it were never a stable contract. Phases 1–3 ship shims that delegate to the CLI; phase 4 collapses them to a single ~20-line entry point.
+2. **Commit-gate co-port — IN SCOPE FOR G.** `hooks/commit-review-gate.sh` (330 LOC) ports alongside `push-review-core.sh`. Both gates share the same audit-record emission, cache lookup, REA_ROOT anchoring, jq dependency, and control-char sanitization infrastructure. Porting one without the other doubles the maintenance burden during the transition (every new defect class surfaced by the TS port would need a parallel fix in the bash commit-gate). One unified `src/hooks/review-gate/` module tree serves both; the CLI exposes `rea hook push-review-gate` and `rea hook commit-review-gate` as sibling subcommands. Phase split: phase 1 builds the shared primitives (args, hash, banner, policy, metadata, protected-paths) that BOTH gates need; phases 2–3 compose the push-specific and commit-specific entry points; phase 4 cuts over both shims together.
+3. **T self-check widening — IN SCOPE FOR PHASE 4.** The Codex concern on defect T (fromjson-tolerance) is that the `jq -R 'fromjson?'` fix applied only to the push-review scanner; the same corrupt-line sensitivity exists in the audit-middleware scan (`src/gateway/middleware/audit.ts`) and the rotator (`src/gateway/audit/rotator.ts`). Phase 4's 0.11.0 cut is the right moment to apply it once, because the new `codex-gate.ts` module's tolerant-parse helper can be extracted into a shared `src/audit/jsonl-stream.ts` that both the gate and the middleware consume. Defer-to-later leaves a known-defective code path on disk; the rewrite is the opportunity to close it. The 0.11.0 changelog bundles the T widen as part of the minor bump.
+4. **Cache-key compat fixture — RECORD ONCE AT PHASE 1.** `src/hooks/review-gate/__fixtures__/cache-keys.json` is committed in phase 1 with cache-key inputs + expected SHA-256 outputs captured from the 0.10.1 bash core for the six representative scenarios (bare push, multi-refspec, force-push, deletion, new-branch, cross-repo). Every phase runs a byte-exact fixture-compat test (`src/hooks/review-gate/cache.test.ts`); any drift is a test failure that must be addressed before merge. If a phase legitimately needs to change the key format (no current reason to), that is a breaking change documented in the phase's changeset as a `minor` bump rather than a silent `patch`. The fixture is the authoritative record of the 0.10.x → 0.11.0 cache-compat promise.
+
+### 11.1 Branch / version sequence (authoritative)
+
+Phases 1–3 cumulatively build on `feat/push-review-ts-port`. Phase 4 lands as 0.11.0 on a distinct branch.
+
+| Phase | Branch | Version | Scope |
+|---|---|---|---|
+| 1 | `feat/push-review-ts-port` | `0.10.2` | Pure TS primitives: `args`, `hash`, `banner`, `metadata`, `policy`, `protected-paths`, `errors`, `cache-key`. Unit tests + fixture. No shim changes. |
+| 2 | `feat/push-review-ts-port-phase-2` | `0.10.3` | Integration modules: `base-resolve`, `codex-gate`, `diff`, `audit`, `cache`. Compose `runPushReviewGate()` + `runCommitReviewGate()` in `index.ts`. Unit-level composition tests. No shim changes. |
+| 3 | `feat/push-review-ts-port-phase-3` | `0.10.4` | `rea hook push-review-gate` + `rea hook commit-review-gate` CLI subcommands. Port 13 integration tests to new CLI path. Bash core still runs in production. |
+| 4 | `feat/push-review-ts-port-phase-4` | `0.11.0` | Shim cutover, bash-core deletion, N-completion (fail-loud + label echo), T self-check widen. Kill-switch env var `REA_LEGACY_PUSH_REVIEW=1` falls back to bash for one release window (0.11.0–0.11.x). |
+
+### 11.2 Kill-switch protocol (every phase)
+
+Every phase ships behind a compile-time-off kill switch. `REA_LEGACY_PUSH_REVIEW=1` in the operator's environment routes to the preserved bash core for that invocation. This lets a consumer hit by an unexpected phase-4 regression revert behavior per-push without downgrading the package. The kill switch is advertised in `rea doctor` once 0.11.0 ships, and is documented in CHANGELOG.md with a sunset commitment: removed in the first `0.12.x` minor after 90 days of clean 0.11.x running on BST-internal + two consumer canaries.
+
+### 11.3 Each phase's definition-of-done
+
+- `pnpm lint && pnpm type-check && pnpm test && pnpm build` with zero warnings on the phase branch.
+- DCO-signed commits, no AI attribution, Codex adversarial review with zero BLOCKING findings.
+- ≥90% line coverage on the phase's new/modified `src/hooks/review-gate/` files.
+- Dogfood push on the rea repo itself succeeds for at least one full push cycle before the phase PR merges.
+- Cache-key fixture suite passes byte-exact against all six scenarios.
 
 ## 12. Appendix — the 1250-LOC measurement
 
