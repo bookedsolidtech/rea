@@ -6,12 +6,12 @@
 
 - 933fc79: Governance recovery + audit integrity + base-branch resolution + audit-chain corruption-tolerance (Defects S + P + N + T + U)
 
-  This patch ships five fixes on one branch. S, P, and N were the 0.10.1 scope
-  that never shipped standalone — the release was superseded by 0.10.2 after T
-  and U surfaced on the same working tree. All five fixes are independent but
+  This patch ships five fixes on one branch. All five are independent but
   ship together because the push-gate and audit-helper surfaces they touch
   overlap enough that landing T and U as a follow-up patch would have required
-  a second Codex pass over code already under review.
+  a second Codex pass over code already under review. Note: the branch commit
+  title on `main` reads "(0.10.2)" as a planning artifact from the working tree
+  — the shipped npm version is `0.10.1`.
 
   ## Defect S — TOFU drift recovery CLI (HIGH — governance recovery path)
 
@@ -64,9 +64,9 @@
   - The push-review cache gate's jq predicate now requires
     `.emission_source == "rea-cli" or .emission_source == "codex-cli"` for
     `codex.review` lookups. Records emitted through the generic helper (tagged
-    `"other"`) or legacy pre-0.10.2 records (field missing) are rejected.
+    `"other"`) or legacy pre-0.10.1 records (field missing) are rejected.
 
-  **Upgrade effect:** The first push on each branch after upgrading to 0.10.2 will
+  **Upgrade effect:** The first push on each branch after upgrading to 0.10.1 will
   require a fresh `rea audit record codex-review` invocation, because legacy
   `codex.review` audit records predate `emission_source`. Subsequent pushes hit
   the cache as normal.
@@ -103,7 +103,7 @@
   `Target:` label. Without a config entry, behavior is unchanged. `configured_base`
   is reset to empty at the top of every refspec-loop iteration so multi-refspec
   pushes (e.g. `git push --all`) cannot leak state from an earlier iteration's
-  config lookup (Codex 0.10.1 finding #1).
+  config lookup (Codex pass finding #1).
 
   **Scope note:** This is the opt-in half of N. The fail-loud-when-no-base and
   general-label-fix halves remain deferred to defect G's TypeScript port of
@@ -215,7 +215,7 @@
     with `emission_source: "other"` fails the cache gate). The existing test
     suite passes end-to-end post-patch; a dedicated P integration fixture can be
     added as part of the G rewrite.
-  - Codex 0.10.1 finding #2: proxied-MCP records through the gateway middleware
+  - Codex pass finding #2: proxied-MCP records through the gateway middleware
     stamp `"rea-cli"` (technically correct — rea is the writer), which means an
     MCP server named `codex` exposing a tool named `review` could produce
     gate-satisfying records via the middleware path if a future middleware also
@@ -224,7 +224,7 @@
     narrow. Track for a future pass: either add a distinct `"rea-gateway"`
     discriminator, or narrow the jq predicate to require a CLI-only metadata
     shape.
-  - Codex 0.10.1 finding #3: `rea tofu accept` writes the fingerprint before
+  - Codex pass finding #3: `rea tofu accept` writes the fingerprint before
     appending the audit record. If audit append fails, the on-disk fingerprint
     is updated but unaudited, and a re-run short-circuits on the `stored ===
 current` guard. Track for a future pass — reverse the order (audit first,
