@@ -160,6 +160,35 @@ async function doAppend(
     const record: AuditRecord = { ...recordBase, hash };
     const line = JSON.stringify(record) + '\n';
 
+    // Defect T (0.10.2): serialization self-check. A valid AuditRecord + the
+    // trailing newline should always round-trip through JSON.parse, but we
+    // verify that invariant BEFORE the line touches the hash-chain file. A
+    // throw here aborts the append WITHOUT writing anything — the caller sees
+    // the failure and the on-disk chain tail is unchanged. This is
+    // defense-in-depth against the class of regression that would otherwise
+    // write an unparseable line to `.rea/audit.jsonl` and only surface at
+    // `rea audit verify` time (or, worse, when push-review-core.sh's jq scan
+    // silently fails to find a legitimate `codex.review` record past the
+    // corruption). The concrete failure modes guarded against:
+    //
+    //   - A future refactor introducing a non-JSON-safe field into
+    //     AuditRecord (BigInt, circular ref, undefined-in-array, etc.) that
+    //     slips past TypeScript.
+    //   - A hostile `metadata` value whose serialized form produces output
+    //     JSON.parse rejects (currently impossible given our input types,
+    //     but the check is cheap and the recovery cost is high).
+    try {
+      JSON.parse(line);
+    } catch (e) {
+      throw new Error(
+        `Audit append aborted: JSON.stringify produced an unparseable line ` +
+          `for tool_name=${JSON.stringify(record.tool_name)} ` +
+          `server_name=${JSON.stringify(record.server_name)}. ` +
+          `Underlying parser error: ${(e as Error).message}. ` +
+          `No data was written to ${auditFile}.`,
+      );
+    }
+
     await fs.appendFile(auditFile, line);
     await fsyncFile(auditFile);
 

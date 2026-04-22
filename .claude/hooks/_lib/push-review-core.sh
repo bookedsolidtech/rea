@@ -938,14 +938,33 @@ pr_core_run() {
           # have no emission_source field and are rejected — the first push
           # on an upgraded consumer requires a fresh `rea audit record
           # codex-review` (or Codex CLI emission) which stamps "rea-cli".
-          if jq -e --arg sha "$local_sha" '
-              select(
-                .tool_name == "codex.review"
-                and .metadata.head_sha == $sha
-                and (.metadata.verdict == "pass" or .metadata.verdict == "concerns")
-                and (.emission_source == "rea-cli" or .emission_source == "codex-cli")
-              )
-            ' "$_audit" >/dev/null 2>&1; then
+          #
+          # Defect T/U (0.10.2): read the audit file as raw lines and parse
+          # each with `fromjson?`. Before 0.10.2 this scan used
+          # `jq -e '<filter>' "$_audit"` which feeds the file as a single
+          # JSON stream — a single malformed line (literal backslash-u
+          # followed by non-hex characters inside a string, for example)
+          # makes jq bail on the stream with exit 2 and the `select` never
+          # runs against ANY record, including legitimate codex.review
+          # entries further down the file. The failure is total: every
+          # cached codex.review receipt becomes unreachable until the
+          # corrupt line is hand-edited out. `-R` flips jq into raw-input
+          # mode (one string per line), and `fromjson?` is the error-
+          # suppressing parser — malformed lines silently yield empty
+          # output. The `select` filter then inspects each successfully
+          # parsed record exactly as before, and `grep -q .` detects
+          # whether ANY record survived the filter. Lines 1107 and the
+          # earlier cache_result scans at :432/:612 operate on a single
+          # printf'd JSON string, not audit.jsonl, so they remain `jq -e`.
+          if jq -R --arg sha "$local_sha" '
+              fromjson?
+              | select(
+                  .tool_name == "codex.review"
+                  and .metadata.head_sha == $sha
+                  and (.metadata.verdict == "pass" or .metadata.verdict == "concerns")
+                  and (.emission_source == "rea-cli" or .emission_source == "codex-cli")
+                )
+            ' "$_audit" 2>/dev/null | grep -q .; then
             _codex_ok=1
           fi
         fi

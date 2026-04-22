@@ -156,6 +156,71 @@ describe('appendAuditRecord — hash-chain normalization (finding #6)', () => {
     }
   });
 
+  it('throws before writing when JSON.stringify output fails self-check (defect T)', async () => {
+    // Defect T contract: appendAuditRecord must verify its own serialization
+    // round-trips through JSON.parse BEFORE the line touches .rea/audit.jsonl.
+    // No public caller can currently produce an unparseable line (TypeScript
+    // input shapes rule it out), so we simulate the failure mode by
+    // monkey-patching JSON.stringify to emit a known-bad line for one call.
+    //
+    // The contract we assert:
+    //   1. The helper throws with a diagnostic naming tool_name/server_name.
+    //   2. `.rea/audit.jsonl` does NOT contain the malformed line — in fact,
+    //      the file remains absent (this was the first write on a fresh repo).
+    //   3. The hash chain on disk is untouched; a subsequent valid write
+    //      lands cleanly.
+    const originalStringify = JSON.stringify.bind(JSON);
+    const spy = (value: unknown, ...rest: unknown[]): string => {
+      // Only intercept the SECOND JSON.stringify call in the append path —
+      // the one that serializes the fully-formed `record` (includes `hash`)
+      // for on-disk write. The FIRST call is computeHash serializing
+      // `recordBase` (has `tool_name` but no `hash`) — we must let that
+      // return real JSON so the hash computes correctly; otherwise the
+      // helper throws inside computeHash instead of the line self-check,
+      // testing a different code path.
+      if (
+        typeof value === 'object' &&
+        value !== null &&
+        (value as Record<string, unknown>).tool_name === 'T-self-check-target' &&
+        typeof (value as Record<string, unknown>).hash === 'string'
+      ) {
+        // Emit a definitively-unparseable string. JSON.parse rejects a bare
+        // trailing backslash-quote sequence, which is the canonical
+        // "escape without target" failure — exactly the kind of byte
+        // sequence defect T surfaced in the wild.
+        return '{"broken":"\\}';
+      }
+      return originalStringify(value, ...(rest as []));
+    };
+    (JSON as { stringify: typeof JSON.stringify }).stringify = spy;
+
+    try {
+      await expect(
+        appendAuditRecord(baseDir, {
+          tool_name: 'T-self-check-target',
+          server_name: 'unit',
+          metadata: { defect: 'T' },
+        }),
+      ).rejects.toThrow(/Audit append aborted.*T-self-check-target.*No data was written/s);
+    } finally {
+      (JSON as { stringify: typeof JSON.stringify }).stringify = originalStringify;
+    }
+
+    // The audit file must not exist — the throw fired before fs.appendFile.
+    const auditFile = path.join(baseDir, '.rea', 'audit.jsonl');
+    await expect(fs.stat(auditFile)).rejects.toMatchObject({ code: 'ENOENT' });
+
+    // A subsequent valid write lands cleanly and chains from GENESIS.
+    const ok = await appendAuditRecord(baseDir, {
+      tool_name: 'after-self-check',
+      server_name: 'unit',
+    });
+    const lines = await readAuditLines(baseDir);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]!.tool_name).toBe('after-self-check');
+    expect(lines[0]!.hash).toBe(ok.hash);
+  });
+
   it('serializes appends across a symlinked baseDir and its real path', async () => {
     // Create a symlink that resolves to baseDir. Callers passing the link and
     // callers passing the real path must share the same queue.

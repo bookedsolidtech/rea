@@ -85,34 +85,106 @@ export async function runAuditRotate(_options: AuditRotateOptions): Promise<void
 }
 
 /**
- * Load a JSONL audit file as a record array + per-line raw text, so we can
- * re-hash against the exact serialization that was written. Throws on read
- * errors; returns an empty array for an empty file.
+ * A single unparseable-line failure. Distinct from a hash-chain failure —
+ * defect T surfaces JSONL corruption as its own class so `rea audit verify`
+ * can continue past it and still attempt chain verification over the
+ * parseable subset, rather than aborting at the first malformed line.
  */
-async function loadRecords(
-  filePath: string,
-): Promise<{ records: AuditRecord[]; rawLines: string[] }> {
+interface ParseFailure {
+  file: string;
+  /** 1-based line number within the file (matches editor / awk / jq output). */
+  lineNumber: number;
+  /** 1-based column of the parser's reported fault, if the error message names one. */
+  column?: number | undefined;
+  /** Underlying `JSON.parse` error message. */
+  message: string;
+}
+
+/**
+ * Best-effort column extractor. Node's JSON.parse error messages include a
+ * `position N` that is a 0-based character offset into the parsed string.
+ * When we parse a single JSONL line, that offset maps directly to a column.
+ * Returns undefined when the position token is absent — the line number
+ * alone is still useful.
+ */
+function extractColumnFromParserError(message: string): number | undefined {
+  const m = /position (\d+)/.exec(message);
+  if (m === null) return undefined;
+  const n = Number.parseInt(m[1] ?? '', 10);
+  if (!Number.isFinite(n) || n < 0) return undefined;
+  return n + 1;
+}
+
+/**
+ * Load a JSONL audit file as a record array + per-line raw text + a list of
+ * per-line parse failures, so we can re-hash against the exact serialization
+ * that was written AND report every malformed line in one pass (defect T).
+ *
+ * Unparseable lines are a DISTINCT failure class from hash-chain tampers:
+ *
+ *   - Malformed lines are collected into `parseFailures` and dropped from
+ *     `records`. `rawLines` still contains the full original line array, so
+ *     callers can cross-reference. `recordLineMap[i]` holds the 1-based file
+ *     line number of `records[i]`.
+ *   - The chain-verify pass runs only over the parseable subset. A caller
+ *     that wants to report the verification result as partial checks
+ *     `parseFailures.length > 0`.
+ *
+ * Throws only on read errors; returns an empty shape for an empty file.
+ */
+async function loadRecords(filePath: string): Promise<{
+  records: AuditRecord[];
+  /** 1-based line numbers for each entry in `records`. Same length as `records`. */
+  recordLineMap: number[];
+  rawLines: string[];
+  parseFailures: ParseFailure[];
+}> {
   const raw = await fs.readFile(filePath, 'utf8');
   // Drop a single trailing newline but preserve blank lines inside the file
   // so index numbers line up with real record positions.
   const trimmedTail = raw.replace(/\n$/, '');
-  if (trimmedTail.length === 0) return { records: [], rawLines: [] };
+  if (trimmedTail.length === 0) {
+    return { records: [], recordLineMap: [], rawLines: [], parseFailures: [] };
+  }
   const rawLines = trimmedTail.split('\n');
-  const records: AuditRecord[] = rawLines.map((line, i) => {
+  const records: AuditRecord[] = [];
+  const recordLineMap: number[] = [];
+  const parseFailures: ParseFailure[] = [];
+  const basename = path.basename(filePath);
+  for (let i = 0; i < rawLines.length; i++) {
+    const line = rawLines[i]!;
+    // Empty lines mid-file are not records but also not parseable — JSON.parse('')
+    // throws. Treat as a parse failure so verify surfaces them explicitly.
     try {
-      return JSON.parse(line) as AuditRecord;
+      const parsed = JSON.parse(line) as AuditRecord;
+      records.push(parsed);
+      recordLineMap.push(i + 1);
     } catch (e) {
-      throw new Error(
-        `Cannot parse JSON at ${path.basename(filePath)} line ${i + 1}: ${(e as Error).message}`,
-      );
+      const msg = (e as Error).message;
+      const col = extractColumnFromParserError(msg);
+      parseFailures.push({
+        file: basename,
+        lineNumber: i + 1,
+        ...(col !== undefined ? { column: col } : {}),
+        message: msg,
+      });
     }
-  });
-  return { records, rawLines };
+  }
+  return { records, recordLineMap, rawLines, parseFailures };
 }
 
 interface VerifyFailure {
   file: string;
-  lineIndex: number; // 0-based within the file
+  /** 0-based position within the parseable subset of this file. */
+  recordIndex: number;
+  /**
+   * 1-based line number in the original file (survives parse-failure skips
+   * via loadRecords.recordLineMap). Matches editor/awk/jq output directly.
+   * Defect T: when a malformed line precedes the tampered record, recordIndex
+   * and fileLineNumber diverge — operators need the latter to jq/grep to the
+   * right place.
+   */
+  fileLineNumber: number;
   reason: string;
   expected?: string;
   actual?: string;
@@ -121,15 +193,18 @@ interface VerifyFailure {
 function verifyChain(
   fileBasename: string,
   records: AuditRecord[],
+  recordLineMap: number[],
   expectedStartPrev: string,
 ): VerifyFailure | null {
   let prev = expectedStartPrev;
   for (let i = 0; i < records.length; i++) {
     const r = records[i]!;
+    const fileLineNumber = recordLineMap[i] ?? i + 1;
     if (r.prev_hash !== prev) {
       return {
         file: fileBasename,
-        lineIndex: i,
+        recordIndex: i,
+        fileLineNumber,
         reason: 'prev_hash does not match previous record',
         expected: prev,
         actual: r.prev_hash,
@@ -142,7 +217,8 @@ function verifyChain(
     if (recomputed !== hash) {
       return {
         file: fileBasename,
-        lineIndex: i,
+        recordIndex: i,
+        fileLineNumber,
         reason: 'stored hash does not match recomputed hash over record body',
         expected: recomputed,
         actual: hash,
@@ -223,37 +299,98 @@ export async function runAuditVerify(options: AuditVerifyOptions): Promise<void>
     process.exit(1);
   }
 
+  // Defect T (0.10.2): collect-all-errors mode. We no longer abort at the
+  // first unparseable line — `rea audit verify` now walks every file, lists
+  // EVERY malformed line with its number + parser message, and attempts
+  // chain verification over the parseable subset. Unparseable lines are a
+  // distinct failure class from hash-chain tampers; both contribute to a
+  // non-zero exit, but they are reported separately so an operator can tell
+  // "JSONL corruption" from "someone edited a hash".
   let expectedPrev = GENESIS_HASH;
   let totalRecords = 0;
+  const allParseFailures: ParseFailure[] = [];
+  let chainFailure: VerifyFailure | null = null;
+  let chainFailureFile: string | null = null;
+
   for (const filePath of filesToVerify) {
-    let records: AuditRecord[];
+    let loaded: Awaited<ReturnType<typeof loadRecords>>;
     try {
-      ({ records } = await loadRecords(filePath));
+      loaded = await loadRecords(filePath);
     } catch (e) {
       err(`${(e as Error).message}`);
       process.exit(1);
     }
 
-    const basename = path.basename(filePath);
-    const failure = verifyChain(basename, records, expectedPrev);
-    if (failure !== null) {
-      err(`Audit chain TAMPER DETECTED in ${failure.file}`);
-      console.error(`       Record index:  ${failure.lineIndex} (0-based within file)`);
-      console.error(`       Reason:        ${failure.reason}`);
-      if (failure.expected !== undefined) {
-        console.error(`       Expected:      ${failure.expected}`);
+    const { records, recordLineMap, parseFailures } = loaded;
+    allParseFailures.push(...parseFailures);
+
+    // Chain verify over the parseable subset only. If an earlier file had a
+    // chain failure we stop verifying further files — advancing `expectedPrev`
+    // past an unknown tail would produce misleading secondary failures.
+    // recordLineMap threads the 1-based original-file line number through so
+    // the failure diagnostic names the editor/jq position directly, not the
+    // parseable-subset index which diverges from the file whenever a
+    // malformed line precedes the tamper.
+    if (chainFailure === null) {
+      const failure = verifyChain(
+        path.basename(filePath),
+        records,
+        recordLineMap,
+        expectedPrev,
+      );
+      if (failure !== null) {
+        chainFailure = failure;
+        chainFailureFile = filePath;
+      } else if (records.length > 0) {
+        expectedPrev = records[records.length - 1]!.hash;
       }
-      if (failure.actual !== undefined) {
-        console.error(`       Actual:        ${failure.actual}`);
-      }
-      process.exit(1);
     }
 
-    // Advance the cross-file anchor for the next file.
-    if (records.length > 0) {
-      expectedPrev = records[records.length - 1]!.hash;
-    }
     totalRecords += records.length;
+  }
+
+  // Report parse failures first — they're independent of the chain result.
+  if (allParseFailures.length > 0) {
+    err(
+      `Audit verify: ${allParseFailures.length} unparseable line(s) detected. ` +
+        `Chain verification was performed over the parseable subset only.`,
+    );
+    for (const f of allParseFailures) {
+      const loc =
+        f.column !== undefined
+          ? `${f.file}:${f.lineNumber}:${f.column}`
+          : `${f.file}:${f.lineNumber}`;
+      console.error(`       ${loc}  ${f.message}`);
+    }
+  }
+
+  // Then report any chain failure found on the parseable subset.
+  if (chainFailure !== null) {
+    err(`Audit chain TAMPER DETECTED in ${chainFailure.file}`);
+    // File-line-number is the operator-facing anchor — jump straight to the
+    // offending line with `sed -n "${n}p" audit.jsonl` or editor:LINE. The
+    // parseable-subset index is kept for audit-tooling consumers that walk
+    // the records[] array.
+    console.error(
+      `       File line:     ${chainFailure.fileLineNumber} (1-based in ${chainFailure.file})`,
+    );
+    console.error(
+      `       Record index:  ${chainFailure.recordIndex} (0-based within parseable subset)`,
+    );
+    console.error(`       Reason:        ${chainFailure.reason}`);
+    if (chainFailure.expected !== undefined) {
+      console.error(`       Expected:      ${chainFailure.expected}`);
+    }
+    if (chainFailure.actual !== undefined) {
+      console.error(`       Actual:        ${chainFailure.actual}`);
+    }
+    if (chainFailureFile !== null) {
+      console.error(`       File path:     ${path.relative(baseDir, chainFailureFile)}`);
+    }
+  }
+
+  if (allParseFailures.length > 0 || chainFailure !== null) {
+    process.exit(1);
   }
 
   log(

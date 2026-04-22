@@ -2,9 +2,14 @@
 '@bookedsolid/rea': patch
 ---
 
-Governance recovery + audit integrity + base-branch resolution (Defects S + P + N)
+Governance recovery + audit integrity + base-branch resolution + audit-chain corruption-tolerance (Defects S + P + N + T + U)
 
-This patch ships three independent fixes on one branch:
+This patch ships five fixes on one branch. S, P, and N were the 0.10.1 scope
+that never shipped standalone — the release was superseded by 0.10.2 after T
+and U surfaced on the same working tree. All five fixes are independent but
+ship together because the push-gate and audit-helper surfaces they touch
+overlap enough that landing T and U as a follow-up patch would have required
+a second Codex pass over code already under review.
 
 ## Defect S — TOFU drift recovery CLI (HIGH — governance recovery path)
 
@@ -59,9 +64,9 @@ body.
 - The push-review cache gate's jq predicate now requires
   `.emission_source == "rea-cli" or .emission_source == "codex-cli"` for
   `codex.review` lookups. Records emitted through the generic helper (tagged
-  `"other"`) or legacy pre-0.10.1 records (field missing) are rejected.
+  `"other"`) or legacy pre-0.10.2 records (field missing) are rejected.
 
-**Upgrade effect:** The first push on each branch after upgrading to 0.10.1 will
+**Upgrade effect:** The first push on each branch after upgrading to 0.10.2 will
 require a fresh `rea audit record codex-review` invocation, because legacy
 `codex.review` audit records predate `emission_source`. Subsequent pushes hit
 the cache as normal.
@@ -107,12 +112,106 @@ can be properly expressed without breaking the existing cache-key contract (an
 inline bash attempt was reverted during this patch after it silently invalidated
 consumer cache entries for bare pushes).
 
+## Defect T — audit writer serialization self-check (MEDIUM — integrity)
+
+Before this patch, `appendAuditRecord()` called
+`fs.appendFile(auditFile, JSON.stringify(record) + '\n')` unconditionally. If a
+future regression introduced a non-JSON-safe field into `AuditRecord` (BigInt,
+circular reference, undefined in array position, hostile `metadata` value that
+survives TypeScript typing but breaks JSON round-trip), the writer would
+produce an unparseable line on disk and only surface the failure at
+`rea audit verify` time — or, worse, when push-review-core.sh's jq scan
+silently failed to find a legitimate `codex.review` record past the corruption
+(which is precisely defect U).
+
+This patch adds a pre-append `JSON.parse` self-check. The helper now verifies
+the serialized line round-trips before it touches `.rea/audit.jsonl`; a throw
+aborts the append without writing and the on-disk chain tail is unchanged.
+The diagnostic names the offending `tool_name`/`server_name` so the caller can
+localize the regression. This is defense-in-depth against a class of bug that
+would otherwise corrupt the hash chain at write time.
+
+The self-check is scoped to the public `appendAuditRecord()` /
+`appendCodexReviewAuditRecord()` entry points (both flow through
+`doAppend()`). The gateway middleware write at
+`src/gateway/middleware/audit.ts` and rotation-marker emission at
+`src/gateway/audit/rotator.ts` still use raw `JSON.stringify()` +
+`appendFile()` / `writeFile()` without a self-check. Widening T to cover
+those paths requires a shared serialization helper and is tracked as a
+followup — this patch closes the two entry points that every external
+consumer (Helix, Codex CLI, ad-hoc CLI scripts) actually reaches.
+
+Separately, `rea audit verify` now collects every unparseable line across
+every file in the walk instead of aborting at the first one. Each failure is
+reported as `audit.jsonl:LINE[:COL]  <parser message>`, and chain verification
+continues over the parseable subset — a genuine hash tamper on a surviving
+record still surfaces alongside the parse failures. The exit code is 1 if
+there is any parse failure OR any chain failure; a fully clean file still
+reports "Audit chain verified". Empty lines mid-file are a distinct parse
+failure class (not silently skipped). Operators bisecting a corrupt audit
+file now see every affected line number in one pass.
+
+Tamper diagnostics include BOTH the parseable-subset record index (for
+audit-tooling consumers that walk `records[]`) AND the 1-based original-file
+line number (for operator workflows that `sed -n Np` or editor:LINE into the
+offending record). The two diverge whenever a malformed line precedes the
+tamper — the file line is the authoritative jump target.
+
+Regression tests at `src/audit/append.test.ts` (self-check intercept) and
+`__tests__/cli/audit-verify-mixed-malformed.test.ts` (five scenarios covering
+mixed-corruption, tamper-alongside-parse-failure, tamper-AFTER-malformed-line
+with divergent subset/file indices, clean-file success, and mid-file empty
+lines).
+
+## Defect U — push-review-core.sh audit scan tolerates malformed lines (HIGH — availability)
+
+Before this patch, `hooks/_lib/push-review-core.sh` used
+`jq -e --arg sha "$sha" '<predicate>' "$_audit"` to test whether a
+`codex.review` receipt existed for the push's head SHA. jq interprets the
+file as a single JSON stream; a single malformed line anywhere in
+`.rea/audit.jsonl` (one stray backslash-u-non-hex sequence, one truncated
+write) makes jq exit with status 2 BEFORE the `select` ever runs against any
+record. Every legitimate codex.review receipt past the corruption becomes
+unreachable. The failure is total: every subsequent push that requires a
+cache hit is silently blocked until the corrupt line is hand-edited out of
+the audit file. One stray byte locks the gate closed.
+
+This patch rewrites the scan as
+`jq -R --arg sha "$sha" 'fromjson? | select(<predicate>)' "$_audit" 2>/dev/null | grep -q .`.
+`-R` takes each line as a raw string; `fromjson?` is the error-suppressing
+parser — malformed lines yield empty output instead of failing the pipeline.
+The `select` filter runs against every successfully parsed record. The
+predicate (tool_name, head_sha, verdict, emission_source) is unchanged, so
+defect P's forgery-rejection guarantee still holds line-by-line.
+
+Mirrored in both `hooks/_lib/push-review-core.sh` (upstream source) and
+`.claude/hooks/_lib/push-review-core.sh` (this repo's dogfood install). The
+two other jq scans in the file — `cache_result` inspection at approximately
+lines 432 and 612, and the cache hit/pass predicate at approximately line
+1107 — operate on single-value `printf`'d JSON strings, not on audit.jsonl,
+and are left as `jq -e`.
+
+Regression test at `__tests__/hooks/push-review-fromjson-tolerance.test.ts`
+drives the exact new pipeline against a scratch audit.jsonl with a malformed
+line sandwiched between two valid `codex.review` records with distinct
+head_sha values. Both records are findable. The forgery-rejection case
+(a hand-written line with `emission_source: "other"` on the far side of a
+malformed line) is also covered — tolerance for malformed lines must not
+weaken the predicate into "anything passes".
+
 ## Followups (not in this patch)
 
 - **G** (push-review-core.sh TS port) — 1154 LOC of shell + jq + awk with 10
   integration test suites that shell out in real git subprocesses. Requires a
   clean-room TS implementation with ≥90% unit coverage and a thin bash shim.
-  Tracked separately.
+  Tracked separately for 0.11.0.
+- **Widen T to gateway middleware + rotation markers** — both paths
+  (`src/gateway/middleware/audit.ts` line ~148 and `src/gateway/audit/rotator.ts`
+  line ~253) still write raw `JSON.stringify(record)+'\n'` without the
+  self-check. No known exploit today (TypeScript input types rule out non-JSON
+  field shapes, and proxied MCP metadata is already redacted), but a shared
+  serialization helper would make the T guarantee universal. Tracked for a
+  future pass.
 - Shell-level integration test for defect P's gate predicate (forged record
   with `emission_source: "other"` fails the cache gate). The existing test
   suite passes end-to-end post-patch; a dedicated P integration fixture can be
