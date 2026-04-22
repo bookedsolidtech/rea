@@ -55,6 +55,9 @@ paths = [
   # Test fixtures must be allowed to contain fake-looking secrets
   '''__tests__/fixtures/''',
   '''src/.*\.test\.ts''',
+  # Cache-key compatibility fixture holds deterministic SHA-256 hashes (not secrets);
+  # high-entropy short strings trip the generic-api-key detector.
+  '''src/hooks/review-gate/__fixtures__/cache-keys\.json$''',
 ]
 
 # GitHub Actions expressions like ${{ secrets.FOO }} are NOT real secrets
