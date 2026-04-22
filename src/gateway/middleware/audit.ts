@@ -117,6 +117,12 @@ export function createAuditMiddleware(
             autonomy_level: autonomyLevel,
             duration_ms,
             prev_hash: prevHash,
+            // Defect P: gateway middleware records every proxied tool call.
+            // rea itself is the writer — tag as rea-cli so the schema is
+            // consistent. "rea-cli" here is a misnomer (the gateway isn't a
+            // CLI) but is part of the stable 0.10.1 discriminator set;
+            // semantically it means "written by @bookedsolid/rea itself".
+            emission_source: 'rea-cli',
           };
 
           if (ctx.error) {

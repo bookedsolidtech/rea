@@ -15,9 +15,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { forceRotate } from '../gateway/audit/rotator.js';
 import {
-  appendAuditRecord,
-  CODEX_REVIEW_SERVER_NAME,
-  CODEX_REVIEW_TOOL_NAME,
+  appendCodexReviewAuditRecord,
   type CodexVerdict,
 } from '../audit/append.js';
 import { computeHash, GENESIS_HASH } from '../audit/fs.js';
@@ -324,9 +322,12 @@ export async function runAuditRecordCodexReview(
     metadata.summary = options.summary;
   }
 
-  await appendAuditRecord(baseDir, {
-    tool_name: CODEX_REVIEW_TOOL_NAME,
-    server_name: CODEX_REVIEW_SERVER_NAME,
+  // Defect P: stamps emission_source: "rea-cli" so the record satisfies the
+  // push-review gate's new integrity predicate. Legacy records (without
+  // emission_source) and records written through the generic
+  // appendAuditRecord() helper (emission_source: "other") are rejected.
+  // tool_name/server_name are fixed inside the helper.
+  await appendCodexReviewAuditRecord(baseDir, {
     tier: Tier.Read,
     status: InvocationStatus.Allowed,
     ...(options.sessionId !== undefined ? { session_id: options.sessionId } : {}),

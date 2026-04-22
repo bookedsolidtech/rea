@@ -719,12 +719,20 @@ pr_core_run() {
   # fail-closed and require an explicit review.
   local SOURCE_SHA="" MERGE_BASE="" TARGET_BRANCH="" SOURCE_REF=""
   local HAS_DELETE=0 BEST_COUNT=0
-  local rec local_sha remote_sha local_ref remote_ref target mb mb_status count count_status
+  local rec local_sha remote_sha local_ref remote_ref target resolved_base mb mb_status count count_status
   for rec in "${REFSPEC_RECORDS[@]}"; do
     IFS='|' read -r local_sha remote_sha local_ref remote_ref <<<"$rec"
     target="${remote_ref#refs/heads/}"
     target="${target#refs/for/}"
     [[ -z "$target" ]] && target="main"
+    # Defect N: track the SEMANTIC base (the ref the diff was anchored on)
+    # distinctly from `target` (the pushed remote ref). For a tracked branch
+    # they coincide; for a new branch, `target` is the branch name being
+    # created — which is NOT what we reviewed against, so `Target:` must
+    # echo `resolved_base` instead. Default to `target` for the tracked
+    # case; the new-branch path overrides with the resolved default_ref
+    # short name below.
+    resolved_base="$target"
 
     if [[ "$local_sha" == "$ZERO_SHA" ]]; then
       HAS_DELETE=1
@@ -774,25 +782,81 @@ pr_core_run() {
       #
       # argv_remote is set from the adapter's argv (git passes the remote name
       # as $1 on pre-push); defaults to "origin" when absent (BUG-008 sniff).
-      local default_ref default_ref_status
-      default_ref=$(cd "$REA_ROOT" && git symbolic-ref "refs/remotes/${argv_remote}/HEAD" 2>/dev/null)
-      default_ref_status=$?
-      if [[ "$default_ref_status" -ne 0 || -z "$default_ref" ]]; then
-        # symbolic-ref failed (common on shallow or mirror clones where
-        # origin/HEAD was never set). Probe the common default-branch names in
-        # order: main, then master. Both are remote-tracking refs and still
-        # server-authoritative; the order matters only for projects that still
-        # default to `master` (older internal forks), where without this
-        # fallback the first push of a new branch would fail closed.
-        if cd "$REA_ROOT" && git rev-parse --verify --quiet "refs/remotes/${argv_remote}/main" >/dev/null 2>&1; then
-          default_ref="refs/remotes/${argv_remote}/main"
-        elif cd "$REA_ROOT" && git rev-parse --verify --quiet "refs/remotes/${argv_remote}/master" >/dev/null 2>&1; then
-          default_ref="refs/remotes/${argv_remote}/master"
-        else
-          default_ref=""
+      #
+      # Defect N (0.10.1): BEFORE falling back to the remote's default branch,
+      # consult per-branch config `branch.<source>.base`. A feature branch
+      # targeting `dev` in a main-as-production repo would otherwise resolve
+      # against `origin/main` silently, producing a diff that spans the entire
+      # dev→main history — reviewers see "Scope: 28690 lines" for a 4-file
+      # change. The git-config route uses local branch knowledge that is
+      # authoritative for this working copy (set via `git branch --set-upstream`,
+      # or by CI tooling that tracks the intended target). This is consulted
+      # BEFORE origin/HEAD because the latter is a server-default that may
+      # mis-represent the reviewer's actual intent for this specific branch.
+      local default_ref default_ref_status configured_base source_branch
+      source_branch="${local_ref#refs/heads/}"
+      default_ref=""
+      # Codex 0.10.1 finding #1: `local` is function-scoped, not loop-
+      # iteration-scoped — without an explicit reset, iteration N inherits
+      # iteration N-1's configured_base and falsely promotes resolved_base
+      # when the current refspec's local_ref does NOT begin with refs/heads/
+      # (tag push, gerrit-style refs/for/, etc.). Reset before every
+      # potential assignment so each iteration sees a clean slate.
+      configured_base=""
+
+      if [[ -n "$source_branch" && "$source_branch" != "HEAD" ]]; then
+        configured_base=$(cd "$REA_ROOT" && git config --get "branch.${source_branch}.base" 2>/dev/null || echo "")
+        if [[ -n "$configured_base" ]]; then
+          # Prefer the REMOTE-TRACKING form so the gate still anchors on a
+          # server-authoritative ref (see the local-ref hijack explanation
+          # above). Fall back to the local short ref only if the remote
+          # counterpart doesn't exist, with a visible WARN on stderr — the
+          # local ref is less trustworthy and the reviewer should know.
+          if cd "$REA_ROOT" && git rev-parse --verify --quiet "refs/remotes/${argv_remote}/${configured_base}" >/dev/null 2>&1; then
+            default_ref="refs/remotes/${argv_remote}/${configured_base}"
+          elif cd "$REA_ROOT" && git rev-parse --verify --quiet "refs/heads/${configured_base}" >/dev/null 2>&1; then
+            default_ref="refs/heads/${configured_base}"
+            printf 'WARN: branch.%s.base=%s resolved to local ref; remote counterpart %s/%s missing — reviewer-side diff may be stale\n' \
+              "$source_branch" "$configured_base" "$argv_remote" "$configured_base" >&2
+          fi
+        fi
+      fi
+
+      if [[ -z "$default_ref" ]]; then
+        default_ref=$(cd "$REA_ROOT" && git symbolic-ref "refs/remotes/${argv_remote}/HEAD" 2>/dev/null)
+        default_ref_status=$?
+        if [[ "$default_ref_status" -ne 0 || -z "$default_ref" ]]; then
+          # symbolic-ref failed (common on shallow or mirror clones where
+          # origin/HEAD was never set). Probe the common default-branch names in
+          # order: main, then master. Both are remote-tracking refs and still
+          # server-authoritative; the order matters only for projects that still
+          # default to `master` (older internal forks), where without this
+          # fallback the first push of a new branch would fail closed.
+          if cd "$REA_ROOT" && git rev-parse --verify --quiet "refs/remotes/${argv_remote}/main" >/dev/null 2>&1; then
+            default_ref="refs/remotes/${argv_remote}/main"
+          elif cd "$REA_ROOT" && git rev-parse --verify --quiet "refs/remotes/${argv_remote}/master" >/dev/null 2>&1; then
+            default_ref="refs/remotes/${argv_remote}/master"
+          else
+            default_ref=""
+          fi
         fi
       fi
       if [[ -n "$default_ref" ]]; then
+        # Defect N: if operator-configured `branch.<source>.base` resolved the
+        # ref we're about to diff against, overwrite `resolved_base` with the
+        # short name so TARGET_BRANCH (and the Target: label) reflect the
+        # actual review anchor. Without an explicit config override, leave
+        # `resolved_base` at the refspec target — this preserves the cache
+        # contract for new-branch pushes where remote_ref is the same as the
+        # source branch (the common case) and for bare pushes that
+        # argv-resolve via `@{upstream}`. Only operators who opted into a
+        # per-branch base get the label promoted, keeping the change
+        # backward-compatible for every other path.
+        if [[ -n "$configured_base" ]]; then
+          resolved_base="${default_ref#refs/remotes/${argv_remote}/}"
+          resolved_base="${resolved_base#refs/heads/}"
+          [[ -z "$resolved_base" ]] && resolved_base="$default_ref"
+        fi
         mb=$(cd "$REA_ROOT" && git merge-base "$default_ref" "$local_sha" 2>/dev/null || echo "")
         if [[ -z "$mb" ]]; then
           # default_ref resolved but merge-base came back empty (unrelated
@@ -867,11 +931,19 @@ pr_core_run() {
         if [[ "$CODEX_WAIVER_ACTIVE" == "1" ]]; then
           _codex_ok=1
         elif [[ -f "$_audit" ]]; then
+          # Defect P (0.10.1): require .emission_source == "rea-cli" or
+          # "codex-cli" so agents cannot forge a codex.review record by
+          # directly calling appendAuditRecord() from an ad-hoc .mjs script
+          # (the generic helper stamps "other"). Legacy records (pre-0.10.1)
+          # have no emission_source field and are rejected — the first push
+          # on an upgraded consumer requires a fresh `rea audit record
+          # codex-review` (or Codex CLI emission) which stamps "rea-cli".
           if jq -e --arg sha "$local_sha" '
               select(
                 .tool_name == "codex.review"
                 and .metadata.head_sha == $sha
                 and (.metadata.verdict == "pass" or .metadata.verdict == "concerns")
+                and (.emission_source == "rea-cli" or .emission_source == "codex-cli")
               )
             ' "$_audit" >/dev/null 2>&1; then
             _codex_ok=1
@@ -918,7 +990,12 @@ pr_core_run() {
     if [[ -z "$SOURCE_SHA" ]] || [[ "$count" -gt "$BEST_COUNT" ]]; then
       SOURCE_SHA="$local_sha"
       MERGE_BASE="$mb"
-      TARGET_BRANCH="$target"
+      # Defect N: use `resolved_base` (the actual merge-base anchor we
+      # diffed against), not `target` (the pushed-ref name). For tracked
+      # branches these are the same; for new branches without an upstream
+      # the distinction is the difference between "Target: <source-branch>"
+      # (misleading) and "Target: main" (or whichever base was resolved).
+      TARGET_BRANCH="$resolved_base"
       SOURCE_REF="$local_ref"
       BEST_COUNT="$count"
     fi
