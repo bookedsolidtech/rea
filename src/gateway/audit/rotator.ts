@@ -260,6 +260,10 @@ export async function performRotation(
       autonomy_level: 'system',
       duration_ms: 0,
       prev_hash: tailHash,
+      // Defect P: rotation markers are written by rea itself, not by an
+      // external caller of appendAuditRecord() — tag as rea-cli so the
+      // hash chain remains consistent under the post-P schema.
+      emission_source: 'rea-cli',
       metadata: {
         rotated_from: path.basename(rotatedPath),
         rotated_at: now.toISOString(),

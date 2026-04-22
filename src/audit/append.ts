@@ -37,7 +37,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { Tier, InvocationStatus } from '../policy/types.js';
 import type { Policy } from '../policy/types.js';
-import type { AuditRecord } from '../gateway/middleware/audit-types.js';
+import type { AuditRecord, EmissionSource } from '../gateway/middleware/audit-types.js';
 import {
   GENESIS_HASH,
   computeHash,
@@ -46,6 +46,7 @@ import {
   withAuditLock,
 } from './fs.js';
 import { maybeRotate } from '../gateway/audit/rotator.js';
+import { CODEX_REVIEW_SERVER_NAME, CODEX_REVIEW_TOOL_NAME } from './codex-event.js';
 
 const REA_DIR = '.rea';
 const AUDIT_FILE = 'audit.jsonl';
@@ -120,6 +121,7 @@ async function resolveBaseDir(baseDir: string): Promise<string> {
 async function doAppend(
   resolvedBase: string,
   input: AppendAuditInput,
+  emissionSource: EmissionSource,
 ): Promise<AuditRecord> {
   const reaDir = path.join(resolvedBase, REA_DIR);
   const auditFile = path.join(reaDir, AUDIT_FILE);
@@ -146,6 +148,7 @@ async function doAppend(
       autonomy_level: input.autonomy_level ?? 'unknown',
       duration_ms: input.duration_ms ?? 0,
       prev_hash: effectivePrev,
+      emission_source: emissionSource,
     };
     if (input.error) recordBase.error = input.error;
     if (input.redacted_fields?.length) recordBase.redacted_fields = input.redacted_fields;
@@ -157,6 +160,35 @@ async function doAppend(
     const record: AuditRecord = { ...recordBase, hash };
     const line = JSON.stringify(record) + '\n';
 
+    // Defect T (0.10.2): serialization self-check. A valid AuditRecord + the
+    // trailing newline should always round-trip through JSON.parse, but we
+    // verify that invariant BEFORE the line touches the hash-chain file. A
+    // throw here aborts the append WITHOUT writing anything — the caller sees
+    // the failure and the on-disk chain tail is unchanged. This is
+    // defense-in-depth against the class of regression that would otherwise
+    // write an unparseable line to `.rea/audit.jsonl` and only surface at
+    // `rea audit verify` time (or, worse, when push-review-core.sh's jq scan
+    // silently fails to find a legitimate `codex.review` record past the
+    // corruption). The concrete failure modes guarded against:
+    //
+    //   - A future refactor introducing a non-JSON-safe field into
+    //     AuditRecord (BigInt, circular ref, undefined-in-array, etc.) that
+    //     slips past TypeScript.
+    //   - A hostile `metadata` value whose serialized form produces output
+    //     JSON.parse rejects (currently impossible given our input types,
+    //     but the check is cheap and the recovery cost is high).
+    try {
+      JSON.parse(line);
+    } catch (e) {
+      throw new Error(
+        `Audit append aborted: JSON.stringify produced an unparseable line ` +
+          `for tool_name=${JSON.stringify(record.tool_name)} ` +
+          `server_name=${JSON.stringify(record.server_name)}. ` +
+          `Underlying parser error: ${(e as Error).message}. ` +
+          `No data was written to ${auditFile}.`,
+      );
+    }
+
     await fs.appendFile(auditFile, line);
     await fsyncFile(auditFile);
 
@@ -164,17 +196,10 @@ async function doAppend(
   });
 }
 
-/**
- * Append a structured audit record to `${baseDir}/.rea/audit.jsonl` with a
- * hash chained against the tail of the existing log.
- *
- * @param baseDir - Repo/project root (the directory that contains `.rea/`).
- * @param input   - Event data. `tool_name` and `server_name` are required.
- * @returns The full written record, including the computed `hash`.
- */
-export async function appendAuditRecord(
+async function enqueueAppend(
   baseDir: string,
   input: AppendAuditInput,
+  emissionSource: EmissionSource,
 ): Promise<AuditRecord> {
   // Canonicalize the baseDir so every caller targeting the same on-disk
   // directory lands on the same queue key, regardless of whether they passed
@@ -191,7 +216,7 @@ export async function appendAuditRecord(
       /* previous write's error is owned by that caller */
     })
     .then(async () => {
-      record = await doAppend(resolvedBase, input);
+      record = await doAppend(resolvedBase, input, emissionSource);
     });
   writeQueues.set(
     key,
@@ -216,7 +241,66 @@ export async function appendAuditRecord(
   return record;
 }
 
-export type { AuditRecord } from '../gateway/middleware/audit-types.js';
+/**
+ * Append a structured audit record to `${baseDir}/.rea/audit.jsonl` with a
+ * hash chained against the tail of the existing log.
+ *
+ * ## emission_source (defect P)
+ *
+ * Records written through this public helper are ALWAYS stamped with
+ * `emission_source: "other"`. External consumers (Helix, ad-hoc scripts,
+ * plugins) have no way to self-assert `"rea-cli"` or `"codex-cli"` through
+ * this entry point — the parameter is not part of the public
+ * {@link AppendAuditInput} shape. Records emitted by the rea CLI itself use
+ * the dedicated {@link appendCodexReviewAuditRecord} helper, which is the
+ * ONLY path that stamps `"rea-cli"`.
+ *
+ * The push-review cache gate rejects `codex.review` records whose
+ * `emission_source` is `"other"` (or missing, for legacy records), so
+ * forging a `codex.review` record through this helper produces a line that
+ * is on the hash chain but does NOT satisfy the gate.
+ *
+ * @param baseDir - Repo/project root (the directory that contains `.rea/`).
+ * @param input   - Event data. `tool_name` and `server_name` are required.
+ * @returns The full written record, including the computed `hash`.
+ */
+export async function appendAuditRecord(
+  baseDir: string,
+  input: AppendAuditInput,
+): Promise<AuditRecord> {
+  return enqueueAppend(baseDir, input, 'other');
+}
+
+/**
+ * Append a `tool_name: "codex.review"` audit record certifying that a Codex
+ * adversarial review ran on a specific commit SHA (defect P).
+ *
+ * This is the ONLY write path in `@bookedsolid/rea` that produces
+ * `emission_source: "rea-cli"` for `codex.review` records. Consumers MUST
+ * reach this helper through the `rea audit record codex-review` CLI (which
+ * is classified as a Write-tier Bash invocation by `reaCommandTier`, defect
+ * E). Any other code path calling the generic {@link appendAuditRecord}
+ * with `tool_name: "codex.review"` lands with `emission_source: "other"`
+ * and does NOT satisfy the push-review cache gate — closing the forgery
+ * surface that `.reports/hook-patches/emit-audit-*.mjs` scripts exploited
+ * before this patch.
+ *
+ * `tool_name` and `server_name` are fixed to the canonical values
+ * (`"codex.review"` / `"codex"`) and are NOT accepted as caller inputs —
+ * the type excludes them so the contract is self-documenting.
+ */
+export async function appendCodexReviewAuditRecord(
+  baseDir: string,
+  input: Omit<AppendAuditInput, 'tool_name' | 'server_name'>,
+): Promise<AuditRecord> {
+  return enqueueAppend(
+    baseDir,
+    { ...input, tool_name: CODEX_REVIEW_TOOL_NAME, server_name: CODEX_REVIEW_SERVER_NAME },
+    'rea-cli',
+  );
+}
+
+export type { AuditRecord, EmissionSource } from '../gateway/middleware/audit-types.js';
 export { Tier, InvocationStatus } from '../policy/types.js';
 export {
   CODEX_REVIEW_TOOL_NAME,

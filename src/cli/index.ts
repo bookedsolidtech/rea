@@ -15,6 +15,7 @@ import { runFreeze, runUnfreeze } from './freeze.js';
 import { runInit } from './init.js';
 import { runServe } from './serve.js';
 import { runStatus } from './status.js';
+import { runTofuAccept, runTofuList } from './tofu.js';
 import { runUpgrade } from './upgrade.js';
 import { err, getPkgVersion } from './utils.js';
 
@@ -261,6 +262,35 @@ async function main(): Promise<void> {
     .option('--branch <branch>', 'only list entries for this branch')
     .action(async (opts: { branch?: string }) => {
       await runCacheList({ ...(opts.branch !== undefined ? { branch: opts.branch } : {}) });
+    });
+
+  const tofu = program
+    .command('tofu')
+    .description(
+      'TOFU fingerprint operations (G7) — inspect and rebase `.rea/fingerprints.json` when a legitimate registry edit has triggered drift fail-close. Emits audit records.',
+    );
+
+  tofu
+    .command('list')
+    .description(
+      'Print every server declared in `.rea/registry.yaml` with its current-vs-stored fingerprint verdict (first-seen | unchanged | drifted).',
+    )
+    .option('--json', 'emit JSON instead of the human-readable table')
+    .action(async (opts: { json?: boolean }) => {
+      await runTofuList({ ...(opts.json === true ? { json: true } : {}) });
+    });
+
+  tofu
+    .command('accept <name>')
+    .description(
+      'Rebase the stored fingerprint for <name> to match the current canonical shape in `.rea/registry.yaml`. Use after a deliberate registry edit (vault added, command path renamed, env-key set changed). Emits a `tofu.drift_accepted_by_cli` audit record; next `rea serve` will classify as unchanged.',
+    )
+    .option(
+      '--reason <text>',
+      'free-text note captured in the audit record (recommended when accepting drift — explains WHY the canonical shape changed)',
+    )
+    .action(async (name: string, opts: { reason?: string }) => {
+      await runTofuAccept({ name, ...(opts.reason !== undefined ? { reason: opts.reason } : {}) });
     });
 
   program

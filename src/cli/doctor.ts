@@ -122,7 +122,7 @@ export async function checkFingerprintStore(baseDir: string): Promise<CheckResul
   return {
     label,
     status: 'warn',
-    detail: `${parts.join(', ')} — next \`rea serve\` will block drift (set REA_ACCEPT_DRIFT=<name> to accept)`,
+    detail: `${parts.join(', ')} — next \`rea serve\` will block drift (run \`rea tofu list\` for detail, \`rea tofu accept <name>\` to rebase after a legitimate registry edit)`,
   };
 }
 
