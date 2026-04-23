@@ -143,6 +143,11 @@ fi
 REA_BIN=""
 if [ -x "\${REA_ROOT}/node_modules/.bin/rea" ]; then
   REA_BIN="\${REA_ROOT}/node_modules/.bin/rea"
+elif [ -f "\${REA_ROOT}/dist/cli/index.js" ]; then
+  # rea's own repo (dogfood) — the package is not installed under
+  # node_modules here because we ARE the package. The built CLI
+  # entry point lives at dist/cli/index.js; node runs it directly.
+  REA_BIN="node \${REA_ROOT}/dist/cli/index.js"
 elif command -v rea >/dev/null 2>&1; then
   REA_BIN="rea"
 elif command -v npx >/dev/null 2>&1; then
