@@ -168,12 +168,10 @@ const EXPECTED_HOOKS = [
   'attribution-advisory.sh',
   'blocked-paths-enforcer.sh',
   'changeset-security-gate.sh',
-  'commit-review-gate.sh',
   'dangerous-bash-interceptor.sh',
   'dependency-audit-gate.sh',
   'env-file-protection.sh',
   'pr-issue-link-gate.sh',
-  'push-review-gate.sh',
   'secret-scanner.sh',
   'security-disclosure-gate.sh',
   'settings-protection.sh',
@@ -387,7 +385,7 @@ function checkPrePushHook(state: PrePushDoctorState): CheckResult {
       active?.reaManaged === true
         ? 'rea-managed'
         : active?.delegatesToGate === true
-          ? 'external (delegates to push-review-gate.sh)'
+          ? 'external (delegates to `rea hook push-gate`)'
           : 'external';
     const detail = active !== undefined ? `${kind} at ${active.path}` : undefined;
     return detail !== undefined
@@ -396,24 +394,16 @@ function checkPrePushHook(state: PrePushDoctorState): CheckResult {
   }
 
   if (state.activeForeign) {
-    // Executable file exists at the active path but does not carry
-    // governance — the parser could not confirm the review gate is
-    // invoked unconditionally. Always a hard fail.
-    //
-    // R13 F3: previously, a substring match of the gate path in the hook
-    // downgraded this to WARN. That was unsafe — any comment, echo, or
-    // dead string mentioning the path would mask a silent-bypass hook.
-    // The classifier now fails closed: either the structural parser
-    // (`referencesReviewGate` in `pre-push.ts`) recognizes a real
-    // invocation, or doctor reports fail.
+    // Executable file exists at the active path but neither carries a rea
+    // marker nor invokes `rea hook push-gate` — the push-gate is silently
+    // bypassed. Always a hard fail.
     return {
       label: 'pre-push hook installed',
       status: 'fail',
       detail:
         `active pre-push at ${state.activePath} is present and executable but does NOT ` +
-        `reference \`.claude/hooks/push-review-gate.sh\` — the protected-path ` +
-        `Codex audit gate is silently bypassed. Either add ` +
-        '`exec .claude/hooks/push-review-gate.sh "$@"` to the existing hook, or ' +
+        'invoke `rea hook push-gate` — the 0.11.0 push-gate is silently bypassed. ' +
+        'Either add `exec rea hook push-gate "$@"` to the existing hook, or ' +
         'remove it and re-run `rea init` to install the fallback.',
     };
   }

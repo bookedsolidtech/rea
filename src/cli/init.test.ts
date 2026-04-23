@@ -142,7 +142,7 @@ describe('rea init — G11.4 codex flags', () => {
     const prePushPath = path.join(dir, '.git', 'hooks', 'pre-push');
     const content = await fs.readFile(prePushPath, 'utf8');
     expect(content).toContain(FALLBACK_MARKER);
-    expect(content).toContain('.claude/hooks/push-review-gate.sh');
+    expect(content).toContain('hook push-gate');
 
     const stat = await fs.stat(prePushPath);
     expect(stat.mode & 0o111).toBeGreaterThan(0);
@@ -194,7 +194,7 @@ describe('rea init — G11.4 codex flags', () => {
 
     const gi = await fs.readFile(path.join(dir, '.gitignore'), 'utf8');
     expect(gi).toContain('.rea/fingerprints.json');
-    expect(gi).toContain('.rea/review-cache.jsonl');
+    expect(gi).toContain('.rea/last-review.json');
     expect(gi).toContain('.rea/audit.jsonl');
     expect(gi).toContain('.rea/audit-*.jsonl');
     expect(gi).toContain('.rea/HALT');

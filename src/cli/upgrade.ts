@@ -63,6 +63,7 @@ import {
   canonicalSettingsSubsetHash,
   defaultDesiredHooks,
   mergeSettings,
+  pruneHookCommands,
   readSettings,
   writeSettingsAtomic,
 } from './install/settings-merge.js';
@@ -83,6 +84,104 @@ export interface UpgradeOptions {
   dryRun?: boolean | undefined;
   yes?: boolean | undefined;
   force?: boolean | undefined;
+}
+
+// ---------------------------------------------------------------------------
+// 0.11.0 policy migration
+// ---------------------------------------------------------------------------
+
+/**
+ * Strip 0.10.x review.* fields that 0.11.0 rejects at schema load, and
+ * backfill `concerns_blocks: true` if the `review:` block exists without
+ * it. Writes a timestamped backup to `.rea/policy.yaml.bak-<ts>` before
+ * mutating.
+ *
+ * Surgical text rewrite, not YAML round-trip. YAML round-tripping loses
+ * comments and reformats quoting; operators care about their comments.
+ * Line-by-line deletion of the two removed keys keeps every other line
+ * byte-identical. This is safe because the keys we strip are simple
+ * scalars (`cache_max_age_seconds: 3600`, `allow_skip_in_ci: false`) that
+ * cannot span multiple lines in any reasonable policy file.
+ */
+async function migrateReviewPolicyFor0110(
+  resolvedRoot: string,
+  opts: { dryRun: boolean },
+): Promise<void> {
+  const policyPath = path.join(resolvedRoot, '.rea', 'policy.yaml');
+  let raw: string;
+  try {
+    raw = await fsPromises.readFile(policyPath, 'utf8');
+  } catch {
+    return; // no policy to migrate
+  }
+
+  const lines = raw.split(/\r?\n/);
+  const REVIEW_RE = /^review:\s*(?:#.*)?$/;
+  const REMOVED_KEY_RE = /^(\s+)(cache_max_age_seconds|allow_skip_in_ci):\s*\S.*$/;
+  const INDENT_RE = /^(\s+)\S/;
+
+  let reviewStart = -1;
+  let reviewIndent = '';
+  const linesToDrop = new Set<number>();
+  let hasConcernsBlocks = false;
+  let reviewChildIndent = '';
+
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i] ?? '';
+    if (reviewStart < 0 && REVIEW_RE.test(line.trimEnd())) {
+      reviewStart = i;
+      const indentMatch = INDENT_RE.exec(line);
+      reviewIndent = indentMatch?.[1] ?? '';
+      continue;
+    }
+    if (reviewStart < 0) continue;
+    // Inside the review: block as long as indent is deeper than reviewIndent.
+    if (line.trim() === '') continue;
+    const indentMatch = INDENT_RE.exec(line);
+    const lineIndent = indentMatch?.[1] ?? '';
+    if (lineIndent.length <= reviewIndent.length) {
+      // Left the block.
+      break;
+    }
+    if (reviewChildIndent.length === 0) reviewChildIndent = lineIndent;
+    if (/^\s+concerns_blocks:/.test(line)) hasConcernsBlocks = true;
+    if (REMOVED_KEY_RE.test(line)) {
+      linesToDrop.add(i);
+    }
+  }
+
+  const addConcernsBlocks = reviewStart >= 0 && !hasConcernsBlocks;
+  if (linesToDrop.size === 0 && !addConcernsBlocks) return;
+
+  const newLines: string[] = [];
+  for (let i = 0; i < lines.length; i += 1) {
+    if (linesToDrop.has(i)) continue;
+    newLines.push(lines[i] ?? '');
+    // Append `concerns_blocks: true` right after the `review:` header line
+    // when the block exists but lacks the key.
+    if (i === reviewStart && addConcernsBlocks) {
+      const indent = reviewChildIndent.length > 0 ? reviewChildIndent : reviewIndent + '  ';
+      newLines.push(`${indent}concerns_blocks: true`);
+    }
+  }
+  const updated = newLines.join('\n');
+
+  const droppedSummary: string[] = [];
+  if (linesToDrop.size > 0) droppedSummary.push(`dropped ${linesToDrop.size} removed-field line(s)`);
+  if (addConcernsBlocks) droppedSummary.push('added concerns_blocks: true');
+
+  if (opts.dryRun) {
+    log(`[dry-run] would migrate .rea/policy.yaml: ${droppedSummary.join(', ')}`);
+    return;
+  }
+
+  const ts = new Date().toISOString().replace(/[:.]/g, '-');
+  const backupPath = `${policyPath}.bak-${ts}`;
+  await fsPromises.copyFile(policyPath, backupPath);
+  await atomicReplaceFile(policyPath, updated);
+  warn(
+    `migrated .rea/policy.yaml for 0.11.0 (${droppedSummary.join(', ')}); backup at ${path.basename(backupPath)}`,
+  );
 }
 
 type Classification =
@@ -342,22 +441,64 @@ async function upgradeClaudeMdFragment(
   return { sha: newSha, action: 'written' };
 }
 
+/**
+ * Hook commands deleted in 0.11.0. `upgradeSettings` prunes any entries
+ * whose `command` string contains one of these tokens so consumer
+ * `.claude/settings.json` files don't keep invoking missing scripts
+ * (which would fail every matched tool call until the operator edited
+ * settings by hand).
+ *
+ * 0.11.0 removals:
+ *   - push-review-gate.sh        (replaced by husky stub → rea hook push-gate)
+ *   - commit-review-gate.sh      (intentionally unregistered; source-of-truth deleted)
+ *   - push-review-gate-git.sh    (native-git adapter; deleted)
+ *
+ * Add future removals here rather than baking the list into
+ * `pruneHookCommands` itself — the removal list is release history,
+ * not a static setting.
+ */
+const STALE_HOOK_COMMAND_TOKENS: readonly string[] = [
+  'push-review-gate.sh',
+  'commit-review-gate.sh',
+  'push-review-gate-git.sh',
+];
+
 async function upgradeSettings(
   baseDir: string,
   opts: UpgradeOptions,
-): Promise<{ sha: string; addedCount: number; skippedCount: number; warnings: string[] }> {
+): Promise<{
+  sha: string;
+  addedCount: number;
+  skippedCount: number;
+  removedCount: number;
+  warnings: string[];
+}> {
   const desired = defaultDesiredHooks();
   const sha = canonicalSettingsSubsetHash(desired);
   const { settings, settingsPath } = readSettings(baseDir);
-  const mergeResult = mergeSettings(settings, desired);
+  // PRUNE FIRST (remove 0.11.0-deleted hook references), THEN MERGE
+  // (add any new hooks). Order matters: merging first would re-add the
+  // stale entry only to have the prune re-delete it on the next line —
+  // pointless work. Pruning first means the merge sees a clean baseline.
+  const pruned = pruneHookCommands(settings, STALE_HOOK_COMMAND_TOKENS);
+  const mergeResult = mergeSettings(pruned.merged, desired);
   if (opts.dryRun !== true) {
     await writeSettingsAtomic(settingsPath, mergeResult.merged);
+  }
+  const warnings = [...mergeResult.warnings];
+  if (pruned.removedCount > 0) {
+    warnings.push(
+      `pruned ${pruned.removedCount} stale 0.10.x hook entr${
+        pruned.removedCount === 1 ? 'y' : 'ies'
+      } from .claude/settings.json (removed in 0.11.0)`,
+    );
   }
   return {
     sha,
     addedCount: mergeResult.addedCount,
     skippedCount: mergeResult.skippedCount,
-    warnings: mergeResult.warnings,
+    removedCount: pruned.removedCount,
+    warnings,
   };
 }
 
@@ -391,6 +532,12 @@ export async function runUpgrade(options: UpgradeOptions = {}): Promise<void> {
       '--force: overwriting locally-modified files and deleting removed-upstream entries without prompt.',
     );
   }
+
+  // 0.11.0 migration — strip removed review.* fields and backfill the new
+  // concerns_blocks default. Runs before canonical file reconciliation so a
+  // policy that fails strict schema load (which happens on upgrade from
+  // 0.10.x the moment we re-read `.rea/policy.yaml`) is cleaned up first.
+  await migrateReviewPolicyFor0110(resolvedRoot, { dryRun });
 
   const canonicalFiles = await enumerateCanonicalFiles();
   if (canonicalFiles.length === 0) {

@@ -1,20 +1,20 @@
 /**
- * Defect P regression — emission_source discriminator for audit records.
+ * `emission_source` — audit record provenance discriminator.
  *
- * These tests pin down the three invariants that close the
- * `appendAuditRecord()` forgery surface:
+ * The 0.11.0 stateless push-gate no longer consults `emission_source` to
+ * decide pass/fail — Codex is re-run on every push, so there is no receipt
+ * to verify. The field is retained in the hash chain for forensic analysis
+ * ("which writer produced this line?") and to avoid a breaking
+ * AuditRecord schema change.
+ *
+ * These tests pin down two remaining invariants:
  *
  *   1. The public `appendAuditRecord()` helper stamps `emission_source:
- *      "other"` on every record. External consumers cannot self-assert
- *      "rea-cli" through this entry point (the field is NOT part of the
- *      public AppendAuditInput shape).
+ *      "other"` on every record. `"rea-cli"` and `"codex-cli"` are NOT
+ *      accepted as caller inputs (the field is not part of the public
+ *      {@link AppendAuditInput} shape).
  *
- *   2. The dedicated `appendCodexReviewAuditRecord()` helper stamps
- *      `"rea-cli"` and forces the canonical tool_name / server_name so
- *      callers cannot route a generic record through the codex-certification
- *      path by accident or on purpose.
- *
- *   3. The hash chain includes `emission_source` in its computed hash, so
+ *   2. The hash chain includes `emission_source` in its computed hash, so
  *      the field cannot be altered post-hoc without breaking the chain.
  */
 
@@ -24,7 +24,6 @@ import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   appendAuditRecord,
-  appendCodexReviewAuditRecord,
   CODEX_REVIEW_SERVER_NAME,
   CODEX_REVIEW_TOOL_NAME,
   type AuditRecord,
@@ -54,7 +53,7 @@ describe('emission_source — public appendAuditRecord stamps "other"', () => {
     expect(parsed.emission_source).toBe('other');
   });
 
-  it('stamps "other" even when the tool_name is codex.review — forgery through the generic helper is visible to the gate', async () => {
+  it('stamps "other" even when the tool_name is codex.review — no caller can self-assert "rea-cli" through the public helper', async () => {
     const rec = await appendAuditRecord(baseDir, {
       tool_name: CODEX_REVIEW_TOOL_NAME,
       server_name: CODEX_REVIEW_SERVER_NAME,
@@ -62,37 +61,6 @@ describe('emission_source — public appendAuditRecord stamps "other"', () => {
     });
     expect(rec.tool_name).toBe('codex.review');
     expect(rec.emission_source).toBe('other');
-  });
-});
-
-describe('emission_source — appendCodexReviewAuditRecord stamps "rea-cli"', () => {
-  let baseDir: string;
-
-  beforeEach(async () => {
-    baseDir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-emission-codex-')));
-  });
-
-  afterEach(async () => {
-    await fs.rm(baseDir, { recursive: true, force: true });
-  });
-
-  it('stamps "rea-cli" and the canonical tool_name/server_name — the helper does not accept caller overrides', async () => {
-    const rec = await appendCodexReviewAuditRecord(baseDir, {
-      metadata: { head_sha: 'cafef00d', verdict: 'pass' },
-    });
-    expect(rec.emission_source).toBe('rea-cli');
-    expect(rec.tool_name).toBe('codex.review');
-    expect(rec.server_name).toBe('codex');
-  });
-
-  it('persists emission_source: "rea-cli" to disk so the jq gate predicate matches', async () => {
-    await appendCodexReviewAuditRecord(baseDir, {
-      metadata: { head_sha: 'abc', verdict: 'pass' },
-    });
-    const raw = await fs.readFile(path.join(baseDir, '.rea', 'audit.jsonl'), 'utf8');
-    const parsed = JSON.parse(raw.trim()) as AuditRecord;
-    expect(parsed.emission_source).toBe('rea-cli');
-    expect(parsed.tool_name).toBe(CODEX_REVIEW_TOOL_NAME);
   });
 });
 

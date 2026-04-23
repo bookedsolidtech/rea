@@ -577,7 +577,7 @@ export async function runInit(options: InitOptions): Promise<void> {
   await writeSettingsAtomic(settingsPath, mergeResult.merged);
 
   const commitMsgResult = await installCommitMsgHook(targetDir);
-  const prePushResult = await installPrePushFallback(targetDir);
+  const prePushResult = await installPrePushFallback({ targetDir });
 
   const fragmentInput = {
     policyPath: `.${path.sep}rea${path.sep}policy.yaml`.replace(/\\/g, '/'),

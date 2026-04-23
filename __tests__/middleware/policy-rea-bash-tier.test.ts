@@ -3,12 +3,13 @@
  * REA's own middleware, and when a Bash invocation IS denied the message must
  * include which command tripped the gate.
  *
- * Scenarios covered:
- *   1. `Bash { command: 'rea cache check ...' }` at L0 is allowed (Read tier).
- *   2. `Bash { command: 'rea audit record codex-review ...' }` at L1 is allowed
- *      (Read tier, not Write — recording its own audit entry is an append-only
- *      diagnostic event).
- *   3. `Bash { command: 'rea cache set <sha> pass ...' }` at L1 is allowed
+ * Scenarios covered (0.11.0 surface):
+ *   1. `Bash { command: '/usr/local/bin/rea check' }` at L0 is allowed (Read).
+ *   2. `Bash { command: '/usr/local/bin/rea hook push-gate ...' }` at L1 is
+ *      allowed (Read tier — the push-gate runs codex and writes an audit
+ *      record but the user-visible effect is an exit code, and the hook must
+ *      run at L1).
+ *   3. `Bash { command: '/usr/local/bin/rea audit rotate' }` at L1 is allowed
  *      (Write tier).
  *   4. `Bash { command: 'rea freeze --reason ...' }` at L1 is denied
  *      (Destructive tier exceeds L1 ceiling) AND the deny-reason contains
@@ -69,9 +70,9 @@ describe('policy middleware — rea-subcommand tier reclassification (Defect E)'
   // PATH-spoofable and treated as weak trust — Read subcommands fall through
   // to the generic Bash Write default; destructive subcommands keep the
   // upgrade defensively.
-  it('allows `/usr/local/bin/rea cache check` at L0 (Read tier)', async () => {
+  it('allows `/usr/local/bin/rea check` at L0 (Read tier)', async () => {
     const mw = createPolicyMiddleware(stubPolicy(AutonomyLevel.L0));
-    const ctx = bashCtx('/usr/local/bin/rea cache check abc --branch feat/x --base main');
+    const ctx = bashCtx('/usr/local/bin/rea check');
     const nextCalled = await run(mw, ctx);
     expect(nextCalled).toBe(true);
     expect(ctx.status).toBe(InvocationStatus.Allowed);
@@ -90,29 +91,27 @@ describe('policy middleware — rea-subcommand tier reclassification (Defect E)'
     expect(ctx.status).toBe(InvocationStatus.Denied);
   });
 
-  it('denies bare `rea cache check` at L0 (weak trust, no downgrade)', async () => {
+  it('denies bare `rea check` at L0 (weak trust, no downgrade)', async () => {
     // Weak-trust invocations no longer downgrade to Read — an L0 agent must
     // use npx or an absolute path. This closes PATH-spoofing attacks where
     // `./rea` or a malicious shim earlier on PATH could impersonate rea.
     const mw = createPolicyMiddleware(stubPolicy(AutonomyLevel.L0));
-    const ctx = bashCtx('rea cache check abc --branch feat/x --base main');
+    const ctx = bashCtx('rea check');
     await run(mw, ctx);
     expect(ctx.status).toBe(InvocationStatus.Denied);
   });
 
-  it('allows `/usr/local/bin/rea audit record codex-review ...` at L1 (Read tier)', async () => {
+  it('allows `/usr/local/bin/rea hook push-gate ...` at L1 (Read tier)', async () => {
     const mw = createPolicyMiddleware(stubPolicy(AutonomyLevel.L1));
-    const ctx = bashCtx(
-      '/usr/local/bin/rea audit record codex-review --head-sha abc --branch feat/x --target main --verdict pass --finding-count 0',
-    );
+    const ctx = bashCtx('/usr/local/bin/rea hook push-gate --base origin/main');
     const nextCalled = await run(mw, ctx);
     expect(nextCalled).toBe(true);
     expect(ctx.tier).toBe(Tier.Read);
   });
 
-  it('allows `/usr/local/bin/rea cache set ... pass` at L1 (Write tier)', async () => {
+  it('allows `/usr/local/bin/rea audit rotate` at L1 (Write tier)', async () => {
     const mw = createPolicyMiddleware(stubPolicy(AutonomyLevel.L1));
-    const ctx = bashCtx('/usr/local/bin/rea cache set abc pass --branch feat/x --base main');
+    const ctx = bashCtx('/usr/local/bin/rea audit rotate');
     const nextCalled = await run(mw, ctx);
     expect(nextCalled).toBe(true);
     expect(ctx.tier).toBe(Tier.Write);
@@ -211,7 +210,7 @@ describe('policy middleware — live policy reload (existing behavior preserved)
     await writePolicyFile(AutonomyLevel.L1);
     const mw = createPolicyMiddleware(stubPolicy(AutonomyLevel.L1), undefined, baseDir);
 
-    const ctx = bashCtx('/usr/local/bin/rea cache check abc --branch feat/x --base main');
+    const ctx = bashCtx('/usr/local/bin/rea hook push-gate');
     const nextCalled = await run(mw, ctx);
     expect(nextCalled).toBe(true);
     expect(ctx.tier).toBe(Tier.Read);

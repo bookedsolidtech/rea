@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   mergeSettings,
   defaultDesiredHooks,
+  pruneHookCommands,
   writeSettingsAtomic,
   type DesiredHookGroup,
 } from './settings-merge.js';
@@ -139,5 +140,83 @@ describe('writeSettingsAtomic — cross-platform rename (finding #8)', () => {
     const written = await fs.readFile(target, 'utf8');
     expect(JSON.parse(written)).toEqual({ fresh: true });
     await expect(fs.stat(`${target}.tmp`)).rejects.toThrow();
+  });
+});
+
+describe('pruneHookCommands — 0.11.0 migration of deleted hook references', () => {
+  it('removes entries whose command contains any listed substring', () => {
+    const existing = {
+      hooks: {
+        PreToolUse: [
+          {
+            matcher: 'Bash',
+            hooks: [
+              { type: 'command', command: '$CLAUDE_PROJECT_DIR/.claude/hooks/push-review-gate.sh' },
+              { type: 'command', command: '$CLAUDE_PROJECT_DIR/.claude/hooks/attribution-advisory.sh' },
+              { type: 'command', command: '$CLAUDE_PROJECT_DIR/.claude/hooks/commit-review-gate.sh' },
+            ],
+          },
+        ],
+      },
+    };
+    const res = pruneHookCommands(existing, ['push-review-gate.sh', 'commit-review-gate.sh']);
+    expect(res.removedCount).toBe(2);
+    const remaining = (
+      res.merged.hooks as { PreToolUse: Array<{ hooks: Array<{ command: string }> }> }
+    ).PreToolUse[0]?.hooks;
+    expect(remaining).toHaveLength(1);
+    expect(remaining?.[0]?.command).toContain('attribution-advisory.sh');
+  });
+
+  it('prunes empty groups and empty events after removal', () => {
+    const existing = {
+      hooks: {
+        PreToolUse: [
+          {
+            matcher: 'Bash',
+            hooks: [
+              { type: 'command', command: '$CLAUDE_PROJECT_DIR/.claude/hooks/push-review-gate.sh' },
+            ],
+          },
+        ],
+      },
+    };
+    const res = pruneHookCommands(existing, ['push-review-gate.sh']);
+    expect(res.removedCount).toBe(1);
+    // After pruning, the Bash group has no hooks left; the PreToolUse
+    // event likewise has no groups. Both should be removed so the file
+    // doesn't accumulate empty sentinels on repeat upgrades.
+    const hooks = res.merged.hooks as Record<string, unknown>;
+    expect(hooks.PreToolUse).toBeUndefined();
+  });
+
+  it('is a no-op when no entries match', () => {
+    const existing = {
+      hooks: {
+        PreToolUse: [
+          {
+            matcher: 'Bash',
+            hooks: [
+              { type: 'command', command: '$CLAUDE_PROJECT_DIR/.claude/hooks/attribution-advisory.sh' },
+            ],
+          },
+        ],
+      },
+    };
+    const res = pruneHookCommands(existing, ['nonexistent.sh']);
+    expect(res.removedCount).toBe(0);
+    const groups = (
+      res.merged.hooks as { PreToolUse: Array<{ hooks: Array<{ command: string }> }> }
+    ).PreToolUse;
+    expect(groups[0]?.hooks).toHaveLength(1);
+  });
+
+  it('preserves non-hook keys in the settings object', () => {
+    const existing = {
+      somethingElse: { keep: true },
+      hooks: {},
+    };
+    const res = pruneHookCommands(existing, ['x']);
+    expect(res.merged.somethingElse).toEqual({ keep: true });
   });
 });

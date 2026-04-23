@@ -114,7 +114,7 @@ describe('ensureReaGitignore — BUG-010 scaffolding', () => {
     expect(content).toContain('.rea/my-local-thing');
     expect(content).toContain('# operator-authored inside block — preserved');
     expect(content).toContain('.rea/fingerprints.json');
-    expect(content).toContain('.rea/review-cache.jsonl');
+    expect(content).toContain('.rea/last-review.json');
     // User top-level line still present.
     expect(content.startsWith('node_modules\n')).toBe(true);
   });
@@ -198,7 +198,7 @@ describe('REA_GITIGNORE_ENTRIES — canonical list', () => {
   });
 
   it('includes the BUG-009 review cache', () => {
-    expect(REA_GITIGNORE_ENTRIES).toContain('.rea/review-cache.jsonl');
+    expect(REA_GITIGNORE_ENTRIES).toContain('.rea/last-review.json');
   });
 
   it('includes the audit rotation glob', () => {

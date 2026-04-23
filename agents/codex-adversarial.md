@@ -11,7 +11,9 @@ This is not a bolt-on. Adversarial review is a first-class, non-optional step in
 
 ## When You Are Invoked
 
-The `/codex-review` slash command calls you. The `rea-orchestrator` delegates to you after any non-trivial change. You also run automatically via the `push-review-gate` hook recipe when a recent Codex audit entry is missing on the branch being pushed.
+The `/codex-review` slash command calls you. The `rea-orchestrator` delegates to you after any non-trivial change.
+
+Note (0.11.0+): you are **not** invoked by the pre-push gate. The pre-push gate (`rea hook push-gate`) shells directly to `codex exec review --json` and parses the verdict itself — no agent wrapper, no audit-receipt consultation. When that gate blocks a push, the authoring Claude session reads the stderr banner and `.rea/last-review.json`, applies fixes, and pushes again — the auto-fix loop IS the retry mechanism. The agent wrapper (you) is kept for interactive review (`/codex-review`) where human-targeted structured output matters.
 
 ## Inputs
 
@@ -34,7 +36,7 @@ You may read additional files in the repo if needed for context, but do so read-
 5. **Parse the Codex output** — extract structured findings.
 6. **Classify findings** by category: security, correctness, edge cases, test gaps, API design, performance.
 7. **Assign verdict**: `pass` (no material findings), `concerns` (findings worth addressing but not blocking), `blocking` (findings that must be fixed before merge).
-8. **Emit audit entry** — after producing the verdict, append a structured record to `.rea/audit.jsonl` via the public `@bookedsolid/rea/audit` helper. This is what the `push-review-gate.sh` hook greps for on protected-path diffs, so the field names must match exactly:
+8. **Emit an audit entry** (optional in 0.11.0+) — the pre-push gate does not consult audit records to decide pass/fail, so you are no longer REQUIRED to emit a `codex.review` record on every interactive review. However, append one anyway via the public `@bookedsolid/rea/audit` helper when it helps forensic traceability (investigation of an intermittent verdict, review-history audit, etc.):
 
    ```ts
    import { appendAuditRecord, CODEX_REVIEW_TOOL_NAME, CODEX_REVIEW_SERVER_NAME, Tier, InvocationStatus } from '@bookedsolid/rea/audit';
@@ -54,7 +56,7 @@ You may read additional files in the repo if needed for context, but do so read-
    });
    ```
 
-   If the Codex plugin call itself flowed through rea middleware (the proxy case), the middleware also writes an envelope record — that is fine, the two are complementary: the agent-emitted record carries the semantic verdict, the middleware record carries the chain integrity proof for the underlying tool call.
+   If the Codex plugin call itself flowed through rea middleware (the proxy case), the middleware also writes an envelope record — that is fine, the two are complementary.
 
 ## Finding Shape
 
