@@ -71,7 +71,7 @@ describe('rea upgrade — BUG-010 gitignore backfill', () => {
     expect(gi).toContain('dist');
     expect(gi).toContain('# === rea managed');
     expect(gi).toContain('.rea/fingerprints.json');
-    expect(gi).toContain('.rea/review-cache.jsonl');
+    expect(gi).toContain('.rea/last-review.json');
     expect(gi).toContain('.rea/audit.jsonl');
   });
 

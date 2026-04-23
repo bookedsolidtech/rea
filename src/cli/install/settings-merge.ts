@@ -270,7 +270,6 @@ export function defaultDesiredHooks(): DesiredHookGroup[] {
         { type: 'command', command: `${base}/security-disclosure-gate.sh`, timeout: 5000, statusMessage: 'Checking disclosure policy...' },
         { type: 'command', command: `${base}/pr-issue-link-gate.sh`, timeout: 5000, statusMessage: 'Checking PR for issue reference...' },
         { type: 'command', command: `${base}/attribution-advisory.sh`, timeout: 5000, statusMessage: 'Checking for AI attribution...' },
-        { type: 'command', command: `${base}/push-review-gate.sh`, timeout: 30000, statusMessage: 'Running push review gate...' },
       ],
     },
     {

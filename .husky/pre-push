@@ -1,180 +1,26 @@
 #!/bin/sh
-# rea:husky-pre-push-gate v1
-# rea:gate-body-v1
-# .husky/pre-push — rea governance gate for terminal-initiated pushes.
+# rea:husky-pre-push-gate v2
+# rea:gate-body-v2
 #
-# Mirrors the logic of `.claude/hooks/push-review-gate.sh` but consumes the
-# git pre-push stdin contract directly (one line per refspec:
-#   <local_ref> <local_sha> <remote_ref> <remote_sha>).
+# Husky pre-push hook installed by `rea init` / `rea upgrade`. Do NOT
+# edit by hand — the file is refreshed on every rea upgrade.
 #
-# Minimum viable check — NOT a full replacement for the Claude Code gate:
-#   1. If `.rea/HALT` exists, block.
-#   2. If the push touches a protected path AND policy.review.codex_required
-#      is not explicitly false, require a `codex.review` audit entry for the
-#      HEAD SHA (or REA_SKIP_CODEX_REVIEW env var for a one-off bypass).
-#
-# Escape hatch: REA_SKIP_CODEX_REVIEW=<reason> bypasses the protected-path
-# check. The skip record is appended by `push-review-gate.sh` in the Claude
-# Code path; for terminal pushes, export the variable AND append a skip
-# record manually if you want it in the audit trail.
-#
-# Subshell-safety note: earlier versions piped `echo "$INPUT" | while read`,
-# which ran the loop in a subshell — `exit 1` inside the loop aborted the
-# subshell only, and the script then ran `exit 0` and allowed the push. We
-# now feed the loop with a here-doc so it runs in the main shell, and we
-# abort immediately (`exit 1`) on the first blocking refspec. The accumulator
-# pattern (`block_push=1; continue`) was dropped so the text-level detector
-# in `src/cli/install/pre-push.ts` can verify the miss-path is truly blocking
-# without modeling loop-carried flags and post-loop exit blocks.
+# Governance contract: HALT kill-switch check, then delegate to
+# `rea hook push-gate`. See src/hooks/push-gate/index.ts.
 
 set -eu
 
-# git passes the remote name as $1 to pre-push. Fall back to `origin` for
-# direct invocation (tests, manual runs). The shared core uses the same
-# argv_remote convention — parity required so a push to `upstream` probes
-# `upstream/main` rather than stale `origin/main`.
-REMOTE="${1:-origin}"
+# REA push-gate (0.11.0+). The heavy lifting — git diff resolution, Codex
+# invocation, verdict inference, audit write — lives in
+# `src/hooks/push-gate/` and is invoked via `rea hook push-gate`.
+# This stub only short-circuits on the kill-switch.
 
 REA_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
-
-# Well-known empty-tree SHA: `git hash-object -t tree /dev/null`. Every git
-# installation carries this object implicitly — using it as a merge-base
-# baseline for initial pushes lets `git diff $EMPTY_TREE $local_sha` emit
-# the complete change set against a truly-empty tree. The protected-path
-# check then sees every file in the initial push, so a first push of
-# protected-path changes to a fresh remote is still gated.
-EMPTY_TREE='4b825dc642cb6eb9a060e54bf8d69288fbee4904'
-
 if [ -f "${REA_ROOT}/.rea/HALT" ]; then
-  # POSIX `head` does not specify `-c`; use awk for the first line. HALT is
-  # a short reason string, so the first line is enough for display.
   reason=$(awk 'NR==1 { print; exit }' "${REA_ROOT}/.rea/HALT" 2>/dev/null || printf 'unknown')
   [ -z "${reason:-}" ] && reason='unknown'
   printf 'REA HALT: %s\nAll push operations suspended. Run: rea unfreeze\n' "$reason" >&2
   exit 1
 fi
 
-# Read refspec lines from stdin. Each line: <local_ref> <local_sha> <remote_ref> <remote_sha>
-INPUT=$(cat)
-[ -z "$INPUT" ] && exit 0
-
-# Anchor every alternative so a legitimate file like `docs/hooks-guide.md` or
-# `src/thirdparty/src/policy/loader.c` is not mistaken for a protected path.
-# `^\.claude/hooks/` is included so someone editing the consumer install
-# (which ships alongside rea itself) cannot sneak past the gate.
-PROTECTED_RE='^src/gateway/middleware/|^hooks/|^\.claude/hooks/|^src/policy/|^\.github/workflows/'
-AUDIT_LOG="${REA_ROOT}/.rea/audit.jsonl"
-
-# G11.4 — honor review.codex_required. When explicitly false, skip the
-# protected-path Codex audit requirement entirely (first-class no-Codex
-# mode). Mirrors the logic in `.claude/hooks/push-review-gate.sh`.
-#
-# Fail-closed: if the helper is missing or errors, treat as true. A missing
-# helper means rea is unbuilt — the operator can run `pnpm build` or set
-# REA_SKIP_CODEX_REVIEW for a one-off bypass.
-CODEX_REQUIRED=true
-READ_FIELD_JS="${REA_ROOT}/dist/scripts/read-policy-field.js"
-if [ -f "$READ_FIELD_JS" ]; then
-  field_value=$(REA_ROOT="$REA_ROOT" node "$READ_FIELD_JS" review.codex_required 2>/dev/null || printf '')
-  if [ "$field_value" = "false" ]; then
-    CODEX_REQUIRED=false
-  fi
-fi
-
-# Here-doc feeds the loop without creating a subshell, so an `exit 1`
-# inside the loop terminates the hook and blocks the push. A pipeline
-# would run the loop in a subshell and `exit 1` inside it would only
-# abort that subshell — NOT the push — which was a real governance
-# defect in the pre-review version of this file.
-while IFS=' ' read -r local_ref local_sha remote_ref remote_sha; do
-  [ -z "${local_sha:-}" ] && continue
-  # Branch deletion: local_sha is 40 zeros. Skip protected-path check.
-  case "$local_sha" in
-    0000000000000000000000000000000000000000) continue ;;
-  esac
-
-  # Determine merge base. If remote is new (remote_sha is zeros), diff against
-  # the default branch; else against remote_sha.
-  #
-  # Anchor on a REMOTE-TRACKING ref (refs/remotes/<remote>/<name>), NOT a bare
-  # branch name. A bare `main` resolves to refs/heads/main, which the pusher
-  # controls locally — a local main fast-forwarded to the feature tip would
-  # give merge-base main <local_sha> == local_sha and silently collapse the
-  # diff to empty. Remote-tracking refs are server-authoritative from the
-  # last fetch and cannot be tampered with locally.
-  #
-  # Fallback order when $REMOTE/HEAD is not set (common on shallow or mirror
-  # clones): probe $REMOTE/main then $REMOTE/master via rev-parse. If neither
-  # exists — initial push to a fresh remote with no tracking refs yet — use
-  # the well-known EMPTY_TREE as the baseline so the diff covers the FULL
-  # change set. This keeps the protected-path check honest on first push
-  # (prior versions of this patch `continue`d here, which was a fail-open
-  # flagged as HIGH by adversarial review).
-  if [ "$remote_sha" = "0000000000000000000000000000000000000000" ]; then
-    default_ref=$(git symbolic-ref "refs/remotes/${REMOTE}/HEAD" 2>/dev/null || printf '')
-    if [ -z "${default_ref:-}" ]; then
-      if git rev-parse --verify --quiet "refs/remotes/${REMOTE}/main" >/dev/null 2>&1; then
-        default_ref="refs/remotes/${REMOTE}/main"
-      elif git rev-parse --verify --quiet "refs/remotes/${REMOTE}/master" >/dev/null 2>&1; then
-        default_ref="refs/remotes/${REMOTE}/master"
-      else
-        default_ref=""
-      fi
-    fi
-    if [ -n "${default_ref:-}" ]; then
-      base=$(git merge-base "$default_ref" "$local_sha" 2>/dev/null || printf '')
-    else
-      # Bootstrap: no remote-tracking ref exists at all. Use the empty-tree
-      # baseline so the diff covers every file in the push. git diff accepts
-      # a tree SHA as the left-hand side.
-      base="$EMPTY_TREE"
-    fi
-  else
-    base=$(git merge-base "$remote_sha" "$local_sha" 2>/dev/null || printf '')
-  fi
-  # Fail CLOSED on empty merge-base when a remote ref DID resolve. The
-  # 0.4.0..0.6.2 behavior here was to `continue` — a silent bypass. A push
-  # whose history is unrelated to origin (or any transient git failure at
-  # merge-base resolution) would pass through without the protected-path
-  # check ever running. Refuse instead and force the operator to resolve it.
-  if [ -z "${base:-}" ]; then
-    printf 'PUSH BLOCKED: could not resolve merge-base between %s and %s (local_ref=%s remote_ref=%s).\n' \
-      "${remote_sha:-<new>}" "${local_sha:-<missing>}" "${local_ref:-<unknown>}" "${remote_ref:-<unknown>}" >&2
-    printf '  Run `git fetch %s` and retry. If the history is genuinely unrelated\n' "$REMOTE" >&2
-    printf '  to %s (e.g. grafted branch), resolve manually before pushing.\n' "$REMOTE" >&2
-    exit 1
-  fi
-
-  # Check if the diff touches protected paths.
-  if git diff --name-only "$base" "$local_sha" 2>/dev/null | grep -qE "$PROTECTED_RE"; then
-    if [ "$CODEX_REQUIRED" = "false" ]; then
-      # Policy opts out of the Codex gate. The downstream `.claude/hooks/`
-      # path already records telemetry; terminal pushes skip silently.
-      continue
-    fi
-    if [ -n "${REA_SKIP_CODEX_REVIEW:-}" ]; then
-      printf 'rea: REA_SKIP_CODEX_REVIEW set (%s) — skipping Codex review requirement for %s\n' \
-        "$REA_SKIP_CODEX_REVIEW" "$local_sha" >&2
-      continue
-    fi
-    if [ ! -f "$AUDIT_LOG" ]; then
-      printf 'PUSH BLOCKED: protected paths changed but no audit log found at %s\n' "$AUDIT_LOG" >&2
-      printf '  Run /codex-review on HEAD %s before pushing.\n' "$local_sha" >&2
-      exit 1
-    fi
-    # Require both (a) a `codex.review` tool_name and (b) the exact head_sha
-    # on the same JSONL line. The `codex.review` pattern ends with a closing
-    # quote, so `codex.review.skipped` never satisfies the gate. The first
-    # refspec that fails this check aborts the hook — no accumulator needed.
-    if ! grep -E '"tool_name":"codex\.review"' "$AUDIT_LOG" 2>/dev/null | \
-         grep -qF "\"head_sha\":\"$local_sha\""; then
-      printf 'PUSH BLOCKED: protected paths changed — /codex-review required for HEAD %s\n' "$local_sha" >&2
-      printf '  Run /codex-review, or set REA_SKIP_CODEX_REVIEW=<reason> to bypass.\n' >&2
-      exit 1
-    fi
-  fi
-done <<HOOK_INPUT_EOF
-$INPUT
-HOOK_INPUT_EOF
-
-exit 0
+exec rea hook push-gate

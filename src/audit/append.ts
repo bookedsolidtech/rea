@@ -46,7 +46,6 @@ import {
   withAuditLock,
 } from './fs.js';
 import { maybeRotate } from '../gateway/audit/rotator.js';
-import { CODEX_REVIEW_SERVER_NAME, CODEX_REVIEW_TOOL_NAME } from './codex-event.js';
 
 const REA_DIR = '.rea';
 const AUDIT_FILE = 'audit.jsonl';
@@ -245,20 +244,14 @@ async function enqueueAppend(
  * Append a structured audit record to `${baseDir}/.rea/audit.jsonl` with a
  * hash chained against the tail of the existing log.
  *
- * ## emission_source (defect P)
+ * ## emission_source
  *
- * Records written through this public helper are ALWAYS stamped with
- * `emission_source: "other"`. External consumers (Helix, ad-hoc scripts,
- * plugins) have no way to self-assert `"rea-cli"` or `"codex-cli"` through
- * this entry point — the parameter is not part of the public
- * {@link AppendAuditInput} shape. Records emitted by the rea CLI itself use
- * the dedicated {@link appendCodexReviewAuditRecord} helper, which is the
- * ONLY path that stamps `"rea-cli"`.
- *
- * The push-review cache gate rejects `codex.review` records whose
- * `emission_source` is `"other"` (or missing, for legacy records), so
- * forging a `codex.review` record through this helper produces a line that
- * is on the hash chain but does NOT satisfy the gate.
+ * Records written through this public helper are stamped with
+ * `emission_source: "other"`. The field is retained for forensic analysis
+ * (who wrote this line) but no gate consults it — the 0.11.0 stateless
+ * push-gate (see `src/hooks/push-gate/`) decides on Codex's live verdict,
+ * not on a receipt in the audit log. Pre-0.11.0 `emission_source`-gated
+ * predicates have been removed.
  *
  * @param baseDir - Repo/project root (the directory that contains `.rea/`).
  * @param input   - Event data. `tool_name` and `server_name` are required.
@@ -269,35 +262,6 @@ export async function appendAuditRecord(
   input: AppendAuditInput,
 ): Promise<AuditRecord> {
   return enqueueAppend(baseDir, input, 'other');
-}
-
-/**
- * Append a `tool_name: "codex.review"` audit record certifying that a Codex
- * adversarial review ran on a specific commit SHA (defect P).
- *
- * This is the ONLY write path in `@bookedsolid/rea` that produces
- * `emission_source: "rea-cli"` for `codex.review` records. Consumers MUST
- * reach this helper through the `rea audit record codex-review` CLI (which
- * is classified as a Write-tier Bash invocation by `reaCommandTier`, defect
- * E). Any other code path calling the generic {@link appendAuditRecord}
- * with `tool_name: "codex.review"` lands with `emission_source: "other"`
- * and does NOT satisfy the push-review cache gate — closing the forgery
- * surface that `.reports/hook-patches/emit-audit-*.mjs` scripts exploited
- * before this patch.
- *
- * `tool_name` and `server_name` are fixed to the canonical values
- * (`"codex.review"` / `"codex"`) and are NOT accepted as caller inputs —
- * the type excludes them so the contract is self-documenting.
- */
-export async function appendCodexReviewAuditRecord(
-  baseDir: string,
-  input: Omit<AppendAuditInput, 'tool_name' | 'server_name'>,
-): Promise<AuditRecord> {
-  return enqueueAppend(
-    baseDir,
-    { ...input, tool_name: CODEX_REVIEW_TOOL_NAME, server_name: CODEX_REVIEW_SERVER_NAME },
-    'rea-cli',
-  );
 }
 
 export type { AuditRecord, EmissionSource } from '../gateway/middleware/audit-types.js';

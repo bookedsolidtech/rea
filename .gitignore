@@ -33,7 +33,10 @@ coverage/
 .rea/serve.pid
 .rea/serve.state.json
 .rea/fingerprints.json
-.rea/review-cache.jsonl
+.rea/fingerprints.json.bak.*
+.rea/last-review.json
+.rea/policy.yaml.bak-*
+.claude/worktrees/
 
 # Scratch space
 .scratch/

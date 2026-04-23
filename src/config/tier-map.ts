@@ -136,28 +136,20 @@ export function isToolBlocked(
  * Classify a `rea <subcommand>` Bash invocation by its own semantics rather
  * than the generic Bash default.
  *
- * Defect E (rea#78): REA's own governance CLI must not be denied by REA's own
- * middleware. The gate's error messages literally say "Run `rea cache set
- * <sha> pass --branch <x> --base <y>`" — then the agent is denied at autonomy
- * L1 because `Bash` is classified Write and the downstream middleware can't
- * see that the Write is just appending a line to `.rea/review-cache.jsonl`.
+ * REA's own governance CLI must not be denied by REA's own middleware. This
+ * helper returns the tier appropriate to the rea subcommand when the command
+ * parses as `rea <sub>` or `npx rea <sub>`. Returns `null` if the command is
+ * not a rea invocation — callers then fall back to the generic Bash tier.
  *
- * This helper returns the tier appropriate to the rea subcommand when the
- * command parses as `rea <sub>` or `npx rea <sub>`. Returns `null` if the
- * command is not a rea invocation — callers then fall back to the generic
- * Bash tier.
- *
- * Tier mapping:
- *   - Read:        `cache check|list|get`, `audit verify`,
- *                  `audit record codex-review`, `check`, `doctor`, `status`
- *   - Write:       `cache set|clear`, `audit rotate`, `init`,
- *                  `serve`, `upgrade`, `unfreeze`
+ * Tier mapping (0.11.0):
+ *   - Read:        `audit verify`, `check`, `doctor`, `status`,
+ *                  `hook push-gate` (exec-only — no state mutation)
+ *   - Write:       `audit rotate`, `init`, `serve`, `upgrade`, `unfreeze`
  *   - Destructive: `freeze` (writes `.rea/HALT`, suspends the session)
  *
- * `audit record codex-review` is Read-tier because it is REA's own append-only
- * audit surface — the whole point of the command is to let an L1 agent satisfy
- * the push-review gate without a human in the loop. Write-tier here would
- * reintroduce exactly the deadlock Defect D/E close.
+ * `rea cache` and `rea audit record codex-review` were removed in 0.11.0 —
+ * the stateless push-gate needs neither. Any lingering reference to those
+ * subcommands falls through to `Tier.Write` (safe default).
  *
  * SECURITY: returns `null` for any command containing shell metacharacters
  * that would let an attacker piggyback arbitrary commands onto an allowed
@@ -298,14 +290,17 @@ export function reaCommandTier(command: string): Tier | null {
       case 'doctor':
       case 'status':
         return Tier.Read;
-      case 'cache': {
-        if (sub2 === 'check' || sub2 === 'list' || sub2 === 'get') return Tier.Read;
-        if (sub2 === 'set' || sub2 === 'clear') return Tier.Write;
+      case 'hook': {
+        // `rea hook push-gate` is execution-only — it runs codex exec review
+        // and writes `.rea/last-review.json` + an audit record, but the
+        // user-visible effect is an exit code. Classify Read so the pre-push
+        // hook is not blocked at L1 (symmetric to the 0.10.x reasoning for
+        // `audit record codex-review`).
+        if (sub2 === 'push-gate') return Tier.Read;
         return Tier.Write;
       }
       case 'audit': {
         if (sub2 === 'verify') return Tier.Read;
-        if (sub2 === 'record') return Tier.Read;
         if (sub2 === 'rotate') return Tier.Write;
         return Tier.Write;
       }

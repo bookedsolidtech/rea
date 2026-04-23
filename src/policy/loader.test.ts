@@ -66,7 +66,7 @@ describe('policy loader', () => {
     expect(() => loadPolicy(baseDir)).toThrow(/Policy file not found/);
   });
 
-  describe('review policy (G11.2)', () => {
+  describe('review policy (0.11.0 push-gate)', () => {
     it('accepts review.codex_required when set', async () => {
       const yaml = SAMPLE + '\nreview:\n  codex_required: false\n';
       await fs.writeFile(path.join(baseDir, '.rea', 'policy.yaml'), yaml, 'utf8');
@@ -74,10 +74,42 @@ describe('policy loader', () => {
       expect(p.review?.codex_required).toBe(false);
     });
 
+    it('accepts review.concerns_blocks when set', async () => {
+      const yaml = SAMPLE + '\nreview:\n  concerns_blocks: false\n';
+      await fs.writeFile(path.join(baseDir, '.rea', 'policy.yaml'), yaml, 'utf8');
+      const p = loadPolicy(baseDir);
+      expect(p.review?.concerns_blocks).toBe(false);
+    });
+
+    it('accepts review.timeout_ms when set (positive integer)', async () => {
+      const yaml = SAMPLE + '\nreview:\n  timeout_ms: 300000\n';
+      await fs.writeFile(path.join(baseDir, '.rea', 'policy.yaml'), yaml, 'utf8');
+      const p = loadPolicy(baseDir);
+      expect(p.review?.timeout_ms).toBe(300_000);
+    });
+
+    it('rejects non-positive timeout_ms', async () => {
+      const yaml = SAMPLE + '\nreview:\n  timeout_ms: 0\n';
+      await fs.writeFile(path.join(baseDir, '.rea', 'policy.yaml'), yaml, 'utf8');
+      expect(() => loadPolicy(baseDir)).toThrow(/Invalid policy schema/);
+    });
+
     it('leaves review undefined when not set (backwards compatible)', async () => {
       await fs.writeFile(path.join(baseDir, '.rea', 'policy.yaml'), SAMPLE, 'utf8');
       const p = loadPolicy(baseDir);
       expect(p.review).toBeUndefined();
+    });
+
+    it('rejects the 0.10.x cache_max_age_seconds field (removed in 0.11.0)', async () => {
+      const yaml = SAMPLE + '\nreview:\n  codex_required: true\n  cache_max_age_seconds: 3600\n';
+      await fs.writeFile(path.join(baseDir, '.rea', 'policy.yaml'), yaml, 'utf8');
+      expect(() => loadPolicy(baseDir)).toThrow(/Invalid policy schema/);
+    });
+
+    it('rejects the 0.10.x allow_skip_in_ci field (removed in 0.11.0)', async () => {
+      const yaml = SAMPLE + '\nreview:\n  codex_required: true\n  allow_skip_in_ci: true\n';
+      await fs.writeFile(path.join(baseDir, '.rea', 'policy.yaml'), yaml, 'utf8');
+      expect(() => loadPolicy(baseDir)).toThrow(/Invalid policy schema/);
     });
 
     it('rejects unknown fields inside review (strict)', async () => {

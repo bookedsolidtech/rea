@@ -23,38 +23,47 @@ export interface ContextProtection {
 }
 
 /**
- * Review policy knobs. G11.2 only needs `codex_required` as an optional
- * signal to the reviewer selector; G11.4 will flesh this out into a full
- * first-class no-Codex mode (profile defaults, init defaults, etc.).
+ * Review policy knobs for the 0.11.0 stateless push-gate.
+ *
+ * The gate runs `codex exec review --json` on every push and infers a verdict
+ * from the streamed findings (see `src/hooks/push-gate/findings.ts`). No
+ * cache, no audit-receipt consultation, no SHA-keyed attestation. These
+ * knobs shape only the immediate run.
+ *
+ * The 0.10.x knobs `cache_max_age_seconds` and `allow_skip_in_ci` were
+ * removed in 0.11.0. `rea upgrade` strips them from consumer policy files.
  */
 export interface ReviewPolicy {
   /**
-   * When `false`, the selector treats ClaudeSelfReviewer as the preferred
-   * reviewer (not degraded). When `true` or unset, Codex is preferred and
-   * a ClaudeSelfReviewer result is marked `degraded: true` in the audit
-   * log. Default when unset is `true` (Codex required).
+   * When `true` or unset, `git push` runs `codex exec review` before the
+   * push is allowed to proceed. When `false`, the push-gate short-circuits
+   * to `disabled` (exit 0, audit event still recorded). No middle state —
+   * either we run Codex or we don't.
+   *
+   * Profile default: `true` in `bst-internal`, `client-engagement`,
+   * `lit-wc`, `open-source`. `false` in `*-no-codex` variants.
    */
   codex_required?: boolean;
   /**
-   * Review-cache TTL used by `rea cache check` (BUG-009). Entries older
-   * than this window are treated as a miss, forcing re-review. Default
-   * when unset is 3600 seconds (1 hour) — matches the windows the
-   * push-review-gate hook already assumes. Express in seconds, positive
-   * integer.
-   */
-  cache_max_age_seconds?: number;
-  /**
-   * Authorization for `REA_SKIP_PUSH_REVIEW` / `REA_SKIP_CODEX_REVIEW` when
-   * the `CI` environment variable is set. The skip hatches are ambient and
-   * unauthenticated — a leaked env file or a malicious parent process can
-   * bypass the gate and record a forged actor (git config is mutable repo
-   * config). Refusing these hatches in CI contexts by default removes that
-   * bypass surface. Set `true` ONLY on build agents where the operator has
-   * an independent reason to trust the environment. Default `false`.
+   * Whether a `concerns` verdict blocks the push. `true` (default) means any
+   * non-trivial Codex finding halts the push; the agent must address the
+   * concerns (or re-run with `REA_ALLOW_CONCERNS=1` for a one-push override)
+   * before retrying. `false` means only `blocking` verdicts halt — concerns
+   * are logged and written to `.rea/last-review.json` but the push proceeds.
    *
-   * Added in 0.5.0 as Codex F2 on the PR1 adversarial review.
+   * Added in 0.11.0. Default when unset is `true` — safer posture for
+   * consumers who have not thought about it.
    */
-  allow_skip_in_ci?: boolean;
+  concerns_blocks?: boolean;
+  /**
+   * Hard cap on the `codex exec review` subprocess in milliseconds. Exceeding
+   * this kills the subprocess and the gate returns exit 2 with a timeout
+   * error (audited). Default when unset is 600_000 (10 minutes) — matches
+   * the upper bound we observe for a 500-line diff review on a slow link.
+   *
+   * Positive integer only. The loader rejects zero/negative values.
+   */
+  timeout_ms?: number;
 }
 
 /**

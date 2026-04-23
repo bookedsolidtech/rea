@@ -18,9 +18,9 @@
  *   - `.rea/serve.pid`                — G5 `rea serve` pidfile
  *   - `.rea/serve.state.json`         — G5 `rea serve` state snapshot
  *   - `.rea/fingerprints.json`        — G7 downstream catalog fingerprints (BUG-010)
- *   - `.rea/review-cache.jsonl`       — BUG-009 review cache (rea cache set/check)
+ *   - `.rea/last-review.json`         — 0.11.0 push-gate last-review dump
  *   - `.rea/*.tmp`                    — serve temp-file-then-rename pattern
- *   - `.rea/*.tmp.*`                  — review-cache pid-salted temp pattern
+ *   - `.rea/*.tmp.*`                  — push-gate pid-salted temp pattern
  *   - `.rea/install-manifest.json.bak` / `.tmp` — fs-safe atomic-replace sidecars
  *   - `.gitignore.rea-tmp-*`          — this module's own temp files on crash
  *                                       (root-level — writeAtomic stages next
@@ -109,7 +109,7 @@ export const REA_GITIGNORE_ENTRIES: readonly string[] = [
   '.rea/serve.pid',
   '.rea/serve.state.json',
   '.rea/fingerprints.json',
-  '.rea/review-cache.jsonl',
+  '.rea/last-review.json',
   '.rea/*.tmp',
   '.rea/*.tmp.*',
   '.rea/install-manifest.json.bak',

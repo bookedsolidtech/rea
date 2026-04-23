@@ -1,15 +1,9 @@
 #!/usr/bin/env node
 
 import { Command } from 'commander';
-import { runAuditRecordCodexReview, runAuditRotate, runAuditVerify } from './audit.js';
-import {
-  parseCacheResult,
-  runCacheCheck,
-  runCacheClear,
-  runCacheList,
-  runCacheSet,
-} from './cache.js';
+import { runAuditRotate, runAuditVerify } from './audit.js';
 import { runCheck } from './check.js';
+import { registerHookCommand } from './hook.js';
 import { runDoctor } from './doctor.js';
 import { runFreeze, runUnfreeze } from './freeze.js';
 import { runInit } from './init.js';
@@ -147,122 +141,9 @@ async function main(): Promise<void> {
       await runAuditVerify({ ...(opts.since !== undefined ? { since: opts.since } : {}) });
     });
 
-  const auditRecord = audit
-    .command('record')
-    .description('Emit a structured audit record (D).');
-
-  auditRecord
-    .command('codex-review')
-    .description(
-      'Append a codex.review audit entry the push-review cache gate recognizes. With --also-set-cache, writes the review cache in the same invocation (two sequential appends in one process — not a two-phase commit).',
-    )
-    .requiredOption('--head-sha <sha>', 'git HEAD SHA the review covers')
-    .requiredOption('--branch <branch>', 'feature branch under review')
-    .requiredOption('--target <target>', 'base ref or SHA diffed against (e.g. main)')
-    .requiredOption('--verdict <verdict>', 'one of: pass | concerns | blocking | error')
-    .requiredOption('--finding-count <N>', 'non-negative integer finding count', (raw) => {
-      const n = Number.parseInt(raw, 10);
-      if (!Number.isFinite(n) || n < 0) {
-        throw new Error(`--finding-count must be a non-negative integer; got ${JSON.stringify(raw)}`);
-      }
-      return n;
-    })
-    .option('--summary <text>', 'one-sentence review summary (optional)')
-    .option('--session-id <id>', 'session id to attribute (defaults to "external")')
-    .option(
-      '--also-set-cache',
-      'also update .rea/review-cache.jsonl to reflect this verdict, in the same invocation (recommended for post-review push flow)',
-    )
-    .action(
-      async (opts: {
-        headSha: string;
-        branch: string;
-        target: string;
-        verdict: string;
-        findingCount: number;
-        summary?: string;
-        sessionId?: string;
-        alsoSetCache?: boolean;
-      }) => {
-        if (
-          opts.verdict !== 'pass' &&
-          opts.verdict !== 'concerns' &&
-          opts.verdict !== 'blocking' &&
-          opts.verdict !== 'error'
-        ) {
-          throw new Error(
-            `--verdict must be one of pass|concerns|blocking|error; got ${JSON.stringify(opts.verdict)}`,
-          );
-        }
-        await runAuditRecordCodexReview({
-          headSha: opts.headSha,
-          branch: opts.branch,
-          target: opts.target,
-          verdict: opts.verdict,
-          findingCount: opts.findingCount,
-          ...(opts.summary !== undefined ? { summary: opts.summary } : {}),
-          ...(opts.sessionId !== undefined ? { sessionId: opts.sessionId } : {}),
-          ...(opts.alsoSetCache === true ? { alsoSetCache: true } : {}),
-        });
-      },
-    );
-
-  const cache = program
-    .command('cache')
-    .description(
-      'Review-cache operations — check/set/clear/list .rea/review-cache.jsonl (BUG-009). Used by hooks/push-review-gate.sh to skip re-review on a previously-approved diff.',
-    );
-
-  cache
-    .command('check <sha>')
-    .description(
-      'Look up a cache entry. Emits JSON to stdout ONLY — hook contract. On hit: {hit,true,result,branch,base,recorded_at[,reason]}. On miss: {hit:false}. Never exits non-zero for normal miss.',
-    )
-    .requiredOption('--branch <branch>', 'feature branch being pushed')
-    .requiredOption('--base <base>', 'base branch the feature targets')
-    .action(async (sha: string, opts: { branch: string; base: string }) => {
-      await runCacheCheck({ sha, branch: opts.branch, base: opts.base });
-    });
-
-  cache
-    .command('set <sha> <result>')
-    .description(
-      'Record a review outcome. <result> accepts pass|fail (historical) or pass|concerns|blocking|error (Codex verdicts). concerns→pass, blocking|error→fail. Idempotent line-per-invocation; last write wins on (sha, branch, base).',
-    )
-    .requiredOption('--branch <branch>', 'feature branch being pushed')
-    .requiredOption('--base <base>', 'base branch the feature targets')
-    .option('--reason <text>', 'free-text context for this entry (recommended on fail)')
-    .action(
-      async (
-        sha: string,
-        rawResult: string,
-        opts: { branch: string; base: string; reason?: string },
-      ) => {
-        const result = parseCacheResult(rawResult);
-        await runCacheSet({
-          sha,
-          result,
-          branch: opts.branch,
-          base: opts.base,
-          ...(opts.reason !== undefined ? { reason: opts.reason } : {}),
-        });
-      },
-    );
-
-  cache
-    .command('clear <sha>')
-    .description('Remove every cache entry matching <sha>. Dev convenience — prints the removed count.')
-    .action(async (sha: string) => {
-      await runCacheClear({ sha });
-    });
-
-  cache
-    .command('list')
-    .description('Print cache entries in file order. Filter with --branch.')
-    .option('--branch <branch>', 'only list entries for this branch')
-    .action(async (opts: { branch?: string }) => {
-      await runCacheList({ ...(opts.branch !== undefined ? { branch: opts.branch } : {}) });
-    });
+  // Register `rea hook push-gate` — the stateless pre-push Codex gate
+  // called by `.husky/pre-push` and `.git/hooks/pre-push`.
+  registerHookCommand(program);
 
   const tofu = program
     .command('tofu')

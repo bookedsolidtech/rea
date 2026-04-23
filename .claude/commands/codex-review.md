@@ -90,12 +90,10 @@ If the verdict is `blocking`, state plainly: "Do not merge until the blocking fi
 
 ## Pre-merge usage
 
-The recommended BST workflow runs `/codex-review` twice:
+This command is the **interactive** Codex adversarial review. The **pre-push** gate at `rea hook push-gate` runs Codex independently on every push — you do not need to run `/codex-review` to "prime" the push-gate. The two are complementary:
 
-1. After implementation, on the feature branch — catches issues early
-2. Immediately before merge, on the PR branch — records a fresh audit entry that the `push-review-gate` hook can check for freshness
-
-Both invocations are cheap. Run both.
+- `/codex-review` — rich, interactive review output in the chat. Use during implementation to catch issues early, at review checkpoints, or whenever you want Codex's read on a specific diff.
+- `rea hook push-gate` (wired to `.husky/pre-push`) — fresh Codex review on every push. If Codex surfaces blocking/concerns findings, the push exits 2; Claude reads `.rea/last-review.json`, fixes, and pushes again.
 
 ## Constraints
 

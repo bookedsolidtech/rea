@@ -307,7 +307,7 @@ describe('rea doctor — collectChecks (G11.4 codex_required)', () => {
     const check = findCheck(checks, 'pre-push hook installed');
     expect(check?.status).toBe('fail');
     expect(check?.detail).toMatch(/silently bypassed/);
-    expect(check?.detail).toMatch(/push-review-gate\.sh/);
+    expect(check?.detail).toMatch(/rea hook push-gate/);
   });
 
   it('G6: executable foreign hook that DOES delegate to the gate → pass', async () => {
@@ -333,7 +333,7 @@ describe('rea doctor — collectChecks (G11.4 codex_required)', () => {
     const checks = collectChecks(repo.dir, undefined, state);
     const check = findCheck(checks, 'pre-push hook installed');
     expect(check?.status).toBe('pass');
-    expect(check?.detail).toMatch(/delegates to push-review-gate/);
+    expect(check?.detail).toMatch(/delegates to `rea hook push-gate`/);
   });
 
   it('codex_required=false: absence of the codex agent does not fail the check', async () => {

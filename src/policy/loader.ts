@@ -20,16 +20,17 @@ const ContextProtectionSchema = z.object({
 });
 
 /**
- * G11.2: minimal review policy. Only `codex_required` is recognized today;
- * G11.4 will expand this (profile defaults, reviewer pin, token caps).
- * Kept strict so a typo (`codex_require`) fails loudly instead of silently
- * defaulting.
+ * 0.11.0 push-gate review policy. Three knobs only — the stateless gate does
+ * not have a cache and does not treat CI differently. Strict mode so typos
+ * (`codex_require`, `concerns_block`) fail loudly rather than silently
+ * defaulting. `rea upgrade` strips the removed 0.10.x fields
+ * (`cache_max_age_seconds`, `allow_skip_in_ci`) from consumer policy files.
  */
 const ReviewPolicySchema = z
   .object({
     codex_required: z.boolean().optional(),
-    cache_max_age_seconds: z.number().int().positive().optional(),
-    allow_skip_in_ci: z.boolean().optional(),
+    concerns_blocks: z.boolean().optional(),
+    timeout_ms: z.number().int().positive().optional(),
   })
   .strict();
 
