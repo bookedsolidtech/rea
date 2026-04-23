@@ -218,7 +218,13 @@ export async function runCodexReview(options: CodexRunOptions): Promise<CodexRun
       }
       reject(e);
     });
-    child.on('exit', (code: number | null, signal: NodeJS.Signals | null) => {
+    // `close` (not `exit`) fires after BOTH stdio streams drain and the
+    // process has exited. Node can emit `exit` before the final stdout
+    // chunks are flushed on large reviews or slow pipes, causing
+    // `parseCodexJsonl()` to run against a truncated buffer and
+    // misclassify a blocking review as pass. Waiting for `close`
+    // guarantees every agent_message chunk is in `stdoutChunks`.
+    child.on('close', (code: number | null, signal: NodeJS.Signals | null) => {
       clearTimeout(timer);
       if (code === null && signal !== null) {
         reject(

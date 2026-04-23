@@ -10,17 +10,24 @@
 
 set -eu
 
-# REA push-gate (0.11.0+). The heavy lifting — git diff resolution, Codex
-# invocation, verdict inference, audit write — lives in
-# `src/hooks/push-gate/` and is invoked via `rea hook push-gate`.
-# This stub only short-circuits on the kill-switch.
-
 REA_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
 if [ -f "${REA_ROOT}/.rea/HALT" ]; then
-  reason=$(awk 'NR==1 { print; exit }' "${REA_ROOT}/.rea/HALT" 2>/dev/null || printf 'unknown')
-  [ -z "${reason:-}" ] && reason='unknown'
-  printf 'REA HALT: %s\nAll push operations suspended. Run: rea unfreeze\n' "$reason" >&2
+  reason=$(awk "NR==1 { print; exit }" "${REA_ROOT}/.rea/HALT" 2>/dev/null || printf "unknown")
+  [ -z "${reason:-}" ] && reason="unknown"
+  printf "REA HALT: %s\nAll push operations suspended. Run: rea unfreeze\n" "$reason" >&2
   exit 1
 fi
 
-exec rea hook push-gate
+REA_BIN=""
+if [ -x "${REA_ROOT}/node_modules/.bin/rea" ]; then
+  REA_BIN="${REA_ROOT}/node_modules/.bin/rea"
+elif command -v rea >/dev/null 2>&1; then
+  REA_BIN="rea"
+elif command -v npx >/dev/null 2>&1; then
+  REA_BIN="npx --no-install @bookedsolid/rea"
+else
+  printf "rea: cannot locate the rea CLI.\n" >&2
+  exit 2
+fi
+
+exec $REA_BIN hook push-gate "$@"

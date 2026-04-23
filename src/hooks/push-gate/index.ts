@@ -70,12 +70,60 @@ export interface GateResult {
   headSha?: string;
 }
 
+/**
+ * A single refspec the pre-push stdin contract yields. Git passes one line
+ * per refspec being pushed: `<local_ref> <local_sha> <remote_ref> <remote_sha>`.
+ * See githooks(5) — Hook "pre-push".
+ */
+export interface PrePushRefspec {
+  localRef: string;
+  localSha: string;
+  remoteRef: string;
+  remoteSha: string;
+}
+
+/**
+ * Parse the raw pre-push stdin text into refspecs. Each line is four
+ * whitespace-separated fields. Blank lines and malformed lines are
+ * silently dropped — the empty result then falls through to the
+ * upstream-resolver path in `runPushGate`.
+ */
+export function parsePrePushStdin(raw: string): PrePushRefspec[] {
+  const out: PrePushRefspec[] = [];
+  for (const line of raw.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (trimmed.length === 0) continue;
+    const fields = trimmed.split(/\s+/);
+    if (fields.length !== 4) continue;
+    const [localRef, localSha, remoteRef, remoteSha] = fields;
+    if (
+      typeof localRef !== 'string' ||
+      typeof localSha !== 'string' ||
+      typeof remoteRef !== 'string' ||
+      typeof remoteSha !== 'string'
+    ) {
+      continue;
+    }
+    out.push({ localRef, localSha, remoteRef, remoteSha });
+  }
+  return out;
+}
+
 export interface PushGateDeps {
   baseDir: string;
   env: NodeJS.ProcessEnv;
   stderr: (line: string) => void;
   /** Override via `--base <ref>`. Absent → auto-resolve. */
   explicitBase?: string;
+  /**
+   * Pre-push refspecs from git's stdin. Empty when invoked outside a
+   * pre-push context (manual `rea hook push-gate` from the CLI). When
+   * non-empty, the gate diffs each refspec's (remote_sha..local_sha) and
+   * reviews against the actual push target — matters when the operator
+   * does `git push origin HEAD:release/1.0` and the tracking branch is
+   * a different branch entirely.
+   */
+  refspecs?: PrePushRefspec[];
   /** Test seams; production wires these to the real implementations. */
   git?: GitExecutor;
   resolvePolicy?: (baseDir: string) => Promise<ResolvedReviewPolicy>;
@@ -85,6 +133,13 @@ export interface PushGateDeps {
   appendAudit?: typeof appendAuditRecord;
   now?: () => Date;
 }
+
+/**
+ * Well-known "null SHA" in git's wire format. Pre-push sends this as
+ * `remote_sha` for a fresh remote ref (the branch doesn't exist yet on
+ * the remote) and as `local_sha` for a branch deletion.
+ */
+const NULL_SHA = '0000000000000000000000000000000000000000';
 
 // ---------------------------------------------------------------------------
 // Audit event names (advisory — no gate ever reads these back)
@@ -172,14 +227,40 @@ export async function runPushGate(deps: PushGateDeps): Promise<GateResult> {
     };
   }
 
-  // 4. Resolve the base ref. `explicitBase` (from `--base <ref>`) wins; else
-  //    we walk the upstream → origin/HEAD → main/master ladder.
-  const base: BaseResolution = resolveBaseRef(git, {
-    ...(deps.explicitBase !== undefined && deps.explicitBase.length > 0
-      ? { explicit: deps.explicitBase }
-      : {}),
-  });
-  const headSha = git.headSha();
+  // 4. Resolve (base_ref, head_sha) for the actual review.
+  //
+  //    When pre-push stdin yielded at least one refspec (`git push` path),
+  //    diff against the first NON-DELETION refspec's (remote_sha..local_sha).
+  //    This matches what git itself is about to push — critical when the
+  //    operator uses `git push origin HEAD:release/1.0` and the branch's
+  //    tracking ref is a different branch entirely (the 0.10.x gate
+  //    silently reviewed against the wrong base in that case).
+  //
+  //    When stdin was empty (manual invocation, test), fall back to the
+  //    upstream → origin/HEAD → main/master ladder.
+  const activeRefspec = (deps.refspecs ?? []).find(
+    (r) => r.localSha !== NULL_SHA && r.localSha.length > 0,
+  );
+  let base: BaseResolution;
+  let headSha: string;
+  if (activeRefspec !== undefined && (deps.explicitBase === undefined || deps.explicitBase.length === 0)) {
+    headSha = activeRefspec.localSha;
+    if (activeRefspec.remoteSha === NULL_SHA || activeRefspec.remoteSha.length === 0) {
+      // New remote ref — no existing commits to diff against. Fall back to
+      // the resolver ladder so we still get a meaningful review (e.g. vs
+      // origin/main) rather than an empty-tree diff of everything.
+      base = resolveBaseRef(git);
+    } else {
+      base = { ref: activeRefspec.remoteSha, source: 'explicit' };
+    }
+  } else {
+    base = resolveBaseRef(git, {
+      ...(deps.explicitBase !== undefined && deps.explicitBase.length > 0
+        ? { explicit: deps.explicitBase }
+        : {}),
+    });
+    headSha = git.headSha();
+  }
   if (headSha.length === 0) {
     stderr('PUSH BLOCKED: could not resolve HEAD SHA. Is this a valid git repo?\n');
     await safeAppend(appendAuditFn, deps.baseDir, EVT_ERROR, { kind: 'head-sha-missing' });

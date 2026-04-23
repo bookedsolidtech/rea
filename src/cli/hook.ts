@@ -30,7 +30,7 @@
  */
 
 import type { Command } from 'commander';
-import { runPushGate } from '../hooks/push-gate/index.js';
+import { parsePrePushStdin, runPushGate } from '../hooks/push-gate/index.js';
 import { err } from './utils.js';
 
 export interface HookPushGateOptions {
@@ -49,11 +49,18 @@ export async function runHookPushGate(options: HookPushGateOptions): Promise<voi
   const stderr = (line: string): void => {
     process.stderr.write(line);
   };
+  // Git's pre-push contract sends one refspec per line on stdin. Read it
+  // all upfront with a timeout guard so a misconfigured invocation
+  // (stdin pipe never closed) doesn't hang the gate indefinitely. TTY
+  // stdin short-circuits to empty — `rea hook push-gate` invoked from
+  // a terminal has no refspec data.
+  const refspecs = process.stdin.isTTY ? [] : parsePrePushStdin(await readStdinWithTimeout(5_000));
   try {
     const result = await runPushGate({
       baseDir,
       env: process.env,
       stderr,
+      refspecs,
       ...(options.base !== undefined && options.base.length > 0 ? { explicitBase: options.base } : {}),
     });
     process.exit(result.exitCode);
@@ -64,6 +71,40 @@ export async function runHookPushGate(options: HookPushGateOptions): Promise<voi
     err(`push-gate internal error: ${e instanceof Error ? e.message : String(e)}`);
     process.exit(2);
   }
+}
+
+/**
+ * Read stdin to end with a timeout. Returns '' on timeout — the caller
+ * then falls through to the upstream-resolver path instead of blocking
+ * the gate on a pipe that may never close.
+ *
+ * Git ALWAYS closes stdin after sending refspecs, so the timeout is a
+ * safety net for weird invocations (running the CLI from a script that
+ * piped in nothing, a test that forgot to close the write end, etc.).
+ */
+async function readStdinWithTimeout(timeoutMs: number): Promise<string> {
+  return new Promise((resolve) => {
+    const chunks: Buffer[] = [];
+    let resolved = false;
+    const finish = (): void => {
+      if (resolved) return;
+      resolved = true;
+      resolve(Buffer.concat(chunks).toString('utf8'));
+    };
+    const timer = setTimeout(finish, timeoutMs);
+    timer.unref?.();
+    process.stdin.on('data', (chunk) => {
+      chunks.push(typeof chunk === 'string' ? Buffer.from(chunk, 'utf8') : chunk);
+    });
+    process.stdin.on('end', () => {
+      clearTimeout(timer);
+      finish();
+    });
+    process.stdin.on('error', () => {
+      clearTimeout(timer);
+      finish();
+    });
+  });
 }
 
 /**

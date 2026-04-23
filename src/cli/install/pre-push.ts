@@ -117,7 +117,14 @@ const BODY_TEMPLATE = `set -eu
 # REA push-gate (0.11.0+). The heavy lifting — git diff resolution, Codex
 # invocation, verdict inference, audit write — lives in
 # \`src/hooks/push-gate/\` and is invoked via \`rea hook push-gate\`.
-# This stub only short-circuits on the kill-switch.
+# This stub only short-circuits on the kill-switch and resolves the rea
+# binary (in priority: project node_modules/.bin/rea → PATH → npx).
+#
+# The 0.10.x hooks assumed rea was on PATH. Consumers who bootstrap via
+# \`npx @bookedsolid/rea init\` have no persistent global rea install, so
+# the bare \`exec rea\` pattern fails with "rea: not found" on push. We
+# resolve against the project-local node_modules/.bin first, then PATH,
+# then fall back to npx so the gate runs in every documented setup.
 
 REA_ROOT=\$(git rev-parse --show-toplevel 2>/dev/null || pwd)
 if [ -f "\${REA_ROOT}/.rea/HALT" ]; then
@@ -127,7 +134,30 @@ if [ -f "\${REA_ROOT}/.rea/HALT" ]; then
   exit 1
 fi
 
-exec rea hook push-gate
+# The pre-push stdin carries one line per refspec (local_ref local_sha
+# remote_ref remote_sha). Forward stdin verbatim via process substitution
+# — the \`rea hook push-gate\` CLI reads it via process.stdin to pick up
+# the actual push base. Empty stdin (direct invocation, CI, etc.) is
+# handled by the CLI falling back to upstream → origin/HEAD resolution.
+
+REA_BIN=""
+if [ -x "\${REA_ROOT}/node_modules/.bin/rea" ]; then
+  REA_BIN="\${REA_ROOT}/node_modules/.bin/rea"
+elif command -v rea >/dev/null 2>&1; then
+  REA_BIN="rea"
+elif command -v npx >/dev/null 2>&1; then
+  # Last resort: npx will resolve the package from npm or the cache.
+  # Pass \`--no-install\` so a rare cache-cold machine surfaces a clear
+  # error instead of silently downloading at push time.
+  REA_BIN="npx --no-install @bookedsolid/rea"
+else
+  printf 'rea: cannot locate the rea CLI. Install locally (\`pnpm add -D @bookedsolid/rea\`) or globally (\`npm i -g @bookedsolid/rea\`).\\n' >&2
+  exit 2
+fi
+
+# \$@ carries the pre-push arguments (git passes <remote-name> <remote-url>).
+# Stdin is inherited by \`exec\` → the CLI sees it unchanged.
+exec \$REA_BIN hook push-gate "\$@"
 `;
 
 /** Fallback hook body — `.git/hooks/pre-push` in vanilla-git installs. */

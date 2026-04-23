@@ -142,7 +142,7 @@ describe('rea init — G11.4 codex flags', () => {
     const prePushPath = path.join(dir, '.git', 'hooks', 'pre-push');
     const content = await fs.readFile(prePushPath, 'utf8');
     expect(content).toContain(FALLBACK_MARKER);
-    expect(content).toContain('exec rea hook push-gate');
+    expect(content).toContain('hook push-gate');
 
     const stat = await fs.stat(prePushPath);
     expect(stat.mode & 0o111).toBeGreaterThan(0);

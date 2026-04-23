@@ -63,6 +63,7 @@ import {
   canonicalSettingsSubsetHash,
   defaultDesiredHooks,
   mergeSettings,
+  pruneHookCommands,
   readSettings,
   writeSettingsAtomic,
 } from './install/settings-merge.js';
@@ -440,22 +441,64 @@ async function upgradeClaudeMdFragment(
   return { sha: newSha, action: 'written' };
 }
 
+/**
+ * Hook commands deleted in 0.11.0. `upgradeSettings` prunes any entries
+ * whose `command` string contains one of these tokens so consumer
+ * `.claude/settings.json` files don't keep invoking missing scripts
+ * (which would fail every matched tool call until the operator edited
+ * settings by hand).
+ *
+ * 0.11.0 removals:
+ *   - push-review-gate.sh        (replaced by husky stub → rea hook push-gate)
+ *   - commit-review-gate.sh      (intentionally unregistered; source-of-truth deleted)
+ *   - push-review-gate-git.sh    (native-git adapter; deleted)
+ *
+ * Add future removals here rather than baking the list into
+ * `pruneHookCommands` itself — the removal list is release history,
+ * not a static setting.
+ */
+const STALE_HOOK_COMMAND_TOKENS: readonly string[] = [
+  'push-review-gate.sh',
+  'commit-review-gate.sh',
+  'push-review-gate-git.sh',
+];
+
 async function upgradeSettings(
   baseDir: string,
   opts: UpgradeOptions,
-): Promise<{ sha: string; addedCount: number; skippedCount: number; warnings: string[] }> {
+): Promise<{
+  sha: string;
+  addedCount: number;
+  skippedCount: number;
+  removedCount: number;
+  warnings: string[];
+}> {
   const desired = defaultDesiredHooks();
   const sha = canonicalSettingsSubsetHash(desired);
   const { settings, settingsPath } = readSettings(baseDir);
-  const mergeResult = mergeSettings(settings, desired);
+  // PRUNE FIRST (remove 0.11.0-deleted hook references), THEN MERGE
+  // (add any new hooks). Order matters: merging first would re-add the
+  // stale entry only to have the prune re-delete it on the next line —
+  // pointless work. Pruning first means the merge sees a clean baseline.
+  const pruned = pruneHookCommands(settings, STALE_HOOK_COMMAND_TOKENS);
+  const mergeResult = mergeSettings(pruned.merged, desired);
   if (opts.dryRun !== true) {
     await writeSettingsAtomic(settingsPath, mergeResult.merged);
+  }
+  const warnings = [...mergeResult.warnings];
+  if (pruned.removedCount > 0) {
+    warnings.push(
+      `pruned ${pruned.removedCount} stale 0.10.x hook entr${
+        pruned.removedCount === 1 ? 'y' : 'ies'
+      } from .claude/settings.json (removed in 0.11.0)`,
+    );
   }
   return {
     sha,
     addedCount: mergeResult.addedCount,
     skippedCount: mergeResult.skippedCount,
-    warnings: mergeResult.warnings,
+    removedCount: pruned.removedCount,
+    warnings,
   };
 }
 

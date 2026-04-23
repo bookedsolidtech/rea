@@ -78,6 +78,58 @@ function keyFor(matcher: string, command: string): string {
  * hooks and returns the merged settings plus a list of warnings. Does NOT
  * touch disk.
  */
+/**
+ * Remove hook entries whose `command` contains any of the listed
+ * substrings. Returns a deep-cloned settings object plus the count of
+ * entries removed. Empty hook arrays and empty groups are pruned too so
+ * the resulting file doesn't accumulate empty sentinel objects after
+ * repeated upgrade runs.
+ *
+ * Used by `rea upgrade` to purge references to hooks we delete in a
+ * release (0.11.0 removed `push-review-gate.sh` and `commit-review-gate.sh`).
+ * Without this, `mergeSettings()` is additive-only and consumer
+ * `.claude/settings.json` would keep executing stale commands that
+ * point at files we just deleted from `.claude/hooks/`.
+ */
+export function pruneHookCommands(
+  existing: Record<string, unknown>,
+  staleSubstrings: readonly string[],
+): { merged: Record<string, unknown>; removedCount: number } {
+  const merged = deepClone(existing);
+  const hooks = ensureHooksShape(merged);
+  let removedCount = 0;
+  for (const event of Object.keys(hooks)) {
+    const groups = hooks[event];
+    if (!Array.isArray(groups)) continue;
+    for (const group of groups) {
+      const entries = group.hooks ?? [];
+      if (!Array.isArray(entries)) continue;
+      const kept: typeof entries = [];
+      for (const entry of entries) {
+        const cmd = typeof entry.command === 'string' ? entry.command : '';
+        if (staleSubstrings.some((s) => cmd.includes(s))) {
+          removedCount += 1;
+          continue;
+        }
+        kept.push(entry);
+      }
+      group.hooks = kept;
+    }
+    // Drop groups whose hooks list is now empty.
+    hooks[event] = groups.filter(
+      (g) => Array.isArray(g.hooks) && g.hooks.length > 0,
+    );
+  }
+  // Drop events whose group list is now empty.
+  for (const event of Object.keys(hooks)) {
+    const groups = hooks[event];
+    if (Array.isArray(groups) && groups.length === 0) {
+      delete hooks[event];
+    }
+  }
+  return { merged, removedCount };
+}
+
 export function mergeSettings(
   existing: Record<string, unknown>,
   desired: DesiredHookGroup[],

@@ -7,7 +7,7 @@ import {
   PUSH_GATE_DEFAULT_CONCERNS_BLOCKS,
   PUSH_GATE_DEFAULT_TIMEOUT_MS,
 } from './policy.js';
-import { runPushGate, type PushGateDeps } from './index.js';
+import { parsePrePushStdin, runPushGate, type PushGateDeps } from './index.js';
 import type { GitExecutor } from './codex-runner.js';
 
 function fakeGit(overrides: Partial<GitExecutor> = {}): GitExecutor {
@@ -265,6 +265,153 @@ describe('runPushGate — verdict mapping', () => {
     const payload = JSON.parse(raw) as { verdict: string; finding_count: number };
     expect(payload.verdict).toBe('pass');
     expect(payload.finding_count).toBe(0);
+  });
+});
+
+describe('runPushGate — pre-push stdin refspecs', () => {
+  let baseDir: string;
+  beforeEach(async () => {
+    baseDir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-pg-idx-refspec-')));
+  });
+  afterEach(async () => {
+    await fs.rm(baseDir, { recursive: true, force: true });
+  });
+
+  it('diffs against the refspec remote_sha, not the upstream ladder, when stdin carries a refspec', async () => {
+    let codexInvokedWithBase = '';
+    const REMOTE_SHA = 'a'.repeat(40);
+    const LOCAL_SHA = 'b'.repeat(40);
+    await runPushGate(
+      baseDeps(baseDir, {
+        refspecs: [
+          {
+            localRef: 'refs/heads/feature',
+            localSha: LOCAL_SHA,
+            remoteRef: 'refs/heads/release/1.0',
+            remoteSha: REMOTE_SHA,
+          },
+        ],
+        git: fakeGit({
+          tryRevParse: () => 'origin/main',
+          headSha: () => 'UNUSED-because-refspec-wins',
+          diffNames: () => ['src/change.ts'],
+        }),
+        runCodex: async (opts) => {
+          codexInvokedWithBase = opts.baseRef;
+          return { reviewText: '', eventCount: 1, durationSeconds: 0.1 };
+        },
+      }),
+    );
+    expect(codexInvokedWithBase).toBe(REMOTE_SHA);
+  });
+
+  it('uses the refspec local_sha as head_sha (not git HEAD)', async () => {
+    const REMOTE_SHA = 'a'.repeat(40);
+    const LOCAL_SHA = 'b'.repeat(40);
+    const result = await runPushGate(
+      baseDeps(baseDir, {
+        refspecs: [
+          {
+            localRef: 'refs/heads/feature',
+            localSha: LOCAL_SHA,
+            remoteRef: 'refs/heads/release/1.0',
+            remoteSha: REMOTE_SHA,
+          },
+        ],
+        git: fakeGit({ headSha: () => 'DIFFERENT-HEAD' }),
+      }),
+    );
+    expect(result.headSha).toBe(LOCAL_SHA);
+  });
+
+  it('falls back to the upstream ladder when refspec remote_sha is the null SHA (new remote ref)', async () => {
+    let codexInvokedWithBase = '';
+    const NULL = '0'.repeat(40);
+    const LOCAL_SHA = 'b'.repeat(40);
+    await runPushGate(
+      baseDeps(baseDir, {
+        refspecs: [
+          {
+            localRef: 'refs/heads/feature',
+            localSha: LOCAL_SHA,
+            remoteRef: 'refs/heads/feature',
+            remoteSha: NULL,
+          },
+        ],
+        git: fakeGit({
+          tryRevParse: (args) => (args.includes('@{upstream}') ? 'origin/main' : ''),
+          diffNames: () => ['src/change.ts'],
+        }),
+        runCodex: async (opts) => {
+          codexInvokedWithBase = opts.baseRef;
+          return { reviewText: '', eventCount: 1, durationSeconds: 0.1 };
+        },
+      }),
+    );
+    expect(codexInvokedWithBase).toBe('origin/main');
+  });
+
+  it('skips deletion refspecs (local_sha = null SHA) and moves on', async () => {
+    let codexInvokedWithBase = '';
+    const NULL = '0'.repeat(40);
+    const REMOTE_SHA = 'a'.repeat(40);
+    const LOCAL_SHA = 'b'.repeat(40);
+    await runPushGate(
+      baseDeps(baseDir, {
+        refspecs: [
+          { localRef: '', localSha: NULL, remoteRef: 'refs/heads/stale', remoteSha: REMOTE_SHA },
+          {
+            localRef: 'refs/heads/feature',
+            localSha: LOCAL_SHA,
+            remoteRef: 'refs/heads/release',
+            remoteSha: REMOTE_SHA,
+          },
+        ],
+        runCodex: async (opts) => {
+          codexInvokedWithBase = opts.baseRef;
+          return { reviewText: '', eventCount: 1, durationSeconds: 0.1 };
+        },
+      }),
+    );
+    expect(codexInvokedWithBase).toBe(REMOTE_SHA);
+  });
+});
+
+describe('parsePrePushStdin', () => {
+  it('parses a single well-formed refspec line', () => {
+    const raw = 'refs/heads/feat aaaaaa refs/heads/main bbbbbb\n';
+    const parsed = parsePrePushStdin(raw);
+    expect(parsed).toEqual([
+      {
+        localRef: 'refs/heads/feat',
+        localSha: 'aaaaaa',
+        remoteRef: 'refs/heads/main',
+        remoteSha: 'bbbbbb',
+      },
+    ]);
+  });
+
+  it('parses multiple refspec lines', () => {
+    const raw = [
+      'refs/heads/a 1111111111111111111111111111111111111111 refs/heads/a 2222222222222222222222222222222222222222',
+      'refs/heads/b 3333333333333333333333333333333333333333 refs/heads/b 4444444444444444444444444444444444444444',
+      '',
+    ].join('\n');
+    const parsed = parsePrePushStdin(raw);
+    expect(parsed).toHaveLength(2);
+    expect(parsed[0]?.localRef).toBe('refs/heads/a');
+    expect(parsed[1]?.localRef).toBe('refs/heads/b');
+  });
+
+  it('drops blank lines and malformed (not-four-fields) lines silently', () => {
+    const raw = 'a b\nrefs/heads/x SHA1 refs/heads/y SHA2\n\n';
+    const parsed = parsePrePushStdin(raw);
+    expect(parsed).toHaveLength(1);
+  });
+
+  it('returns empty array for empty input', () => {
+    expect(parsePrePushStdin('')).toEqual([]);
+    expect(parsePrePushStdin('   \n   \n')).toEqual([]);
   });
 });
 
