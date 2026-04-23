@@ -121,6 +121,14 @@ export function registerHookCommand(program: Command): void {
 
   hook
     .command('push-gate')
+    // Accept (and silently ignore) positional args. Git passes the
+    // pre-push hook `<remote-name> <remote-url>` as $@; the husky stub
+    // forwards them with `"$@"`. Those values aren't used by the gate
+    // directly (base ref + refspecs come from stdin + git tree probes),
+    // but commander without this option would reject the invocation.
+    // Declared as a variadic positional so an arbitrary number of
+    // trailing tokens are accepted.
+    .argument('[gitArgs...]', 'positional args forwarded by git (remote name, URL); ignored')
     .description(
       'Run `codex exec review` against the current diff and block on blocking findings. Exits 0/1/2: pass/HALT/blocked. No cache — every push runs Codex afresh.',
     )
@@ -128,7 +136,7 @@ export function registerHookCommand(program: Command): void {
       '--base <ref>',
       'explicit base ref to diff against (e.g. origin/main). Defaults to @{upstream} → origin/HEAD → main/master → empty-tree.',
     )
-    .action(async (opts: { base?: string }) => {
+    .action(async (_gitArgs: string[], opts: { base?: string }) => {
       await runHookPushGate({ ...(opts.base !== undefined ? { base: opts.base } : {}) });
     });
 }
