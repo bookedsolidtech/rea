@@ -8,6 +8,7 @@
 [![license](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
 [![DCO](https://img.shields.io/badge/DCO-required-green)](https://developercertificate.org/)
 [![Node](https://img.shields.io/badge/node-%3E%3D22-brightgreen)](https://nodejs.org/)
+[![SafeSkill 20/100](https://img.shields.io/badge/SafeSkill-20%2F100_Blocked-red)](https://safeskill.dev/scan/bookedsolidtech-rea)
 
 > Status: `0.9.x` — published to npm with provenance. See
 > [CHANGELOG.md](./CHANGELOG.md) for the per-release history.
