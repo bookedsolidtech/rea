@@ -30,7 +30,7 @@ jobs:
 
       - name: Setup pnpm
         # pin: pnpm/action-setup v4.0.0 — version derived from packageManager in package.json
-        uses: pnpm/action-setup@fe02b34f77f8bc703788d5817da081398fad5dd2
+        uses: pnpm/action-setup@903f9c1a6ebcba6cf41d87230be49611ac97822e
 
       - name: Setup Node
         # pin: actions/setup-node v4.0.3
