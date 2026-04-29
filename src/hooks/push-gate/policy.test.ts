@@ -39,8 +39,41 @@ describe('resolvePushGatePolicy', () => {
       codex_required: PUSH_GATE_DEFAULT_CODEX_REQUIRED,
       concerns_blocks: PUSH_GATE_DEFAULT_CONCERNS_BLOCKS,
       timeout_ms: PUSH_GATE_DEFAULT_TIMEOUT_MS,
+      last_n_commits: undefined,
       policyMissing: true,
     });
+  });
+
+  it('PUSH_GATE_DEFAULT_TIMEOUT_MS is 30 minutes (raised in 0.12.0 from 10 min)', () => {
+    expect(PUSH_GATE_DEFAULT_TIMEOUT_MS).toBe(1_800_000);
+  });
+
+  it('honors explicit review.last_n_commits', async () => {
+    await fs.writeFile(
+      path.join(baseDir, '.rea', 'policy.yaml'),
+      MINIMAL_POLICY + 'review:\n  last_n_commits: 7\n',
+      'utf8',
+    );
+    const p = await resolvePushGatePolicy(baseDir);
+    expect(p.last_n_commits).toBe(7);
+  });
+
+  it('rejects review.last_n_commits: 0 (positive integer required)', async () => {
+    await fs.writeFile(
+      path.join(baseDir, '.rea', 'policy.yaml'),
+      MINIMAL_POLICY + 'review:\n  last_n_commits: 0\n',
+      'utf8',
+    );
+    await expect(resolvePushGatePolicy(baseDir)).rejects.toThrow(/Invalid policy schema/);
+  });
+
+  it('rejects review.last_n_commits: -3 (positive integer required)', async () => {
+    await fs.writeFile(
+      path.join(baseDir, '.rea', 'policy.yaml'),
+      MINIMAL_POLICY + 'review:\n  last_n_commits: -3\n',
+      'utf8',
+    );
+    await expect(resolvePushGatePolicy(baseDir)).rejects.toThrow(/Invalid policy schema/);
   });
 
   it('defaults when .rea/policy.yaml has no review block', async () => {

@@ -58,12 +58,54 @@ export interface ReviewPolicy {
   /**
    * Hard cap on the `codex exec review` subprocess in milliseconds. Exceeding
    * this kills the subprocess and the gate returns exit 2 with a timeout
-   * error (audited). Default when unset is 600_000 (10 minutes) — matches
-   * the upper bound we observe for a 500-line diff review on a slow link.
+   * error (audited). Default when unset is 1_800_000 (30 minutes) as of
+   * 0.12.0 — raised from 10 minutes after the helixir migration session
+   * 2026-04-26 showed realistic feature-branch diffs routinely exceeded
+   * the previous default. Operators with explicit `timeout_ms:` in
+   * `.rea/policy.yaml` are unaffected.
    *
    * Positive integer only. The loader rejects zero/negative values.
    */
   timeout_ms?: number;
+  /**
+   * When set, `rea hook push-gate` resolves the diff base to `HEAD~N`
+   * instead of the upstream → origin/HEAD ladder. Useful when a feature
+   * branch accumulates many commits and the full origin/main diff
+   * overwhelms the reviewer (the helixir 2026-04-26 case: 50+ commits
+   * relative to origin/main produced non-deterministic Codex verdicts and
+   * 10-minute timeouts).
+   *
+   * Precedence: explicit `--base <ref>` flag wins; then `--last-n-commits N`
+   * flag; then this policy key; then refspec-aware base resolution; then
+   * the upstream-ladder fallback. When `--base` AND
+   * `--last-n-commits`/`policy.last_n_commits` are both set, `--base`
+   * wins and a stderr warning is emitted.
+   *
+   * Resolution: `git rev-parse HEAD~N`. When `HEAD~N` is unreachable
+   * the resolver consults `git rev-parse --is-shallow-repository` to
+   * pick the right clamp:
+   *
+   *   - FULL clone, branch shorter than N: clamps to the empty-tree
+   *     sentinel so the root commit's changes are included
+   *     (`git diff base..HEAD` excludes `base`, so diffing against
+   *     `HEAD~K` would silently drop the root commit). Reports
+   *     `last_n_commits: K+1` — every commit on the branch reviewed.
+   *
+   *   - SHALLOW clone: clamps to `HEAD~K` (the deepest LOCALLY
+   *     resolvable ancestor) since older history exists on the remote
+   *     but isn't fetched. Using empty-tree here would balloon the
+   *     review to every tracked file in the checkout. Reports
+   *     `last_n_commits: K`. The K-th commit's content is excluded —
+   *     accepted as the cost of the shallow clone.
+   *
+   * A stderr warning surfaces the requested-vs-clamped numbers in
+   * both cases. Audit metadata records `base_source: 'last-n-commits'`,
+   * `last_n_commits: <count actually reviewed>`, and
+   * `last_n_commits_requested: N` (only present when clamped).
+   *
+   * Positive integer. The loader rejects zero/negative values.
+   */
+  last_n_commits?: number;
 }
 
 /**

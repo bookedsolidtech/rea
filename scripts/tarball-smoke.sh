@@ -74,8 +74,13 @@ echo "[smoke]   → $VERSION_OUT"
 echo "[smoke] rea --help"
 ./node_modules/.bin/rea --help >/dev/null
 
-echo "[smoke] rea init --yes --profile open-source"
-./node_modules/.bin/rea init --yes --profile open-source
+echo "[smoke] rea init --yes --profile open-source-no-codex"
+# 0.12.0+: doctor hard-fails when policy.review.codex_required: true and codex
+# is not on PATH (fix C of the helixir migration unblocker — see PR #85). CI
+# does not provision the codex CLI, so the smoke uses the -no-codex profile
+# variant which defaults codex_required: false. The new doctor probe is
+# covered by unit tests in src/cli/doctor.test.ts.
+./node_modules/.bin/rea init --yes --profile open-source-no-codex
 
 # Verify the installed layout matches what init claims it wrote.
 for expected in .rea/policy.yaml .rea/registry.yaml .claude/settings.json CLAUDE.md .rea/install-manifest.json; do

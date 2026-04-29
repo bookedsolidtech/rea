@@ -12,6 +12,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
+  checkCodexBinaryOnPath,
   checkFingerprintStore,
   checksFromProbeState,
   collectChecks,
@@ -693,5 +694,110 @@ describe('rea doctor — checkFingerprintStore (G7)', () => {
     );
     const r = await checkFingerprintStore(repo.dir);
     expect(r.status).toBe('fail');
+  });
+});
+
+describe('rea doctor — checkCodexBinaryOnPath (Fix C / 0.12.0)', () => {
+  const cleanup: string[] = [];
+  const originalPath = process.env.PATH;
+
+  afterEach(async () => {
+    process.env.PATH = originalPath;
+    await Promise.all(
+      cleanup.splice(0).map((d) => fs.rm(d, { recursive: true, force: true })),
+    );
+  });
+
+  it('passes when a `codex` shim is on PATH', async () => {
+    const tmp = await fs.realpath(
+      await fs.mkdtemp(path.join(os.tmpdir(), 'rea-doctor-codex-pass-')),
+    );
+    cleanup.push(tmp);
+    const shim = path.join(tmp, 'codex');
+    await fs.writeFile(shim, '#!/bin/sh\nexit 0\n', { encoding: 'utf8', mode: 0o755 });
+    process.env.PATH = `${tmp}${path.delimiter}${originalPath ?? ''}`;
+    const r = checkCodexBinaryOnPath();
+    expect(r.status).toBe('pass');
+    expect(r.detail).toMatch(/codex$/);
+  });
+
+  it('fails with actionable detail when codex is not on PATH', () => {
+    // Restrict PATH to a directory that exists but contains no `codex`.
+    process.env.PATH = '/var/empty';
+    const r = checkCodexBinaryOnPath();
+    expect(r.status).toBe('fail');
+    expect(r.detail).toMatch(/codex not found on PATH/);
+    expect(r.detail).toMatch(/codex_required: true/);
+    expect(r.detail).toMatch(/codex_required: false/);
+  });
+
+  it('collectChecks includes codex CLI on PATH check when codex_required=true', async () => {
+    const tmp = await fs.realpath(
+      await fs.mkdtemp(path.join(os.tmpdir(), 'rea-doctor-cdx-collect-')),
+    );
+    cleanup.push(tmp);
+    await fs.mkdir(path.join(tmp, '.rea'), { recursive: true });
+    await fs.writeFile(
+      path.join(tmp, '.rea', 'policy.yaml'),
+      [
+        'version: "1"',
+        'profile: "bst-internal"',
+        'installed_by: "test"',
+        'installed_at: "2026-04-18T00:00:00Z"',
+        'autonomy_level: L1',
+        'max_autonomy_level: L2',
+        'promotion_requires_human_approval: true',
+        'block_ai_attribution: true',
+        'blocked_paths:',
+        '  - .env',
+        'notification_channel: ""',
+        'review:',
+        '  codex_required: true',
+        '',
+      ].join('\n'),
+    );
+    await fs.writeFile(
+      path.join(tmp, '.rea', 'registry.yaml'),
+      ['version: "1"', 'servers: []', ''].join('\n'),
+    );
+    await fs.mkdir(path.join(tmp, '.git', 'hooks'), { recursive: true });
+    const checks = collectChecks(tmp);
+    const cdx = checks.find((c) => c.label === 'codex CLI on PATH');
+    expect(cdx).toBeDefined();
+  });
+
+  it('collectChecks omits codex CLI on PATH check when codex_required=false', async () => {
+    const tmp = await fs.realpath(
+      await fs.mkdtemp(path.join(os.tmpdir(), 'rea-doctor-cdx-collect-off-')),
+    );
+    cleanup.push(tmp);
+    await fs.mkdir(path.join(tmp, '.rea'), { recursive: true });
+    await fs.writeFile(
+      path.join(tmp, '.rea', 'policy.yaml'),
+      [
+        'version: "1"',
+        'profile: "bst-internal-no-codex"',
+        'installed_by: "test"',
+        'installed_at: "2026-04-18T00:00:00Z"',
+        'autonomy_level: L1',
+        'max_autonomy_level: L2',
+        'promotion_requires_human_approval: true',
+        'block_ai_attribution: true',
+        'blocked_paths:',
+        '  - .env',
+        'notification_channel: ""',
+        'review:',
+        '  codex_required: false',
+        '',
+      ].join('\n'),
+    );
+    await fs.writeFile(
+      path.join(tmp, '.rea', 'registry.yaml'),
+      ['version: "1"', 'servers: []', ''].join('\n'),
+    );
+    await fs.mkdir(path.join(tmp, '.git', 'hooks'), { recursive: true });
+    const checks = collectChecks(tmp);
+    const cdx = checks.find((c) => c.label === 'codex CLI on PATH');
+    expect(cdx).toBeUndefined();
   });
 });
