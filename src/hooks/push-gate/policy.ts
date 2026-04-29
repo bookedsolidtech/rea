@@ -42,6 +42,13 @@ export interface ResolvedReviewPolicy {
    * `undefined` when unset (default-untouched behavior).
    */
   last_n_commits: number | undefined;
+  /**
+   * Auto-narrow threshold (J / 0.13.0). When the resolved diff base is more
+   * than N commits behind HEAD AND no explicit narrowing was pinned, the
+   * gate scopes to `PUSH_GATE_DEFAULT_LAST_N_COMMITS_FALLBACK` (10) and
+   * emits a stderr warning. Defaults to 30 when unset; 0 disables.
+   */
+  auto_narrow_threshold: number;
   /** `true` when `.rea/policy.yaml` was absent; defaults apply. */
   policyMissing: boolean;
 }
@@ -49,6 +56,20 @@ export interface ResolvedReviewPolicy {
 export const PUSH_GATE_DEFAULT_TIMEOUT_MS = 1_800_000;
 export const PUSH_GATE_DEFAULT_CODEX_REQUIRED = true;
 export const PUSH_GATE_DEFAULT_CONCERNS_BLOCKS = true;
+/**
+ * Default auto-narrow threshold (J / 0.13.0). When the divergence between
+ * the resolved base and HEAD exceeds this count and the operator has not
+ * pinned an explicit window, the gate auto-narrows to
+ * `PUSH_GATE_DEFAULT_LAST_N_COMMITS_FALLBACK` commits.
+ */
+export const PUSH_GATE_DEFAULT_AUTO_NARROW_THRESHOLD = 30;
+/**
+ * Window the gate auto-narrows to when the threshold trips and the operator
+ * has not pinned `policy.review.last_n_commits`. Conservative — small
+ * enough that Codex review stays fast, large enough to capture meaningful
+ * recent work.
+ */
+export const PUSH_GATE_DEFAULT_LAST_N_COMMITS_FALLBACK = 10;
 
 /**
  * Resolve the push-gate policy for `baseDir`. Never throws — a malformed
@@ -68,6 +89,7 @@ export async function resolvePushGatePolicy(baseDir: string): Promise<ResolvedRe
       concerns_blocks: PUSH_GATE_DEFAULT_CONCERNS_BLOCKS,
       timeout_ms: PUSH_GATE_DEFAULT_TIMEOUT_MS,
       last_n_commits: undefined,
+      auto_narrow_threshold: PUSH_GATE_DEFAULT_AUTO_NARROW_THRESHOLD,
       policyMissing: true,
     };
   }
@@ -78,6 +100,8 @@ export async function resolvePushGatePolicy(baseDir: string): Promise<ResolvedRe
     concerns_blocks: review.concerns_blocks ?? PUSH_GATE_DEFAULT_CONCERNS_BLOCKS,
     timeout_ms: review.timeout_ms ?? PUSH_GATE_DEFAULT_TIMEOUT_MS,
     last_n_commits: review.last_n_commits,
+    auto_narrow_threshold:
+      review.auto_narrow_threshold ?? PUSH_GATE_DEFAULT_AUTO_NARROW_THRESHOLD,
     policyMissing: false,
   };
 }

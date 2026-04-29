@@ -27,6 +27,7 @@ import { appendAuditRecord } from '../../audit/append.js';
 import { Tier, InvocationStatus } from '../../policy/types.js';
 import {
   resolvePushGatePolicy,
+  PUSH_GATE_DEFAULT_LAST_N_COMMITS_FALLBACK,
   type ResolvedReviewPolicy,
 } from './policy.js';
 import { readHalt, type HaltState } from './halt.js';
@@ -289,6 +290,13 @@ export async function runPushGate(deps: PushGateDeps): Promise<GateResult> {
   );
   let base: BaseResolution;
   let headSha: string;
+  // Tracks whether the base was resolved from the active refspec's
+  // remoteSha — i.e. "the tip of this branch as the remote currently sees
+  // it". Only that case represents commits Codex has already reviewed in
+  // a prior push; auto-narrow is only safe there (J / 0.13.0). Initial
+  // pushes against `origin/main`-shaped bases must NOT auto-narrow,
+  // because earlier commits on the branch may never have been reviewed.
+  let baseFromPushedRemoteTip = false;
   if (explicitBaseSet) {
     // (a) explicit base wins absolutely.
     base = resolveBaseRef(git, { explicit: deps.explicitBase as string });
@@ -330,6 +338,9 @@ export async function runPushGate(deps: PushGateDeps): Promise<GateResult> {
       base = resolveBaseRef(git);
     } else {
       base = { ref: activeRefspec.remoteSha, source: 'explicit' };
+      // ONLY this path produces a base that represents the previously-
+      // reviewed remote tip of THIS branch. Auto-narrow is safe here.
+      baseFromPushedRemoteTip = true;
     }
   } else {
     // (e) upstream ladder.
@@ -340,6 +351,73 @@ export async function runPushGate(deps: PushGateDeps): Promise<GateResult> {
     stderr('PUSH BLOCKED: could not resolve HEAD SHA. Is this a valid git repo?\n');
     await safeAppend(appendAuditFn, deps.baseDir, EVT_ERROR, { kind: 'head-sha-missing' });
     return { status: 'error', exitCode: 2, summary: 'head-sha-missing' };
+  }
+
+  // 4b. Auto-narrow probe (J / 0.13.0). When the resolved base is far
+  //     behind HEAD AND the operator has not already pinned an explicit
+  //     window, scope the review down to the recent commits and warn.
+  //
+  //     CRITICAL safety rule: auto-narrow ONLY fires when the base was
+  //     resolved from the active refspec's remoteSha — i.e. "the tip of
+  //     this branch as the remote currently sees it". Only that case
+  //     represents commits Codex already reviewed in a prior push, so
+  //     skipping older commits on the branch is safe.
+  //
+  //     For initial pushes (or any base resolved via the upstream /
+  //     origin-head / origin-main ladder), the diff target is a trunk-
+  //     like ref where commits earlier in the branch may never have been
+  //     reviewed. Auto-narrowing past them would silently bypass the
+  //     advertised pre-push review for a hook/policy/security change
+  //     made early in the branch (codex-review 0.13.0 [P1]).
+  //
+  //     Suppression rules (any one prevents auto-narrow from firing):
+  //
+  //       - `--base` flag set (operator picked an explicit ref)
+  //       - `--last-n-commits` flag set (operator picked an explicit
+  //         window)
+  //       - `policy.review.last_n_commits` set (persistent narrow window)
+  //       - `policy.review.auto_narrow_threshold: 0` (disabled)
+  //       - resolver already produced a `last-n-commits` source (we got
+  //         here via the policyLastN branch above)
+  //       - resolver fell back to `empty-tree` (single-commit branch /
+  //         orphan; no usable upstream — narrowing would be silly)
+  //       - base was NOT derived from the active refspec's remoteSha
+  //         (initial push, no upstream, fallback to origin/main, etc.)
+  //
+  //     The probe uses `git rev-list --count base..HEAD` rather than
+  //     `diffNames().length` — line-counting commits is far cheaper than
+  //     listing every changed path on a 50+ commit branch. A null result
+  //     (range unresolvable) suppresses auto-narrow entirely; we'd
+  //     rather err on the side of reviewing more than tripping a
+  //     half-baked auto-narrow on a degenerate ref.
+  let autoNarrowed = false;
+  let originalCommitCount: number | null = null;
+  const autoNarrowEligible =
+    !explicitBaseSet &&
+    lastNFromFlag === undefined &&
+    policyLastN === undefined &&
+    policy.auto_narrow_threshold > 0 &&
+    base.source !== 'last-n-commits' &&
+    base.source !== 'empty-tree' &&
+    baseFromPushedRemoteTip;
+  if (autoNarrowEligible) {
+    originalCommitCount = git.revListCount(base.ref, headSha);
+    if (
+      originalCommitCount !== null &&
+      originalCommitCount > policy.auto_narrow_threshold
+    ) {
+      const fallbackWindow = PUSH_GATE_DEFAULT_LAST_N_COMMITS_FALLBACK;
+      const narrowed = resolveBaseRef(git, {
+        lastNCommits: fallbackWindow,
+        headRef: headSha,
+      });
+      stderr(
+        `rea: auto-narrow — ${originalCommitCount} commits behind ${base.ref} (threshold ${policy.auto_narrow_threshold}); reviewing the last ${fallbackWindow} commits instead.\n` +
+          `  Override: pass \`--last-n-commits N\` or \`--base <ref>\`, set \`review.last_n_commits\` in .rea/policy.yaml, or disable with \`review.auto_narrow_threshold: 0\`.\n`,
+      );
+      base = narrowed;
+      autoNarrowed = true;
+    }
   }
 
   // 5. Empty-diff short-circuit. An initial push against the empty-tree
@@ -354,6 +432,9 @@ export async function runPushGate(deps: PushGateDeps): Promise<GateResult> {
       head_sha: headSha,
       last_n_commits: base.lastNCommits,
       last_n_commits_requested: base.lastNCommitsRequested,
+      auto_narrowed: autoNarrowed ? true : undefined,
+      original_commit_count:
+        originalCommitCount !== null ? originalCommitCount : undefined,
     });
     return {
       status: 'empty-diff',
@@ -411,6 +492,9 @@ export async function runPushGate(deps: PushGateDeps): Promise<GateResult> {
         summary.verdict === 'concerns' && isConcernsOverrideSet(env) ? true : undefined,
       last_n_commits: base.lastNCommits,
       last_n_commits_requested: base.lastNCommitsRequested,
+      auto_narrowed: autoNarrowed ? true : undefined,
+      original_commit_count:
+        originalCommitCount !== null ? originalCommitCount : undefined,
     });
 
     if (blocked) {

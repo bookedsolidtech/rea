@@ -105,12 +105,15 @@ describe('rea doctor — collectChecks (G11.4 codex_required)', () => {
     expect(findCheck(checks, 'codex-adversarial agent installed')).toBeUndefined();
     expect(findCheck(checks, '/codex-review command installed')).toBeUndefined();
 
-    // Exactly one info line with the expected body.
-    const infoLines = checks.filter((c) => c.status === 'info');
-    expect(infoLines).toHaveLength(1);
-    expect(infoLines[0]?.label).toBe('codex');
-    expect(infoLines[0]?.detail).toMatch(/codex_required/);
-    expect(infoLines[0]?.detail).toMatch(/disabled via policy/);
+    // Exactly one Codex info line. The 0.13.0 extension-fragments probe
+    // (H) also emits an info line; filter the codex-only one for this
+    // assertion.
+    const codexInfoLines = checks.filter(
+      (c) => c.status === 'info' && c.label === 'codex',
+    );
+    expect(codexInfoLines).toHaveLength(1);
+    expect(codexInfoLines[0]?.detail).toMatch(/codex_required/);
+    expect(codexInfoLines[0]?.detail).toMatch(/disabled via policy/);
   });
 
   it('codex_required=true: Codex-specific checks are present (regression)', async () => {
@@ -123,8 +126,10 @@ describe('rea doctor — collectChecks (G11.4 codex_required)', () => {
     expect(findCheck(checks, 'codex-adversarial agent installed')).toBeDefined();
     expect(findCheck(checks, '/codex-review command installed')).toBeDefined();
 
-    // No info line.
-    expect(checks.some((c) => c.status === 'info')).toBe(false);
+    // No `codex` info line — the codex-disabled short-circuit didn't fire.
+    // (The extension-fragments probe (H) emits its own info line; that's
+    // unrelated to codex configuration.)
+    expect(checks.some((c) => c.status === 'info' && c.label === 'codex')).toBe(false);
   });
 
   it('review field absent: defaults to codex_required=true (regression)', async () => {
@@ -135,7 +140,7 @@ describe('rea doctor — collectChecks (G11.4 codex_required)', () => {
 
     expect(findCheck(checks, 'codex-adversarial agent installed')).toBeDefined();
     expect(findCheck(checks, '/codex-review command installed')).toBeDefined();
-    expect(checks.some((c) => c.status === 'info')).toBe(false);
+    expect(checks.some((c) => c.status === 'info' && c.label === 'codex')).toBe(false);
   });
 
   it('codex_required=true + probe responsive: adds cli_responsive pass + last_probe_at info', async () => {
@@ -799,5 +804,66 @@ describe('rea doctor — checkCodexBinaryOnPath (Fix C / 0.12.0)', () => {
     const checks = collectChecks(tmp);
     const cdx = checks.find((c) => c.label === 'codex CLI on PATH');
     expect(cdx).toBeUndefined();
+  });
+});
+
+describe('rea doctor — checkExtensionFragments (Fix H / 0.13.0)', () => {
+  const cleanup: string[] = [];
+  afterEach(async () => {
+    await Promise.all(
+      cleanup.splice(0).map((d) => fs.rm(d, { recursive: true, force: true })),
+    );
+  });
+
+  it('info "none" when no .husky/{commit-msg,pre-push}.d/ exists', async () => {
+    const repo = await makeScratchRepo({ codexRequired: false });
+    cleanup.push(repo.dir);
+    const checks = collectChecks(repo.dir);
+    const ext = checks.find((c) => c.label === 'extension hook fragments');
+    expect(ext).toBeDefined();
+    expect(ext?.status).toBe('info');
+    expect(ext?.detail).toMatch(/none/);
+  });
+
+  it('info with executable list when fragments exist', async () => {
+    const repo = await makeScratchRepo({ codexRequired: false });
+    cleanup.push(repo.dir);
+    const fragDir = path.join(repo.dir, '.husky', 'pre-push.d');
+    await fs.mkdir(fragDir, { recursive: true });
+    await fs.writeFile(path.join(fragDir, '10-foo'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    const checks = collectChecks(repo.dir);
+    const ext = checks.find((c) => c.label === 'extension hook fragments');
+    expect(ext?.status).toBe('info');
+    expect(ext?.detail).toMatch(/1 executable/);
+    expect(ext?.detail).toMatch(/pre-push\.d\/10-foo/);
+  });
+
+  it('warns when a non-executable file sits in the fragment dir (silently skipped)', async () => {
+    const repo = await makeScratchRepo({ codexRequired: false });
+    cleanup.push(repo.dir);
+    const fragDir = path.join(repo.dir, '.husky', 'commit-msg.d');
+    await fs.mkdir(fragDir, { recursive: true });
+    await fs.writeFile(path.join(fragDir, '10-noexec'), '#!/bin/sh\nexit 0\n', { mode: 0o644 });
+    const checks = collectChecks(repo.dir);
+    const ext = checks.find((c) => c.label === 'extension hook fragments');
+    expect(ext?.status).toBe('warn');
+    expect(ext?.detail).toMatch(/non-executable/);
+    expect(ext?.detail).toMatch(/commit-msg\.d\/10-noexec/);
+  });
+
+  it('lists fragments from BOTH directories', async () => {
+    const repo = await makeScratchRepo({ codexRequired: false });
+    cleanup.push(repo.dir);
+    const cmDir = path.join(repo.dir, '.husky', 'commit-msg.d');
+    const ppDir = path.join(repo.dir, '.husky', 'pre-push.d');
+    await fs.mkdir(cmDir, { recursive: true });
+    await fs.mkdir(ppDir, { recursive: true });
+    await fs.writeFile(path.join(cmDir, '10-cm'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    await fs.writeFile(path.join(ppDir, '20-pp'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    const checks = collectChecks(repo.dir);
+    const ext = checks.find((c) => c.label === 'extension hook fragments');
+    expect(ext?.status).toBe('info');
+    expect(ext?.detail).toMatch(/commit-msg\.d\/10-cm/);
+    expect(ext?.detail).toMatch(/pre-push\.d\/20-pp/);
   });
 });

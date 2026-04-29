@@ -106,6 +106,34 @@ export interface ReviewPolicy {
    * Positive integer. The loader rejects zero/negative values.
    */
   last_n_commits?: number;
+  /**
+   * Auto-narrow threshold (J / 0.13.0). When the resolved diff base is more
+   * than N commits behind HEAD, the gate automatically scopes the review to
+   * the last 10 commits (or `last_n_commits` if pinned) and emits a stderr
+   * warning explaining the auto-narrow + how to override.
+   *
+   * Default `30` when unset. Explicit `0` disables auto-narrow entirely.
+   *
+   * Auto-narrow is SUPPRESSED when the operator already expressed explicit
+   * intent — any of these prevents auto-narrow from firing:
+   *
+   *   - `--last-n-commits N` flag (the operator picked an exact window)
+   *   - `--base <ref>` flag (the operator picked an exact base)
+   *   - `policy.review.last_n_commits` (persistent narrow-window config)
+   *
+   * Audit metadata records `auto_narrowed: true|false` and
+   * `original_commit_count: N` on every reviewed event so operators can
+   * grep their audit log for narrowed reviews.
+   *
+   * Background: large feature branches (50+ commits relative to origin/main)
+   * routinely produced non-deterministic Codex verdicts, 10-minute timeouts,
+   * and the "thrashing" reported in helixir migration 2026-04-26. The 0.12.0
+   * `last_n_commits` knob fixed it for operators who knew to set it; J makes
+   * the protective default automatic.
+   *
+   * Non-negative integer. The loader rejects negative values.
+   */
+  auto_narrow_threshold?: number;
 }
 
 /**

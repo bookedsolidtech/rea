@@ -93,6 +93,14 @@ export interface GitExecutor {
   headSha(): string;
   /** `git diff --name-only <base> <head>`. Returns path list (possibly empty). */
   diffNames(base: string, head: string): string[];
+  /**
+   * `git rev-list --count <base>..<head>`. Returns the integer commit count
+   * or `null` when the range cannot be resolved (unreachable base, shallow
+   * clone, etc.) — null lets the caller treat divergence-counting as
+   * best-effort without breaking the gate. Used by the auto-narrow probe
+   * (J / 0.13.0).
+   */
+  revListCount(base: string, head: string): number | null;
 }
 
 /**
@@ -126,6 +134,17 @@ export function createRealGitExecutor(cwd: string): GitExecutor {
       const r = run(['diff', '--name-only', base, head]);
       if (r.code !== 0) return [];
       return r.stdout.split(/\r?\n/).filter((l) => l.length > 0);
+    },
+    revListCount(base, head) {
+      // `git rev-list --count base..head` — number of commits reachable
+      // from head but not base. Returns null on any failure so the caller
+      // can treat divergence-counting as best-effort (auto-narrow probe).
+      const r = run(['rev-list', '--count', `${base}..${head}`]);
+      if (r.code !== 0) return null;
+      const trimmed = r.stdout.trim();
+      if (trimmed.length === 0) return null;
+      const n = Number(trimmed);
+      return Number.isFinite(n) && n >= 0 ? Math.floor(n) : null;
     },
   };
 }

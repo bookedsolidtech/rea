@@ -348,6 +348,8 @@ review:
                               #   600000 in 0.12.0 — see CHANGELOG)
   last_n_commits: 10          # OPTIONAL — narrow review to the last N commits
                               #   (diff vs HEAD~N). Defaults unset.
+  auto_narrow_threshold: 30   # OPTIONAL — auto-narrow when commit count
+                              #   behind base > N (0 disables, default 30)
 ```
 
 | Key | Type | Default | Purpose |
@@ -356,6 +358,84 @@ review:
 | `review.concerns_blocks` | boolean | `true` | When `true`, `[P2]` verdicts return exit 2. Flip to `false` for a looser posture where only `[P1]` halts the push. |
 | `review.timeout_ms` | number | `1800000` | Hard cap on the `codex exec review` subprocess in milliseconds. Exceeding it kills the subprocess and returns exit 2 with a `timeout` kind. Positive integer; zero/negative is rejected at load. **Raised from 600000 (10 min) to 1800000 (30 min) in 0.12.0** after operator data showed realistic feature-branch reviews routinely exceeded 10 minutes; pin `timeout_ms: 600000` explicitly to retain the old default. |
 | `review.last_n_commits` | number | unset | When set, the gate diffs against `HEAD~N` instead of running the upstream → origin/HEAD → main/master ladder. Useful when a feature branch has accumulated many commits and the full base diff overwhelms the reviewer. Positive integer. CLI `--last-n-commits N` overrides this; `--base <ref>` overrides both. When `HEAD~N` is unreachable the resolver clamps based on whether the repo is a shallow clone: **(full clone, branch shorter than N)** clamps to the empty-tree sentinel so the root commit's changes are included (reviewing all `K+1` commits on the branch); **(shallow clone)** clamps to `HEAD~K` SHA — the deepest locally resolvable ancestor — so the review does not balloon to every tracked file (older history exists on the remote but isn't fetched). A stderr warning surfaces the requested-vs-clamped numbers in both cases. Audit metadata records `base_source: 'last-n-commits'`, `last_n_commits: <count actually reviewed>`, and `last_n_commits_requested: N` (only present when clamped). |
+| `review.auto_narrow_threshold` | number | `30` | Added in **0.13.0**. When the resolved diff base is more than N commits behind HEAD AND the base was resolved from the active refspec's `remoteSha` (i.e. previously-pushed remote tip of this branch — commits already Codex-reviewed) AND no explicit narrowing was set, the gate auto-scopes to the last 10 commits and emits a stderr warning. Set to `0` to disable. **Suppressed** when any of `--base`, `--last-n-commits`, `policy.review.last_n_commits`, OR the base was resolved via the upstream / origin-head / origin-main ladder (initial push, no upstream, fallback to trunk). Auto-narrow never fires on initial pushes — earlier commits on the branch may not have been reviewed yet, and skipping past them would silently bypass the gate's coverage contract. Audit metadata records `auto_narrowed: true` and `original_commit_count: N` so operators can grep for narrowed reviews. Background: large feature branches (50+ commits relative to a previously-pushed tip) routinely produced non-deterministic Codex verdicts and 30-minute timeouts; J makes the protective default automatic without compromising first-push coverage. |
+
+### Auto-narrow on large divergence (0.13.0)
+
+When pushing a long-running branch that has already been pushed before (so
+the remote tip is the previously-reviewed Codex baseline), follow-up
+pushes that pile up many commits since the last push can timeout the
+reviewer or produce inconsistent verdicts. **Auto-narrow** detects this
+case and scopes the review down to recent commits automatically:
+
+```
+$ git push origin feature/big-thing
+rea: auto-narrow — 80 commits behind <previous-remote-tip-sha> (threshold 30);
+  reviewing the last 10 commits instead.
+  Override: pass `--last-n-commits N` or `--base <ref>`, set
+  `review.last_n_commits` in .rea/policy.yaml, or disable with
+  `review.auto_narrow_threshold: 0`.
+```
+
+The probe runs `git rev-list --count base..HEAD` after base resolution.
+**Auto-narrow only fires when the base was resolved from the active
+refspec's `remoteSha`** — i.e. the previously-pushed tip of this branch,
+where the older commits have already been Codex-reviewed in a prior push.
+Initial pushes (where the resolver falls back to `origin/main` or the
+upstream ladder) are NEVER auto-narrowed: skipping past those earlier
+commits would silently bypass the advertised pre-push review for any
+hook/policy/security change made early in the branch.
+
+When eligible and the count exceeds `review.auto_narrow_threshold`
+(default 30) and no narrowing override is in effect, the gate re-resolves
+to `HEAD~10` and proceeds with the smaller diff. Every reviewed event
+includes `auto_narrowed: true` + `original_commit_count: <N>` in audit
+metadata.
+
+To opt out for one push: pass `--last-n-commits N` or `--base <ref>`. To
+opt out persistently: set `review.last_n_commits` (any value), or set
+`review.auto_narrow_threshold: 0`.
+
+### Extension-hook chaining (0.13.0)
+
+Drop executable scripts into `.husky/commit-msg.d/` or `.husky/pre-push.d/`
+and rea will run them after its own governance work, in lexical order, with
+the same positional args. Useful for layering commitlint, conventional-
+commits linters, branch-policy checks, or any other per-commit / per-push
+work without losing rea coverage.
+
+```bash
+mkdir -p .husky/pre-push.d
+cat > .husky/pre-push.d/10-commitlint <<'EOF'
+#!/bin/sh
+# Verify every new commit on the pushed range has a conventional message.
+exec npx --no-install commitlint --from "origin/main" --to "HEAD"
+EOF
+chmod +x .husky/pre-push.d/10-commitlint
+```
+
+Rules:
+
+- **Sourced AFTER rea's body** — HALT, attribution blocking, and Codex
+  review run first; fragments only fire when rea succeeds. A non-zero exit
+  from rea short-circuits before any fragment runs.
+- **Lexical order** — `10-foo` runs before `20-bar` runs before `90-baz`.
+  The standard convention is to prefix with a two-digit ordering number.
+- **Executable bit gates** — only files with `chmod +x` are run. A README
+  or `.disabled` file in the directory is silently skipped.
+- **Non-zero exit fails the hook** — the next fragment does not run, the
+  push / commit is blocked. This matches husky's normal hook chaining
+  semantics.
+- **Missing directory is a no-op** — backward compatible with consumers
+  who never opt into fragments.
+- **Fragments cannot replay pre-push stdin** — git delivers refspec data
+  on stdin which rea consumes during its own review. Fragments that need
+  refspec data should run before rea (use a custom hook in
+  `core.hooksPath` instead). Fragments that need ambient repo state can
+  call `git rev-parse` themselves.
+
+`rea doctor` lists every fragment it sees and warns when a non-executable
+file is sitting in either directory (silently skipped at hook-fire time).
 
 ### Codex CLI dependency
 
@@ -595,6 +675,8 @@ review:
   concerns_blocks: true
   timeout_ms: 1800000
   # last_n_commits: 10            # optional — narrow review to HEAD~N
+  # auto_narrow_threshold: 30     # optional — auto-narrow when commits
+                                   # behind base > N (0 disables, default 30)
 redact:
   match_timeout_ms: 100
   patterns:

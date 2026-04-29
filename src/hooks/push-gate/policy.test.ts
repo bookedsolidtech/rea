@@ -3,8 +3,10 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
+  PUSH_GATE_DEFAULT_AUTO_NARROW_THRESHOLD,
   PUSH_GATE_DEFAULT_CODEX_REQUIRED,
   PUSH_GATE_DEFAULT_CONCERNS_BLOCKS,
+  PUSH_GATE_DEFAULT_LAST_N_COMMITS_FALLBACK,
   PUSH_GATE_DEFAULT_TIMEOUT_MS,
   resolvePushGatePolicy,
 } from './policy.js';
@@ -40,8 +42,46 @@ describe('resolvePushGatePolicy', () => {
       concerns_blocks: PUSH_GATE_DEFAULT_CONCERNS_BLOCKS,
       timeout_ms: PUSH_GATE_DEFAULT_TIMEOUT_MS,
       last_n_commits: undefined,
+      auto_narrow_threshold: PUSH_GATE_DEFAULT_AUTO_NARROW_THRESHOLD,
       policyMissing: true,
     });
+  });
+
+  it('PUSH_GATE_DEFAULT_AUTO_NARROW_THRESHOLD is 30', () => {
+    expect(PUSH_GATE_DEFAULT_AUTO_NARROW_THRESHOLD).toBe(30);
+  });
+
+  it('PUSH_GATE_DEFAULT_LAST_N_COMMITS_FALLBACK is 10', () => {
+    expect(PUSH_GATE_DEFAULT_LAST_N_COMMITS_FALLBACK).toBe(10);
+  });
+
+  it('honors explicit review.auto_narrow_threshold', async () => {
+    await fs.writeFile(
+      path.join(baseDir, '.rea', 'policy.yaml'),
+      MINIMAL_POLICY + 'review:\n  auto_narrow_threshold: 100\n',
+      'utf8',
+    );
+    const p = await resolvePushGatePolicy(baseDir);
+    expect(p.auto_narrow_threshold).toBe(100);
+  });
+
+  it('honors review.auto_narrow_threshold: 0 (disabled)', async () => {
+    await fs.writeFile(
+      path.join(baseDir, '.rea', 'policy.yaml'),
+      MINIMAL_POLICY + 'review:\n  auto_narrow_threshold: 0\n',
+      'utf8',
+    );
+    const p = await resolvePushGatePolicy(baseDir);
+    expect(p.auto_narrow_threshold).toBe(0);
+  });
+
+  it('rejects review.auto_narrow_threshold: -1 (non-negative integer required)', async () => {
+    await fs.writeFile(
+      path.join(baseDir, '.rea', 'policy.yaml'),
+      MINIMAL_POLICY + 'review:\n  auto_narrow_threshold: -1\n',
+      'utf8',
+    );
+    await expect(resolvePushGatePolicy(baseDir)).rejects.toThrow(/Invalid policy schema/);
   });
 
   it('PUSH_GATE_DEFAULT_TIMEOUT_MS is 30 minutes (raised in 0.12.0 from 10 min)', () => {
