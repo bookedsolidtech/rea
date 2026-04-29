@@ -230,10 +230,12 @@ $ git push
 │   1. HALT check (again, defense-in-depth)               │
 │   2. Load .rea/policy.yaml (zod-validated)              │
 │   3. codex_required=false → status:disabled, exit 0     │
-│   4. REA_SKIP_PUSH_GATE=<reason> → skipped, exit 0      │
+│   4. REA_SKIP_PUSH_GATE / REA_SKIP_CODEX_REVIEW=<reason>│
+│      → skipped, exit 0 (audit records skip_var)         │
 │   5. Parse pre-push stdin refspecs                      │
-│   6. Resolve base ref (refspec → upstream → origin/HEAD │
-│      → main/master → empty-tree sentinel)               │
+│   6. Resolve base ref (--base → --last-n-commits N      │
+│      → policy.review.last_n_commits → refspec →         │
+│      upstream → origin/HEAD → main/master → empty-tree) │
 │   7. Empty-diff check → status:empty-diff, exit 0       │
 │   8. codex exec review --base <ref> --json --ephemeral  │
 │   9. Parse [P1]/[P2]/[P3] findings                      │
@@ -256,7 +258,7 @@ $ git push
 | `blocking` | Push blocks always | `2` | `[P1]` findings present; no override |
 | HALT | Push blocks | `1` | `.rea/HALT` is active; run `rea unfreeze` |
 | `disabled` | Push proceeds | `0` | `review.codex_required: false` in policy |
-| `skipped` | Push proceeds | `0` | `REA_SKIP_PUSH_GATE=<reason>` set; audited |
+| `skipped` | Push proceeds | `0` | `REA_SKIP_PUSH_GATE=<reason>` or `REA_SKIP_CODEX_REVIEW=<reason>` set; audited |
 | `empty-diff` | Push proceeds | `0` | No file changes between base and head |
 | `error` | Push blocks | `2` | Codex not installed, timeout, subprocess error, malformed policy, head-sha resolution failure |
 
@@ -331,11 +333,9 @@ The file is:
 
 | Variable | Purpose |
 | --- | --- |
-| `REA_SKIP_PUSH_GATE=<reason>` | Value-carrying waiver. When set to a non-empty string, the gate short-circuits to `status:skipped` (exit 0) and appends `rea.push_gate.skipped` with the reason as metadata. HALT **always** wins over this — a frozen install still blocks. Use sparingly; every use is audited. |
+| `REA_SKIP_PUSH_GATE=<reason>` | Value-carrying waiver. When set to a non-empty string, the gate short-circuits to `status:skipped` (exit 0) and appends `rea.push_gate.skipped` with the reason and `skip_var: REA_SKIP_PUSH_GATE` as metadata. HALT **always** wins over this — a frozen install still blocks. Use sparingly; every use is audited. |
+| `REA_SKIP_CODEX_REVIEW=<reason>` | Equivalent alias for `REA_SKIP_PUSH_GATE`, added in 0.12.0. Same exit behavior; audit metadata records `skip_var: REA_SKIP_CODEX_REVIEW` so operators can grep their audit log to see which variant agents used. When both env vars are set, `REA_SKIP_PUSH_GATE` wins. |
 | `REA_ALLOW_CONCERNS=1` | One-push override for `concerns` verdict. Accepts `1`, `true`, or `yes` (case-insensitive). Does **not** override `blocking`. The audit record is stamped `concerns_override: true` so reviewers can see the override was used. |
-
-There is no `REA_SKIP_CODEX_REVIEW` or `REA_SKIP_PUSH_REVIEW` anymore;
-both were removed in 0.11.0 along with the cache-attestation gate.
 
 ### Policy knobs
 
@@ -344,19 +344,38 @@ both were removed in 0.11.0 along with the cache-attestation gate.
 review:
   codex_required: true        # default true — run Codex on every push
   concerns_blocks: true       # default true — [P2] halts the push
-  timeout_ms: 600000          # default 600000 (10 minutes)
+  timeout_ms: 1800000         # default 1800000 (30 minutes; raised from
+                              #   600000 in 0.12.0 — see CHANGELOG)
+  last_n_commits: 10          # OPTIONAL — narrow review to the last N commits
+                              #   (diff vs HEAD~N). Defaults unset.
 ```
 
 | Key | Type | Default | Purpose |
 | --- | --- | --- | --- |
 | `review.codex_required` | boolean | `true` | Master on/off. `false` short-circuits the gate to `status:disabled`, still audited. `-no-codex` profiles set this to `false`. |
 | `review.concerns_blocks` | boolean | `true` | When `true`, `[P2]` verdicts return exit 2. Flip to `false` for a looser posture where only `[P1]` halts the push. |
-| `review.timeout_ms` | number | `600000` | Hard cap on the `codex exec review` subprocess in milliseconds. Exceeding it kills the subprocess and returns exit 2 with a `timeout` kind. Positive integer; zero/negative is rejected at load. |
+| `review.timeout_ms` | number | `1800000` | Hard cap on the `codex exec review` subprocess in milliseconds. Exceeding it kills the subprocess and returns exit 2 with a `timeout` kind. Positive integer; zero/negative is rejected at load. **Raised from 600000 (10 min) to 1800000 (30 min) in 0.12.0** after operator data showed realistic feature-branch reviews routinely exceeded 10 minutes; pin `timeout_ms: 600000` explicitly to retain the old default. |
+| `review.last_n_commits` | number | unset | When set, the gate diffs against `HEAD~N` instead of running the upstream → origin/HEAD → main/master ladder. Useful when a feature branch has accumulated many commits and the full base diff overwhelms the reviewer. Positive integer. CLI `--last-n-commits N` overrides this; `--base <ref>` overrides both. When `HEAD~N` is unreachable the resolver clamps based on whether the repo is a shallow clone: **(full clone, branch shorter than N)** clamps to the empty-tree sentinel so the root commit's changes are included (reviewing all `K+1` commits on the branch); **(shallow clone)** clamps to `HEAD~K` SHA — the deepest locally resolvable ancestor — so the review does not balloon to every tracked file (older history exists on the remote but isn't fetched). A stderr warning surfaces the requested-vs-clamped numbers in both cases. Audit metadata records `base_source: 'last-n-commits'`, `last_n_commits: <count actually reviewed>`, and `last_n_commits_requested: N` (only present when clamped). |
 
 ### Codex CLI dependency
 
-The gate shells out to `codex`. If the binary is not on `PATH` the gate
-returns exit 2 with a clear install hint:
+The gate shells out to `codex`. **`codex` is a hard prerequisite** when
+`policy.review.codex_required: true` (the default for every profile other
+than the `-no-codex` variants). As of 0.12.0 `rea doctor` runs a
+`codex CLI on PATH` check that **fails** when codex is required by policy
+but the binary is not on `PATH` — surfacing the prereq during install
+rather than at first push:
+
+```
+[fail] codex CLI on PATH
+       codex not found on PATH. policy.review.codex_required: true requires
+       the codex binary. Install: https://github.com/openai/codex
+       (e.g. `npm i -g @openai/codex`). To disable the push-gate instead,
+       set policy.review.codex_required: false in .rea/policy.yaml.
+```
+
+If a push is attempted without codex on PATH, the gate also returns exit 2
+with the same install hint:
 
 ```
 codex CLI not found on PATH. Install with `npm i -g @openai/codex`,
@@ -369,8 +388,6 @@ Operators who do not have Codex available can either:
 - Run `rea init --profile bst-internal-no-codex` (or `open-source-no-codex`),
   which sets `review.codex_required: false` on install.
 - Flip `review.codex_required: false` in an existing policy file.
-
-`rea doctor` warns when Codex is required by policy but not on PATH.
 
 ### Standalone usage
 
@@ -385,6 +402,10 @@ rea hook push-gate
 # Review against an explicit base.
 rea hook push-gate --base origin/main
 rea hook push-gate --base refs/remotes/upstream/main
+
+# Narrow the review to the last N commits (diff vs HEAD~N). Loses to
+# --base when both are set; mirrors policy.review.last_n_commits.
+rea hook push-gate --last-n-commits 10
 ```
 
 Exit codes match the pre-push contract. The JSON payload is written to
@@ -572,7 +593,8 @@ context_protection:
 review:
   codex_required: true
   concerns_blocks: true
-  timeout_ms: 600000
+  timeout_ms: 1800000
+  # last_n_commits: 10            # optional — narrow review to HEAD~N
 redact:
   match_timeout_ms: 100
   patterns:
@@ -870,9 +892,14 @@ there to make it a one-liner.
   — all removed. The stateless gate consults no cache.
 - `rea audit record codex-review --also-set-cache` — removed. The gate
   writes its own audit records from the actual Codex run.
-- Setting `REA_SKIP_CODEX_REVIEW` / `REA_SKIP_PUSH_REVIEW` — removed. Use
-  `REA_SKIP_PUSH_GATE=<reason>` (value-carrying, always audited) or flip
-  `review.codex_required: false` in policy.
+- Setting `REA_SKIP_PUSH_REVIEW` — removed. Use either
+  `REA_SKIP_PUSH_GATE=<reason>` or `REA_SKIP_CODEX_REVIEW=<reason>`
+  (both value-carrying and always audited; identical effect, distinct
+  `skip_var` in audit metadata) or flip `review.codex_required: false`
+  in policy. `REA_SKIP_CODEX_REVIEW` was reinstated in 0.12.0 as an
+  audited alias for `REA_SKIP_PUSH_GATE` — it had been documented in the
+  gateway-tier reviewers but not in the push-gate, leaving agents
+  setting the documented variant blocked.
 
 ---
 

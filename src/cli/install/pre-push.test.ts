@@ -119,6 +119,107 @@ describe('isReaManagedHuskyGate — three-line anchored markers', () => {
   });
 });
 
+describe('BODY_TEMPLATE — path-with-spaces portability (Fix A / 0.12.0)', () => {
+  it('uses positional-args dispatch via `set --` rather than `exec $REA_BIN`', () => {
+    const body = fallbackHookContent();
+    // The 0.11.x body word-split on `exec $REA_BIN ...` — break that by
+    // ensuring the modern form uses `set --` arms terminated by `exec "$@"`.
+    expect(body).toMatch(/set -- "\$\{REA_ROOT\}\/node_modules\/\.bin\/rea" hook push-gate "\$@"/);
+    expect(body).toMatch(/set -- node "\$\{REA_ROOT\}\/dist\/cli\/index\.js" hook push-gate "\$@"/);
+    expect(body).toMatch(/exec "\$@"/);
+    // The fragile pattern `exec $REA_BIN ...` must not appear as an
+    // executable line. Comments referencing the historic bug are fine —
+    // anchor the negative match to lines NOT starting with `#`.
+    const bodyLines = body.split('\n');
+    const executableLines = bodyLines.filter((l) => !/^\s*#/.test(l));
+    expect(executableLines.some((l) => /exec\s+\$REA_BIN/.test(l))).toBe(false);
+  });
+
+  it('shellcheck-clean: every command substitution + var expansion is double-quoted', () => {
+    const body = fallbackHookContent();
+    // `${REA_ROOT}/...` paths inside `set --` arms must be quoted (positional
+    // arg integrity when the path contains spaces).
+    expect(body).toMatch(/"\$\{REA_ROOT\}\/node_modules\/\.bin\/rea"/);
+    expect(body).toMatch(/"\$\{REA_ROOT\}\/dist\/cli\/index\.js"/);
+    // The HALT-detection branch already used quoted expansion; keep it.
+    expect(body).toMatch(/"\$\{REA_ROOT\}\/\.rea\/HALT"/);
+  });
+
+  it('dogfood `dist/cli/index.js` branch is gated on package.json declaring @bookedsolid/rea', () => {
+    // Regression for codex-adversarial finding 2026-04-29 (P1):
+    // a bare `[ -f dist/cli/index.js ]` predicate fired in any consumer
+    // repo that happened to ship its own dist/cli/index.js — running the
+    // consumer's unrelated app with `hook push-gate` instead of REA. The
+    // dogfood arm must require a rea-specific package.json signal too.
+    const body = fallbackHookContent();
+    expect(body).toMatch(/grep -q '"name": \*"@bookedsolid\/rea"' "\$\{REA_ROOT\}\/package\.json"/);
+    expect(body).toMatch(/\[ -f "\$\{REA_ROOT\}\/dist\/cli\/index\.js" \] && \[ -f "\$\{REA_ROOT\}\/package\.json" \]/);
+  });
+
+  it('shipped husky body delegates via `set --` arms identically to the fallback', () => {
+    const husky = huskyHookContent();
+    expect(husky).toMatch(/set -- "\$\{REA_ROOT\}\/node_modules\/\.bin\/rea" hook push-gate "\$@"/);
+    expect(husky).toMatch(/exec "\$@"/);
+    const huskyLines = husky.split('\n');
+    const executableHuskyLines = huskyLines.filter((l) => !/^\s*#/.test(l));
+    expect(executableHuskyLines.some((l) => /exec\s+\$REA_BIN/.test(l))).toBe(false);
+  });
+
+  it('runs end-to-end against a path containing a space (real shell exec)', async () => {
+    // Stage the body in a tmpdir whose path contains a space (the
+    // helixir-migration breakage). Use `sh -n` for a syntax check first
+    // (parse failures would manifest as syntax errors when REA_ROOT
+    // contained whitespace under the old word-split form).
+    const dirWithSpace = await fs.realpath(
+      await fs.mkdtemp(path.join(os.tmpdir(), 'rea-prepush-space ')),
+    );
+    try {
+      const hp = path.join(dirWithSpace, 'pre-push');
+      await fs.writeFile(hp, fallbackHookContent(), { encoding: 'utf8', mode: 0o755 });
+      // sh -n verifies the body parses without word-splitting issues even
+      // when the surrounding directory has whitespace.
+      const r = await execFileAsync('sh', ['-n', hp]);
+      expect(r.stderr).toBe('');
+    } finally {
+      await fs.rm(dirWithSpace, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('marker bumps (Fix A / 0.12.0) — v3 markers + v2 legacy detection', () => {
+  it('FALLBACK_MARKER is the v3 marker', () => {
+    expect(FALLBACK_MARKER).toBe('# rea:pre-push-fallback v3');
+  });
+
+  it('HUSKY_GATE_MARKER and HUSKY_GATE_BODY_MARKER are v3', () => {
+    expect(HUSKY_GATE_MARKER).toBe('# rea:husky-pre-push-gate v3');
+    expect(HUSKY_GATE_BODY_MARKER).toBe('# rea:gate-body-v3');
+  });
+
+  it('isLegacyReaManagedFallback recognizes 0.11.x v2 markers (refresh-on-upgrade)', () => {
+    const v2Body = `#!/bin/sh\n# rea:pre-push-fallback v2\n# rea:gate-body-v2\nset -eu\nexec $REA_BIN hook push-gate "$@"\n`;
+    expect(isLegacyReaManagedFallback(v2Body)).toBe(true);
+  });
+
+  it('isLegacyReaManagedHuskyGate recognizes 0.11.x v2 marker pair (refresh-on-upgrade)', () => {
+    const v2Body = `#!/bin/sh\n# rea:husky-pre-push-gate v2\n# rea:gate-body-v2\nset -eu\nexec $REA_BIN hook push-gate "$@"\n`;
+    expect(isLegacyReaManagedHuskyGate(v2Body)).toBe(true);
+  });
+
+  it('classifyExistingHook maps a v2 husky body to rea-managed-husky-legacy-v1 (legacy bucket)', async () => {
+    const tmp = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-pp-v2-')));
+    try {
+      const hp = path.join(tmp, 'pre-push');
+      const v2Body = `#!/bin/sh\n# rea:husky-pre-push-gate v2\n# rea:gate-body-v2\nset -eu\nexec $REA_BIN hook push-gate "$@"\n`;
+      await writeHook(hp, v2Body);
+      const res = await classifyExistingHook(hp);
+      expect(res.kind).toBe('rea-managed-husky-legacy-v1');
+    } finally {
+      await fs.rm(tmp, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('referencesReviewGate — delegation to `rea hook push-gate`', () => {
   it('matches a bare `exec rea hook push-gate` line', () => {
     expect(referencesReviewGate('#!/bin/sh\nexec rea hook push-gate\n')).toBe(true);

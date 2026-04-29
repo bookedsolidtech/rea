@@ -24,6 +24,7 @@ const DEFAULT_POLICY = {
   codex_required: PUSH_GATE_DEFAULT_CODEX_REQUIRED,
   concerns_blocks: PUSH_GATE_DEFAULT_CONCERNS_BLOCKS,
   timeout_ms: PUSH_GATE_DEFAULT_TIMEOUT_MS,
+  last_n_commits: undefined,
   policyMissing: false,
 };
 
@@ -157,6 +158,359 @@ describe('runPushGate — REA_SKIP_PUSH_GATE waiver', () => {
       }),
     );
     expect(codexInvoked).toBe(true);
+  });
+});
+
+describe('runPushGate — REA_SKIP_CODEX_REVIEW waiver (Fix B / 0.12.0)', () => {
+  let baseDir: string;
+  beforeEach(async () => {
+    baseDir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-pg-idx-skipcdx-')));
+  });
+  afterEach(async () => {
+    await fs.rm(baseDir, { recursive: true, force: true });
+  });
+
+  it('skips gate when REA_SKIP_CODEX_REVIEW is set with a non-empty reason', async () => {
+    let codexInvoked = false;
+    const audited: Array<{ tool: string; meta?: Record<string, unknown> }> = [];
+    const result = await runPushGate(
+      baseDeps(baseDir, {
+        env: { REA_SKIP_CODEX_REVIEW: 'helixir-migration 2026-04-26' },
+        runCodex: async () => {
+          codexInvoked = true;
+          return { reviewText: '', eventCount: 0, durationSeconds: 0 };
+        },
+        appendAudit: async (_baseDir, record) => {
+          audited.push({ tool: record.tool_name, meta: record.metadata });
+          return {} as never;
+        },
+      }),
+    );
+    expect(result.status).toBe('skipped');
+    expect(result.exitCode).toBe(0);
+    expect(codexInvoked).toBe(false);
+    const skipped = audited.find((e) => e.tool === 'rea.push_gate.skipped');
+    expect(skipped?.meta?.skip_var).toBe('REA_SKIP_CODEX_REVIEW');
+    expect(skipped?.meta?.reason).toBe('helixir-migration 2026-04-26');
+  });
+
+  it('does NOT skip when REA_SKIP_CODEX_REVIEW is set to empty string', async () => {
+    let codexInvoked = false;
+    await runPushGate(
+      baseDeps(baseDir, {
+        env: { REA_SKIP_CODEX_REVIEW: '' },
+        runCodex: async () => {
+          codexInvoked = true;
+          return { reviewText: '', eventCount: 0, durationSeconds: 0 };
+        },
+      }),
+    );
+    expect(codexInvoked).toBe(true);
+  });
+
+  it('REA_SKIP_PUSH_GATE wins when both env vars are set', async () => {
+    const audited: Array<{ tool: string; meta?: Record<string, unknown> }> = [];
+    await runPushGate(
+      baseDeps(baseDir, {
+        env: {
+          REA_SKIP_PUSH_GATE: 'canonical waiver',
+          REA_SKIP_CODEX_REVIEW: 'should-not-win',
+        },
+        appendAudit: async (_baseDir, record) => {
+          audited.push({ tool: record.tool_name, meta: record.metadata });
+          return {} as never;
+        },
+      }),
+    );
+    const skipped = audited.find((e) => e.tool === 'rea.push_gate.skipped');
+    expect(skipped?.meta?.skip_var).toBe('REA_SKIP_PUSH_GATE');
+    expect(skipped?.meta?.reason).toBe('canonical waiver');
+  });
+
+  it('audits skip_var=REA_SKIP_PUSH_GATE on the original waiver', async () => {
+    const audited: Array<{ tool: string; meta?: Record<string, unknown> }> = [];
+    await runPushGate(
+      baseDeps(baseDir, {
+        env: { REA_SKIP_PUSH_GATE: 'urgent hotfix' },
+        appendAudit: async (_baseDir, record) => {
+          audited.push({ tool: record.tool_name, meta: record.metadata });
+          return {} as never;
+        },
+      }),
+    );
+    const skipped = audited.find((e) => e.tool === 'rea.push_gate.skipped');
+    expect(skipped?.meta?.skip_var).toBe('REA_SKIP_PUSH_GATE');
+  });
+});
+
+describe('runPushGate — --last-n-commits / policy.review.last_n_commits (Fix D / 0.12.0)', () => {
+  let baseDir: string;
+  beforeEach(async () => {
+    baseDir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-pg-idx-lastn-')));
+  });
+  afterEach(async () => {
+    await fs.rm(baseDir, { recursive: true, force: true });
+  });
+
+  it('uses HEAD~N when --last-n-commits flag is set; audit metadata reflects last-n-commits source', async () => {
+    const audited: Array<{ tool: string; meta?: Record<string, unknown> }> = [];
+    let codexBaseRef = '';
+    const result = await runPushGate(
+      baseDeps(baseDir, {
+        lastNCommits: 3,
+        git: fakeGit({
+          tryRevParse: (args) => {
+            // Resolver asks `git rev-parse --verify --quiet HEAD~3^{commit}`.
+            if (args.some((a) => /~\d+\^\{commit\}$/.test(a))) {
+              return 'cafefeed1234567890abcdef1234567890abcdef';
+            }
+            return '';
+          },
+        }),
+        runCodex: async ({ baseRef }) => {
+          codexBaseRef = baseRef;
+          return { reviewText: 'No issues.', eventCount: 1, durationSeconds: 0.1 };
+        },
+        appendAudit: async (_baseDir, record) => {
+          audited.push({ tool: record.tool_name, meta: record.metadata });
+          return {} as never;
+        },
+      }),
+    );
+    expect(result.status).toBe('pass');
+    expect(codexBaseRef).toBe('cafefeed1234567890abcdef1234567890abcdef');
+    const reviewed = audited.find((e) => e.tool === 'rea.push_gate.reviewed');
+    expect(reviewed?.meta?.base_source).toBe('last-n-commits');
+    expect(reviewed?.meta?.last_n_commits).toBe(3);
+  });
+
+  it('warns and uses empty-tree when even HEAD~1 does not resolve (single-commit history)', async () => {
+    const stderr: string[] = [];
+    const audited: Array<{ tool: string; meta?: Record<string, unknown> }> = [];
+    await runPushGate(
+      baseDeps(baseDir, {
+        lastNCommits: 50,
+        stderr: (line) => stderr.push(line),
+        git: fakeGit({
+          tryRevParse: () => '', // single-commit — every probe (incl. ~1) fails
+        }),
+        appendAudit: async (_baseDir, record) => {
+          audited.push({ tool: record.tool_name, meta: record.metadata });
+          return {} as never;
+        },
+      }),
+    );
+    // Warning: requested ~50 not reachable; reviewing all 1 commits.
+    expect(stderr.some((l) => /~50 not reachable; reviewing all 1 commits/.test(l))).toBe(true);
+    const reviewed = audited.find((e) => e.tool === 'rea.push_gate.reviewed');
+    expect(reviewed?.meta?.last_n_commits).toBe(1);
+    expect(reviewed?.meta?.last_n_commits_requested).toBe(50);
+  });
+
+  it('full clone, branch shorter than N: includes the root commit (empty-tree base; K+1 commits reviewed)', async () => {
+    // Regression for [P1] Codex 2026-04-29 (first finding): when
+    // last_n_commits is larger than the branch history on a FULL
+    // clone, the resolver must include the root commit's changes.
+    // Diffing against the oldest reachable commit (HEAD~K) would
+    // silently EXCLUDE that commit (`git diff base..HEAD` excludes
+    // `base`). The fix: clamp to empty-tree and report
+    // `last_n_commits: K+1` (every commit reviewed, root included).
+    const reachableDepths = new Set([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+    const stderr: string[] = [];
+    const audited: Array<{ tool: string; meta?: Record<string, unknown> }> = [];
+    await runPushGate(
+      baseDeps(baseDir, {
+        lastNCommits: 50,
+        stderr: (line) => stderr.push(line),
+        git: fakeGit({
+          tryRevParse: (args) => {
+            if (args.includes('--is-shallow-repository')) return 'false';
+            for (const a of args) {
+              const m = /~(\d+)\^\{commit\}$/.exec(a);
+              if (m !== null) {
+                const depth = Number(m[1]);
+                if (reachableDepths.has(depth)) {
+                  return `cafe${depth.toString(16).padStart(36, '0')}`;
+                }
+                return '';
+              }
+            }
+            return '';
+          },
+        }),
+        appendAudit: async (_baseDir, record) => {
+          audited.push({ tool: record.tool_name, meta: record.metadata });
+          return {} as never;
+        },
+      }),
+    );
+    expect(stderr.some((l) => /~50 not reachable; reviewing all 13 commits/.test(l))).toBe(true);
+    const reviewed = audited.find((e) => e.tool === 'rea.push_gate.reviewed');
+    expect(reviewed?.meta?.base_source).toBe('last-n-commits');
+    expect(reviewed?.meta?.last_n_commits).toBe(13);
+    expect(reviewed?.meta?.last_n_commits_requested).toBe(50);
+  });
+
+  it('shallow clone, depth shorter than N: clamps to ~K SHA so the review does not balloon to every tracked file', async () => {
+    // Regression for [P1] Codex 2026-04-29 (second finding): on a
+    // SHALLOW clone the deepest reachable commit is NOT the root —
+    // older history exists on the remote. Using empty-tree as the
+    // base would make the review include every tracked file in the
+    // checkout, defeating the narrowing the operator asked for. The
+    // fix: when --is-shallow-repository is true, diff against
+    // <headRef>~K SHA and report `last_n_commits: K`.
+    const reachableDepths = new Set([1, 2, 3, 4, 5]);
+    const stderr: string[] = [];
+    const audited: Array<{ tool: string; meta?: Record<string, unknown> }> = [];
+    await runPushGate(
+      baseDeps(baseDir, {
+        lastNCommits: 50,
+        stderr: (line) => stderr.push(line),
+        git: fakeGit({
+          tryRevParse: (args) => {
+            if (args.includes('--is-shallow-repository')) return 'true';
+            for (const a of args) {
+              const m = /~(\d+)\^\{commit\}$/.exec(a);
+              if (m !== null) {
+                const depth = Number(m[1]);
+                if (reachableDepths.has(depth)) {
+                  return `cafe${depth.toString(16).padStart(36, '0')}`;
+                }
+                return '';
+              }
+            }
+            return '';
+          },
+        }),
+        appendAudit: async (_baseDir, record) => {
+          audited.push({ tool: record.tool_name, meta: record.metadata });
+          return {} as never;
+        },
+      }),
+    );
+    expect(stderr.some((l) => /~50 not reachable; reviewing all 5 commits/.test(l))).toBe(true);
+    const reviewed = audited.find((e) => e.tool === 'rea.push_gate.reviewed');
+    expect(reviewed?.meta?.base_source).toBe('last-n-commits');
+    expect(reviewed?.meta?.last_n_commits).toBe(5);
+    expect(reviewed?.meta?.last_n_commits_requested).toBe(50);
+  });
+
+  it('CLI flag wins over policy key when both are set', async () => {
+    const audited: Array<{ tool: string; meta?: Record<string, unknown> }> = [];
+    await runPushGate(
+      baseDeps(baseDir, {
+        lastNCommits: 2,
+        resolvePolicy: async () => ({
+          codex_required: true,
+          concerns_blocks: true,
+          timeout_ms: 1_800_000,
+          last_n_commits: 7,
+          policyMissing: false,
+        }),
+        git: fakeGit({
+          tryRevParse: (args) =>
+            args.some((a) => /~\d+\^\{commit\}$/.test(a))
+              ? 'beefcafe1234567890abcdef1234567890abcdef'
+              : '',
+        }),
+        appendAudit: async (_baseDir, record) => {
+          audited.push({ tool: record.tool_name, meta: record.metadata });
+          return {} as never;
+        },
+      }),
+    );
+    const reviewed = audited.find((e) => e.tool === 'rea.push_gate.reviewed');
+    expect(reviewed?.meta?.last_n_commits).toBe(2);
+  });
+
+  it('--base wins over --last-n-commits and emits a stderr warning', async () => {
+    const stderr: string[] = [];
+    const audited: Array<{ tool: string; meta?: Record<string, unknown> }> = [];
+    await runPushGate(
+      baseDeps(baseDir, {
+        explicitBase: 'origin/release-1.0',
+        lastNCommits: 5,
+        stderr: (line) => stderr.push(line),
+        appendAudit: async (_baseDir, record) => {
+          audited.push({ tool: record.tool_name, meta: record.metadata });
+          return {} as never;
+        },
+      }),
+    );
+    const reviewed = audited.find((e) => e.tool === 'rea.push_gate.reviewed');
+    expect(reviewed?.meta?.base_source).toBe('explicit');
+    expect(stderr.some((l) => l.includes('--base origin/release-1.0 overrides'))).toBe(true);
+  });
+
+  it('walks back from the PUSHED ref (refspec.localSha), not local HEAD, when both are present', async () => {
+    // Regression for the codex-adversarial finding 2026-04-29:
+    // `git push origin some-other-branch` had the gate computing
+    // HEAD~N (current checkout) instead of <pushed-sha>~N.
+    const probedRefs: string[] = [];
+    const audited: Array<{ tool: string; meta?: Record<string, unknown> }> = [];
+    await runPushGate(
+      baseDeps(baseDir, {
+        lastNCommits: 2,
+        refspecs: [
+          {
+            localRef: 'refs/heads/feature-x',
+            localSha: 'aaaa11111111111111111111111111111111aaaa',
+            remoteRef: 'refs/heads/feature-x',
+            remoteSha: 'bbbb22222222222222222222222222222222bbbb',
+          },
+        ],
+        git: fakeGit({
+          headSha: () => 'cccc33333333333333333333333333333333cccc', // local HEAD differs
+          tryRevParse: (args) => {
+            const probe = args.find((a) => /~\d+\^\{commit\}$/.test(a));
+            if (probe !== undefined) probedRefs.push(probe);
+            // Resolve `<pushedSha>~2^{commit}` to a base SHA.
+            if (args.some((a) => a === 'aaaa11111111111111111111111111111111aaaa~2^{commit}')) {
+              return '0000999999999999999999999999999999990000';
+            }
+            return '';
+          },
+        }),
+        appendAudit: async (_baseDir, record) => {
+          audited.push({ tool: record.tool_name, meta: record.metadata });
+          return {} as never;
+        },
+      }),
+    );
+    // The resolver must have probed the PUSHED sha, not the local HEAD.
+    expect(probedRefs.some((r) => r.startsWith('aaaa1111'))).toBe(true);
+    expect(probedRefs.some((r) => r.startsWith('cccc3333'))).toBe(false);
+    const reviewed = audited.find((e) => e.tool === 'rea.push_gate.reviewed');
+    expect(reviewed?.meta?.base_source).toBe('last-n-commits');
+    expect(reviewed?.meta?.head_sha).toBe('aaaa11111111111111111111111111111111aaaa');
+  });
+
+  it('policy.review.last_n_commits applies when CLI flag is unset', async () => {
+    const audited: Array<{ tool: string; meta?: Record<string, unknown> }> = [];
+    await runPushGate(
+      baseDeps(baseDir, {
+        resolvePolicy: async () => ({
+          codex_required: true,
+          concerns_blocks: true,
+          timeout_ms: 1_800_000,
+          last_n_commits: 4,
+          policyMissing: false,
+        }),
+        git: fakeGit({
+          tryRevParse: (args) =>
+            args.some((a) => /~\d+\^\{commit\}$/.test(a))
+              ? 'feedcafe1234567890abcdef1234567890abcdef'
+              : '',
+        }),
+        appendAudit: async (_baseDir, record) => {
+          audited.push({ tool: record.tool_name, meta: record.metadata });
+          return {} as never;
+        },
+      }),
+    );
+    const reviewed = audited.find((e) => e.tool === 'rea.push_gate.reviewed');
+    expect(reviewed?.meta?.base_source).toBe('last-n-commits');
+    expect(reviewed?.meta?.last_n_commits).toBe(4);
   });
 });
 

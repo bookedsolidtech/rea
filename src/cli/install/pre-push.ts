@@ -69,10 +69,16 @@ const execFileAsync = promisify(execFile);
  * classification. Bump the version suffix whenever the body semantics
  * change so upgrades can migrate old installs cleanly.
  *
+ * v3 — 0.12.0 BODY_TEMPLATE rewrite: positional-args dispatch via `case`
+ *      arms with `set --`, removing the `exec $REA_BIN` word-splitting bug
+ *      that broke pushes from repo paths containing spaces.
  * v2 — 0.11.0 stateless push-gate body (no bash core, no audit grep).
  * v1 — 0.10.x and prior, delegated to `.claude/hooks/push-review-gate.sh`.
  */
-export const FALLBACK_MARKER = '# rea:pre-push-fallback v2';
+export const FALLBACK_MARKER = '# rea:pre-push-fallback v3';
+
+/** Legacy v2 marker (0.11.x bodies). Refresh-on-upgrade. */
+export const LEGACY_FALLBACK_MARKER_V2 = '# rea:pre-push-fallback v2';
 
 /** Legacy v1 marker — used by upgrade migration to detect old installs. */
 export const LEGACY_FALLBACK_MARKER_V1 = '# rea:pre-push-fallback v1';
@@ -81,9 +87,12 @@ export const LEGACY_FALLBACK_MARKER_V1 = '# rea:pre-push-fallback v1';
  * Marker present in the shipped `.husky/pre-push` governance gate. The
  * second line of the shipped husky hook is this marker — rea upgrade
  * detects it to refresh in-place. Bump the suffix whenever the body
- * changes; pre-0.11 markers live in `LEGACY_HUSKY_GATE_MARKER_V1`.
+ * changes; pre-0.12 markers live in `LEGACY_HUSKY_GATE_MARKER_V{1,2}`.
  */
-export const HUSKY_GATE_MARKER = '# rea:husky-pre-push-gate v2';
+export const HUSKY_GATE_MARKER = '# rea:husky-pre-push-gate v3';
+
+/** Legacy v2 husky marker (0.11.x bodies). Refresh-on-upgrade. */
+export const LEGACY_HUSKY_GATE_MARKER_V2 = '# rea:husky-pre-push-gate v2';
 
 /** Legacy v1 husky marker for migration. */
 export const LEGACY_HUSKY_GATE_MARKER_V1 = '# rea:husky-pre-push-gate v1';
@@ -93,7 +102,10 @@ export const LEGACY_HUSKY_GATE_MARKER_V1 = '# rea:husky-pre-push-gate v1';
  * empty body (stubbed out by a consumer) is NOT classified as rea-managed.
  * A real rea hook always carries both markers.
  */
-export const HUSKY_GATE_BODY_MARKER = '# rea:gate-body-v2';
+export const HUSKY_GATE_BODY_MARKER = '# rea:gate-body-v3';
+
+/** Legacy v2 body marker (0.11.x bodies). Refresh-on-upgrade. */
+export const LEGACY_HUSKY_GATE_BODY_MARKER_V2 = '# rea:gate-body-v2';
 
 /** Legacy body marker — used by upgrade migration detection. */
 export const LEGACY_HUSKY_GATE_BODY_MARKER_V1 = '# rea:gate-body-v1';
@@ -118,7 +130,8 @@ const BODY_TEMPLATE = `set -eu
 # invocation, verdict inference, audit write — lives in
 # \`src/hooks/push-gate/\` and is invoked via \`rea hook push-gate\`.
 # This stub only short-circuits on the kill-switch and resolves the rea
-# binary (in priority: project node_modules/.bin/rea → PATH → npx).
+# binary (in priority: project node_modules/.bin/rea → dogfood dist →
+# PATH → npx).
 #
 # The 0.10.x hooks assumed rea was on PATH. Consumers who bootstrap via
 # \`npx @bookedsolid/rea init\` have no persistent global rea install, so
@@ -134,35 +147,39 @@ if [ -f "\${REA_ROOT}/.rea/HALT" ]; then
   exit 1
 fi
 
-# The pre-push stdin carries one line per refspec (local_ref local_sha
-# remote_ref remote_sha). Forward stdin verbatim via process substitution
-# — the \`rea hook push-gate\` CLI reads it via process.stdin to pick up
-# the actual push base. Empty stdin (direct invocation, CI, etc.) is
-# handled by the CLI falling back to upstream → origin/HEAD resolution.
+# Dispatch the rea CLI as a positional-args list rather than a string
+# (the 0.11.x \`exec \$REA_BIN ...\` pattern broke when REA_ROOT contained
+# whitespace because the unquoted \$REA_BIN expansion underwent word
+# splitting; \`/Users/jane/My Projects/repo\` produced four argv tokens
+# instead of two). The \`set --\` form below preserves spaces verbatim.
+#
+# The pre-push stdin carries one line per refspec; \`exec\` inherits stdin
+# unchanged. \$@ on entry carries git's <remote-name> <remote-url>; we
+# preserve those by appending "\$@" inside each \`set --\` arm.
 
-REA_BIN=""
 if [ -x "\${REA_ROOT}/node_modules/.bin/rea" ]; then
-  REA_BIN="\${REA_ROOT}/node_modules/.bin/rea"
-elif [ -f "\${REA_ROOT}/dist/cli/index.js" ]; then
+  set -- "\${REA_ROOT}/node_modules/.bin/rea" hook push-gate "\$@"
+elif [ -f "\${REA_ROOT}/dist/cli/index.js" ] && [ -f "\${REA_ROOT}/package.json" ] && grep -q '"name": *"@bookedsolid/rea"' "\${REA_ROOT}/package.json" 2>/dev/null; then
   # rea's own repo (dogfood) — the package is not installed under
   # node_modules here because we ARE the package. The built CLI
   # entry point lives at dist/cli/index.js; node runs it directly.
-  REA_BIN="node \${REA_ROOT}/dist/cli/index.js"
+  # Gate this branch on \`package.json\` declaring \`@bookedsolid/rea\` so a
+  # consumer repo that happens to ship its own \`dist/cli/index.js\` does
+  # not get this hook executing the consumer's unrelated build.
+  set -- node "\${REA_ROOT}/dist/cli/index.js" hook push-gate "\$@"
 elif command -v rea >/dev/null 2>&1; then
-  REA_BIN="rea"
+  set -- rea hook push-gate "\$@"
 elif command -v npx >/dev/null 2>&1; then
   # Last resort: npx will resolve the package from npm or the cache.
   # Pass \`--no-install\` so a rare cache-cold machine surfaces a clear
   # error instead of silently downloading at push time.
-  REA_BIN="npx --no-install @bookedsolid/rea"
+  set -- npx --no-install @bookedsolid/rea hook push-gate "\$@"
 else
   printf 'rea: cannot locate the rea CLI. Install locally (\`pnpm add -D @bookedsolid/rea\`) or globally (\`npm i -g @bookedsolid/rea\`).\\n' >&2
   exit 2
 fi
 
-# \$@ carries the pre-push arguments (git passes <remote-name> <remote-url>).
-# Stdin is inherited by \`exec\` → the CLI sees it unchanged.
-exec \$REA_BIN hook push-gate "\$@"
+exec "\$@"
 `;
 
 /** Fallback hook body — `.git/hooks/pre-push` in vanilla-git installs. */
@@ -216,17 +233,21 @@ export function isReaManagedFallback(content: string): boolean {
 }
 
 /**
- * True when `content` is the legacy v1 fallback (`.git/hooks/pre-push`
- * that delegated to `.claude/hooks/push-review-gate.sh`). Used by `rea
- * upgrade` to migrate — we overwrite these unconditionally because we
- * control the entire body shape.
+ * True when `content` is a legacy fallback hook authored by an earlier rea
+ * release: v2 (0.11.x — broken `exec $REA_BIN` body) or v1 (0.10.x —
+ * delegated to `.claude/hooks/push-review-gate.sh`). Used by `rea upgrade`
+ * to migrate — we overwrite these unconditionally because we control the
+ * entire body shape.
  */
 export function isLegacyReaManagedFallback(content: string): boolean {
   if (!content.startsWith('#!/bin/sh\n')) return false;
   const secondLineEnd = content.indexOf('\n', 10);
   if (secondLineEnd < 0) return false;
   const secondLine = content.slice(10, secondLineEnd);
-  return secondLine === LEGACY_FALLBACK_MARKER_V1;
+  return (
+    secondLine === LEGACY_FALLBACK_MARKER_V2 ||
+    secondLine === LEGACY_FALLBACK_MARKER_V1
+  );
 }
 
 /**
@@ -245,14 +266,22 @@ export function isReaManagedHuskyGate(content: string): boolean {
 }
 
 /**
- * True when `content` is the legacy v1 Husky gate (`.husky/pre-push` from
- * 0.10.x and earlier). Used to trigger the upgrade migration.
+ * True when `content` is a legacy Husky gate from an earlier rea release:
+ * v2 (0.11.x — broken `exec $REA_BIN` body) or v1 (0.10.x — bash core
+ * delegating). Used to trigger the upgrade migration.
  */
 export function isLegacyReaManagedHuskyGate(content: string): boolean {
-  return hasHeaderMarkers(
-    content,
-    LEGACY_HUSKY_GATE_MARKER_V1,
-    LEGACY_HUSKY_GATE_BODY_MARKER_V1,
+  return (
+    hasHeaderMarkers(
+      content,
+      LEGACY_HUSKY_GATE_MARKER_V2,
+      LEGACY_HUSKY_GATE_BODY_MARKER_V2,
+    ) ||
+    hasHeaderMarkers(
+      content,
+      LEGACY_HUSKY_GATE_MARKER_V1,
+      LEGACY_HUSKY_GATE_BODY_MARKER_V1,
+    )
   );
 }
 
@@ -613,6 +642,8 @@ async function cleanupStaleTempFiles(dst: string): Promise<void> {
       if (
         !body.includes(FALLBACK_MARKER) &&
         !body.includes(HUSKY_GATE_MARKER) &&
+        !body.includes(LEGACY_FALLBACK_MARKER_V2) &&
+        !body.includes(LEGACY_HUSKY_GATE_MARKER_V2) &&
         !body.includes(LEGACY_FALLBACK_MARKER_V1) &&
         !body.includes(LEGACY_HUSKY_GATE_MARKER_V1)
       ) {

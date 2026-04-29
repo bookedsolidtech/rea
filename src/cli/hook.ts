@@ -35,6 +35,13 @@ import { err } from './utils.js';
 
 export interface HookPushGateOptions {
   base?: string;
+  /**
+   * Diff against `HEAD~N` instead of running the upstream ladder. Mirrors
+   * `policy.review.last_n_commits`; the CLI flag wins when both are set.
+   * `--base` always wins over both. Validated as a positive integer; the
+   * CLI rejects non-numeric input before reaching `runPushGate`.
+   */
+  lastNCommits?: number;
 }
 
 /**
@@ -62,6 +69,7 @@ export async function runHookPushGate(options: HookPushGateOptions): Promise<voi
       stderr,
       refspecs,
       ...(options.base !== undefined && options.base.length > 0 ? { explicitBase: options.base } : {}),
+      ...(options.lastNCommits !== undefined ? { lastNCommits: options.lastNCommits } : {}),
     });
     process.exit(result.exitCode);
   } catch (e) {
@@ -136,7 +144,21 @@ export function registerHookCommand(program: Command): void {
       '--base <ref>',
       'explicit base ref to diff against (e.g. origin/main). Defaults to @{upstream} → origin/HEAD → main/master → empty-tree.',
     )
-    .action(async (_gitArgs: string[], opts: { base?: string }) => {
-      await runHookPushGate({ ...(opts.base !== undefined ? { base: opts.base } : {}) });
+    .option(
+      '--last-n-commits <n>',
+      'narrow review to the last N commits (diff against HEAD~N). Useful for large feature branches. Loses to --base when both are set; mirrors policy.review.last_n_commits.',
+      (raw: string): number => {
+        const n = Number(raw);
+        if (!Number.isInteger(n) || n <= 0) {
+          throw new Error(`--last-n-commits must be a positive integer, got ${JSON.stringify(raw)}`);
+        }
+        return n;
+      },
+    )
+    .action(async (_gitArgs: string[], opts: { base?: string; lastNCommits?: number }) => {
+      await runHookPushGate({
+        ...(opts.base !== undefined ? { base: opts.base } : {}),
+        ...(opts.lastNCommits !== undefined ? { lastNCommits: opts.lastNCommits } : {}),
+      });
     });
 }

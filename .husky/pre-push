@@ -1,6 +1,6 @@
 #!/bin/sh
-# rea:husky-pre-push-gate v2
-# rea:gate-body-v2
+# rea:husky-pre-push-gate v3
+# rea:gate-body-v3
 #
 # Husky pre-push hook installed by `rea init` / `rea upgrade`. Do NOT
 # edit by hand — the file is refreshed on every rea upgrade.
@@ -10,26 +10,57 @@
 
 set -eu
 
+# REA push-gate (0.11.0+). The heavy lifting — git diff resolution, Codex
+# invocation, verdict inference, audit write — lives in
+# `src/hooks/push-gate/` and is invoked via `rea hook push-gate`.
+# This stub only short-circuits on the kill-switch and resolves the rea
+# binary (in priority: project node_modules/.bin/rea → dogfood dist →
+# PATH → npx).
+#
+# The 0.10.x hooks assumed rea was on PATH. Consumers who bootstrap via
+# `npx @bookedsolid/rea init` have no persistent global rea install, so
+# the bare `exec rea` pattern fails with "rea: not found" on push. We
+# resolve against the project-local node_modules/.bin first, then PATH,
+# then fall back to npx so the gate runs in every documented setup.
+
 REA_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
 if [ -f "${REA_ROOT}/.rea/HALT" ]; then
-  reason=$(awk "NR==1 { print; exit }" "${REA_ROOT}/.rea/HALT" 2>/dev/null || printf "unknown")
-  [ -z "${reason:-}" ] && reason="unknown"
-  printf "REA HALT: %s\nAll push operations suspended. Run: rea unfreeze\n" "$reason" >&2
+  reason=$(awk 'NR==1 { print; exit }' "${REA_ROOT}/.rea/HALT" 2>/dev/null || printf 'unknown')
+  [ -z "${reason:-}" ] && reason='unknown'
+  printf 'REA HALT: %s\nAll push operations suspended. Run: rea unfreeze\n' "$reason" >&2
   exit 1
 fi
 
-REA_BIN=""
+# Dispatch the rea CLI as a positional-args list rather than a string
+# (the 0.11.x `exec $REA_BIN ...` pattern broke when REA_ROOT contained
+# whitespace because the unquoted $REA_BIN expansion underwent word
+# splitting; `/Users/jane/My Projects/repo` produced four argv tokens
+# instead of two). The `set --` form below preserves spaces verbatim.
+#
+# The pre-push stdin carries one line per refspec; `exec` inherits stdin
+# unchanged. $@ on entry carries git's <remote-name> <remote-url>; we
+# preserve those by appending "$@" inside each `set --` arm.
+
 if [ -x "${REA_ROOT}/node_modules/.bin/rea" ]; then
-  REA_BIN="${REA_ROOT}/node_modules/.bin/rea"
-elif [ -f "${REA_ROOT}/dist/cli/index.js" ]; then
-  REA_BIN="node ${REA_ROOT}/dist/cli/index.js"
+  set -- "${REA_ROOT}/node_modules/.bin/rea" hook push-gate "$@"
+elif [ -f "${REA_ROOT}/dist/cli/index.js" ] && [ -f "${REA_ROOT}/package.json" ] && grep -q '"name": *"@bookedsolid/rea"' "${REA_ROOT}/package.json" 2>/dev/null; then
+  # rea's own repo (dogfood) — the package is not installed under
+  # node_modules here because we ARE the package. The built CLI
+  # entry point lives at dist/cli/index.js; node runs it directly.
+  # Gate this branch on `package.json` declaring `@bookedsolid/rea` so a
+  # consumer repo that happens to ship its own `dist/cli/index.js` does
+  # not get this hook executing the consumer's unrelated build.
+  set -- node "${REA_ROOT}/dist/cli/index.js" hook push-gate "$@"
 elif command -v rea >/dev/null 2>&1; then
-  REA_BIN="rea"
+  set -- rea hook push-gate "$@"
 elif command -v npx >/dev/null 2>&1; then
-  REA_BIN="npx --no-install @bookedsolid/rea"
+  # Last resort: npx will resolve the package from npm or the cache.
+  # Pass `--no-install` so a rare cache-cold machine surfaces a clear
+  # error instead of silently downloading at push time.
+  set -- npx --no-install @bookedsolid/rea hook push-gate "$@"
 else
-  printf "rea: cannot locate the rea CLI.\n" >&2
+  printf 'rea: cannot locate the rea CLI. Install locally (`pnpm add -D @bookedsolid/rea`) or globally (`npm i -g @bookedsolid/rea`).\n' >&2
   exit 2
 fi
 
-exec $REA_BIN hook push-gate "$@"
+exec "$@"

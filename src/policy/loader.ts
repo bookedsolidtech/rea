@@ -31,6 +31,7 @@ const ReviewPolicySchema = z
     codex_required: z.boolean().optional(),
     concerns_blocks: z.boolean().optional(),
     timeout_ms: z.number().int().positive().optional(),
+    last_n_commits: z.number().int().positive().optional(),
   })
   .strict();
 

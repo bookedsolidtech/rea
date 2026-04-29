@@ -9,9 +9,16 @@
  * skip". This module is pure policy.
  *
  * Defaults (when a field is absent or `review:` is missing entirely):
- *   - `codex_required`   → `true`  (safe-by-default: run Codex)
- *   - `concerns_blocks`  → `true`  (safe-by-default: concerns halt the push)
- *   - `timeout_ms`       → 600_000 (10 minutes)
+ *   - `codex_required`   → `true`    (safe-by-default: run Codex)
+ *   - `concerns_blocks`  → `true`    (safe-by-default: concerns halt the push)
+ *   - `timeout_ms`       → 1_800_000 (30 minutes — raised in 0.12.0 from the
+ *                                     previous 10-minute default after the
+ *                                     helixir migration session 2026-04-26
+ *                                     showed realistic feature-branch
+ *                                     reviews routinely exceeded 10 minutes
+ *                                     on large diffs. Operators who pin
+ *                                     `timeout_ms:` in policy.yaml are
+ *                                     unaffected by this change.)
  *
  * A missing `.rea/policy.yaml` is treated as "defaults apply" — the
  * operator may not have run `rea init` yet, and the gate's behavior
@@ -28,11 +35,18 @@ export interface ResolvedReviewPolicy {
   codex_required: boolean;
   concerns_blocks: boolean;
   timeout_ms: number;
+  /**
+   * When set, the gate resolves the diff base to `HEAD~N` (see Fix D in
+   * 0.12.0). The CLI flag `--last-n-commits N` overrides this; the
+   * policy key surfaces here as a runtime knob with the same effect.
+   * `undefined` when unset (default-untouched behavior).
+   */
+  last_n_commits: number | undefined;
   /** `true` when `.rea/policy.yaml` was absent; defaults apply. */
   policyMissing: boolean;
 }
 
-export const PUSH_GATE_DEFAULT_TIMEOUT_MS = 600_000;
+export const PUSH_GATE_DEFAULT_TIMEOUT_MS = 1_800_000;
 export const PUSH_GATE_DEFAULT_CODEX_REQUIRED = true;
 export const PUSH_GATE_DEFAULT_CONCERNS_BLOCKS = true;
 
@@ -53,6 +67,7 @@ export async function resolvePushGatePolicy(baseDir: string): Promise<ResolvedRe
       codex_required: PUSH_GATE_DEFAULT_CODEX_REQUIRED,
       concerns_blocks: PUSH_GATE_DEFAULT_CONCERNS_BLOCKS,
       timeout_ms: PUSH_GATE_DEFAULT_TIMEOUT_MS,
+      last_n_commits: undefined,
       policyMissing: true,
     };
   }
@@ -62,6 +77,7 @@ export async function resolvePushGatePolicy(baseDir: string): Promise<ResolvedRe
     codex_required: review.codex_required ?? PUSH_GATE_DEFAULT_CODEX_REQUIRED,
     concerns_blocks: review.concerns_blocks ?? PUSH_GATE_DEFAULT_CONCERNS_BLOCKS,
     timeout_ms: review.timeout_ms ?? PUSH_GATE_DEFAULT_TIMEOUT_MS,
+    last_n_commits: review.last_n_commits,
     policyMissing: false,
   };
 }

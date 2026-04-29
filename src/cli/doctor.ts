@@ -451,6 +451,93 @@ function checkCodexCommand(baseDir: string): CheckResult {
 }
 
 /**
+ * Resolve the absolute path of `codex` on PATH (cross-platform). Returns
+ * `null` when codex is not installed. We walk `process.env.PATH`
+ * directly rather than shelling out — earlier iterations spawned
+ * `sh -c "command -v codex"` which gave false negatives in sanitized
+ * POSIX environments where `/bin` is omitted from PATH (CI runners,
+ * hardened dev shells) but the `codex` binary lives at a project-bin
+ * path that IS on PATH. Codex [P2] 2026-04-29.
+ *
+ * On Windows we iterate `PATHEXT` (default `.COM;.EXE;.BAT;.CMD`) so
+ * `codex.cmd` (the typical npm shim) is discovered. POSIX checks the
+ * bare name and accepts any file with an execute bit set.
+ */
+function resolveCodexBinary(): string | null {
+  const isWindows = process.platform === 'win32';
+  const pathEnv = process.env.PATH ?? process.env.Path ?? '';
+  if (pathEnv.length === 0) return null;
+  const sep = isWindows ? ';' : ':';
+  const entries = pathEnv.split(sep).filter((p) => p.length > 0);
+
+  if (isWindows) {
+    const pathExt = (process.env.PATHEXT ?? '.COM;.EXE;.BAT;.CMD').split(';');
+    for (const dir of entries) {
+      for (const ext of pathExt) {
+        const candidate = path.join(dir, `codex${ext}`);
+        try {
+          const st = fs.statSync(candidate);
+          if (st.isFile()) return candidate;
+        } catch {
+          // not present in this PATH entry — keep walking
+        }
+      }
+      // also check the bare name in case PATHEXT is unusual
+      const bare = path.join(dir, 'codex');
+      try {
+        const st = fs.statSync(bare);
+        if (st.isFile()) return bare;
+      } catch {
+        // not present — keep walking
+      }
+    }
+    return null;
+  }
+
+  // POSIX: check executable bit on the file mode.
+  for (const dir of entries) {
+    const candidate = path.join(dir, 'codex');
+    try {
+      const st = fs.statSync(candidate);
+      if (st.isFile() && (st.mode & 0o111) !== 0) return candidate;
+    } catch {
+      // not present in this PATH entry — keep walking
+    }
+  }
+  return null;
+}
+
+/**
+ * Hard-fail when `policy.review.codex_required: true` but the `codex`
+ * binary is not on PATH. Pre-0.12.0 this prereq surfaced only at first
+ * push, by which point the consumer had cloned, run `pnpm install`,
+ * authored a commit, and tried to push — only then to learn that they
+ * needed a separate install. Fix C of 0.12.0 surfaces it during install.
+ *
+ * Returns `pass` when codex resolves; `fail` when missing. Operators who
+ * want to disable the gate can flip `policy.review.codex_required: false`
+ * (the doctor then short-circuits past every Codex check).
+ */
+export function checkCodexBinaryOnPath(): CheckResult {
+  const resolved = resolveCodexBinary();
+  if (resolved !== null) {
+    return {
+      label: 'codex CLI on PATH',
+      status: 'pass',
+      detail: resolved,
+    };
+  }
+  return {
+    label: 'codex CLI on PATH',
+    status: 'fail',
+    detail:
+      'codex not found on PATH. policy.review.codex_required: true requires the codex binary. ' +
+      'Install: https://github.com/openai/codex (e.g. `npm i -g @openai/codex`). ' +
+      'To disable the push-gate instead, set policy.review.codex_required: false in .rea/policy.yaml.',
+  };
+}
+
+/**
  * Translate a `CodexProbeState` into two doctor CheckResults: one for
  * responsiveness (pass/warn) and one informational line about the last
  * probe time. Extracted so tests can feed a stub state without running
@@ -554,7 +641,11 @@ export function collectChecks(
   }
 
   if (codexRequiredFromPolicy(baseDir)) {
-    checks.push(checkCodexAgent(baseDir), checkCodexCommand(baseDir));
+    checks.push(
+      checkCodexAgent(baseDir),
+      checkCodexCommand(baseDir),
+      checkCodexBinaryOnPath(),
+    );
     if (codexProbeState !== undefined) {
       checks.push(...checksFromProbeState(codexProbeState));
     }

@@ -116,6 +116,14 @@ export interface PushGateDeps {
   /** Override via `--base <ref>`. Absent → auto-resolve. */
   explicitBase?: string;
   /**
+   * Override from the `--last-n-commits N` CLI flag. When set, the gate
+   * diffs against `HEAD~N` instead of running the upstream ladder. Wins
+   * over `policy.review.last_n_commits` but loses to `explicitBase`. When
+   * both `explicitBase` and this are set, `explicitBase` is used and a
+   * stderr warning is emitted noting the conflict.
+   */
+  lastNCommits?: number;
+  /**
    * Pre-push refspecs from git's stdin. Empty when invoked outside a
    * pre-push context (manual `rea hook push-gate` from the CLI). When
    * non-empty, the gate diffs each refspec's (remote_sha..local_sha) and
@@ -209,41 +217,111 @@ export async function runPushGate(deps: PushGateDeps): Promise<GateResult> {
     };
   }
 
-  // 3. REA_SKIP_PUSH_GATE — value-carrying waiver. HALT-wins ordering means
-  //    this is checked AFTER halt (step 1) and AFTER codex_required=false
+  // 3. Value-carrying skip waivers. HALT-wins ordering means these are
+  //    checked AFTER halt (step 1) and AFTER codex_required=false
   //    short-circuit (step 2). Both of those should hold anyway; this is
-  //    for the case where codex is required but the operator wants to
+  //    for the case where codex IS required but the operator wants to
   //    skip for a narrow, documented reason.
-  const skipReason = (env.REA_SKIP_PUSH_GATE ?? '').trim();
-  if (skipReason.length > 0) {
-    stderr(`rea: REA_SKIP_PUSH_GATE=${skipReason} — push-gate skipped (audited).\n`);
+  //
+  //    Two equivalent env vars are honored — gate behavior is identical;
+  //    only the audit metadata's `skip_var` differs so operators can grep
+  //    their audit log to see which variant agents used:
+  //
+  //      - REA_SKIP_PUSH_GATE     — the original 0.11.0 var
+  //      - REA_SKIP_CODEX_REVIEW  — added in 0.12.0 to match the variant
+  //                                 documented elsewhere in the codebase
+  //                                 (gateway/reviewers, codex-probe). Prior
+  //                                 to 0.12.0 this string only worked at
+  //                                 the gateway tier; agents who set it on
+  //                                 a `git push` got no skip and codex still
+  //                                 ran. The mismatch surfaced during the
+  //                                 helixir migration session 2026-04-26.
+  //
+  //    Precedence on simultaneous set: REA_SKIP_PUSH_GATE wins (it was the
+  //    canonical name) and REA_SKIP_CODEX_REVIEW is logged but not used.
+  //    Either var alone with non-empty reason short-circuits.
+  const skipPush = (env.REA_SKIP_PUSH_GATE ?? '').trim();
+  const skipCodex = (env.REA_SKIP_CODEX_REVIEW ?? '').trim();
+  if (skipPush.length > 0 || skipCodex.length > 0) {
+    const skipVar: 'REA_SKIP_PUSH_GATE' | 'REA_SKIP_CODEX_REVIEW' =
+      skipPush.length > 0 ? 'REA_SKIP_PUSH_GATE' : 'REA_SKIP_CODEX_REVIEW';
+    const skipReason = skipVar === 'REA_SKIP_PUSH_GATE' ? skipPush : skipCodex;
+    stderr(`rea: ${skipVar}=${skipReason} — push-gate skipped (audited).\n`);
     await safeAppend(appendAuditFn, deps.baseDir, EVT_SKIPPED, {
       reason: skipReason,
+      skip_var: skipVar,
     });
     return {
       status: 'skipped',
       exitCode: 0,
-      summary: `REA_SKIP_PUSH_GATE waiver: ${skipReason}`,
+      summary: `${skipVar} waiver: ${skipReason}`,
     };
   }
 
   // 4. Resolve (base_ref, head_sha) for the actual review.
   //
-  //    When pre-push stdin yielded at least one refspec (`git push` path),
-  //    diff against the first NON-DELETION refspec's (remote_sha..local_sha).
-  //    This matches what git itself is about to push — critical when the
-  //    operator uses `git push origin HEAD:release/1.0` and the branch's
-  //    tracking ref is a different branch entirely (the 0.10.x gate
-  //    silently reviewed against the wrong base in that case).
+  //    Precedence (highest first):
+  //      a) `--base <ref>` CLI flag (deps.explicitBase) — explicit ref the
+  //         operator named; we trust it.
+  //      b) `--last-n-commits N` CLI flag (deps.lastNCommits) — diff
+  //         against HEAD~N. Wins over the policy key.
+  //      c) `policy.review.last_n_commits` — same effect as (b), but
+  //         configured in `.rea/policy.yaml`. Persistent narrow-window.
+  //      d) Active refspec from pre-push stdin — what git is about to
+  //         push. Critical for `git push origin HEAD:release/1.0`.
+  //      e) Upstream → origin/HEAD → main/master ladder.
   //
-  //    When stdin was empty (manual invocation, test), fall back to the
-  //    upstream → origin/HEAD → main/master ladder.
+  //    When (a) collides with (b) or (c), (a) wins and we warn — explicit
+  //    ref beats relative count.
+  const policyLastN = policy.last_n_commits;
+  const explicitBaseSet = deps.explicitBase !== undefined && deps.explicitBase.length > 0;
+  const lastNFromFlag = deps.lastNCommits;
+  const effectiveLastN = lastNFromFlag !== undefined ? lastNFromFlag : policyLastN;
+  if (explicitBaseSet && effectiveLastN !== undefined) {
+    const source = lastNFromFlag !== undefined ? '--last-n-commits' : 'policy.review.last_n_commits';
+    stderr(
+      `rea: --base ${deps.explicitBase} overrides ${source}=${effectiveLastN}; using explicit ref.\n`,
+    );
+  }
+
   const activeRefspec = (deps.refspecs ?? []).find(
     (r) => r.localSha !== NULL_SHA && r.localSha.length > 0,
   );
   let base: BaseResolution;
   let headSha: string;
-  if (activeRefspec !== undefined && (deps.explicitBase === undefined || deps.explicitBase.length === 0)) {
+  if (explicitBaseSet) {
+    // (a) explicit base wins absolutely.
+    base = resolveBaseRef(git, { explicit: deps.explicitBase as string });
+    headSha = activeRefspec !== undefined ? activeRefspec.localSha : git.headSha();
+  } else if (effectiveLastN !== undefined && effectiveLastN > 0) {
+    // (b) / (c) last-n-commits. Resolves to a SHA via `git rev-parse
+    // <headRef>~N`. Compute headSha FIRST so the resolver walks back N
+    // commits from the pushed ref rather than the local HEAD — critical
+    // for `git push origin some-other-branch` where the active refspec's
+    // localSha is a different branch entirely from the checkout's HEAD.
+    headSha = activeRefspec !== undefined ? activeRefspec.localSha : git.headSha();
+    base = resolveBaseRef(git, {
+      lastNCommits: effectiveLastN,
+      headRef: headSha,
+    });
+    if (
+      base.lastNCommitsRequested !== undefined &&
+      base.lastNCommits !== undefined &&
+      base.lastNCommits < base.lastNCommitsRequested
+    ) {
+      // Clamp warning: the resolver couldn't go back N commits, so it
+      // clamped to the entire branch history (diff vs empty-tree, K+1
+      // commits reviewed) — `base.lastNCommits` carries the actual K+1.
+      // This warning fires both when source is 'last-n-commits' (clamped
+      // mid-branch, root commit included via empty-tree) and when source
+      // is 'empty-tree' (single-commit branch). The user-facing message
+      // is identical: we wanted N, got K, here's what we reviewed.
+      stderr(
+        `rea: ${headSha.slice(0, 12)}~${base.lastNCommitsRequested} not reachable; reviewing all ${base.lastNCommits} commits on this branch instead.\n`,
+      );
+    }
+  } else if (activeRefspec !== undefined) {
+    // (d) refspec-aware base — use what git is about to push.
     headSha = activeRefspec.localSha;
     if (activeRefspec.remoteSha === NULL_SHA || activeRefspec.remoteSha.length === 0) {
       // New remote ref — no existing commits to diff against. Fall back to
@@ -254,11 +332,8 @@ export async function runPushGate(deps: PushGateDeps): Promise<GateResult> {
       base = { ref: activeRefspec.remoteSha, source: 'explicit' };
     }
   } else {
-    base = resolveBaseRef(git, {
-      ...(deps.explicitBase !== undefined && deps.explicitBase.length > 0
-        ? { explicit: deps.explicitBase }
-        : {}),
-    });
+    // (e) upstream ladder.
+    base = resolveBaseRef(git);
     headSha = git.headSha();
   }
   if (headSha.length === 0) {
@@ -277,6 +352,8 @@ export async function runPushGate(deps: PushGateDeps): Promise<GateResult> {
       base_ref: base.ref,
       base_source: base.source,
       head_sha: headSha,
+      last_n_commits: base.lastNCommits,
+      last_n_commits_requested: base.lastNCommitsRequested,
     });
     return {
       status: 'empty-diff',
@@ -332,6 +409,8 @@ export async function runPushGate(deps: PushGateDeps): Promise<GateResult> {
       event_count: codexResult.eventCount,
       concerns_override:
         summary.verdict === 'concerns' && isConcernsOverrideSet(env) ? true : undefined,
+      last_n_commits: base.lastNCommits,
+      last_n_commits_requested: base.lastNCommitsRequested,
     });
 
     if (blocked) {
