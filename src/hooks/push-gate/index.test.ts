@@ -3,6 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
+  PUSH_GATE_DEFAULT_AUTO_NARROW_THRESHOLD,
   PUSH_GATE_DEFAULT_CODEX_REQUIRED,
   PUSH_GATE_DEFAULT_CONCERNS_BLOCKS,
   PUSH_GATE_DEFAULT_TIMEOUT_MS,
@@ -16,6 +17,7 @@ function fakeGit(overrides: Partial<GitExecutor> = {}): GitExecutor {
     trySymbolicRef: () => '',
     headSha: () => 'deadbeef1234567890abcdef1234567890abcdef',
     diffNames: () => ['src/changed.ts'],
+    revListCount: () => null,
     ...overrides,
   };
 }
@@ -25,6 +27,7 @@ const DEFAULT_POLICY = {
   concerns_blocks: PUSH_GATE_DEFAULT_CONCERNS_BLOCKS,
   timeout_ms: PUSH_GATE_DEFAULT_TIMEOUT_MS,
   last_n_commits: undefined,
+  auto_narrow_threshold: PUSH_GATE_DEFAULT_AUTO_NARROW_THRESHOLD,
   policyMissing: false,
 };
 
@@ -788,5 +791,292 @@ describe('runPushGate — codex errors', () => {
     );
     expect(result.status).toBe('error');
     expect(result.exitCode).toBe(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Auto-narrow on large divergence (J / 0.13.0)
+// ---------------------------------------------------------------------------
+
+describe('runPushGate — auto-narrow on large divergence (J / 0.13.0)', () => {
+  let baseDir: string;
+  beforeEach(async () => {
+    baseDir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-pg-idx-an-')));
+  });
+  afterEach(async () => {
+    await fs.rm(baseDir, { recursive: true, force: true });
+  });
+
+  // Auto-narrow only fires when the base was resolved from the active
+  // refspec's remoteSha (i.e. previously-pushed remote tip of THIS
+  // branch). All tests below provide such a refspec unless explicitly
+  // probing the suppression path.
+  const REMOTE_SHA = 'r'.repeat(40);
+  const LOCAL_SHA = 'l'.repeat(40);
+  const refspecPushedTip = () => [
+    {
+      localRef: 'refs/heads/feature',
+      localSha: LOCAL_SHA,
+      remoteRef: 'refs/heads/feature',
+      remoteSha: REMOTE_SHA,
+    },
+  ];
+
+  it('fires when commit count exceeds threshold and base came from refspec remote tip', async () => {
+    let stderrText = '';
+    let auditMeta: Record<string, unknown> | null = null;
+    const result = await runPushGate(
+      baseDeps(baseDir, {
+        refspecs: refspecPushedTip(),
+        stderr: (line) => {
+          stderrText += line;
+        },
+        // 80 commits behind base — well above default threshold of 30.
+        git: fakeGit({
+          tryRevParse: (args) => {
+            // last-n-commits ~10 re-resolve uses LOCAL_SHA (refspec's
+            // localSha) as headRef and walks back 10 commits.
+            if (args.some((a) => /~10\^\{commit\}/.test(a))) return 'narrowed-base-sha';
+            return '';
+          },
+          revListCount: () => 80,
+          diffNames: () => ['src/changed.ts'],
+        }),
+        appendAudit: async (_baseDir, rec: { tool_name?: string; metadata?: Record<string, unknown> }) => {
+          if (rec.tool_name === 'rea.push_gate.reviewed') {
+            auditMeta = rec.metadata ?? null;
+          }
+          return {} as never;
+        },
+      }),
+    );
+    expect(result.status).toBe('pass');
+    expect(stderrText).toMatch(/auto-narrow/);
+    expect(stderrText).toMatch(/80 commits behind/);
+    expect(stderrText).toMatch(/last 10 commits/);
+    expect(auditMeta).not.toBeNull();
+    expect((auditMeta as { auto_narrowed?: boolean }).auto_narrowed).toBe(true);
+    expect((auditMeta as { original_commit_count?: number }).original_commit_count).toBe(80);
+  });
+
+  it('does NOT fire when base came from the upstream ladder (initial push, no refspec)', async () => {
+    // Critical safety case (codex-review 0.13.0 [P1]): a long-lived branch
+    // pushed for the FIRST time would resolve base via the upstream ladder
+    // (origin/HEAD or origin/main). Auto-narrow MUST NOT fire there —
+    // earlier commits on the branch may never have been Codex-reviewed.
+    let stderrText = '';
+    let auditMeta: Record<string, unknown> | null = null;
+    await runPushGate(
+      baseDeps(baseDir, {
+        // NO refspecs — gate falls through to the upstream ladder.
+        stderr: (line) => {
+          stderrText += line;
+        },
+        git: fakeGit({
+          tryRevParse: (args) => {
+            // Resolver finds origin/main via the ladder.
+            if (args.includes('refs/remotes/origin/main')) return 'orig-main-sha';
+            return '';
+          },
+          revListCount: () => 80, // 80 commits ahead, but still no auto-narrow
+          diffNames: () => ['src/x.ts'],
+        }),
+        appendAudit: async (_baseDir, rec: { tool_name?: string; metadata?: Record<string, unknown> }) => {
+          if (rec.tool_name === 'rea.push_gate.reviewed') auditMeta = rec.metadata ?? null;
+          return {} as never;
+        },
+      }),
+    );
+    expect(stderrText).not.toMatch(/auto-narrow/);
+    expect((auditMeta as { auto_narrowed?: boolean } | null)?.auto_narrowed).toBeUndefined();
+  });
+
+  it('does NOT fire when refspec remoteSha is the null SHA (new remote ref / first push of branch)', async () => {
+    const NULL = '0'.repeat(40);
+    let stderrText = '';
+    await runPushGate(
+      baseDeps(baseDir, {
+        refspecs: [
+          {
+            localRef: 'refs/heads/new-feature',
+            localSha: LOCAL_SHA,
+            remoteRef: 'refs/heads/new-feature',
+            remoteSha: NULL,
+          },
+        ],
+        stderr: (line) => {
+          stderrText += line;
+        },
+        git: fakeGit({
+          tryRevParse: (args) => {
+            if (args.includes('refs/remotes/origin/main')) return 'orig-main-sha';
+            return '';
+          },
+          revListCount: () => 999,
+          diffNames: () => ['x.ts'],
+        }),
+      }),
+    );
+    expect(stderrText).not.toMatch(/auto-narrow/);
+  });
+
+  it('does NOT fire when commit count <= threshold', async () => {
+    let stderrText = '';
+    let auditMeta: Record<string, unknown> | null = null;
+    await runPushGate(
+      baseDeps(baseDir, {
+        refspecs: refspecPushedTip(),
+        stderr: (line) => {
+          stderrText += line;
+        },
+        git: fakeGit({
+          revListCount: () => 5, // way under threshold
+          diffNames: () => ['src/x.ts'],
+        }),
+        appendAudit: async (_baseDir, rec: { tool_name?: string; metadata?: Record<string, unknown> }) => {
+          if (rec.tool_name === 'rea.push_gate.reviewed') auditMeta = rec.metadata ?? null;
+          return {} as never;
+        },
+      }),
+    );
+    expect(stderrText).not.toMatch(/auto-narrow/);
+    expect((auditMeta as { auto_narrowed?: boolean } | null)?.auto_narrowed).toBeUndefined();
+  });
+
+  it('suppresses when --last-n-commits is set (operator picked an explicit window)', async () => {
+    let stderrText = '';
+    await runPushGate(
+      baseDeps(baseDir, {
+        refspecs: refspecPushedTip(),
+        lastNCommits: 5,
+        stderr: (line) => {
+          stderrText += line;
+        },
+        git: fakeGit({
+          tryRevParse: (args) => {
+            if (args.some((a) => /~5\^\{commit\}/.test(a))) return 'last5-sha';
+            return '';
+          },
+          revListCount: () => 999,
+          diffNames: () => ['x.ts'],
+        }),
+      }),
+    );
+    expect(stderrText).not.toMatch(/auto-narrow/);
+  });
+
+  it('suppresses when --base is set (operator picked an explicit ref)', async () => {
+    let stderrText = '';
+    await runPushGate(
+      baseDeps(baseDir, {
+        refspecs: refspecPushedTip(),
+        explicitBase: 'origin/feature-x',
+        stderr: (line) => {
+          stderrText += line;
+        },
+        git: fakeGit({
+          revListCount: () => 999,
+          diffNames: () => ['x.ts'],
+        }),
+      }),
+    );
+    expect(stderrText).not.toMatch(/auto-narrow/);
+  });
+
+  it('suppresses when policy.review.last_n_commits is set', async () => {
+    let stderrText = '';
+    await runPushGate(
+      baseDeps(baseDir, {
+        refspecs: refspecPushedTip(),
+        resolvePolicy: async () => ({ ...DEFAULT_POLICY, last_n_commits: 5 }),
+        stderr: (line) => {
+          stderrText += line;
+        },
+        git: fakeGit({
+          tryRevParse: (args) => {
+            if (args.some((a) => /~5\^\{commit\}/.test(a))) return 'pol-last5-sha';
+            return '';
+          },
+          revListCount: () => 999,
+          diffNames: () => ['x.ts'],
+        }),
+      }),
+    );
+    expect(stderrText).not.toMatch(/auto-narrow/);
+  });
+
+  it('disabled by policy.review.auto_narrow_threshold: 0', async () => {
+    let stderrText = '';
+    await runPushGate(
+      baseDeps(baseDir, {
+        refspecs: refspecPushedTip(),
+        resolvePolicy: async () => ({ ...DEFAULT_POLICY, auto_narrow_threshold: 0 }),
+        stderr: (line) => {
+          stderrText += line;
+        },
+        git: fakeGit({
+          revListCount: () => 9999,
+          diffNames: () => ['x.ts'],
+        }),
+      }),
+    );
+    expect(stderrText).not.toMatch(/auto-narrow/);
+  });
+
+  it('does not fire when revListCount returns null (range unresolvable)', async () => {
+    let stderrText = '';
+    await runPushGate(
+      baseDeps(baseDir, {
+        refspecs: refspecPushedTip(),
+        stderr: (line) => {
+          stderrText += line;
+        },
+        git: fakeGit({
+          revListCount: () => null,
+          diffNames: () => ['x.ts'],
+        }),
+      }),
+    );
+    expect(stderrText).not.toMatch(/auto-narrow/);
+  });
+
+  it('fires at exactly threshold+1 (boundary check)', async () => {
+    let stderrText = '';
+    await runPushGate(
+      baseDeps(baseDir, {
+        refspecs: refspecPushedTip(),
+        resolvePolicy: async () => ({ ...DEFAULT_POLICY, auto_narrow_threshold: 30 }),
+        stderr: (line) => {
+          stderrText += line;
+        },
+        git: fakeGit({
+          tryRevParse: (args) => {
+            if (args.some((a) => /~10\^\{commit\}/.test(a))) return 'narrow-sha';
+            return '';
+          },
+          revListCount: () => 31, // > threshold by exactly 1
+          diffNames: () => ['x.ts'],
+        }),
+      }),
+    );
+    expect(stderrText).toMatch(/auto-narrow/);
+  });
+
+  it('does not fire at exactly threshold (boundary check)', async () => {
+    let stderrText = '';
+    await runPushGate(
+      baseDeps(baseDir, {
+        refspecs: refspecPushedTip(),
+        resolvePolicy: async () => ({ ...DEFAULT_POLICY, auto_narrow_threshold: 30 }),
+        stderr: (line) => {
+          stderrText += line;
+        },
+        git: fakeGit({
+          revListCount: () => 30, // == threshold
+          diffNames: () => ['x.ts'],
+        }),
+      }),
+    );
+    expect(stderrText).not.toMatch(/auto-narrow/);
   });
 });

@@ -430,6 +430,64 @@ function checkPrePushHook(state: PrePushDoctorState): CheckResult {
   };
 }
 
+/**
+ * Detect and list extension-hook fragments under `.husky/commit-msg.d/` and
+ * `.husky/pre-push.d/`. Informational only — fragments are an opt-in feature
+ * (added in 0.13.0); their presence is something operators should know about
+ * but never a hard fail. Non-executable files in the directories are
+ * surfaced as a warning since they are silently skipped at hook-fire time
+ * (executable bit is the consumer's opt-in).
+ */
+function checkExtensionFragments(baseDir: string): CheckResult {
+  const dirs = [
+    { name: 'commit-msg.d', path: path.join(baseDir, '.husky', 'commit-msg.d') },
+    { name: 'pre-push.d', path: path.join(baseDir, '.husky', 'pre-push.d') },
+  ];
+  const found: string[] = [];
+  const inert: string[] = [];
+  for (const d of dirs) {
+    if (!fs.existsSync(d.path)) continue;
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(d.path, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const e of entries) {
+      if (!e.isFile()) continue;
+      const abs = path.join(d.path, e.name);
+      try {
+        const st = fs.statSync(abs);
+        if ((st.mode & 0o111) !== 0) {
+          found.push(`${d.name}/${e.name}`);
+        } else {
+          inert.push(`${d.name}/${e.name}`);
+        }
+      } catch {
+        // unreadable — skip, will be surfaced at hook-fire time
+      }
+    }
+  }
+  if (found.length === 0 && inert.length === 0) {
+    return {
+      label: 'extension hook fragments',
+      status: 'info',
+      detail: 'none — drop executables into .husky/{commit-msg,pre-push}.d/ to chain custom checks',
+    };
+  }
+  if (inert.length > 0) {
+    const detail =
+      `executable: ${found.length === 0 ? 'none' : found.join(', ')}; ` +
+      `non-executable (silently skipped): ${inert.join(', ')} — chmod +x to enable`;
+    return { label: 'extension hook fragments', status: 'warn', detail };
+  }
+  return {
+    label: 'extension hook fragments',
+    status: 'info',
+    detail: `${found.length} executable fragment(s): ${found.join(', ')}`,
+  };
+}
+
 function checkCodexAgent(baseDir: string): CheckResult {
   const agentPath = path.join(baseDir, '.claude', 'agents', 'codex-adversarial.md');
   if (fs.existsSync(agentPath)) return { label: 'codex-adversarial agent installed', status: 'pass' };
@@ -631,6 +689,7 @@ export function collectChecks(
     if (prePushState !== undefined) {
       checks.push(checkPrePushHook(prePushState));
     }
+    checks.push(checkExtensionFragments(baseDir));
   } else {
     checks.push({
       label: 'git hooks',

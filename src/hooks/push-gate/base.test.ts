@@ -8,6 +8,7 @@ function fakeGit(overrides: Partial<GitExecutor> = {}): GitExecutor {
     trySymbolicRef: () => '',
     headSha: () => 'deadbeef',
     diffNames: () => [],
+    revListCount: () => null,
     ...overrides,
   };
 }

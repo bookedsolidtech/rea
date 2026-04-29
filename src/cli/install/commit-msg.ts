@@ -28,6 +28,82 @@ import { PKG_ROOT, warn } from '../utils.js';
 const execFileAsync = promisify(execFile);
 
 /**
+ * Marker baked into every rea-installed commit-msg hook. Anchored on line 2
+ * of the file (immediately after the shebang) for classification. Bump the
+ * version suffix whenever the body semantics change so upgrades can migrate
+ * old installs cleanly.
+ *
+ * v1 — 0.13.0: first version of the commit-msg marker. Pre-0.13 installs
+ *      shipped the same file content but without a marker line — those
+ *      classify as `unmarked` and are upgraded in place.
+ */
+export const COMMIT_MSG_MARKER = '# rea:commit-msg v1';
+
+/**
+ * Classify an existing `commit-msg` file. The classifier is permissive on
+ * upgrades (treat `unmarked` as legacy rea body) and conservative on
+ * foreign hooks (do not stomp).
+ */
+export type CommitMsgClassification =
+  | { kind: 'absent' }
+  | { kind: 'rea-managed'; version: string }
+  | { kind: 'unmarked' }
+  | { kind: 'foreign'; reason: string };
+
+/**
+ * Inspect `hookPath` and decide whether it is rea-authored, a pre-marker
+ * legacy rea body, or a foreign user hook. The pre-0.13 commit-msg shipped
+ * with no marker line; we detect that shape via the literal "block_ai_attribution"
+ * grep — every rea body has consulted that policy field since 0.1.0.
+ */
+export async function classifyCommitMsgHook(
+  hookPath: string,
+): Promise<CommitMsgClassification> {
+  let stat: fs.Stats;
+  try {
+    stat = await fsPromises.lstat(hookPath);
+  } catch {
+    return { kind: 'absent' };
+  }
+  if (stat.isDirectory()) return { kind: 'foreign', reason: 'is-directory' };
+  if (stat.isSymbolicLink()) return { kind: 'foreign', reason: 'is-symlink' };
+  if (!stat.isFile()) return { kind: 'foreign', reason: 'not-regular-file' };
+
+  let content: string;
+  try {
+    content = await fsPromises.readFile(hookPath, 'utf8');
+  } catch (e) {
+    return {
+      kind: 'foreign',
+      reason: `read-error: ${e instanceof Error ? e.message : String(e)}`,
+    };
+  }
+
+  // Anchor the marker on the second line — substring match would be tricked
+  // by a foreign hook that mentions the marker in a comment.
+  if (content.startsWith('#!/bin/sh\n')) {
+    const secondLineEnd = content.indexOf('\n', 10);
+    if (secondLineEnd > 0) {
+      const secondLine = content.slice(10, secondLineEnd);
+      if (secondLine === COMMIT_MSG_MARKER) {
+        return { kind: 'rea-managed', version: 'v1' };
+      }
+    }
+  }
+
+  // Pre-0.13 rea body had no marker but always contained the attribution
+  // grep. Treat that shape as upgradeable rather than foreign.
+  if (
+    content.includes('block_ai_attribution') &&
+    content.includes('AI attribution detected')
+  ) {
+    return { kind: 'unmarked' };
+  }
+
+  return { kind: 'foreign', reason: 'no-marker' };
+}
+
+/**
  * Read `core.hooksPath` via `git config --get`. This is the only correct way
  * to consult git config: regex-matching `.git/config` (finding #9) is
  * section-blind and matches `hooksPath = …` inside `[worktree]`, `[alias]`,

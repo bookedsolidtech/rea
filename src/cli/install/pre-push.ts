@@ -69,13 +69,19 @@ const execFileAsync = promisify(execFile);
  * classification. Bump the version suffix whenever the body semantics
  * change so upgrades can migrate old installs cleanly.
  *
+ * v4 — 0.13.0 extension-hook chaining: rea body sources `.husky/pre-push.d/*`
+ *      fragments after its own work and before the final `exec`, in lex
+ *      order. Non-zero fragment exit fails the hook.
  * v3 — 0.12.0 BODY_TEMPLATE rewrite: positional-args dispatch via `case`
  *      arms with `set --`, removing the `exec $REA_BIN` word-splitting bug
  *      that broke pushes from repo paths containing spaces.
  * v2 — 0.11.0 stateless push-gate body (no bash core, no audit grep).
  * v1 — 0.10.x and prior, delegated to `.claude/hooks/push-review-gate.sh`.
  */
-export const FALLBACK_MARKER = '# rea:pre-push-fallback v3';
+export const FALLBACK_MARKER = '# rea:pre-push-fallback v4';
+
+/** Legacy v3 marker (0.12.x bodies). Refresh-on-upgrade. */
+export const LEGACY_FALLBACK_MARKER_V3 = '# rea:pre-push-fallback v3';
 
 /** Legacy v2 marker (0.11.x bodies). Refresh-on-upgrade. */
 export const LEGACY_FALLBACK_MARKER_V2 = '# rea:pre-push-fallback v2';
@@ -87,9 +93,12 @@ export const LEGACY_FALLBACK_MARKER_V1 = '# rea:pre-push-fallback v1';
  * Marker present in the shipped `.husky/pre-push` governance gate. The
  * second line of the shipped husky hook is this marker — rea upgrade
  * detects it to refresh in-place. Bump the suffix whenever the body
- * changes; pre-0.12 markers live in `LEGACY_HUSKY_GATE_MARKER_V{1,2}`.
+ * changes; pre-0.13 markers live in `LEGACY_HUSKY_GATE_MARKER_V{1,2,3}`.
  */
-export const HUSKY_GATE_MARKER = '# rea:husky-pre-push-gate v3';
+export const HUSKY_GATE_MARKER = '# rea:husky-pre-push-gate v4';
+
+/** Legacy v3 husky marker (0.12.x bodies). Refresh-on-upgrade. */
+export const LEGACY_HUSKY_GATE_MARKER_V3 = '# rea:husky-pre-push-gate v3';
 
 /** Legacy v2 husky marker (0.11.x bodies). Refresh-on-upgrade. */
 export const LEGACY_HUSKY_GATE_MARKER_V2 = '# rea:husky-pre-push-gate v2';
@@ -102,7 +111,10 @@ export const LEGACY_HUSKY_GATE_MARKER_V1 = '# rea:husky-pre-push-gate v1';
  * empty body (stubbed out by a consumer) is NOT classified as rea-managed.
  * A real rea hook always carries both markers.
  */
-export const HUSKY_GATE_BODY_MARKER = '# rea:gate-body-v3';
+export const HUSKY_GATE_BODY_MARKER = '# rea:gate-body-v4';
+
+/** Legacy v3 body marker (0.12.x bodies). Refresh-on-upgrade. */
+export const LEGACY_HUSKY_GATE_BODY_MARKER_V3 = '# rea:gate-body-v3';
 
 /** Legacy v2 body marker (0.11.x bodies). Refresh-on-upgrade. */
 export const LEGACY_HUSKY_GATE_BODY_MARKER_V2 = '# rea:gate-body-v2';
@@ -179,7 +191,51 @@ else
   exit 2
 fi
 
-exec "\$@"
+# Run the rea push-gate FIRST. We capture its exit and explicitly propagate
+# instead of \`exec\`-ing — extension fragments must only run after rea's own
+# governance work succeeds. The fragments are user code; surfacing them
+# AFTER rea's body (HALT check, Codex review, audit write) preserves the
+# governance contract while letting consumers chain their own checks (e.g.
+# commitlint, branch-policy linters) without losing rea coverage.
+"\$@"
+rea_status=\$?
+if [ "\$rea_status" -ne 0 ]; then
+  exit "\$rea_status"
+fi
+
+# Extension-hook chaining: source every executable file under
+# \`.husky/pre-push.d/\` in lexical order. Missing directory = no-op
+# (backward compatible). Each fragment receives the original positional
+# args from git's \`<remote-name> <remote-url>\` invocation. Non-zero exit
+# from any fragment fails the push; this matches husky's normal hook
+# chaining semantics.
+#
+# The git pre-push contract delivers refspecs on stdin. Once rea's body has
+# consumed it (\`exec rea hook push-gate "\$@"\` reads stdin during \`runPushGate\`),
+# subsequent fragments cannot replay it — that's by design: agents that need
+# refspec data should run before rea, not after. Fragments that need ambient
+# repo state can call \`git rev-parse\` themselves.
+ext_dir="\${REA_ROOT}/.husky/pre-push.d"
+if [ -d "\$ext_dir" ]; then
+  # Collect fragments deterministically. POSIX sort orders the same way on
+  # macOS (BSD sort) and Linux (GNU sort) for ASCII filenames; consumers who
+  # name their fragments \`10-foo\` / \`20-bar\` get predictable ordering.
+  for frag in "\$ext_dir"/*; do
+    # Glob expands to itself when no matches — guard with -e.
+    [ -e "\$frag" ] || continue
+    # Skip non-files (directories, sockets) and non-executables. The
+    # executable bit is the consumer's opt-in: dropping a non-executable
+    # README into the dir does not become a hook.
+    [ -f "\$frag" ] || continue
+    [ -x "\$frag" ] || continue
+    # Each fragment runs in its own subprocess with the original git args.
+    # Failures propagate via \`set -eu\` above (loop body inherits, so any
+    # non-zero exit blocks the push immediately).
+    "\$frag" "\$@"
+  done
+fi
+
+exit 0
 `;
 
 /** Fallback hook body — `.git/hooks/pre-push` in vanilla-git installs. */
@@ -234,10 +290,11 @@ export function isReaManagedFallback(content: string): boolean {
 
 /**
  * True when `content` is a legacy fallback hook authored by an earlier rea
- * release: v2 (0.11.x — broken `exec $REA_BIN` body) or v1 (0.10.x —
- * delegated to `.claude/hooks/push-review-gate.sh`). Used by `rea upgrade`
- * to migrate — we overwrite these unconditionally because we control the
- * entire body shape.
+ * release: v3 (0.12.x — pre-extension body), v2 (0.11.x — broken
+ * `exec $REA_BIN` body), or v1 (0.10.x — delegated to
+ * `.claude/hooks/push-review-gate.sh`). Used by `rea upgrade` to migrate
+ * — we overwrite these unconditionally because we control the entire
+ * body shape.
  */
 export function isLegacyReaManagedFallback(content: string): boolean {
   if (!content.startsWith('#!/bin/sh\n')) return false;
@@ -245,6 +302,7 @@ export function isLegacyReaManagedFallback(content: string): boolean {
   if (secondLineEnd < 0) return false;
   const secondLine = content.slice(10, secondLineEnd);
   return (
+    secondLine === LEGACY_FALLBACK_MARKER_V3 ||
     secondLine === LEGACY_FALLBACK_MARKER_V2 ||
     secondLine === LEGACY_FALLBACK_MARKER_V1
   );
@@ -267,11 +325,17 @@ export function isReaManagedHuskyGate(content: string): boolean {
 
 /**
  * True when `content` is a legacy Husky gate from an earlier rea release:
- * v2 (0.11.x — broken `exec $REA_BIN` body) or v1 (0.10.x — bash core
- * delegating). Used to trigger the upgrade migration.
+ * v3 (0.12.x — pre-extension body), v2 (0.11.x — broken `exec $REA_BIN`
+ * body), or v1 (0.10.x — bash core delegating). Used to trigger the
+ * upgrade migration.
  */
 export function isLegacyReaManagedHuskyGate(content: string): boolean {
   return (
+    hasHeaderMarkers(
+      content,
+      LEGACY_HUSKY_GATE_MARKER_V3,
+      LEGACY_HUSKY_GATE_BODY_MARKER_V3,
+    ) ||
     hasHeaderMarkers(
       content,
       LEGACY_HUSKY_GATE_MARKER_V2,
@@ -642,6 +706,8 @@ async function cleanupStaleTempFiles(dst: string): Promise<void> {
       if (
         !body.includes(FALLBACK_MARKER) &&
         !body.includes(HUSKY_GATE_MARKER) &&
+        !body.includes(LEGACY_FALLBACK_MARKER_V3) &&
+        !body.includes(LEGACY_HUSKY_GATE_MARKER_V3) &&
         !body.includes(LEGACY_FALLBACK_MARKER_V2) &&
         !body.includes(LEGACY_HUSKY_GATE_MARKER_V2) &&
         !body.includes(LEGACY_FALLBACK_MARKER_V1) &&

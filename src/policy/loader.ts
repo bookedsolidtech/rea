@@ -32,6 +32,16 @@ const ReviewPolicySchema = z
     concerns_blocks: z.boolean().optional(),
     timeout_ms: z.number().int().positive().optional(),
     last_n_commits: z.number().int().positive().optional(),
+    /**
+     * Auto-narrow threshold (J / 0.13.0). When the resolved diff base is more
+     * than N commits away from HEAD, the gate auto-scopes to
+     * `last_n_commits` (or the 0.13 fallback default of 10) and emits a
+     * stderr warning. Default 30 when unset; explicit 0 disables auto-narrow
+     * entirely. Suppressed when the operator pinned `--last-n-commits`,
+     * `--base`, or `policy.review.last_n_commits` (those are explicit
+     * intent and auto-narrow stays out of the way).
+     */
+    auto_narrow_threshold: z.number().int().nonnegative().optional(),
   })
   .strict();
 

@@ -123,10 +123,15 @@ describe('BODY_TEMPLATE — path-with-spaces portability (Fix A / 0.12.0)', () =
   it('uses positional-args dispatch via `set --` rather than `exec $REA_BIN`', () => {
     const body = fallbackHookContent();
     // The 0.11.x body word-split on `exec $REA_BIN ...` — break that by
-    // ensuring the modern form uses `set --` arms terminated by `exec "$@"`.
+    // ensuring the modern form uses `set --` arms. v4 (0.13.0) replaces the
+    // old terminal `exec "$@"` with `"$@"` followed by status-propagation
+    // and extension-fragment chaining (so fragments under
+    // `.husky/pre-push.d/` run AFTER rea succeeds).
     expect(body).toMatch(/set -- "\$\{REA_ROOT\}\/node_modules\/\.bin\/rea" hook push-gate "\$@"/);
     expect(body).toMatch(/set -- node "\$\{REA_ROOT\}\/dist\/cli\/index\.js" hook push-gate "\$@"/);
-    expect(body).toMatch(/exec "\$@"/);
+    // v4 marker: rea body is invoked then exit propagated, so a bare `"$@"`
+    // statement appears (no `exec` prefix) BEFORE the fragment loop.
+    expect(body).toMatch(/^"\$@"$/m);
     // The fragile pattern `exec $REA_BIN ...` must not appear as an
     // executable line. Comments referencing the historic bug are fine —
     // anchor the negative match to lines NOT starting with `#`.
@@ -159,7 +164,9 @@ describe('BODY_TEMPLATE — path-with-spaces portability (Fix A / 0.12.0)', () =
   it('shipped husky body delegates via `set --` arms identically to the fallback', () => {
     const husky = huskyHookContent();
     expect(husky).toMatch(/set -- "\$\{REA_ROOT\}\/node_modules\/\.bin\/rea" hook push-gate "\$@"/);
-    expect(husky).toMatch(/exec "\$@"/);
+    // v4 (0.13.0): rea body invoked via `"$@"` (not `exec`) so post-body
+    // extension-fragment chaining can run.
+    expect(husky).toMatch(/^"\$@"$/m);
     const huskyLines = husky.split('\n');
     const executableHuskyLines = huskyLines.filter((l) => !/^\s*#/.test(l));
     expect(executableHuskyLines.some((l) => /exec\s+\$REA_BIN/.test(l))).toBe(false);
@@ -186,14 +193,19 @@ describe('BODY_TEMPLATE — path-with-spaces portability (Fix A / 0.12.0)', () =
   });
 });
 
-describe('marker bumps (Fix A / 0.12.0) — v3 markers + v2 legacy detection', () => {
-  it('FALLBACK_MARKER is the v3 marker', () => {
-    expect(FALLBACK_MARKER).toBe('# rea:pre-push-fallback v3');
+describe('marker bumps (Fix H / 0.13.0) — v4 markers + v3/v2 legacy detection', () => {
+  it('FALLBACK_MARKER is the v4 marker', () => {
+    expect(FALLBACK_MARKER).toBe('# rea:pre-push-fallback v4');
   });
 
-  it('HUSKY_GATE_MARKER and HUSKY_GATE_BODY_MARKER are v3', () => {
-    expect(HUSKY_GATE_MARKER).toBe('# rea:husky-pre-push-gate v3');
-    expect(HUSKY_GATE_BODY_MARKER).toBe('# rea:gate-body-v3');
+  it('HUSKY_GATE_MARKER and HUSKY_GATE_BODY_MARKER are v4', () => {
+    expect(HUSKY_GATE_MARKER).toBe('# rea:husky-pre-push-gate v4');
+    expect(HUSKY_GATE_BODY_MARKER).toBe('# rea:gate-body-v4');
+  });
+
+  it('isLegacyReaManagedFallback recognizes 0.12.x v3 markers (refresh-on-upgrade)', () => {
+    const v3Body = `#!/bin/sh\n# rea:pre-push-fallback v3\n# rea:gate-body-v3\nset -eu\nexec "$@"\n`;
+    expect(isLegacyReaManagedFallback(v3Body)).toBe(true);
   });
 
   it('isLegacyReaManagedFallback recognizes 0.11.x v2 markers (refresh-on-upgrade)', () => {
@@ -201,9 +213,27 @@ describe('marker bumps (Fix A / 0.12.0) — v3 markers + v2 legacy detection', (
     expect(isLegacyReaManagedFallback(v2Body)).toBe(true);
   });
 
+  it('isLegacyReaManagedHuskyGate recognizes 0.12.x v3 marker pair (refresh-on-upgrade)', () => {
+    const v3Body = `#!/bin/sh\n# rea:husky-pre-push-gate v3\n# rea:gate-body-v3\nset -eu\nexec "$@"\n`;
+    expect(isLegacyReaManagedHuskyGate(v3Body)).toBe(true);
+  });
+
   it('isLegacyReaManagedHuskyGate recognizes 0.11.x v2 marker pair (refresh-on-upgrade)', () => {
     const v2Body = `#!/bin/sh\n# rea:husky-pre-push-gate v2\n# rea:gate-body-v2\nset -eu\nexec $REA_BIN hook push-gate "$@"\n`;
     expect(isLegacyReaManagedHuskyGate(v2Body)).toBe(true);
+  });
+
+  it('classifyExistingHook maps a v3 husky body to rea-managed-husky-legacy-v1 (legacy bucket)', async () => {
+    const tmp = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-pp-v3-')));
+    try {
+      const hp = path.join(tmp, 'pre-push');
+      const v3Body = `#!/bin/sh\n# rea:husky-pre-push-gate v3\n# rea:gate-body-v3\nset -eu\nexec "$@"\n`;
+      await writeHook(hp, v3Body);
+      const res = await classifyExistingHook(hp);
+      expect(res.kind).toBe('rea-managed-husky-legacy-v1');
+    } finally {
+      await fs.rm(tmp, { recursive: true, force: true });
+    }
   });
 
   it('classifyExistingHook maps a v2 husky body to rea-managed-husky-legacy-v1 (legacy bucket)', async () => {
@@ -524,5 +554,203 @@ describe('inspectPrePushState', () => {
     const s = await inspectPrePushState(repo);
     expect(s.ok).toBe(false);
     expect(s.activeForeign).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Extension-hook chaining (Fix H / 0.13.0)
+// ---------------------------------------------------------------------------
+
+describe('extension-hook chaining (Fix H / 0.13.0) — `.husky/pre-push.d/*`', () => {
+  it('BODY contains the extension-hook loop sourcing `.husky/pre-push.d/`', () => {
+    const body = fallbackHookContent();
+    expect(body).toMatch(/ext_dir="\$\{REA_ROOT\}\/\.husky\/pre-push\.d"/);
+    expect(body).toMatch(/if \[ -d "\$ext_dir" \]; then/);
+    // Lex-ordered glob — POSIX `*` expands sorted.
+    expect(body).toMatch(/for frag in "\$ext_dir"\/\*/);
+    // Executable-bit gate — non-executable files are skipped silently.
+    expect(body).toMatch(/\[ -x "\$frag" \] \|\| continue/);
+    // Fragment receives original positional args.
+    expect(body).toMatch(/"\$frag" "\$@"/);
+  });
+
+  it('BODY runs rea push-gate FIRST and exits on its non-zero — fragments only fire on success', () => {
+    const body = fallbackHookContent();
+    // Fragment loop must come AFTER the rea_status guard. Verify the
+    // status check + early-exit precedes the ext_dir loop.
+    const reaStatusIdx = body.indexOf('rea_status=$?');
+    const extDirIdx = body.indexOf('ext_dir="${REA_ROOT}/.husky/pre-push.d"');
+    expect(reaStatusIdx).toBeGreaterThan(0);
+    expect(extDirIdx).toBeGreaterThan(reaStatusIdx);
+    expect(body).toMatch(/if \[ "\$rea_status" -ne 0 \]; then\n\s*exit "\$rea_status"/);
+  });
+
+  it('shipped husky hook also carries the extension-hook loop', () => {
+    const husky = huskyHookContent();
+    expect(husky).toMatch(/ext_dir="\$\{REA_ROOT\}\/\.husky\/pre-push\.d"/);
+    expect(husky).toMatch(/for frag in "\$ext_dir"\/\*/);
+  });
+
+  it('BODY parses cleanly under `sh -n` (POSIX syntax check)', async () => {
+    const tmpDir = await fs.realpath(
+      await fs.mkdtemp(path.join(os.tmpdir(), 'rea-pp-h-')),
+    );
+    try {
+      const hp = path.join(tmpDir, 'pre-push');
+      await fs.writeFile(hp, fallbackHookContent(), { encoding: 'utf8', mode: 0o755 });
+      const r = await execFileAsync('sh', ['-n', hp]);
+      expect(r.stderr).toBe('');
+    } finally {
+      await fs.rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('end-to-end: a successful rea body invokes fragments in lex order', async () => {
+    // Stand up a tmp REA_ROOT with a stubbed rea binary that exits 0,
+    // a `.husky/pre-push.d/` populated with three fragments, and the
+    // extension-loop body. Track invocation order via a shared log
+    // file. The fragments must run after the rea body in lex order
+    // (10 → 20 → 90), and the final exit code must be 0.
+    const repoDir = await fs.realpath(
+      await fs.mkdtemp(path.join(os.tmpdir(), 'rea-pp-e2e-')),
+    );
+    try {
+      // Init a real git repo so `git rev-parse --show-toplevel` works.
+      await execFileAsync('git', ['-C', repoDir, 'init', '-q']);
+      // Stub the rea CLI under node_modules/.bin/rea — write a 0-exit
+      // shell script that logs a marker line and then exits.
+      const log = path.join(repoDir, 'order.log');
+      const stubBin = path.join(repoDir, 'node_modules', '.bin', 'rea');
+      await fs.mkdir(path.dirname(stubBin), { recursive: true });
+      await fs.writeFile(
+        stubBin,
+        `#!/bin/sh\nprintf 'rea\\n' >> "${log}"\nexit 0\n`,
+        { mode: 0o755 },
+      );
+      // Fragments in deliberately-non-alphabetical filenames to prove
+      // sort-order, not creation-order, dictates execution.
+      const fragDir = path.join(repoDir, '.husky', 'pre-push.d');
+      await fs.mkdir(fragDir, { recursive: true });
+      await fs.writeFile(
+        path.join(fragDir, '90-third'),
+        `#!/bin/sh\nprintf 'third\\n' >> "${log}"\n`,
+        { mode: 0o755 },
+      );
+      await fs.writeFile(
+        path.join(fragDir, '10-first'),
+        `#!/bin/sh\nprintf 'first\\n' >> "${log}"\n`,
+        { mode: 0o755 },
+      );
+      await fs.writeFile(
+        path.join(fragDir, '20-second'),
+        `#!/bin/sh\nprintf 'second\\n' >> "${log}"\n`,
+        { mode: 0o755 },
+      );
+      // A README sitting in the dir without exec bit is silently skipped.
+      await fs.writeFile(path.join(fragDir, 'README'), '# notes\n', { mode: 0o644 });
+
+      const hookPath = path.join(repoDir, '.git', 'hooks', 'pre-push');
+      await fs.writeFile(hookPath, fallbackHookContent(), { encoding: 'utf8', mode: 0o755 });
+      // Invoke the hook; pre-push fixtures pass two positional args
+      // (remote name, remote URL).
+      const r = await execFileAsync(hookPath, ['origin', 'git@example:repo.git'], {
+        cwd: repoDir,
+      });
+      expect(r.stderr).toBe('');
+      const order = (await fs.readFile(log, 'utf8')).trim().split('\n');
+      expect(order).toEqual(['rea', 'first', 'second', 'third']);
+    } finally {
+      await fs.rm(repoDir, { recursive: true, force: true });
+    }
+  });
+
+  it('end-to-end: a non-zero fragment fails the push (set -eu propagates)', async () => {
+    const repoDir = await fs.realpath(
+      await fs.mkdtemp(path.join(os.tmpdir(), 'rea-pp-fail-')),
+    );
+    try {
+      await execFileAsync('git', ['-C', repoDir, 'init', '-q']);
+      const stubBin = path.join(repoDir, 'node_modules', '.bin', 'rea');
+      await fs.mkdir(path.dirname(stubBin), { recursive: true });
+      await fs.writeFile(stubBin, `#!/bin/sh\nexit 0\n`, { mode: 0o755 });
+      const fragDir = path.join(repoDir, '.husky', 'pre-push.d');
+      await fs.mkdir(fragDir, { recursive: true });
+      await fs.writeFile(
+        path.join(fragDir, '50-broken'),
+        `#!/bin/sh\nprintf 'broken\\n' >&2\nexit 7\n`,
+        { mode: 0o755 },
+      );
+      const hookPath = path.join(repoDir, '.git', 'hooks', 'pre-push');
+      await fs.writeFile(hookPath, fallbackHookContent(), { encoding: 'utf8', mode: 0o755 });
+      const r = await execFileAsync(hookPath, ['origin', 'git@example:r.git'], {
+        cwd: repoDir,
+      }).catch((e: { code?: number; stderr?: string }) => e);
+      // When set -eu propagates a non-zero from the fragment, the script
+      // exits with that non-zero status. execFileAsync rejects.
+      const exitCode = (r as { code?: number }).code ?? 0;
+      expect(exitCode).not.toBe(0);
+      expect((r as { stderr?: string }).stderr ?? '').toContain('broken');
+    } finally {
+      await fs.rm(repoDir, { recursive: true, force: true });
+    }
+  });
+
+  it('missing `.husky/pre-push.d/` is a no-op (backward compat)', async () => {
+    const repoDir = await fs.realpath(
+      await fs.mkdtemp(path.join(os.tmpdir(), 'rea-pp-noop-')),
+    );
+    try {
+      await execFileAsync('git', ['-C', repoDir, 'init', '-q']);
+      const stubBin = path.join(repoDir, 'node_modules', '.bin', 'rea');
+      await fs.mkdir(path.dirname(stubBin), { recursive: true });
+      await fs.writeFile(stubBin, `#!/bin/sh\nexit 0\n`, { mode: 0o755 });
+      // No `.husky/pre-push.d/` directory.
+      const hookPath = path.join(repoDir, '.git', 'hooks', 'pre-push');
+      await fs.writeFile(hookPath, fallbackHookContent(), { encoding: 'utf8', mode: 0o755 });
+      const r = await execFileAsync(hookPath, ['origin', 'git@example:r.git'], {
+        cwd: repoDir,
+      });
+      expect(r.stderr).toBe('');
+    } finally {
+      await fs.rm(repoDir, { recursive: true, force: true });
+    }
+  });
+
+  it('non-executable files in `.husky/pre-push.d/` are silently skipped', async () => {
+    const repoDir = await fs.realpath(
+      await fs.mkdtemp(path.join(os.tmpdir(), 'rea-pp-skip-')),
+    );
+    try {
+      await execFileAsync('git', ['-C', repoDir, 'init', '-q']);
+      const log = path.join(repoDir, 'order.log');
+      const stubBin = path.join(repoDir, 'node_modules', '.bin', 'rea');
+      await fs.mkdir(path.dirname(stubBin), { recursive: true });
+      await fs.writeFile(
+        stubBin,
+        `#!/bin/sh\nprintf 'rea\\n' >> "${log}"\nexit 0\n`,
+        { mode: 0o755 },
+      );
+      const fragDir = path.join(repoDir, '.husky', 'pre-push.d');
+      await fs.mkdir(fragDir, { recursive: true });
+      // 10-not-exec is a valid shell script BUT lacks the exec bit — must be skipped.
+      await fs.writeFile(
+        path.join(fragDir, '10-not-exec'),
+        `#!/bin/sh\nprintf 'should-not-run\\n' >> "${log}"\n`,
+        { mode: 0o644 },
+      );
+      // 20-runs IS executable — must run.
+      await fs.writeFile(
+        path.join(fragDir, '20-runs'),
+        `#!/bin/sh\nprintf 'runs\\n' >> "${log}"\n`,
+        { mode: 0o755 },
+      );
+      const hookPath = path.join(repoDir, '.git', 'hooks', 'pre-push');
+      await fs.writeFile(hookPath, fallbackHookContent(), { encoding: 'utf8', mode: 0o755 });
+      await execFileAsync(hookPath, ['origin', 'git@example:r.git'], { cwd: repoDir });
+      const order = (await fs.readFile(log, 'utf8')).trim().split('\n');
+      expect(order).toEqual(['rea', 'runs']);
+    } finally {
+      await fs.rm(repoDir, { recursive: true, force: true });
+    }
   });
 });
