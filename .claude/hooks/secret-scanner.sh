@@ -40,11 +40,41 @@ fi
 FILE_PATH=$(printf '%s' "$INPUT" | jq -r '.tool_input.file_path // empty' 2>/dev/null)
 CONTENT_WRITE=$(printf '%s' "$INPUT" | jq -r '.tool_input.content // empty' 2>/dev/null)
 CONTENT_EDIT=$(printf '%s' "$INPUT"  | jq -r '.tool_input.new_string // empty' 2>/dev/null)
+# MultiEdit (0.14.0 fix): the payload is at tool_input.edits[].new_string —
+# an array, not a scalar — and the prior versions of this hook never read
+# it. Result: any agent could route credential writes through MultiEdit and
+# bypass the secret scanner entirely. We extract every `new_string` value
+# from the edits array and concatenate them with newlines so the awk-based
+# pattern scan below treats them like any other write content.
+#
+# Defensive coercion (codex round-1 P1): a malformed payload where
+# `new_string` is a number, object, or array would make jq error out, the
+# `2>/dev/null` would swallow stderr, `CONTENT_MULTIEDIT` would be empty,
+# and the precedence chain below would fall through to `exit 0` —
+# silently allowing the write. Same fail-open mode for a non-array
+# `edits` value. We:
+#
+#   1. Coerce `.tool_input.edits` to `[]` if it's anything other than an
+#      array (`if type=="array" then . else [] end`)
+#   2. Coerce every `new_string` to a string via `tostring` so jq cannot
+#      fail on heterogeneous types
+#
+# Both layers fail closed: a malformed payload either yields the empty
+# string (no scan needed, exit 0 from the precedence chain) or yields a
+# pattern-scannable string. There is no path where jq errors silently and
+# the hook falls through to allow.
+CONTENT_MULTIEDIT=$(printf '%s' "$INPUT" | jq -r '
+  (.tool_input.edits // [] | if type=="array" then . else [] end)
+  | map((.new_string // "") | tostring)
+  | join("\n")
+' 2>/dev/null)
 
 if [[ -n "$CONTENT_WRITE" ]]; then
   CONTENT="$CONTENT_WRITE"
 elif [[ -n "$CONTENT_EDIT" ]]; then
   CONTENT="$CONTENT_EDIT"
+elif [[ -n "$CONTENT_MULTIEDIT" ]]; then
+  CONTENT="$CONTENT_MULTIEDIT"
 else
   exit 0
 fi

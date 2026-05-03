@@ -17,6 +17,12 @@
 
 set -uo pipefail
 
+# Source shared shell-segment splitter (0.15.0). Replaces full-command
+# grep that false-positives on commit messages mentioning `.env` (e.g.
+# `git commit -m "stop reading .env via cat"`).
+# shellcheck source=_lib/cmd-segments.sh
+source "$(dirname "$0")/_lib/cmd-segments.sh"
+
 INPUT=$(cat)
 
 # ── Dependency check ──────────────────────────────────────────────────────────
@@ -70,17 +76,21 @@ PATTERN_ENV_FILE='(\.env[a-zA-Z0-9._-]*|\.envrc)([[:space:]]|"|'"'"'|$)'
 MATCHES_UTILITY=0
 MATCHES_ENV_FILE=0
 
-if printf '%s' "$CMD" | grep -qE "$PATTERN_UTILITY"; then
+# 0.15.0: per-segment match. Pre-fix this greped the FULL command which
+# false-positived on commit messages: `git commit -m "stop reading .env
+# files via cat"` matched both PATTERN_UTILITY (cat) and PATTERN_ENV_FILE
+# (.env) and the hook blocked a perfectly safe commit.
+if any_segment_matches "$CMD" "$PATTERN_UTILITY"; then
   MATCHES_UTILITY=1
 fi
 
-if printf '%s' "$CMD" | grep -qE "$PATTERN_ENV_FILE"; then
+if any_segment_matches "$CMD" "$PATTERN_ENV_FILE"; then
   MATCHES_ENV_FILE=1
 fi
 
 # Direct source/cp of .env files — always block
-if printf '%s' "$CMD" | grep -qE "$PATTERN_SOURCE" || \
-   printf '%s' "$CMD" | grep -qE "$PATTERN_CP_ENV"; then
+if any_segment_matches "$CMD" "$PATTERN_SOURCE" || \
+   any_segment_matches "$CMD" "$PATTERN_CP_ENV"; then
   TRUNCATED_CMD=$(truncate_cmd "$CMD")
   {
     printf 'ENV FILE PROTECTION: Direct sourcing or copying of .env files is blocked.\n'

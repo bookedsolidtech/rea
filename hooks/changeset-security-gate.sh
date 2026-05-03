@@ -23,8 +23,12 @@ check_halt
 INPUT="$(cat)"
 TOOL_NAME=$(echo "$INPUT" | jq -r '.tool_name // ""')
 
-# Only handle Write and Edit
-if [[ "$TOOL_NAME" != "Write" && "$TOOL_NAME" != "Edit" ]]; then
+# 0.15.0 fix: MultiEdit was not in the allowed tool_name set, so the gate
+# silently exited 0 on every MultiEdit call against `.changeset/*.md` —
+# letting GHSA / CVE pre-disclosure through and skipping frontmatter
+# validation. Same bypass shape as the secret-scanner MultiEdit issue
+# fixed in 0.14.0; this is the second hook in the same family.
+if [[ "$TOOL_NAME" != "Write" && "$TOOL_NAME" != "Edit" && "$TOOL_NAME" != "MultiEdit" ]]; then
   exit 0
 fi
 
@@ -37,12 +41,22 @@ fi
 
 require_jq
 
-# Extract the content being written
+# Extract the content being written. MultiEdit content lives at
+# `tool_input.edits[].new_string` (an array, not a scalar) — see the
+# corresponding extraction in hooks/secret-scanner.sh. We use the same
+# defensive coercion (`tostring` + `if type=="array" then . else [] end`)
+# so a malformed payload fails closed: either yields the empty string
+# (no scan needed, exit 0) or yields a pattern-scannable string.
 if [[ "$TOOL_NAME" == "Write" ]]; then
   CONTENT=$(echo "$INPUT" | jq -r '.tool_input.content // ""')
-else
-  # For Edit: check the new_string being inserted
+elif [[ "$TOOL_NAME" == "Edit" ]]; then
   CONTENT=$(echo "$INPUT" | jq -r '.tool_input.new_string // ""')
+else
+  CONTENT=$(echo "$INPUT" | jq -r '
+    (.tool_input.edits // [] | if type=="array" then . else [] end)
+    | map((.new_string // "") | tostring)
+    | join("\n")
+  ')
 fi
 
 # ─── 1. SECURITY DISCLOSURE CHECK ───────────────────────────────────────────
@@ -90,6 +104,19 @@ fi
 #
 # A changeset without valid frontmatter is silently ignored by the changesets
 # tool — the package bump and CHANGELOG entry never appear in the release.
+#
+# 0.15.0 fix: skip frontmatter validation for MultiEdit. MultiEdit's
+# `tool_input.edits[].new_string` payload is a list of partial string
+# replacements, not the full file body — running the frontmatter
+# validator against the concatenation of new_strings would reject every
+# legitimate MultiEdit on an existing changeset (none of the edit
+# fragments individually contains a frontmatter block, even though the
+# resulting file does). The disclosure scan above still runs on
+# MultiEdit content because GHSA/CVE patterns match per-fragment without
+# any structural assumption.
+if [[ "$TOOL_NAME" == "MultiEdit" ]]; then
+  exit 0
+fi
 
 # Must start with ---
 if ! echo "$CONTENT" | head -1 | grep -qE '^---'; then
@@ -107,9 +134,20 @@ Brief description of what changed and why (close #N if applicable).
 Bump types: patch (bug fix/security), minor (new feature), major (breaking change)"
 fi
 
-# Must have at least one package bump entry and a closing ---
+# Must have at least one package bump entry and a closing ---.
+# 0.15.0 fix: accept single-quoted, double-quoted, AND unquoted package
+# names (all three are valid YAML for the same string). Pre-fix the
+# regex required single quotes, so a tool or human authoring the
+# changeset with `"@scope/name": patch` was rejected as malformed even
+# though the Changesets tool itself accepts every form.
+#
+# Codex round-1 P2-1 fix: explicit-alternation form (no backref) so
+# the unquoted variant matches on BSD grep too. The earlier
+# `^([\"']?)[^\"']+\1: ...` shape relied on backref-with-empty-capture
+# semantics that BSD's grep rejects when the capture group's `?` made
+# it absent — quoted forms matched on macOS but unquoted did not.
 FRONTMATTER=$(echo "$CONTENT" | awk '/^---/{count++; if(count==2){exit} next} count==1{print}')
-if ! echo "$FRONTMATTER" | grep -qE "^'.+': (patch|minor|major)"; then
+if ! echo "$FRONTMATTER" | grep -qE "^(\"[^\"]+\"|'[^']+'|[^\"'[:space:]]+): (patch|minor|major)"; then
   json_output "block" \
     "CHANGESET FORMAT GATE: Frontmatter does not contain a valid package bump entry.
 
