@@ -452,6 +452,14 @@ export async function runPushGate(deps: PushGateDeps): Promise<GateResult> {
       cwd: deps.baseDir,
       timeoutMs: policy.timeout_ms,
       env,
+      // 0.14.0+: pass the resolved policy's model + reasoning overrides so
+      // codex spawns with `-c model="<name>" -c model_reasoning_effort="<level>"`.
+      // Defaults (gpt-5.4 + high) are baked into resolvePushGatePolicy so
+      // policies that omit these keys still get the iron-gate defaults.
+      ...(policy.codex_model !== undefined ? { model: policy.codex_model } : {}),
+      ...(policy.codex_reasoning_effort !== undefined
+        ? { reasoningEffort: policy.codex_reasoning_effort }
+        : {}),
     });
     const summary = summarizeReview(codexResult.reviewText);
     const blocked = summary.verdict === 'blocking'

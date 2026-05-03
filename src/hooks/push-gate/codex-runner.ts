@@ -153,12 +153,40 @@ export function createRealGitExecutor(cwd: string): GitExecutor {
 // Codex invocation
 // ---------------------------------------------------------------------------
 
+/**
+ * Escape a string for safe inclusion inside a TOML basic-string literal.
+ * Codex's `-c key=value` parser runs the value through TOML, so we have to
+ * close over the same escape contract — namely backslash and double-quote
+ * (TOML basic strings forbid raw `"` and `\` in the body). The model names
+ * and reasoning levels we expect (`gpt-5.4`, `high`, etc.) never contain
+ * either character; this guard exists so a future model-name typo with a
+ * shell metacharacter cannot smuggle a TOML escape that codex misparses
+ * into something dangerous.
+ */
+function escapeTomlString(value: string): string {
+  return value.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+}
+
 export interface CodexRunOptions {
   baseRef: string;
   cwd: string;
   timeoutMs: number;
   /** Optional custom review prompt; defaults to Codex's built-in. */
   prompt?: string;
+  /**
+   * Codex CLI model override (0.13.4+). When set, the runner passes
+   * `-c model="<value>"` to `codex exec review`. Codex itself validates
+   * the name. `undefined` falls back to codex's own default
+   * (`codex-auto-review` today, NOT the `gpt-5.4` flagship).
+   */
+  model?: string;
+  /**
+   * Codex reasoning effort (0.13.4+). When set, the runner passes
+   * `-c model_reasoning_effort="<value>"`. Only meaningful when paired
+   * with a reasoning-capable model (gpt-5.4, gpt-5.3-codex). Codex's
+   * own default is `medium`.
+   */
+  reasoningEffort?: 'low' | 'medium' | 'high';
   /**
    * Env passthrough. Tests inject a clean env to prevent ambient overrides.
    * Production passes `process.env`.
@@ -197,7 +225,30 @@ export interface CodexRunResult {
  */
 export async function runCodexReview(options: CodexRunOptions): Promise<CodexRunResult> {
   const spawner = options.spawnImpl ?? spawn;
-  const baseArgs = ['exec', 'review', '--base', options.baseRef, '--json', '--ephemeral'];
+  // Model + reasoning overrides go BEFORE the `exec` subcommand because
+  // `-c key=value` is a top-level codex CLI flag, not an `exec` flag.
+  // Codex's TOML parser interprets the value, so we wrap strings in TOML
+  // quotes — `-c model="gpt-5.4"` not `-c model=gpt-5.4` — to ensure the
+  // value lands as a string regardless of upstream parsing changes.
+  const overrideArgs: string[] = [];
+  if (options.model !== undefined && options.model.length > 0) {
+    overrideArgs.push('-c', `model="${escapeTomlString(options.model)}"`);
+  }
+  if (options.reasoningEffort !== undefined) {
+    overrideArgs.push(
+      '-c',
+      `model_reasoning_effort="${escapeTomlString(options.reasoningEffort)}"`,
+    );
+  }
+  const baseArgs = [
+    ...overrideArgs,
+    'exec',
+    'review',
+    '--base',
+    options.baseRef,
+    '--json',
+    '--ephemeral',
+  ];
   const args =
     options.prompt !== undefined && options.prompt.length > 0 ? [...baseArgs, options.prompt] : baseArgs;
 
