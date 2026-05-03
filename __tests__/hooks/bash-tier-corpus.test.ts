@@ -201,6 +201,74 @@ const DEPENDENCY_AUDIT_GATE_CORPUS: CorpusCase[] = [
   },
 ];
 
+const ENV_FILE_PROTECTION_CORPUS: CorpusCase[] = [
+  // ─── helix-017 P2 #2: utility + .env must co-occur in SAME segment ──
+  // Pre-fix: independent any_segment_matches booleans OR'd together
+  // false-positived on multi-segment constructions.
+  {
+    cmd: 'echo "log: cat is broken" ; touch foo.env',
+    expectExit: 0,
+    origin: 'helix-017 #2',
+    notes: 'utility (cat in echo string) seg-1, .env name seg-2 — must NOT block',
+  },
+  {
+    cmd: 'echo "we use grep here" && touch foo.env',
+    expectExit: 0,
+    origin: 'helix-017 #2 sibling',
+    notes: 'segments differ; same-segment co-occurrence rule must hold',
+  },
+  // ─── true-positive: utility AND .env in same segment ────────────────
+  {
+    cmd: 'cat .env',
+    expectExit: 2,
+    origin: 'env-file baseline',
+    notes: 'classic same-segment match — must block',
+  },
+  {
+    cmd: 'grep TOKEN .env.production',
+    expectExit: 2,
+    origin: 'env-file baseline',
+    notes: '.env-variant filename — must block',
+  },
+  // ─── known-good: legitimate commit message mentioning .env + cat ────
+  {
+    cmd: 'git commit -m "stop reading .env files via cat"',
+    expectExit: 0,
+    origin: 'env-file E.1 sibling',
+    notes: 'utility and .env in commit-message body — must NOT block',
+  },
+];
+
+const ATTRIBUTION_ADVISORY_CORPUS: CorpusCase[] = [
+  // ─── helix-017 P3 #4: markdown-link regex too broad ─────────────────
+  // Pre-fix: \[Claude Code\] matched ANY bracketed mention.
+  {
+    cmd: 'gh pr edit 42 --body "feat: support [Claude Code] hook output format"',
+    expectExit: 0,
+    origin: 'helix-017 #4',
+    notes: 'legitimate bracketed mention — must NOT block',
+  },
+  {
+    cmd: 'git commit -m "docs: clarify [Cursor] integration notes"',
+    expectExit: 0,
+    origin: 'helix-017 #4 sibling',
+    notes: 'bracketed mention in commit body — must NOT block',
+  },
+  // ─── true-positive: markdown link form must still block ─────────────
+  {
+    cmd: 'git commit -m "feat: x\n\nGenerated with [Claude Code](https://claude.com/claude-code)"',
+    expectExit: 2,
+    origin: 'attribution baseline',
+    notes: 'actual markdown-link attribution — must block',
+  },
+  {
+    cmd: 'gh pr create --title x --body "Generated with [GitHub Copilot](https://...)"',
+    expectExit: 2,
+    origin: 'attribution baseline',
+    notes: 'gh pr create with markdown-link attribution — must block',
+  },
+];
+
 function networkAvailable(): boolean {
   const res = spawnSync('curl', ['-fsS', '--max-time', '5', 'https://registry.npmjs.org/-/ping'], {
     encoding: 'utf8',
@@ -230,6 +298,30 @@ describe('bash-tier corpus — dependency-audit-gate.sh', () => {
       // Network-bound corpus cases — skip when offline.
       if (c.expectExit === 2 && !networkAvailable()) return;
       const res = runHook('dependency-audit-gate.sh', c.cmd);
+      expect(res.status, `expected exit ${c.expectExit} for: ${c.cmd}\nstderr: ${res.stderr}`).toBe(
+        c.expectExit,
+      );
+    });
+  }
+});
+
+describe('bash-tier corpus — env-file-protection.sh', () => {
+  for (const c of ENV_FILE_PROTECTION_CORPUS) {
+    it(`[${c.origin}] ${c.cmd.slice(0, 60)}${c.cmd.length > 60 ? '…' : ''}`, () => {
+      if (!jqExists()) return;
+      const res = runHook('env-file-protection.sh', c.cmd);
+      expect(res.status, `expected exit ${c.expectExit} for: ${c.cmd}\nstderr: ${res.stderr}`).toBe(
+        c.expectExit,
+      );
+    });
+  }
+});
+
+describe('bash-tier corpus — attribution-advisory.sh', () => {
+  for (const c of ATTRIBUTION_ADVISORY_CORPUS) {
+    it(`[${c.origin}] ${c.cmd.slice(0, 60)}${c.cmd.length > 60 ? '…' : ''}`, () => {
+      if (!jqExists()) return;
+      const res = runHook('attribution-advisory.sh', c.cmd);
       expect(res.status, `expected exit ${c.expectExit} for: ${c.cmd}\nstderr: ${res.stderr}`).toBe(
         c.expectExit,
       );
