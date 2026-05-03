@@ -29,6 +29,26 @@ describe('mergeSettings', () => {
     // No "chained new command" warnings: on a fresh install, every matcher
     // group is novel and should be added cleanly.
     expect(result.warnings.some((w) => w.includes('chained new command'))).toBe(false);
+
+    // 0.16.3 discord-ops Round 9 #1: the Bash matcher group must
+    // include `blocked-paths-bash-gate.sh` immediately after
+    // `protected-paths-bash-gate.sh`. The order matters because the
+    // protected-paths gate is the hard fail-closed list (HALT,
+    // policy.yaml, settings.json, .husky/) and runs first; the new
+    // blocked-paths-bash-gate handles the runtime-configurable
+    // `blocked_paths` list from policy.yaml.
+    const bashHooks = (preHooks.find((g) => g.matcher === 'Bash') as
+      | { hooks: Array<{ command: string }> }
+      | undefined)?.hooks ?? [];
+    const cmdList = bashHooks.map((h) => h.command);
+    const protectedIdx = cmdList.findIndex((c) => c.includes('protected-paths-bash-gate.sh'));
+    const blockedIdx = cmdList.findIndex((c) => c.includes('blocked-paths-bash-gate.sh'));
+    expect(protectedIdx).toBeGreaterThanOrEqual(0);
+    expect(blockedIdx).toBeGreaterThanOrEqual(0);
+    expect(blockedIdx).toBeGreaterThan(protectedIdx);
+    // And before dependency-audit-gate (per the layering rationale).
+    const depAuditIdx = cmdList.findIndex((c) => c.includes('dependency-audit-gate.sh'));
+    expect(depAuditIdx).toBeGreaterThan(blockedIdx);
   });
 
   it('is idempotent — a second merge skips everything', () => {

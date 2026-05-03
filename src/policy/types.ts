@@ -280,6 +280,7 @@ export interface Policy {
   promotion_requires_human_approval: boolean;
   block_ai_attribution: boolean;
   blocked_paths: string[];
+  protected_paths_relax: string[];
   notification_channel: string;
   injection_detection?: 'block' | 'warn';
   injection?: InjectionPolicy;

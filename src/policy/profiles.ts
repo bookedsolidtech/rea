@@ -52,6 +52,7 @@ export const ProfileSchema = z
     promotion_requires_human_approval: z.boolean().optional(),
     block_ai_attribution: z.boolean().optional(),
     blocked_paths: z.array(z.string()).optional(),
+    protected_paths_relax: z.array(z.string()).optional(),
     notification_channel: z.string().optional(),
     injection_detection: z.enum(['block', 'warn']).optional(),
     injection: InjectionProfileSchema.optional(),

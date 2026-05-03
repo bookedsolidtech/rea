@@ -28,6 +28,12 @@
           },
           {
             "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/blocked-paths-bash-gate.sh",
+            "timeout": 5000,
+            "statusMessage": "Checking for shell-redirect to policy-blocked paths..."
+          },
+          {
+            "type": "command",
             "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/dependency-audit-gate.sh",
             "timeout": 15000,
             "statusMessage": "Verifying package exists..."
