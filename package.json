@@ -49,6 +49,7 @@
     ".husky/",
     "LICENSE",
     "README.md",
+    "MIGRATING.md",
     "SECURITY.md",
     "THREAT_MODEL.md"
   ],
