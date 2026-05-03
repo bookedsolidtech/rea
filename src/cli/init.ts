@@ -335,10 +335,27 @@ async function printCodexInstallAssist(): Promise<void> {
   );
 }
 
+function readExistingInstalledAt(policyPath: string): string | undefined {
+  try {
+    if (!fs.existsSync(policyPath)) return undefined;
+    const raw = fs.readFileSync(policyPath, 'utf8');
+    const m = raw.match(/^installed_at:\s*"([^"]+)"\s*$/m);
+    return m ? m[1] : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function writePolicyYaml(targetDir: string, config: ResolvedConfig, layered: Profile): string {
   const policyPath = path.join(targetDir, REA_DIR, POLICY_FILE);
   const installedBy = process.env.USER ?? os.userInfo().username ?? 'unknown';
-  const installedAt = new Date().toISOString();
+  // 0.17.0 idempotency: preserve the original `installed_at` if a policy
+  // already exists. Without this, every `rea init` re-stamps the field
+  // and produces a non-idempotent diff. The first install date is the
+  // semantically correct value — re-runs reflect refreshes, not new
+  // installs. Falls back to `new Date()` only when the file is absent
+  // or unparseable.
+  const installedAt = readExistingInstalledAt(policyPath) ?? new Date().toISOString();
 
   const lines: string[] = [];
   lines.push(`# .rea/policy.yaml — managed by rea v${getPkgVersion()}`);
@@ -460,13 +477,37 @@ async function writeInstallManifest(
     source: 'claude-md',
   });
 
+  // 0.17.0 idempotency: preserve the original `installed_at` from a
+  // prior manifest if present. The first install date is the semantic
+  // truth — re-runs reflect refreshes, not new installs.
+  const manifestPath = path.join(targetDir, REA_DIR, 'install-manifest.json');
   const manifest: InstallManifest = {
     version: getPkgVersion(),
     profile,
-    installed_at: new Date().toISOString(),
+    installed_at:
+      readExistingManifestInstalledAt(manifestPath) ?? new Date().toISOString(),
     files: entries,
   };
   return writeManifestAtomic(targetDir, manifest);
+}
+
+function readExistingManifestInstalledAt(manifestPath: string): string | undefined {
+  try {
+    if (!fs.existsSync(manifestPath)) return undefined;
+    const raw = fs.readFileSync(manifestPath, 'utf8');
+    const parsed: unknown = JSON.parse(raw);
+    if (
+      typeof parsed === 'object' &&
+      parsed !== null &&
+      'installed_at' in parsed &&
+      typeof (parsed as { installed_at: unknown }).installed_at === 'string'
+    ) {
+      return (parsed as { installed_at: string }).installed_at;
+    }
+  } catch {
+    // Fall through — caller stamps a fresh date.
+  }
+  return undefined;
 }
 
 export async function runInit(options: InitOptions): Promise<void> {

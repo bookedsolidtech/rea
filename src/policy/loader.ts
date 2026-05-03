@@ -172,11 +172,19 @@ const PolicySchema = z
     promotion_requires_human_approval: z.boolean(),
     block_ai_attribution: z.boolean().default(false),
     blocked_paths: z.array(z.string()),
-    // 0.16.3 F7: opt-in relax list. Consumers can list rea-managed
-    // hard-protected patterns they want unblocked (e.g. `.husky/` to
-    // author their own husky hooks). The kill-switch invariants
-    // (`.rea/HALT`, `.rea/policy.yaml`, `.claude/settings.json`) are
-    // ignored if listed — see hooks/_lib/protected-paths.sh.
+    // 0.16.5 F9 (helix-018 Option A): full policy-driven definition of
+    // the rea-managed write-protection list. When set, fully owns the
+    // protected set (kill-switch invariants are always added). When
+    // unset, defaults to the 5 historical patterns. Consumers who want
+    // to ADD a path (e.g. `.github/workflows/`) or remove non-invariant
+    // entries (e.g. `.husky/`) declare the full list here.
+    protected_writes: z.array(z.string()).optional(),
+    // 0.16.3 F7: opt-in subtractor. Removes entries from whatever the
+    // effective protected set is (default OR `protected_writes`).
+    // Kill-switch invariants (`.rea/HALT`, `.rea/policy.yaml`,
+    // `.claude/settings.json`) are silently dropped from the relax
+    // list — see hooks/_lib/protected-paths.sh. Both keys can coexist;
+    // `protected_paths_relax` runs AFTER `protected_writes`.
     protected_paths_relax: z.array(z.string()).default([]),
     notification_channel: z.string().default(''),
     injection_detection: z.enum(['block', 'warn']).optional(),
