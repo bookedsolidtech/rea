@@ -157,6 +157,26 @@ describe('blocked-paths-enforcer.sh — path-traversal rejection (0.14.0 iron-ga
     expect(res.status).toBe(2);
   });
 
+  it('blocks backslash-separated paths matching a blocked entry (0.15.0 fix)', () => {
+    if (!jqExists()) return;
+    // Pre-0.15.0: `.github\workflows\release.yml` reaches `.github/workflows/release.yml`
+    // on Windows / Git Bash but didn't normalize to forward slashes, so the
+    // literal-match against `.github/workflows/` (which IS in the policy)
+    // failed and the hook exited 0. settings-protection.sh had this fix
+    // since 0.10.x; blocked-paths-enforcer was the gap.
+    const target = `${dir}/.github\\workflows\\release.yml`;
+    const res = runHook(dir, target);
+    expect(res.status).toBe(2);
+    expect(res.stderr).toMatch(/BLOCKED PATH/);
+  });
+
+  it('blocks percent-encoded backslash traversal (%5C)', () => {
+    if (!jqExists()) return;
+    const target = `${dir}/.github%5Cworkflows%5Crelease.yml`;
+    const res = runHook(dir, target);
+    expect(res.status).toBe(2);
+  });
+
   it('allows paths that contain ".." as part of a filename (not a segment)', () => {
     if (!jqExists()) return;
     // `foo..bar/baz.ts` and `foo..` are NOT traversal — `..` is a literal

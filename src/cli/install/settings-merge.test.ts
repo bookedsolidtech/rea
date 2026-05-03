@@ -16,7 +16,12 @@ describe('mergeSettings', () => {
     const preHooks = ((result.merged.hooks as { PreToolUse?: Array<{ matcher: string }> }).PreToolUse) ?? [];
     const matchers = preHooks.map((g) => g.matcher);
     expect(matchers).toContain('Bash');
-    expect(matchers).toContain('Write|Edit');
+    // 0.15.0+: matcher includes MultiEdit so the secret-scanner /
+    // blocked-paths / settings-protection / changeset-security gates
+    // dispatch on MultiEdit calls. Pre-0.15.0 the matcher was `Write|Edit`
+    // and MultiEdit silently bypassed the entire write-tier hook block.
+    expect(matchers).toContain('Write|Edit|MultiEdit');
+    expect(matchers).not.toContain('Write|Edit');
     expect(result.addedCount).toBeGreaterThan(0);
     expect(result.skippedCount).toBe(0);
     // No "chained new command" warnings: on a fresh install, every matcher

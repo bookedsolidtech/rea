@@ -418,4 +418,37 @@ describe('settings-protection.sh — `.husky/*.d/` extension surface (Fix 0.13.2
     expect(res.status).toBe(2);
     expect(res.stderr).toMatch(/symlink in extension surface refused/);
   });
+
+  it('refuses intermediate-directory symlink bypass (helix Finding 2 / 0.15.0)', async () => {
+    if (!jqExists()) return;
+    // The earlier `[ -L "$FILE_PATH" ]` check only inspected the FINAL
+    // path component. An attacker could symlink an INTERMEDIATE
+    // directory inside the surface to escape it:
+    //
+    //   .husky/pre-push.d/linkdir -> ../   (resolves to .husky/)
+    //   write .husky/pre-push.d/linkdir/pre-push  → writes .husky/pre-push
+    //
+    // The final `pre-push` is not yet a file/symlink so `[ -L … ]`
+    // returned false. The 0.15.0 fix resolves the parent dir's realpath
+    // and refuses if the resolved path leaves the surface.
+    const protectedBody = path.join(dir, '.husky', 'pre-push');
+    await fs.writeFile(protectedBody, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    const linkDir = path.join(dir, '.husky', 'pre-push.d', 'linkdir');
+    await fs.symlink('../', linkDir);
+    const target = path.join(linkDir, 'pre-push');
+    const res = runHook(dir, target);
+    expect(res.status).toBe(2);
+    expect(res.stderr).toMatch(/extension path resolves outside surface/);
+  });
+
+  it('still allows nested fragments under non-symlinked subdirs', async () => {
+    if (!jqExists()) return;
+    // Regression-protection: the realpath check must not refuse
+    // legitimate nested-but-real subdirectories under the surface.
+    const subdir = path.join(dir, '.husky', 'pre-push.d', 'sub');
+    await fs.mkdir(subdir, { recursive: true });
+    const target = path.join(subdir, 'inner');
+    const res = runHook(dir, target);
+    expect(res.status).toBe(0);
+  });
 });

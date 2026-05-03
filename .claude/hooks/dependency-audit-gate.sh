@@ -43,30 +43,60 @@ fi
 extract_packages() {
   local cmd="$1"
 
-  # npm install/add with packages (skip flags and local paths)
-  if printf '%s' "$cmd" | grep -qiE '(npm[[:space:]]+(install|i|add)|pnpm[[:space:]]+(add|install)|yarn[[:space:]]+add)[[:space:]]'; then
-    # Extract the part after the install command
-    local after_cmd
-    after_cmd=$(printf '%s' "$cmd" | sed -E 's/.*(npm[[:space:]]+(install|i|add)|pnpm[[:space:]]+(add|install)|yarn[[:space:]]+add)[[:space:]]+//')
+  # 0.15.0 fix: the previous parser ran `grep` against the entire bash
+  # command string with no segment boundary anchor. A heredoc body or
+  # commit-message containing `pnpm install` (e.g. inside
+  # `git commit -m "$(cat <<EOF ... pnpm install ... EOF)"`) matched the
+  # grep, the `.*` in the sed stripped up to that occurrence, and the rest
+  # of the command (`chore:`, `&&`, `||`, etc.) was passed to
+  # `npm view <token> name` and reported as missing packages. The hook
+  # then refused to commit perfectly innocent code.
+  #
+  # Fix: split the command on shell command separators (`;`, `&&`, `||`,
+  # `|`, newlines) and only run the install-detection on segments whose
+  # FIRST non-whitespace token is one of the install commands. Heredoc
+  # bodies inside `$()` substitutions are NOT split into separate segments
+  # — the entire `$(cat <<EOF ... EOF)` is one token attached to the
+  # outer command — but they're never the FIRST token on a segment, so
+  # the anchor rejects them.
 
-    # Split on spaces and filter
-    for token in $after_cmd; do
-      # Skip flags
-      if [[ "$token" == -* ]]; then continue; fi
-      # Skip local paths
-      if [[ "$token" == ./* || "$token" == /* || "$token" == ../* ]]; then continue; fi
-      # Skip empty
-      if [[ -z "$token" ]]; then continue; fi
-      # Strip version specifier for lookup
-      local pkg_name
-      pkg_name=$(printf '%s' "$token" | sed -E 's/@[^@/]+$//')
-      # Handle scoped packages (@scope/name)
-      if [[ -z "$pkg_name" ]]; then
-        pkg_name="$token"
-      fi
-      printf '%s\n' "$pkg_name"
-    done
-  fi
+  # Tokenize on shell separators. Each `IFS=` entry becomes a separate
+  # segment we can anchor against. We use bash's `mapfile` with a sed
+  # to inject newlines at separators; awk-based splitting handles the
+  # quoting heuristic well enough for the realistic cases (agent-issued
+  # commands rarely have separators inside single-quoted strings that
+  # would confuse this).
+  local segments
+  segments=$(printf '%s\n' "$cmd" | sed -E 's/(\|\||\&\&|;|\|)/\n/g')
+
+  while IFS= read -r segment; do
+    # Trim leading whitespace.
+    segment="${segment#"${segment%%[![:space:]]*}"}"
+    # Anchor to start: only match when the install command is the FIRST
+    # thing on the segment, optionally preceded by `sudo` / `exec` /
+    # `time` / etc.
+    if printf '%s' "$segment" | grep -qiE '^(sudo[[:space:]]+|exec[[:space:]]+|time[[:space:]]+)*(npm[[:space:]]+(install|i|add)|pnpm[[:space:]]+(add|install|i)|yarn[[:space:]]+add)[[:space:]]+'; then
+      # Strip the leading prefix wrappers + install command, leaving args.
+      local after_cmd
+      after_cmd=$(printf '%s' "$segment" | sed -E 's/^(sudo[[:space:]]+|exec[[:space:]]+|time[[:space:]]+)*(npm[[:space:]]+(install|i|add)|pnpm[[:space:]]+(add|install|i)|yarn[[:space:]]+add)[[:space:]]+//')
+
+      for token in $after_cmd; do
+        if [[ "$token" == -* ]]; then continue; fi
+        if [[ "$token" == ./* || "$token" == /* || "$token" == ../* ]]; then continue; fi
+        if [[ -z "$token" ]]; then continue; fi
+        # `npm view` can't validate `@workspace:*` / `link:` / `file:`
+        # prefixes (workspace protocols). Skip them — they're never npm
+        # registry packages.
+        if [[ "$token" == workspace:* || "$token" == link:* || "$token" == file:* || "$token" == git+* ]]; then continue; fi
+        local pkg_name
+        pkg_name=$(printf '%s' "$token" | sed -E 's/@[^@/]+$//')
+        if [[ -z "$pkg_name" ]]; then
+          pkg_name="$token"
+        fi
+        printf '%s\n' "$pkg_name"
+      done
+    fi
+  done <<< "$segments"
 }
 
 PACKAGES=$(extract_packages "$CMD")

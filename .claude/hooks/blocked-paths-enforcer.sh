@@ -106,12 +106,58 @@ normalize_path() {
   if [[ "$p" == "$root"/* ]]; then
     p="${p#$root/}"
   fi
-  p=$(printf '%s' "$p" | sed 's/%2[Ff]/\//g; s/%2[Ee]/./g; s/%20/ /g')
+  # 0.15.0 fix: include `\` (and `%5C` percent-encoded form) in the
+  # normalization. Without this, a path like
+  # `.github\workflows\release.yml` under Windows / Git Bash reaches
+  # that file but compares as a different string than
+  # `.github/workflows/release.yml`, missing the literal blocked-paths
+  # match. Mirrors settings-protection.sh §4 which has had backslash
+  # normalization since 0.10.x.
+  p=$(printf '%s' "$p" | sed 's/%2[Ff]/\//g; s/%2[Ee]/./g; s/%20/ /g; s/%5[Cc]/\\/g')
+  p=$(printf '%s' "$p" | tr '\\\\' '/')
   p="${p#./}"
   printf '%s' "$p"
 }
 
 NORMALIZED=$(normalize_path "$FILE_PATH")
+
+# ── 5a. Path-traversal rejection (0.14.0 iron-gate fix) ───────────────────────
+# Reject any path containing a `..` segment BEFORE the literal-match below.
+# Without this, `foo/../CODEOWNERS` would get past `normalize_path()` (which
+# only strips leading project root + URL-decodes) and the literal-match
+# loop would compare `foo/../CODEOWNERS` against the literal `CODEOWNERS`
+# entry — which doesn't match, so the policy lets the write through. The
+# downstream Write/Edit tool then resolves the traversal and writes to
+# `CODEOWNERS` anyway, defeating the gate.
+#
+# Mirrors settings-protection.sh §5a (which has had this guard since
+# 0.10.x). Both pre- and post-decode forms are checked because
+# normalize_path() URL-decodes earlier and an attacker could split the
+# traversal across encodings (`%2E%2E/`, `..%2F`, etc.).
+raw_has_traversal=0
+norm_has_traversal=0
+case "/$FILE_PATH/" in
+  */../*) raw_has_traversal=1 ;;
+esac
+case "/$NORMALIZED/" in
+  */../*) norm_has_traversal=1 ;;
+esac
+# Also catch URL-encoded traversal in case some tool routes raw-encoded
+# paths through here (e.g. file:// inputs). normalize_path()'s decoder
+# only handles a fixed set; an unrecognized encoding would slip past.
+case "$FILE_PATH" in
+  *%2[Ee]%2[Ee]*|*%2[Ee].*|*.%2[Ee]*) raw_has_traversal=1 ;;
+esac
+if [[ "$raw_has_traversal" -eq 1 ]] || [[ "$norm_has_traversal" -eq 1 ]]; then
+  {
+    printf 'BLOCKED PATH: path traversal rejected\n'
+    printf '\n'
+    printf '  File: %s\n' "$FILE_PATH"
+    printf "  Rule: path contains a '..' segment; rewrite to a canonical\n"
+    printf '        project-relative path without traversal.\n'
+  } >&2
+  exit 2
+fi
 
 for writable in "${AGENT_WRITABLE[@]}"; do
   if [[ "$NORMALIZED" == "$writable" ]] || [[ "$NORMALIZED" == "$writable"* && "$writable" == */ ]]; then

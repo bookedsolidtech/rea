@@ -157,14 +157,27 @@ LOWER_NORM=$(printf '%s' "$NORMALIZED" | tr '[:upper:]' '[:lower:]')
 # package-managed body — §5a kills it before this matcher runs.
 #
 # SECURITY (defense-in-depth): symlinks INSIDE the .d/ surface are
-# refused. A fragment is a short shell script authored in place;
-# consumers do not need symlinks here. Without this check, a sequence
-# like `ln -s ../pre-push .husky/pre-push.d/00-evil; write 00-evil`
-# would be allowed by §5b's path-string match and the downstream
-# Write/Edit tool would follow the symlink, overwriting the
-# package-managed `.husky/pre-push` body that §6 is meant to protect.
-# Costs near-zero (no legitimate use case for symlinked fragments);
-# closes the path-string→symlink bypass completely.
+# refused — both final-component AND intermediate-directory symlinks.
+# A fragment is a short shell script authored in place; consumers do
+# not need symlinks here. Without these checks the gate has two
+# bypass shapes:
+#
+#   (a) Final-component symlink:
+#       ln -s ../pre-push .husky/pre-push.d/00-evil; write 00-evil
+#       — caught by `[ -L "$FILE_PATH" ]`.
+#
+#   (b) Intermediate-directory symlink (helix Finding 2 / 0.15.0):
+#       mkdir .husky/pre-push.d; ln -s ../ .husky/pre-push.d/linkdir
+#       write .husky/pre-push.d/linkdir/pre-push
+#       — `[ -L $FILE_PATH ]` only inspects the FINAL component, so a
+#       not-yet-existing target whose parent contains a symlink resolves
+#       to outside the surface (here: `.husky/pre-push`), letting the
+#       attacker write through to the package-managed body.
+#
+# Resolve the realpath of the parent directory and require it to live
+# under the literal extension surface. Use a portable `cd ... && pwd -P`
+# subshell pattern (no Python or readlink -f dependency required).
+# Closes the path-string→symlink bypass completely.
 case "$LOWER_NORM" in
   .husky/commit-msg.d/*|.husky/pre-push.d/*)
     if [ -L "$FILE_PATH" ]; then
@@ -177,6 +190,34 @@ case "$LOWER_NORM" in
         printf '        package-managed body and bypass §6 protection).\n'
       } >&2
       exit 2
+    fi
+    # Resolve the parent directory's realpath. If any intermediate
+    # component is a symlink whose target leaves the surface, the
+    # resolved path no longer contains `/.husky/<surface>.d/` and we
+    # refuse. The parent dir must already exist for this check; if it
+    # doesn't, the write is creating the parent, in which case there
+    # is no intermediate symlink to follow yet.
+    parent_dir=$(dirname -- "$FILE_PATH")
+    if [ -d "$parent_dir" ]; then
+      resolved_parent=$(cd -P -- "$parent_dir" 2>/dev/null && pwd -P 2>/dev/null) || resolved_parent=""
+      if [ -n "$resolved_parent" ]; then
+        case "$resolved_parent" in
+          *"/.husky/commit-msg.d"*|*"/.husky/pre-push.d"*) : ;;
+          *)
+            {
+              printf 'SETTINGS PROTECTION: extension path resolves outside surface\n'
+              printf '\n'
+              printf '  Logical:  %s\n' "$SAFE_FILE_PATH"
+              printf '  Resolved: %s\n' "$resolved_parent"
+              printf '  Rule: an intermediate directory of the extension path is a\n'
+              printf '        symlink whose target leaves .husky/{commit-msg,pre-push}.d/.\n'
+              printf '        Refused to prevent symlinked-parent bypass of the\n'
+              printf '        package-managed body protection.\n'
+            } >&2
+            exit 2
+          ;;
+        esac
+      fi
     fi
     # Documented extension surface — agents can write here freely.
     exit 0
