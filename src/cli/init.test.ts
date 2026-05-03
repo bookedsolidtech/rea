@@ -224,6 +224,41 @@ describe('rea init — G11.4 codex flags', () => {
     expect(closeMarkers).toBe(1);
   });
 
+  it('0.17.0 idempotency: re-running rea init preserves installed_at in policy.yaml', async () => {
+    const dir = await makeScratch();
+    cleanup.push(dir);
+    process.chdir(dir);
+
+    await runInit({ yes: true, profile: 'minimal', codex: false });
+    const first = await fs.readFile(path.join(dir, '.rea', 'policy.yaml'), 'utf8');
+    const firstStamp = first.match(/^installed_at:\s*"([^"]+)"/m)?.[1];
+    expect(firstStamp).toBeDefined();
+
+    await new Promise((r) => setTimeout(r, 20));
+    await runInit({ yes: true, profile: 'minimal', codex: false });
+    const second = await fs.readFile(path.join(dir, '.rea', 'policy.yaml'), 'utf8');
+    const secondStamp = second.match(/^installed_at:\s*"([^"]+)"/m)?.[1];
+
+    expect(secondStamp).toBe(firstStamp);
+  });
+
+  it('0.17.0 idempotency: re-running rea init preserves installed_at in install-manifest.json', async () => {
+    const dir = await makeScratch();
+    cleanup.push(dir);
+    process.chdir(dir);
+
+    await runInit({ yes: true, profile: 'minimal', codex: false });
+    const firstRaw = await fs.readFile(path.join(dir, '.rea', 'install-manifest.json'), 'utf8');
+    const firstStamp = (JSON.parse(firstRaw) as { installed_at: string }).installed_at;
+
+    await new Promise((r) => setTimeout(r, 20));
+    await runInit({ yes: true, profile: 'minimal', codex: false });
+    const secondRaw = await fs.readFile(path.join(dir, '.rea', 'install-manifest.json'), 'utf8');
+    const secondStamp = (JSON.parse(secondRaw) as { installed_at: string }).installed_at;
+
+    expect(secondStamp).toBe(firstStamp);
+  });
+
   it('BUG-010: init preserves existing .gitignore content when adding managed block', async () => {
     const dir = await makeScratch();
     cleanup.push(dir);
