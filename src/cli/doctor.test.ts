@@ -388,6 +388,99 @@ describe('rea doctor — collectChecks (G11.4 codex_required)', () => {
     expect(check?.detail).toMatch(/silently bypassed/);
   });
 
+  it('G6: activeForeign + commitlint reference → fail with .d/ migration hint', async () => {
+    const repo = await makeScratchRepo({ codexRequired: true });
+    cleanup.push(repo.dir);
+    const hookPath = path.join(repo.dir, '.git', 'hooks', 'pre-push');
+    await fs.writeFile(
+      hookPath,
+      '#!/bin/sh\nnpx --no-install commitlint --edit "$1"\nexit 0\n',
+      { mode: 0o755 },
+    );
+    const state: PrePushDoctorState = {
+      ok: false,
+      activeForeign: true,
+      activePath: hookPath,
+      candidates: [
+        {
+          path: hookPath,
+          exists: true,
+          executable: true,
+          reaManaged: false,
+          delegatesToGate: false,
+        },
+      ],
+    };
+    const checks = collectChecks(repo.dir, undefined, state);
+    const check = findCheck(checks, 'pre-push hook installed');
+    expect(check?.status).toBe('fail');
+    expect(check?.detail).toMatch(/Detected prior tooling.*commitlint/);
+    expect(check?.detail).toMatch(/\.husky\/pre-push\.d\//);
+    expect(check?.detail).toMatch(/MIGRATING\.md/);
+  });
+
+  it('G6: activeForeign + multiple tools → all surfaced in hint', async () => {
+    const repo = await makeScratchRepo({ codexRequired: true });
+    cleanup.push(repo.dir);
+    const hookPath = path.join(repo.dir, '.git', 'hooks', 'pre-push');
+    await fs.writeFile(
+      hookPath,
+      [
+        '#!/bin/sh',
+        '# pre-push gate',
+        'pnpm lint-staged',
+        './scripts/act-ci.sh',
+        'gitleaks detect --redact',
+      ].join('\n'),
+      { mode: 0o755 },
+    );
+    const state: PrePushDoctorState = {
+      ok: false,
+      activeForeign: true,
+      activePath: hookPath,
+      candidates: [
+        {
+          path: hookPath,
+          exists: true,
+          executable: true,
+          reaManaged: false,
+          delegatesToGate: false,
+        },
+      ],
+    };
+    const checks = collectChecks(repo.dir, undefined, state);
+    const check = findCheck(checks, 'pre-push hook installed');
+    expect(check?.status).toBe('fail');
+    expect(check?.detail).toMatch(/lint-staged/);
+    expect(check?.detail).toMatch(/act-CI/);
+    expect(check?.detail).toMatch(/gitleaks/);
+  });
+
+  it('G6: activeForeign with no recognized tools → fail without hint clutter', async () => {
+    const repo = await makeScratchRepo({ codexRequired: true });
+    cleanup.push(repo.dir);
+    const hookPath = path.join(repo.dir, '.git', 'hooks', 'pre-push');
+    await fs.writeFile(hookPath, '#!/bin/sh\necho hi\nexit 0\n', { mode: 0o755 });
+    const state: PrePushDoctorState = {
+      ok: false,
+      activeForeign: true,
+      activePath: hookPath,
+      candidates: [
+        {
+          path: hookPath,
+          exists: true,
+          executable: true,
+          reaManaged: false,
+          delegatesToGate: false,
+        },
+      ],
+    };
+    const checks = collectChecks(repo.dir, undefined, state);
+    const check = findCheck(checks, 'pre-push hook installed');
+    expect(check?.status).toBe('fail');
+    expect(check?.detail).not.toMatch(/Detected prior tooling/);
+  });
+
   it('G6 strict=true: activeForeign yields fail, not warn', async () => {
     // Finding 2 — strict mode: CI must exit non-zero when the active pre-push
     // hook does not invoke the review gate. This is the governance-absent
