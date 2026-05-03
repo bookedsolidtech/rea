@@ -134,6 +134,34 @@ export interface ReviewPolicy {
    * Non-negative integer. The loader rejects negative values.
    */
   auto_narrow_threshold?: number;
+  /**
+   * Codex CLI model override (0.13.4+). Pinned via `-c model="<name>"` on
+   * every `codex exec review` invocation. When unset, codex's own default
+   * applies — which today is the special-purpose `codex-auto-review` model
+   * at medium reasoning, NOT the flagship.
+   *
+   * Recommended for serious adversarial review: `gpt-5.4` paired with
+   * `codex_reasoning_effort: high`. Higher reasoning trades push-gate
+   * latency for verdict consistency — fewer same-code-different-verdict
+   * round-trips like the 2026-04-26 helixir migration session.
+   *
+   * Loose string type — codex's model catalog evolves. Codex itself
+   * validates the model name at exec time; an unknown name surfaces as
+   * a clear runtime error rather than a silent fallback.
+   */
+  codex_model?: string;
+  /**
+   * Codex reasoning effort (0.13.4+). Pinned via
+   * `-c model_reasoning_effort="<level>"` on every invocation. Only
+   * meaningful when paired with a reasoning-capable model (gpt-5.4,
+   * gpt-5.3-codex). Codex's own default is `medium`.
+   *
+   * Recommended: `high` for serious review on long-running branches
+   * (more compute spent per finding, fewer flips). `low` for
+   * cost-bounded environments where consistency matters less than
+   * throughput.
+   */
+  codex_reasoning_effort?: 'low' | 'medium' | 'high';
 }
 
 /**

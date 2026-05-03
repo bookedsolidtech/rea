@@ -42,6 +42,36 @@ const ReviewPolicySchema = z
      * intent and auto-narrow stays out of the way).
      */
     auto_narrow_threshold: z.number().int().nonnegative().optional(),
+    /**
+     * Codex CLI model override (0.13.4+). Pinned via `-c model="<name>"` on
+     * every `codex exec review` invocation. When unset, codex's own default
+     * applies — which today is the special-purpose `codex-auto-review`
+     * model at `medium` reasoning, NOT the flagship.
+     *
+     * For serious adversarial review on consumer codebases (where verdict
+     * stability matters) the recommended setting is `gpt-5.4` with
+     * `codex_reasoning_effort: high`. Higher reasoning trades push-gate
+     * latency for finding consistency — fewer same-code-different-verdict
+     * round-trips like the 2026-04-26 helixir migration session.
+     *
+     * Loose string type: codex's model catalog evolves over time and we do
+     * NOT want to lock consumers to a hardcoded enum that drifts behind
+     * upstream. Codex itself validates the model name at exec time.
+     */
+    codex_model: z.string().min(1).optional(),
+    /**
+     * Codex reasoning effort knob (0.13.4+). Pinned via
+     * `-c model_reasoning_effort="<level>"` on every invocation. Only
+     * meaningful when paired with a reasoning-capable model (gpt-5.4,
+     * gpt-5.3-codex, etc.). The `codex-auto-review` model honors this
+     * but caps lower than gpt-5.4.
+     *
+     * Recommended: `high` for serious review on long-running branches
+     * (more compute spent per finding, fewer flips). `medium` is codex's
+     * own default. `low` for cost-bounded environments where consistency
+     * matters less than throughput.
+     */
+    codex_reasoning_effort: z.enum(['low', 'medium', 'high']).optional(),
   })
   .strict();
 

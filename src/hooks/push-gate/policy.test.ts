@@ -4,6 +4,8 @@ import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   PUSH_GATE_DEFAULT_AUTO_NARROW_THRESHOLD,
+  PUSH_GATE_DEFAULT_CODEX_MODEL,
+  PUSH_GATE_DEFAULT_CODEX_REASONING_EFFORT,
   PUSH_GATE_DEFAULT_CODEX_REQUIRED,
   PUSH_GATE_DEFAULT_CONCERNS_BLOCKS,
   PUSH_GATE_DEFAULT_LAST_N_COMMITS_FALLBACK,
@@ -43,8 +45,72 @@ describe('resolvePushGatePolicy', () => {
       timeout_ms: PUSH_GATE_DEFAULT_TIMEOUT_MS,
       last_n_commits: undefined,
       auto_narrow_threshold: PUSH_GATE_DEFAULT_AUTO_NARROW_THRESHOLD,
+      codex_model: PUSH_GATE_DEFAULT_CODEX_MODEL,
+      codex_reasoning_effort: PUSH_GATE_DEFAULT_CODEX_REASONING_EFFORT,
       policyMissing: true,
     });
+  });
+
+  it('PUSH_GATE_DEFAULT_CODEX_MODEL is the flagship gpt-5.4 (iron-gate default, 0.14.0+)', () => {
+    // The plain `codex exec review` form falls through to codex-auto-review
+    // (a special-purpose lower-reasoning model). The 0.14.0 iron-gate
+    // posture pins the flagship by default — verdict consistency over
+    // per-push compute cost.
+    expect(PUSH_GATE_DEFAULT_CODEX_MODEL).toBe('gpt-5.4');
+  });
+
+  it('PUSH_GATE_DEFAULT_CODEX_REASONING_EFFORT is high (iron-gate default, 0.14.0+)', () => {
+    expect(PUSH_GATE_DEFAULT_CODEX_REASONING_EFFORT).toBe('high');
+  });
+
+  it('honors explicit review.codex_model override', async () => {
+    await fs.writeFile(
+      path.join(baseDir, '.rea', 'policy.yaml'),
+      MINIMAL_POLICY + 'review:\n  codex_model: gpt-5.4-mini\n',
+      'utf8',
+    );
+    const p = await resolvePushGatePolicy(baseDir);
+    expect(p.codex_model).toBe('gpt-5.4-mini');
+  });
+
+  it('honors explicit review.codex_reasoning_effort override', async () => {
+    await fs.writeFile(
+      path.join(baseDir, '.rea', 'policy.yaml'),
+      MINIMAL_POLICY + 'review:\n  codex_reasoning_effort: low\n',
+      'utf8',
+    );
+    const p = await resolvePushGatePolicy(baseDir);
+    expect(p.codex_reasoning_effort).toBe('low');
+  });
+
+  it('honors override of model AND reasoning together (cost-bounded opt-out)', async () => {
+    await fs.writeFile(
+      path.join(baseDir, '.rea', 'policy.yaml'),
+      MINIMAL_POLICY +
+        'review:\n  codex_model: codex-auto-review\n  codex_reasoning_effort: medium\n',
+      'utf8',
+    );
+    const p = await resolvePushGatePolicy(baseDir);
+    expect(p.codex_model).toBe('codex-auto-review');
+    expect(p.codex_reasoning_effort).toBe('medium');
+  });
+
+  it('rejects review.codex_reasoning_effort: "extreme" (only low|medium|high allowed)', async () => {
+    await fs.writeFile(
+      path.join(baseDir, '.rea', 'policy.yaml'),
+      MINIMAL_POLICY + 'review:\n  codex_reasoning_effort: extreme\n',
+      'utf8',
+    );
+    await expect(resolvePushGatePolicy(baseDir)).rejects.toThrow(/Invalid policy schema/);
+  });
+
+  it('rejects empty-string review.codex_model', async () => {
+    await fs.writeFile(
+      path.join(baseDir, '.rea', 'policy.yaml'),
+      MINIMAL_POLICY + 'review:\n  codex_model: ""\n',
+      'utf8',
+    );
+    await expect(resolvePushGatePolicy(baseDir)).rejects.toThrow(/Invalid policy schema/);
   });
 
   it('PUSH_GATE_DEFAULT_AUTO_NARROW_THRESHOLD is 30', () => {

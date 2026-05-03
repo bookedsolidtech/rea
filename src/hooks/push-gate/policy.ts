@@ -49,6 +49,19 @@ export interface ResolvedReviewPolicy {
    * emits a stderr warning. Defaults to 30 when unset; 0 disables.
    */
   auto_narrow_threshold: number;
+  /**
+   * Codex CLI model override (0.13.4+). When set, the runner passes
+   * `-c model="<value>"` to every `codex exec review`. `undefined` falls
+   * back to codex's own default (currently `codex-auto-review`, NOT the
+   * flagship `gpt-5.4`).
+   */
+  codex_model: string | undefined;
+  /**
+   * Codex reasoning effort (0.13.4+). When set, the runner passes
+   * `-c model_reasoning_effort="<value>"`. `undefined` falls back to
+   * codex's own default (currently `medium`).
+   */
+  codex_reasoning_effort: 'low' | 'medium' | 'high' | undefined;
   /** `true` when `.rea/policy.yaml` was absent; defaults apply. */
   policyMissing: boolean;
 }
@@ -70,6 +83,27 @@ export const PUSH_GATE_DEFAULT_AUTO_NARROW_THRESHOLD = 30;
  * recent work.
  */
 export const PUSH_GATE_DEFAULT_LAST_N_COMMITS_FALLBACK = 10;
+/**
+ * Default codex model for the push-gate (0.14.0+). Pinned to the flagship
+ * (`gpt-5.4`) instead of falling through to codex's own default of
+ * `codex-auto-review` (a lower-reasoning special-purpose model). Verdict
+ * stability matters more than per-push compute cost for adversarial
+ * review of consumer codebases — the helixir 2026-04-26 thrashing came
+ * from the lower-reasoning default.
+ *
+ * Override via `policy.review.codex_model: <name>` in `.rea/policy.yaml`
+ * for cost-bounded environments. `codex-auto-review` is the explicit
+ * opt-in to the prior 0.13.x behavior.
+ */
+export const PUSH_GATE_DEFAULT_CODEX_MODEL = 'gpt-5.4';
+/**
+ * Default codex reasoning effort (0.14.0+). Pinned to `high` for maximum
+ * compute per finding — fewer same-code-different-verdict round-trips.
+ * Trades latency for stability. Override via
+ * `policy.review.codex_reasoning_effort: medium | low` in
+ * `.rea/policy.yaml` for cost-bounded environments.
+ */
+export const PUSH_GATE_DEFAULT_CODEX_REASONING_EFFORT: 'low' | 'medium' | 'high' = 'high';
 
 /**
  * Resolve the push-gate policy for `baseDir`. Never throws — a malformed
@@ -90,6 +124,8 @@ export async function resolvePushGatePolicy(baseDir: string): Promise<ResolvedRe
       timeout_ms: PUSH_GATE_DEFAULT_TIMEOUT_MS,
       last_n_commits: undefined,
       auto_narrow_threshold: PUSH_GATE_DEFAULT_AUTO_NARROW_THRESHOLD,
+      codex_model: PUSH_GATE_DEFAULT_CODEX_MODEL,
+      codex_reasoning_effort: PUSH_GATE_DEFAULT_CODEX_REASONING_EFFORT,
       policyMissing: true,
     };
   }
@@ -102,6 +138,9 @@ export async function resolvePushGatePolicy(baseDir: string): Promise<ResolvedRe
     last_n_commits: review.last_n_commits,
     auto_narrow_threshold:
       review.auto_narrow_threshold ?? PUSH_GATE_DEFAULT_AUTO_NARROW_THRESHOLD,
+    codex_model: review.codex_model ?? PUSH_GATE_DEFAULT_CODEX_MODEL,
+    codex_reasoning_effort:
+      review.codex_reasoning_effort ?? PUSH_GATE_DEFAULT_CODEX_REASONING_EFFORT,
     policyMissing: false,
   };
 }

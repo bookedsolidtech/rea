@@ -261,6 +261,50 @@ After migration, run `pnpm rea doctor`. The relevant lines:
 - `[info] extension-hook fragments detected: N pre-push.d, M
   commit-msg.d` — your fragment chain is active
 
+## Codex model knobs (added in 0.14.0)
+
+The push-gate now pins the flagship codex model and `high` reasoning
+effort by default. Pre-0.14.0 it used codex's built-in default, which
+is the special-purpose `codex-auto-review` model at `medium`
+reasoning — a meaningfully weaker reviewer than the flagship.
+Same-code-different-verdict thrashing on long-running branches was
+substantially driven by the lower-reasoning default.
+
+**Defaults (0.14.0+):**
+
+```yaml
+review:
+  codex_model: gpt-5.4              # was codex-auto-review (codex's own default)
+  codex_reasoning_effort: high      # was medium (codex's own default)
+```
+
+You don't need to set these — `gpt-5.4` + `high` are baked in at the
+package level. The policy keys exist for cost-bounded environments
+that want to opt into a weaker model:
+
+```yaml
+review:
+  codex_model: codex-auto-review    # opts back into the prior default
+  codex_reasoning_effort: medium
+```
+
+The model name is passed through to codex's TOML config layer
+(`-c model="…"`); codex itself validates it. An unknown model name
+surfaces as a clear runtime error at first push, not a silent
+fallback. Codex's current catalog (as of 2026-05-03):
+
+- `gpt-5.4` — flagship, reasoning-capable (recommended for review)
+- `gpt-5.4-mini` — smaller, faster, cheaper, less reasoning depth
+- `gpt-5.3-codex` — prior generation, code-specialized
+- `gpt-5.3-codex-spark` — even faster prior gen
+- `gpt-5.2` — older, generally avoid for security-relevant review
+- `codex-auto-review` — special-purpose, lower reasoning ceiling
+
+Reasoning effort is `low | medium | high`. `high` spends more compute
+per finding and produces more consistent verdicts — fewer
+same-code-different-verdict round-trips. Trade-off is push-gate
+latency.
+
 ## Policy knobs worth setting
 
 For consumers with a long-running migration branch (>30 commits since
@@ -274,6 +318,8 @@ review:
   timeout_ms: 1800000              # 30 min — explicit pin
   auto_narrow_threshold: 30        # 0 to disable auto-narrow
   last_n_commits: 10               # explicit scope window
+  codex_model: gpt-5.4             # 0.14.0+ default; iron-gate
+  codex_reasoning_effort: high     # 0.14.0+ default; iron-gate
 ```
 
 ## Bypass when you genuinely need to
