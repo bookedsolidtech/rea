@@ -71,9 +71,17 @@ _rea_split_segments() {
   # under any encoding we care about (any agent that intentionally
   # included this string would already be obviously trying to confuse
   # the splitter — and even then, the worst case is fail-closed).
+  # 0.16.1 helix-016 P1 fix: also split on single `&` (background-process
+  # operator). Pre-fix the splitter only broke on `&&|||;|`; a command like
+  # `sleep 1 & git push --force` was treated as ONE segment whose first
+  # token is `sleep`, and `any_segment_starts_with($CMD, 'git push')`
+  # missed the force-push entirely. Add `&` to the separator set, but
+  # AFTER `&&` is already swapped out so we don't break it apart.
   printf '%s\n' "$cmd" \
     | sed -E 's/>\|/__REA_GTPIPE_a8f2c1__/g' \
-    | sed -E 's/(\|\||&&|;|\|)/\n/g' \
+    | sed -E 's/&&/__REA_LOGAND_a8f2c1__/g' \
+    | sed -E 's/(\|\||;|\||&)/\n/g' \
+    | sed -E 's/__REA_LOGAND_a8f2c1__/\n/g' \
     | sed -E 's/__REA_GTPIPE_a8f2c1__/>|/g'
 }
 
@@ -145,6 +153,30 @@ any_segment_matches() {
   while IFS= read -r segment; do
     stripped=$(_rea_strip_prefix "$segment")
     if printf '%s' "$stripped" | grep -qiE "$pattern"; then
+      return 0
+    fi
+  done < <(_rea_split_segments "$cmd")
+  return 1
+}
+
+# Return 0 if any segment of $1 (RAW — no prefix-stripping) matches the
+# extended regex $2. Use this for checks where the prefix itself IS the
+# signal — e.g. H10's `HUSKY=0 git commit` detection (the prefix-stripper
+# would strip the `HUSKY=0` before any_segment_matches sees it). Also
+# right for H15 (`REA_BYPASS=...`) and H16 (alias/function defs).
+#
+# 0.16.1 helix-016 sibling fix: H10 baseline corpus regressed from
+# 0.15.0 because it migrated to `any_segment_matches` which strips
+# env-var prefixes. The check needs the raw segment to fire.
+any_segment_raw_matches() {
+  local cmd="$1"
+  local pattern="$2"
+  local segment
+  while IFS= read -r segment; do
+    # Trim leading whitespace for clean anchor matching, but otherwise
+    # leave the segment intact (env-var assignments preserved).
+    segment="${segment#"${segment%%[![:space:]]*}"}"
+    if printf '%s' "$segment" | grep -qiE "$pattern"; then
       return 0
     fi
   done < <(_rea_split_segments "$cmd")

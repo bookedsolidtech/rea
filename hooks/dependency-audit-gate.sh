@@ -73,15 +73,35 @@ extract_packages() {
     # Anchor to start: only match when the install command is the FIRST
     # thing on the segment, optionally preceded by `sudo` / `exec` /
     # `time` / etc.
-    if printf '%s' "$segment" | grep -qiE '^(sudo[[:space:]]+|exec[[:space:]]+|time[[:space:]]+)*(npm[[:space:]]+(install|i|add)|pnpm[[:space:]]+(add|install|i)|yarn[[:space:]]+add)[[:space:]]+'; then
+    #
+    # 0.16.1 helix-016 P2 fix: also strip leading KEY=VALUE env-var
+    # assignments. Pre-fix the prefix allow-list only permitted
+    # sudo/exec/time, so `CI=1 pnpm add foo` and
+    # `NODE_ENV=development npm install bar` bypassed the audit
+    # entirely. POSIX shell allows any number of leading KEY=VALUE
+    # assignments before the command word; we strip them the same
+    # way the shell does.
+    local stripped_segment
+    stripped_segment=$(printf '%s' "$segment" | sed -E 's/^([[:space:]]*[A-Za-z_][A-Za-z0-9_]*=[^[:space:]]+[[:space:]]+)+//')
+
+    if printf '%s' "$stripped_segment" | grep -qiE '^(sudo[[:space:]]+|exec[[:space:]]+|time[[:space:]]+)*(npm[[:space:]]+(install|i|add)|pnpm[[:space:]]+(add|install|i)|yarn[[:space:]]+add)[[:space:]]+'; then
       # Strip the leading prefix wrappers + install command, leaving args.
       local after_cmd
-      after_cmd=$(printf '%s' "$segment" | sed -E 's/^(sudo[[:space:]]+|exec[[:space:]]+|time[[:space:]]+)*(npm[[:space:]]+(install|i|add)|pnpm[[:space:]]+(add|install|i)|yarn[[:space:]]+add)[[:space:]]+//')
+      after_cmd=$(printf '%s' "$stripped_segment" | sed -E 's/^(sudo[[:space:]]+|exec[[:space:]]+|time[[:space:]]+)*(npm[[:space:]]+(install|i|add)|pnpm[[:space:]]+(add|install|i)|yarn[[:space:]]+add)[[:space:]]+//')
 
       for token in $after_cmd; do
         if [[ "$token" == -* ]]; then continue; fi
         if [[ "$token" == ./* || "$token" == /* || "$token" == ../* ]]; then continue; fi
         if [[ -z "$token" ]]; then continue; fi
+        # 0.16.1: tighten token classification (helix-016 sibling concern).
+        # A "package name" is something that doesn't contain shell
+        # metacharacters — `2>&1`, `$VAR`, etc. are never valid npm
+        # package names. Skip any token containing `=`, `>`, `<`, `&`,
+        # `|`, `;`, `$`, backtick, or quotes.
+        if [[ "$token" == *=* || "$token" == *">"* || "$token" == *"<"* ||
+              "$token" == *"&"* || "$token" == *"|"* || "$token" == *";"* ||
+              "$token" == *'$'* || "$token" == *'`'* ||
+              "$token" == *'"'* || "$token" == *"'"* ]]; then continue; fi
         # `npm view` can't validate `@workspace:*` / `link:` / `file:`
         # prefixes (workspace protocols). Skip them — they're never npm
         # registry packages.

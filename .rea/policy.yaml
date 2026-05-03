@@ -23,3 +23,12 @@ context_protection:
   max_bash_output_lines: 100
 review:
   codex_required: false
+  # 0.16.1+: pin the rea repo to the iron-gate codex defaults so any P1
+  # in the canonical hooks gets caught against this repo at the SAME
+  # reasoning level helix and BST run their consumer push-gates at.
+  # Pre-fix, rea was running its own pre-publish review at codex CLI
+  # defaults (codex-auto-review at medium) — meaningfully weaker than
+  # the consumers — which is why their push-gates kept catching things
+  # rea pre-publish missed across the helix-014 / 015 / 016 cycle.
+  codex_model: gpt-5.4
+  codex_reasoning_effort: high
