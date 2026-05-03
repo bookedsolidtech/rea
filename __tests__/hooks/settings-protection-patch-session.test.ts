@@ -312,3 +312,110 @@ describe('settings-protection.sh — path-traversal bypass (Codex HIGH 1)', () =
     expect(res.stderr).toMatch(/SETTINGS PROTECTION/);
   });
 });
+
+describe('settings-protection.sh — `.husky/*.d/` extension surface (Fix 0.13.2)', () => {
+  let dir: string;
+
+  beforeEach(async () => {
+    dir = await fs.realpath(
+      await fs.mkdtemp(path.join(os.tmpdir(), 'rea-ext-')),
+    );
+    await fs.mkdir(path.join(dir, '.husky', 'pre-push.d'), { recursive: true });
+    await fs.mkdir(path.join(dir, '.husky', 'commit-msg.d'), { recursive: true });
+  });
+
+  afterEach(async () => {
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
+  it('allows agent writes to .husky/pre-push.d/<fragment>', () => {
+    if (!jqExists()) return;
+    const target = path.join(dir, '.husky', 'pre-push.d', '00-act-ci');
+    const res = runHook(dir, target);
+    expect(res.status).toBe(0);
+  });
+
+  it('allows agent writes to .husky/commit-msg.d/<fragment>', () => {
+    if (!jqExists()) return;
+    const target = path.join(dir, '.husky', 'commit-msg.d', '01-commitlint');
+    const res = runHook(dir, target);
+    expect(res.status).toBe(0);
+  });
+
+  it('allows nested fragments (e.g. .husky/pre-push.d/sub/file)', () => {
+    if (!jqExists()) return;
+    const target = path.join(dir, '.husky', 'pre-push.d', 'sub', 'inner');
+    const res = runHook(dir, target);
+    expect(res.status).toBe(0);
+  });
+
+  it('still blocks .husky/pre-push (the package-managed body)', () => {
+    if (!jqExists()) return;
+    const target = path.join(dir, '.husky', 'pre-push');
+    const res = runHook(dir, target);
+    expect(res.status).toBe(2);
+    expect(res.stderr).toMatch(/SETTINGS PROTECTION/);
+  });
+
+  it('still blocks .husky/commit-msg (the package-managed body)', () => {
+    if (!jqExists()) return;
+    const target = path.join(dir, '.husky', 'commit-msg');
+    const res = runHook(dir, target);
+    expect(res.status).toBe(2);
+    expect(res.stderr).toMatch(/SETTINGS PROTECTION/);
+  });
+
+  it('still blocks .husky/_/<hookname> (husky 9 runtime stubs)', () => {
+    if (!jqExists()) return;
+    const target = path.join(dir, '.husky', '_', 'pre-push');
+    const res = runHook(dir, target);
+    expect(res.status).toBe(2);
+    expect(res.stderr).toMatch(/SETTINGS PROTECTION/);
+  });
+
+  it('does NOT allow .husky/pre-push.d.bak/* (near-miss prefix)', () => {
+    if (!jqExists()) return;
+    const target = path.join(dir, '.husky', 'pre-push.d.bak', 'foo');
+    const res = runHook(dir, target);
+    // Falls through to .husky/ prefix block.
+    expect(res.status).toBe(2);
+    expect(res.stderr).toMatch(/SETTINGS PROTECTION/);
+  });
+
+  it('rejects traversal back into protected files via the .d/ surface', () => {
+    if (!jqExists()) return;
+    const target = path.join(dir, '.husky/pre-push.d/../pre-push');
+    const res = runHook(dir, target);
+    // §5a path-traversal reject runs BEFORE the §5b allow-list, so the
+    // traversal can't smuggle a write to the package-managed body.
+    expect(res.status).toBe(2);
+    expect(res.stderr).toMatch(/SETTINGS PROTECTION/);
+  });
+
+  it('refuses symlinks placed in .husky/pre-push.d/* (defense-in-depth)', async () => {
+    if (!jqExists()) return;
+    // Without the symlink check, an agent could `ln -s ../pre-push
+    // .husky/pre-push.d/00-evil` then Write through the symlink to
+    // overwrite the package-managed `.husky/pre-push` body (which §6
+    // protects). §5b refuses any symlink in the .d/ surface; consumers
+    // have no legitimate use case for symlinked fragments.
+    const protectedBody = path.join(dir, '.husky', 'pre-push');
+    await fs.writeFile(protectedBody, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    const symlinkPath = path.join(dir, '.husky', 'pre-push.d', '00-evil');
+    await fs.symlink('../pre-push', symlinkPath);
+    const res = runHook(dir, symlinkPath);
+    expect(res.status).toBe(2);
+    expect(res.stderr).toMatch(/symlink in extension surface refused/);
+  });
+
+  it('refuses symlinks placed in .husky/commit-msg.d/* (defense-in-depth)', async () => {
+    if (!jqExists()) return;
+    const protectedBody = path.join(dir, '.husky', 'commit-msg');
+    await fs.writeFile(protectedBody, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    const symlinkPath = path.join(dir, '.husky', 'commit-msg.d', '01-evil');
+    await fs.symlink('../commit-msg', symlinkPath);
+    const res = runHook(dir, symlinkPath);
+    expect(res.status).toBe(2);
+    expect(res.stderr).toMatch(/symlink in extension surface refused/);
+  });
+});

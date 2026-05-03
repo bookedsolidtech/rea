@@ -125,15 +125,18 @@ describe('BODY_TEMPLATE — path-with-spaces portability (Fix A / 0.12.0)', () =
   it('uses positional-args dispatch via `set --` rather than `exec $REA_BIN`', () => {
     const body = fallbackHookContent();
     // The 0.11.x body word-split on `exec $REA_BIN ...` — break that by
-    // ensuring the modern form uses `set --` arms. v4 (0.13.0) replaces the
-    // old terminal `exec "$@"` with `"$@"` followed by status-propagation
-    // and extension-fragment chaining (so fragments under
-    // `.husky/pre-push.d/` run AFTER rea succeeds).
+    // ensuring the modern form uses `set --` arms. v4 (0.13.0) introduced
+    // post-body extension-fragment chaining; 0.13.2 wraps the dispatch in
+    // a subshell `(...)` so the `set --` rewrite of $@ does NOT bleed into
+    // the parent shell where the fragment loop runs.
     expect(body).toMatch(/set -- "\$\{REA_ROOT\}\/node_modules\/\.bin\/rea" hook push-gate "\$@"/);
     expect(body).toMatch(/set -- node "\$\{REA_ROOT\}\/dist\/cli\/index\.js" hook push-gate "\$@"/);
-    // v4 marker: rea body is invoked then exit propagated, so a bare `"$@"`
-    // statement appears (no `exec` prefix) BEFORE the fragment loop.
-    expect(body).toMatch(/^"\$@"$/m);
+    // 0.13.2: rea body invoked via `exec "$@"` inside a subshell, with
+    // status captured via `$?` after the subshell exits. The $@ rewrite
+    // is scoped to the subshell so the fragment loop's `"$@"` still
+    // sees git's original argv.
+    expect(body).toMatch(/exec\s+"\$@"/);
+    expect(body).toMatch(/rea_status=\$\?/);
     // The fragile pattern `exec $REA_BIN ...` must not appear as an
     // executable line. Comments referencing the historic bug are fine —
     // anchor the negative match to lines NOT starting with `#`.
@@ -166,9 +169,10 @@ describe('BODY_TEMPLATE — path-with-spaces portability (Fix A / 0.12.0)', () =
   it('shipped husky body delegates via `set --` arms identically to the fallback', () => {
     const husky = huskyHookContent();
     expect(husky).toMatch(/set -- "\$\{REA_ROOT\}\/node_modules\/\.bin\/rea" hook push-gate "\$@"/);
-    // v4 (0.13.0): rea body invoked via `"$@"` (not `exec`) so post-body
-    // extension-fragment chaining can run.
-    expect(husky).toMatch(/^"\$@"$/m);
+    // 0.13.2: rea body invoked via `exec "$@"` inside a subshell so post-body
+    // extension-fragment chaining sees git's original argv.
+    expect(husky).toMatch(/exec\s+"\$@"/);
+    expect(husky).toMatch(/rea_status=\$\?/);
     const huskyLines = husky.split('\n');
     const executableHuskyLines = huskyLines.filter((l) => !/^\s*#/.test(l));
     expect(executableHuskyLines.some((l) => /exec\s+\$REA_BIN/.test(l))).toBe(false);
@@ -946,6 +950,104 @@ describe('extension-hook chaining (Fix H / 0.13.0) — `.husky/pre-push.d/*`', (
       await execFileAsync(hookPath, ['origin', 'git@example:r.git'], { cwd: repoDir });
       const order = (await fs.readFile(log, 'utf8')).trim().split('\n');
       expect(order).toEqual(['rea', 'runs']);
+    } finally {
+      await fs.rm(repoDir, { recursive: true, force: true });
+    }
+  });
+
+  it('end-to-end: fragments receive git\'s original argv (Fix 0.13.2 — $@ preservation)', async () => {
+    // Regression test for the BST 2026-05-03 report. Pre-0.13.2, the rea
+    // dispatch used `set -- "${REA_ROOT}/node_modules/.bin/rea" hook push-gate "$@"`
+    // followed by `"$@"` to invoke. The `set --` mutated the parent shell's
+    // $@, so by the time the fragment loop ran `"$frag" "$@"` it was passing
+    // the rewritten rea-CLI argv (`<rea-bin> hook push-gate <remote> <url>`)
+    // instead of git's original `<remote> <url>` — breaking branch-policy
+    // linters, lint-staged-on-push wrappers, and any fragment that reads
+    // $1/$2 per the standard pre-push contract. The fix wraps the dispatch
+    // in a subshell `(...)` so set-- stays scoped.
+    const repoDir = await fs.realpath(
+      await fs.mkdtemp(path.join(os.tmpdir(), 'rea-pp-argv-')),
+    );
+    try {
+      await execFileAsync('git', ['-C', repoDir, 'init', '-q']);
+      const reaArgvLog = path.join(repoDir, 'rea-argv.log');
+      const fragArgvLog = path.join(repoDir, 'frag-argv.log');
+      const stubBin = path.join(repoDir, 'node_modules', '.bin', 'rea');
+      await fs.mkdir(path.dirname(stubBin), { recursive: true });
+      // rea CLI logs its full argv so we can assert it gets `hook push-gate
+      // <remote> <url>` (the dispatched argv).
+      await fs.writeFile(
+        stubBin,
+        `#!/bin/sh\nprintf '%s\\n' "$#" "$@" >> "${reaArgvLog}"\nexit 0\n`,
+        { mode: 0o755 },
+      );
+      const fragDir = path.join(repoDir, '.husky', 'pre-push.d');
+      await fs.mkdir(fragDir, { recursive: true });
+      // Fragment logs its argv so we can assert it gets git's original
+      // `<remote> <url>` (NOT the rea-CLI dispatched argv).
+      await fs.writeFile(
+        path.join(fragDir, '99-argv-probe'),
+        `#!/bin/sh\nprintf '%s\\n' "$#" "$@" >> "${fragArgvLog}"\nexit 0\n`,
+        { mode: 0o755 },
+      );
+      const hookPath = path.join(repoDir, '.git', 'hooks', 'pre-push');
+      await fs.writeFile(hookPath, fallbackHookContent(), { encoding: 'utf8', mode: 0o755 });
+      await execFileAsync(hookPath, ['origin', 'git@example:repo.git'], { cwd: repoDir });
+
+      const reaArgv = (await fs.readFile(reaArgvLog, 'utf8')).trim().split('\n');
+      // rea CLI receives: argc=4, args = hook push-gate origin git@example:repo.git
+      expect(reaArgv).toEqual(['4', 'hook', 'push-gate', 'origin', 'git@example:repo.git']);
+
+      const fragArgv = (await fs.readFile(fragArgvLog, 'utf8')).trim().split('\n');
+      // Fragment receives: argc=2, args = origin git@example:repo.git (git's original)
+      expect(fragArgv).toEqual(['2', 'origin', 'git@example:repo.git']);
+    } finally {
+      await fs.rm(repoDir, { recursive: true, force: true });
+    }
+  });
+
+  it('end-to-end: fragments receive git\'s argv even when rea CLI is multi-token (node + script path)', async () => {
+    // Variant of the argv preservation test using the dogfood dispatch arm
+    // (`set -- node "${REA_ROOT}/dist/cli/index.js" hook push-gate "$@"`),
+    // which has the most tokens and the highest blast radius for $@
+    // contamination.
+    const repoDir = await fs.realpath(
+      await fs.mkdtemp(path.join(os.tmpdir(), 'rea-pp-argv2-')),
+    );
+    try {
+      await execFileAsync('git', ['-C', repoDir, 'init', '-q']);
+      // Set up the dogfood dispatch trigger: dist/cli/index.js + a
+      // package.json declaring the rea package name.
+      const distEntry = path.join(repoDir, 'dist', 'cli', 'index.js');
+      await fs.mkdir(path.dirname(distEntry), { recursive: true });
+      const reaLog = path.join(repoDir, 'rea-argv.log');
+      const fragLog = path.join(repoDir, 'frag-argv.log');
+      // The "rea CLI" here is actually a node script that logs its argv.
+      await fs.writeFile(
+        distEntry,
+        `#!/usr/bin/env node\nimport('node:fs').then(({ writeFileSync, appendFileSync }) => {\n  appendFileSync(${JSON.stringify(reaLog)}, [process.argv.length - 2, ...process.argv.slice(2)].join('\\n') + '\\n');\n  process.exit(0);\n});\n`,
+      );
+      await fs.writeFile(
+        path.join(repoDir, 'package.json'),
+        JSON.stringify({ name: '@bookedsolid/rea', version: '0.0.0' }),
+      );
+      const fragDir = path.join(repoDir, '.husky', 'pre-push.d');
+      await fs.mkdir(fragDir, { recursive: true });
+      await fs.writeFile(
+        path.join(fragDir, '99-argv-probe'),
+        `#!/bin/sh\nprintf '%s\\n' "$#" "$@" >> "${fragLog}"\nexit 0\n`,
+        { mode: 0o755 },
+      );
+      const hookPath = path.join(repoDir, '.git', 'hooks', 'pre-push');
+      await fs.writeFile(hookPath, fallbackHookContent(), { encoding: 'utf8', mode: 0o755 });
+      await execFileAsync(hookPath, ['origin', 'git@example:repo.git'], { cwd: repoDir });
+
+      const reaArgv = (await fs.readFile(reaLog, 'utf8')).trim().split('\n');
+      // node receives: hook, push-gate, origin, git@example:repo.git (after script path)
+      expect(reaArgv).toEqual(['4', 'hook', 'push-gate', 'origin', 'git@example:repo.git']);
+
+      const fragArgv = (await fs.readFile(fragLog, 'utf8')).trim().split('\n');
+      expect(fragArgv).toEqual(['2', 'origin', 'git@example:repo.git']);
     } finally {
       await fs.rm(repoDir, { recursive: true, force: true });
     }

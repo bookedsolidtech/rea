@@ -396,15 +396,31 @@ function checkPrePushHook(state: PrePushDoctorState): CheckResult {
   if (state.activeForeign) {
     // Executable file exists at the active path but neither carries a rea
     // marker nor invokes `rea hook push-gate` — the push-gate is silently
-    // bypassed. Always a hard fail.
+    // bypassed. Always a hard fail. When the foreign hook references a
+    // recognizable prior tool (commitlint, lint-staged, gitleaks, act-CI,
+    // …), surface the .d/ migration path explicitly so consumers know
+    // exactly how to keep their existing chain without losing rea coverage
+    // or having `rea upgrade` clobber them again.
+    const hints = state.activePath !== null
+      ? detectPriorToolHints(state.activePath)
+      : [];
+    let detail =
+      `active pre-push at ${state.activePath} is present and executable but does NOT ` +
+      'invoke `rea hook push-gate` — the 0.11.0 push-gate is silently bypassed. ' +
+      'Either add `exec rea hook push-gate "$@"` to the existing hook, or ' +
+      'remove it and re-run `rea init` to install the fallback.';
+    if (hints.length > 0) {
+      detail +=
+        `\n      Detected prior tooling in the foreign hook: ${hints.join(', ')}. ` +
+        'Recommended migration (rea 0.13.0+): move each chained command to ' +
+        '`.husky/pre-push.d/<NN>-<name>` as a separate executable file; rea then ' +
+        'runs them in lex order AFTER the push-gate, surviving `rea upgrade` ' +
+        'unchanged. See `MIGRATING.md` for a worked example.';
+    }
     return {
       label: 'pre-push hook installed',
       status: 'fail',
-      detail:
-        `active pre-push at ${state.activePath} is present and executable but does NOT ` +
-        'invoke `rea hook push-gate` — the 0.11.0 push-gate is silently bypassed. ' +
-        'Either add `exec rea hook push-gate "$@"` to the existing hook, or ' +
-        'remove it and re-run `rea init` to install the fallback.',
+      detail,
     };
   }
 
@@ -428,6 +444,40 @@ function checkPrePushHook(state: PrePushDoctorState): CheckResult {
       'no pre-push hook found in `.git/hooks/`, configured `core.hooksPath`, or `.husky/`. ' +
       'Run `rea init` to install the fallback.',
   };
+}
+
+/**
+ * Best-effort scan of a foreign hook body for references to recognizable
+ * consumer tooling. Each match returns a short label so doctor can render
+ * a precise migration recommendation without dumping the raw hook body.
+ *
+ * Patterns are intentionally narrow: a substring match in a non-comment line
+ * referencing a tool's CLI binary or a well-known wrapper. False positives
+ * here are cosmetic (extra hint) — the hard-fail decision still drives the
+ * doctor verdict.
+ *
+ * Read errors are swallowed (return []). Doctor's foreign-hook message is
+ * still useful without hints.
+ */
+function detectPriorToolHints(hookPath: string): string[] {
+  let body: string;
+  try {
+    body = fs.readFileSync(hookPath, 'utf8');
+  } catch {
+    return [];
+  }
+  const lines = body.split(/\r?\n/);
+  const found = new Set<string>();
+  for (const raw of lines) {
+    if (/^\s*#/.test(raw)) continue; // skip comments
+    if (/\bcommitlint\b/.test(raw)) found.add('commitlint');
+    if (/\blint-staged\b/.test(raw)) found.add('lint-staged');
+    if (/\bgitleaks\b/.test(raw)) found.add('gitleaks');
+    if (/\bact[-_]ci\b/i.test(raw) || /\bact-CI\b/.test(raw)) found.add('act-CI');
+    if (/\bhusky\.sh\b/.test(raw)) found.add('legacy husky 4-8 wrapper');
+    if (/\bnpx\s+--no-install\s+commitlint/.test(raw)) found.add('commitlint');
+  }
+  return Array.from(found).sort();
 }
 
 /**

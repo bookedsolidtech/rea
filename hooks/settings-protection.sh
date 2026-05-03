@@ -130,6 +130,59 @@ if [[ "$raw_has_traversal" -eq 1 ]] || [[ "$norm_has_traversal" -eq 1 ]]; then
   exit 2
 fi
 
+# Compute lower-cased path early so the §5b allow-list (and §6/§6b matchers
+# below) all reference a single normalized variable.
+LOWER_NORM=$(printf '%s' "$NORMALIZED" | tr '[:upper:]' '[:lower:]')
+
+# ── 5b. Extension-surface allow-list ──────────────────────────────────────────
+# `.husky/commit-msg.d/*` and `.husky/pre-push.d/*` are the documented
+# consumer extension surface (Fix H / 0.13.0). Consumers — and the agents
+# that govern those consumers — are expected to write here freely so they
+# can layer commitlint, lint-staged, branch-policy, act-CI, etc. without
+# losing rea coverage on `rea upgrade`.
+#
+# The §6 PROTECTED_PATTERNS list below has `.husky/` as a prefix block,
+# which (correctly) keeps `.husky/pre-push`, `.husky/commit-msg`, and
+# the `.husky/_/*` runtime stubs out of agent reach. But the same prefix
+# also caught `.husky/pre-push.d/00-act-ci` and `.husky/commit-msg.d/*`
+# until 0.13.2 — the very directories advertised as the extension
+# surface. This early allow-list closes that contract gap.
+#
+# Anchored on the literal `.d/` segment (not `.d`) so `.husky/pre-push.d.bak/`
+# or `.husky/pre-push.dump` still hit the prefix block. Nested fragments
+# (e.g. `pre-push.d/sub/file`) are allowed so the surface composes naturally.
+#
+# SECURITY: runs AFTER §5a (path-traversal reject), so a clever
+# `.husky/pre-push.d/../pre-push` cannot bypass §6's protection of the
+# package-managed body — §5a kills it before this matcher runs.
+#
+# SECURITY (defense-in-depth): symlinks INSIDE the .d/ surface are
+# refused. A fragment is a short shell script authored in place;
+# consumers do not need symlinks here. Without this check, a sequence
+# like `ln -s ../pre-push .husky/pre-push.d/00-evil; write 00-evil`
+# would be allowed by §5b's path-string match and the downstream
+# Write/Edit tool would follow the symlink, overwriting the
+# package-managed `.husky/pre-push` body that §6 is meant to protect.
+# Costs near-zero (no legitimate use case for symlinked fragments);
+# closes the path-string→symlink bypass completely.
+case "$LOWER_NORM" in
+  .husky/commit-msg.d/*|.husky/pre-push.d/*)
+    if [ -L "$FILE_PATH" ]; then
+      {
+        printf 'SETTINGS PROTECTION: symlink in extension surface refused\n'
+        printf '\n'
+        printf '  File: %s\n' "$SAFE_FILE_PATH"
+        printf '  Rule: .husky/commit-msg.d/* and .husky/pre-push.d/* must be\n'
+        printf '        regular files (a symlink could resolve to a protected\n'
+        printf '        package-managed body and bypass §6 protection).\n'
+      } >&2
+      exit 2
+    fi
+    # Documented extension surface — agents can write here freely.
+    exit 0
+    ;;
+esac
+
 # ── 6. Protected path patterns ────────────────────────────────────────────────
 # §6 runs BEFORE the patch-session allowlist so hook-patch sessions cannot
 # reach .rea/policy.yaml, .rea/HALT, or .claude/settings.json via any glob
@@ -149,7 +202,7 @@ PATCH_SESSION_PATTERNS=(
   '.claude/hooks/'
 )
 
-LOWER_NORM=$(printf '%s' "$NORMALIZED" | tr '[:upper:]' '[:lower:]')
+# LOWER_NORM was computed in §5b above and is reused here.
 
 # Match $NORMALIZED against PROTECTED_PATTERNS (exact or prefix for patterns
 # ending in '/'). Sets $PROTECTED_MATCH to the matched pattern; exit 0 on hit.
