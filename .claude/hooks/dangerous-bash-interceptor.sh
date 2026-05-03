@@ -216,7 +216,7 @@ if any_segment_starts_with "$CMD" 'git[[:space:]]+commit.*--no-verify'; then
 fi
 
 # H10: HUSKY=0 bypass — suppresses all git hooks without --no-verify
-if any_segment_matches "$CMD" '(^|[[:space:];]|&&|\|\|)HUSKY=0[[:space:]]+git[[:space:]]+(commit|push|tag)'; then
+if any_segment_raw_matches "$CMD" '^HUSKY=0[[:space:]]+git[[:space:]]+(commit|push|tag)'; then
   add_high \
     "HUSKY=0 — bypasses all husky git hooks" \
     "Setting HUSKY=0 disables pre-commit, commit-msg, and pre-push safety gates without --no-verify." \
@@ -243,8 +243,15 @@ if any_segment_starts_with "$CMD" "rm[[:space:]]+-[a-zA-Z]*r[a-zA-Z]*f[[:space:]
     "Alt: Move to a temp location first, or use 'rm -ri' for interactive deletion."
 fi
 
-# H12: curl/wget piped directly to shell (supply chain attack vector)
-if any_segment_matches "$CMD" '(curl|wget)[^|]*\|[[:space:]]*(bash|sh|zsh|fish)'; then
+# H12: curl/wget piped directly to shell (supply chain attack vector).
+# 0.16.1 helix-016 P1 fix: this check requires BOTH the curl/wget call
+# AND the `| sh` to appear in the same shell pipeline. The 0.16.0
+# refactor moved this into `any_segment_matches`, but the segmenter
+# splits on `|` first — so `curl https://x | sh` decomposed into two
+# segments (`curl https://x`, `sh`) and the regex (which requires both
+# in one segment) never matched. Pipe-RCE is fundamentally a
+# multi-segment property and must be checked against the raw command.
+if printf '%s' "$CMD" | grep -qiE '(curl|wget)[^|]*\|[[:space:]]*(sudo[[:space:]]+)?(bash|sh|zsh|fish)'; then
   add_high \
     "curl/wget piped to shell — remote code execution" \
     "Executing remote scripts without inspection is a major supply chain risk." \
@@ -268,7 +275,7 @@ if any_segment_starts_with "$CMD" 'git[[:space:]]+-c[[:space:]]+core\.hookspath'
 fi
 
 # H15: REA_BYPASS env var — attempted escape hatch
-if any_segment_matches "$CMD" '(^|[[:space:];]|&&|\|\|)REA_BYPASS[[:space:]]*='; then
+if any_segment_raw_matches "$CMD" '^REA_BYPASS[[:space:]]*='; then
   add_high \
     "REA_BYPASS env var — unauthorized bypass attempt" \
     "Setting REA_BYPASS is not a supported escape mechanism and indicates a bypass attempt." \
@@ -276,7 +283,7 @@ if any_segment_matches "$CMD" '(^|[[:space:];]|&&|\|\|)REA_BYPASS[[:space:]]*=';
 fi
 
 # H16: alias/function definitions containing bypass strings
-if any_segment_matches "$CMD" '(alias|function)[[:space:]]+[a-zA-Z_]+.*(--(no-verify|force)|HUSKY=0|core\.hookspath)'; then
+if any_segment_raw_matches "$CMD" '^(alias|function)[[:space:]]+[a-zA-Z_]+.*(--(no-verify|force)|HUSKY=0|core\.hookspath)'; then
   add_high \
     "Alias/function definition with bypass — circumventing safety gates" \
     "Defining aliases or functions that embed bypass flags defeats safety hooks." \
