@@ -1,5 +1,87 @@
 # @bookedsolid/rea
 
+## 0.14.0
+
+### Minor Changes
+
+- 75714f0: [security] 0.14.0 — iron-gate codex defaults + two protected-hook fixes.
+
+  Three changes ship together because they share the same theme: rea
+  should be a hard gate, not a leaky one.
+
+  **Codex defaults (behavioral change).** The push-gate previously
+  invoked `codex exec review` with no `-c model=…` override, so codex
+  fell through to its built-in default — which today is the
+  special-purpose `codex-auto-review` model at `medium` reasoning, NOT
+  the flagship `gpt-5.4`. Lower-reasoning models contributed to the
+  verdict-thrashing reported during the 2026-04-26 helixir migration
+  session. 0.14.0 pins `gpt-5.4` + reasoning `high` as the new default,
+  exposed via two new `policy.review` knobs:
+  - `policy.review.codex_model: <name>` — defaults to `gpt-5.4`. Set to
+    `codex-auto-review` (or `gpt-5.4-mini`, `gpt-5.3-codex`, …) for
+    cost-bounded environments.
+  - `policy.review.codex_reasoning_effort: low | medium | high` —
+    defaults to `high`. Trades push-gate latency for verdict
+    consistency.
+
+  When set, the runner passes `-c model="<value>"` and
+  `-c model_reasoning_effort="<value>"` to every `codex exec review`
+  spawn. TOML-quoted with shell-safe escaping for `\` and `"`. `MIGRATING.md`
+  gets a "codex model knobs" section.
+
+  **Secret scanner now catches MultiEdit (P1 security fix).** Reported
+  by an external team. Pre-0.14.0, `hooks/secret-scanner.sh` only
+  inspected `tool_input.content` (Write) and `tool_input.new_string`
+  (Edit). MultiEdit's payload is at `tool_input.edits[].new_string`
+  (an array) and was never scanned, so any agent could route credential
+  writes through MultiEdit to bypass the scanner entirely. The hook now
+  extracts every `new_string` value from the edits array and runs them
+  through the same pattern scan. Precedence preserves: Write content
+  beats Edit `new_string` beats MultiEdit `edits[]`.
+
+  **Blocked-paths-enforcer rejects path traversal (P2 security fix).**
+  Reported by the same team. Pre-0.14.0, `normalize_path()` stripped
+  the project-root prefix and URL-decoded a fixed set of escape
+  sequences but did NOT reject `..` segments. So
+  `foo/../CODEOWNERS` would compare against the literal `CODEOWNERS`
+  blocked-paths entry, fail to match, and the hook would exit 0 — the
+  downstream Write tool would then resolve the traversal and write
+  `CODEOWNERS` anyway. Mirrors the §5a path-traversal-reject pattern
+  that `settings-protection.sh` has had since 0.10.x. Both pre- and
+  post-decode forms are checked, plus URL-encoded traversal
+  (`%2E%2E/`, `%2e%2e/`, `.%2E`).
+
+  **Test coverage.** 1073 tests, +36 new across:
+  - `__tests__/hooks/secret-scanner.test.ts` (new file, 11 tests
+    covering Write/Edit/MultiEdit positive + negative + precedence)
+  - `__tests__/hooks/blocked-paths-enforcer.test.ts` (new file, 13
+    tests covering literal match, traversal-reject, agent-writable
+    allowlist, defense-in-depth on traversal-vs-allowlist)
+  - `src/hooks/push-gate/policy.test.ts` (7 new — codex_model + codex_reasoning_effort
+    defaults, overrides, schema rejection of bad inputs)
+  - `src/hooks/push-gate/codex-runner.test.ts` (6 new — spawn-args
+    capture verifying `-c model="…"` and `-c model_reasoning_effort="…"`
+    precede `exec`, both-set / neither-set / TOML-injection-escape /
+    argument-order)
+
+  **API additions.** `policy.review.codex_model: string`,
+  `policy.review.codex_reasoning_effort: 'low' | 'medium' | 'high'`,
+  `PUSH_GATE_DEFAULT_CODEX_MODEL`, `PUSH_GATE_DEFAULT_CODEX_REASONING_EFFORT`,
+  `runCodexReview` options gain `model` + `reasoningEffort` fields. No
+  breaking changes — all existing callers continue to work; defaults
+  shift behavior toward stronger review.
+
+  **Operator guidance.** Cost-bounded environments should pin a weaker
+  model in `.rea/policy.yaml`:
+
+  ```yaml
+  review:
+    codex_model: codex-auto-review
+    codex_reasoning_effort: medium
+  ```
+
+  Default is the strongest available for adversarial review.
+
 ## 0.13.3
 
 ### Patch Changes
@@ -274,13 +356,13 @@ codex-review --also-set-cache`) on every push, produced a 1,250-line bash
 
   This release replaces the entire stack with a stateless gate:
 
-                git push
-                  → .husky/pre-push → rea hook push-gate
-                  → codex exec review --base <ref> --json
-                  → parse verdict from streamed findings
-                  → block on [P1] (blocking) or [P2] when concerns_blocks=true
-                  → write .rea/last-review.json + audit record
-                  → exit 0 / 1 (HALT) / 2 (blocked)
+                  git push
+                    → .husky/pre-push → rea hook push-gate
+                    → codex exec review --base <ref> --json
+                    → parse verdict from streamed findings
+                    → block on [P1] (blocking) or [P2] when concerns_blocks=true
+                    → write .rea/last-review.json + audit record
+                    → exit 0 / 1 (HALT) / 2 (blocked)
 
   Codex is run fresh on every push. No cache. No SHA matching. No receipt
   consultation. When the gate blocks, Claude reads stderr + the
