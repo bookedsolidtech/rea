@@ -1,5 +1,22 @@
 # @bookedsolid/rea
 
+## 0.13.3
+
+### Patch Changes
+
+- 41fc904: Ship `MIGRATING.md` in the npm tarball.
+
+  The 0.13.2 release added `MIGRATING.md` at the repo root and `rea
+doctor`'s foreign-hook fail message references it ("See `MIGRATING.md`
+  for a worked example"). The doc was missing from `package.json#files`,
+  so consumers running `npm i @bookedsolid/rea` got the doctor reference
+  but no local copy of the file. They had to land on GitHub to read it.
+
+  Adds `MIGRATING.md` to the `files` allowlist alongside `README.md`,
+  `SECURITY.md`, and `THREAT_MODEL.md`. Now the migration guide ships
+  with every install — `cat node_modules/@bookedsolid/rea/MIGRATING.md`
+  works.
+
 ## 0.13.2
 
 ### Patch Changes
@@ -257,13 +274,13 @@ codex-review --also-set-cache`) on every push, produced a 1,250-line bash
 
   This release replaces the entire stack with a stateless gate:
 
-              git push
-                → .husky/pre-push → rea hook push-gate
-                → codex exec review --base <ref> --json
-                → parse verdict from streamed findings
-                → block on [P1] (blocking) or [P2] when concerns_blocks=true
-                → write .rea/last-review.json + audit record
-                → exit 0 / 1 (HALT) / 2 (blocked)
+                git push
+                  → .husky/pre-push → rea hook push-gate
+                  → codex exec review --base <ref> --json
+                  → parse verdict from streamed findings
+                  → block on [P1] (blocking) or [P2] when concerns_blocks=true
+                  → write .rea/last-review.json + audit record
+                  → exit 0 / 1 (HALT) / 2 (blocked)
 
   Codex is run fresh on every push. No cache. No SHA matching. No receipt
   consultation. When the gate blocks, Claude reads stderr + the
