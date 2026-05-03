@@ -327,7 +327,7 @@ export function defaultDesiredHooks(): DesiredHookGroup[] {
     },
     {
       event: 'PreToolUse',
-      matcher: 'Write|Edit|MultiEdit',
+      matcher: 'Write|Edit|MultiEdit|NotebookEdit',
       hooks: [
         { type: 'command', command: `${base}/secret-scanner.sh`, timeout: 15000, statusMessage: 'Scanning for credentials...' },
         { type: 'command', command: `${base}/settings-protection.sh`, timeout: 5000, statusMessage: 'Checking settings protection...' },
@@ -337,7 +337,7 @@ export function defaultDesiredHooks(): DesiredHookGroup[] {
     },
     {
       event: 'PostToolUse',
-      matcher: 'Write|Edit|MultiEdit',
+      matcher: 'Write|Edit|MultiEdit|NotebookEdit',
       hooks: [
         { type: 'command', command: `${base}/architecture-review-gate.sh`, timeout: 10000, statusMessage: 'Checking architecture impact...' },
       ],

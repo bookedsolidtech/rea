@@ -16,11 +16,13 @@ describe('mergeSettings', () => {
     const preHooks = ((result.merged.hooks as { PreToolUse?: Array<{ matcher: string }> }).PreToolUse) ?? [];
     const matchers = preHooks.map((g) => g.matcher);
     expect(matchers).toContain('Bash');
-    // 0.15.0+: matcher includes MultiEdit so the secret-scanner /
+    // 0.16.0+: matcher includes NotebookEdit so the secret-scanner /
     // blocked-paths / settings-protection / changeset-security gates
-    // dispatch on MultiEdit calls. Pre-0.15.0 the matcher was `Write|Edit`
-    // and MultiEdit silently bypassed the entire write-tier hook block.
-    expect(matchers).toContain('Write|Edit|MultiEdit');
+    // dispatch on notebook cell writes. Pre-0.16.0 the matcher was
+    // `Write|Edit|MultiEdit` and notebook cells silently bypassed
+    // the entire write-tier hook block.
+    expect(matchers).toContain('Write|Edit|MultiEdit|NotebookEdit');
+    expect(matchers).not.toContain('Write|Edit|MultiEdit');
     expect(matchers).not.toContain('Write|Edit');
     expect(result.addedCount).toBeGreaterThan(0);
     expect(result.skippedCount).toBe(0);

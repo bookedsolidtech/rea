@@ -35,13 +35,11 @@ if ! command -v jq >/dev/null 2>&1; then
 fi
 
 # ── 3. HALT check ─────────────────────────────────────────────────────────────
-REA_ROOT="${CLAUDE_PROJECT_DIR:-$(pwd)}"
-HALT_FILE="${REA_ROOT}/.rea/HALT"
-if [ -f "$HALT_FILE" ]; then
-  printf 'REA HALT: %s\nAll agent operations suspended. Run: rea unfreeze\n' \
-    "$(head -c 1024 "$HALT_FILE" 2>/dev/null || echo 'Reason unknown')" >&2
-  exit 2
-fi
+# 0.16.0: HALT check sourced from shared _lib/halt-check.sh.
+# shellcheck source=_lib/halt-check.sh
+source "$(dirname "$0")/_lib/halt-check.sh"
+check_halt
+REA_ROOT=$(rea_root)
 
 # ── 4. Parse tool_input.command from the hook payload ─────────────────────────
 CMD=$(printf '%s' "$INPUT" | jq -r '.tool_input.command // empty' 2>/dev/null)
@@ -285,48 +283,34 @@ if any_segment_matches "$CMD" '(alias|function)[[:space:]]+[a-zA-Z_]+.*(--(no-ve
     "Alt: Do not wrap bypass patterns in aliases or functions."
 fi
 
-# H17: context_protection — block commands that should be delegated to subagents
+# H17: context_protection — block commands that should be delegated to subagents.
 # Reads context_protection.delegate_to_subagent from .rea/policy.yaml.
 # These commands produce excessive output that exhausts coordinator context windows.
-POLICY_FILE="${REA_ROOT}/.rea/policy.yaml"
-if [[ -f "$POLICY_FILE" ]]; then
-  DELEGATE_PATTERNS=()
-  IN_DELEGATE_BLOCK=0
-  while IFS= read -r line; do
-    if printf '%s' "$line" | grep -qE '^[[:space:]]*delegate_to_subagent:'; then
-      # Check for inline empty array
-      if printf '%s' "$line" | grep -qE 'delegate_to_subagent:[[:space:]]*\[\]'; then
-        break
-      fi
-      IN_DELEGATE_BLOCK=1
-      continue
-    fi
-    if [[ $IN_DELEGATE_BLOCK -eq 1 ]]; then
-      # Block sequence items start with "  - "
-      if printf '%s' "$line" | grep -qE '^[[:space:]]*-[[:space:]]'; then
-        pattern=$(printf '%s' "$line" | sed "s/^[[:space:]]*-[[:space:]]*//; s/^[\"']//; s/[\"']$//")
-        if [[ -n "$pattern" ]]; then
-          DELEGATE_PATTERNS+=("$pattern")
-        fi
-      else
-        # Non-continuation line = end of block
-        break
-      fi
-    fi
-  done < "$POLICY_FILE"
+#
+# 0.16.0 fix J.2: replaced the inline YAML parser (40+ lines reimplementing
+# block-sequence walking) with `policy_list` from `_lib/policy-read.sh`.
+# Same parser shape as every other rea hook now reads policy via the shared
+# helper; drift between hooks is structurally impossible.
+# shellcheck source=_lib/policy-read.sh
+source "$(dirname "$0")/_lib/policy-read.sh"
 
-  for pattern in "${DELEGATE_PATTERNS[@]+"${DELEGATE_PATTERNS[@]}"}"; do
-    # Use fixed-string match — these are command prefixes, not regex
-    if printf '%s' "$CMD" | grep -qF "$pattern"; then
-      add_high \
-        "Context protection — command must run in a subagent" \
-        "This command produces excessive output that will exhaust the coordinator context window. Delegate it to a subagent instead of running it directly." \
-        "Alt: Use the Agent tool to delegate: Agent(subagent_type: 'qa-engineer-automation', prompt: 'Run $pattern and report pass/fail summary only.')" \
-        "Alt: The context_protection policy in .rea/policy.yaml lists commands that must be delegated."
-      break
-    fi
-  done
-fi
+DELEGATE_PATTERNS=()
+while IFS= read -r pattern; do
+  [[ -z "$pattern" ]] && continue
+  DELEGATE_PATTERNS+=("$pattern")
+done < <(policy_list "delegate_to_subagent")
+
+for pattern in "${DELEGATE_PATTERNS[@]+"${DELEGATE_PATTERNS[@]}"}"; do
+  # Use fixed-string match — these are command prefixes, not regex.
+  if printf '%s' "$CMD" | grep -qF "$pattern"; then
+    add_high \
+      "Context protection — command must run in a subagent" \
+      "This command produces excessive output that will exhaust the coordinator context window. Delegate it to a subagent instead of running it directly." \
+      "Alt: Use the Agent tool to delegate: Agent(subagent_type: 'qa-engineer-automation', prompt: 'Run $pattern and report pass/fail summary only.')" \
+      "Alt: The context_protection policy in .rea/policy.yaml lists commands that must be delegated."
+    break
+  fi
+done
 
 # ── 10. MEDIUM severity checks ────────────────────────────────────────────────
 
