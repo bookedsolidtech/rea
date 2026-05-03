@@ -1,5 +1,67 @@
 # @bookedsolid/rea
 
+## 0.16.4
+
+### Patch Changes
+
+- d55a0f4: Close helix-018 Option B: Bash-tier `.husky/{commit-msg,pre-push,pre-commit}.d/*` carve-out.
+
+  helix-018 reports that the `.husky/<hookname>.d/*` extension surface — the
+  documented rea-blessed slot for consumer-authored husky fragments since
+  0.13.0 / 0.13.2 — was refused by the Bash-tier `protected-paths-bash-gate.sh`
+  even though the Write-tier `settings-protection.sh §5b` allow-list explicitly
+  permits it. Result: a consumer who tried to author a fragment via shell
+  redirect (`cat <<EOF > .husky/pre-push.d/20-helix-cem-drift`) was blocked,
+  while the equivalent Write-tool call succeeded. The two tiers were
+  inconsistent on what the rea contract actually covers.
+
+  ### Fix
+
+  `hooks/_lib/protected-paths.sh` now exposes a `rea_path_is_extension_surface`
+  helper and `rea_path_is_protected` short-circuits to "not protected" when
+  the path is inside the surface. The carve-out matches `.husky/commit-msg.d/*`,
+  `.husky/pre-push.d/*`, and `.husky/pre-commit.d/*` (case-insensitive) and
+  requires a fragment AFTER the `.d/` segment (so the bare directory itself
+  or sibling-named directories like `.husky/pre-push.d.bak/` still hit the
+  parent prefix block).
+
+  `protected-paths-bash-gate.sh` and any future caller of `rea_path_is_protected`
+  inherit the carve-out automatically. `blocked-paths-bash-gate.sh` (the
+  soft user-declared list, shipped in 0.16.3 F3) is intentionally NOT
+  extended — that list is policy-driven and the user's explicit intent
+  should win there.
+
+  ### What this does NOT change
+  - Write-tier `settings-protection.sh §5b` allow-list — already shipped in
+    0.13.2, verified working via 3 new corpus fixtures in this release. The
+    helix-018 report's claim that §5b blocked the path may be a
+    misattribution; the Bash-tier was the actual gap.
+  - helix-018 Option A (full policy-driven `protected_writes` re-design) is
+    deferred to 0.17.0 where it can be paired with deprecation of the
+    `protected_paths_relax` key shipped in 0.16.3 F7.
+
+  ### Empirical validation
+
+  | Hook                      | Case                                                      | Pre-fix | This branch |
+  | ------------------------- | --------------------------------------------------------- | ------- | ----------- |
+  | protected-paths-bash-gate | `echo "..." > .husky/pre-push.d/20-helix-cem-drift`       | block   | allow       |
+  | protected-paths-bash-gate | `echo x > .husky/commit-msg.d/30-styles-token-discipline` | block   | allow       |
+  | protected-paths-bash-gate | `echo x > .husky/pre-commit.d/40-eslint-staged`           | block   | allow       |
+  | protected-paths-bash-gate | `echo x > .husky/pre-push` (parent script)                | block   | block       |
+  | protected-paths-bash-gate | `echo x > .husky/pre-push.d.bak/00-evil` (sibling-named)  | block   | block       |
+  | protected-paths-bash-gate | `echo x > .husky/_/pre-push` (husky 9 stub)               | block   | block       |
+  | settings-protection §5b   | Write to `.husky/pre-push.d/20-helix-cem-drift`           | allow   | allow       |
+  | settings-protection §5b   | Write to `.husky/commit-msg.d/30-helix-styles`            | allow   | allow       |
+  | settings-protection §5b   | Write to `.husky/pre-push` (parent body)                  | block   | block       |
+
+  ### Test coverage
+  - 1218 vitest tests (was 1208 in 0.16.3), +10 helix-018 fixtures: 7 for
+    the bash-tier carve-out (every allow + every still-blocked sibling),
+    3 verifying §5b's existing Write-tier behavior so it can never silently
+    regress.
+  - `pnpm test:dogfood` clean.
+  - `pnpm test:bash-syntax`, `pnpm lint`, `pnpm type-check`, `pnpm build` all clean.
+
 ## 0.16.3
 
 ### Patch Changes
@@ -765,13 +827,13 @@ codex-review --also-set-cache`) on every push, produced a 1,250-line bash
 
   This release replaces the entire stack with a stateless gate:
 
-                            git push
-                              → .husky/pre-push → rea hook push-gate
-                              → codex exec review --base <ref> --json
-                              → parse verdict from streamed findings
-                              → block on [P1] (blocking) or [P2] when concerns_blocks=true
-                              → write .rea/last-review.json + audit record
-                              → exit 0 / 1 (HALT) / 2 (blocked)
+                              git push
+                                → .husky/pre-push → rea hook push-gate
+                                → codex exec review --base <ref> --json
+                                → parse verdict from streamed findings
+                                → block on [P1] (blocking) or [P2] when concerns_blocks=true
+                                → write .rea/last-review.json + audit record
+                                → exit 0 / 1 (HALT) / 2 (blocked)
 
   Codex is run fresh on every push. No cache. No SHA matching. No receipt
   consultation. When the gate blocks, Claude reads stderr + the
