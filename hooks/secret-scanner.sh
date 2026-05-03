@@ -29,53 +29,24 @@ if ! command -v jq >/dev/null 2>&1; then
 fi
 
 # ── HALT check ────────────────────────────────────────────────────────────────
-REA_ROOT="${CLAUDE_PROJECT_DIR:-$(pwd)}"
-HALT_FILE="${REA_ROOT}/.rea/HALT"
-if [ -f "$HALT_FILE" ]; then
-  printf 'REA HALT: %s\nAll agent operations suspended. Run: rea unfreeze\n' \
-    "$(head -c 1024 "$HALT_FILE" 2>/dev/null || echo 'Reason unknown')" >&2
-  exit 2
-fi
+# 0.16.0: HALT check sourced from shared _lib/halt-check.sh.
+# shellcheck source=_lib/halt-check.sh
+source "$(dirname "$0")/_lib/halt-check.sh"
+check_halt
+REA_ROOT=$(rea_root)
 
-FILE_PATH=$(printf '%s' "$INPUT" | jq -r '.tool_input.file_path // empty' 2>/dev/null)
-CONTENT_WRITE=$(printf '%s' "$INPUT" | jq -r '.tool_input.content // empty' 2>/dev/null)
-CONTENT_EDIT=$(printf '%s' "$INPUT"  | jq -r '.tool_input.new_string // empty' 2>/dev/null)
-# MultiEdit (0.14.0 fix): the payload is at tool_input.edits[].new_string —
-# an array, not a scalar — and the prior versions of this hook never read
-# it. Result: any agent could route credential writes through MultiEdit and
-# bypass the secret scanner entirely. We extract every `new_string` value
-# from the edits array and concatenate them with newlines so the awk-based
-# pattern scan below treats them like any other write content.
-#
-# Defensive coercion (codex round-1 P1): a malformed payload where
-# `new_string` is a number, object, or array would make jq error out, the
-# `2>/dev/null` would swallow stderr, `CONTENT_MULTIEDIT` would be empty,
-# and the precedence chain below would fall through to `exit 0` —
-# silently allowing the write. Same fail-open mode for a non-array
-# `edits` value. We:
-#
-#   1. Coerce `.tool_input.edits` to `[]` if it's anything other than an
-#      array (`if type=="array" then . else [] end`)
-#   2. Coerce every `new_string` to a string via `tostring` so jq cannot
-#      fail on heterogeneous types
-#
-# Both layers fail closed: a malformed payload either yields the empty
-# string (no scan needed, exit 0 from the precedence chain) or yields a
-# pattern-scannable string. There is no path where jq errors silently and
-# the hook falls through to allow.
-CONTENT_MULTIEDIT=$(printf '%s' "$INPUT" | jq -r '
-  (.tool_input.edits // [] | if type=="array" then . else [] end)
-  | map((.new_string // "") | tostring)
-  | join("\n")
-' 2>/dev/null)
+# 0.16.0: payload extraction moved to `_lib/payload-read.sh`. The shared
+# helpers handle Write content / Edit new_string / MultiEdit edits[] /
+# NotebookEdit new_source with the same defensive type-guards. Adding
+# the next write-tier tool is a one-line edit there, not a sweep
+# across N hooks.
+# shellcheck source=_lib/payload-read.sh
+source "$(dirname "$0")/_lib/payload-read.sh"
 
-if [[ -n "$CONTENT_WRITE" ]]; then
-  CONTENT="$CONTENT_WRITE"
-elif [[ -n "$CONTENT_EDIT" ]]; then
-  CONTENT="$CONTENT_EDIT"
-elif [[ -n "$CONTENT_MULTIEDIT" ]]; then
-  CONTENT="$CONTENT_MULTIEDIT"
-else
+FILE_PATH=$(extract_file_path "$INPUT")
+CONTENT=$(extract_write_content "$INPUT")
+
+if [[ -z "$CONTENT" ]]; then
   exit 0
 fi
 

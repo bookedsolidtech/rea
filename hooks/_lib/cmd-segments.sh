@@ -53,7 +53,28 @@ _rea_split_segments() {
   # GNU sed and BSD sed both honor `s/PATTERN/\n/g` with `-E` for ERE.
   # We use printf+sed instead of bash IFS=$'...' read so the splitter
   # behaves identically across BSD and GNU sed.
-  printf '%s\n' "$cmd" | sed -E 's/(\|\||&&|;|\|)/\n/g'
+  #
+  # 0.16.0 codex P1 fix (helix-015 #3): the prior sed split on bare `|`
+  # which broke bash's `>|` (noclobber-override redirect) into two
+  # segments — `printf x >` then ` .rea/HALT`. The redirect detector
+  # then never saw a complete `>|` operator and the bash-gate let the
+  # write through.
+  #
+  # 0.16.0 codex P2-1 fix: the placeholder must NOT collide with any
+  # legal byte the agent could supply. The earlier `\x01` (SOH) is a
+  # legal UTF-8 byte and rare-but-possible in commands; if a payload
+  # contained `\x01` literally, the third sed pass would manufacture
+  # a `>|` operator that wasn't in the original — corrupting downstream
+  # parsing in either fail-open or fail-closed directions depending on
+  # what came after. The new sentinel `__REA_GTPIPE_a8f2c1__` is
+  # multi-byte alphanumeric, impossible to collide with shell input
+  # under any encoding we care about (any agent that intentionally
+  # included this string would already be obviously trying to confuse
+  # the splitter — and even then, the worst case is fail-closed).
+  printf '%s\n' "$cmd" \
+    | sed -E 's/>\|/__REA_GTPIPE_a8f2c1__/g' \
+    | sed -E 's/(\|\||&&|;|\|)/\n/g' \
+    | sed -E 's/__REA_GTPIPE_a8f2c1__/>|/g'
 }
 
 # Strip leading whitespace and well-known command prefixes from a single

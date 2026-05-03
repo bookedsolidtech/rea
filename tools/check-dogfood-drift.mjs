@@ -107,7 +107,7 @@ function checkSettingsRegistration() {
         'pr-issue-link-gate.sh',
         'attribution-advisory.sh',
       ],
-      'Write|Edit|MultiEdit': [
+      'Write|Edit|MultiEdit|NotebookEdit': [
         'secret-scanner.sh',
         'settings-protection.sh',
         'blocked-paths-enforcer.sh',
@@ -115,7 +115,7 @@ function checkSettingsRegistration() {
       ],
     },
     PostToolUse: {
-      'Write|Edit|MultiEdit': ['architecture-review-gate.sh'],
+      'Write|Edit|MultiEdit|NotebookEdit': ['architecture-review-gate.sh'],
     },
   };
 

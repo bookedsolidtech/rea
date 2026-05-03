@@ -52,19 +52,71 @@ if [[ -z "$CMD" ]]; then
   exit 0
 fi
 
-# Normalize a path token: strip enclosing quotes, strip leading
-# `$REA_ROOT/`, strip leading `./`. The result is project-relative
-# for matching against REA_PROTECTED_PATTERNS.
+# Normalize a path token. 0.16.0 codex P1 fixes (helix Findings 015):
+#   - resolve `..` segments via realpath when the path exists, OR reject
+#     them outright when it doesn't (`.claude/hooks/../settings.json`
+#     writes to `.claude/settings.json` but the literal-string match
+#     missed it pre-fix)
+#   - lowercase the result so case-insensitive matchers (macOS APFS,
+#     `.ClAuDe/settings.json`) still match the canonical lowercase
+#     pattern (`.claude/settings.json`)
+#   - apply shared `_lib/path-normalize.sh::normalize_path` for backslash
+#     translation + URL decode + leading-`./` strip
+# shellcheck source=_lib/path-normalize.sh
+source "$(dirname "$0")/_lib/path-normalize.sh"
+
 _normalize_target() {
   local t="$1"
   # Strip matching surrounding quotes.
   if [[ "$t" =~ ^\"(.*)\"$ ]]; then t="${BASH_REMATCH[1]}"; fi
   if [[ "$t" =~ ^\'(.*)\'$ ]]; then t="${BASH_REMATCH[1]}"; fi
-  # Strip $REA_ROOT prefix (with or without trailing slash).
-  if [[ "$t" == "$REA_ROOT"/* ]]; then t="${t#"$REA_ROOT"/}"; fi
-  # Strip leading ./
-  while [[ "$t" == ./* ]]; do t="${t#./}"; done
-  printf '%s' "$t"
+  # If the path contains `..` segments, resolve them aggressively. We
+  # cannot rely on `realpath` being installed; do a manual resolution
+  # by walking segments. This is the helix-015 P1 fix: pre-fix, the
+  # literal `.claude/hooks/../settings.json` did not match the
+  # `.claude/settings.json` pattern even though the OS would resolve
+  # the write to that target.
+  case "/$t/" in
+    */../*)
+      # Build absolute then walk and normalize segments.
+      # 0.16.0 codex P1-1 fix: use `read -ra` with IFS=/ instead of an
+      # unquoted `for part in $abs` loop. The unquoted `for` was subject
+      # to pathname expansion — `.claude/*/../settings.json` would glob
+      # `*` against the agent's CWD, mangling the resolved path and
+      # bypassing the protected-paths matcher. `read -ra` with an
+      # explicit delimiter disables both word-splitting (via IFS) AND
+      # pathname expansion (read does not glob).
+      local abs="$t"
+      [[ "$abs" != /* ]] && abs="$REA_ROOT/$abs"
+      local -a raw_parts parts=()
+      IFS='/' read -ra raw_parts <<<"$abs"
+      for part in "${raw_parts[@]}"; do
+        case "$part" in
+          ''|.) continue ;;
+          ..) [[ "${#parts[@]}" -gt 0 ]] && unset 'parts[${#parts[@]}-1]' ;;
+          *) parts+=("$part") ;;
+        esac
+      done
+      t="/$(IFS=/; printf '%s' "${parts[*]}")"
+      # 0.16.0 codex P2-3 fix: if the resolved absolute path escapes
+      # REA_ROOT, emit a sentinel so the caller refuses outright.
+      # `exit 2` here would only exit the `$()` subshell, not the parent
+      # hook process — sentinel + caller-side handling is the only
+      # cross-shell-portable way.
+      if [[ "$t" != "$REA_ROOT" && "$t" != "$REA_ROOT"/* ]]; then
+        printf '__rea_outside_root__:%s' "$t"
+        return 0
+      fi
+      ;;
+  esac
+  # Hand off to shared normalize_path (strips $REA_ROOT, URL-decodes,
+  # translates `\` → `/`, strips leading `./`).
+  t=$(normalize_path "$t")
+  # Lowercase for case-insensitive matching (helix-015 P1 fix #2 —
+  # macOS APFS allows `.ClAuDe/settings.json` to land on the same
+  # file as `.claude/settings.json`, so the matcher must compare
+  # lowercased forms).
+  printf '%s' "$t" | tr '[:upper:]' '[:lower:]'
 }
 
 # Refuse and exit 2 with a uniform error message.
@@ -96,7 +148,15 @@ _check_segment() {
   # bash `[[ =~ ]]` regex literals with `|` and `(...)` parsed inline
   # confuse some bash versions on macOS. Use named variables for each
   # pattern so the literal stays in a string context only.
-  local re_redirect='(^|[[:space:]])(&>|2>>|2>|>>|>)[[:space:]]*([^[:space:]&|;<>]+)'
+  # 0.16.0 codex P1 fix (helix-015 #3): widened redirect regex. Pre-fix
+  # only matched `>`, `>>`, `2>`, `2>>`, `&>`. Missed:
+  #   - `1>` / `1>>` (explicit stdout fd)
+  #   - `>|` (noclobber-override redirect)
+  #   - `[0-9]+>` / `[0-9]+>>` (any fd prefix — `9>file`, `42>>file`)
+  # All of these write to the target and bypassed the gate. The new
+  # pattern accepts: optional fd-prefix, then `>` or `>>` or `>|`, with
+  # optional `&` for stderr-merge variants.
+  local re_redirect='(^|[[:space:]])(&>>|&>|[0-9]+>>|[0-9]+>\||[0-9]+>|>>|>\||>)[[:space:]]*([^[:space:]&|;<>]+)'
   local re_cpmv='(^|[[:space:]])(cp|mv)[[:space:]]+[^&|;<>]+[[:space:]]([^[:space:]&|;<>]+)[[:space:]]*$'
   local re_sed='(^|[[:space:]])sed[[:space:]]+(-[a-zA-Z]*i[a-zA-Z]*[^[:space:]]*)[[:space:]]+[^&|;<>]+[[:space:]]([^[:space:]&|;<>]+)[[:space:]]*$'
   local re_dd='(^|[[:space:]])dd[[:space:]]+[^&|;<>]*of=([^[:space:]&|;<>]+)'
@@ -175,11 +235,22 @@ _check_segment() {
           # walking — there may be more positional args.
           local _t
           _t=$(_normalize_target "$target_token")
+          # 0.16.0 codex P2-3: outside-REA_ROOT sentinel handling.
+          if [[ "$_t" == __rea_outside_root__:* ]]; then
+            local resolved="${_t#__rea_outside_root__:}"
+            {
+              printf 'PROTECTED PATH (bash): path traversal escapes project root\n'
+              printf '  Logical: %s\n  Resolved: %s\n' "$target_token" "$resolved"
+            } >&2
+            exit 2
+          fi
           if rea_path_is_protected "$_t"; then
             local matched=""
+            local pattern_lc
             for pattern in "${REA_PROTECTED_PATTERNS[@]}"; do
-              if [[ "$_t" == "$pattern" ]]; then matched="$pattern"; break; fi
-              if [[ "$pattern" == */ && "$_t" == "$pattern"* ]]; then matched="$pattern"; break; fi
+              pattern_lc=$(printf '%s' "$pattern" | tr '[:upper:]' '[:lower:]')
+              if [[ "$_t" == "$pattern_lc" ]]; then matched="$pattern"; break; fi
+              if [[ "$pattern_lc" == */ && "$_t" == "$pattern_lc"* ]]; then matched="$pattern"; break; fi
             done
             _refuse "$matched" "$_t" "$segment"
           fi
@@ -196,12 +267,31 @@ _check_segment() {
 
   local target
   target=$(_normalize_target "$target_token")
+  # 0.16.0 codex P2-3 fix: outside-REA_ROOT sentinel from _normalize_target.
+  if [[ "$target" == __rea_outside_root__:* ]]; then
+    local resolved="${target#__rea_outside_root__:}"
+    {
+      printf 'PROTECTED PATH (bash): path traversal escapes project root\n'
+      printf '\n'
+      printf '  Logical:  %s\n' "$target_token"
+      printf '  Resolved: %s\n' "$resolved"
+      printf '  Segment:  %s\n' "$segment"
+      printf '\n'
+      printf '  Rule: bash redirects whose target resolves outside REA_ROOT\n'
+      printf '        are refused. Use a project-relative path without `..`\n'
+      printf '        segments.\n'
+    } >&2
+    exit 2
+  fi
   if rea_path_is_protected "$target"; then
-    # Find the matching pattern for the error message.
-    local matched=""
+    # Find the matching pattern for the error message. Both `target`
+    # and `pattern` lowercased to match `_normalize_target`'s case-
+    # insensitive output (helix-015 P1 fix).
+    local matched="" pattern_lc
     for pattern in "${REA_PROTECTED_PATTERNS[@]}"; do
-      if [[ "$target" == "$pattern" ]]; then matched="$pattern"; break; fi
-      if [[ "$pattern" == */ && "$target" == "$pattern"* ]]; then matched="$pattern"; break; fi
+      pattern_lc=$(printf '%s' "$pattern" | tr '[:upper:]' '[:lower:]')
+      if [[ "$target" == "$pattern_lc" ]]; then matched="$pattern"; break; fi
+      if [[ "$pattern_lc" == */ && "$target" == "$pattern_lc"* ]]; then matched="$pattern"; break; fi
     done
     _refuse "$matched" "$target" "$segment"
   fi

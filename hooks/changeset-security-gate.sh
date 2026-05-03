@@ -26,38 +26,29 @@ TOOL_NAME=$(echo "$INPUT" | jq -r '.tool_name // ""')
 # 0.15.0 fix: MultiEdit was not in the allowed tool_name set, so the gate
 # silently exited 0 on every MultiEdit call against `.changeset/*.md` —
 # letting GHSA / CVE pre-disclosure through and skipping frontmatter
-# validation. Same bypass shape as the secret-scanner MultiEdit issue
-# fixed in 0.14.0; this is the second hook in the same family.
-if [[ "$TOOL_NAME" != "Write" && "$TOOL_NAME" != "Edit" && "$TOOL_NAME" != "MultiEdit" ]]; then
+# validation. 0.16.0: NotebookEdit added too (changesets are .md files
+# but a malicious agent could in principle route a .md write through
+# NotebookEdit's new_source path; cheap to allow, free to test).
+if [[ "$TOOL_NAME" != "Write" && "$TOOL_NAME" != "Edit" && "$TOOL_NAME" != "MultiEdit" && "$TOOL_NAME" != "NotebookEdit" ]]; then
   exit 0
 fi
 
-FILE_PATH=$(echo "$INPUT" | jq -r '.tool_input.file_path // ""')
+require_jq
+
+# 0.16.0: payload extraction migrated to `_lib/payload-read.sh`. Shared
+# helpers handle every write-tier tool with the same defensive
+# coercion. Adding the next write-tier tool is a one-line edit there.
+# shellcheck source=_lib/payload-read.sh
+source "$(dirname "$0")/_lib/payload-read.sh"
+
+FILE_PATH=$(extract_file_path "$INPUT")
 
 # Only care about .changeset/*.md files — exclude README.md (changeset tool metadata)
 if ! echo "$FILE_PATH" | grep -qE '\.changeset/[^/]+\.md$' || echo "$FILE_PATH" | grep -qE '\.changeset/README\.md$'; then
   exit 0
 fi
 
-require_jq
-
-# Extract the content being written. MultiEdit content lives at
-# `tool_input.edits[].new_string` (an array, not a scalar) — see the
-# corresponding extraction in hooks/secret-scanner.sh. We use the same
-# defensive coercion (`tostring` + `if type=="array" then . else [] end`)
-# so a malformed payload fails closed: either yields the empty string
-# (no scan needed, exit 0) or yields a pattern-scannable string.
-if [[ "$TOOL_NAME" == "Write" ]]; then
-  CONTENT=$(echo "$INPUT" | jq -r '.tool_input.content // ""')
-elif [[ "$TOOL_NAME" == "Edit" ]]; then
-  CONTENT=$(echo "$INPUT" | jq -r '.tool_input.new_string // ""')
-else
-  CONTENT=$(echo "$INPUT" | jq -r '
-    (.tool_input.edits // [] | if type=="array" then . else [] end)
-    | map((.new_string // "") | tostring)
-    | join("\n")
-  ')
-fi
+CONTENT=$(extract_write_content "$INPUT")
 
 # ─── 1. SECURITY DISCLOSURE CHECK ───────────────────────────────────────────
 #

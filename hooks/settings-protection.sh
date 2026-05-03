@@ -33,13 +33,11 @@ if ! command -v jq >/dev/null 2>&1; then
 fi
 
 # ── 3. HALT check ────────────────────────────────────────────────────────────
-REA_ROOT="${CLAUDE_PROJECT_DIR:-$(pwd)}"
-HALT_FILE="${REA_ROOT}/.rea/HALT"
-if [ -f "$HALT_FILE" ]; then
-  printf 'REA HALT: %s\nAll agent operations suspended. Run: rea unfreeze\n' \
-    "$(head -c 1024 "$HALT_FILE" 2>/dev/null || echo 'Reason unknown')" >&2
-  exit 2
-fi
+# 0.16.0: HALT check sourced from shared _lib/halt-check.sh.
+# shellcheck source=_lib/halt-check.sh
+source "$(dirname "$0")/_lib/halt-check.sh"
+check_halt
+REA_ROOT=$(rea_root)
 
 # ── 4. Extract file path from payload ─────────────────────────────────────────
 FILE_PATH=$(printf '%s' "$INPUT" | jq -r '.tool_input.file_path // empty' 2>/dev/null)
@@ -333,6 +331,63 @@ if match_protected_ci; then
     printf '  Matched: %s\n' "$PROTECTED_MATCH"
   } >&2
   exit 2
+fi
+
+# ── 6c. Intermediate-symlink resolution (0.16.0 fix H.1) ──────────────────────
+# Helix Finding 2 reborn against the hard-protected list. The §5b
+# extension-surface fix (0.13.2) resolved parent realpath for the
+# `.husky/{commit-msg,pre-push}.d/*` allowlist; §6 was never given the
+# same protection. Attack:
+#
+#   mkdir innocuous_path
+#   ln -s ../.husky innocuous_path/maybe   # symlink resolves to .husky/
+#   write innocuous_path/maybe/pre-push    # writes through to .husky/pre-push
+#
+# §5a (`..` traversal) doesn't catch — the path string has no `..`.
+# §6 PROTECTED_PATTERNS sees `innocuous_path/maybe/pre-push` — doesn't
+# match `.husky/` prefix. The write succeeds and the package-managed
+# pre-push body is overwritten.
+#
+# Fix: when the parent directory of the target exists, resolve its
+# realpath via cd -P && pwd -P (same shape as §5b) and check whether
+# the resolved path falls inside any protected directory. Only resolve
+# when the parent already exists — a write that creates the parent has
+# nothing to follow.
+if [[ -e "$FILE_PATH" || -d "$(dirname -- "$FILE_PATH")" ]]; then
+  parent_dir=$(dirname -- "$FILE_PATH")
+  if [[ -d "$parent_dir" ]]; then
+    resolved_parent=$(cd -P -- "$parent_dir" 2>/dev/null && pwd -P 2>/dev/null) || resolved_parent=""
+    if [[ -n "$resolved_parent" ]]; then
+      # If the resolved parent is inside REA_ROOT, compute the project-
+      # relative path and test it against the protected patterns.
+      if [[ "$resolved_parent" == "$REA_ROOT"/* ]]; then
+        relative_resolved="${resolved_parent#"$REA_ROOT"/}"
+        # Walk every PROTECTED_PATTERN that's a directory prefix and
+        # check whether the resolved parent falls inside it. Direct
+        # filename matches against PROTECTED_PATTERNS for the resolved
+        # final path (parent + basename).
+        resolved_target="${relative_resolved}/$(basename -- "$FILE_PATH")"
+        resolved_target_lc=$(printf '%s' "$resolved_target" | tr '[:upper:]' '[:lower:]')
+        for pattern in "${PROTECTED_PATTERNS[@]}"; do
+          pattern_lc=$(printf '%s' "$pattern" | tr '[:upper:]' '[:lower:]')
+          if [[ "$resolved_target_lc" == "$pattern_lc" ]] || \
+             { [[ "$pattern_lc" == */ ]] && [[ "$resolved_target_lc" == "$pattern_lc"* ]]; }; then
+            {
+              printf 'SETTINGS PROTECTION: intermediate-symlink resolution blocked\n'
+              printf '\n'
+              printf '  Logical:  %s\n' "$SAFE_FILE_PATH"
+              printf '  Resolved: %s\n' "$resolved_target"
+              printf '  Matched:  %s\n' "$pattern"
+              printf '  Rule: an intermediate directory of the target path is a\n'
+              printf '        symlink whose target falls inside a hard-protected\n'
+              printf '        path. Refused to prevent symlinked-parent bypass.\n'
+            } >&2
+            exit 2
+          fi
+        done
+      fi
+    fi
+  fi
 fi
 
 # ── 6b. Hook-patch session (Defect I / rea#76) ───────────────────────────────
