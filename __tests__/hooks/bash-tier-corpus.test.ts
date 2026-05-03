@@ -773,3 +773,116 @@ describe('protected_paths_relax (F7) — policy-driven hard-protected list', () 
     expect(res.status).toBe(2);
   });
 });
+
+// ─── 0.16.4 helix-018 Option B: .husky/{commit-msg,pre-push,pre-commit}.d/* ──
+// settings-protection.sh §5b has carved this surface out of write-tier
+// protection since 0.13.2. The bash-tier protected-paths-bash-gate.sh
+// had no parity carve-out until 0.16.4 — `cat <<EOF > .husky/pre-push.d/X`
+// was refused by the bash-gate even though the equivalent Write-tool
+// call succeeded.
+describe('husky extension surface carve-out (helix-018 Option B)', () => {
+  it('.husky/pre-push.d/X — Bash redirect ALLOWED (parity with §5b)', () => {
+    if (!jqExists()) return;
+    const res = runHook(
+      'protected-paths-bash-gate.sh',
+      'echo "#!/bin/sh\necho hi" > .husky/pre-push.d/20-helix-cem-drift',
+    );
+    expect(res.status).toBe(0);
+  });
+
+  it('.husky/commit-msg.d/X — Bash redirect ALLOWED', () => {
+    if (!jqExists()) return;
+    const res = runHook(
+      'protected-paths-bash-gate.sh',
+      'echo x > .husky/commit-msg.d/30-styles-token-discipline',
+    );
+    expect(res.status).toBe(0);
+  });
+
+  it('.husky/pre-commit.d/X — Bash redirect ALLOWED', () => {
+    if (!jqExists()) return;
+    const res = runHook(
+      'protected-paths-bash-gate.sh',
+      'echo x > .husky/pre-commit.d/40-eslint-staged',
+    );
+    expect(res.status).toBe(0);
+  });
+
+  it('.husky/pre-push (parent script, NO .d/ suffix) — STILL BLOCKED', () => {
+    if (!jqExists()) return;
+    const res = runHook(
+      'protected-paths-bash-gate.sh',
+      'echo x > .husky/pre-push',
+    );
+    expect(res.status).toBe(2);
+  });
+
+  it('.husky/pre-push.d/ (bare dir, no fragment) — STILL BLOCKED via parent prefix', () => {
+    if (!jqExists()) return;
+    const res = runHook(
+      'protected-paths-bash-gate.sh',
+      'echo x > .husky/pre-push.d/',
+    );
+    // The bare directory write would be a no-op anyway; we just confirm
+    // we don't accidentally allow it via the carve-out (which requires
+    // a fragment AFTER the .d/ segment).
+    expect(res.status).toBe(2);
+  });
+
+  it('.husky/pre-push.d.bak/X (sibling-named directory) — STILL BLOCKED', () => {
+    if (!jqExists()) return;
+    const res = runHook(
+      'protected-paths-bash-gate.sh',
+      'echo x > .husky/pre-push.d.bak/00-evil',
+    );
+    expect(res.status).toBe(2);
+  });
+
+  it('.husky/_/pre-push (husky 9 stub) — STILL BLOCKED', () => {
+    if (!jqExists()) return;
+    const res = runHook(
+      'protected-paths-bash-gate.sh',
+      'echo x > .husky/_/pre-push',
+    );
+    expect(res.status).toBe(2);
+  });
+});
+
+// settings-protection.sh §5b verification — independent corpus pinning the
+// Write-tier allow-list for the helix-018 specific path. settings-protection
+// expects `tool_input.file_path` (not `tool_input.command`); we shape the
+// payload accordingly.
+describe('settings-protection.sh §5b — Write-tier .d/ allow-list (helix-018 #2)', () => {
+  function runWriteHook(filePath: string): { status: number; stderr: string } {
+    const HOOK = path.join(REPO_ROOT, 'hooks', 'settings-protection.sh');
+    const payload = JSON.stringify({
+      tool_name: 'Write',
+      tool_input: { file_path: filePath, content: 'x' },
+    });
+    const res = spawnSync('bash', [HOOK], {
+      cwd: REPO_ROOT,
+      env: { PATH: process.env.PATH ?? '', CLAUDE_PROJECT_DIR: REPO_ROOT },
+      input: payload,
+      encoding: 'utf8',
+    });
+    return { status: res.status ?? -1, stderr: res.stderr ?? '' };
+  }
+
+  it('.husky/pre-push.d/20-helix-cem-drift — Write tool ALLOWED', () => {
+    if (!jqExists()) return;
+    const res = runWriteHook('.husky/pre-push.d/20-helix-cem-drift');
+    expect(res.status).toBe(0);
+  });
+
+  it('.husky/commit-msg.d/X — Write tool ALLOWED', () => {
+    if (!jqExists()) return;
+    const res = runWriteHook('.husky/commit-msg.d/30-helix-styles');
+    expect(res.status).toBe(0);
+  });
+
+  it('.husky/pre-push (parent body) — Write tool BLOCKED', () => {
+    if (!jqExists()) return;
+    const res = runWriteHook('.husky/pre-push');
+    expect(res.status).toBe(2);
+  });
+});
