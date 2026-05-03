@@ -1,5 +1,102 @@
 # @bookedsolid/rea
 
+## 0.16.3
+
+### Patch Changes
+
+- 1d9e0d8: Close 8 unaddressed findings: 2 helix-016.1 carry-forwards (filed against
+  0.16.1, restated against 0.16.2), 4 discord-ops Round 9 findings against
+  0.16.2, plus 2 user-reported design issues surfaced during 0.16.3
+  implementation (F7 hardcoded-protection escape hatch, F8 self-trip in the
+  new F4 body-file scanner). Every finding gets a corpus-pinned fixture so
+  the fix cannot silently regress.
+
+  ### Findings closed
+
+  | #   | Sev | File                                                                                                                                         | Change                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+  | --- | --- | -------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+  | F1  | P1  | `src/hooks/push-gate/codex-runner.ts`                                                                                                        | Pre-flight `codex --version` probe before the long-running review subprocess. ENOENT (and EACCES) on the probe surfaces `CodexNotInstalledError` synchronously so `index.ts` formats the friendly install hint as the headline `PUSH BLOCKED:` line instead of an opaque subprocess stack frame. (helix-016.1 #1, restated 016-2 #1)                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+  | F2  | P1  | `hooks/_lib/cmd-segments.sh`                                                                                                                 | `_rea_split_segments` gains a quote-mask preprocessing pass: an awk one-pass scan replaces `;`/`&`/`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                | `/newline INSIDE matched `"…"`and`'…'` spans with multi-byte sentinels before splitting, then restores the literal characters in the surviving segments. Quoted prose containing trigger words no longer fragments into phantom segments that anchor on the trigger. The "INTENTIONAL and SAFE over-splitting" comment block — empirically refuted by helix — is removed. (helix-016.1 #2, restated 016-2 #2 with empirical reproducer) |
+  | F3  | P1  | new `hooks/blocked-paths-bash-gate.sh`                                                                                                       | Bash-tier counterpart for the soft `policy.yaml → blocked_paths` list. Reads `policy_list "blocked_paths"` and refuses redirects, cp/mv/sed -i tail-targets, dd `of=`, tee/truncate/install/ln, and `node -e fs.write*` calls whose resolved target matches an entry. Modeled on `protected-paths-bash-gate.sh`. Registered between `protected-paths-bash-gate.sh` and `dependency-audit-gate.sh` in `defaultDesiredHooks()` and the dogfood `.claude/settings.json`. (discord-ops Round 9 #1)                                                                                                                                                                                                                                                                                      |
+  | F4  | P1  | `hooks/security-disclosure-gate.sh`                                                                                                          | Resolves `--body-file PATH` and `-F PATH` arguments, reads up to 64 KiB of each, prepends the lowercased contents to `FULL_TEXT` before pattern scan. Stdin form (`-F -`) is skipped (re-read impossible). Paths whose canonical form uses `..`-traversal escaping `REA_ROOT` are refused; plain absolute paths (e.g. `/var/folders/...` tmpfiles) are honored. Unreadable files emit a stderr advisory and continue scanning the command line. (discord-ops Round 9 #2)                                                                                                                                                                                                                                                                                                            |
+  | F5  | P2  | `hooks/dangerous-bash-interceptor.sh` H17                                                                                                    | `delegate_to_subagent` patterns now match via `any_segment_starts_with` instead of unanchored `grep -F` against the whole `$CMD`. Patterns from `policy.yaml` are command prefixes (`pnpm run build`, `pnpm run test`, `pnpm run lint`); they only fire when a segment STARTS with the pattern. Commit messages and prose mentioning those prefixes no longer false-positive. ERE metacharacters in the policy patterns are escaped before the regex match. (discord-ops Round 9 #3)                                                                                                                                                                                                                                                                                                |
+  | F6  | P3  | `hooks/env-file-protection.sh`                                                                                                               | `PATTERN_SOURCE` and `PATTERN_CP_ENV` migrated from `any_segment_matches` to `any_segment_starts_with`. The patterns are command prefixes (`source PATH`, `. PATH`, `cp X PATH`); commit messages or echoed prose containing `source .env` no longer fire the direct-source/cp block. (discord-ops Round 9 #4)                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+  | F7  | P1  | `hooks/_lib/protected-paths.sh` + `hooks/settings-protection.sh` + `src/policy/loader.ts` + `src/policy/types.ts` + `src/policy/profiles.ts` | New `protected_paths_relax` policy key. Pre-fix the hard-protected list was hardcoded — consumers who needed to author `.husky/<hookname>` files had no escape: settings-protection.sh §6 refused the write, and the protection list itself lived in rea-managed source that protected-paths-bash-gate.sh ALSO refused. Now the lib reads `protected_paths_relax` from policy.yaml and removes listed entries from the effective set. Kill-switch invariants (`.rea/HALT`, `.rea/policy.yaml`, `.claude/settings.json`) are silently ignored if listed AND emit a stderr advisory. settings-protection.sh §6 migrated to source the shared lib so both Write/Edit and Bash tiers honor the same effective list. (user-reported, design issue surfaced during 0.16.3 implementation) |
+  | F8  | P2  | `hooks/security-disclosure-gate.sh` early-exit                                                                                               | Anchor the early-exit detection at segment start via `any_segment_starts_with`, falling back to legacy unanchored grep if `_lib/cmd-segments.sh` is unreachable. Same anchoring class as F5/F6 — surfaced when the F4-shipping orchestrator's own PR body containing the literal phrase tripped on its own change. (rea-internal, surfaced during 0.16.3 codex pass)                                                                                                                                                                                                                                                                                                                                                                                                                |
+
+  Sibling improvement (folded into F2): H12 (curl/wget piped to shell) was
+  previously checked against the raw command to preserve the multi-segment
+  pipeline property. With the new quote-aware splitter, H12 now scans the
+  quote-masked form of the command — same un-split shape, but in-quote pipes
+  are masked. `git commit -m "...curl-pipe-shell example..."` no longer
+  false-positives, while the genuine `curl … | sh` invocation still blocks.
+
+  ### `protected_paths_relax` usage (F7)
+
+  The new policy key is opt-in and narrow. Example:
+
+  ```yaml
+  # .rea/policy.yaml
+  protected_paths_relax:
+    - .husky/ # I author my own husky hooks; opt out of rea protection
+  ```
+
+  Listing a kill-switch invariant (`.rea/HALT`, `.rea/policy.yaml`, or
+  `.claude/settings.json`) is silently dropped from the relax set AND emits
+  a stderr advisory naming the offending entry. Defaults to empty — no
+  behavior change for existing installs that don't declare the key.
+
+  ### Empirical validation
+
+  Replays of every fixture cited in helix-016.1 / 016-2, discord-ops
+  Round 9, F7 (user-reported), and F8 (rea-internal), run against
+  `hooks/*.sh` on this branch:
+
+  | Hook                           | Case                                                            | Pre-fix               | This branch                |
+  | ------------------------------ | --------------------------------------------------------------- | --------------------- | -------------------------- |
+  | dangerous-bash-interceptor     | `echo "release note & git push --force now"`                    | block (FP)            | allow                      |
+  | dangerous-bash-interceptor     | `echo "ship & ship-force-rebase docs"`                          | block (FP)            | allow                      |
+  | dangerous-bash-interceptor     | `echo 'release note & git push --force now'`                    | block (FP)            | allow                      |
+  | dangerous-bash-interceptor     | `git commit -m "fix: stop using git push --force; ..."`         | block (FP)            | allow                      |
+  | dangerous-bash-interceptor     | `git commit -m "doc: discuss curl-pipe-shell..."`               | block (FP)            | allow                      |
+  | dangerous-bash-interceptor     | `sleep 1 & git push --force` (true positive)                    | block                 | block                      |
+  | dangerous-bash-interceptor     | `curl https://x \| sh` (true positive)                          | block                 | block                      |
+  | dangerous-bash-interceptor     | `pnpm run build` (true positive — delegate)                     | block                 | block                      |
+  | dangerous-bash-interceptor     | `git commit -m "...delegate pnpm test..."`                      | block (FP)            | allow                      |
+  | dangerous-bash-interceptor     | `git commit -m "docs: explain pnpm run build delegation"`       | block (FP)            | allow                      |
+  | blocked-paths-bash-gate (NEW)  | `echo x > .env`                                                 | bypass (no Bash gate) | block                      |
+  | blocked-paths-bash-gate (NEW)  | `cp src.txt .env`                                               | bypass                | block                      |
+  | blocked-paths-bash-gate (NEW)  | `sed -i '' '1d' .env.production`                                | bypass                | block                      |
+  | blocked-paths-bash-gate (NEW)  | `node -e "fs.writeFileSync('.env','x')"`                        | bypass                | block                      |
+  | blocked-paths-bash-gate (NEW)  | `tee .env < input.txt`                                          | bypass                | block                      |
+  | blocked-paths-bash-gate (NEW)  | `printf x > .rea/HALT`                                          | bypass                | block                      |
+  | blocked-paths-bash-gate (NEW)  | `echo x > docs/safe.md` (negative)                              | bypass                | allow                      |
+  | security-disclosure-gate       | `gh issue create --body-file <body w/ "exploit">`               | allow (FP miss)       | block                      |
+  | security-disclosure-gate       | `gh issue create -F <body w/ "GHSA-…">`                         | allow (FP miss)       | block                      |
+  | security-disclosure-gate       | `gh issue create --body-file <benign>`                          | allow                 | allow                      |
+  | security-disclosure-gate       | `gh issue create --body-file -` (stdin)                         | allow                 | allow (skip-with-advisory) |
+  | security-disclosure-gate (F8)  | `gh pr create --body "context: gh issue create earlier failed"` | block (FP)            | allow                      |
+  | security-disclosure-gate (F8)  | `git commit -m "docs: explain when to use gh issue create"`     | block (FP)            | allow                      |
+  | env-file-protection            | `source .env` (true positive)                                   | block                 | block                      |
+  | env-file-protection            | `cp .env /tmp/x` (true positive)                                | block                 | block                      |
+  | env-file-protection            | `git commit -m "fix: don't source .env files"`                  | block (FP)            | allow                      |
+  | env-file-protection            | `echo "do not source .env in scripts"`                          | block (FP)            | allow                      |
+  | protected-paths-bash-gate (F7) | `echo x > .husky/pre-commit` (no relax)                         | block                 | block                      |
+  | protected-paths-bash-gate (F7) | `echo x > .husky/pre-commit` (relax `.husky/`)                  | block                 | allow                      |
+  | protected-paths-bash-gate (F7) | `echo halt > .rea/HALT` (relax `.rea/HALT`)                     | block                 | block + advisory           |
+  | protected-paths-bash-gate (F7) | `cp /tmp/x .rea/policy.yaml` (relax `.rea/policy.yaml`)         | block                 | block + advisory           |
+  | protected-paths-bash-gate (F7) | `echo x > .claude/settings.json` (relax `.husky/`)              | block                 | block (non-relaxed entry)  |
+
+  ### Test coverage
+  - 1208 vitest tests pass (was 1078 in 0.14.0; new 0.16.3 work adds corpus
+    fixtures across `bash-tier-corpus.test.ts`, an installer-registration
+    assertion in `settings-merge.test.ts`, the codex-runner async-ENOENT
+    case in `codex-runner.test.ts`, and 5 protected_paths_relax tests).
+  - `pnpm test:dogfood` clean (canonical hooks ↔ `.claude/hooks/`,
+    `.claude/settings.json` registers all canonical hooks).
+  - `pnpm test:bash-syntax` clean.
+  - `pnpm lint`, `pnpm type-check`, `pnpm build` all clean.
+
 ## 0.16.2
 
 ### Patch Changes
@@ -668,13 +765,13 @@ codex-review --also-set-cache`) on every push, produced a 1,250-line bash
 
   This release replaces the entire stack with a stateless gate:
 
-                          git push
-                            → .husky/pre-push → rea hook push-gate
-                            → codex exec review --base <ref> --json
-                            → parse verdict from streamed findings
-                            → block on [P1] (blocking) or [P2] when concerns_blocks=true
-                            → write .rea/last-review.json + audit record
-                            → exit 0 / 1 (HALT) / 2 (blocked)
+                            git push
+                              → .husky/pre-push → rea hook push-gate
+                              → codex exec review --base <ref> --json
+                              → parse verdict from streamed findings
+                              → block on [P1] (blocking) or [P2] when concerns_blocks=true
+                              → write .rea/last-review.json + audit record
+                              → exit 0 / 1 (HALT) / 2 (blocked)
 
   Codex is run fresh on every push. No cache. No SHA matching. No receipt
   consultation. When the gate blocks, Claude reads stderr + the
