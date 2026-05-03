@@ -20,7 +20,7 @@
  */
 
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -370,6 +370,23 @@ const SECURITY_DISCLOSURE_GATE_CORPUS: CorpusCase[] = [
     origin: 'security-disclosure baseline',
     notes: 'gh pr create is out of scope for this hook',
   },
+  // ─── 0.16.3 F8: anchor early-exit at segment start ──────────────────
+  // Pre-fix the early-exit regex `gh\s+issue\s+create` matched
+  // ANYWHERE in $COMMAND, including the body of a `gh pr create` whose
+  // text mentioned `gh issue create`. Surfaced when the orchestrator
+  // building this very release tripped on its own PR body.
+  {
+    cmd: 'gh pr create --title rea --body "context: gh issue create earlier failed"',
+    expectExit: 0,
+    origin: '0.16.3 F8 (rea-internal)',
+    notes: 'gh pr create with body referencing gh issue create must NOT block',
+  },
+  {
+    cmd: 'git commit -m "docs: explain when to use gh issue create vs gh pr create"',
+    expectExit: 0,
+    origin: '0.16.3 F8 sibling',
+    notes: 'commit message mentioning gh issue create must NOT block',
+  },
 ];
 
 const BLOCKED_PATHS_BASH_GATE_CORPUS: CorpusCase[] = [
@@ -651,4 +668,108 @@ describe('bash-tier corpus — blocked-paths-bash-gate.sh', () => {
       );
     });
   }
+});
+
+// ─── 0.16.3 F7: protected_paths_relax policy key ───────────────────────────
+// Pre-fix the hard-protected list in `_lib/protected-paths.sh` was hardcoded.
+// Consumers who legitimately needed to author `.husky/<hookname>` files had no
+// escape — settings-protection.sh §6 refused the write, and the protection
+// list itself lived in rea-managed source that protected-paths-bash-gate.sh
+// ALSO refused. F7 introduces `protected_paths_relax` in policy.yaml.
+//
+// These tests spawn protected-paths-bash-gate against a temp project root
+// that has its own .rea/policy.yaml with the relax key set, so the lib's
+// lazy load picks up the relax list at hook-invocation time.
+
+function runHookInTempProject(
+  hookName: string,
+  cmd: string,
+  policyYaml: string,
+): { status: number; stderr: string } {
+  const HOOK = path.join(REPO_ROOT, 'hooks', hookName);
+  // Stage a temp project: .rea/policy.yaml + the hook needs jq (PATH passes
+  // through) and the _lib siblings (the hook sources via $(dirname "$0")
+  // which is REPO_ROOT/hooks, so libs come from canonical regardless of
+  // CLAUDE_PROJECT_DIR — that's exactly what we want).
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'rea-f7-'));
+  try {
+    const reaDir = path.join(dir, '.rea');
+    mkdirSync(reaDir, { recursive: true });
+    writeFileSync(path.join(reaDir, 'policy.yaml'), policyYaml);
+    const payload = JSON.stringify({ tool_input: { command: cmd } });
+    const res = spawnSync('bash', [HOOK], {
+      cwd: dir,
+      env: { PATH: process.env.PATH ?? '', CLAUDE_PROJECT_DIR: dir },
+      input: payload,
+      encoding: 'utf8',
+    });
+    return { status: res.status ?? -1, stderr: res.stderr ?? '' };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+const POLICY_BASE = `version: "1"
+profile: bst-internal
+installed_by: test
+installed_at: "2026-05-03T00:00:00Z"
+autonomy_level: L1
+max_autonomy_level: L2
+promotion_requires_human_approval: true
+block_ai_attribution: true
+blocked_paths:
+  - .env
+`;
+
+describe('protected_paths_relax (F7) — policy-driven hard-protected list', () => {
+  it('default policy (no relax) — .husky/ write is BLOCKED', () => {
+    if (!jqExists()) return;
+    const res = runHookInTempProject(
+      'protected-paths-bash-gate.sh',
+      'echo x > .husky/pre-commit',
+      POLICY_BASE,
+    );
+    expect(res.status).toBe(2);
+  });
+
+  it('protected_paths_relax: [".husky/"] — .husky/ write is ALLOWED', () => {
+    if (!jqExists()) return;
+    const res = runHookInTempProject(
+      'protected-paths-bash-gate.sh',
+      'echo x > .husky/pre-commit',
+      `${POLICY_BASE}protected_paths_relax:\n  - .husky/\n`,
+    );
+    expect(res.status).toBe(0);
+  });
+
+  it('protected_paths_relax: [".rea/HALT"] — kill-switch invariant ignored, BLOCK and emit advisory', () => {
+    if (!jqExists()) return;
+    const res = runHookInTempProject(
+      'protected-paths-bash-gate.sh',
+      'echo halt > .rea/HALT',
+      `${POLICY_BASE}protected_paths_relax:\n  - .rea/HALT\n`,
+    );
+    expect(res.status).toBe(2);
+    expect(res.stderr).toMatch(/kill-switch invariant/);
+  });
+
+  it('protected_paths_relax: [".rea/policy.yaml"] — invariant ignored, write still BLOCKED', () => {
+    if (!jqExists()) return;
+    const res = runHookInTempProject(
+      'protected-paths-bash-gate.sh',
+      'cp /tmp/x .rea/policy.yaml',
+      `${POLICY_BASE}protected_paths_relax:\n  - .rea/policy.yaml\n`,
+    );
+    expect(res.status).toBe(2);
+  });
+
+  it('protected_paths_relax: [".husky/"] — non-relaxed protected path STILL blocked', () => {
+    if (!jqExists()) return;
+    const res = runHookInTempProject(
+      'protected-paths-bash-gate.sh',
+      'echo x > .claude/settings.json',
+      `${POLICY_BASE}protected_paths_relax:\n  - .husky/\n`,
+    );
+    expect(res.status).toBe(2);
+  });
 });

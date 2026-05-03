@@ -172,6 +172,12 @@ const PolicySchema = z
     promotion_requires_human_approval: z.boolean(),
     block_ai_attribution: z.boolean().default(false),
     blocked_paths: z.array(z.string()),
+    // 0.16.3 F7: opt-in relax list. Consumers can list rea-managed
+    // hard-protected patterns they want unblocked (e.g. `.husky/` to
+    // author their own husky hooks). The kill-switch invariants
+    // (`.rea/HALT`, `.rea/policy.yaml`, `.claude/settings.json`) are
+    // ignored if listed — see hooks/_lib/protected-paths.sh.
+    protected_paths_relax: z.array(z.string()).default([]),
     notification_channel: z.string().default(''),
     injection_detection: z.enum(['block', 'warn']).optional(),
     injection: InjectionPolicySchema.optional(),

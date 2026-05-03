@@ -40,8 +40,23 @@ fi
 COMMAND=$(echo "$INPUT" | jq -r '.tool_input.command // ""')
 
 # Only intercept gh issue create
-if ! echo "$COMMAND" | grep -qE 'gh\s+issue\s+create'; then
-  exit 0
+# 0.16.3 F8: anchor at segment start so `gh pr create --body "context: gh issue create earlier"`
+# does not match. Same anchoring class as F5/F6 in this release. Source the
+# segment splitter and use any_segment_starts_with — when the cmd-segments
+# lib isn't reachable for any reason, fall back to the legacy unanchored
+# grep (defense-in-depth: better to over-block prose mentions than miss a
+# real `gh issue create`).
+# shellcheck source=_lib/cmd-segments.sh
+if [ -f "$(dirname "$0")/_lib/cmd-segments.sh" ]; then
+  # shellcheck source=_lib/cmd-segments.sh
+  source "$(dirname "$0")/_lib/cmd-segments.sh"
+  if ! any_segment_starts_with "$COMMAND" 'gh[[:space:]]+issue[[:space:]]+create'; then
+    exit 0
+  fi
+else
+  if ! echo "$COMMAND" | grep -qE 'gh\s+issue\s+create'; then
+    exit 0
+  fi
 fi
 
 require_jq
