@@ -148,17 +148,63 @@ jobs:
       # step produced above. A mismatch means the published tarball does not
       # contain the dist/ that passed the pre-publish tarball-smoke gate, and
       # the run fails so the npm tag is not treated as authoritative.
+      #
+      # CDN-propagation retry: `npm publish` returns success once the
+      # registry record is created, but the tarball CDN takes 30-60 seconds
+      # to globally propagate. A naive `npm pack` immediately after publish
+      # has a flake rate observed across 7+ consecutive releases — every
+      # one passed manual `npm pack` 30 seconds later but failed in CI. We
+      # retry the registry lookup THEN the pack with bounded backoff so the
+      # workflow no longer false-fails on a successful publish. Total cap
+      # ~3 minutes; if we hit it, something is genuinely wrong upstream.
       - name: Verify published tarball dist/ matches CI-built dist/
         if: steps.changesets.outputs.published == 'true'
         run: |
           VERSION="$(jq -r '.version' package.json)"
-          echo "[release] verifying @bookedsolid/rea@$VERSION"
+          PKG="@bookedsolid/rea"
+          echo "[release] verifying ${PKG}@${VERSION}"
+
+          # Phase 1 — wait for the registry record. Uses the npm registry
+          # JSON API directly (faster + more reliable than `npm view`).
+          # 12 attempts × 5s = 60s window.
+          REGISTRY_URL="https://registry.npmjs.org/${PKG}/${VERSION}"
+          REGISTRY_OK=0
+          for attempt in $(seq 1 12); do
+            if curl --silent --fail --location --max-time 10 \
+                "$REGISTRY_URL" > /dev/null 2>&1; then
+              echo "[release] registry record present after ${attempt} attempt(s)"
+              REGISTRY_OK=1
+              break
+            fi
+            echo "[release] registry record not yet visible (attempt ${attempt}/12); sleeping 5s"
+            sleep 5
+          done
+          if [ "$REGISTRY_OK" -ne 1 ]; then
+            echo "::error::registry record for ${PKG}@${VERSION} did not appear after 60s — investigate npm publish output above"
+            exit 1
+          fi
+
+          # Phase 2 — wait for the tarball CDN. 12 attempts × 10s = 120s.
           WORK="$(mktemp -d -t rea-verify-XXXXXX)"
           cd "$WORK"
-          npm pack "@bookedsolid/rea@$VERSION" --silent > /dev/null
+          PACK_OK=0
+          for attempt in $(seq 1 12); do
+            if npm pack "${PKG}@${VERSION}" --silent > /dev/null 2>&1; then
+              echo "[release] npm pack succeeded after ${attempt} attempt(s)"
+              PACK_OK=1
+              break
+            fi
+            echo "[release] npm pack not yet returning a tarball (attempt ${attempt}/12); sleeping 10s"
+            sleep 10
+          done
+          if [ "$PACK_OK" -ne 1 ]; then
+            echo "::error::npm pack failed for ${PKG}@${VERSION} after 120s — registry record was visible but the tarball CDN never propagated"
+            exit 1
+          fi
+
           TARBALL="$(ls bookedsolid-rea-*.tgz | head -1)"
           if [ -z "$TARBALL" ]; then
-            echo "::error::npm pack produced no tarball for @bookedsolid/rea@$VERSION"
+            echo "::error::npm pack produced no tarball for ${PKG}@${VERSION}"
             exit 1
           fi
           mkdir -p extract
