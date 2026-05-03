@@ -319,6 +319,7 @@ export function defaultDesiredHooks(): DesiredHookGroup[] {
         { type: 'command', command: `${base}/dangerous-bash-interceptor.sh`, timeout: 10000, statusMessage: 'Checking command safety...' },
         { type: 'command', command: `${base}/env-file-protection.sh`, timeout: 5000, statusMessage: 'Checking for .env file reads...' },
         { type: 'command', command: `${base}/protected-paths-bash-gate.sh`, timeout: 5000, statusMessage: 'Checking for shell-redirect to protected paths...' },
+        { type: 'command', command: `${base}/blocked-paths-bash-gate.sh`, timeout: 5000, statusMessage: 'Checking for shell-redirect to policy-blocked paths...' },
         { type: 'command', command: `${base}/dependency-audit-gate.sh`, timeout: 15000, statusMessage: 'Verifying package exists...' },
         { type: 'command', command: `${base}/security-disclosure-gate.sh`, timeout: 5000, statusMessage: 'Checking disclosure policy...' },
         { type: 'command', command: `${base}/pr-issue-link-gate.sh`, timeout: 5000, statusMessage: 'Checking PR for issue reference...' },

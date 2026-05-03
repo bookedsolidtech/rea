@@ -2,6 +2,7 @@ import { EventEmitter } from 'node:events';
 import { Readable } from 'node:stream';
 import { describe, expect, it } from 'vitest';
 import {
+  CodexNotInstalledError,
   CodexProtocolError,
   parseCodexJsonl,
   runCodexReview,
@@ -204,6 +205,41 @@ describe('runCodexReview — model + reasoning_effort plumbing (0.14.0)', () => 
     // The `"` must be escaped to `\"` so the TOML parser sees one string,
     // not a closed string followed by a token.
     expect(args).toContain('model="malicious\\""');
+  });
+
+  // 0.16.3 helix-016.1 #1: when spawn succeeds but the child emits an
+  // ENOENT-class 'error' event (the async-failure shape that leaked
+  // through the synchronous try/catch pre-fix), the runner must surface
+  // CodexNotInstalledError so index.ts formats the headline as the
+  // friendly install hint rather than an opaque subprocess message.
+  it('throws CodexNotInstalledError when child emits async ENOENT error', async () => {
+    const fakeSpawn = (): ChildProcessWithoutNullStreams => {
+      const child = new EventEmitter() as ChildProcessWithoutNullStreams;
+      child.stdout = Readable.from([]) as ChildProcessWithoutNullStreams['stdout'];
+      child.stderr = Readable.from([]) as ChildProcessWithoutNullStreams['stderr'];
+      child.kill = (() => true) as ChildProcessWithoutNullStreams['kill'];
+      queueMicrotask(() => {
+        const err = new Error('spawn codex ENOENT') as NodeJS.ErrnoException;
+        err.code = 'ENOENT';
+        child.emit('error', err);
+      });
+      return child;
+    };
+    await expect(
+      runCodexReview({
+        baseRef: 'origin/main',
+        cwd: '/tmp',
+        timeoutMs: 60_000,
+        spawnImpl: fakeSpawn,
+      }),
+    ).rejects.toBeInstanceOf(CodexNotInstalledError);
+  });
+
+  it('CodexNotInstalledError carries the install-hint headline message', () => {
+    const e = new CodexNotInstalledError();
+    expect(e.message).toMatch(/codex CLI not found on PATH/);
+    expect(e.message).toMatch(/npm i -g @openai\/codex/);
+    expect(e.message).toMatch(/review\.codex_required: false/);
   });
 
   it('preserves original baseRef and --json --ephemeral flags after the overrides', async () => {

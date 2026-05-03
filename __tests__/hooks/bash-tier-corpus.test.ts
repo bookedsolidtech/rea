@@ -20,6 +20,8 @@
  */
 
 import { spawnSync } from 'node:child_process';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 
@@ -151,6 +153,69 @@ const DANGEROUS_BASH_INTERCEPTOR_CORPUS: CorpusCase[] = [
     expectExit: 0,
     origin: 'H5 — dry-run exclusion',
   },
+  // ─── helix-016.1 #2: quote-mask preprocessing in _rea_split_segments ─
+  // The 0.16.1 splitter added bare `&` to the separator set but did not
+  // honor quote context, so quoted prose containing `&` followed by a
+  // trigger word fragmented and the second segment anchored on the
+  // trigger word (false positive). 0.16.3 adds awk-based quote masking.
+  {
+    cmd: 'echo "release note & git push --force now"',
+    expectExit: 0,
+    origin: 'helix-016.1 #2',
+    notes: 'quoted ampersand in prose — must NOT split into two segments',
+  },
+  {
+    cmd: "echo 'release note & git push --force now'",
+    expectExit: 0,
+    origin: 'helix-016.1 #2 sibling',
+    notes: 'single-quoted ampersand — must NOT split',
+  },
+  {
+    cmd: 'echo "ship & ship-force-rebase docs"',
+    expectExit: 0,
+    origin: 'helix-016.2 empirical reproducer',
+    notes: 'helix reproduced this exact split-and-anchor false positive',
+  },
+  {
+    cmd: 'git commit -m "fix: stop using git push --force; document --force-with-lease"',
+    expectExit: 0,
+    origin: 'helix-016.1 #2 carry-forward',
+    notes: 'quoted commit-msg prose mentioning force-push semantics',
+  },
+  {
+    cmd: 'git commit -m "doc: discuss curl|sh patterns in code blocks"',
+    expectExit: 0,
+    origin: 'helix-016.2 sibling — H12 quoted-pipe FP',
+    notes: 'commit message body containing curl|sh literal must not block',
+  },
+  // ─── helix-016 baseline preservation: still must catch real attacks ──
+  {
+    cmd: 'sleep 0 & git push --force origin main',
+    expectExit: 2,
+    origin: 'helix-016 #1 baseline preserved through 0.16.3',
+    notes: 'unquoted & must still split + H1 must still fire',
+  },
+  // ─── discord-ops Round 9 #3: delegate-to-subagent anchoring ─────────
+  // Pre-fix: substring search fired on commit-msg / prose mentioning
+  // delegate-list patterns. 0.16.3 anchors on segment-start.
+  {
+    cmd: 'pnpm run build',
+    expectExit: 2,
+    origin: 'discord-ops Round 9 #3 baseline',
+    notes: 'true-positive must still block (delegate to subagent)',
+  },
+  {
+    cmd: 'git commit -m "doc: when to delegate pnpm test to subagent"',
+    expectExit: 0,
+    origin: 'discord-ops Round 9 #3',
+    notes: 'delegate pattern in commit-msg body — must NOT block',
+  },
+  {
+    cmd: 'echo "we delegate pnpm run build to a subagent"',
+    expectExit: 0,
+    origin: 'discord-ops Round 9 #3 sibling',
+    notes: 'delegate pattern in prose — must NOT block',
+  },
 ];
 
 const DEPENDENCY_AUDIT_GATE_CORPUS: CorpusCase[] = [
@@ -237,6 +302,154 @@ const ENV_FILE_PROTECTION_CORPUS: CorpusCase[] = [
     origin: 'env-file E.1 sibling',
     notes: 'utility and .env in commit-message body — must NOT block',
   },
+  // ─── discord-ops Round 9 #4: source/cp anchored on segment-start ────
+  // Pre-fix: any_segment_matches (anywhere-in-segment) fired on
+  // `git commit -m "fix: don't source .env files"`. 0.16.3 anchors
+  // PATTERN_SOURCE / PATTERN_CP_ENV at segment-start so prose mentions
+  // of "source .env" or "cp .env" no longer false-positive.
+  {
+    cmd: 'source .env',
+    expectExit: 2,
+    origin: 'discord-ops Round 9 #4 baseline',
+    notes: 'true-positive direct source must still block',
+  },
+  {
+    cmd: '. .env',
+    expectExit: 2,
+    origin: 'discord-ops Round 9 #4 baseline',
+    notes: 'POSIX dot-source variant must still block',
+  },
+  {
+    cmd: 'cp .env /tmp/x',
+    expectExit: 2,
+    origin: 'discord-ops Round 9 #4 baseline',
+    notes: 'cp .env must still block',
+  },
+  {
+    cmd: 'git commit -m "fix: don\'t source .env files"',
+    expectExit: 0,
+    origin: 'discord-ops Round 9 #4',
+    notes: 'commit-msg mentioning source .env — must NOT block',
+  },
+  {
+    cmd: 'echo "do not source .env in scripts"',
+    expectExit: 0,
+    origin: 'discord-ops Round 9 #4 sibling',
+    notes: 'echo prose mentioning source .env — must NOT block',
+  },
+];
+
+const SECURITY_DISCLOSURE_GATE_CORPUS: CorpusCase[] = [
+  // ─── discord-ops Round 9 #2: --body-file payload scan ───────────────
+  // The hook scans command text only by default; pre-fix, body content
+  // routed through --body-file or -F never reached the regex. 0.16.3
+  // resolves the file path, reads up to 64 KiB, and folds the body into
+  // FULL_TEXT before pattern matching. Stdin form (`-F -`) is skipped.
+  // These corpus cases construct a tmpfile per test inside the runner.
+  {
+    cmd: 'gh issue create --title bug --body "feature request: add dark mode"',
+    expectExit: 0,
+    origin: 'security-disclosure baseline',
+    notes: 'benign --body must NOT block',
+  },
+  {
+    cmd: 'gh issue create --title bug --body "rce exploit demonstration"',
+    expectExit: 2,
+    origin: 'security-disclosure baseline',
+    notes: 'sensitive keyword in --body must still block',
+  },
+  {
+    cmd: 'gh issue create --title bug --body-file -',
+    expectExit: 0,
+    origin: 'discord-ops Round 9 #2',
+    notes: 'stdin form (--body-file -) must NOT scan stdin (re-read impossible)',
+  },
+  {
+    cmd: 'gh pr create --title bug --body "non-issue command bypassed"',
+    expectExit: 0,
+    origin: 'security-disclosure baseline',
+    notes: 'gh pr create is out of scope for this hook',
+  },
+];
+
+const BLOCKED_PATHS_BASH_GATE_CORPUS: CorpusCase[] = [
+  // ─── discord-ops Round 9 #1: Bash writes to soft blocked_paths ───
+  // The hook ships in 0.16.3. blocked-paths-enforcer.sh covers
+  // Write/Edit/MultiEdit/NotebookEdit; this gate covers Bash redirects
+  // and write-flag utilities. Reads policy.yaml's blocked_paths list.
+  {
+    cmd: 'echo x > .env',
+    expectExit: 2,
+    origin: 'discord-ops Round 9 #1',
+    notes: 'redirect to .env must block',
+  },
+  {
+    cmd: 'echo x > .env.production',
+    expectExit: 2,
+    origin: 'discord-ops Round 9 #1',
+    notes: '.env-glob target must block',
+  },
+  {
+    cmd: 'cp src.txt .env',
+    expectExit: 2,
+    origin: 'discord-ops Round 9 #1',
+    notes: 'cp tail-target .env must block',
+  },
+  {
+    cmd: "sed -i '' '1d' .env.production",
+    expectExit: 2,
+    origin: 'discord-ops Round 9 #1',
+    notes: 'sed -i in-place edit on .env-variant must block',
+  },
+  {
+    cmd: "node -e \"fs.writeFileSync('.env','x')\"",
+    expectExit: 2,
+    origin: 'discord-ops Round 9 #1',
+    notes: 'node -e fs.writeFileSync to blocked path must block',
+  },
+  {
+    cmd: 'tee .env < input.txt',
+    expectExit: 2,
+    origin: 'discord-ops Round 9 #1',
+    notes: 'tee write to .env must block',
+  },
+  {
+    cmd: 'printf x > .rea/HALT',
+    expectExit: 2,
+    origin: 'discord-ops Round 9 #1',
+    notes: 'redirect to .rea/HALT (in blocked_paths) must block',
+  },
+  {
+    cmd: 'echo y > .github/workflows/release.yml',
+    expectExit: 2,
+    origin: 'discord-ops Round 9 #1',
+    notes: 'redirect to release workflow (in blocked_paths) must block',
+  },
+  // ─── true-negatives: writes to non-blocked paths must allow ─────
+  {
+    cmd: 'echo x > docs/safe.md',
+    expectExit: 0,
+    origin: 'discord-ops Round 9 #1 negative',
+    notes: 'non-blocked target must NOT block',
+  },
+  {
+    cmd: 'cp src.txt docs/safe.md',
+    expectExit: 0,
+    origin: 'discord-ops Round 9 #1 negative',
+    notes: 'cp to non-blocked target must NOT block',
+  },
+  {
+    cmd: 'git commit -m "fix: stop reading .env files"',
+    expectExit: 0,
+    origin: 'discord-ops Round 9 #1 sibling',
+    notes: 'commit-msg mentioning .env — must NOT block (no write)',
+  },
+  {
+    cmd: 'ls -la .env',
+    expectExit: 0,
+    origin: 'discord-ops Round 9 #1 sibling',
+    notes: 'read-only ls of .env — must NOT block (no write)',
+  },
 ];
 
 const ATTRIBUTION_ADVISORY_CORPUS: CorpusCase[] = [
@@ -322,6 +535,117 @@ describe('bash-tier corpus — attribution-advisory.sh', () => {
     it(`[${c.origin}] ${c.cmd.slice(0, 60)}${c.cmd.length > 60 ? '…' : ''}`, () => {
       if (!jqExists()) return;
       const res = runHook('attribution-advisory.sh', c.cmd);
+      expect(res.status, `expected exit ${c.expectExit} for: ${c.cmd}\nstderr: ${res.stderr}`).toBe(
+        c.expectExit,
+      );
+    });
+  }
+});
+
+// 0.16.3 — security-disclosure body-file scan needs the tool_name set
+// because the hook short-circuits when tool_name != "Bash". The default
+// runHook() above only sets tool_input.command. We define a runHook
+// variant that also stamps tool_name.
+function runHookWithToolName(hookName: string, cmd: string, toolName = 'Bash'): { status: number; stderr: string } {
+  const HOOK = path.join(REPO_ROOT, 'hooks', hookName);
+  const payload = JSON.stringify({ tool_name: toolName, tool_input: { command: cmd } });
+  const res = spawnSync('bash', [HOOK], {
+    cwd: REPO_ROOT,
+    env: { PATH: process.env.PATH ?? '', CLAUDE_PROJECT_DIR: REPO_ROOT },
+    input: payload,
+    encoding: 'utf8',
+  });
+  return { status: res.status ?? -1, stderr: res.stderr ?? '' };
+}
+
+describe('bash-tier corpus — security-disclosure-gate.sh', () => {
+  for (const c of SECURITY_DISCLOSURE_GATE_CORPUS) {
+    it(`[${c.origin}] ${c.cmd.slice(0, 60)}${c.cmd.length > 60 ? '…' : ''}`, () => {
+      if (!jqExists()) return;
+      const res = runHookWithToolName('security-disclosure-gate.sh', c.cmd);
+      expect(res.status, `expected exit ${c.expectExit} for: ${c.cmd}\nstderr: ${res.stderr}`).toBe(
+        c.expectExit,
+      );
+    });
+  }
+
+  // 0.16.3 discord-ops Round 9 #2 — body-file payload extraction.
+  // Round-trip: write a tmpfile with the body content, then run the
+  // hook with `gh issue create --body-file <tmpfile>`. The hook should
+  // BLOCK when the body contains a sensitive pattern and ALLOW
+  // otherwise. We use os.tmpdir() for the body file because it is
+  // outside REA_ROOT and the hook should still scan it (the
+  // outside-root refusal applies only to `..`-traversal escapes).
+  it('--body-file with "exploit chain" body — must BLOCK', () => {
+    if (!jqExists()) return;
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'rea-sd-corpus-'));
+    try {
+      const bodyFile = path.join(dir, 'body.md');
+      writeFileSync(bodyFile, 'POC for arbitrary code execution exploit chain\n');
+      const res = runHookWithToolName(
+        'security-disclosure-gate.sh',
+        `gh issue create --title "x" --body-file ${bodyFile}`,
+      );
+      expect(res.status).toBe(2);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('--body-file with "GHSA-" reference — must BLOCK', () => {
+    if (!jqExists()) return;
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'rea-sd-corpus-'));
+    try {
+      const bodyFile = path.join(dir, 'body.md');
+      writeFileSync(bodyFile, 'tracking related advisory GHSA-1234-5678-9abc\n');
+      const res = runHookWithToolName(
+        'security-disclosure-gate.sh',
+        `gh issue create --title "x" --body-file ${bodyFile}`,
+      );
+      expect(res.status).toBe(2);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('--body-file with benign body — must ALLOW', () => {
+    if (!jqExists()) return;
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'rea-sd-corpus-'));
+    try {
+      const bodyFile = path.join(dir, 'body.md');
+      writeFileSync(bodyFile, 'feature request: add a dark mode toggle\n');
+      const res = runHookWithToolName(
+        'security-disclosure-gate.sh',
+        `gh issue create --title "x" --body-file ${bodyFile}`,
+      );
+      expect(res.status).toBe(0);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('-F (alias) with sensitive body — must BLOCK', () => {
+    if (!jqExists()) return;
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'rea-sd-corpus-'));
+    try {
+      const bodyFile = path.join(dir, 'body.md');
+      writeFileSync(bodyFile, 'CVE-2024-99999 lateral exfiltration vector\n');
+      const res = runHookWithToolName(
+        'security-disclosure-gate.sh',
+        `gh issue create --title "x" -F ${bodyFile}`,
+      );
+      expect(res.status).toBe(2);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('bash-tier corpus — blocked-paths-bash-gate.sh', () => {
+  for (const c of BLOCKED_PATHS_BASH_GATE_CORPUS) {
+    it(`[${c.origin}] ${c.cmd.slice(0, 60)}${c.cmd.length > 60 ? '…' : ''}`, () => {
+      if (!jqExists()) return;
+      const res = runHook('blocked-paths-bash-gate.sh', c.cmd);
       expect(res.status, `expected exit ${c.expectExit} for: ${c.cmd}\nstderr: ${res.stderr}`).toBe(
         c.expectExit,
       );
