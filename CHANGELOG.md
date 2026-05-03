@@ -1,5 +1,65 @@
 # @bookedsolid/rea
 
+## 0.13.2
+
+### Patch Changes
+
+- 3064640: Fix the 0.13.0 extension-hook contract end-to-end + ship a migration guide.
+
+  Two defects in 0.13.0/0.13.1 made `.husky/{commit-msg,pre-push}.d/` —
+  advertised as the upgrade-safe extension surface — unusable in
+  practice. Both are fixed in 0.13.2.
+
+  **Issue 1 — `settings-protection.sh` blocked the documented extension
+  surface.** The `.husky/` prefix in `PROTECTED_PATTERNS` was correct for
+  the package-managed bodies (`pre-push`, `commit-msg`, `_/*`), but it
+  also caught `.husky/pre-push.d/00-act-ci` and `.husky/commit-msg.d/*` —
+  the very directories consumers were supposed to write fragments into.
+  Agents under rea's governance got `SETTINGS PROTECTION: Modification
+blocked` whenever they tried to lay down a fragment. Fixed via a §5b
+  allow-list that runs after path-traversal rejection but before the
+  prefix block. `.husky/{commit-msg,pre-push}.d/*` and nested files
+  under those dirs are now writable; the package-managed bodies and
+  husky 9 runtime stubs (`.husky/_/*`) remain protected. Near-miss
+  prefixes (`.husky/pre-push.d.bak/`, `.husky/pre-push.dump`) still hit
+  the prefix block — only the literal `.d/` segment opens the surface.
+
+  **Issue 2 — `$@` mutation in the v4 pre-push body corrupted argv for
+  fragments.** The dispatch did `set -- "${REA_ROOT}/node_modules/.bin/rea"
+hook push-gate "$@"` followed by `"$@"` to invoke. Because `set --`
+  mutates `$@` in place, by the time the fragment loop ran `"$frag"
+"$@"` it was passing the rewritten rea-CLI argv (`<rea-bin> hook
+push-gate <remote> <url>`) instead of git's original `<remote> <url>`.
+  Branch-policy linters, lint-staged-on-push wrappers, and any fragment
+  that reads `$1`/`$2` per the standard pre-push contract would
+  mis-handle the push or fail outright. Fixed by wrapping the dispatch
+  in a subshell `(...)` so the `set --` rewrite stays scoped to the
+  subshell; the parent's `$@` retains git's argv. Captures rea's exit
+  status via `$?` after the subshell exits.
+
+  **Doctor migration helper.** `rea doctor` now scans foreign pre-push
+  hook bodies for references to recognizable consumer tooling
+  (`commitlint`, `lint-staged`, `gitleaks`, `act-CI`) and adds an
+  explicit migration recommendation to the fail message — pointing at
+  `.husky/pre-push.d/` and `MIGRATING.md`.
+
+  **`MIGRATING.md`.** New repo-root guide naming each conflict pattern
+  by name (commitlint, lint-staged, gitleaks, act-CI, branch-policy
+  linter, pre-existing rea invocation, husky 9 layout) with the exact
+  copy-paste migration command for each. The mismatch between rea's
+  0.11.0 stateless thesis and consumers' real-world prior infrastructure
+  was a documentation gap as much as a code gap.
+
+  API additions: none. Behavioral changes:
+  - `settings-protection.sh` no longer blocks `.husky/{commit-msg,pre-push}.d/*`
+  - `BODY_TEMPLATE` in `src/cli/install/pre-push.ts` runs rea inside a
+    subshell; fragments now see git's original argv
+  - `rea doctor`'s foreign-hook fail message includes a migration hint
+    when prior tools are detected
+
+  Reported by BST during the 0.13.0 → main upgrade
+  (`booked-solid-tech/.scratch/rea-013-pre-push-issues.md`).
+
 ## 0.13.1
 
 ### Patch Changes
@@ -197,13 +257,13 @@ codex-review --also-set-cache`) on every push, produced a 1,250-line bash
 
   This release replaces the entire stack with a stateless gate:
 
-            git push
-              → .husky/pre-push → rea hook push-gate
-              → codex exec review --base <ref> --json
-              → parse verdict from streamed findings
-              → block on [P1] (blocking) or [P2] when concerns_blocks=true
-              → write .rea/last-review.json + audit record
-              → exit 0 / 1 (HALT) / 2 (blocked)
+              git push
+                → .husky/pre-push → rea hook push-gate
+                → codex exec review --base <ref> --json
+                → parse verdict from streamed findings
+                → block on [P1] (blocking) or [P2] when concerns_blocks=true
+                → write .rea/last-review.json + audit record
+                → exit 0 / 1 (HALT) / 2 (blocked)
 
   Codex is run fresh on every push. No cache. No SHA matching. No receipt
   consultation. When the gate blocks, Claude reads stderr + the
