@@ -34,6 +34,7 @@ import {
   huskyHookContent,
   inspectPrePushState,
   installPrePushFallback,
+  isHusky9Stub,
   isLegacyReaManagedFallback,
   isLegacyReaManagedHuskyGate,
   isReaManagedFallback,
@@ -42,6 +43,7 @@ import {
   LEGACY_HUSKY_GATE_BODY_MARKER_V1,
   LEGACY_HUSKY_GATE_MARKER_V1,
   referencesReviewGate,
+  resolveHusky9StubTarget,
 } from './pre-push.js';
 
 const execFileAsync = promisify(execFile);
@@ -353,6 +355,181 @@ describe('classifyExistingHook', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Husky 9 stub follow (false-positive fix — see helixir migration report)
+// ---------------------------------------------------------------------------
+
+describe('isHusky9Stub — husky 9 auto-generated stub detection', () => {
+  it('accepts the canonical husky 9 stub with `${0%/*}/h`', () => {
+    const stub = '#!/usr/bin/env sh\n. "${0%/*}/h"\n';
+    expect(isHusky9Stub(stub)).toBe(true);
+  });
+
+  it('accepts the alternate `$(dirname -- "$0")/h` shape', () => {
+    const stub = '#!/usr/bin/env sh\n. "$(dirname -- "$0")/h"\n';
+    expect(isHusky9Stub(stub)).toBe(true);
+  });
+
+  it('accepts the stub with a trailing comment block', () => {
+    const stub =
+      '#!/usr/bin/env sh\n# husky 9 stub — do not edit\n. "${0%/*}/h"\n# fires .husky/<hookname>\n';
+    expect(isHusky9Stub(stub)).toBe(true);
+  });
+
+  it('rejects a husky 9 stub with extra non-comment lines', () => {
+    const stub = '#!/usr/bin/env sh\n. "${0%/*}/h"\necho "after"\n';
+    expect(isHusky9Stub(stub)).toBe(false);
+  });
+
+  it('rejects a hook that sources something other than `h`', () => {
+    expect(isHusky9Stub('#!/usr/bin/env sh\n. "${0%/*}/init.sh"\n')).toBe(false);
+  });
+
+  it('rejects a hook whose source argument has no `$0` self-reference', () => {
+    expect(isHusky9Stub('#!/usr/bin/env sh\n. /usr/local/lib/h\n')).toBe(false);
+  });
+
+  it('rejects the rea husky body (multi-line, references `rea hook push-gate`)', () => {
+    expect(isHusky9Stub(huskyHookContent())).toBe(false);
+  });
+
+  it('rejects a foreign multi-command hook', () => {
+    expect(isHusky9Stub('#!/bin/sh\npnpm lint\npnpm test\n')).toBe(false);
+  });
+
+  it('rejects an empty file', () => {
+    expect(isHusky9Stub('')).toBe(false);
+  });
+});
+
+describe('resolveHusky9StubTarget — derive parent hook path', () => {
+  it('walks `.husky/_/pre-push` to `.husky/pre-push`', () => {
+    expect(resolveHusky9StubTarget('/repo/.husky/_/pre-push')).toBe('/repo/.husky/pre-push');
+  });
+
+  it('walks any one-level husky-style stub directory', () => {
+    expect(resolveHusky9StubTarget('/repo/hooks/_/commit-msg')).toBe('/repo/hooks/commit-msg');
+  });
+
+  it('returns null at the filesystem root', () => {
+    expect(resolveHusky9StubTarget('/pre-push')).toBe(null);
+  });
+});
+
+describe('classifyExistingHook — follows husky 9 stubs to canonical body', () => {
+  let repo: string;
+
+  beforeEach(async () => {
+    repo = await makeRepo();
+  });
+
+  afterEach(async () => {
+    await fs.rm(repo, { recursive: true, force: true });
+  });
+
+  it('returns rea-managed-husky when the active stub points at a rea-managed parent', async () => {
+    // Reproduces the helixir false-positive: git fires `.husky/_/pre-push`
+    // (auto-generated) which sources `.husky/_/h` which exec's the canonical
+    // `.husky/pre-push` (rea-managed). Doctor should follow the chain.
+    const stubPath = path.join(repo, '.husky/_/pre-push');
+    const realPath = path.join(repo, '.husky/pre-push');
+    await writeHook(stubPath, '#!/usr/bin/env sh\n. "${0%/*}/h"\n');
+    await writeHook(realPath, huskyHookContent());
+
+    const res = await classifyExistingHook(stubPath);
+    expect(res.kind).toBe('rea-managed-husky');
+  });
+
+  it('returns gate-delegating when the parent is a custom hook that invokes the gate', async () => {
+    const stubPath = path.join(repo, '.husky/_/pre-push');
+    const realPath = path.join(repo, '.husky/pre-push');
+    await writeHook(stubPath, '#!/usr/bin/env sh\n. "${0%/*}/h"\n');
+    await writeHook(realPath, '#!/bin/sh\necho custom\nexec rea hook push-gate "$@"\n');
+
+    const res = await classifyExistingHook(stubPath);
+    expect(res.kind).toBe('gate-delegating');
+  });
+
+  it('returns absent when the stub points at a missing parent', async () => {
+    const stubPath = path.join(repo, '.husky/_/pre-push');
+    await writeHook(stubPath, '#!/usr/bin/env sh\n. "${0%/*}/h"\n');
+    const res = await classifyExistingHook(stubPath);
+    expect(res.kind).toBe('absent');
+  });
+
+  it('returns foreign when the stub points at a foreign parent', async () => {
+    const stubPath = path.join(repo, '.husky/_/pre-push');
+    const realPath = path.join(repo, '.husky/pre-push');
+    await writeHook(stubPath, '#!/usr/bin/env sh\n. "${0%/*}/h"\n');
+    await writeHook(realPath, '#!/bin/sh\npnpm lint\n');
+    const res = await classifyExistingHook(stubPath);
+    expect(res.kind).toBe('foreign');
+  });
+
+  it('does not recurse stubs of stubs (one level of follow only)', async () => {
+    // Two stubs in a chain — the outer stub follows once, then the second
+    // stub is classified WITHOUT further follow, so it returns foreign.
+    const outer = path.join(repo, '.husky/_/_/pre-push');
+    const inner = path.join(repo, '.husky/_/pre-push');
+    await writeHook(outer, '#!/usr/bin/env sh\n. "${0%/*}/h"\n');
+    await writeHook(inner, '#!/usr/bin/env sh\n. "${0%/*}/h"\n');
+    const res = await classifyExistingHook(outer);
+    // Inner stub, when classified without follow, is foreign (no marker, not
+    // rea-managed). This proves we cap the chain at one hop and don't loop.
+    expect(res.kind).toBe('foreign');
+  });
+
+  it('returns rea-managed-husky directly (not via stub follow) when called on the canonical body', async () => {
+    // Sanity: non-stub paths take the normal classifier path; the stub follow
+    // is skipped because `isHusky9Stub` returns false for the rea body.
+    const realPath = path.join(repo, '.husky/pre-push');
+    await writeHook(realPath, huskyHookContent());
+    const res = await classifyExistingHook(realPath);
+    expect(res.kind).toBe('rea-managed-husky');
+  });
+});
+
+describe('inspectPrePushState — husky 9 governance via stub indirection', () => {
+  let repo: string;
+
+  beforeEach(async () => {
+    repo = await makeRepo();
+  });
+
+  afterEach(async () => {
+    await fs.rm(repo, { recursive: true, force: true });
+  });
+
+  it('reports ok=true when core.hooksPath=.husky/_ and the stub delegates to a rea-managed parent', async () => {
+    // The exact helixir failure: doctor previously reported
+    // ok=false because it classified `.husky/_/pre-push` (the stub) as
+    // foreign. With the stub-follow patch, doctor sees through the
+    // indirection and recognizes the rea-managed `.husky/pre-push`.
+    await setHooksPath(repo, '.husky/_');
+    const stubPath = path.join(repo, '.husky/_/pre-push');
+    const realPath = path.join(repo, '.husky/pre-push');
+    await writeHook(stubPath, '#!/usr/bin/env sh\n. "${0%/*}/h"\n');
+    await writeHook(realPath, huskyHookContent());
+
+    const state = await inspectPrePushState(repo);
+    expect(state.ok).toBe(true);
+    expect(state.activeForeign).toBe(false);
+    expect(state.activePath).toBe(stubPath);
+  });
+
+  it('reports activeForeign=true when the stub delegates to a foreign parent', async () => {
+    await setHooksPath(repo, '.husky/_');
+    const stubPath = path.join(repo, '.husky/_/pre-push');
+    const realPath = path.join(repo, '.husky/pre-push');
+    await writeHook(stubPath, '#!/usr/bin/env sh\n. "${0%/*}/h"\n');
+    await writeHook(realPath, '#!/bin/sh\npnpm lint\n');
+
+    const state = await inspectPrePushState(repo);
+    expect(state.ok).toBe(false);
+    expect(state.activeForeign).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // classifyPrePushInstall
 // ---------------------------------------------------------------------------
 
@@ -423,6 +600,26 @@ describe('classifyPrePushInstall — decision tree', () => {
       action: 'skip',
       reason: 'active-pre-push-present',
       hookPath: hp,
+    });
+  });
+
+  it('skip + active-pre-push-present on husky 9 layout (stub delegates to rea-managed parent)', async () => {
+    // Pin the install-side behavior change: husky 9 layouts where
+    // core.hooksPath=.husky/_ used to classify the active hook (the stub)
+    // as foreign and warn `skip + foreign-pre-push`. With stub-follow,
+    // the install path now sees the parent's `rea-managed-husky`
+    // classification and correctly skips with `active-pre-push-present`
+    // — matching the canonical husky-gate path.
+    await setHooksPath(repo, '.husky/_');
+    const stubPath = path.join(repo, '.husky', '_', 'pre-push');
+    const realPath = path.join(repo, '.husky', 'pre-push');
+    await writeHook(stubPath, '#!/usr/bin/env sh\n. "${0%/*}/h"\n');
+    await writeHook(realPath, huskyHookContent());
+    const d = await classifyPrePushInstall(repo);
+    expect(d).toEqual({
+      action: 'skip',
+      reason: 'active-pre-push-present',
+      hookPath: stubPath,
     });
   });
 });

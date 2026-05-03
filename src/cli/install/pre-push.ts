@@ -386,6 +386,70 @@ export function referencesReviewGate(content: string): boolean {
   return false;
 }
 
+/**
+ * True when `content` is a husky 9 auto-generated stub that delegates to
+ * the canonical hook body via `.husky/_/h`.
+ *
+ * Husky 9 layout when `core.hooksPath=.husky/_`:
+ *   .husky/<hookname>      — user/rea-authored body (committed, source of truth)
+ *   .husky/_/<hookname>    — auto-generated stub git actually fires
+ *   .husky/_/h             — runner that exec's `.husky/<hookname>`
+ *
+ * The stub body is a single non-comment line, e.g.
+ *   . "${0%/*}/h"
+ *   . "$(dirname -- "$0")/h"
+ *
+ * Without this detection `rea doctor` would classify `.husky/_/pre-push`
+ * as foreign (no rea marker, no `rea hook push-gate` reference) even
+ * though the hook git fires sources the canonical body that DOES carry
+ * governance. The stub is the husky 9 indirection contract — treating it
+ * as the active hook and following the source chain to the parent hook
+ * resolves the false positive.
+ *
+ * Detection is conservative: any non-comment, non-blank, non-source line
+ * disqualifies. We anchor on `$0` in the dirname expansion to confirm the
+ * stub references self, and on the trailing `/h` segment to confirm it
+ * sources the husky 9 runner. A user-authored shell script that happens
+ * to dot-source a file does NOT match.
+ */
+export function isHusky9Stub(content: string): boolean {
+  const lines = content.split(/\r?\n/);
+  // Match a `.` (source) command whose argument is the husky 9 runner `h`
+  // resolved relative to the stub's own location. The two shapes husky 9
+  // generates:
+  //   . "${0%/*}/h"                  — POSIX param expansion (current default)
+  //   . "$(dirname -- "$0")/h"       — older variant still in the wild
+  // We do NOT accept arbitrary `. <path>/h` because that would false-match
+  // a user-authored hook that happens to source a file named `h`.
+  const sourceLine =
+    /^\.\s+(?:"\$\{0%\/\*\}\/h"|"\$\(dirname[^)]*\$0[^)]*\)\/h")\s*$/;
+  let sawSource = false;
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (line === '') continue;
+    if (line.startsWith('#')) continue; // shebang, comment
+    if (sawSource) return false; // any line after the source line disqualifies
+    if (sourceLine.test(line)) {
+      sawSource = true;
+      continue;
+    }
+    return false;
+  }
+  return sawSource;
+}
+
+/**
+ * Resolve a husky 9 stub at `<dir>/<hookname>` to the canonical hook
+ * body at `<parent-of-dir>/<hookname>`. Returns null when the stub
+ * lives at the filesystem root (no parent to walk to).
+ */
+export function resolveHusky9StubTarget(stubPath: string): string | null {
+  const dir = path.dirname(stubPath);
+  const parent = path.dirname(dir);
+  if (parent === dir) return null;
+  return path.join(parent, path.basename(stubPath));
+}
+
 // ---------------------------------------------------------------------------
 // Hook resolution
 // ---------------------------------------------------------------------------
@@ -478,7 +542,9 @@ export type ClassifyExistingHook =
 
 export async function classifyExistingHook(
   hookPath: string,
+  options: { followHusky9Stub?: boolean } = {},
 ): Promise<ClassifyExistingHook> {
+  const followStub = options.followHusky9Stub ?? true;
   let stat: fs.Stats;
   try {
     stat = await fsPromises.lstat(hookPath);
@@ -504,6 +570,18 @@ export async function classifyExistingHook(
   if (isReaManagedFallback(content)) return { kind: 'rea-managed' };
   if (isLegacyReaManagedFallback(content)) return { kind: 'rea-managed-legacy-v1' };
   if (referencesReviewGate(content)) return { kind: 'gate-delegating' };
+
+  // Husky 9 indirection: when git fires `.husky/_/<hookname>` (auto-generated
+  // stub) the body just sources `.husky/_/h` which exec's the canonical
+  // `.husky/<hookname>`. Without this branch, doctor false-positives the stub
+  // as foreign even though governance is intact via the source chain.
+  // One level of follow only — never recurse stubs-of-stubs.
+  if (followStub && isHusky9Stub(content)) {
+    const target = resolveHusky9StubTarget(hookPath);
+    if (target !== null) {
+      return classifyExistingHook(target, { followHusky9Stub: false });
+    }
+  }
   return { kind: 'foreign', reason: 'no-marker' };
 }
 
