@@ -133,6 +133,36 @@ _rea_load_protected_patterns() {
   _REA_PROTECTED_PATTERNS_LOADED=1
 }
 
+# Test whether a project-relative path is in the documented husky
+# extension surface (`.husky/commit-msg.d/*`, `.husky/pre-push.d/*`).
+# Returns 0 on match, 1 on no match. Case-insensitive.
+#
+# 0.16.4 helix-018 Option B: settings-protection.sh §5b has carved
+# this surface out of write-tier protection since 0.13.2 — consumers
+# write extension fragments here freely. Pre-0.16.4 the BASH-tier
+# gates (`protected-paths-bash-gate.sh`, `blocked-paths-bash-gate.sh`)
+# had no parity carve-out, so a `cat <<EOF > .husky/pre-push.d/X`
+# redirect was refused by the bash-gate even though the equivalent
+# Write-tool call would succeed. This helper bakes the carve-out
+# into the shared lib so every caller inherits it uniformly.
+rea_path_is_extension_surface() {
+  local p_lc
+  p_lc=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+  case "$p_lc" in
+    .husky/commit-msg.d/*|.husky/pre-push.d/*|.husky/pre-commit.d/*)
+      # Refuse the bare directory itself — only fragments INSIDE
+      # the surface count. `.husky/pre-push.d/` (trailing slash, no
+      # fragment) and `.husky/pre-push.d` (the dir node) both fall
+      # through to the protection check via the parent prefix.
+      case "$p_lc" in
+        .husky/commit-msg.d/|.husky/pre-push.d/|.husky/pre-commit.d/) return 1 ;;
+      esac
+      return 0
+      ;;
+  esac
+  return 1
+}
+
 # Test whether a project-relative path matches any protected pattern
 # (after applying `protected_paths_relax`). Returns 0 on match, 1 on
 # no match.
@@ -145,8 +175,18 @@ _rea_load_protected_patterns() {
 # §6 has had a CI matcher since 0.10.x; this helper was missing it.
 # We lowercase BOTH sides so the comparison is symmetric — callers can
 # pass either case.
+#
+# 0.16.4 helix-018 Option B: paths inside the documented husky
+# extension surface (`.husky/{commit-msg,pre-push,pre-commit}.d/*`)
+# return 1 (not protected) BEFORE the prefix-pattern check so they
+# don't get caught by `.husky/`'s prefix block. This mirrors the
+# §5b allow-list that has been in settings-protection.sh since 0.13.2.
 rea_path_is_protected() {
   _rea_load_protected_patterns
+  # Extension-surface allow-list — short-circuit before pattern match.
+  if rea_path_is_extension_surface "$1"; then
+    return 1
+  fi
   local p_lc
   p_lc=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
   local pattern pattern_lc
