@@ -228,7 +228,7 @@ function checkSettingsJson(baseDir: string): CheckResult {
   const settingsPath = path.join(baseDir, '.claude', 'settings.json');
   if (!fs.existsSync(settingsPath)) {
     return {
-      label: 'settings.json matchers cover Bash + Write|Edit',
+      label: 'settings.json matchers cover Bash + Write|Edit|MultiEdit',
       status: 'fail',
       detail: `missing: ${settingsPath}`,
     };
@@ -242,21 +242,28 @@ function checkSettingsJson(baseDir: string): CheckResult {
     const matchers = new Set(pre.map((g) => g.matcher).filter((m): m is string => typeof m === 'string'));
     const needs: string[] = [];
     if (!matchers.has('Bash')) needs.push('Bash');
-    if (!matchers.has('Write|Edit')) needs.push('Write|Edit');
+    // 0.15.0: matcher was widened from `Write|Edit` to `Write|Edit|MultiEdit`
+    // in 0.14.0; doctor's check missed the rename. Accept either form so
+    // pre-0.14.0 installs that haven't run `rea upgrade` still report
+    // accurately, but the canonical produced by `defaultDesiredHooks()` is
+    // the wider matcher.
+    if (!matchers.has('Write|Edit|MultiEdit') && !matchers.has('Write|Edit')) {
+      needs.push('Write|Edit|MultiEdit');
+    }
     if (needs.length === 0) {
       return {
-        label: 'settings.json matchers cover Bash + Write|Edit',
+        label: 'settings.json matchers cover Bash + Write|Edit|MultiEdit',
         status: 'pass',
       };
     }
     return {
-      label: 'settings.json matchers cover Bash + Write|Edit',
+      label: 'settings.json matchers cover Bash + Write|Edit|MultiEdit',
       status: 'fail',
       detail: `missing PreToolUse matchers: ${needs.join(', ')}`,
     };
   } catch (e) {
     return {
-      label: 'settings.json matchers cover Bash + Write|Edit',
+      label: 'settings.json matchers cover Bash + Write|Edit|MultiEdit',
       status: 'fail',
       detail: e instanceof Error ? e.message : String(e),
     };
