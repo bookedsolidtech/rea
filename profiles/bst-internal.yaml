@@ -28,3 +28,11 @@ context_protection:
     - pnpm run test
     - pnpm run lint
   max_bash_output_lines: 100
+# 0.18.1+ helixir #9: enable audit log rotation by default for
+# bst-internal. Long sessions accumulate 100s of push_gate.reviewed
+# entries; without rotation the audit file grows unbounded. The empty
+# `rotation: {}` block opts in to the documented defaults — 50 MiB
+# OR 30 days, whichever arrives first. Rotation marker preserves the
+# hash chain across the boundary.
+audit:
+  rotation: {}

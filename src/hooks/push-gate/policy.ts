@@ -62,6 +62,12 @@ export interface ResolvedReviewPolicy {
    * codex's own default (currently `medium`).
    */
   codex_reasoning_effort: 'low' | 'medium' | 'high' | undefined;
+  /**
+   * Verdict cache TTL in milliseconds (0.18.1+). `0` disables caching;
+   * positive values enable the same-SHA short-circuit. Default 86_400_000
+   * (24 hours) when policy.review.cache_ttl_ms is unset.
+   */
+  cache_ttl_ms: number;
   /** `true` when `.rea/policy.yaml` was absent; defaults apply. */
   policyMissing: boolean;
 }
@@ -104,6 +110,17 @@ export const PUSH_GATE_DEFAULT_CODEX_MODEL = 'gpt-5.4';
  * `.rea/policy.yaml` for cost-bounded environments.
  */
 export const PUSH_GATE_DEFAULT_CODEX_REASONING_EFFORT: 'low' | 'medium' | 'high' = 'high';
+/**
+ * Default verdict-cache TTL in milliseconds (0.18.1+). 24 hours: long
+ * enough to amortize multi-push iteration of the same SHA (push, push
+ * --force-with-lease after a quick fixup, push again post-rebase),
+ * short enough that a stale cache from yesterday doesn't suppress
+ * review of code whose context (env, dependencies, .rea/policy.yaml)
+ * has changed. Operators can shorten to a few minutes for tighter
+ * loops or extend via `policy.review.cache_ttl_ms`. `0` disables
+ * caching — every push re-invokes codex (pre-0.18.1 behavior).
+ */
+export const PUSH_GATE_DEFAULT_CACHE_TTL_MS = 24 * 60 * 60 * 1_000;
 
 /**
  * Resolve the push-gate policy for `baseDir`. Never throws — a malformed
@@ -126,6 +143,7 @@ export async function resolvePushGatePolicy(baseDir: string): Promise<ResolvedRe
       auto_narrow_threshold: PUSH_GATE_DEFAULT_AUTO_NARROW_THRESHOLD,
       codex_model: PUSH_GATE_DEFAULT_CODEX_MODEL,
       codex_reasoning_effort: PUSH_GATE_DEFAULT_CODEX_REASONING_EFFORT,
+      cache_ttl_ms: PUSH_GATE_DEFAULT_CACHE_TTL_MS,
       policyMissing: true,
     };
   }
@@ -141,6 +159,7 @@ export async function resolvePushGatePolicy(baseDir: string): Promise<ResolvedRe
     codex_model: review.codex_model ?? PUSH_GATE_DEFAULT_CODEX_MODEL,
     codex_reasoning_effort:
       review.codex_reasoning_effort ?? PUSH_GATE_DEFAULT_CODEX_REASONING_EFFORT,
+    cache_ttl_ms: review.cache_ttl_ms ?? PUSH_GATE_DEFAULT_CACHE_TTL_MS,
     policyMissing: false,
   };
 }

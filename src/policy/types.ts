@@ -162,6 +162,17 @@ export interface ReviewPolicy {
    * throughput.
    */
   codex_reasoning_effort?: 'low' | 'medium' | 'high';
+  /**
+   * Verdict cache TTL in milliseconds (0.18.1+ helixir #1, #4, #7, #8).
+   * Default 86_400_000 (24 hours). When a push of `head_sha` produces a
+   * non-blocking verdict, the result is written to
+   * `.rea/last-review.cache.json`. Subsequent pushes of the same SHA
+   * within the TTL skip the codex invocation and reuse the cached
+   * verdict. Set to `0` to disable caching (every push re-invokes
+   * codex — pre-0.18.1 behavior). Verdict flips on the same SHA emit
+   * a `rea.push_gate.verdict_flip` audit event and overwrite the cache.
+   */
+  cache_ttl_ms?: number;
 }
 
 /**
