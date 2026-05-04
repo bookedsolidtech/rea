@@ -23,9 +23,33 @@
  * `failed` token specifically.
  */
 import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import path from 'node:path';
+import fs from 'node:fs';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const repoRoot = path.resolve(__dirname, '..');
+
+// Resolve vitest's real entry point (not the .bin/ shell wrapper which
+// some CI shells fail to resolve as 'vitest' on PATH).
+const candidates = [
+  path.join(repoRoot, 'node_modules', 'vitest', 'vitest.mjs'),
+  path.join(repoRoot, 'node_modules', '.pnpm', 'node_modules', 'vitest', 'vitest.mjs'),
+];
+let vitestEntry = null;
+for (const c of candidates) {
+  if (fs.existsSync(c)) {
+    vitestEntry = c;
+    break;
+  }
+}
+// Fallback: PATH lookup of `vitest`.
+const cmd = vitestEntry ? process.execPath : 'vitest';
+const baseArgs = vitestEntry ? [vitestEntry, 'run'] : ['run'];
 
 const args = process.argv.slice(2);
-const result = spawnSync('vitest', ['run', ...args], {
+const result = spawnSync(cmd, [...baseArgs, ...args], {
+  cwd: repoRoot,
   stdio: ['inherit', 'pipe', 'pipe'],
   encoding: 'utf8',
 });
