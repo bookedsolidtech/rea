@@ -195,10 +195,16 @@ function toReviewFinding(input: unknown): ReviewFinding | undefined {
     'performance',
   ];
   const validSeverities: ReadonlyArray<ReviewFinding['severity']> = ['high', 'medium', 'low'];
-  if (typeof o['category'] !== 'string' || !validCategories.includes(o['category'] as ReviewFinding['category'])) {
+  if (
+    typeof o['category'] !== 'string' ||
+    !validCategories.includes(o['category'] as ReviewFinding['category'])
+  ) {
     return undefined;
   }
-  if (typeof o['severity'] !== 'string' || !validSeverities.includes(o['severity'] as ReviewFinding['severity'])) {
+  if (
+    typeof o['severity'] !== 'string' ||
+    !validSeverities.includes(o['severity'] as ReviewFinding['severity'])
+  ) {
     return undefined;
   }
   if (typeof o['file'] !== 'string') return undefined;
@@ -270,14 +276,9 @@ export class ClaudeSelfReviewer implements AdversarialReviewer {
 
     const diffBytes = Buffer.byteLength(req.diff, 'utf8');
     const truncated = diffBytes > DIFF_TRUNCATE_BYTES;
-    const effectiveDiff = truncated
-      ? req.diff.slice(0, DIFF_TRUNCATE_BYTES)
-      : req.diff;
+    const effectiveDiff = truncated ? req.diff.slice(0, DIFF_TRUNCATE_BYTES) : req.diff;
 
-    const userMessage = buildUserMessage(
-      { ...req, diff: effectiveDiff },
-      truncated,
-    );
+    const userMessage = buildUserMessage({ ...req, diff: effectiveDiff }, truncated);
 
     // G11.5 — measure the SDK call. The telemetry write is best-effort and
     // fire-and-forget; it MUST NOT block or fail the review. We call
@@ -301,7 +302,12 @@ export class ClaudeSelfReviewer implements AdversarialReviewer {
       // Rate-limits, 5xx, network errors all land here. Surface the raw
       // message so operators can act on it; the caller decides whether
       // to retry or abort.
-      const message = err instanceof APIError ? `API ${err.status ?? '?'}: ${err.message}` : err instanceof Error ? err.message : String(err);
+      const message =
+        err instanceof APIError
+          ? `API ${err.status ?? '?'}: ${err.message}`
+          : err instanceof Error
+            ? err.message
+            : String(err);
       this.emitTelemetry({
         invocation_type: 'adversarial-review',
         input_text: userMessage,

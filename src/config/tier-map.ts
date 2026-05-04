@@ -330,4 +330,3 @@ export function reaCommandTier(command: string): Tier | null {
   if (subcommandTier === Tier.Destructive) return Tier.Destructive;
   return null;
 }
-

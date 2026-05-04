@@ -46,8 +46,7 @@ export type ExecFileFn = (
   options: { timeout: number },
 ) => Promise<{ stdout: string; stderr: string }>;
 
-const defaultExec: ExecFileFn = (file, args, options) =>
-  execFileAsync(file, [...args], options);
+const defaultExec: ExecFileFn = (file, args, options) => execFileAsync(file, [...args], options);
 
 export class CodexReviewer implements AdversarialReviewer {
   readonly name = 'codex';

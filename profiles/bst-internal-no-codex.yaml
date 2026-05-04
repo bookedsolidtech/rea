@@ -31,7 +31,7 @@ blocked_paths:
   - .github/workflows/release.yml
   - SECURITY.md
   - THREAT_MODEL.md
-notification_channel: ""
+notification_channel: ''
 # G9: Booked-internal consumers retain the stricter 0.2.x posture — a single
 # literal injection match at write/destructive tier denies (does not merely
 # warn). External profiles inherit the schema default `false`.

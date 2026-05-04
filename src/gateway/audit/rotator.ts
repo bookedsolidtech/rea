@@ -300,10 +300,7 @@ export async function maybeRotate(
     if (!due) return { rotated: false };
     return await performRotation(auditFile, now);
   } catch (err) {
-    console.error(
-      '[rea] AUDIT ROTATION FAILED:',
-      err instanceof Error ? err.message : String(err),
-    );
+    console.error('[rea] AUDIT ROTATION FAILED:', err instanceof Error ? err.message : String(err));
     return { rotated: false };
   }
 }

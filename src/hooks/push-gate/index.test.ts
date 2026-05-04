@@ -842,7 +842,10 @@ describe('runPushGate — auto-narrow on large divergence (J / 0.13.0)', () => {
           revListCount: () => 80,
           diffNames: () => ['src/changed.ts'],
         }),
-        appendAudit: async (_baseDir, rec: { tool_name?: string; metadata?: Record<string, unknown> }) => {
+        appendAudit: async (
+          _baseDir,
+          rec: { tool_name?: string; metadata?: Record<string, unknown> },
+        ) => {
           if (rec.tool_name === 'rea.push_gate.reviewed') {
             auditMeta = rec.metadata ?? null;
           }
@@ -881,7 +884,10 @@ describe('runPushGate — auto-narrow on large divergence (J / 0.13.0)', () => {
           revListCount: () => 80, // 80 commits ahead, but still no auto-narrow
           diffNames: () => ['src/x.ts'],
         }),
-        appendAudit: async (_baseDir, rec: { tool_name?: string; metadata?: Record<string, unknown> }) => {
+        appendAudit: async (
+          _baseDir,
+          rec: { tool_name?: string; metadata?: Record<string, unknown> },
+        ) => {
           if (rec.tool_name === 'rea.push_gate.reviewed') auditMeta = rec.metadata ?? null;
           return {} as never;
         },
@@ -933,7 +939,10 @@ describe('runPushGate — auto-narrow on large divergence (J / 0.13.0)', () => {
           revListCount: () => 5, // way under threshold
           diffNames: () => ['src/x.ts'],
         }),
-        appendAudit: async (_baseDir, rec: { tool_name?: string; metadata?: Record<string, unknown> }) => {
+        appendAudit: async (
+          _baseDir,
+          rec: { tool_name?: string; metadata?: Record<string, unknown> },
+        ) => {
           if (rec.tool_name === 'rea.push_gate.reviewed') auditMeta = rec.metadata ?? null;
           return {} as never;
         },

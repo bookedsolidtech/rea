@@ -94,9 +94,30 @@ describe('__rea__health meta-tool — pure snapshot builder', () => {
 
   it('rolls up counts across a mixed fleet', () => {
     const ds: DownstreamHealth[] = [
-      { name: 'ok', enabled: true, connected: true, healthy: true, last_error: null, tools_count: 11 },
-      { name: 'flapping', enabled: true, connected: true, healthy: false, last_error: 'rc=1', tools_count: null },
-      { name: 'dead', enabled: true, connected: false, healthy: false, last_error: 'boom', tools_count: null },
+      {
+        name: 'ok',
+        enabled: true,
+        connected: true,
+        healthy: true,
+        last_error: null,
+        tools_count: 11,
+      },
+      {
+        name: 'flapping',
+        enabled: true,
+        connected: true,
+        healthy: false,
+        last_error: 'rc=1',
+        tools_count: null,
+      },
+      {
+        name: 'dead',
+        enabled: true,
+        connected: false,
+        healthy: false,
+        last_error: 'boom',
+        tools_count: null,
+      },
     ];
     const snap = buildHealthSnapshot({
       gatewayVersion: '0.5.1',
@@ -197,7 +218,12 @@ describe('__rea__health through the gateway', () => {
     expect(result.isError).toBeFalsy();
     const snap = JSON.parse(result.content[0]!.text) as {
       summary: { registered: number; healthy: number; connected: number };
-      downstreams: Array<{ name: string; healthy: boolean; connected: boolean; last_error: string | null }>;
+      downstreams: Array<{
+        name: string;
+        healthy: boolean;
+        connected: boolean;
+        last_error: string | null;
+      }>;
       gateway: { halt: boolean };
       policy: { profile: string };
     };

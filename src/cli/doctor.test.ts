@@ -18,10 +18,7 @@ import {
   collectChecks,
   type CheckResult,
 } from './doctor.js';
-import {
-  FINGERPRINT_STORE_VERSION,
-  saveFingerprintStore,
-} from '../registry/fingerprints-store.js';
+import { FINGERPRINT_STORE_VERSION, saveFingerprintStore } from '../registry/fingerprints-store.js';
 import { fingerprintServer } from '../registry/fingerprint.js';
 import type { RegistryServer } from '../registry/types.js';
 import type { CodexProbeState } from '../gateway/observability/codex-probe.js';
@@ -37,12 +34,8 @@ interface ScratchRepo {
  * so every non-Codex check can report `pass`. The caller supplies the value
  * of `review.codex_required` (or undefined to omit the field).
  */
-async function makeScratchRepo(opts: {
-  codexRequired: boolean | undefined;
-}): Promise<ScratchRepo> {
-  const dir = await fs.realpath(
-    await fs.mkdtemp(path.join(os.tmpdir(), 'rea-doctor-test-')),
-  );
+async function makeScratchRepo(opts: { codexRequired: boolean | undefined }): Promise<ScratchRepo> {
+  const dir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-doctor-test-')));
 
   await fs.mkdir(path.join(dir, '.rea'), { recursive: true });
   const policyLines = [
@@ -62,10 +55,7 @@ async function makeScratchRepo(opts: {
     policyLines.push('review:', `  codex_required: ${opts.codexRequired}`);
   }
   policyLines.push('');
-  await fs.writeFile(
-    path.join(dir, '.rea', 'policy.yaml'),
-    policyLines.join('\n'),
-  );
+  await fs.writeFile(path.join(dir, '.rea', 'policy.yaml'), policyLines.join('\n'));
   await fs.writeFile(
     path.join(dir, '.rea', 'registry.yaml'),
     ['version: "1"', 'servers: []', ''].join('\n'),
@@ -79,10 +69,7 @@ async function makeScratchRepo(opts: {
   return { dir };
 }
 
-function findCheck(
-  checks: CheckResult[],
-  labelFragment: string,
-): CheckResult | undefined {
+function findCheck(checks: CheckResult[], labelFragment: string): CheckResult | undefined {
   return checks.find((c) => c.label.includes(labelFragment));
 }
 
@@ -90,9 +77,7 @@ describe('rea doctor — collectChecks (G11.4 codex_required)', () => {
   const cleanup: string[] = [];
 
   afterEach(async () => {
-    await Promise.all(
-      cleanup.splice(0).map((d) => fs.rm(d, { recursive: true, force: true })),
-    );
+    await Promise.all(cleanup.splice(0).map((d) => fs.rm(d, { recursive: true, force: true })));
   });
 
   it('codex_required=false: Codex-specific checks are replaced by a single info line', async () => {
@@ -108,9 +93,7 @@ describe('rea doctor — collectChecks (G11.4 codex_required)', () => {
     // Exactly one Codex info line. The 0.13.0 extension-fragments probe
     // (H) also emits an info line; filter the codex-only one for this
     // assertion.
-    const codexInfoLines = checks.filter(
-      (c) => c.status === 'info' && c.label === 'codex',
-    );
+    const codexInfoLines = checks.filter((c) => c.status === 'info' && c.label === 'codex');
     expect(codexInfoLines).toHaveLength(1);
     expect(codexInfoLines[0]?.detail).toMatch(/codex_required/);
     expect(codexInfoLines[0]?.detail).toMatch(/disabled via policy/);
@@ -392,11 +375,9 @@ describe('rea doctor — collectChecks (G11.4 codex_required)', () => {
     const repo = await makeScratchRepo({ codexRequired: true });
     cleanup.push(repo.dir);
     const hookPath = path.join(repo.dir, '.git', 'hooks', 'pre-push');
-    await fs.writeFile(
-      hookPath,
-      '#!/bin/sh\nnpx --no-install commitlint --edit "$1"\nexit 0\n',
-      { mode: 0o755 },
-    );
+    await fs.writeFile(hookPath, '#!/bin/sh\nnpx --no-install commitlint --edit "$1"\nexit 0\n', {
+      mode: 0o755,
+    });
     const state: PrePushDoctorState = {
       ok: false,
       activeForeign: true,
@@ -513,15 +494,11 @@ describe('rea doctor — non-git escape hatch', () => {
   const cleanup: string[] = [];
 
   afterEach(async () => {
-    await Promise.all(
-      cleanup.splice(0).map((d) => fs.rm(d, { recursive: true, force: true })),
-    );
+    await Promise.all(cleanup.splice(0).map((d) => fs.rm(d, { recursive: true, force: true })));
   });
 
   async function makeNonGitScratch(): Promise<ScratchRepo> {
-    const dir = await fs.realpath(
-      await fs.mkdtemp(path.join(os.tmpdir(), 'rea-doctor-nongit-')),
-    );
+    const dir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-doctor-nongit-')));
     await fs.mkdir(path.join(dir, '.rea'), { recursive: true });
     await fs.writeFile(
       path.join(dir, '.rea', 'policy.yaml'),
@@ -661,11 +638,7 @@ describe('rea doctor — non-git escape hatch', () => {
     // covered above; this one locks down the relative-path branch.
     const repo = await makeNonGitScratch();
     cleanup.push(repo.dir);
-    await fs.writeFile(
-      path.join(repo.dir, '.git'),
-      'gitdir: ./pruned-does-not-exist\n',
-      'utf8',
-    );
+    await fs.writeFile(path.join(repo.dir, '.git'), 'gitdir: ./pruned-does-not-exist\n', 'utf8');
 
     const checks = collectChecks(repo.dir);
     expect(findCheck(checks, 'commit-msg hook installed')).toBeUndefined();
@@ -715,14 +688,10 @@ describe('rea doctor — checkFingerprintStore (G7)', () => {
   const cleanup: string[] = [];
 
   afterEach(async () => {
-    await Promise.all(
-      cleanup.splice(0).map((d) => fs.rm(d, { recursive: true, force: true })),
-    );
+    await Promise.all(cleanup.splice(0).map((d) => fs.rm(d, { recursive: true, force: true })));
   });
 
-  async function scratchWithRegistry(
-    servers: RegistryServer[],
-  ): Promise<ScratchRepo> {
+  async function scratchWithRegistry(servers: RegistryServer[]): Promise<ScratchRepo> {
     const repo = await makeScratchRepo({ codexRequired: false });
     const yaml = [
       'version: "1"',
@@ -786,10 +755,7 @@ describe('rea doctor — checkFingerprintStore (G7)', () => {
   it('fail when the fingerprint store is corrupt', async () => {
     const repo = await scratchWithRegistry([svr('mock')]);
     cleanup.push(repo.dir);
-    await fs.writeFile(
-      path.join(repo.dir, '.rea', 'fingerprints.json'),
-      'not { valid json',
-    );
+    await fs.writeFile(path.join(repo.dir, '.rea', 'fingerprints.json'), 'not { valid json');
     const r = await checkFingerprintStore(repo.dir);
     expect(r.status).toBe('fail');
   });
@@ -801,9 +767,7 @@ describe('rea doctor — checkCodexBinaryOnPath (Fix C / 0.12.0)', () => {
 
   afterEach(async () => {
     process.env.PATH = originalPath;
-    await Promise.all(
-      cleanup.splice(0).map((d) => fs.rm(d, { recursive: true, force: true })),
-    );
+    await Promise.all(cleanup.splice(0).map((d) => fs.rm(d, { recursive: true, force: true })));
   });
 
   it('passes when a `codex` shim is on PATH', async () => {
@@ -903,9 +867,7 @@ describe('rea doctor — checkCodexBinaryOnPath (Fix C / 0.12.0)', () => {
 describe('rea doctor — checkExtensionFragments (Fix H / 0.13.0)', () => {
   const cleanup: string[] = [];
   afterEach(async () => {
-    await Promise.all(
-      cleanup.splice(0).map((d) => fs.rm(d, { recursive: true, force: true })),
-    );
+    await Promise.all(cleanup.splice(0).map((d) => fs.rm(d, { recursive: true, force: true })));
   });
 
   it('info "none" when no .husky/{commit-msg,pre-push}.d/ exists', async () => {

@@ -150,11 +150,7 @@ interface WorkerErrorReply {
   ok: false;
   error: string;
 }
-type WorkerReply =
-  | WorkerTestReply
-  | WorkerReplaceReply
-  | WorkerMatchAllReply
-  | WorkerErrorReply;
+type WorkerReply = WorkerTestReply | WorkerReplaceReply | WorkerMatchAllReply | WorkerErrorReply;
 
 interface WorkerRequestBase {
   source: string;
@@ -277,10 +273,7 @@ export function wrapRegex(pattern: RegExp, opts?: MatchTimeoutOptions): SafeRege
   return {
     pattern,
     test(input: string): SafeRegexTestResult {
-      const { reply, timedOut } = runInWorkerSync(
-        { op: 'test', source, flags, input },
-        timeoutMs,
-      );
+      const { reply, timedOut } = runInWorkerSync({ op: 'test', source, flags, input }, timeoutMs);
       if (timedOut) {
         emitTimeout(input);
         return { matched: false, timedOut: true };
@@ -323,4 +316,3 @@ export function wrapRegex(pattern: RegExp, opts?: MatchTimeoutOptions): SafeRege
     },
   };
 }
-

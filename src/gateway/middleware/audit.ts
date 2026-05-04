@@ -4,12 +4,7 @@ import type { AuditRecord } from './audit-types.js';
 import type { Policy } from '../../policy/types.js';
 import { Tier, InvocationStatus } from '../../policy/types.js';
 import type { Middleware } from './chain.js';
-import {
-  computeHash,
-  fsyncFile,
-  readLastRecord,
-  withAuditLock,
-} from '../../audit/fs.js';
+import { computeHash, fsyncFile, readLastRecord, withAuditLock } from '../../audit/fs.js';
 import { maybeRotate } from '../audit/rotator.js';
 import type { MetricsRegistry } from '../observability/metrics.js';
 

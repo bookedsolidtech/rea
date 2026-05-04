@@ -11,9 +11,7 @@ import {
 
 /** Create a fresh scratch dir; caller is responsible for cleanup via the registry. */
 async function scratch(): Promise<string> {
-  return fs.realpath(
-    await fs.mkdtemp(path.join(os.tmpdir(), 'rea-telemetry-test-')),
-  );
+  return fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-telemetry-test-')));
 }
 
 async function readLines(filePath: string): Promise<string[]> {
@@ -25,9 +23,7 @@ describe('recordTelemetry', () => {
   const cleanup: string[] = [];
 
   afterEach(async () => {
-    await Promise.all(
-      cleanup.splice(0).map((d) => fs.rm(d, { recursive: true, force: true })),
-    );
+    await Promise.all(cleanup.splice(0).map((d) => fs.rm(d, { recursive: true, force: true })));
   });
 
   it('writes a single JSONL row with the expected shape', async () => {
@@ -206,9 +202,7 @@ describe('summarizeTelemetry', () => {
 
   afterEach(async () => {
     vi.useRealTimers();
-    await Promise.all(
-      cleanup.splice(0).map((d) => fs.rm(d, { recursive: true, force: true })),
-    );
+    await Promise.all(cleanup.splice(0).map((d) => fs.rm(d, { recursive: true, force: true })));
   });
 
   it('missing file → all-zero summary, no throw', async () => {

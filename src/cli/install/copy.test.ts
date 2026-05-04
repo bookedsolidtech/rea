@@ -68,12 +68,7 @@ describe('copyArtifacts', () => {
     // Plant a symlink at a hook destination pointing at a "sensitive" file we
     // control inside the sandbox. If the installer follows the link, the
     // target gets overwritten — that is the vulnerability we are testing.
-    const hookDst = path.join(
-      targetDir,
-      '.claude',
-      'hooks',
-      'dangerous-bash-interceptor.sh',
-    );
+    const hookDst = path.join(targetDir, '.claude', 'hooks', 'dangerous-bash-interceptor.sh');
     const sensitive = path.join(targetDir, 'sentinel.txt');
     const sentinelContents = 'DO NOT OVERWRITE\n';
     await fs.writeFile(sensitive, sentinelContents, 'utf8');

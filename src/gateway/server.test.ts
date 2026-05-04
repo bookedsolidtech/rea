@@ -70,10 +70,7 @@ describe('gateway server smoke', () => {
     const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
     await handle.start(serverSide);
 
-    const client = new Client(
-      { name: 'rea-test-client', version: '0.0.0' },
-      { capabilities: {} },
-    );
+    const client = new Client({ name: 'rea-test-client', version: '0.0.0' }, { capabilities: {} });
     await client.connect(clientSide);
 
     // The gateway ALWAYS exposes __rea__health so callers have a
@@ -94,10 +91,7 @@ describe('gateway server smoke', () => {
     const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
     await handle.start(serverSide);
 
-    const client = new Client(
-      { name: 'rea-test-client', version: '0.0.0' },
-      { capabilities: {} },
-    );
+    const client = new Client({ name: 'rea-test-client', version: '0.0.0' }, { capabilities: {} });
     await client.connect(clientSide);
 
     const result = (await client.callTool({
@@ -138,10 +132,7 @@ describe('gateway server smoke', () => {
     const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
     await handle.start(serverSide);
 
-    const client = new Client(
-      { name: 'rea-test-client', version: '0.0.0' },
-      { capabilities: {} },
-    );
+    const client = new Client({ name: 'rea-test-client', version: '0.0.0' }, { capabilities: {} });
     await client.connect(clientSide);
 
     const result = (await client.callTool({
@@ -172,10 +163,7 @@ describe('gateway server smoke', () => {
     const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
     await handle.start(serverSide);
 
-    const client = new Client(
-      { name: 'rea-test-client', version: '0.0.0' },
-      { capabilities: {} },
-    );
+    const client = new Client({ name: 'rea-test-client', version: '0.0.0' }, { capabilities: {} });
     await client.connect(clientSide);
 
     await client.callTool({ name: 'mock__list_items', arguments: {} });

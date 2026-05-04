@@ -225,9 +225,7 @@ servers:
 `;
       await fs.writeFile(path.join(baseDir, '.rea', 'registry.yaml'), yaml, 'utf8');
       const r = loadRegistry(baseDir);
-      expect(r.servers[0]?.env.BOT_TOKEN).toBe(
-        '${DISCORD_BOT_TOKEN_DEFINITELY_NOT_SET_ANYWHERE}',
-      );
+      expect(r.servers[0]?.env.BOT_TOKEN).toBe('${DISCORD_BOT_TOKEN_DEFINITELY_NOT_SET_ANYWHERE}');
     });
   });
 

@@ -455,7 +455,11 @@ export class LiveStatePublisher {
     if (typeof parsed.session_id !== 'string') return true;
     if (parsed.session_id === this.opts.sessionId) return true;
     // Foreign session_id. Use owner_pid to decide whether to yield or steal.
-    if (typeof parsed.owner_pid !== 'number' || !Number.isFinite(parsed.owner_pid) || parsed.owner_pid <= 0) {
+    if (
+      typeof parsed.owner_pid !== 'number' ||
+      !Number.isFinite(parsed.owner_pid) ||
+      parsed.owner_pid <= 0
+    ) {
       // Pre-0.9.0 file (no owner_pid recorded) or malformed value. We
       // cannot prove the writer is alive, and refusing to write forever
       // is the bigger hazard — claim the file. This is the same

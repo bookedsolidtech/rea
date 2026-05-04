@@ -67,7 +67,10 @@ const ReviewPolicySchema = z
     // (NUL, NL, CR, escape sequences) through the `-c model="<value>"`
     // injection point. Accepts published codex model names; rejects
     // re-quote / TOML-escape edge cases.
-    codex_model: z.string().regex(/^[a-zA-Z0-9._-]{1,64}$/).optional(),
+    codex_model: z
+      .string()
+      .regex(/^[a-zA-Z0-9._-]{1,64}$/)
+      .optional(),
     /**
      * Codex reasoning effort knob (0.13.4+). Pinned via
      * `-c model_reasoning_effort="<level>"` on every invocation. Only

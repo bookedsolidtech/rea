@@ -65,9 +65,7 @@ export function resolveContained(resolvedRoot: string, candidate: string): strin
     );
   }
   const absolute = path.resolve(resolvedRoot, candidate);
-  const rootWithSep = resolvedRoot.endsWith(path.sep)
-    ? resolvedRoot
-    : resolvedRoot + path.sep;
+  const rootWithSep = resolvedRoot.endsWith(path.sep) ? resolvedRoot : resolvedRoot + path.sep;
   if (absolute !== resolvedRoot && !absolute.startsWith(rootWithSep)) {
     throw new UnsafeInstallPathError(
       'escape',
@@ -89,9 +87,7 @@ export async function assertSafeDestination(
   dstPath: string,
 ): Promise<boolean> {
   const resolvedDst = path.resolve(dstPath);
-  const rootWithSep = resolvedRoot.endsWith(path.sep)
-    ? resolvedRoot
-    : resolvedRoot + path.sep;
+  const rootWithSep = resolvedRoot.endsWith(path.sep) ? resolvedRoot : resolvedRoot + path.sep;
   if (resolvedDst !== resolvedRoot && !resolvedDst.startsWith(rootWithSep)) {
     throw new UnsafeInstallPathError(
       'escape',
@@ -137,14 +133,9 @@ export async function assertSafeDestination(
   return true;
 }
 
-export async function assertSafeDirectory(
-  resolvedRoot: string,
-  dirPath: string,
-): Promise<void> {
+export async function assertSafeDirectory(resolvedRoot: string, dirPath: string): Promise<void> {
   const resolvedDir = path.resolve(dirPath);
-  const rootWithSep = resolvedRoot.endsWith(path.sep)
-    ? resolvedRoot
-    : resolvedRoot + path.sep;
+  const rootWithSep = resolvedRoot.endsWith(path.sep) ? resolvedRoot : resolvedRoot + path.sep;
   if (resolvedDir !== resolvedRoot && !resolvedDir.startsWith(rootWithSep)) {
     throw new UnsafeInstallPathError(
       'escape',
@@ -189,9 +180,7 @@ export async function snapshotAncestors(
   dstPath: string,
 ): Promise<Map<string, string>> {
   const snapshot = new Map<string, string>();
-  const rootWithSep = resolvedRoot.endsWith(path.sep)
-    ? resolvedRoot
-    : resolvedRoot + path.sep;
+  const rootWithSep = resolvedRoot.endsWith(path.sep) ? resolvedRoot : resolvedRoot + path.sep;
   const leafDir = path.dirname(path.resolve(dstPath));
   let cursor = leafDir;
   let reachedRoot = false;
@@ -252,9 +241,7 @@ export async function snapshotAncestors(
   return snapshot;
 }
 
-export async function verifyAncestorsUnchanged(
-  snapshot: Map<string, string>,
-): Promise<void> {
+export async function verifyAncestorsUnchanged(snapshot: Map<string, string>): Promise<void> {
   for (const [ancestor, originalReal] of snapshot) {
     let currentReal: string;
     try {
@@ -289,10 +276,7 @@ export async function writeFileExclusiveNoFollow(
   mode: number = 0o644,
 ): Promise<void> {
   const flags =
-    fs.constants.O_WRONLY |
-    fs.constants.O_CREAT |
-    fs.constants.O_EXCL |
-    fs.constants.O_NOFOLLOW;
+    fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW;
   const fh = await fsPromises.open(dstPath, flags, mode);
   try {
     await fh.writeFile(contents);
@@ -342,10 +326,7 @@ export async function safeInstallFile(opts: SafeWriteOptions): Promise<string> {
  * regular file. Used by `rea upgrade` on `removed-upstream` classifications
  * where the path comes from a manifest (attacker-controllable).
  */
-export async function safeDeleteFile(
-  resolvedRoot: string,
-  destRelPath: string,
-): Promise<void> {
+export async function safeDeleteFile(resolvedRoot: string, destRelPath: string): Promise<void> {
   const abs = resolveContained(resolvedRoot, destRelPath);
   let stat: fs.Stats;
   try {

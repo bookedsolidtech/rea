@@ -1,5 +1,9 @@
 import type { Middleware, InvocationContext } from './chain.js';
-import { wrapRegex, type SafeRegex, type MatchTimeoutOptions } from '../redact-safe/match-timeout.js';
+import {
+  wrapRegex,
+  type SafeRegex,
+  type MatchTimeoutOptions,
+} from '../redact-safe/match-timeout.js';
 
 /**
  * Patterns that match common secret formats.
@@ -177,9 +181,7 @@ function recordTimeoutOnCtx(
  * JSON.parse, which could corrupt the result if a replacement changes JSON
  * structure.
  */
-export function createRedactMiddleware(
-  opts: RedactMiddlewareOptions = {},
-): Middleware {
+export function createRedactMiddleware(opts: RedactMiddlewareOptions = {}): Middleware {
   const timeoutMs = opts.matchTimeoutMs ?? 100;
   const defaultPatterns = compileDefaultSecretPatterns({ timeoutMs, source: 'default' });
   const userPatterns = opts.userPatterns ?? [];

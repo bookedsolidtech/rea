@@ -150,7 +150,9 @@ export function translateReagentPolicy(
   const notices: string[] = [];
   if (dropped.length > 0) {
     for (const f of dropped) {
-      notices.push(`dropped reagent field "${f}" — governance surface no longer modeled in rea policy`);
+      notices.push(
+        `dropped reagent field "${f}" — governance surface no longer modeled in rea policy`,
+      );
     }
   }
 

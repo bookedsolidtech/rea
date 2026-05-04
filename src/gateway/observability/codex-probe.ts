@@ -61,8 +61,7 @@ export type ExecFileFn = (
   options: { timeout: number },
 ) => Promise<{ stdout: string; stderr: string }>;
 
-const defaultExec: ExecFileFn = (file, args, options) =>
-  execFileAsync(file, [...args], options);
+const defaultExec: ExecFileFn = (file, args, options) => execFileAsync(file, [...args], options);
 
 /**
  * Observable Codex state. Serialized verbatim into the doctor output and

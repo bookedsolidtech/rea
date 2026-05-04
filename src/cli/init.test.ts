@@ -41,9 +41,7 @@ describe('rea init — G11.4 codex flags', () => {
 
   afterEach(async () => {
     process.chdir(prevCwd);
-    await Promise.all(
-      cleanup.splice(0).map((d) => fs.rm(d, { recursive: true, force: true })),
-    );
+    await Promise.all(cleanup.splice(0).map((d) => fs.rm(d, { recursive: true, force: true })));
   });
 
   it('--yes --no-codex writes review.codex_required: false', async () => {
@@ -218,7 +216,8 @@ describe('rea init — G11.4 codex flags', () => {
 
     expect(second).toBe(first);
     // Exactly one managed block.
-    const openMarkers = (second.match(/# === rea managed — do not edit between markers ===/g) ?? []).length;
+    const openMarkers = (second.match(/# === rea managed — do not edit between markers ===/g) ?? [])
+      .length;
     const closeMarkers = (second.match(/# === end rea managed ===/g) ?? []).length;
     expect(openMarkers).toBe(1);
     expect(closeMarkers).toBe(1);

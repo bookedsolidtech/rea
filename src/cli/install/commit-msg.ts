@@ -56,9 +56,7 @@ export type CommitMsgClassification =
  * with no marker line; we detect that shape via the literal "block_ai_attribution"
  * grep — every rea body has consulted that policy field since 0.1.0.
  */
-export async function classifyCommitMsgHook(
-  hookPath: string,
-): Promise<CommitMsgClassification> {
+export async function classifyCommitMsgHook(hookPath: string): Promise<CommitMsgClassification> {
   let stat: fs.Stats;
   try {
     stat = await fsPromises.lstat(hookPath);
@@ -93,10 +91,7 @@ export async function classifyCommitMsgHook(
 
   // Pre-0.13 rea body had no marker but always contained the attribution
   // grep. Treat that shape as upgradeable rather than foreign.
-  if (
-    content.includes('block_ai_attribution') &&
-    content.includes('AI attribution detected')
-  ) {
+  if (content.includes('block_ai_attribution') && content.includes('AI attribution detected')) {
     return { kind: 'unmarked' };
   }
 
@@ -151,9 +146,7 @@ async function writeExecutable(src: string, dst: string): Promise<void> {
  * Requires `targetDir/.git` to exist (not a bare clone). The husky copy is
  * best-effort and only runs if `.husky/` is already a directory.
  */
-export async function installCommitMsgHook(
-  targetDir: string,
-): Promise<CommitMsgInstallResult> {
+export async function installCommitMsgHook(targetDir: string): Promise<CommitMsgInstallResult> {
   const result: CommitMsgInstallResult = { warnings: [] };
   const src = sourceHookPath();
   if (!fs.existsSync(src)) {

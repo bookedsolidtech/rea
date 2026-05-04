@@ -63,9 +63,7 @@ describe('blocked-paths-enforcer.sh — literal match (baseline behavior)', () =
   let dir: string;
 
   beforeEach(async () => {
-    dir = await fs.realpath(
-      await fs.mkdtemp(path.join(os.tmpdir(), 'rea-blocked-paths-')),
-    );
+    dir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-blocked-paths-')));
     await fs.mkdir(path.join(dir, '.rea'), { recursive: true });
     await fs.writeFile(path.join(dir, '.rea', 'policy.yaml'), POLICY_WITH_CODEOWNERS);
   });
@@ -101,9 +99,7 @@ describe('blocked-paths-enforcer.sh — path-traversal rejection (0.14.0 iron-ga
   let dir: string;
 
   beforeEach(async () => {
-    dir = await fs.realpath(
-      await fs.mkdtemp(path.join(os.tmpdir(), 'rea-blocked-paths-tr-')),
-    );
+    dir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-blocked-paths-tr-')));
     await fs.mkdir(path.join(dir, '.rea'), { recursive: true });
     await fs.writeFile(path.join(dir, '.rea', 'policy.yaml'), POLICY_WITH_CODEOWNERS);
   });
@@ -201,9 +197,7 @@ describe('blocked-paths-enforcer.sh — agent-writable allowlist (regression)', 
   let dir: string;
 
   beforeEach(async () => {
-    dir = await fs.realpath(
-      await fs.mkdtemp(path.join(os.tmpdir(), 'rea-blocked-paths-aw-')),
-    );
+    dir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-blocked-paths-aw-')));
     await fs.mkdir(path.join(dir, '.rea'), { recursive: true });
     // Block .rea/ so we can verify the allowlist exemptions work.
     await fs.writeFile(

@@ -23,25 +23,14 @@ import {
   enumerateCanonicalFiles,
 } from './install/canonical.js';
 import { writeManifestAtomic } from './install/manifest-io.js';
-import type {
-  InstallManifest,
-  ManifestEntry,
-} from './install/manifest-schema.js';
+import type { InstallManifest, ManifestEntry } from './install/manifest-schema.js';
 import { sha256OfBuffer, sha256OfFile } from './install/sha.js';
 import {
   defaultReagentPath,
   ReagentDroppedFieldsError,
   translateReagentPolicy,
 } from './install/reagent.js';
-import {
-  POLICY_FILE,
-  REA_DIR,
-  REGISTRY_FILE,
-  err,
-  getPkgVersion,
-  log,
-  warn,
-} from './utils.js';
+import { POLICY_FILE, REA_DIR, REGISTRY_FILE, err, getPkgVersion, log, warn } from './utils.js';
 
 export interface InitOptions {
   yes?: boolean | undefined;
@@ -152,10 +141,7 @@ function cancel(message: string): never {
  * Build the final layered profile in the documented merge order:
  *   hardDefaults ← profile ← reagentTranslation ← wizardAnswers
  */
-function resolveLayered(
-  profileName: ProfileName,
-  reagentTranslated: Profile | null,
-): Profile {
+function resolveLayered(profileName: ProfileName, reagentTranslated: Profile | null): Profile {
   const profile = loadProfile(profileName);
   if (profile === null) {
     warn(`profile "${profileName}" not found on disk — using hard defaults only`);
@@ -203,7 +189,11 @@ async function runWizard(
       initialValue: 'minimal',
       options: [
         { value: 'minimal', label: 'minimal', hint: 'bare policy, no extras (default)' },
-        { value: 'client-engagement', label: 'client-engagement', hint: 'zero-trust client project' },
+        {
+          value: 'client-engagement',
+          label: 'client-engagement',
+          hint: 'zero-trust client project',
+        },
         { value: 'bst-internal', label: 'bst-internal', hint: 'internal BST projects' },
         { value: 'lit-wc', label: 'lit-wc', hint: 'Lit / web component libraries' },
         { value: 'open-source', label: 'open-source', hint: 'public OSS repos' },
@@ -216,9 +206,7 @@ async function runWizard(
   // 0.21.1: prefer the existing on-disk value over the profile default
   // so re-running `rea init` doesn't reset an operator's manual edit.
   const autonomyDefault =
-    existingPolicy?.autonomyLevel
-    ?? layeredBase.autonomy_level
-    ?? AutonomyLevel.L1;
+    existingPolicy?.autonomyLevel ?? layeredBase.autonomy_level ?? AutonomyLevel.L1;
   const autonomyPick = await p.select<AutonomyLevel>({
     message:
       existingPolicy?.autonomyLevel !== undefined
@@ -272,12 +260,9 @@ async function runWizard(
   // chosen profile (any `*-no-codex` profile defaults to No). An explicit
   // flag on the command line overrides that default for the initial value.
   const codexInitial =
-    options.codex !== undefined
-      ? options.codex
-      : profileDefaultCodexRequired(profileName);
+    options.codex !== undefined ? options.codex : profileDefaultCodexRequired(profileName);
   const codexPick = await p.confirm({
-    message:
-      'Use Codex adversarial review? (requires an OpenAI account — can be added later)',
+    message: 'Use Codex adversarial review? (requires an OpenAI account — can be added later)',
     initialValue: codexInitial,
   });
   if (p.isCancel(codexPick)) cancel('Init cancelled.');
@@ -337,15 +322,9 @@ async function printCodexInstallAssist(): Promise<void> {
     return;
   }
   console.log('Codex CLI not detected on PATH.');
-  console.log(
-    '  Adversarial review via `/codex-review` requires the Codex plugin.',
-  );
-  console.log(
-    '  Install via the Claude Code Codex plugin helper: `/codex:setup`,',
-  );
-  console.log(
-    '  or set `review.codex_required: false` in .rea/policy.yaml to opt out.',
-  );
+  console.log('  Adversarial review via `/codex-review` requires the Codex plugin.');
+  console.log('  Install via the Claude Code Codex plugin helper: `/codex:setup`,');
+  console.log('  or set `review.codex_required: false` in .rea/policy.yaml to opt out.');
 }
 
 /**
@@ -451,7 +430,9 @@ function writePolicyYaml(targetDir: string, config: ResolvedConfig, layered: Pro
 
   const lines: string[] = [];
   lines.push(`# .rea/policy.yaml — managed by rea v${getPkgVersion()}`);
-  lines.push(`# Edit carefully: tightening takes effect on next load; loosening requires human approval.`);
+  lines.push(
+    `# Edit carefully: tightening takes effect on next load; loosening requires human approval.`,
+  );
   lines.push(`version: "1"`);
   lines.push(`profile: ${JSON.stringify(config.profile)}`);
   lines.push(`installed_by: ${JSON.stringify(installedBy)}`);
@@ -477,7 +458,9 @@ function writePolicyYaml(targetDir: string, config: ResolvedConfig, layered: Pro
   // which keeps 0.2.x consumers from being silently tightened on upgrade.
   if (layered.injection?.suspicious_blocks_writes !== undefined) {
     lines.push(`injection:`);
-    lines.push(`  suspicious_blocks_writes: ${layered.injection.suspicious_blocks_writes ? 'true' : 'false'}`);
+    lines.push(
+      `  suspicious_blocks_writes: ${layered.injection.suspicious_blocks_writes ? 'true' : 'false'}`,
+    );
   }
   if (layered.context_protection !== undefined) {
     lines.push(`context_protection:`);
@@ -511,8 +494,7 @@ function writePolicyYaml(targetDir: string, config: ResolvedConfig, layered: Pro
     lines.push(`audit:`);
     if (layered.audit.rotation !== undefined) {
       const rot = layered.audit.rotation;
-      const hasFields =
-        rot.max_bytes !== undefined || rot.max_age_days !== undefined;
+      const hasFields = rot.max_bytes !== undefined || rot.max_age_days !== undefined;
       lines.push(hasFields ? `  rotation:` : `  rotation: {}`);
       if (rot.max_bytes !== undefined) {
         lines.push(`    max_bytes: ${rot.max_bytes}`);
@@ -606,8 +588,7 @@ async function writeInstallManifest(
   const manifest: InstallManifest = {
     version: getPkgVersion(),
     profile,
-    installed_at:
-      readExistingManifestInstalledAt(manifestPath) ?? new Date().toISOString(),
+    installed_at: readExistingManifestInstalledAt(manifestPath) ?? new Date().toISOString(),
     files: entries,
   };
   return writeManifestAtomic(targetDir, manifest);
@@ -641,7 +622,9 @@ export async function runInit(options: InitOptions): Promise<void> {
   if (fs.existsSync(policyPath) && options.yes !== true && options.force !== true) {
     err(`.rea/policy.yaml already exists at ${policyPath}`);
     console.error('');
-    console.error('  Refusing to overwrite. Pass --force to replace, or --yes to accept current settings.');
+    console.error(
+      '  Refusing to overwrite. Pass --force to replace, or --yes to accept current settings.',
+    );
     console.error('');
     process.exit(1);
   }
@@ -669,9 +652,7 @@ export async function runInit(options: InitOptions): Promise<void> {
     }
     const baseProfile = loadProfile(profileName);
     const profileCeiling =
-      baseProfile?.max_autonomy_level ??
-      HARD_DEFAULTS.max_autonomy_level ??
-      AutonomyLevel.L2;
+      baseProfile?.max_autonomy_level ?? HARD_DEFAULTS.max_autonomy_level ?? AutonomyLevel.L2;
     try {
       const t = translateReagentPolicy(reagentPolicyPath, {
         profileCeiling,
@@ -718,25 +699,14 @@ export async function runInit(options: InitOptions): Promise<void> {
     config = {
       profile: profileName,
       autonomyLevel:
-        existingPolicy?.autonomyLevel
-        ?? layeredBase.autonomy_level
-        ?? AutonomyLevel.L1,
+        existingPolicy?.autonomyLevel ?? layeredBase.autonomy_level ?? AutonomyLevel.L1,
       maxAutonomyLevel:
-        existingPolicy?.maxAutonomyLevel
-        ?? layeredBase.max_autonomy_level
-        ?? AutonomyLevel.L2,
+        existingPolicy?.maxAutonomyLevel ?? layeredBase.max_autonomy_level ?? AutonomyLevel.L2,
       blockAiAttribution:
-        existingPolicy?.blockAiAttribution
-        ?? layeredBase.block_ai_attribution
-        ?? true,
-      blockedPaths:
-        existingPolicy?.blockedPaths
-        ?? layeredBase.blocked_paths
-        ?? ['.env', '.env.*'],
+        existingPolicy?.blockAiAttribution ?? layeredBase.block_ai_attribution ?? true,
+      blockedPaths: existingPolicy?.blockedPaths ?? layeredBase.blocked_paths ?? ['.env', '.env.*'],
       notificationChannel:
-        existingPolicy?.notificationChannel
-        ?? layeredBase.notification_channel
-        ?? '',
+        existingPolicy?.notificationChannel ?? layeredBase.notification_channel ?? '',
       codexRequired,
       fromReagent,
       reagentPolicyPath,
@@ -795,11 +765,7 @@ export async function runInit(options: InitOptions): Promise<void> {
   // G12 — record the install manifest. SHAs are of the files actually on disk
   // after the copy pass, so drift detection compares against real state (not
   // canonical, which may differ if the consumer's copy was aborted mid-run).
-  const manifestPath = await writeInstallManifest(
-    targetDir,
-    config.profile,
-    fragmentInput,
-  );
+  const manifestPath = await writeInstallManifest(targetDir, config.profile, fragmentInput);
 
   console.log('');
   log('init complete');
@@ -810,15 +776,13 @@ export async function runInit(options: InitOptions): Promise<void> {
   console.log(
     `  + .claude/settings.json (${mergeResult.addedCount} hook entries added, ${mergeResult.skippedCount} already present)`,
   );
-  if (commitMsgResult.gitHook) console.log(`  + ${path.relative(targetDir, commitMsgResult.gitHook)}`);
+  if (commitMsgResult.gitHook)
+    console.log(`  + ${path.relative(targetDir, commitMsgResult.gitHook)}`);
   if (commitMsgResult.huskyHook)
     console.log(`  + ${path.relative(targetDir, commitMsgResult.huskyHook)}`);
   if (prePushResult.written !== undefined) {
-    const verb =
-      prePushResult.decision.action === 'refresh' ? '~' : '+';
-    console.log(
-      `  ${verb} ${path.relative(targetDir, prePushResult.written)} (pre-push fallback)`,
-    );
+    const verb = prePushResult.decision.action === 'refresh' ? '~' : '+';
+    console.log(`  ${verb} ${path.relative(targetDir, prePushResult.written)} (pre-push fallback)`);
   } else if (
     prePushResult.decision.action === 'skip' &&
     prePushResult.decision.reason === 'active-pre-push-present'
@@ -831,17 +795,13 @@ export async function runInit(options: InitOptions): Promise<void> {
     `  ${mdResult.replaced ? '~' : '+'} ${path.relative(targetDir, mdResult.path)} (fragment ${mdResult.replaced ? 'replaced' : 'written'})`,
   );
   if (gitignoreResult.action === 'created') {
-    console.log(
-      `  + ${path.relative(targetDir, gitignoreResult.path)} (managed block written)`,
-    );
+    console.log(`  + ${path.relative(targetDir, gitignoreResult.path)} (managed block written)`);
   } else if (gitignoreResult.action === 'updated') {
     console.log(
       `  ~ ${path.relative(targetDir, gitignoreResult.path)} (managed block ${gitignoreResult.addedEntries.length} entr${gitignoreResult.addedEntries.length === 1 ? 'y' : 'ies'} added)`,
     );
   } else {
-    console.log(
-      `  · ${path.relative(targetDir, gitignoreResult.path)} (managed block up to date)`,
-    );
+    console.log(`  · ${path.relative(targetDir, gitignoreResult.path)} (managed block up to date)`);
   }
   for (const w of gitignoreResult.warnings) warn(w);
   console.log(`  + ${path.relative(targetDir, manifestPath)}`);
@@ -870,9 +830,7 @@ export async function runInit(options: InitOptions): Promise<void> {
   } else {
     console.log('');
     console.log('Codex review disabled. ClaudeSelfReviewer will be used.');
-    console.log(
-      '  Set review.codex_required: true in .rea/policy.yaml to re-enable.',
-    );
+    console.log('  Set review.codex_required: true in .rea/policy.yaml to re-enable.');
   }
 
   console.log('');

@@ -13,7 +13,8 @@ import {
 describe('mergeSettings', () => {
   it('adds all hooks into an empty settings file without chaining warnings', () => {
     const result = mergeSettings({}, defaultDesiredHooks());
-    const preHooks = ((result.merged.hooks as { PreToolUse?: Array<{ matcher: string }> }).PreToolUse) ?? [];
+    const preHooks =
+      (result.merged.hooks as { PreToolUse?: Array<{ matcher: string }> }).PreToolUse ?? [];
     const matchers = preHooks.map((g) => g.matcher);
     expect(matchers).toContain('Bash');
     // 0.16.0+: matcher includes NotebookEdit so the secret-scanner /
@@ -37,9 +38,12 @@ describe('mergeSettings', () => {
     // policy.yaml, settings.json, .husky/) and runs first; the new
     // blocked-paths-bash-gate handles the runtime-configurable
     // `blocked_paths` list from policy.yaml.
-    const bashHooks = (preHooks.find((g) => g.matcher === 'Bash') as
-      | { hooks: Array<{ command: string }> }
-      | undefined)?.hooks ?? [];
+    const bashHooks =
+      (
+        preHooks.find((g) => g.matcher === 'Bash') as
+          | { hooks: Array<{ command: string }> }
+          | undefined
+      )?.hooks ?? [];
     const cmdList = bashHooks.map((h) => h.command);
     const protectedIdx = cmdList.findIndex((c) => c.includes('protected-paths-bash-gate.sh'));
     const blockedIdx = cmdList.findIndex((c) => c.includes('blocked-paths-bash-gate.sh'));
@@ -70,8 +74,11 @@ describe('mergeSettings', () => {
       },
     };
     const result = mergeSettings(consumer, defaultDesiredHooks());
-    const bashGroup = (result.merged.hooks as { PreToolUse: Array<{ matcher: string; hooks: Array<{ command: string }> }> })
-      .PreToolUse.find((g) => g.matcher === 'Bash')!;
+    const bashGroup = (
+      result.merged.hooks as {
+        PreToolUse: Array<{ matcher: string; hooks: Array<{ command: string }> }>;
+      }
+    ).PreToolUse.find((g) => g.matcher === 'Bash')!;
     const commands = bashGroup.hooks.map((h) => h.command);
     expect(commands).toContain('/consumer/own.sh');
     expect(commands.some((c) => c.includes('dangerous-bash-interceptor.sh'))).toBe(true);
@@ -179,8 +186,14 @@ describe('pruneHookCommands — 0.11.0 migration of deleted hook references', ()
             matcher: 'Bash',
             hooks: [
               { type: 'command', command: '$CLAUDE_PROJECT_DIR/.claude/hooks/push-review-gate.sh' },
-              { type: 'command', command: '$CLAUDE_PROJECT_DIR/.claude/hooks/attribution-advisory.sh' },
-              { type: 'command', command: '$CLAUDE_PROJECT_DIR/.claude/hooks/commit-review-gate.sh' },
+              {
+                type: 'command',
+                command: '$CLAUDE_PROJECT_DIR/.claude/hooks/attribution-advisory.sh',
+              },
+              {
+                type: 'command',
+                command: '$CLAUDE_PROJECT_DIR/.claude/hooks/commit-review-gate.sh',
+              },
             ],
           },
         ],
@@ -224,7 +237,10 @@ describe('pruneHookCommands — 0.11.0 migration of deleted hook references', ()
           {
             matcher: 'Bash',
             hooks: [
-              { type: 'command', command: '$CLAUDE_PROJECT_DIR/.claude/hooks/attribution-advisory.sh' },
+              {
+                type: 'command',
+                command: '$CLAUDE_PROJECT_DIR/.claude/hooks/attribution-advisory.sh',
+              },
             ],
           },
         ],

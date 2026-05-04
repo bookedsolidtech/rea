@@ -77,12 +77,10 @@ function captureIo(): CapturedIo {
  */
 async function runVerify(): Promise<{ exitCode: number | null }> {
   let exitCode: number | null = null;
-  const exitSpy = vi
-    .spyOn(process, 'exit')
-    .mockImplementation(((code?: number) => {
-      exitCode = code ?? 0;
-      throw new Error(`__exit__${exitCode}`);
-    }) as never);
+  const exitSpy = vi.spyOn(process, 'exit').mockImplementation(((code?: number) => {
+    exitCode = code ?? 0;
+    throw new Error(`__exit__${exitCode}`);
+  }) as never);
   try {
     await runAuditVerify({});
   } catch (e) {
@@ -125,8 +123,7 @@ describe('runAuditVerify — defect T collect-all-errors mode', () => {
     const auditFile = path.join(baseDir, '.rea', 'audit.jsonl');
     const original = await fs.readFile(auditFile, 'utf8');
     const [lineOne, lineTwo] = original.split('\n').filter((l) => l.length > 0);
-    const corrupted =
-      [lineOne, '{not-json-at-all', lineTwo, '{"incomplete":', ''].join('\n');
+    const corrupted = [lineOne, '{not-json-at-all', lineTwo, '{"incomplete":', ''].join('\n');
     await fs.writeFile(auditFile, corrupted);
 
     const { exitCode } = await runVerify();
@@ -230,13 +227,7 @@ describe('runAuditVerify — defect T collect-all-errors mode', () => {
     expect(tampered).not.toBe(originalLines[1]);
 
     // Splice a malformed line BEFORE the tamper.
-    const corrupted = [
-      originalLines[0],
-      '{not-json',
-      tampered,
-      originalLines[2],
-      '',
-    ].join('\n');
+    const corrupted = [originalLines[0], '{not-json', tampered, originalLines[2], ''].join('\n');
     await fs.writeFile(auditFile, corrupted);
 
     const { exitCode } = await runVerify();

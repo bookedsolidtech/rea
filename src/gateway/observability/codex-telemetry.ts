@@ -128,10 +128,7 @@ export function metricsFilePath(baseDir: string): string {
  * Append a single telemetry row. Always fail-soft — the caller must be
  * able to treat this as a best-effort observation and continue.
  */
-export async function recordTelemetry(
-  baseDir: string,
-  input: RecordTelemetryInput,
-): Promise<void> {
+export async function recordTelemetry(baseDir: string, input: RecordTelemetryInput): Promise<void> {
   const record: TelemetryRecord = {
     timestamp: new Date().toISOString(),
     invocation_type: input.invocation_type,
@@ -258,8 +255,7 @@ export async function summarizeTelemetry(
     const key = dayKey(r.timestamp);
     if (!countsByKey.has(key)) continue; // outside window
     countsByKey.set(key, (countsByKey.get(key) ?? 0) + 1);
-    totalTokens +=
-      (r.estimated_input_tokens ?? 0) + (r.estimated_output_tokens ?? 0);
+    totalTokens += (r.estimated_input_tokens ?? 0) + (r.estimated_output_tokens ?? 0);
     if (r.rate_limited) rateLimitedCount += 1;
     durationSum += r.duration_ms ?? 0;
     inWindow += 1;

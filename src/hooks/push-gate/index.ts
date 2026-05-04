@@ -47,12 +47,7 @@ import {
 } from './codex-runner.js';
 import { summarizeReview, type Verdict } from './findings.js';
 import { renderBanner, writeLastReview, type LastReviewPayload } from './report.js';
-import {
-  isFlip,
-  lookupVerdict,
-  writeVerdict,
-  type VerdictCacheEntry,
-} from './verdict-cache.js';
+import { isFlip, lookupVerdict, writeVerdict, type VerdictCacheEntry } from './verdict-cache.js';
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -206,7 +201,9 @@ export async function runPushGate(deps: PushGateDeps): Promise<GateResult> {
   //    prevent the kill-switch from firing.
   const halt = readHaltFn(deps.baseDir);
   if (halt.halted) {
-    stderr(`REA HALT: ${halt.reason ?? 'unknown'}\nAll push operations suspended. Run: rea unfreeze\n`);
+    stderr(
+      `REA HALT: ${halt.reason ?? 'unknown'}\nAll push operations suspended. Run: rea unfreeze\n`,
+    );
     await safeAppend(appendAuditFn, deps.baseDir, EVT_HALTED, fullPolicy, {
       reason: halt.reason ?? 'unknown',
     });
@@ -304,7 +301,8 @@ export async function runPushGate(deps: PushGateDeps): Promise<GateResult> {
   const lastNFromFlag = deps.lastNCommits;
   const effectiveLastN = lastNFromFlag !== undefined ? lastNFromFlag : policyLastN;
   if (explicitBaseSet && effectiveLastN !== undefined) {
-    const source = lastNFromFlag !== undefined ? '--last-n-commits' : 'policy.review.last_n_commits';
+    const source =
+      lastNFromFlag !== undefined ? '--last-n-commits' : 'policy.review.last_n_commits';
     stderr(
       `rea: --base ${deps.explicitBase} overrides ${source}=${effectiveLastN}; using explicit ref.\n`,
     );
@@ -374,7 +372,9 @@ export async function runPushGate(deps: PushGateDeps): Promise<GateResult> {
   }
   if (headSha.length === 0) {
     stderr('PUSH BLOCKED: could not resolve HEAD SHA. Is this a valid git repo?\n');
-    await safeAppend(appendAuditFn, deps.baseDir, EVT_ERROR, fullPolicy, { kind: 'head-sha-missing' });
+    await safeAppend(appendAuditFn, deps.baseDir, EVT_ERROR, fullPolicy, {
+      kind: 'head-sha-missing',
+    });
     return { status: 'error', exitCode: 2, summary: 'head-sha-missing' };
   }
 
@@ -427,10 +427,7 @@ export async function runPushGate(deps: PushGateDeps): Promise<GateResult> {
     baseFromPushedRemoteTip;
   if (autoNarrowEligible) {
     originalCommitCount = git.revListCount(base.ref, headSha);
-    if (
-      originalCommitCount !== null &&
-      originalCommitCount > policy.auto_narrow_threshold
-    ) {
+    if (originalCommitCount !== null && originalCommitCount > policy.auto_narrow_threshold) {
       const fallbackWindow = PUSH_GATE_DEFAULT_LAST_N_COMMITS_FALLBACK;
       const narrowed = resolveBaseRef(git, {
         lastNCommits: fallbackWindow,
@@ -458,8 +455,7 @@ export async function runPushGate(deps: PushGateDeps): Promise<GateResult> {
       last_n_commits: base.lastNCommits,
       last_n_commits_requested: base.lastNCommitsRequested,
       auto_narrowed: autoNarrowed ? true : undefined,
-      original_commit_count:
-        originalCommitCount !== null ? originalCommitCount : undefined,
+      original_commit_count: originalCommitCount !== null ? originalCommitCount : undefined,
     });
     return {
       status: 'empty-diff',
@@ -480,8 +476,8 @@ export async function runPushGate(deps: PushGateDeps): Promise<GateResult> {
   if (cacheLookup.hit && cacheLookup.entry !== undefined) {
     const cached = cacheLookup.entry;
     const cachedBlocked =
-      cached.verdict === 'blocking'
-      || (cached.verdict === 'concerns' && policy.concerns_blocks && !isConcernsOverrideSet(env));
+      cached.verdict === 'blocking' ||
+      (cached.verdict === 'concerns' && policy.concerns_blocks && !isConcernsOverrideSet(env));
     // 0.19.1 P3-3 (code-reviewer): emit EVT_CACHE_HIT (forensic detail
     // for the cache layer specifically) AND EVT_REVIEWED (the canonical
     // verdict event with `cache_hit: true` metadata). Operators
@@ -541,10 +537,9 @@ export async function runPushGate(deps: PushGateDeps): Promise<GateResult> {
         : {}),
     });
     const summary = summarizeReview(codexResult.reviewText);
-    const blocked = summary.verdict === 'blocking'
-      || (summary.verdict === 'concerns'
-        && policy.concerns_blocks
-        && !isConcernsOverrideSet(env));
+    const blocked =
+      summary.verdict === 'blocking' ||
+      (summary.verdict === 'concerns' && policy.concerns_blocks && !isConcernsOverrideSet(env));
 
     const lastReviewPath = path.join(deps.baseDir, '.rea', 'last-review.json');
     const payload: LastReviewPayload = writeLastReviewFn({
@@ -616,11 +611,11 @@ export async function runPushGate(deps: PushGateDeps): Promise<GateResult> {
       last_n_commits: base.lastNCommits,
       last_n_commits_requested: base.lastNCommitsRequested,
       auto_narrowed: autoNarrowed ? true : undefined,
-      original_commit_count:
-        originalCommitCount !== null ? originalCommitCount : undefined,
-      flipped: cacheLookup.entry !== undefined && isFlip(cacheLookup.entry, summary.verdict)
-        ? true
-        : undefined,
+      original_commit_count: originalCommitCount !== null ? originalCommitCount : undefined,
+      flipped:
+        cacheLookup.entry !== undefined && isFlip(cacheLookup.entry, summary.verdict)
+          ? true
+          : undefined,
     });
 
     if (blocked) {
@@ -635,11 +630,12 @@ export async function runPushGate(deps: PushGateDeps): Promise<GateResult> {
       };
     }
     return {
-      status: summary.verdict === 'blocking'
-        ? 'blocking'
-        : summary.verdict === 'concerns'
-          ? 'concerns'
-          : 'pass',
+      status:
+        summary.verdict === 'blocking'
+          ? 'blocking'
+          : summary.verdict === 'concerns'
+            ? 'concerns'
+            : 'pass',
       exitCode: 0,
       summary: `${summary.verdict}: ${summary.findings.length} finding(s)`,
       verdict: summary.verdict,
@@ -688,9 +684,10 @@ async function handleCodexError(
   };
 }
 
-function classifyCodexError(
-  e: unknown,
-): { kind: CodexRunError['kind'] | 'unknown'; message: string } {
+function classifyCodexError(e: unknown): {
+  kind: CodexRunError['kind'] | 'unknown';
+  message: string;
+} {
   if (e instanceof CodexNotInstalledError) return { kind: 'not-installed', message: e.message };
   if (e instanceof CodexTimeoutError) return { kind: 'timeout', message: e.message };
   if (e instanceof CodexProtocolError) return { kind: 'protocol', message: e.message };

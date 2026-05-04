@@ -421,10 +421,7 @@ describe('LiveStatePublisher', () => {
 
       // Swap to a dead PID so the retry's flushNow reclaims.
       const deadPid = 2 ** 22;
-      fs.writeFileSync(
-        statePath,
-        JSON.stringify({ ...liveOwned, owner_pid: deadPid }) + '\n',
-      );
+      fs.writeFileSync(statePath, JSON.stringify({ ...liveOwned, owner_pid: deadPid }) + '\n');
 
       // Advance fake timers past the retry interval (2s). Before the pass-5
       // fix, nothing was scheduled and this advancement is a no-op.

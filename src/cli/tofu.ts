@@ -59,10 +59,7 @@ export interface TofuRow {
 }
 
 /** Pure classifier used by both `list` and `accept` — keep free of I/O. */
-export function classifyRows(
-  servers: RegistryServer[],
-  stored: Record<string, string>,
-): TofuRow[] {
+export function classifyRows(servers: RegistryServer[], stored: Record<string, string>): TofuRow[] {
   return servers.map((s) => {
     const current = fingerprintServer(s);
     const prior = stored[s.name];
@@ -152,7 +149,8 @@ export async function runTofuAccept(options: RunTofuAcceptOptions): Promise<void
   };
   await saveFingerprintStore(baseDir, nextStore);
 
-  const event = stored === undefined ? 'tofu.first_seen_accepted_by_cli' : 'tofu.drift_accepted_by_cli';
+  const event =
+    stored === undefined ? 'tofu.first_seen_accepted_by_cli' : 'tofu.drift_accepted_by_cli';
   try {
     await appendAuditRecord(baseDir, {
       tool_name: 'rea.tofu',

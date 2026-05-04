@@ -222,8 +222,7 @@ describe('protected-paths-bash-gate.sh — codex round-1 P2-1: segment splitter 
     // way to inject SOH through the JSON wire, but we verify a
     // command containing the new sentinel string itself doesn't get
     // mangled into a redirect.
-    const cmd =
-      'echo "doc: __REA_GTPIPE_a8f2c1__ is the splitter sentinel; do not rename"';
+    const cmd = 'echo "doc: __REA_GTPIPE_a8f2c1__ is the splitter sentinel; do not rename"';
     const res = runHook(cmd);
     expect(res.status).toBe(0);
   });

@@ -30,4 +30,4 @@ blocked_paths:
   - SECURITY.md
   - .github/workflows/release.yml
   - .github/workflows/publish.yml
-notification_channel: ""
+notification_channel: ''

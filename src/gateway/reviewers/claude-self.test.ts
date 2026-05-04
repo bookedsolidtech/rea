@@ -29,9 +29,7 @@ describe('ClaudeSelfReviewer', () => {
     // Redirect process.cwd() to a scratch dir so the reviewer's default
     // telemetry write lands in a throwaway location instead of polluting
     // the real `.rea/metrics.jsonl` under the repo root.
-    cwdStash = await fs.realpath(
-      await fs.mkdtemp(path.join(os.tmpdir(), 'rea-claude-self-cwd-')),
-    );
+    cwdStash = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-claude-self-cwd-')));
     process.chdir(cwdStash);
   });
 
@@ -242,9 +240,7 @@ describe('ClaudeSelfReviewer', () => {
     it('records invocation_type=adversarial-review on success with exit_code 0', async () => {
       const recorded: Array<{ baseDir: string; input: Record<string, unknown> }> = [];
       const reviewer = new ClaudeSelfReviewer({
-        create: okCreate(
-          JSON.stringify({ verdict: 'pass', summary: 'ok', findings: [] }),
-        ),
+        create: okCreate(JSON.stringify({ verdict: 'pass', summary: 'ok', findings: [] })),
         baseDir: '/tmp/telemetry-test',
         recordTelemetryFn: async (baseDir, input) => {
           recorded.push({ baseDir, input: input as unknown as Record<string, unknown> });
@@ -298,9 +294,7 @@ describe('ClaudeSelfReviewer', () => {
 
     it('telemetry write failure does not impact the review result (fail-soft)', async () => {
       const reviewer = new ClaudeSelfReviewer({
-        create: okCreate(
-          JSON.stringify({ verdict: 'pass', summary: 'ok', findings: [] }),
-        ),
+        create: okCreate(JSON.stringify({ verdict: 'pass', summary: 'ok', findings: [] })),
         // Deliberately throwing telemetry fn; the outer review must still
         // return a real ReviewResult.
         recordTelemetryFn: () => {

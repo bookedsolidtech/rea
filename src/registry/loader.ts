@@ -57,10 +57,7 @@ const RegistryServerSchema = z
       .array(
         z
           .string()
-          .regex(
-            /^[A-Za-z_][A-Za-z0-9_]*$/,
-            'env var name must match POSIX identifier syntax',
-          )
+          .regex(/^[A-Za-z_][A-Za-z0-9_]*$/, 'env var name must match POSIX identifier syntax')
           .refine(
             (name) => !SECRET_NAME_HEURISTIC.test(name),
             (name) => ({

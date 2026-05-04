@@ -193,9 +193,7 @@ function reconcileBlock(
   bodyLines: readonly string[],
   required: readonly string[],
 ): { lines: string[]; added: string[] } {
-  const present = new Set(
-    bodyLines.map((l) => l.replace(/\s+$/, '')).filter((l) => l.length > 0),
-  );
+  const present = new Set(bodyLines.map((l) => l.replace(/\s+$/, '')).filter((l) => l.length > 0));
   const added: string[] = [];
   const appended: string[] = [];
   for (const entry of required) {
@@ -253,9 +251,7 @@ async function readGitignoreIfFile(absPath: string): Promise<string | null> {
     .open(absPath, O_RDONLY | O_NOFOLLOW)
     .catch((err: NodeJS.ErrnoException) => {
       if (err.code === 'ELOOP') {
-        throw new Error(
-          `${absPath} became a symlink between lstat and open — refusing to read.`,
-        );
+        throw new Error(`${absPath} became a symlink between lstat and open — refusing to read.`);
       }
       throw err;
     });
@@ -352,11 +348,7 @@ export async function ensureReaGitignore(
     })();
     const bodyLines = lines.slice(0, trimmedTailIdx + 1);
     const separator = bodyLines.length === 0 ? [] : [''];
-    const newLines = [
-      ...bodyLines,
-      ...separator,
-      buildManagedBlock(entries, eol),
-    ];
+    const newLines = [...bodyLines, ...separator, buildManagedBlock(entries, eol)];
     const content = newLines.join(eol) + eol;
     await writeAtomic(absPath, content);
     return {

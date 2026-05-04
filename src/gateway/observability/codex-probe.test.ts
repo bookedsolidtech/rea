@@ -105,9 +105,7 @@ describe('CodexProbe', () => {
       const exec = routedExec({
         version: () => Promise.resolve({ stdout: 'codex 1.0.0', stderr: '' }),
         catalog: () =>
-          Promise.reject(
-            Object.assign(new Error("unknown command 'catalog'"), { code: 1 }),
-          ),
+          Promise.reject(Object.assign(new Error("unknown command 'catalog'"), { code: 1 })),
       });
       const probe = new CodexProbe({ execFileFn: exec });
       const state = await probe.probe();
@@ -119,10 +117,7 @@ describe('CodexProbe', () => {
     it('catalog fails with a genuine error → cli_responsive false, last_error populated', async () => {
       const exec = routedExec({
         version: () => Promise.resolve({ stdout: 'codex 1.0.0', stderr: '' }),
-        catalog: () =>
-          Promise.reject(
-            Object.assign(new Error('401 unauthorized'), { code: 1 }),
-          ),
+        catalog: () => Promise.reject(Object.assign(new Error('401 unauthorized'), { code: 1 })),
       });
       const probe = new CodexProbe({ execFileFn: exec });
       const state = await probe.probe();
@@ -221,9 +216,7 @@ describe('CodexProbe', () => {
     });
 
     it('start() is idempotent', async () => {
-      const exec: ExecFileFn = vi
-        .fn()
-        .mockResolvedValue({ stdout: 'codex 1.0.0', stderr: '' });
+      const exec: ExecFileFn = vi.fn().mockResolvedValue({ stdout: 'codex 1.0.0', stderr: '' });
       const probe = new CodexProbe({ execFileFn: exec });
       probe.start(10_000);
       probe.start(10_000); // second call must not install a second interval
@@ -233,9 +226,7 @@ describe('CodexProbe', () => {
       probe.stop();
       const frozen = (exec as unknown as { mock: { calls: unknown[] } }).mock.calls.length;
       await vi.advanceTimersByTimeAsync(60_000);
-      expect((exec as unknown as { mock: { calls: unknown[] } }).mock.calls.length).toBe(
-        frozen,
-      );
+      expect((exec as unknown as { mock: { calls: unknown[] } }).mock.calls.length).toBe(frozen);
     });
 
     it('stop() before start() is a no-op', () => {
@@ -304,8 +295,7 @@ describe('CodexProbe', () => {
       off();
       // Force a state transition so the remaining listener-free path fires.
       // Swap the exec to fail.
-      (probe as unknown as { exec: ExecFileFn }).exec = () =>
-        Promise.reject(enoentError());
+      (probe as unknown as { exec: ExecFileFn }).exec = () => Promise.reject(enoentError());
       await probe.probe();
       expect(listener).toHaveBeenCalledTimes(1);
     });

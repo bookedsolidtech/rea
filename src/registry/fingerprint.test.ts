@@ -51,12 +51,8 @@ describe('fingerprintServer — stability', () => {
   });
 
   it('is invariant to tier-override key order', () => {
-    const a = fingerprintServer(
-      server({ tier_overrides: { foo: Tier.Read, bar: Tier.Write } }),
-    );
-    const b = fingerprintServer(
-      server({ tier_overrides: { bar: Tier.Write, foo: Tier.Read } }),
-    );
+    const a = fingerprintServer(server({ tier_overrides: { foo: Tier.Read, bar: Tier.Write } }));
+    const b = fingerprintServer(server({ tier_overrides: { bar: Tier.Write, foo: Tier.Read } }));
     expect(a).toBe(b);
   });
 
@@ -100,9 +96,11 @@ describe('fingerprintServer — instability (drift triggers)', () => {
 
   it('changes when passthrough surface expands', () => {
     const a = fingerprintServer(server({ env_passthrough: ['HTTPS_PROXY'] }));
-    const b = fingerprintServer(server({
-      env_passthrough: ['HTTPS_PROXY', 'NPM_CONFIG_REGISTRY'],
-    }));
+    const b = fingerprintServer(
+      server({
+        env_passthrough: ['HTTPS_PROXY', 'NPM_CONFIG_REGISTRY'],
+      }),
+    );
     expect(a).not.toBe(b);
   });
 
@@ -127,9 +125,7 @@ describe('fingerprintServer — instability (drift triggers)', () => {
 
 describe('canonicalization shape', () => {
   it('fingerprints env by KEY SET, not values', () => {
-    const c = __canonicalizeForTests(
-      server({ env: { TOKEN: 'secret-value', OTHER: 'x' } }),
-    );
+    const c = __canonicalizeForTests(server({ env: { TOKEN: 'secret-value', OTHER: 'x' } }));
     expect(c.env_keys).toEqual(['OTHER', 'TOKEN']);
     // Values must not appear anywhere in the canonical form.
     expect(JSON.stringify(c)).not.toContain('secret-value');

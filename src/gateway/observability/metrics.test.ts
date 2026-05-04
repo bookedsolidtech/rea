@@ -196,16 +196,16 @@ describe('startMetricsServer — host allowlist (security)', () => {
 
   it('rejects "localhost" at the API boundary BEFORE a socket opens', async () => {
     const reg = new MetricsRegistry();
-    await expect(
-      startMetricsServer({ port: 0, registry: reg, host: 'localhost' }),
-    ).rejects.toThrow(TypeError);
+    await expect(startMetricsServer({ port: 0, registry: reg, host: 'localhost' })).rejects.toThrow(
+      TypeError,
+    );
   });
 
   it('rejects 0.0.0.0 so an unauthenticated bind to all interfaces is impossible', async () => {
     const reg = new MetricsRegistry();
-    await expect(
-      startMetricsServer({ port: 0, registry: reg, host: '0.0.0.0' }),
-    ).rejects.toThrow(/only loopback/i);
+    await expect(startMetricsServer({ port: 0, registry: reg, host: '0.0.0.0' })).rejects.toThrow(
+      /only loopback/i,
+    );
   });
 
   it('rejects a LAN IP (192.168.x.x) with TypeError', async () => {

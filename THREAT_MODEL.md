@@ -524,3 +524,585 @@ REA operates two independent layers. Bypassing one does not disable the other.
 **Gateway layer** (runtime, `rea serve`): A middleware chain processes every proxied MCP tool call. Middleware enforces: audit, kill switch, policy/autonomy level, tier classification, blocked paths, rate limit, circuit breaker, prompt-injection classification (§5.21), secret redaction (pre and post), and result size cap. The gateway also supervises downstream child processes (§5.14), emits a `SESSION_BLOCKER` audit event on persistent failure (§5.15), and publishes a live per-downstream state snapshot to `.rea/serve.state.json` (§5.16) that `rea status` reads read-only. The `__rea__health` meta-tool short-circuits the chain for callability under HALT and runs a dedicated sanitizer on its response (§5.17).
 
 Both layers fail closed: on read failure, parse error, unknown errno on HALT, regex timeout, or any unexpected condition, the default action is deny (or for redaction specifically: replace with a sentinel — the content never escapes unscanned).
+
+---
+
+## 8. Bash-tier scanner (parser-backed, 0.23.0+)
+
+Two of the shipped hooks — `protected-paths-bash-gate.sh` and
+`blocked-paths-bash-gate.sh` — are thin shims that forward stdin to
+the `rea hook scan-bash` CLI subcommand. The CLI parses the Bash
+command via `mvdan-sh@0.10.1`, walks the AST in
+`src/hooks/bash-scanner/walker.ts`, and applies per-utility detectors
+that produce a `DetectedWrite[]`. The scanner then matches each
+detection's path against the protected-paths or blocked_paths policy
+and emits a verdict JSON. The shim re-verifies the verdict shape via
+`node -e` before honoring the exit code (defense against a tampered
+`REA_NODE_CLI` that returns exit 0 with empty stdout).
+
+### 8.1 Trust assumptions
+
+The scanner trusts the following components. Each row names what we
+trust, what would happen if the trust were violated, and what pins
+the trust.
+
+| Component                          | What we trust                                                                                            | If violated                                                       | Pinned by                                                                              |
+| ---------------------------------- | -------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------- | -------------------------------------------------------------------------------------- |
+| `mvdan-sh@0.10.1`                  | Produces a faithful AST from any input bash accepts                                                      | Detector misses target on mis-shaped node                          | Pinned version, RedirOperator op-code snapshot tests, Class O exhaustiveness contract |
+| Walker dispatch table              | Enumerates every shape that produces a write                                                              | Novel utility silently allowed                                     | Per-PR corpus fixture requirement; 18 corpus classes; convergence ladder              |
+| `fs.lstatSync` / `fs.readlinkSync` | Identify symlinks including dangling links                                                                | Symlink-out bypass class reopens                                   | Codex round 1 F-2 closure + symlink corpus                                             |
+| `node` on PATH in the shim         | Verdict-JSON verifier runs                                                                                | Shim refuses on uncertainty (fail-closed)                         | Shim test for missing-node branch                                                      |
+| Project-root realpath              | `realpath(cli).startsWith(realpath(CLAUDE_PROJECT_DIR))` defends symlink-out                              | Forged CLI path inside `node_modules` defeats CLI-resolver       | Codex round 5 F2 closure + corpus                                                      |
+| OS realpath semantics              | `node:fs.realpathSync` resolves symlinks consistently with the kernel; macOS `/var` ↔ `/private/var` aliasing handled via the rea_resolved_relative_form helper | Path-traversal escape                                              | helix-021 closure + corpus                                                              |
+| `@bookedsolid/rea` package install | `node_modules/@bookedsolid/rea/package.json#name === "@bookedsolid/rea"` AND realpath stays in project   | Supply-chain compromise — see §8.3                                | npm provenance; opt-in `policy.review.cli_sha256` (deferred to future minor)          |
+
+The scanner does NOT trust:
+
+- The Bash command string itself — every input is parsed with a
+  hostile-input-tolerant parser and walked with a deny-by-default
+  visitor.
+- `REA_NODE_CLI` / any environment variable nominating the CLI path
+  (codex round 1 F-3 + round 2 R2-3 — env-var hijack class dropped).
+- The CLI exit code alone — the shim re-parses verdict JSON via
+  `node -e` and cross-checks exit code matches verdict (round 1 F-3).
+- The visitor's per-`Cmd`-kind enumeration — replaced with `syntax.Walk`
+  in round-6 (round 6 closure: walker-dispatch field-omission is
+  structurally impossible).
+- mvdan-sh's `syntax.Walk` to visit every Word-bearing field — Class O
+  contract test pins reach (round-7 closure).
+- `unshellEscape` to handle every DQ-escape sequence — bash spec
+  enumerated and pinned by Class P corpus (round-8 closure).
+
+### 8.2 Bypass classes structurally impossible
+
+- **walker dispatch field-omission is structurally impossible**, and
+  **mvdan-sh `syntax.Walk` field gaps are pinned by a contract test**
+  (0.23.0 round-6 + round-7 layered closure).
+
+  Round 6 — our own dispatch. Pre-refactor `walkForWrites` dispatched
+  on AST `Cmd` kinds via an explicit `case` ladder
+  (`case 'WhileClause':`, `case 'ForClause':`, …) and manually
+  enumerated which fields each kind traversed. Any field NOT
+  enumerated in a case branch was silently dropped — that pattern
+  produced six rounds of P0 bypasses (rounds 1-5 patched detection
+  gaps; round 6 closed the structural class). Round 6 found two P0s
+  in the same class as round 5 (`WhileClause.Cond`,
+  `ForClause.CStyleLoop.{Init,Cond,Post}`) and the convergence ladder
+  34→14→9→8→5→2 demonstrated the walker would never reach 0 with
+  patches alone — it was structurally a denylist over AST shapes.
+  The new walker uses `mvdan-sh`'s built-in `syntax.Walk(node, visit)`
+  which traverses every Cmd-kind dispatch exhaustively from OUR side.
+  Our dispatch is preserved (per-utility cp/mv/sed/find/etc.), but the
+  TRAVERSAL is no longer a denylist of OUR shapes. A new `Cmd` type
+  added to mvdan-sh, or a new field on an existing type, reaches OUR
+  dispatcher when Walk descends into its inner Stmts / CallExprs /
+  BinaryCmds.
+
+  Round 7 — Walk's own field gaps. Codex round 7 (P0) flagged that
+  the round-6 framing "Walk visits every field" was overclaim:
+  mvdan-sh@0.10.1's `syntax.Walk` itself has empirically-verified
+  field gaps. Specifically, `ParamExp.Slice.Offset` and
+  `ParamExp.Slice.Length` (Word nodes that can hold CmdSubst payloads)
+  are NOT visited. Pre-fix this defeated 17 round-7 PoCs including
+  `${X:$(rm)}`, `${X:0:$(rm)}`, `${arr[@]:$(rm)}`, `${@:$(rm)}` —
+  every paramexp-slice form bypassed every detector. That made
+  0.23.0 a regression vs 0.22.0 (whose bash regex caught
+  `${X:$(rm)}` directly). Round-7 closure layers on round-6:
+
+  1. Tactical fix: `walkForWrites` declares its visitor up front and
+     manually re-enters `syntax.Walk` on `ParamExp.Slice.Offset` /
+     `Slice.Length` whenever the visitor sees a ParamExp. The
+     re-entry uses the SAME visitor, so nested ParamExp.Slice forms
+     (e.g. `${X:${Y:$(rm)}}`) recurse correctly.
+  2. Structural pin: the **Class O exhaustiveness contract test**
+     (`__tests__/hooks/bash-scanner/walker-exhaustiveness.contract.test.ts`)
+     enumerates every named (node-type, field) Word-bearing position
+     mvdan-sh's parser populates and asserts the walker reaches each
+     one. If mvdan-sh@0.11.0+ adds a new node-with-Word-field that
+     Walk skips, the contract fails CI before runtime. The fix in
+     that case is always a one-line manual recursion in the visit
+     callback (same pattern as `recurseParamExpSlice`).
+
+  Combined: walker-dispatch field-omission bugs in OUR code are
+  structurally impossible (Walk-based traversal). Walk's own field
+  gaps are pinned by Class O. New mvdan-sh versions cannot silently
+  introduce new bypass classes — they fail the contract first.
+- segment-splitter mis-detection (helix-014/015/016) — there is no
+  segmenter to bypass.
+- shell-redirect ordering vs argv ordering ambiguity — the parser
+  attaches `Redirs` to the right `Stmt`, including FuncDecl Body
+  Stmts (codex round 1 F-1).
+- nested-shell payload bypass (helix-017 #2 / helix-022 #3) —
+  `bash -c PAYLOAD` re-parses the payload up to a depth cap of 8.
+- `find -exec bash -c` re-wrap (codex round 1 F-4) — inner argv
+  routes through `detectNestedShell` for re-parse.
+- combined flag-cluster bypass (`bash -ic`, `node -pe`, `perl -E`,
+  codex round 1 F-13/F-8) — the eval-flag scanner accepts any
+  short-flag cluster containing the eval char.
+- backslash-escape bypass (codex round 1 F-15) — normalize strips
+  bash's runtime backslash collapse.
+- dangling-symlink bypass (codex round 1 F-2) — `lstat`+`readlink`
+  resolves the link manually.
+- REA_NODE_CLI hijack (codex round 1 F-3, codex round 2 R2-3) — env
+  var dropped entirely. The 4-tier resolver was further narrowed in
+  codex round 4 Finding 2: tiers 1 (`command -v rea` PATH lookup) and
+  2 (`node_modules/.bin/rea` symlink) were DROPPED because both are
+  workspace-attacker-controllable. The shim now uses a 2-tier sandboxed
+  resolver (`node_modules/@bookedsolid/rea/dist/cli/index.js` or
+  `dist/cli/index.js`). Workspace-bin attacker hijack via fake `rea`
+  binary at `node_modules/.bin/rea` is closed. The structural-impossibility
+  claim is bounded — see §8.3 for the supply-chain residual.
+- symlink-out-of-project sandbox bypass (codex round 5 F2 — P0) — pre-fix
+  the realpath check only walked up looking for a `package.json` with
+  `name === "@bookedsolid/rea"`. An attacker who could write a symlink
+  at `node_modules/@bookedsolid/rea` pointing to `/tmp/sym-attacker/`
+  containing a forged `package.json` + a forged `dist/cli/index.js` that
+  exits 0 with `{"verdict":"allow"}` defeated the sandbox. Fix: PRIMARY
+  check is `realpath(cli).startsWith(realpath(CLAUDE_PROJECT_DIR) + sep)`;
+  any escape-out-of-project realpath refuses. The pkg.json walk-up
+  remains as the SECONDARY check guarding intra-project hijacks.
+- assignment-side cmdsubst silent bypass (codex round 5 F1 — P0) —
+  `FOO=$(rm -rf .rea)`, `X=\`rm -rf .rea\``, `export FOO=$(rm)`,
+  `readonly X=$(rm)`, `local`/`declare`/`typeset`, `ARR=( $(rm) )`,
+  `[[ -n $(rm) ]]`, `case $(rm) in *) ;; esac`, `cat <<< $(rm)`,
+  `read X < <(rm)`, `(( $(rm | wc -l) ))`, `for x in $(rm)`. Pre-fix the
+  walker short-circuited at `args.length === 0` and ignored
+  `CallExpr.Assigns`; the AST cases `DeclClause`, `TestClause`,
+  `ArithmCmd`, `LetClause`, `SelectClause` and `CaseClause.Word` were
+  dropped at the walkCmd default. Stmt.Redirs's Word also wasn't walked
+  for embedded CmdSubst on read ops (here-string `<<<` 0x3f, procsubst-
+  on-stdin `< <(...)` 0x38). Fix: new `walkAssignsForSubstNodes` walks
+  every Assign.Value / Assign.Array.Elems[*].Value / Assign.Index for
+  embedded CmdSubst/ProcSubst/ArithmExp; new `walkTestExpr` recurses
+  through UnaryTest/BinaryTest/ParenTest leaves; walkCmd cases added for
+  every dropped clause type; extractStmtRedirects walks the Word for
+  cmdsubst regardless of operator.
+- mixed-quote interpreter shell-out (codex round 5 F3 — P1) — pre-fix
+  the per-language `*_SHELL_OUT_RE` patterns used `["']([^"']+)["']` for
+  the inner-cmd capture, which truncated bodies whose source contained
+  the alternate quote (e.g. `os.system('rm "x"')` captured `rm `). Fix:
+  quote-aware variants `(["'])((?:(?!\1)[^\\]|\\.)+)\1` for python /
+  ruby / node / perl, plus a fail-closed shell-out fallback that emits a
+  dynamic detection when the payload contains a shell-out API token but
+  no shell-out regex extracted a clean payload.
+- chained-interpreter multi-level escape bypass (codex round 5 F4 — P1)
+  — pre-fix `python -c "import os; os.system('node -e \"require(\\\"fs
+  \\\").rmSync(\\\".rea\\\", ...)\"')"` allowed because each layer
+  accumulates a `\\\"` shell-escape level and the per-language path-
+  quote regex rejects `(\\"` after the call paren. Fix: when a shell-
+  out body itself contains a known interpreter binary head followed by
+  an eval flag (`-c`/`-e`/`--eval`/`-pe`/`-ic`), emit a dynamic
+  detection (`looksLikeChainedInterpreter`). Refuse on uncertainty.
+- non-string `tool_input.command` (codex round 1 F-31) — refused at
+  CLI input parse.
+- absolute / relative-path command head (codex round 2 R2-14) —
+  basename-normalized before dispatcher switch; `/usr/bin/bash`,
+  `./sed`, `/usr/bin/env bash` all dispatch identically to the
+  bare-name form.
+- decoupled-variable interpreter writes (codex round 2 R2-1) —
+  flat-scan over the payload: write API + any string-construction
+  primitive → dynamic detection.
+- symlink cycles / deep chains (codex round 2 R2-2) — visited-set +
+  depth cap (32); cycle/cap returns sentinel that maps to "refuse on
+  uncertainty".
+- joined `-t<DIR>` form (codex round 2 R2-4) — cp/mv/install/ln all
+  recognize the no-space form.
+- tar `-C DIR`, rsync DEST, curl `-o`, wget `-O`, shred FILE,
+  eval payload, git checkout/restore/reset path (codex round 2 R2-7
+  through R2-13) — each utility now has a dedicated dispatcher.
+- heredoc-into-shell (codex round 2 R2-12) — `bash <<EOF\n…\nEOF`
+  re-parses the heredoc body and walks the inner AST.
+- eval re-parse (codex round 2 R2-13) — argv concat → re-parse →
+  walk; refuse on dynamic argv or parse failure.
+- eval ordering with cmdsubst (codex round 3 Finding 1 — P0) —
+  `eval $(cmd)` no longer slips through the empty-inner short-circuit;
+  any-dynamic-argv emits a dynamic detection.
+- pipe-into-bare-shell (codex round 3 Finding 2 — P1) — `cmd | bash`
+  with no `-c` is refuse-on-uncertainty.
+- tar cluster `-xzfC` (codex round 3 Finding 3 — P1) — value-bearing
+  cluster chars consume subsequent argv tokens correctly.
+- git top-level value-bearing flags (codex round 3 Finding 4 — P1) —
+  `-C`, `-c`, `--git-dir`, `--work-tree`, etc. are walked past before
+  identifying the subcommand.
+- python shell-out shapes (codex round 3 Finding 5 — P1) —
+  `subprocess.* shell=True` and `subprocess.run(..., stdout=open())`
+  re-parse the inner shell.
+- recursive directory delete bypass (codex round 4 Finding 1 — P0) —
+  `rm -rf .rea`, `rmdir .rea`, `find .rea -delete`, `shutil.rmtree(...)`,
+  `fs.rmSync(..., {recursive:true})`, `FileUtils.rm_rf(...)` etc. all
+  flag isDestructive on emit; the matcher's protected-ancestry path
+  treats writes against an ancestor directory as hits on every protected
+  pattern under it. Structurally closed: `PROTECTED_DIR_ANCESTORS` was
+  added to the corpus generator so the cross-product produces directory-
+  shaped destructive fixtures, eliminating the structural gap that
+  prevented detection.
+- mv source-side bypass (codex round 4 Finding 3 — P1) — `mv` source
+  positionals are emitted as destructive writes too (mv removes content
+  at the source).
+- find -delete unmodeled (codex round 4 Finding 4 — P1) — seed paths
+  are emitted as destructive write targets; with `-name PREDICATE`
+  present, the seed is emitted as dynamic+destructive (refuse on
+  uncertainty).
+- interpreter shell-out breadth (codex round 4 Finding 5 — P1) — perl
+  exec/open-pipe, ruby Open3 / IO.popen, node spawn-with-bash-c, python
+  pty.spawn, opaque-spawn APIs (os.spawnv* / os.execv*) all detected
+  with re-parse-or-refuse.
+- pathlib & File-class destructive APIs (codex round 4 Finding 6 — P1)
+  — Path(...).touch / .unlink / .rmdir / .rename, File.delete /
+  File.unlink / File.rename, ruby `open(F, 'w')` (bare), perl unlink /
+  rename all caught with isDestructive plumbed through where the API
+  semantic is removal.
+- misc utility writes (codex round 4 Finding 7 — P1) — `patch`, `sort
+  -o`, `shuf -o`, `gpg --output`, `split <PREFIX>`, `trap "cmd" SIGNAL`
+  (re-parse trap command), `git config --file` all detected.
+- procsubst-feeding-bash (codex round 4 Finding 7 — P1) — `bash <(cmd)`,
+  `bash 0< <(cmd)`, `bash <<< "cmd"` all emit dynamic detections; the
+  shell reads the FIFO/here-string as a script we cannot statically
+  resolve.
+- nested-shell DQ-escape parity (codex round 8 P0) — `unshellEscape`
+  pre-fix collapsed only `\"` and `\'` from DQ payloads. Bash spec
+  collapses 5 DQ-significant escape sequences (`\$`, `` \` ``, `\"`,
+  `\\`, `\<newline>`). Pre-fix `bash -c "echo \"\$(rm .rea/HALT)\""`
+  was a verified end-to-end exploit: the real shell collapsed `\$` →
+  `$`, evaluated the CmdSubst, and deleted HALT, while the walker's
+  re-parse saw `\$` as a literal `$` (no CmdSubst child) and ALLOWED.
+  Fix: widened `unshellEscape`'s replace class to all five DQ-significant
+  escape characters. Class P corpus (≥560 fixtures across 5 shells × 16
+  DQ-escape shapes × 7 protected targets, plus 8 negatives) pins the
+  closure. Class O contract (round-7) was simultaneously tightened —
+  the lenient `|| w.dynamic` acceptance was replaced with opt-in
+  `acceptDynamic` per row, so contract-test passes can no longer mask
+  walker gaps via unrelated `nested_shell_inner` dynamic emits.
+- wrapper-shell-exec class (codex round 9 F1 + round 10 P1) —
+  `<wrapper> <shell> -c PAYLOAD` shape where the wrapper transparently
+  forks/execs the next argv as the "real" command (`nice`, `timeout`,
+  `chronic`, `parallel`, `watch`, `dbus-launch`, ... and unbounded
+  future similar wrappers). Pre-round-9 `stripEnvAndModifiers` ignored
+  these wrappers, so the head-dispatch saw the wrapper name and missed
+  the inner `<shell> -c PAYLOAD`. Round 9 enumerated 21 wrappers; round
+  10 surfaced 5 more — clear evidence the enumeration approach was
+  unbounded. Round-10 closure is **structural**: a new
+  `detectWrappedNestedShell` pass runs in `walkCallExpr`'s `default:`
+  case (head not in dispatcher's allow-list) and detects the bypass
+  shape `<UNRECOGNIZED-HEAD> [...flags...] <KNOWN-SHELL> -c PAYLOAD`
+  REGARDLESS of wrapper identity. Synthesizes a `[shell, -c, PAYLOAD,
+  ...]` slice and re-dispatches through `detectNestedShell`. False-
+  positive guards (a) skip when head is an introspection / output
+  utility (`echo`, `printf`, `man`, `which`, ...) and (b) skip when
+  argv[1] is itself an introspection head — covers
+  `<wrapper> echo bash` shapes. Three-token lookahead window between
+  shell positional and `-c` flag bounds false-positive risk. Bare-
+  shell-without-`-c` form refuses on uncertainty (stdin read).
+  Closes the bug class — every future unknown wrapper that
+  fork/execs a shell is caught without enumeration. Round 10 also
+  added explicit enumerations for `chronic`/`dbus-launch`/`watch`/
+  `script -c`/`parallel ::: ` for clean dispatch (no
+  refuse-on-uncertainty banner). Class S (233 wrapper-extension
+  positives + 38 negatives) and Class T (314 synthetic-wrapper
+  structural-guard positives + 29 false-positive-guard negatives)
+  pin the closure.
+- find-exec placeholder, git history-rewrite seams, archive
+  extraction, parallel-stdin, more wrappers, php (codex round 11
+  F11-1..F11-7) — seven INDEPENDENT classes against the round-10
+  wrapper closure. None were variants of the wrapper family;
+  each landed in a different parser seam. (a) `find . -name HALT
+  -exec rm {} \;` — `{}` is a placeholder substituted at runtime
+  by find against the live filesystem; static analysis cannot
+  resolve which paths it expands to. Round-11 fix: synthetic
+  `find_exec_placeholder_unresolvable` dynamic detection emitted
+  whenever inner argv has `{}` AND the inner head is not in a
+  small read-only allow-list (`cat`, `grep`, `head`, `wc`, etc.).
+  (b) `git rm -f .rea/HALT` and `git mv .rea/HALT /tmp/x` were
+  not in the `TRACKED` subcommand set; round-11 added explicit
+  branches with `--cached` carve-out for `git rm`. (c) `git
+  filter-branch --tree-filter PAYLOAD` and `git rebase --exec`
+  / `-x` / `git bisect run` / `git commit --template=PATH` were
+  re-parse seams where git feeds PAYLOAD through `/bin/sh -c` at
+  runtime; round-11 added per-subcommand handlers feeding PAYLOAD
+  through `recurseShellPayload` → `parseBashCommand` →
+  `walkForWrites` (full top-level walker re-dispatch). (d)
+  archive extraction: `tar -xf x.tar -C . .rea/HALT` extracts the
+  protected member; `tar -xzf x.tgz` (no `-C`, no member list)
+  extracts every member — archive may contain `.rea/HALT`.
+  Round-11 fix: `detectTar` extended with extract-mode positional
+  harvesting, plus new `detectUnzip`/`detect7z`/`detectGzip`/
+  `detectPax` dispatchers. `bsdtar` aliases to `tar`. When -x is
+  set with no `-C` AND no explicit members, emit
+  `archive_extract_unresolvable`. (e) `echo .rea/HALT | parallel
+  rm` reads input from stdin (no `:::`); round-11 added pre-strip
+  detection in `walkCallExpr` that emits
+  `parallel_stdin_unresolvable` when parallel head has positional
+  template tokens AND no `:::`/`::::`/`:::+`/`::::+` separator.
+  (f) `fakeroot`/`flock`/`gtimeout`/`unshare`/`env --chdir=`/
+  `sudo -s --` were not stripped by `stripEnvAndModifiers`;
+  round-11 added each wrapper with appropriate flag arity
+  handling, plus shell-mode `sudo -s --` synthesis to `sh -c
+  PAYLOAD`. (g) `php -r CODE` was missing from interpreter
+  dispatch; round-11 added `PHP_EVAL_FLAGS` (-r, --run) and
+  `PHP_WRITE_PATTERNS` covering `unlink`/`file_put_contents`/
+  `rename`/`copy`/`fopen` (write modes)/`mkdir`/`rmdir`/`touch`/
+  `chmod`/`chown`/`chgrp`/`symlink`/`link`/`move_uploaded_file`.
+  Class U (round-11 find/git/archive/parallel — 360 positives +
+  17 negatives) and Class V (round-11 wrappers + PHP — 124
+  positives + 8 negatives) pin the closure.
+- adjacent-utility / cumulative-parity gaps (codex round 12
+  F12-1..F12-9 — nine INDEPENDENT findings against the round-11
+  surface). Not variants of any prior round; each landed in
+  PHP / archive-create / cmake / mkfifo+mknod / find-write-
+  predicate space where round-11 had not applied the cumulative
+  discipline established by earlier rounds. (a) F12-1 P0:
+  PHP `rename(SRC, DEST)` SOURCE-side blindspot — round-4 F3
+  established mv-shape source IS destructive; round-11 bundled
+  PHP rename with the destination-only group, so SRC slipped
+  past. Round-12 fix: split rename into TWO patterns + add
+  `rename(` to DESTRUCTIVE_API_TOKENS. (b) F12-2 P0: PHP
+  `rmdir(PATH)` not flagged destructive — bundled with mkdir/
+  touch (creates), so protected-ancestry never matched. Round-12
+  fix: split rmdir + add `rmdir(` to DESTRUCTIVE_API_TOKENS.
+  (c) F12-3 P0: PHP shell-out missing entirely —
+  `pickShellOutPatternsFor` had no php_r_path case. Round-12
+  fix: new PHP_SHELL_OUT_RE with quote-aware backref body
+  extraction covering system / exec / shell_exec / passthru /
+  popen / proc_open / backtick. (d) F12-4 P0: PHP -B/-E /
+  --process-begin / --process-end accept CODE same as -r;
+  round-11 PHP_EVAL_FLAGS only had -r/--run. Round-12 fix:
+  extend exactLong + shortChars (case-sensitive uppercase).
+  (e) F12-5 P0: archive CREATE direction missing — only EXTRACT
+  was checked. `tar -cf .rea/policy.yaml docs/`, `zip
+  .rea/policy.yaml docs/file`, `7z a .rea/policy.yaml docs/`
+  all silently overwrote the OUTPUT archive at the protected
+  path. Round-12 fix: detectTar gains isCreateOrAppend pass +
+  -f/-cf/--file emit; detect7z gains a/u/d compress branch;
+  new detectZip dispatcher (zip OUTPUT.zip [files...]).
+  (f) F12-6 P1: cmake -E utility surface — rm/remove/rename/
+  copy/copy_if_different/copy_directory/touch/remove_directory/
+  create_symlink/create_hardlink/make_directory all slipped past
+  pre-fix. Round-12 fix: new detectCmake with per-subcommand
+  argv shapes (cp-shape, mv-shape, variadic, second-positional).
+  (g) F12-7 P1: mkfifo / mknod create special files at protected
+  paths; no dispatchers existed. Round-12 fix: new detectMkfifo
+  (variadic) and detectMknod (NAME is first bare positional).
+  (h) F12-8 P1: find write-predicates -fls / -fprint / -fprintf
+  not in detectFind. Round-12 fix: scan for these predicates
+  and emit FILE as destructive write target (-fprintf consumes
+  TWO args). (i) F12-9 P2 false-positive regression: detectUnzip
+  emitted dynamic unresolvable for read-only flags `-p` (extract
+  to stdout), `-l/-Z/-t/-v/-z` (list/test/verbose/comment).
+  Round-12 fix: early-return ALLOW from detectUnzip when any
+  read-only flag (or cluster char) present. Class W (round-12
+  closures — 173 positives + 18 negatives) pins the closure.
+
+### 8.3 Bypass classes still possible
+
+- **`@bookedsolid/rea` package-tier supply-chain compromise** (codex
+  round 5 F5 — P1/P3 acknowledged residual). The bash-tier shim's
+  CLI-resolution sandbox check (codex round 4 #2 + round 5 F2)
+  defeats node_modules-symlink-out and workspace-bin hijack. It does
+  NOT defeat an attacker who can write a forged
+  `node_modules/@bookedsolid/rea/dist/cli/index.js` *and* a matching
+  `node_modules/@bookedsolid/rea/package.json` with `name ===
+  "@bookedsolid/rea"` directly inside the project's `node_modules/`.
+  Such an attacker has already compromised the package install
+  pipeline (e.g. via a compromised lockfile / dependency-confusion
+  attack / npm registry compromise). At that level the attacker can
+  also forge any other dependency the agent uses, so hook-tier defense
+  is past — the trust boundary is the `npm install` provenance check
+  (npm provenance + manifest verification) rather than the bash gate.
+  Hardening (opt-in): operators may set `policy.review.cli_sha256: <hex>`
+  in `.rea/policy.yaml` and the shim will refuse if the resolved CLI's
+  SHA-256 does not match. Defaults to unset; documented as an opt-in
+  belt-and-braces measure rather than a structural defense (see
+  `docs/architecture/bash-scanner.md` for the full rationale).
+- **`git checkout REVISION PATH` and `git restore --source=REVISION
+  PATH` without the POSIX `--` argv separator** (codex round 9 F3 —
+  accepted false negative since 0.22.0). When an attacker invokes
+  `git checkout main .rea/HALT` (or `git restore --source=HEAD~1
+  .rea/policy.yaml`), git's pre-`--` argv shape is structurally
+  ambiguous between "REVISION PATH" and "PATH...". The `detectGit`
+  walker conservatively treats positionals after the subcommand as
+  destructive-overwrite targets ONLY when `--` is present, because
+  disambiguation requires a runtime ref-existence check that the
+  static walker cannot perform without filesystem I/O. Workaround:
+  the kill-switch invariants for protected files (`.rea/HALT`,
+  `.rea/policy.yaml`, `.claude/settings.json`, etc.) are still caught
+  by the symlink-resolution layer in `protected-paths-bash-gate.sh`
+  at file-write time when git actually opens the destination for
+  write — the bash-scanner's static layer is one of multiple
+  enforcement points. Pin: 0.24.0 milestone for a comprehensive fix
+  (likely a conservative refusal whenever the first positional
+  matches a known git-revspec shape AND following positionals exist).
+- glob expansion in argv-based commands (`chmod +x bin/*.sh` on a
+  filesystem where `bin/.rea` exists). Glob detection is scoped to
+  redirect-form targets only because argv-globs in legitimate code
+  are common. Future: enumerate filesystem-level glob matches.
+- awk `-f script-file` body. We currently emit a dynamic detection
+  (refuse on uncertainty). Future: read + scan the file.
+- semantic obfuscation via `${!ind}` indirect expansion, `read -p`
+  prompts, computed-property attacks in interpreter payloads that
+  evade the flat-scan heuristic. These are parse-correct and the
+  detector is best-effort.
+- WASM `sh-syntax` migration risk: parser bugs in the new library
+  could reopen bypass classes. Mitigated by the corpus fixture
+  suite (every closed bypass replays as a positive regression
+  test).
+- **Round-13 deferred to 0.24.0** (utility-enumeration completeness
+  — same shape as round 12; convergence at this tier is asymptotic
+  per codex's explicit assessment):
+    1. **PHP indirect-callable shell-out** —
+       `array_map("system", [...])`, `call_user_func("system", ...)`,
+       `eval("system(...);")`, variable-bound callable
+       `$f = "system"; $f(...)`. Round 12 closed direct calls;
+       indirect callable forms remain.
+    2. **vim/emacs editor exec re-parse seam** — `vim -c "!cmd"`,
+       `vim -c "w PATH"`, `vim -c "source PATH"`, `emacs --eval
+       "(shell-command \"...\")"`, `emacs --eval "(delete-file
+       \"...\")"`. No vim/emacs dispatcher in 0.23.0.
+    3. **Standalone compression utilities** — `xz -o FILE`,
+       `zstd -o FILE`, `lz4 INPUT FILE`, `lzma -o FILE`. Round 12
+       closed tar/zip/7z/cpio/pax create-direction; standalone
+       compression family adjacent.
+    4. **Image-builder utilities** — `mksquashfs INPUT OUTPUT`,
+       `genisoimage -o OUTPUT`, `mkisofs -o OUTPUT`, `xorriso
+       -outdev OUTPUT`. CI/build pipelines use these.
+    5. **`7zz` Linux-canonical 7zip alias** — `detect7z` only fires
+       on `7z`; the official Linux package binary is `7zz`.
+    6. **Python argv-form subprocess** — `subprocess.Popen(['rm',
+       '...'])`, `subprocess.run(['rm', '...'])` etc. without
+       `shell=True`. Round 3 F5 closed `shell=True` form;
+       argv-list form still allows.
+    7. **vim ex-mode literal-path write** (P2) — `vim -c "w PATH"`
+       writes literally with PATH in argv, regex-level miss
+       independent of the broader `-c` re-parse seam.
+- **Denylist scanner is structurally limited** (acknowledged by
+  codex round 4 and reaffirmed by codex round 13: "convergence on
+  enumeration completeness is asymptotic — every round will probably
+  find more"). A denylist enumerates the destructive shapes the
+  scanner knows. Novel shapes (interpreters or utilities not yet
+  modeled, language constructs we haven't seen) can in principle
+  bypass until added. Defense in depth:
+    1. mvdan-sh AST parsing eliminates an entire class of regex/
+       segmenter mistakes.
+    2. Comprehensive walker dispatchers per known destructive utility +
+       per known shell-out + per known interpreter API.
+    3. Adversarial corpus generators span the parameter cross-product
+       so generators produce shapes Codex hasn't visited.
+    4. Per-round Codex review surfaces gaps before release; the
+       convergence ladder
+       (round 1 → round 2 → round 3 → round 4 → round 5 ...) is the
+       audit trail.
+    5. Fail-closed defaults: dynamic targets always block.
+  An allowlist scanner ("only known-safe commands pass") would close
+  this class structurally but is incompatible with the rea use case
+  (agentic workflows need arbitrary bash access).
+
+### 8.4 Test surface
+
+The fixture corpus at
+`__tests__/hooks/bash-tier-corpus.test.ts` (≥185 entries) and
+`__tests__/hooks/bash-tier-corpus-round2.test.ts` (≥186 entries,
+codex round 2 bypass-class fixtures) locks every documented bypass
+class as a regression-positive test.
+The walker unit tests at `__tests__/hooks/bash-scanner/walker.test.ts`
+pin the parser-emitted RedirOperator codes (codex round 1 F-33) so a
+parser-library bump that re-numbers them fails LOUDLY. The verdict-
+shape snapshot at `__tests__/hooks/bash-scanner/verdict-shape.test.ts`
+locks the wire format for the bash shim consumers.
+
+The cross-product corpus at
+`__tests__/hooks/bash-scanner/adversarial-corpus.test.ts` runs ≥7700
+fixtures across 18 classes (A–P plus extensions). Coverage assertion:
+≥3000 positive (must-block) and ≥1000 negative (must-allow) fixtures.
+
+The Class O exhaustiveness contract test at
+`__tests__/hooks/bash-scanner/walker-exhaustiveness.contract.test.ts`
+pins the walker reach across every Word-bearing AST position
+mvdan-sh's parser populates. Round-8 tightened the acceptance to
+path-explicit-by-default; opt-in `acceptDynamic` per row is the only
+way to accept a `dynamic: true` write as proof-of-reach.
+
+The bash-shim subprocess sampling at
+`adversarial-corpus.test.ts > "bash shim subprocess sampling"`
+spawns the actual hook script under a clean env across 100
+deterministically-sampled fixtures, parses verdict JSON, and
+cross-checks against in-process scan. Catches drift between the
+in-process verdict and what the shim's JSON verifier + 4-tier
+resolver chain actually returns.
+
+### 8.5 Defense in depth
+
+The bash gate is one layer. The full defensive stack:
+
+1. **Parser AST** (`mvdan-sh@0.10.1`) — eliminates regex/segmenter
+   tokenization mistakes.
+2. **Walker** (`syntax.Walk`-based deny-by-default traversal +
+   `recurseParamExpSlice` for Walk gaps) — visits every node type;
+   no Cmd-kind branch can silently drop a field.
+3. **Per-utility dispatchers** — comprehensive coverage of cp, mv,
+   sed, dd, tee, install, ln, awk, ed, ex, find, xargs, node,
+   python, ruby, perl, tar, rsync, curl, wget, shred, eval, git,
+   patch, sort, shuf, gpg, split, trap, bash/sh/zsh/dash/ksh.
+4. **Interpreter scanners** — write-API tokens for node fs, python
+   os/shutil/subprocess, ruby Pathname/FileUtils, perl unlink/rename;
+   shell-out re-parse for `system`/`subprocess.run shell=True`/`qx`/
+   backticks.
+5. **DQ-escape parity** — `unshellEscape` collapses all 5 DQ-significant
+   escapes (round-8) so re-parser sees the same syntax tree as bash.
+6. **Symlink resolver** — visited-set + depth cap (32); refuses on
+   cycle/cap; macOS `/var` ↔ `/private/var` aliasing handled by
+   `rea_resolved_relative_form` (helix-021).
+7. **2-tier sandboxed CLI resolver** — only
+   `node_modules/@bookedsolid/rea/dist/cli/index.js` and
+   `dist/cli/index.js` accepted; `realpath` containment check
+   refuses any escape from `CLAUDE_PROJECT_DIR`.
+8. **Verdict JSON verifier** — shim re-parses CLI output via
+   `node -e` and cross-checks exit code ↔ verdict (round-1 F-3).
+9. **Cross-product corpus** (Classes A–P) — ≥7700 fixtures span the
+   parameter space so generators produce shapes the round-by-round
+   manual review hadn't visited.
+10. **Class O exhaustiveness contract** — pins every Word-bearing
+    AST position so mvdan-sh upgrades cannot silently introduce
+    Walk-skip bypasses.
+11. **Codex adversarial review** — every release goes through
+    `/codex-review` before merge; convergence ladder is the audit
+    trail. 0.23.0 round count: 8 (and counting).
+12. **Middleware audit log** — every tool invocation is hash-chained
+    in `.rea/audit.jsonl` (append-only, tamper-evident).
+13. **Codex push-gate** (0.11.0+) — pre-push stateless review by
+    GPT-5.4 (codex-auto-review) catches semantic concerns the static
+    scanner cannot reason about.
+14. **Husky 9 hook chain** — `commit-msg`, `pre-push`, `pre-commit`
+    register every hook in the package; consumers can extend via
+    `.husky/{commit-msg,pre-push,pre-commit}.d/*` (helix-018 Option B).
+
+A bypass requires defeating multiple layers simultaneously. The
+trust boundary between this stack and the rest of the system is
+package-tier integrity (npm provenance + manifest verification).
+
+### 8.6 Out of scope
+
+The bash gate explicitly does NOT defend against:
+
+- **Kernel-level / LD_PRELOAD / ptrace attacks.** The OS kernel and
+  loader are trusted. An attacker with code execution at that tier
+  bypasses every userland defense.
+- **Network-tier MITM during package install.** rea trusts the npm
+  registry (with provenance verification) and the system's TLS root
+  store. A compromised TLS chain at `npm install` time gives the
+  attacker the same authority as the package itself.
+- **Supply-chain compromise of `@bookedsolid/rea` on npm.** A signed
+  release with malicious code defeats the gate because the gate IS
+  the malicious code. Mitigation is npm provenance + manifest
+  verification + (opt-in) `policy.review.cli_sha256`. See §8.3.
+- **Out-of-band file modifications.** rea gates Bash tool calls and
+  Write/Edit/MultiEdit Write-tier hooks. Filesystem changes initiated
+  outside the harness (user editing files directly, language server
+  edits, other processes) are not gated.
+- **Read-side policy leaks.** The bash gate concerns WRITES. Reading
+  `.rea/policy.yaml` is allowed by default — the policy is checked-in
+  and visible. `env-file-protection.sh` handles `.env*` reads at the
+  Write tier; bash-tier coverage of `.env*` reads is via
+  `dependency-audit-gate.sh` and the segmenter for those forms.
+- **Attacker-controlled PATH at scanner runtime.** If `rea` resolves
+  to an attacker binary on PATH, the gate is defeated. Production
+  deployments pin PATH via the harness; `rea doctor` verifies PATH
+  integrity at install time but does not enforce it at runtime.

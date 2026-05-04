@@ -15,7 +15,11 @@ function extractReaSubcommand(command: string): string | null {
   const first = tokens[0];
   if (first === undefined) return null;
   let idx = 0;
-  if (first === 'npx' && tokens.length >= 2 && (tokens[1] === 'rea' || tokens[1] === '@bookedsolid/rea')) {
+  if (
+    first === 'npx' &&
+    tokens.length >= 2 &&
+    (tokens[1] === 'rea' || tokens[1] === '@bookedsolid/rea')
+  ) {
     idx = 2;
   } else if (first === 'rea' || first.endsWith('/rea')) {
     idx = 1;

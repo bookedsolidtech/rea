@@ -154,8 +154,7 @@ export class DownstreamPool {
       // `healthy: false`, which is a worse-than-null diagnostic — operators
       // would read "5 tools reachable" from a server that is reachable
       // through exactly zero tools.
-      const tools_count =
-        connected && healthy && typeof cached === 'number' ? cached : null;
+      const tools_count = connected && healthy && typeof cached === 'number' ? cached : null;
       out.push({
         name,
         enabled: true,

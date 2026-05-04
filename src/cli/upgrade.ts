@@ -48,11 +48,7 @@ import {
   enumerateCanonicalFiles,
   type CanonicalFile,
 } from './install/canonical.js';
-import {
-  buildFragment,
-  extractFragment,
-  type ClaudeMdFragmentInput,
-} from './install/claude-md.js';
+import { buildFragment, extractFragment, type ClaudeMdFragmentInput } from './install/claude-md.js';
 import {
   atomicReplaceFile,
   safeDeleteFile,
@@ -68,15 +64,8 @@ import {
   writeSettingsAtomic,
 } from './install/settings-merge.js';
 import { ensureReaGitignore } from './install/gitignore.js';
-import {
-  manifestExists,
-  readManifest,
-  writeManifestAtomic,
-} from './install/manifest-io.js';
-import {
-  type InstallManifest,
-  type ManifestEntry,
-} from './install/manifest-schema.js';
+import { manifestExists, readManifest, writeManifestAtomic } from './install/manifest-io.js';
+import { type InstallManifest, type ManifestEntry } from './install/manifest-schema.js';
 import { sha256OfBuffer, sha256OfFile } from './install/sha.js';
 import { err, getPkgVersion, log, warn } from './utils.js';
 
@@ -167,7 +156,8 @@ async function migrateReviewPolicyFor0110(
   const updated = newLines.join('\n');
 
   const droppedSummary: string[] = [];
-  if (linesToDrop.size > 0) droppedSummary.push(`dropped ${linesToDrop.size} removed-field line(s)`);
+  if (linesToDrop.size > 0)
+    droppedSummary.push(`dropped ${linesToDrop.size} removed-field line(s)`);
   if (addConcernsBlocks) droppedSummary.push('added concerns_blocks: true');
 
   if (opts.dryRun) {
@@ -186,8 +176,20 @@ async function migrateReviewPolicyFor0110(
 
 type Classification =
   | { kind: 'new'; canonical: CanonicalFile; canonicalSha: string }
-  | { kind: 'unmodified'; canonical: CanonicalFile; canonicalSha: string; localSha: string; entry: ManifestEntry }
-  | { kind: 'drifted'; canonical: CanonicalFile; canonicalSha: string; localSha: string; entry: ManifestEntry }
+  | {
+      kind: 'unmodified';
+      canonical: CanonicalFile;
+      canonicalSha: string;
+      localSha: string;
+      entry: ManifestEntry;
+    }
+  | {
+      kind: 'drifted';
+      canonical: CanonicalFile;
+      canonicalSha: string;
+      localSha: string;
+      entry: ManifestEntry;
+    }
   | { kind: 'removed-upstream'; entry: ManifestEntry };
 
 /**
@@ -273,7 +275,11 @@ async function promptDriftDecision(
       initialValue: 'keep',
       options: [
         { value: 'keep', label: 'keep', hint: 'leave your version untouched (default)' },
-        { value: 'overwrite', label: 'overwrite', hint: `replace with canonical (rea v${getPkgVersion()})` },
+        {
+          value: 'overwrite',
+          label: 'overwrite',
+          hint: `replace with canonical (rea v${getPkgVersion()})`,
+        },
         { value: 'diff', label: 'diff', hint: 'show diff, then re-prompt' },
       ],
     });
@@ -361,10 +367,7 @@ async function classifyFiles(
   // Removed-upstream: in manifest but not in canonical set.
   if (manifest !== null) {
     for (const entry of manifest.files) {
-      if (
-        entry.path === CLAUDE_MD_MANIFEST_PATH ||
-        entry.path === SETTINGS_MANIFEST_PATH
-      ) {
+      if (entry.path === CLAUDE_MD_MANIFEST_PATH || entry.path === SETTINGS_MANIFEST_PATH) {
         continue; // synthetic entries handled separately
       }
       if (!canonicalByPath.has(entry.path)) {
@@ -651,9 +654,7 @@ export async function runUpgrade(options: UpgradeOptions = {}): Promise<void> {
         });
       }
     } else if (c.kind === 'removed-upstream') {
-      const decision = dryRun
-        ? 'skip'
-        : await promptRemovedDecision(c.entry.path, options);
+      const decision = dryRun ? 'skip' : await promptRemovedDecision(c.entry.path, options);
       if (decision === 'delete') {
         console.log(`  - ${c.entry.path} (deleted)`);
         if (!dryRun) {
@@ -725,9 +726,12 @@ export async function runUpgrade(options: UpgradeOptions = {}): Promise<void> {
     console.log('');
     log('dry run — no changes written.');
     const planned =
-      counts.new_ + counts.drifted + counts.removedUpstream +
+      counts.new_ +
+      counts.drifted +
+      counts.removedUpstream +
       (classifications.some((c) => c.kind === 'unmodified' && c.canonicalSha !== c.localSha)
-        ? classifications.filter((c) => c.kind === 'unmodified' && c.canonicalSha !== c.localSha).length
+        ? classifications.filter((c) => c.kind === 'unmodified' && c.canonicalSha !== c.localSha)
+            .length
         : 0);
     console.log(`  ${planned} file action(s) planned.`);
     return;
@@ -764,15 +768,13 @@ export async function runUpgrade(options: UpgradeOptions = {}): Promise<void> {
   log(
     `upgrade complete — ${applied.length} applied, ${skipped.length} skipped, ${errors.length} errors`,
   );
-  console.log(`  manifest: ${path.relative(resolvedRoot, manifestPath)} (v${freshManifest.version})`);
+  console.log(
+    `  manifest: ${path.relative(resolvedRoot, manifestPath)} (v${freshManifest.version})`,
+  );
   if (isBootstrap) {
     console.log('');
-    console.log(
-      'Bootstrap mode: existing files were recorded as-is. The next `rea upgrade`',
-    );
-    console.log(
-      'will compare against the canonical set and surface any legitimate drift.',
-    );
+    console.log('Bootstrap mode: existing files were recorded as-is. The next `rea upgrade`');
+    console.log('will compare against the canonical set and surface any legitimate drift.');
   }
   console.log('');
 }

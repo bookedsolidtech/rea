@@ -14,4 +14,4 @@ blocked_paths:
   - .github/workflows/release.yml
   - .github/workflows/publish.yml
   - tokens/
-notification_channel: ""
+notification_channel: ''

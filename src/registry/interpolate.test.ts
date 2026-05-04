@@ -10,10 +10,7 @@ import { interpolateEnv, SECRET_NAME_HEURISTIC } from './interpolate.js';
 
 describe('interpolateEnv', () => {
   it('returns identity when there are no placeholders', () => {
-    const r = interpolateEnv(
-      { LOG_LEVEL: 'info', REGION: 'us-east-1' },
-      { UNRELATED: 'nope' },
-    );
+    const r = interpolateEnv({ LOG_LEVEL: 'info', REGION: 'us-east-1' }, { UNRELATED: 'nope' });
     expect(r.resolved).toEqual({ LOG_LEVEL: 'info', REGION: 'us-east-1' });
     expect(r.missing).toEqual([]);
     expect(r.secretKeys).toEqual([]);
@@ -31,19 +28,13 @@ describe('interpolateEnv', () => {
   });
 
   it('resolves multiple placeholders in the same value', () => {
-    const r = interpolateEnv(
-      { AUTH: 'Bearer ${A}-${B}' },
-      { A: 'alpha', B: 'beta' },
-    );
+    const r = interpolateEnv({ AUTH: 'Bearer ${A}-${B}' }, { A: 'alpha', B: 'beta' });
     expect(r.resolved.AUTH).toBe('Bearer alpha-beta');
     expect(r.missing).toEqual([]);
   });
 
   it('mixes literal keys and interpolated keys correctly', () => {
-    const r = interpolateEnv(
-      { LOG_LEVEL: 'info', TOKEN: '${X}' },
-      { X: 'resolved' },
-    );
+    const r = interpolateEnv({ LOG_LEVEL: 'info', TOKEN: '${X}' }, { X: 'resolved' });
     expect(r.resolved).toEqual({ LOG_LEVEL: 'info', TOKEN: 'resolved' });
   });
 
@@ -58,18 +49,12 @@ describe('interpolateEnv', () => {
   });
 
   it('deduplicates and orders missing vars by first reference', () => {
-    const r = interpolateEnv(
-      { A: '${FOO}', B: '${BAR}-${FOO}' },
-      {},
-    );
+    const r = interpolateEnv({ A: '${FOO}', B: '${BAR}-${FOO}' }, {});
     expect(r.missing).toEqual(['FOO', 'BAR']);
   });
 
   it('flags secret-named KEY even when the value is a literal', () => {
-    const r = interpolateEnv(
-      { SECRET_KEY: 'literal-value' },
-      {},
-    );
+    const r = interpolateEnv({ SECRET_KEY: 'literal-value' }, {});
     expect(r.resolved.SECRET_KEY).toBe('literal-value');
     expect(r.secretKeys).toEqual(['SECRET_KEY']);
   });
@@ -86,10 +71,7 @@ describe('interpolateEnv', () => {
   });
 
   it('does NOT flag keys whose value has only non-secret references', () => {
-    const r = interpolateEnv(
-      { LOG_LEVEL: '${APP_LOG_LEVEL}' },
-      { APP_LOG_LEVEL: 'debug' },
-    );
+    const r = interpolateEnv({ LOG_LEVEL: '${APP_LOG_LEVEL}' }, { APP_LOG_LEVEL: 'debug' });
     expect(r.resolved.LOG_LEVEL).toBe('debug');
     expect(r.secretKeys).toEqual([]);
   });
@@ -99,21 +81,15 @@ describe('interpolateEnv', () => {
   });
 
   it('rejects var names with invalid characters (space)', () => {
-    expect(() => interpolateEnv({ X: '${SPACE IN NAME}' }, {})).toThrow(
-      /invalid var name/,
-    );
+    expect(() => interpolateEnv({ X: '${SPACE IN NAME}' }, {})).toThrow(/invalid var name/);
   });
 
   it('rejects var names starting with a digit', () => {
-    expect(() => interpolateEnv({ X: '${123STARTS_WITH_DIGIT}' }, {})).toThrow(
-      /invalid var name/,
-    );
+    expect(() => interpolateEnv({ X: '${123STARTS_WITH_DIGIT}' }, {})).toThrow(/invalid var name/);
   });
 
   it('rejects unterminated ${', () => {
-    expect(() => interpolateEnv({ X: '${unterminated' }, {})).toThrow(
-      /unterminated/,
-    );
+    expect(() => interpolateEnv({ X: '${unterminated' }, {})).toThrow(/unterminated/);
   });
 
   it('rejects unterminated ${ even when a later } appears far after', () => {
@@ -121,19 +97,14 @@ describe('interpolateEnv', () => {
     // open followed by stray close looks "balanced" to the naive check.
     // Document the expected behaviour: this is treated as a SINGLE placeholder,
     // which will then fail the VAR_NAME_RE check because of the `\n`/space inside.
-    expect(() =>
-      interpolateEnv({ X: '${oops\nlater}' }, {}),
-    ).toThrow(/invalid var name/);
+    expect(() => interpolateEnv({ X: '${oops\nlater}' }, {})).toThrow(/invalid var name/);
   });
 
   it('does NOT perform a second expansion pass (resolved value stays literal)', () => {
     // If FOO resolves to `${BAR}`, the inner `${BAR}` is a LITERAL in the
     // resolved output — we don't lookup BAR. This is a hard-coded security
     // choice (prevents a hostile env var's contents from triggering extra lookups).
-    const r = interpolateEnv(
-      { X: '${FOO}' },
-      { FOO: '${BAR}', BAR: 'should-not-be-reached' },
-    );
+    const r = interpolateEnv({ X: '${FOO}' }, { FOO: '${BAR}', BAR: 'should-not-be-reached' });
     expect(r.resolved.X).toBe('${BAR}');
   });
 
