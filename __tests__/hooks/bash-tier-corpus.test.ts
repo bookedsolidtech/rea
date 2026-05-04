@@ -1409,3 +1409,164 @@ describe('helix-021 — Bash-tier symlink-bypass parity', () => {
     }
   });
 });
+
+// ─── helix-022 — 5 adjacent Bash-tier bypass classes (0.21.2) ────────────
+describe('helix-022 — adjacent Bash-tier bypass classes (0.21.2)', () => {
+  function makeFixture(setup: (dir: string) => void): { dir: string; cleanup: () => void } {
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'rea-helix-022-'));
+    mkdirSync(path.join(dir, '.rea'), { recursive: true });
+    setup(dir);
+    return { dir, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
+  }
+
+  function runHookCwd(
+    hook: string,
+    dir: string,
+    cmd: string,
+  ): { status: number; stderr: string } {
+    const HOOK = path.join(REPO_ROOT, 'hooks', hook);
+    const payload = JSON.stringify({ tool_input: { command: cmd } });
+    const res = spawnSync('bash', [HOOK], {
+      cwd: dir,
+      env: { PATH: process.env.PATH ?? '', CLAUDE_PROJECT_DIR: dir },
+      input: payload,
+      encoding: 'utf8',
+    });
+    return { status: res.status ?? -1, stderr: res.stderr ?? '' };
+  }
+
+  it('F1 parent-walks: ln -s . linkroot + mkdir + redirect must BLOCK', () => {
+    if (!jqExists()) return;
+    const { dir, cleanup } = makeFixture((d) => {
+      symlinkSync('.', path.join(d, 'linkroot'));
+    });
+    try {
+      const res = runHookCwd(
+        'protected-paths-bash-gate.sh',
+        dir,
+        'mkdir -p linkroot/.husky/sub && printf x > linkroot/.husky/sub/newfile',
+      );
+      expect(res.status).toBe(2);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('F2 node -e fs.writeFileSync(.rea/HALT) must BLOCK', () => {
+    if (!jqExists()) return;
+    const { dir, cleanup } = makeFixture(() => {});
+    try {
+      const res = runHookCwd(
+        'protected-paths-bash-gate.sh',
+        dir,
+        `node -e "const fs=require('fs'); fs.writeFileSync('.rea/HALT','x')"`,
+      );
+      expect(res.status).toBe(2);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('F3 nested 2-level bash -lc payload must BLOCK', () => {
+    if (!jqExists()) return;
+    const { dir, cleanup } = makeFixture(() => {});
+    try {
+      const res = runHookCwd(
+        'protected-paths-bash-gate.sh',
+        dir,
+        `bash -lc "bash -lc 'printf x > .rea/HALT'"`,
+      );
+      expect(res.status).toBe(2);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('F4 cp -f src .rea/HALT (flag form) must BLOCK', () => {
+    if (!jqExists()) return;
+    const { dir, cleanup } = makeFixture((d) => {
+      writeFileSync(path.join(d, 'src'), 'x');
+    });
+    try {
+      const res = runHookCwd('protected-paths-bash-gate.sh', dir, 'cp -f src .rea/HALT');
+      expect(res.status).toBe(2);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('F4 cp a b .husky/pre-push (multi-source) must BLOCK', () => {
+    if (!jqExists()) return;
+    const { dir, cleanup } = makeFixture((d) => {
+      writeFileSync(path.join(d, 'a'), 'x');
+      writeFileSync(path.join(d, 'b'), 'x');
+    });
+    try {
+      const res = runHookCwd('protected-paths-bash-gate.sh', dir, 'cp a b .husky/pre-push');
+      expect(res.status).toBe(2);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('F5 unresolved $-expansion in target must BLOCK with advisory', () => {
+    if (!jqExists()) return;
+    const { dir, cleanup } = makeFixture(() => {});
+    try {
+      const res = runHookCwd(
+        'protected-paths-bash-gate.sh',
+        dir,
+        'p=.rea/HALT; printf x > "$p"',
+      );
+      expect(res.status).toBe(2);
+      expect(res.stderr).toMatch(/unresolved shell expansion/);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('F5 backtick command-substitution in target must BLOCK', () => {
+    if (!jqExists()) return;
+    const { dir, cleanup } = makeFixture(() => {});
+    try {
+      const res = runHookCwd(
+        'protected-paths-bash-gate.sh',
+        dir,
+        'printf x > "`echo .rea/HALT`"',
+      );
+      expect(res.status).toBe(2);
+    } finally {
+      cleanup();
+    }
+  });
+
+  // Regression: must not over-block legitimate paths.
+  it('regression: cp src docs/safe.md (negative — not protected) must ALLOW', () => {
+    if (!jqExists()) return;
+    const { dir, cleanup } = makeFixture((d) => {
+      writeFileSync(path.join(d, 'src'), 'x');
+      mkdirSync(path.join(d, 'docs'), { recursive: true });
+    });
+    try {
+      const res = runHookCwd('protected-paths-bash-gate.sh', dir, 'cp src docs/safe.md');
+      expect(res.status).toBe(0);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('regression: node -e writing /tmp/log (legit external) must ALLOW', () => {
+    if (!jqExists()) return;
+    const { dir, cleanup } = makeFixture(() => {});
+    try {
+      const res = runHookCwd(
+        'protected-paths-bash-gate.sh',
+        dir,
+        `node -e "require('fs').writeFileSync('/tmp/rea-helix-022-allow.log','x')"`,
+      );
+      expect(res.status).toBe(0);
+    } finally {
+      cleanup();
+    }
+  });
+});
