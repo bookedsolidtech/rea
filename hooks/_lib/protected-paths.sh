@@ -45,6 +45,10 @@ REA_PROTECTED_PATTERNS_FULL=(
   '.husky/'
   '.rea/policy.yaml'
   '.rea/HALT'
+  # 0.19.0 security review C1: the verdict cache is a security boundary
+  # since 0.18.1. A forged entry would skip codex on next push of that
+  # SHA. Protect it like the kill-switch.
+  '.rea/last-review.cache.json'
 )
 
 # Kill-switch invariants — never relaxable. Subset of FULL.
@@ -52,6 +56,7 @@ REA_KILL_SWITCH_INVARIANTS=(
   '.claude/settings.json'
   '.rea/policy.yaml'
   '.rea/HALT'
+  '.rea/last-review.cache.json'
 )
 
 # Effective patterns after applying the relax list. Computed lazily on

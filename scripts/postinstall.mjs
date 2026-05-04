@@ -135,10 +135,17 @@ try {
       const reaCli = path.join(consumerRoot, 'node_modules', '.bin', 'rea');
       if (fs.existsSync(reaCli)) {
         const { spawnSync } = await import('node:child_process');
+        // 0.19.0 backend-engineer P2-1: 5-min wall-clock cap so a hung
+        // upgrade falls through to print-only instead of hanging the
+        // consumer's `npm install`. 0.19.0 code-reviewer P3-6:
+        // Windows shim (.bin/rea.cmd) requires `shell: true` —
+        // detect via process.platform.
         const res = spawnSync(reaCli, ['upgrade', '--yes'], {
           cwd: consumerRoot,
           stdio: 'inherit',
           env: process.env,
+          timeout: 5 * 60 * 1000,
+          shell: process.platform === 'win32',
         });
         if (res.status === 0) {
           NOTE([

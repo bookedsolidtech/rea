@@ -24,7 +24,8 @@
 
 import path from 'node:path';
 import { appendAuditRecord } from '../../audit/append.js';
-import { Tier, InvocationStatus } from '../../policy/types.js';
+import { loadPolicyAsync } from '../../policy/loader.js';
+import { Tier, InvocationStatus, type Policy } from '../../policy/types.js';
 import {
   resolvePushGatePolicy,
   PUSH_GATE_DEFAULT_LAST_N_COMMITS_FALLBACK,
@@ -39,6 +40,8 @@ import {
   CodexProtocolError,
   CodexSubprocessError,
   CodexTimeoutError,
+  IRON_GATE_DEFAULT_MODEL,
+  IRON_GATE_DEFAULT_REASONING,
   type CodexRunError,
   type GitExecutor,
 } from './codex-runner.js';
@@ -184,13 +187,27 @@ export async function runPushGate(deps: PushGateDeps): Promise<GateResult> {
   const appendAuditFn = deps.appendAudit ?? appendAuditRecord;
   const git: GitExecutor = deps.git ?? createRealGitExecutor(deps.baseDir);
 
+  // 0.19.0 backend-engineer review P1-1: load the full Policy once and
+  // thread it to every safeAppend so audit rotation actually fires.
+  // Pre-fix the rotator short-circuited because policy was never passed
+  // through, silently disabling the `audit.rotation: {}` opt-in shipped
+  // in 0.18.1 for the bst-internal profile. A failure to load policy
+  // here is non-fatal — the gate continues; audit rotation just stays
+  // disabled for this run (back-compat).
+  let fullPolicy: Policy | undefined;
+  try {
+    fullPolicy = await loadPolicyAsync(deps.baseDir);
+  } catch {
+    fullPolicy = undefined;
+  }
+
   // 1. HALT wins over everything, including `review.codex_required: false`.
   //    Reading it before policy also means a corrupted policy.yaml doesn't
   //    prevent the kill-switch from firing.
   const halt = readHaltFn(deps.baseDir);
   if (halt.halted) {
     stderr(`REA HALT: ${halt.reason ?? 'unknown'}\nAll push operations suspended. Run: rea unfreeze\n`);
-    await safeAppend(appendAuditFn, deps.baseDir, EVT_HALTED, {
+    await safeAppend(appendAuditFn, deps.baseDir, EVT_HALTED, fullPolicy, {
       reason: halt.reason ?? 'unknown',
     });
     return {
@@ -208,7 +225,7 @@ export async function runPushGate(deps: PushGateDeps): Promise<GateResult> {
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     stderr(`PUSH BLOCKED: failed to load .rea/policy.yaml — ${msg}\n`);
-    await safeAppend(appendAuditFn, deps.baseDir, EVT_ERROR, {
+    await safeAppend(appendAuditFn, deps.baseDir, EVT_ERROR, fullPolicy, {
       kind: 'policy-load',
       error: msg,
     });
@@ -216,7 +233,7 @@ export async function runPushGate(deps: PushGateDeps): Promise<GateResult> {
   }
 
   if (!policy.codex_required) {
-    await safeAppend(appendAuditFn, deps.baseDir, EVT_DISABLED, {
+    await safeAppend(appendAuditFn, deps.baseDir, EVT_DISABLED, fullPolicy, {
       policy_missing: policy.policyMissing,
     });
     return {
@@ -256,7 +273,7 @@ export async function runPushGate(deps: PushGateDeps): Promise<GateResult> {
       skipPush.length > 0 ? 'REA_SKIP_PUSH_GATE' : 'REA_SKIP_CODEX_REVIEW';
     const skipReason = skipVar === 'REA_SKIP_PUSH_GATE' ? skipPush : skipCodex;
     stderr(`rea: ${skipVar}=${skipReason} — push-gate skipped (audited).\n`);
-    await safeAppend(appendAuditFn, deps.baseDir, EVT_SKIPPED, {
+    await safeAppend(appendAuditFn, deps.baseDir, EVT_SKIPPED, fullPolicy, {
       reason: skipReason,
       skip_var: skipVar,
     });
@@ -357,7 +374,7 @@ export async function runPushGate(deps: PushGateDeps): Promise<GateResult> {
   }
   if (headSha.length === 0) {
     stderr('PUSH BLOCKED: could not resolve HEAD SHA. Is this a valid git repo?\n');
-    await safeAppend(appendAuditFn, deps.baseDir, EVT_ERROR, { kind: 'head-sha-missing' });
+    await safeAppend(appendAuditFn, deps.baseDir, EVT_ERROR, fullPolicy, { kind: 'head-sha-missing' });
     return { status: 'error', exitCode: 2, summary: 'head-sha-missing' };
   }
 
@@ -434,7 +451,7 @@ export async function runPushGate(deps: PushGateDeps): Promise<GateResult> {
   //    no-op relative to base.
   const diff = git.diffNames(base.ref, headSha);
   if (diff.length === 0) {
-    await safeAppend(appendAuditFn, deps.baseDir, EVT_EMPTY, {
+    await safeAppend(appendAuditFn, deps.baseDir, EVT_EMPTY, fullPolicy, {
       base_ref: base.ref,
       base_source: base.source,
       head_sha: headSha,
@@ -465,7 +482,7 @@ export async function runPushGate(deps: PushGateDeps): Promise<GateResult> {
     const cachedBlocked =
       cached.verdict === 'blocking'
       || (cached.verdict === 'concerns' && policy.concerns_blocks && !isConcernsOverrideSet(env));
-    await safeAppend(appendAuditFn, deps.baseDir, EVT_CACHE_HIT, {
+    await safeAppend(appendAuditFn, deps.baseDir, EVT_CACHE_HIT, fullPolicy, {
       verdict: cached.verdict,
       finding_count: cached.finding_count,
       base_ref: base.ref,
@@ -546,7 +563,7 @@ export async function runPushGate(deps: PushGateDeps): Promise<GateResult> {
     if (policy.cache_ttl_ms > 0) {
       const flipped = isFlip(cacheLookup.entry, summary.verdict);
       if (flipped && cacheLookup.entry !== undefined) {
-        await safeAppend(appendAuditFn, deps.baseDir, EVT_VERDICT_FLIP, {
+        await safeAppend(appendAuditFn, deps.baseDir, EVT_VERDICT_FLIP, fullPolicy, {
           head_sha: headSha,
           prior_verdict: cacheLookup.entry.verdict,
           fresh_verdict: summary.verdict,
@@ -558,20 +575,22 @@ export async function runPushGate(deps: PushGateDeps): Promise<GateResult> {
         verdict: summary.verdict,
         finding_count: summary.findings.length,
         reviewed_at: deps.now !== undefined ? deps.now().toISOString() : new Date().toISOString(),
-        model: policy.codex_model ?? 'gpt-5.4',
-        reasoning_effort: policy.codex_reasoning_effort ?? 'high',
+        model: policy.codex_model ?? IRON_GATE_DEFAULT_MODEL,
+        reasoning_effort: policy.codex_reasoning_effort ?? IRON_GATE_DEFAULT_REASONING,
         ttl_ms: policy.cache_ttl_ms,
       };
       try {
-        writeVerdict(deps.baseDir, headSha, entry);
+        await writeVerdict(deps.baseDir, headSha, entry);
       } catch {
         // Cache writes are best-effort. A failure here must NOT
         // affect the verdict — log to stderr (already done by the
-        // caller via banner) and proceed.
+        // caller via banner) and proceed. Foreign-schema (v3+ cache
+        // from a future rea version) lands here and is correctly
+        // declined — overwriting would lose forward-compat data.
       }
     }
 
-    await safeAppend(appendAuditFn, deps.baseDir, EVT_REVIEWED, {
+    await safeAppend(appendAuditFn, deps.baseDir, EVT_REVIEWED, fullPolicy, {
       verdict: summary.verdict,
       finding_count: summary.findings.length,
       base_ref: base.ref,
@@ -617,7 +636,7 @@ export async function runPushGate(deps: PushGateDeps): Promise<GateResult> {
       headSha,
     };
   } catch (e) {
-    return handleCodexError(e, deps, base, headSha, appendAuditFn);
+    return handleCodexError(e, deps, base, headSha, appendAuditFn, fullPolicy);
   }
 }
 
@@ -634,6 +653,7 @@ async function handleCodexError(
   base: BaseResolution,
   headSha: string,
   appendAuditFn: typeof appendAuditRecord,
+  policy: Policy | undefined,
 ): Promise<GateResult> {
   const stderr = deps.stderr;
   const runError = classifyCodexError(e);
@@ -646,7 +666,7 @@ async function handleCodexError(
   if (runError.message.length > 0) metadata.error = runError.message;
 
   stderr(`PUSH BLOCKED: ${runError.message}\n`);
-  await safeAppend(appendAuditFn, deps.baseDir, EVT_ERROR, metadata);
+  await safeAppend(appendAuditFn, deps.baseDir, EVT_ERROR, policy, metadata);
   return {
     status: 'error',
     exitCode: 2,
@@ -677,6 +697,7 @@ async function safeAppend(
   appendFn: typeof appendAuditRecord,
   baseDir: string,
   toolName: string,
+  policy: Policy | undefined,
   metadata: Record<string, unknown>,
 ): Promise<void> {
   try {
@@ -687,12 +708,19 @@ async function safeAppend(
     for (const [k, v] of Object.entries(metadata)) {
       if (v !== undefined) cleanMeta[k] = v;
     }
+    // 0.19.0 P1-1 fix (backend-engineer review): pass the loaded Policy
+    // through so `appendAuditRecord` → `maybeRotate` actually fires.
+    // Pre-fix the policy was never threaded; rotation short-circuited
+    // to `{ rotated: false }` on the entire push-gate audit-emission
+    // path, silently disabling the `audit.rotation: {}` opt-in shipped
+    // in 0.18.1 for the bst-internal profile.
     await appendFn(baseDir, {
       tool_name: toolName,
       server_name: AUDIT_SERVER_NAME,
       tier: Tier.Read,
       status: InvocationStatus.Allowed,
       ...(Object.keys(cleanMeta).length > 0 ? { metadata: cleanMeta } : {}),
+      ...(policy !== undefined ? { policy } : {}),
     });
   } catch (e) {
     // Audit persistence failure should never cascade into a push block when

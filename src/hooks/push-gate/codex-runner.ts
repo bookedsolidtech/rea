@@ -23,6 +23,29 @@ import { spawn, spawnSync } from 'node:child_process';
 import type { ChildProcessWithoutNullStreams } from 'node:child_process';
 
 // ---------------------------------------------------------------------------
+// Iron-gate runtime defaults (0.18.0+)
+// ---------------------------------------------------------------------------
+
+/**
+ * Default codex model when policy doesn't pin one. Always passed via
+ * `-c model="<name>"` so codex's own default (`codex-auto-review` at
+ * medium reasoning) is unreachable through the rea push-gate.
+ *
+ * 0.19.0 code-reviewer P3-4: exported as a single source of truth.
+ * `src/hooks/push-gate/index.ts` imports this for the verdict-cache
+ * write so the cached `model` field reflects the same constant the
+ * runner actually used. Bump here to bump everywhere.
+ */
+export const IRON_GATE_DEFAULT_MODEL = 'gpt-5.4';
+
+/**
+ * Default reasoning effort when policy doesn't pin one. `high` for
+ * verdict stability — the helixir 2026-04-26 thrashing came from the
+ * lower-reasoning default.
+ */
+export const IRON_GATE_DEFAULT_REASONING: 'low' | 'medium' | 'high' = 'high';
+
+// ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
 
@@ -241,8 +264,10 @@ export async function runCodexReview(options: CodexRunOptions): Promise<CodexRun
   // quotes — `-c model="gpt-5.4"` not `-c model=gpt-5.4` — to ensure the
   // value lands as a string regardless of upstream parsing changes.
   const effectiveModel =
-    options.model !== undefined && options.model.length > 0 ? options.model : 'gpt-5.4';
-  const effectiveReasoning = options.reasoningEffort ?? 'high';
+    options.model !== undefined && options.model.length > 0
+      ? options.model
+      : IRON_GATE_DEFAULT_MODEL;
+  const effectiveReasoning = options.reasoningEffort ?? IRON_GATE_DEFAULT_REASONING;
   const overrideArgs: string[] = [
     '-c',
     `model="${escapeTomlString(effectiveModel)}"`,
