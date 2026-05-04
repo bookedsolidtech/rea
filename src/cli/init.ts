@@ -173,6 +173,7 @@ async function runWizard(
   targetDir: string,
   reagentPolicyPath: string | null,
   layeredBase: Profile,
+  existingPolicy: ExistingPolicyValues | undefined = undefined,
 ): Promise<ResolvedConfig> {
   const projectName = detectProjectName(targetDir);
   p.intro(`rea init — ${projectName}`);
@@ -212,9 +213,17 @@ async function runWizard(
     profileName = picked;
   }
 
-  const autonomyDefault = layeredBase.autonomy_level ?? AutonomyLevel.L1;
+  // 0.21.1: prefer the existing on-disk value over the profile default
+  // so re-running `rea init` doesn't reset an operator's manual edit.
+  const autonomyDefault =
+    existingPolicy?.autonomyLevel
+    ?? layeredBase.autonomy_level
+    ?? AutonomyLevel.L1;
   const autonomyPick = await p.select<AutonomyLevel>({
-    message: 'Starting autonomy_level',
+    message:
+      existingPolicy?.autonomyLevel !== undefined
+        ? `Starting autonomy_level (current: ${existingPolicy.autonomyLevel})`
+        : 'Starting autonomy_level',
     initialValue: autonomyDefault,
     options: [
       { value: AutonomyLevel.L0, label: 'L0', hint: 'read-only; every write needs approval' },
@@ -227,7 +236,11 @@ async function runWizard(
   const autonomyLevel = autonomyPick;
 
   const maxCandidates = AUTONOMY_LEVELS.filter((lvl) => levelRank(lvl) >= levelRank(autonomyLevel));
+  // 0.21.1: prefer existing on-disk max_autonomy_level over profile default.
   const defaultMax: AutonomyLevel =
+    (existingPolicy?.maxAutonomyLevel !== undefined &&
+      maxCandidates.includes(existingPolicy.maxAutonomyLevel) &&
+      existingPolicy.maxAutonomyLevel) ||
     (layeredBase.max_autonomy_level !== undefined &&
       maxCandidates.includes(layeredBase.max_autonomy_level) &&
       layeredBase.max_autonomy_level) ||
@@ -333,6 +346,85 @@ async function printCodexInstallAssist(): Promise<void> {
   console.log(
     '  or set `review.codex_required: false` in .rea/policy.yaml to opt out.',
   );
+}
+
+/**
+ * 0.21.1: user-mutable policy values preserved across `rea init` re-runs.
+ * Each field is undefined when the existing policy didn't set it.
+ */
+interface ExistingPolicyValues {
+  profile?: ProfileName;
+  autonomyLevel?: AutonomyLevel;
+  maxAutonomyLevel?: AutonomyLevel;
+  blockAiAttribution?: boolean;
+  blockedPaths?: string[];
+  notificationChannel?: string;
+  codexRequired?: boolean;
+}
+
+/**
+ * Read user-mutable values from an existing `.rea/policy.yaml`.
+ * Returns undefined when the file doesn't exist or fails to parse.
+ *
+ * The reader is permissive — any field that fails to extract is
+ * dropped from the result; the caller falls back to the profile
+ * default for that one field. This is the idempotency contract
+ * extension introduced in 0.17.0 (`installed_at` preservation),
+ * extended in 0.21.1 to cover every field an operator might
+ * manually edit between init runs.
+ *
+ * Profile-switch is allowed but advisory: when the existing
+ * `profile:` value disagrees with the requested one, the existing
+ * VALUES are still preserved. Operators who want full reset pass
+ * `--force` to bypass the file-existence check entirely.
+ */
+function readExistingPolicyForPreservation(targetDir: string): ExistingPolicyValues | undefined {
+  const policyPath = path.join(targetDir, REA_DIR, POLICY_FILE);
+  if (!fs.existsSync(policyPath)) return undefined;
+  try {
+    const raw = fs.readFileSync(policyPath, 'utf8');
+    const out: ExistingPolicyValues = {};
+    // Profile (informational; used for stderr advisory).
+    const pm = raw.match(/^profile:\s*['"]?([a-z0-9-]+)['"]?\s*$/m);
+    if (pm) out.profile = pm[1] as ProfileName;
+    // Autonomy + ceiling (enum).
+    const am = raw.match(/^autonomy_level:\s*(L[0-3])\s*$/m);
+    const amVal = am?.[1];
+    if (amVal !== undefined && (Object.values(AutonomyLevel) as string[]).includes(amVal)) {
+      out.autonomyLevel = amVal as AutonomyLevel;
+    }
+    const mm = raw.match(/^max_autonomy_level:\s*(L[0-3])\s*$/m);
+    const mmVal = mm?.[1];
+    if (mmVal !== undefined && (Object.values(AutonomyLevel) as string[]).includes(mmVal)) {
+      out.maxAutonomyLevel = mmVal as AutonomyLevel;
+    }
+    // block_ai_attribution.
+    const bm = raw.match(/^block_ai_attribution:\s*(true|false)\s*$/m);
+    if (bm?.[1] !== undefined) out.blockAiAttribution = bm[1] === 'true';
+    // blocked_paths block-sequence — line-by-line scan.
+    const bpStart = raw.match(/^blocked_paths:\s*$/m);
+    if (bpStart) {
+      const after = raw.slice((bpStart.index ?? 0) + bpStart[0].length + 1);
+      const lines = after.split('\n');
+      const collected: string[] = [];
+      for (const line of lines) {
+        const m2 = line.match(/^\s*-\s+(?:['"]([^'"]+)['"]|(\S.*?))\s*$/);
+        if (!m2) break;
+        const v = m2[1] ?? m2[2];
+        if (v !== undefined) collected.push(v);
+      }
+      if (collected.length > 0) out.blockedPaths = collected;
+    }
+    // notification_channel.
+    const nm = raw.match(/^notification_channel:\s*['"]?([^'"\n]*)['"]?\s*$/m);
+    if (nm?.[1] !== undefined) out.notificationChannel = nm[1];
+    // review.codex_required (under nested `review:` block).
+    const cm = raw.match(/^\s+codex_required:\s*(true|false)\s*$/m);
+    if (cm?.[1] !== undefined) out.codexRequired = cm[1] === 'true';
+    return out;
+  } catch {
+    return undefined;
+  }
 }
 
 function readExistingInstalledAt(policyPath: string): string | undefined {
@@ -599,33 +691,68 @@ export async function runInit(options: InitOptions): Promise<void> {
 
   const layeredBase = resolveLayered(profileName, reagentTranslated);
 
+  // 0.21.1: preserve user-mutable policy values across re-init (idempotency
+  // class — same as the `installed_at` fix from 0.17.0). Pre-fix, every
+  // `rea init` re-applied profile defaults, silently resetting an
+  // operator's `autonomy_level: L2` back to the profile's L1, etc.
+  // Read the existing policy if present and merge: explicit existing
+  // value wins over profile default. Operator opts out with --force
+  // (existing flag — bypass the file-existence check entirely).
+  // Profile-switch case: when the existing profile name disagrees with
+  // the requested profile, the existing values are STILL preserved by
+  // default but a stderr advisory names what was kept; operator can
+  // pass --force to fully reset.
+  const existingPolicy = readExistingPolicyForPreservation(targetDir);
+
   let config: ResolvedConfig;
 
   if (options.yes === true) {
     // G11.4 non-interactive codex resolution:
     //   1. Explicit --codex / --no-codex flag wins.
-    //   2. Otherwise derive from the profile name (`*-no-codex` → false).
+    //   2. Otherwise existing policy value wins (preserves operator edit).
+    //   3. Otherwise derive from the profile name (`*-no-codex` → false).
     const codexRequired =
       options.codex !== undefined
         ? options.codex
-        : profileDefaultCodexRequired(profileName);
+        : (existingPolicy?.codexRequired ?? profileDefaultCodexRequired(profileName));
     config = {
       profile: profileName,
-      autonomyLevel: layeredBase.autonomy_level ?? AutonomyLevel.L1,
-      maxAutonomyLevel: layeredBase.max_autonomy_level ?? AutonomyLevel.L2,
-      blockAiAttribution: layeredBase.block_ai_attribution ?? true,
-      blockedPaths: layeredBase.blocked_paths ?? ['.env', '.env.*'],
-      notificationChannel: layeredBase.notification_channel ?? '',
+      autonomyLevel:
+        existingPolicy?.autonomyLevel
+        ?? layeredBase.autonomy_level
+        ?? AutonomyLevel.L1,
+      maxAutonomyLevel:
+        existingPolicy?.maxAutonomyLevel
+        ?? layeredBase.max_autonomy_level
+        ?? AutonomyLevel.L2,
+      blockAiAttribution:
+        existingPolicy?.blockAiAttribution
+        ?? layeredBase.block_ai_attribution
+        ?? true,
+      blockedPaths:
+        existingPolicy?.blockedPaths
+        ?? layeredBase.blocked_paths
+        ?? ['.env', '.env.*'],
+      notificationChannel:
+        existingPolicy?.notificationChannel
+        ?? layeredBase.notification_channel
+        ?? '',
       codexRequired,
       fromReagent,
       reagentPolicyPath,
       reagentNotices,
     };
-    log(
-      `Non-interactive init: profile=${profileName}, autonomy=${config.autonomyLevel}, max=${config.maxAutonomyLevel}, attribution-block=${config.blockAiAttribution}, codex_required=${config.codexRequired}`,
-    );
+    if (existingPolicy !== undefined) {
+      log(
+        `Non-interactive init (re-run): preserving existing autonomy=${config.autonomyLevel}, max=${config.maxAutonomyLevel}, attribution-block=${config.blockAiAttribution}, codex_required=${config.codexRequired}. Pass --force to reset to profile defaults.`,
+      );
+    } else {
+      log(
+        `Non-interactive init: profile=${profileName}, autonomy=${config.autonomyLevel}, max=${config.maxAutonomyLevel}, attribution-block=${config.blockAiAttribution}, codex_required=${config.codexRequired}`,
+      );
+    }
   } else {
-    config = await runWizard(options, targetDir, reagentPolicyPath, layeredBase);
+    config = await runWizard(options, targetDir, reagentPolicyPath, layeredBase, existingPolicy);
     config.reagentNotices = reagentNotices;
   }
 
