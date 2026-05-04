@@ -224,6 +224,62 @@ describe('rea init — G11.4 codex flags', () => {
     expect(closeMarkers).toBe(1);
   });
 
+  it('0.21.1 idempotency: re-running rea init preserves manually-edited autonomy_level', async () => {
+    const dir = await makeScratch();
+    cleanup.push(dir);
+    process.chdir(dir);
+
+    // First init — profile default L1.
+    await runInit({ yes: true, profile: 'minimal', codex: false });
+    let raw = await fs.readFile(path.join(dir, '.rea', 'policy.yaml'), 'utf8');
+    expect(raw).toMatch(/^autonomy_level:\s*L1\s*$/m);
+
+    // Operator manually escalates to L2.
+    raw = raw.replace(/^autonomy_level:\s*L1\s*$/m, 'autonomy_level: L2');
+    await fs.writeFile(path.join(dir, '.rea', 'policy.yaml'), raw, 'utf8');
+
+    // Re-init — must preserve L2.
+    await new Promise((r) => setTimeout(r, 20));
+    await runInit({ yes: true, profile: 'minimal', codex: false });
+    const second = await fs.readFile(path.join(dir, '.rea', 'policy.yaml'), 'utf8');
+    expect(second).toMatch(/^autonomy_level:\s*L2\s*$/m);
+  });
+
+  it('0.21.1 idempotency: re-running rea init preserves manually-edited blocked_paths', async () => {
+    const dir = await makeScratch();
+    cleanup.push(dir);
+    process.chdir(dir);
+
+    await runInit({ yes: true, profile: 'minimal', codex: false });
+    let raw = await fs.readFile(path.join(dir, '.rea', 'policy.yaml'), 'utf8');
+    // Operator adds .secrets to the blocked list.
+    raw = raw.replace(/^blocked_paths:\s*\n((?:\s+-\s+.*\n)+)/m, (_m, body: string) => {
+      return `blocked_paths:\n${body}  - ".secrets"\n`;
+    });
+    await fs.writeFile(path.join(dir, '.rea', 'policy.yaml'), raw, 'utf8');
+
+    await new Promise((r) => setTimeout(r, 20));
+    await runInit({ yes: true, profile: 'minimal', codex: false });
+    const second = await fs.readFile(path.join(dir, '.rea', 'policy.yaml'), 'utf8');
+    expect(second).toMatch(/-\s+["']?\.secrets["']?/);
+  });
+
+  it('0.21.1 idempotency: re-running rea init preserves block_ai_attribution = false', async () => {
+    const dir = await makeScratch();
+    cleanup.push(dir);
+    process.chdir(dir);
+
+    await runInit({ yes: true, profile: 'minimal', codex: false });
+    let raw = await fs.readFile(path.join(dir, '.rea', 'policy.yaml'), 'utf8');
+    raw = raw.replace(/^block_ai_attribution:\s*true\s*$/m, 'block_ai_attribution: false');
+    await fs.writeFile(path.join(dir, '.rea', 'policy.yaml'), raw, 'utf8');
+
+    await new Promise((r) => setTimeout(r, 20));
+    await runInit({ yes: true, profile: 'minimal', codex: false });
+    const second = await fs.readFile(path.join(dir, '.rea', 'policy.yaml'), 'utf8');
+    expect(second).toMatch(/^block_ai_attribution:\s*false\s*$/m);
+  });
+
   it('0.17.0 idempotency: re-running rea init preserves installed_at in policy.yaml', async () => {
     const dir = await makeScratch();
     cleanup.push(dir);
