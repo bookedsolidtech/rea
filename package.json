@@ -61,7 +61,7 @@
     "lint:regex": "node scripts/lint-safe-regex.mjs",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "test": "pnpm run build && pnpm run test:dogfood && pnpm run test:bash-syntax && vitest run",
+    "test": "pnpm run build && pnpm run test:dogfood && pnpm run test:bash-syntax && node scripts/run-vitest.mjs",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
     "test:dogfood": "node tools/check-dogfood-drift.mjs",
