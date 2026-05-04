@@ -44,9 +44,7 @@ describe('rea upgrade — BUG-010 gitignore backfill', () => {
 
   afterEach(async () => {
     process.chdir(prevCwd);
-    await Promise.all(
-      cleanup.splice(0).map((d) => fs.rm(d, { recursive: true, force: true })),
-    );
+    await Promise.all(cleanup.splice(0).map((d) => fs.rm(d, { recursive: true, force: true })));
   });
 
   it('backfills .gitignore managed block on upgrade when consumer has no block', async () => {

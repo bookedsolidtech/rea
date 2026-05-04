@@ -273,7 +273,10 @@ export function createGateway(opts: GatewayOptions): GatewayHandle {
   // condition without parsing stderr.
   let healthAuditFailCount = 0;
 
-  const server = new Server({ name: 'rea', version: gatewayVersion }, { capabilities: { tools: {} } });
+  const server = new Server(
+    { name: 'rea', version: gatewayVersion },
+    { capabilities: { tools: {} } },
+  );
 
   // Build the circuit breaker with observability hooks wired in — state
   // transitions log a structured record AND update the Prometheus gauge.

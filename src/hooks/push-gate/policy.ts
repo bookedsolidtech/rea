@@ -154,8 +154,7 @@ export async function resolvePushGatePolicy(baseDir: string): Promise<ResolvedRe
     concerns_blocks: review.concerns_blocks ?? PUSH_GATE_DEFAULT_CONCERNS_BLOCKS,
     timeout_ms: review.timeout_ms ?? PUSH_GATE_DEFAULT_TIMEOUT_MS,
     last_n_commits: review.last_n_commits,
-    auto_narrow_threshold:
-      review.auto_narrow_threshold ?? PUSH_GATE_DEFAULT_AUTO_NARROW_THRESHOLD,
+    auto_narrow_threshold: review.auto_narrow_threshold ?? PUSH_GATE_DEFAULT_AUTO_NARROW_THRESHOLD,
     codex_model: review.codex_model ?? PUSH_GATE_DEFAULT_CODEX_MODEL,
     codex_reasoning_effort:
       review.codex_reasoning_effort ?? PUSH_GATE_DEFAULT_CODEX_REASONING_EFFORT,

@@ -12,12 +12,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { appendAuditRecord } from './append.js';
-import {
-  GENESIS_HASH,
-  computeHash,
-  readLastRecord,
-  withAuditLock,
-} from './fs.js';
+import { GENESIS_HASH, computeHash, readLastRecord, withAuditLock } from './fs.js';
 import type { AuditRecord } from '../gateway/middleware/audit-types.js';
 import { forceRotate } from '../gateway/audit/rotator.js';
 import { runAuditVerify } from '../cli/audit.js';
@@ -93,9 +88,9 @@ describe('durability — tamper detection via rea audit verify', () => {
     }) as typeof process.exit;
 
     try {
-      await expect(
-        runAuditVerify({ since: path.basename(rotatedPath) }),
-      ).rejects.toThrow('__exit__');
+      await expect(runAuditVerify({ since: path.basename(rotatedPath) })).rejects.toThrow(
+        '__exit__',
+      );
     } finally {
       console.error = origError;
       console.log = origLog;
@@ -193,11 +188,10 @@ describe('durability — cross-process concurrency', () => {
     try {
       await fs.access(distMarker);
     } catch {
-      const result = spawnSync(
-        'pnpm',
-        ['exec', 'tsc', '-p', 'tsconfig.build.json'],
-        { cwd: projectRoot, stdio: 'inherit' },
-      );
+      const result = spawnSync('pnpm', ['exec', 'tsc', '-p', 'tsconfig.build.json'], {
+        cwd: projectRoot,
+        stdio: 'inherit',
+      });
       if (result.status !== 0) {
         throw new Error(
           `concurrency test: failed to build dist/ (exit ${result.status}). Run 'pnpm build' manually.`,
@@ -215,81 +209,71 @@ describe('durability — cross-process concurrency', () => {
     await fs.rm(baseDir, { recursive: true, force: true });
   });
 
-  it(
-    'two processes each appending 50 records produce a linear 100-record chain',
-    async () => {
-      // Resolve the compiled-or-source append path. Tests run under vitest
-      // with TS-source, so point children at the TS file via tsx — but we
-      // avoid that dependency by spawning a child that re-imports the same
-      // vitest-configured module path via Node's loader hook.
-      //
-      // Simpler: write a tiny JS worker that requires a pre-built dist/
-      // artifact. Our pipeline runs `pnpm build` before `pnpm test`... no,
-      // it does not. Vitest runs TS directly, and we need the CHILD to run
-      // TS directly too. Easiest: the child reads stdin for config and
-      // exec's its worker logic via dynamic import of the test file's own
-      // source tree through vite-node.
-      //
-      // We sidestep the TS/JS question entirely by using vite-node's CLI via
-      // pnpm, which is already on PATH in any environment running this
-      // suite. The child script is a minimal loop that calls
-      // `appendAuditRecord` N times.
-      const here = path.dirname(fileURLToPath(import.meta.url));
-      const workerPath = path.join(here, '__fixtures__', 'concurrency-worker.mjs');
+  it('two processes each appending 50 records produce a linear 100-record chain', async () => {
+    // Resolve the compiled-or-source append path. Tests run under vitest
+    // with TS-source, so point children at the TS file via tsx — but we
+    // avoid that dependency by spawning a child that re-imports the same
+    // vitest-configured module path via Node's loader hook.
+    //
+    // Simpler: write a tiny JS worker that requires a pre-built dist/
+    // artifact. Our pipeline runs `pnpm build` before `pnpm test`... no,
+    // it does not. Vitest runs TS directly, and we need the CHILD to run
+    // TS directly too. Easiest: the child reads stdin for config and
+    // exec's its worker logic via dynamic import of the test file's own
+    // source tree through vite-node.
+    //
+    // We sidestep the TS/JS question entirely by using vite-node's CLI via
+    // pnpm, which is already on PATH in any environment running this
+    // suite. The child script is a minimal loop that calls
+    // `appendAuditRecord` N times.
+    const here = path.dirname(fileURLToPath(import.meta.url));
+    const workerPath = path.join(here, '__fixtures__', 'concurrency-worker.mjs');
 
-      // Ensure the worker file exists — it's a checked-in fixture next to
-      // this test.
-      await fs.access(workerPath);
+    // Ensure the worker file exists — it's a checked-in fixture next to
+    // this test.
+    await fs.access(workerPath);
 
-      const spawnOne = (
-        label: string,
-      ): Promise<{ code: number | null; stderr: string }> =>
-        new Promise((resolve, reject) => {
-          const child = spawn(
-            process.execPath,
-            [workerPath, baseDir, label, '50'],
-            {
-              stdio: ['ignore', 'ignore', 'pipe'],
-              env: { ...process.env },
-            },
-          );
-          let stderr = '';
-          child.stderr.on('data', (d: Buffer) => {
-            stderr += d.toString('utf8');
-          });
-          child.on('error', reject);
-          child.on('exit', (code) => {
-            resolve({ code, stderr });
-          });
+    const spawnOne = (label: string): Promise<{ code: number | null; stderr: string }> =>
+      new Promise((resolve, reject) => {
+        const child = spawn(process.execPath, [workerPath, baseDir, label, '50'], {
+          stdio: ['ignore', 'ignore', 'pipe'],
+          env: { ...process.env },
         });
+        let stderr = '';
+        child.stderr.on('data', (d: Buffer) => {
+          stderr += d.toString('utf8');
+        });
+        child.on('error', reject);
+        child.on('exit', (code) => {
+          resolve({ code, stderr });
+        });
+      });
 
-      const [a, b] = await Promise.all([spawnOne('proc-a'), spawnOne('proc-b')]);
-      expect(a.code, `proc-a stderr:\n${a.stderr}`).toBe(0);
-      expect(b.code, `proc-b stderr:\n${b.stderr}`).toBe(0);
+    const [a, b] = await Promise.all([spawnOne('proc-a'), spawnOne('proc-b')]);
+    expect(a.code, `proc-a stderr:\n${a.stderr}`).toBe(0);
+    expect(b.code, `proc-b stderr:\n${b.stderr}`).toBe(0);
 
-      const lines = await readLines(auditFile);
-      expect(lines).toHaveLength(100);
+    const lines = await readLines(auditFile);
+    expect(lines).toHaveLength(100);
 
-      // Chain integrity: every prev_hash is the previous record's hash,
-      // and every stored hash matches its record body.
-      let prev = GENESIS_HASH;
-      for (let i = 0; i < lines.length; i++) {
-        const r = lines[i]!;
-        expect(r.prev_hash).toBe(prev);
-        const { hash, ...rest } = r;
-        expect(computeHash(rest)).toBe(hash);
-        prev = hash;
-      }
+    // Chain integrity: every prev_hash is the previous record's hash,
+    // and every stored hash matches its record body.
+    let prev = GENESIS_HASH;
+    for (let i = 0; i < lines.length; i++) {
+      const r = lines[i]!;
+      expect(r.prev_hash).toBe(prev);
+      const { hash, ...rest } = r;
+      expect(computeHash(rest)).toBe(hash);
+      prev = hash;
+    }
 
-      // Distribution sanity: both processes made progress. If one crowded
-      // out the other we'd still see 100, but we want to know both wrote.
-      const fromA = lines.filter((l) => l.tool_name === 'proc-a').length;
-      const fromB = lines.filter((l) => l.tool_name === 'proc-b').length;
-      expect(fromA).toBe(50);
-      expect(fromB).toBe(50);
-    },
-    60_000,
-  );
+    // Distribution sanity: both processes made progress. If one crowded
+    // out the other we'd still see 100, but we want to know both wrote.
+    const fromA = lines.filter((l) => l.tool_name === 'proc-a').length;
+    const fromB = lines.filter((l) => l.tool_name === 'proc-b').length;
+    expect(fromA).toBe(50);
+    expect(fromB).toBe(50);
+  }, 60_000);
 });
 
 describe('durability — rea audit verify happy path', () => {

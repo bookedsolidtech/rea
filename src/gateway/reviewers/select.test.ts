@@ -2,11 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { AutonomyLevel } from '../../policy/types.js';
 import type { Policy } from '../../policy/types.js';
 import type { Registry } from '../../registry/types.js';
-import {
-  NoReviewerAvailableError,
-  selectReviewer,
-  type SelectorDeps,
-} from './select.js';
+import { NoReviewerAvailableError, selectReviewer, type SelectorDeps } from './select.js';
 import type { AdversarialReviewer, ReviewRequest, ReviewResult } from './types.js';
 
 function basePolicy(overrides: Partial<Policy> = {}): Policy {
@@ -38,14 +34,16 @@ function fakeReviewer(name: string, available: boolean): AdversarialReviewer {
     name,
     version: `${name}-v0`,
     isAvailable: vi.fn().mockResolvedValue(available),
-    review: vi.fn().mockImplementation(async (_req: ReviewRequest): Promise<ReviewResult> => ({
-      reviewer_name: name,
-      reviewer_version: `${name}-v0`,
-      verdict: 'pass',
-      findings: [],
-      summary: 'ok',
-      degraded: false,
-    })),
+    review: vi.fn().mockImplementation(
+      async (_req: ReviewRequest): Promise<ReviewResult> => ({
+        reviewer_name: name,
+        reviewer_version: `${name}-v0`,
+        verdict: 'pass',
+        findings: [],
+        summary: 'ok',
+        degraded: false,
+      }),
+    ),
   };
 }
 
@@ -104,10 +102,7 @@ describe('selectReviewer', () => {
 
   describe('env override', () => {
     it('rejects unknown REA_REVIEWER values', async () => {
-      const deps = depsWith(
-        fakeReviewer('codex', true),
-        fakeReviewer('claude-self', true),
-      );
+      const deps = depsWith(fakeReviewer('codex', true), fakeReviewer('claude-self', true));
       await expect(
         selectReviewer(
           basePolicy(),

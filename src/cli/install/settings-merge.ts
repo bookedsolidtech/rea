@@ -63,7 +63,9 @@ function deepClone<T>(value: T): T {
   return structuredClone(value);
 }
 
-function ensureHooksShape(settings: Record<string, unknown>): Record<string, ExistingMatcherGroup[]> {
+function ensureHooksShape(
+  settings: Record<string, unknown>,
+): Record<string, ExistingMatcherGroup[]> {
   const hooks = (settings.hooks as Record<string, unknown>) ?? {};
   settings.hooks = hooks;
   return hooks as Record<string, ExistingMatcherGroup[]>;
@@ -116,9 +118,7 @@ export function pruneHookCommands(
       group.hooks = kept;
     }
     // Drop groups whose hooks list is now empty.
-    hooks[event] = groups.filter(
-      (g) => Array.isArray(g.hooks) && g.hooks.length > 0,
-    );
+    hooks[event] = groups.filter((g) => Array.isArray(g.hooks) && g.hooks.length > 0);
   }
   // Drop events whose group list is now empty.
   for (const event of Object.keys(hooks)) {
@@ -172,9 +172,7 @@ export function mergeSettings(
         targetGroup = { matcher: want.matcher, hooks: [] };
         existingGroups.push(targetGroup);
         hooks[want.event] = existingGroups;
-        warnings.push(
-          `added novel matcher "${want.matcher}" to event ${want.event}`,
-        );
+        warnings.push(`added novel matcher "${want.matcher}" to event ${want.event}`);
       } else if (wasPreExisting) {
         // Same matcher existed already in the consumer file; we're chaining
         // new commands onto something the consumer owns. Warn so they review
@@ -188,9 +186,7 @@ export function mergeSettings(
         type: wantHook.type,
         command: wantHook.command,
         ...(wantHook.timeout !== undefined ? { timeout: wantHook.timeout } : {}),
-        ...(wantHook.statusMessage !== undefined
-          ? { statusMessage: wantHook.statusMessage }
-          : {}),
+        ...(wantHook.statusMessage !== undefined ? { statusMessage: wantHook.statusMessage } : {}),
       });
       seen.add(k);
       addedCount += 1;
@@ -273,9 +269,7 @@ export function readSettings(targetDir: string): {
     const parsed = JSON.parse(raw) as Record<string, unknown>;
     return { settings: parsed, settingsPath, existed: true };
   } catch (err) {
-    throw new Error(
-      `Failed to parse ${settingsPath}: ${err instanceof Error ? err.message : err}`,
-    );
+    throw new Error(`Failed to parse ${settingsPath}: ${err instanceof Error ? err.message : err}`);
   }
 }
 
@@ -316,31 +310,96 @@ export function defaultDesiredHooks(): DesiredHookGroup[] {
       event: 'PreToolUse',
       matcher: 'Bash',
       hooks: [
-        { type: 'command', command: `${base}/dangerous-bash-interceptor.sh`, timeout: 10000, statusMessage: 'Checking command safety...' },
-        { type: 'command', command: `${base}/env-file-protection.sh`, timeout: 5000, statusMessage: 'Checking for .env file reads...' },
-        { type: 'command', command: `${base}/protected-paths-bash-gate.sh`, timeout: 5000, statusMessage: 'Checking for shell-redirect to protected paths...' },
-        { type: 'command', command: `${base}/blocked-paths-bash-gate.sh`, timeout: 5000, statusMessage: 'Checking for shell-redirect to policy-blocked paths...' },
-        { type: 'command', command: `${base}/dependency-audit-gate.sh`, timeout: 15000, statusMessage: 'Verifying package exists...' },
-        { type: 'command', command: `${base}/security-disclosure-gate.sh`, timeout: 5000, statusMessage: 'Checking disclosure policy...' },
-        { type: 'command', command: `${base}/pr-issue-link-gate.sh`, timeout: 5000, statusMessage: 'Checking PR for issue reference...' },
-        { type: 'command', command: `${base}/attribution-advisory.sh`, timeout: 5000, statusMessage: 'Checking for AI attribution...' },
+        {
+          type: 'command',
+          command: `${base}/dangerous-bash-interceptor.sh`,
+          timeout: 10000,
+          statusMessage: 'Checking command safety...',
+        },
+        {
+          type: 'command',
+          command: `${base}/env-file-protection.sh`,
+          timeout: 5000,
+          statusMessage: 'Checking for .env file reads...',
+        },
+        {
+          type: 'command',
+          command: `${base}/protected-paths-bash-gate.sh`,
+          timeout: 5000,
+          statusMessage: 'Checking for shell-redirect to protected paths...',
+        },
+        {
+          type: 'command',
+          command: `${base}/blocked-paths-bash-gate.sh`,
+          timeout: 5000,
+          statusMessage: 'Checking for shell-redirect to policy-blocked paths...',
+        },
+        {
+          type: 'command',
+          command: `${base}/dependency-audit-gate.sh`,
+          timeout: 15000,
+          statusMessage: 'Verifying package exists...',
+        },
+        {
+          type: 'command',
+          command: `${base}/security-disclosure-gate.sh`,
+          timeout: 5000,
+          statusMessage: 'Checking disclosure policy...',
+        },
+        {
+          type: 'command',
+          command: `${base}/pr-issue-link-gate.sh`,
+          timeout: 5000,
+          statusMessage: 'Checking PR for issue reference...',
+        },
+        {
+          type: 'command',
+          command: `${base}/attribution-advisory.sh`,
+          timeout: 5000,
+          statusMessage: 'Checking for AI attribution...',
+        },
       ],
     },
     {
       event: 'PreToolUse',
       matcher: 'Write|Edit|MultiEdit|NotebookEdit',
       hooks: [
-        { type: 'command', command: `${base}/secret-scanner.sh`, timeout: 15000, statusMessage: 'Scanning for credentials...' },
-        { type: 'command', command: `${base}/settings-protection.sh`, timeout: 5000, statusMessage: 'Checking settings protection...' },
-        { type: 'command', command: `${base}/blocked-paths-enforcer.sh`, timeout: 5000, statusMessage: 'Checking blocked paths...' },
-        { type: 'command', command: `${base}/changeset-security-gate.sh`, timeout: 5000, statusMessage: 'Checking changeset for security leaks...' },
+        {
+          type: 'command',
+          command: `${base}/secret-scanner.sh`,
+          timeout: 15000,
+          statusMessage: 'Scanning for credentials...',
+        },
+        {
+          type: 'command',
+          command: `${base}/settings-protection.sh`,
+          timeout: 5000,
+          statusMessage: 'Checking settings protection...',
+        },
+        {
+          type: 'command',
+          command: `${base}/blocked-paths-enforcer.sh`,
+          timeout: 5000,
+          statusMessage: 'Checking blocked paths...',
+        },
+        {
+          type: 'command',
+          command: `${base}/changeset-security-gate.sh`,
+          timeout: 5000,
+          statusMessage: 'Checking changeset for security leaks...',
+        },
       ],
     },
     {
       event: 'PostToolUse',
       matcher: 'Write|Edit|MultiEdit|NotebookEdit',
       hooks: [
-        { type: 'command', command: `${base}/architecture-review-gate.sh`, timeout: 10000, statusMessage: 'Checking architecture impact...' },
+        {
+          type: 'command',
+          command: `${base}/architecture-review-gate.sh`,
+          timeout: 10000,
+          statusMessage: 'Checking architecture impact...',
+        },
       ],
     },
   ];

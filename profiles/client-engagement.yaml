@@ -15,7 +15,7 @@ blocked_paths:
   - THREAT_MODEL.md
   - secrets/
   - credentials/
-notification_channel: ""
+notification_channel: ''
 context_protection:
   delegate_to_subagent:
     - pnpm run build

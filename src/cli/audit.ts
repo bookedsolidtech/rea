@@ -325,12 +325,7 @@ export async function runAuditVerify(options: AuditVerifyOptions): Promise<void>
     // parseable-subset index which diverges from the file whenever a
     // malformed line precedes the tamper.
     if (chainFailure === null) {
-      const failure = verifyChain(
-        path.basename(filePath),
-        records,
-        recordLineMap,
-        expectedPrev,
-      );
+      const failure = verifyChain(path.basename(filePath), records, recordLineMap, expectedPrev);
       if (failure !== null) {
         chainFailure = failure;
         chainFailureFile = filePath;

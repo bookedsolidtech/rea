@@ -87,11 +87,28 @@ async function walkFiles(srcDir: string): Promise<string[]> {
  * `.husky/` directory — so when a new hook ships (e.g. `pre-push`) it
  * automatically becomes part of the upgrade surface without code changes.
  */
-export async function enumerateCanonicalFiles(pkgRoot: string = PKG_ROOT): Promise<CanonicalFile[]> {
+export async function enumerateCanonicalFiles(
+  pkgRoot: string = PKG_ROOT,
+): Promise<CanonicalFile[]> {
   const mappings: DirMapping[] = [
-    { srcDir: path.join(pkgRoot, 'hooks'), dstPrefix: '.claude/hooks', source: 'hook', mode: 0o755 },
-    { srcDir: path.join(pkgRoot, 'agents'), dstPrefix: '.claude/agents', source: 'agent', mode: 0o644 },
-    { srcDir: path.join(pkgRoot, 'commands'), dstPrefix: '.claude/commands', source: 'command', mode: 0o644 },
+    {
+      srcDir: path.join(pkgRoot, 'hooks'),
+      dstPrefix: '.claude/hooks',
+      source: 'hook',
+      mode: 0o755,
+    },
+    {
+      srcDir: path.join(pkgRoot, 'agents'),
+      dstPrefix: '.claude/agents',
+      source: 'agent',
+      mode: 0o644,
+    },
+    {
+      srcDir: path.join(pkgRoot, 'commands'),
+      dstPrefix: '.claude/commands',
+      source: 'command',
+      mode: 0o644,
+    },
     { srcDir: path.join(pkgRoot, '.husky'), dstPrefix: '.husky', source: 'husky', mode: 0o755 },
   ];
   const out: CanonicalFile[] = [];

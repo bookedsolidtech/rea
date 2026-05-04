@@ -186,7 +186,8 @@ export function renderBanner(input: RenderBannerInput): string {
     );
     const shown = sorted.slice(0, max);
     for (const f of shown) {
-      const loc = f.file !== undefined ? ` — ${f.file}${f.line !== undefined ? `:${f.line}` : ''}` : '';
+      const loc =
+        f.file !== undefined ? ` — ${f.file}${f.line !== undefined ? `:${f.line}` : ''}` : '';
       lines.push(`- [${f.severity}] ${f.title}${loc}`);
     }
     if (sorted.length > shown.length) {

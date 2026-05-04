@@ -158,11 +158,7 @@ describe('policy loader', () => {
 
     it('rejects a user pattern that does not compile', async () => {
       const yaml =
-        SAMPLE +
-        '\nredact:\n' +
-        '  patterns:\n' +
-        '    - name: bad-regex\n' +
-        '      regex: "("\n';
+        SAMPLE + '\nredact:\n' + '  patterns:\n' + '    - name: bad-regex\n' + '      regex: "("\n';
       await fs.writeFile(path.join(baseDir, '.rea', 'policy.yaml'), yaml, 'utf8');
       expect(() => loadPolicy(baseDir)).toThrow(/Invalid redact pattern "bad-regex"/);
     });
@@ -236,8 +232,7 @@ describe('policy loader', () => {
     });
 
     it('rejects unknown fields inside audit.rotation (strict)', async () => {
-      const yaml =
-        SAMPLE + '\naudit:\n  rotation:\n    max_bytes: 1024\n    mystery: true\n';
+      const yaml = SAMPLE + '\naudit:\n  rotation:\n    max_bytes: 1024\n    mystery: true\n';
       await fs.writeFile(path.join(baseDir, '.rea', 'policy.yaml'), yaml, 'utf8');
       expect(() => loadPolicy(baseDir)).toThrow(/Invalid policy schema/);
     });
@@ -295,8 +290,7 @@ describe('policy loader', () => {
     });
 
     it('rejects unknown fields inside injection (strict)', async () => {
-      const yaml =
-        SAMPLE + '\ninjection:\n  suspicious_blocks_writes: true\n  mystery: 1\n';
+      const yaml = SAMPLE + '\ninjection:\n  suspicious_blocks_writes: true\n  mystery: 1\n';
       await fs.writeFile(path.join(baseDir, '.rea', 'policy.yaml'), yaml, 'utf8');
       expect(() => loadPolicy(baseDir)).toThrow(/Invalid policy schema/);
     });

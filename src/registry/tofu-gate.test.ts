@@ -94,10 +94,7 @@ describe('applyTofuGate', () => {
     expect(meta?.server).toBe('discord');
 
     // Fingerprint persisted.
-    const storeRaw = await fs.readFile(
-      path.join(baseDir, '.rea', 'fingerprints.json'),
-      'utf8',
-    );
+    const storeRaw = await fs.readFile(path.join(baseDir, '.rea', 'fingerprints.json'), 'utf8');
     const store = JSON.parse(storeRaw) as { servers: Record<string, string> };
     expect(store.servers.discord).toBe(fingerprintServer(s));
   });
@@ -115,9 +112,7 @@ describe('applyTofuGate', () => {
     expect(stderrChunks.join('')).toBe('');
     const linesAfter = await readAuditLines(baseDir);
     // No new TOFU audit entries.
-    const newTofu = linesAfter
-      .slice(linesBefore.length)
-      .filter((l) => l.tool_name === 'rea.tofu');
+    const newTofu = linesAfter.slice(linesBefore.length).filter((l) => l.tool_name === 'rea.tofu');
     expect(newTofu).toHaveLength(0);
   });
 
@@ -130,10 +125,7 @@ describe('applyTofuGate', () => {
 
     // Poison `alpha`; leave `beta` alone.
     const poisonedAlpha = server('alpha', { command: 'evil-node' });
-    const { accepted, classifications } = await applyTofuGate(baseDir, [
-      poisonedAlpha,
-      beta,
-    ]);
+    const { accepted, classifications } = await applyTofuGate(baseDir, [poisonedAlpha, beta]);
 
     // Other server stays up.
     expect(accepted.map((s) => s.name)).toEqual(['beta']);
@@ -191,10 +183,7 @@ describe('applyTofuGate', () => {
     expect((accepted_[0]?.metadata as Record<string, unknown>)?.bypassed).toBe(true);
 
     // After bypass, the new fingerprint is the stored baseline.
-    const storeRaw = await fs.readFile(
-      path.join(baseDir, '.rea', 'fingerprints.json'),
-      'utf8',
-    );
+    const storeRaw = await fs.readFile(path.join(baseDir, '.rea', 'fingerprints.json'), 'utf8');
     const store = JSON.parse(storeRaw) as { servers: Record<string, string> };
     expect(store.servers.mock).toBe(fingerprintServer(rotated));
   });
@@ -210,10 +199,7 @@ describe('applyTofuGate', () => {
 
     const poisonedAlpha = server('alpha', { command: 'evil' });
     const gamma = server('gamma');
-    const { accepted, classifications } = await applyTofuGate(baseDir, [
-      poisonedAlpha,
-      gamma,
-    ]);
+    const { accepted, classifications } = await applyTofuGate(baseDir, [poisonedAlpha, gamma]);
 
     expect(accepted.map((s) => s.name)).toEqual(['gamma']);
     const byName = Object.fromEntries(classifications.map((c) => [c.server, c]));
@@ -226,10 +212,7 @@ describe('applyTofuGate', () => {
     expect(stderr).toMatch(/NEW DOWNSTREAM SERVER/);
 
     // Store: gamma recorded, alpha's original stored fingerprint preserved.
-    const storeRaw = await fs.readFile(
-      path.join(baseDir, '.rea', 'fingerprints.json'),
-      'utf8',
-    );
+    const storeRaw = await fs.readFile(path.join(baseDir, '.rea', 'fingerprints.json'), 'utf8');
     const store = JSON.parse(storeRaw) as { servers: Record<string, string> };
     expect(store.servers.gamma).toBe(fingerprintServer(gamma));
     expect(store.servers.alpha).toBe(fingerprintServer(alpha));
@@ -254,10 +237,7 @@ describe('applyTofuGate', () => {
     // baseline landed on disk.
     expect(accepted.map((s) => s.name)).toEqual(['mcp-x']);
 
-    const storeRaw = await fs.readFile(
-      path.join(baseDir, '.rea', 'fingerprints.json'),
-      'utf8',
-    );
+    const storeRaw = await fs.readFile(path.join(baseDir, '.rea', 'fingerprints.json'), 'utf8');
     const store = JSON.parse(storeRaw) as { servers: Record<string, string> };
     expect(store.servers['mcp-x']).toBe(fingerprintServer(disabled));
   });
@@ -323,9 +303,7 @@ describe('applyTofuGate', () => {
     delete process.env.REA_ACCEPT_DRIFT;
     const secondRotation = server('mock', { command: 'second-rotation' });
     stderrChunks.length = 0;
-    const { accepted, classifications } = await applyTofuGate(baseDir, [
-      secondRotation,
-    ]);
+    const { accepted, classifications } = await applyTofuGate(baseDir, [secondRotation]);
     expect(classifications[0]?.verdict).toBe('drifted');
     expect(classifications[0]?.bypassed).toBe(false);
     expect(accepted).toHaveLength(0);

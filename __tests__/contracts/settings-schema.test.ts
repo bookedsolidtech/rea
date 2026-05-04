@@ -177,9 +177,7 @@ describe('Class M — .claude/settings.json conforms to Claude Code hook-config 
   it('rejects hook entry missing command', () => {
     const bad = {
       hooks: {
-        PreToolUse: [
-          { matcher: 'Bash', hooks: [{ type: 'command' } as HookEntry] },
-        ],
+        PreToolUse: [{ matcher: 'Bash', hooks: [{ type: 'command' } as HookEntry] }],
       },
     };
     expect(validate(bad)).toBe(false);

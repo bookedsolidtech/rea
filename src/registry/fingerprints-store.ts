@@ -45,7 +45,9 @@ export const FINGERPRINT_STORE_VERSION = '1';
 const FingerprintStoreSchema = z
   .object({
     version: z.literal(FINGERPRINT_STORE_VERSION),
-    servers: z.record(z.string().regex(/^[a-f0-9]{64}$/, 'fingerprint must be lowercase hex sha256')),
+    servers: z.record(
+      z.string().regex(/^[a-f0-9]{64}$/, 'fingerprint must be lowercase hex sha256'),
+    ),
   })
   .strict();
 

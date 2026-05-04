@@ -105,11 +105,7 @@ describe('kill-switch middleware', () => {
     await mw(ctx, async () => {
       // Simulate the downstream chain + terminal: create HALT mid-flight, then
       // "execute". A well-behaved kill-switch must NOT re-check.
-      await fs.writeFile(
-        path.join(baseDir, '.rea', 'HALT'),
-        'created mid-invocation\n',
-        'utf8',
-      );
+      await fs.writeFile(path.join(baseDir, '.rea', 'HALT'), 'created mid-invocation\n', 'utf8');
       // yield a tick to let any (buggy) watcher fire
       await new Promise<void>((resolve) => setTimeout(resolve, 0));
       terminalRan = true;

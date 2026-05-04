@@ -65,8 +65,6 @@ async function main() {
 }
 
 main().catch((err) => {
-  console.error(
-    `concurrency-worker: fatal: ${err instanceof Error ? err.stack : String(err)}`,
-  );
+  console.error(`concurrency-worker: fatal: ${err instanceof Error ? err.stack : String(err)}`);
   process.exit(5);
 });

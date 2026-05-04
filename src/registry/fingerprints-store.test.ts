@@ -71,11 +71,7 @@ describe('fingerprints-store', () => {
 
   it('throws on schema mismatch (wrong version)', async () => {
     const filePath = __fingerprintStorePathForTests(baseDir);
-    await fs.writeFile(
-      filePath,
-      JSON.stringify({ version: '0', servers: {} }),
-      'utf8',
-    );
+    await fs.writeFile(filePath, JSON.stringify({ version: '0', servers: {} }), 'utf8');
     await expect(loadFingerprintStore(baseDir)).rejects.toThrow(/schema validation/);
   });
 

@@ -12,9 +12,7 @@ import {
 } from './fs-safe.js';
 
 async function mkTmp(prefix: string): Promise<string> {
-  return fsPromises.realpath(
-    await fsPromises.mkdtemp(path.join(os.tmpdir(), `${prefix}-`)),
-  );
+  return fsPromises.realpath(await fsPromises.mkdtemp(path.join(os.tmpdir(), `${prefix}-`)));
 }
 
 describe('resolveContained', () => {
@@ -26,26 +24,18 @@ describe('resolveContained', () => {
 
   it('refuses absolute paths', async () => {
     const root = await mkTmp('rea-fs-safe');
-    expect(() => resolveContained(root, '/etc/passwd')).toThrow(
-      UnsafeInstallPathError,
-    );
+    expect(() => resolveContained(root, '/etc/passwd')).toThrow(UnsafeInstallPathError);
   });
 
   it('refuses `..` segments', async () => {
     const root = await mkTmp('rea-fs-safe');
-    expect(() => resolveContained(root, '../escape')).toThrow(
-      UnsafeInstallPathError,
-    );
-    expect(() => resolveContained(root, 'a/../../out')).toThrow(
-      UnsafeInstallPathError,
-    );
+    expect(() => resolveContained(root, '../escape')).toThrow(UnsafeInstallPathError);
+    expect(() => resolveContained(root, 'a/../../out')).toThrow(UnsafeInstallPathError);
   });
 
   it('refuses Windows-separator `..` segments', async () => {
     const root = await mkTmp('rea-fs-safe');
-    expect(() => resolveContained(root, 'a\\..\\..\\etc')).toThrow(
-      UnsafeInstallPathError,
-    );
+    expect(() => resolveContained(root, 'a\\..\\..\\etc')).toThrow(UnsafeInstallPathError);
   });
 });
 
@@ -108,9 +98,7 @@ describe('safeDeleteFile', () => {
   });
 
   it('refuses to delete outside the root', async () => {
-    await expect(safeDeleteFile(dir, '../outside')).rejects.toThrow(
-      UnsafeInstallPathError,
-    );
+    await expect(safeDeleteFile(dir, '../outside')).rejects.toThrow(UnsafeInstallPathError);
   });
 
   it('refuses to delete a symlink (even inside root)', async () => {
@@ -118,9 +106,7 @@ describe('safeDeleteFile', () => {
     const link = path.join(dir, 'link.txt');
     await fsPromises.writeFile(target, 'y');
     await fsPromises.symlink(target, link);
-    await expect(safeDeleteFile(dir, 'link.txt')).rejects.toThrow(
-      /refusing to delete symlink/,
-    );
+    await expect(safeDeleteFile(dir, 'link.txt')).rejects.toThrow(/refusing to delete symlink/);
     // Original target still on disk.
     expect(fs.existsSync(target)).toBe(true);
   });
@@ -150,14 +136,10 @@ describe('safeReadFile', () => {
     const link = path.join(dir, 'link.txt');
     await fsPromises.writeFile(target, 'secret');
     await fsPromises.symlink(target, link);
-    await expect(safeReadFile(dir, 'link.txt')).rejects.toThrow(
-      /refusing to read symlink/,
-    );
+    await expect(safeReadFile(dir, 'link.txt')).rejects.toThrow(/refusing to read symlink/);
   });
 
   it('refuses a path that escapes the root', async () => {
-    await expect(safeReadFile(dir, '../../etc/passwd')).rejects.toThrow(
-      UnsafeInstallPathError,
-    );
+    await expect(safeReadFile(dir, '../../etc/passwd')).rejects.toThrow(UnsafeInstallPathError);
   });
 });

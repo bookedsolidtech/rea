@@ -29,8 +29,13 @@
  * This matches the protective default established in 0.10.x.
  */
 
+import fs from 'node:fs';
+import path from 'node:path';
 import type { Command } from 'commander';
 import { parsePrePushStdin, runPushGate } from '../hooks/push-gate/index.js';
+import { runBlockedScan, runProtectedScan, type Verdict } from '../hooks/bash-scanner/index.js';
+import { loadPolicy } from '../policy/loader.js';
+import { appendAuditRecord, InvocationStatus, Tier } from '../audit/append.js';
 import { err } from './utils.js';
 
 export interface HookPushGateOptions {
@@ -68,7 +73,9 @@ export async function runHookPushGate(options: HookPushGateOptions): Promise<voi
       env: process.env,
       stderr,
       refspecs,
-      ...(options.base !== undefined && options.base.length > 0 ? { explicitBase: options.base } : {}),
+      ...(options.base !== undefined && options.base.length > 0
+        ? { explicitBase: options.base }
+        : {}),
       ...(options.lastNCommits !== undefined ? { lastNCommits: options.lastNCommits } : {}),
     });
     process.exit(result.exitCode);
@@ -116,16 +123,219 @@ async function readStdinWithTimeout(timeoutMs: number): Promise<string> {
 }
 
 /**
- * Attach the `rea hook` subcommand tree to a commander Program. Single
- * subcommand today (`push-gate`); new hooks should land here rather than as
- * top-level commands so the CLI surface stays navigable.
+ * `rea hook scan-bash --mode protected|blocked` — invoked by the bash
+ * shim hooks at `hooks/protected-paths-bash-gate.sh` and
+ * `hooks/blocked-paths-bash-gate.sh` (since 0.23.0). Reads the Claude
+ * Code tool-input JSON from stdin, extracts `.tool_input.command`,
+ * runs the parser-backed scanner, and writes a verdict JSON to stdout.
+ *
+ * Exit-code contract (parsed by the bash shim via `jq`):
+ *   0 — allow (verdict.verdict == "allow")
+ *   2 — block (verdict.verdict == "block")
+ *   1 — runtime error (HALT active, missing args, internal exception)
+ *
+ * The verdict shape on stdout is `Verdict` (see `verdict.ts`); the
+ * bash shim only reads `.verdict` and `.reason`. Other fields are for
+ * structured-logging consumers in tests + audit middleware.
+ *
+ * HALT is checked HERE (not in the bash shim) so we have a single
+ * source of truth — the shim is intentionally as dumb as possible.
+ */
+export interface HookScanBashOptions {
+  mode: 'protected' | 'blocked';
+  /**
+   * Override REA_ROOT. Useful in tests; the production shim doesn't
+   * pass this — it relies on `process.cwd()` matching CLAUDE_PROJECT_DIR.
+   */
+  reaRoot?: string;
+}
+
+interface ScanBashStdinPayload {
+  tool_input?: {
+    command?: unknown;
+  };
+}
+
+/**
+ * The non-async entry the commander binding hits. Reads stdin (with
+ * a timeout — same pattern as runHookPushGate), executes the scan,
+ * writes the verdict JSON, exits with the appropriate code.
+ */
+export async function runHookScanBash(options: HookScanBashOptions): Promise<void> {
+  const reaRoot = options.reaRoot ?? process.env['CLAUDE_PROJECT_DIR'] ?? process.cwd();
+
+  // HALT check — uniform with the bash hooks. We exit 2 (block) so
+  // the shim refuses the command in the same way settings-protection
+  // and the bash gates do.
+  const haltPath = path.join(reaRoot, '.rea', 'HALT');
+  if (fs.existsSync(haltPath)) {
+    let reason = 'Reason unknown';
+    try {
+      const content = fs.readFileSync(haltPath, 'utf8');
+      reason = content.slice(0, 1024).trim() || reason;
+    } catch {
+      /* leave default */
+    }
+    process.stderr.write(
+      `REA HALT: ${reason}\nAll agent operations suspended. Run: rea unfreeze\n`,
+    );
+    const haltVerdict: Verdict = {
+      verdict: 'block',
+      reason: 'rea HALT active',
+    };
+    process.stdout.write(JSON.stringify(haltVerdict) + '\n');
+    process.exit(2);
+  }
+
+  const stdinRaw = process.stdin.isTTY ? '' : await readStdinWithTimeout(5_000);
+  let cmd = '';
+  if (stdinRaw.length > 0) {
+    try {
+      const parsed: ScanBashStdinPayload = JSON.parse(stdinRaw);
+      const c = parsed.tool_input?.command;
+      // Codex round 1 F-31: tool_input.command MUST be a string. A
+      // crafted payload with `command: ["rm", "-rf"]` or `command: 42`
+      // would pre-fix silently fall through to "allow on empty cmd".
+      // Refuse on type mismatch.
+      if (c !== undefined && typeof c !== 'string') {
+        const wrong: Verdict = {
+          verdict: 'block',
+          reason:
+            'rea: scan-bash received a non-string `tool_input.command` field; refusing on uncertainty',
+        };
+        process.stdout.write(JSON.stringify(wrong) + '\n');
+        process.stderr.write(wrong.reason + '\n');
+        process.exit(2);
+      }
+      if (typeof c === 'string') cmd = c;
+    } catch {
+      // Malformed JSON on stdin → fail closed. The bash shim only
+      // forwards what Claude Code sends, so this should never happen
+      // in production; treating it as block prevents a crafted payload
+      // from getting an allow.
+      const malformed: Verdict = {
+        verdict: 'block',
+        reason: 'rea: scan-bash received malformed JSON on stdin; refusing on uncertainty',
+      };
+      process.stdout.write(JSON.stringify(malformed) + '\n');
+      process.exit(2);
+    }
+  }
+  // Empty command → allow. Matches the bash gates' `[[ -z "$CMD" ]] && exit 0`.
+  if (cmd.length === 0) {
+    process.stdout.write(JSON.stringify({ verdict: 'allow' }) + '\n');
+    process.exit(0);
+  }
+
+  // Load policy. A missing policy file is treated as "no governance" —
+  // we allow on missing-policy so dev environments without a fully-
+  // initialized rea directory don't hard-block. The bash shim
+  // pre-0.23.0 had the same posture.
+  let blockedPaths: readonly string[] = [];
+  let protectedWrites: string[] | undefined;
+  let protectedRelax: string[] = [];
+  try {
+    const policy = loadPolicy(reaRoot);
+    blockedPaths = policy.blocked_paths;
+    protectedWrites = policy.protected_writes;
+    protectedRelax = policy.protected_paths_relax ?? [];
+  } catch {
+    // Policy missing or invalid. Continue with defaults — the historical
+    // protected list is hardcoded; blocked_paths becomes an empty no-op.
+  }
+
+  let verdict: Verdict;
+  try {
+    if (options.mode === 'protected') {
+      verdict = runProtectedScan(
+        {
+          reaRoot,
+          policy: {
+            ...(protectedWrites !== undefined ? { protected_writes: protectedWrites } : {}),
+            protected_paths_relax: protectedRelax,
+          },
+          stderr: (line) => process.stderr.write(line),
+        },
+        cmd,
+      );
+    } else {
+      verdict = runBlockedScan({ reaRoot, blockedPaths }, cmd);
+    }
+  } catch (e) {
+    // Any exception in the scanner is a bug; fail closed.
+    const reason = e instanceof Error ? e.message : String(e);
+    verdict = {
+      verdict: 'block',
+      reason: `rea: scan-bash internal error; refusing on uncertainty: ${reason}`,
+    };
+  }
+
+  // Codex round 1 F-26: emit an audit record so the gateway audit log
+  // captures every scan-bash invocation. Best-effort — failure to
+  // write an audit entry must NOT change the verdict.
+  try {
+    await appendAuditRecord(reaRoot, {
+      tool_name: 'rea.hook.scan-bash',
+      server_name: 'rea',
+      tier: Tier.Read,
+      status: verdict.verdict === 'allow' ? InvocationStatus.Allowed : InvocationStatus.Denied,
+      metadata: {
+        mode: options.mode,
+        verdict: verdict.verdict,
+        ...(verdict.detected_form !== undefined ? { detected_form: verdict.detected_form } : {}),
+        ...(verdict.hit_pattern !== undefined ? { hit_pattern: verdict.hit_pattern } : {}),
+        // Truncate the command to avoid blowing the audit log on very
+        // long inputs.
+        command_preview: cmd.slice(0, 256),
+      },
+    });
+  } catch {
+    /* best-effort */
+  }
+
+  // Write verdict JSON to stdout.
+  process.stdout.write(JSON.stringify(verdict) + '\n');
+  if (verdict.verdict === 'block') {
+    if (typeof verdict.reason === 'string' && verdict.reason.length > 0) {
+      process.stderr.write(verdict.reason + '\n');
+    }
+    process.exit(2);
+  }
+  process.exit(0);
+}
+
+/**
+ * Attach the `rea hook` subcommand tree to a commander Program. Two
+ * subcommands today: `push-gate` and `scan-bash`. New hooks should land
+ * here rather than as top-level commands so the CLI surface stays
+ * navigable.
  */
 export function registerHookCommand(program: Command): void {
   const hook = program
     .command('hook')
     .description(
-      'Pre-hook entry points for git (pre-push) and Claude Code. Called by `.husky/pre-push` and the optional `.git/hooks/pre-push` fallback.',
+      'Pre-hook entry points for git (pre-push) and Claude Code. Called by `.husky/pre-push`, the optional `.git/hooks/pre-push` fallback, and the bash-shim Claude Code hooks at `.claude/hooks/{protected,blocked}-paths-bash-gate.sh`.',
     );
+
+  hook
+    .command('scan-bash')
+    .description(
+      'Parser-backed bash-tier scanner. Reads Claude Code tool-input JSON from stdin, runs the AST walker against the protected-paths or blocked_paths policy, and writes a verdict JSON to stdout. Exit 0 on allow, 2 on block.',
+    )
+    .option(
+      '--mode <protected|blocked>',
+      'which policy to enforce: `protected` for the hardcoded + protected_writes list, `blocked` for the policy.blocked_paths list',
+      (raw: string): 'protected' | 'blocked' => {
+        if (raw !== 'protected' && raw !== 'blocked') {
+          throw new Error(`--mode must be "protected" or "blocked", got ${JSON.stringify(raw)}`);
+        }
+        return raw;
+      },
+      'protected',
+    )
+    .action(async (opts: { mode: 'protected' | 'blocked' }) => {
+      await runHookScanBash({ mode: opts.mode });
+    });
 
   hook
     .command('push-gate')
@@ -150,7 +360,9 @@ export function registerHookCommand(program: Command): void {
       (raw: string): number => {
         const n = Number(raw);
         if (!Number.isInteger(n) || n <= 0) {
-          throw new Error(`--last-n-commits must be a positive integer, got ${JSON.stringify(raw)}`);
+          throw new Error(
+            `--last-n-commits must be a positive integer, got ${JSON.stringify(raw)}`,
+          );
         }
         return n;
       },

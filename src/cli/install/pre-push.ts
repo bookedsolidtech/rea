@@ -338,21 +338,9 @@ export function isReaManagedHuskyGate(content: string): boolean {
  */
 export function isLegacyReaManagedHuskyGate(content: string): boolean {
   return (
-    hasHeaderMarkers(
-      content,
-      LEGACY_HUSKY_GATE_MARKER_V3,
-      LEGACY_HUSKY_GATE_BODY_MARKER_V3,
-    ) ||
-    hasHeaderMarkers(
-      content,
-      LEGACY_HUSKY_GATE_MARKER_V2,
-      LEGACY_HUSKY_GATE_BODY_MARKER_V2,
-    ) ||
-    hasHeaderMarkers(
-      content,
-      LEGACY_HUSKY_GATE_MARKER_V1,
-      LEGACY_HUSKY_GATE_BODY_MARKER_V1,
-    )
+    hasHeaderMarkers(content, LEGACY_HUSKY_GATE_MARKER_V3, LEGACY_HUSKY_GATE_BODY_MARKER_V3) ||
+    hasHeaderMarkers(content, LEGACY_HUSKY_GATE_MARKER_V2, LEGACY_HUSKY_GATE_BODY_MARKER_V2) ||
+    hasHeaderMarkers(content, LEGACY_HUSKY_GATE_MARKER_V1, LEGACY_HUSKY_GATE_BODY_MARKER_V1)
   );
 }
 
@@ -428,8 +416,7 @@ export function isHusky9Stub(content: string): boolean {
   //   . "$(dirname -- "$0")/h"       — older variant still in the wild
   // We do NOT accept arbitrary `. <path>/h` because that would false-match
   // a user-authored hook that happens to source a file named `h`.
-  const sourceLine =
-    /^\.\s+(?:"\$\{0%\/\*\}\/h"|"\$\(dirname[^)]*\$0[^)]*\)\/h")\s*$/;
+  const sourceLine = /^\.\s+(?:"\$\{0%\/\*\}\/h"|"\$\(dirname[^)]*\$0[^)]*\)\/h")\s*$/;
   let sawSource = false;
   for (const rawLine of lines) {
     const line = rawLine.trim();
@@ -485,9 +472,7 @@ export async function resolveHooksDir(
   if (configured === null) {
     return { dir: null, configured: false };
   }
-  const absolute = path.isAbsolute(configured)
-    ? configured
-    : path.join(targetDir, configured);
+  const absolute = path.isAbsolute(configured) ? configured : path.join(targetDir, configured);
   return { dir: absolute, configured: true };
 }
 
@@ -495,10 +480,7 @@ export async function resolveHooksDir(
  * Resolve the absolute path git itself would fire for `hooks/<name>`. Works
  * across vanilla repos, linked worktrees (shared hooks dir), and submodules.
  */
-async function resolveGitHookPath(
-  targetDir: string,
-  hookName: string,
-): Promise<string | null> {
+async function resolveGitHookPath(targetDir: string, hookName: string): Promise<string | null> {
   try {
     const { stdout } = await execFileAsync(
       'git',
@@ -602,19 +584,14 @@ export type InstallDecision =
   | { action: 'install'; hookPath: string }
   | { action: 'refresh'; hookPath: string };
 
-export async function classifyPrePushInstall(
-  targetDir: string,
-): Promise<InstallDecision> {
+export async function classifyPrePushInstall(targetDir: string): Promise<InstallDecision> {
   const { hookPath } = await resolveTargetHookPath(targetDir);
   const classification = await classifyExistingHook(hookPath);
 
   if (classification.kind === 'absent') {
     return { action: 'install', hookPath };
   }
-  if (
-    classification.kind === 'rea-managed' ||
-    classification.kind === 'rea-managed-legacy-v1'
-  ) {
+  if (classification.kind === 'rea-managed' || classification.kind === 'rea-managed-legacy-v1') {
     return { action: 'refresh', hookPath };
   }
   if (
@@ -732,9 +709,7 @@ async function resolveLockDir(targetDir: string): Promise<string> {
     );
     const commonDir = stdout.trim();
     if (commonDir.length > 0) {
-      const absolute = path.isAbsolute(commonDir)
-        ? commonDir
-        : path.join(targetDir, commonDir);
+      const absolute = path.isAbsolute(commonDir) ? commonDir : path.join(targetDir, commonDir);
       return path.join(absolute, 'rea-prepush.lockdir');
     }
   } catch {
@@ -906,9 +881,7 @@ export interface PrePushDoctorState {
  * Read-only probe used by `rea doctor`. Inspects every plausible hook
  * location and reports whether governance is active.
  */
-export async function inspectPrePushState(
-  targetDir: string,
-): Promise<PrePushDoctorState> {
+export async function inspectPrePushState(targetDir: string): Promise<PrePushDoctorState> {
   const configured = await readHooksPathFromGit(targetDir);
   const activePathResult = await resolveTargetHookPath(targetDir);
 

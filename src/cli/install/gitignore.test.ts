@@ -235,14 +235,16 @@ describe('Codex F7 — adversarial regression fixtures', () => {
     // EOL preserved: file stays CRLF.
     expect(after1.includes('\r\n')).toBe(true);
     // Exactly one managed block.
-    const startCount1 = (after1.match(/# === rea managed — do not edit between markers ===/g) ?? []).length;
+    const startCount1 = (after1.match(/# === rea managed — do not edit between markers ===/g) ?? [])
+      .length;
     expect(startCount1).toBe(1);
 
     // Second run must be a no-op — THIS is what F3 was protecting against.
     const r2 = await ensureReaGitignore(dir);
     expect(r2.action).toBe('unchanged');
     const after2 = await fsPromises.readFile(path.join(dir, '.gitignore'), 'utf8');
-    const startCount2 = (after2.match(/# === rea managed — do not edit between markers ===/g) ?? []).length;
+    const startCount2 = (after2.match(/# === rea managed — do not edit between markers ===/g) ?? [])
+      .length;
     expect(startCount2).toBe(1);
   });
 
@@ -296,7 +298,8 @@ describe('Codex F7 — adversarial regression fixtures', () => {
     // block on disk).
     expect(result.action).toBe('updated');
     const after = await fsPromises.readFile(path.join(dir, '.gitignore'), 'utf8');
-    const startCount = (after.match(/# === rea managed — do not edit between markers ===/g) ?? []).length;
+    const startCount = (after.match(/# === rea managed — do not edit between markers ===/g) ?? [])
+      .length;
     expect(startCount).toBe(1);
   });
 
@@ -304,13 +307,15 @@ describe('Codex F7 — adversarial regression fixtures', () => {
     const dir = await makeTempDir();
     // Some Windows editors prepend U+FEFF to new text files. Without BOM
     // handling, the marker on line 0 would silently not match.
-    const bom = '\uFEFF' + GITIGNORE_BLOCK_START + '\n.rea/audit.jsonl\n' + GITIGNORE_BLOCK_END + '\n';
+    const bom =
+      '\uFEFF' + GITIGNORE_BLOCK_START + '\n.rea/audit.jsonl\n' + GITIGNORE_BLOCK_END + '\n';
     await fsPromises.writeFile(path.join(dir, '.gitignore'), bom, 'utf8');
 
     const result = await ensureReaGitignore(dir);
     expect(result.action).toBe('updated');
     const after = await fsPromises.readFile(path.join(dir, '.gitignore'), 'utf8');
-    const startCount = (after.match(/# === rea managed — do not edit between markers ===/g) ?? []).length;
+    const startCount = (after.match(/# === rea managed — do not edit between markers ===/g) ?? [])
+      .length;
     expect(startCount).toBe(1);
   });
 
@@ -329,7 +334,8 @@ describe('Codex F7 — adversarial regression fixtures', () => {
     await Promise.all([ensureReaGitignore(dir), ensureReaGitignore(dir)]);
 
     const content = await fsPromises.readFile(path.join(dir, '.gitignore'), 'utf8');
-    const startCount = (content.match(/# === rea managed — do not edit between markers ===/g) ?? []).length;
+    const startCount = (content.match(/# === rea managed — do not edit between markers ===/g) ?? [])
+      .length;
     const endCount = (content.match(/# === end rea managed ===/g) ?? []).length;
     expect(startCount).toBe(1);
     expect(endCount).toBe(1);

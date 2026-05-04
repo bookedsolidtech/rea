@@ -50,10 +50,8 @@ import type { DownstreamHealth } from '../downstream-pool.js';
 // - GH_CLASSIC_TOKEN: matches `gh[pousr]_[A-Za-z0-9_]{36,}` (GitHub Token).
 // - OPENAI_PROJECT_TOKEN: matches `sk-proj-[a-zA-Z0-9\-_]{32,}` (OpenAI Project Key).
 const AWS_ACCESS_KEY = 'AK' + 'IAIOSFODNN7EXAMPLE';
-const GH_CLASSIC_TOKEN =
-  'gh' + 'p_' + '1234567890abcdef1234567890abcdef1234';
-const OPENAI_PROJECT_TOKEN =
-  'sk-' + 'proj-' + 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';
+const GH_CLASSIC_TOKEN = 'gh' + 'p_' + '1234567890abcdef1234567890abcdef1234';
+const OPENAI_PROJECT_TOKEN = 'sk-' + 'proj-' + 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';
 
 // Synthetic injection payload. Matches one of the INJECTION_PHRASES
 // hardcoded in `middleware/injection.ts` (`ignore previous instructions`).
@@ -146,11 +144,7 @@ describe('sanitizeHealthSnapshot — BUG-011 regression', () => {
           });
           const out = sanitizeHealthSnapshot(snap, policyWithDiagnostics(undefined));
           const serialized = JSON.stringify(out);
-          for (const fragment of [
-            secret,
-            secret.slice(0, 16),
-            secret.slice(-16),
-          ]) {
+          for (const fragment of [secret, secret.slice(0, 16), secret.slice(-16)]) {
             expect(
               serialized.includes(fragment),
               `secret fragment "${fragment}" leaked under halt=${halt}`,
@@ -322,9 +316,7 @@ describe('sanitizeHealthSnapshot — BUG-011 regression', () => {
       const out = sanitizeHealthSnapshot(snap, policyWithDiagnostics(true));
       expect(out.gateway.halt_reason).not.toBeNull();
       // Truncation appends a sentinel and keeps the total ≤ budget.
-      expect(out.gateway.halt_reason!.length).toBeLessThanOrEqual(
-        DIAGNOSTIC_STRING_MAX_CHARS,
-      );
+      expect(out.gateway.halt_reason!.length).toBeLessThanOrEqual(DIAGNOSTIC_STRING_MAX_CHARS);
       expect(out.gateway.halt_reason).toMatch(/truncated/);
     });
 

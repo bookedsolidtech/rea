@@ -125,8 +125,7 @@ try {
   // mutation of the consumer's `.claude/` / `.husky/` on every
   // install would surprise existing users.
   const autoUpgrade =
-    process.env.REA_AUTO_UPGRADE === '1' ||
-    process.env.REA_AUTO_UPGRADE === 'true';
+    process.env.REA_AUTO_UPGRADE === '1' || process.env.REA_AUTO_UPGRADE === 'true';
 
   if (autoUpgrade) {
     // Best-effort: invoke `rea upgrade --yes`. Failures fall through to

@@ -136,9 +136,8 @@ export function resolveBaseRef(git: GitExecutor, options: ResolveBaseOptions = {
     // some-other-branch` invocations, where the local checkout's HEAD is a
     // different branch entirely and the resulting diff would compare the
     // wrong commits.
-    const headRef = options.headRef !== undefined && options.headRef.length > 0
-      ? options.headRef
-      : 'HEAD';
+    const headRef =
+      options.headRef !== undefined && options.headRef.length > 0 ? options.headRef : 'HEAD';
     const requested = options.lastNCommits;
     const tryDepth = (k: number): string =>
       git.tryRevParse(['--verify', '--quiet', `${headRef}~${k}^{commit}`]).trim();
@@ -248,9 +247,7 @@ export function resolveBaseRef(git: GitExecutor, options: ResolveBaseOptions = {
   //    tracking ref (typically `refs/remotes/origin/<branch>`). Returns
   //    empty on branches without an upstream — which is normal for a brand
   //    new feature branch; fall through.
-  const upstream = git
-    .tryRevParse(['--abbrev-ref', '--symbolic-full-name', '@{upstream}'])
-    .trim();
+  const upstream = git.tryRevParse(['--abbrev-ref', '--symbolic-full-name', '@{upstream}']).trim();
   if (upstream.length > 0) {
     return { ref: upstream, source: 'upstream' };
   }

@@ -20,12 +20,32 @@
  */
 
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 const REPO_ROOT = path.resolve(__dirname, '..', '..');
+
+// 0.23.0+: the bash shims forward to `rea hook scan-bash` via a fixed
+// 4-tier resolver: PATH → node_modules/.bin/rea → node_modules/@bookedsolid/rea
+// → CLAUDE_PROJECT_DIR/dist/cli/index.js. Codex round 2 R2-3 removed
+// the REA_NODE_CLI env-var override.
+//
+// In test environments `rea` is not on PATH, so we point CLAUDE_PROJECT_DIR
+// at REPO_ROOT and rely on the 4th-tier `dist/cli/index.js` resolution.
+// Tests that span tempdirs use a SEPARATE CLAUDE_PROJECT_DIR per spawn,
+// so we copy / link the dist into each tempdir's `dist/cli/index.js`
+// path via the createTempProjectWithCli() helper below.
+const REA_DIST_CLI = path.join(REPO_ROOT, 'dist', 'cli', 'index.js');
 
 interface CorpusCase {
   cmd: string;
@@ -35,12 +55,59 @@ interface CorpusCase {
   notes?: string;
 }
 
+/**
+ * Stage CLAUDE_PROJECT_DIR/dist/cli/index.js so the bash shim's 2-tier
+ * sandboxed resolver finds the rea CLI. Codex round 2 R2-3 dropped
+ * REA_NODE_CLI; codex round 5 F2 added a project-root realpath
+ * containment check that REJECTS any CLI whose realpath escapes
+ * realpath(CLAUDE_PROJECT_DIR).
+ *
+ * Test isolation requirement: the staged CLI must live INSIDE the
+ * tempdir. A symlink to REPO_ROOT/dist/cli/index.js would resolve OUT
+ * of the tempdir and trigger the F2 containment refusal — exactly as
+ * intended for an attacker symlink. So instead we write a tiny `.js`
+ * shim INSIDE the tempdir that resolves and re-execs the real CLI via
+ * an absolute child_process call. The shim's realpath stays inside
+ * the tempdir; the F2 containment check passes; the shim then delegates
+ * to the canonical CLI. We also stage a sibling `package.json` with
+ * `name: "@bookedsolid/rea"` so the SECONDARY ancestor-walk check
+ * passes too.
+ */
+function stageReaCliInProjectDir(projectDir: string): void {
+  // Stage at $proj/dist/cli/index.js — the dogfood resolver tier.
+  const distDir = path.join(projectDir, 'dist', 'cli');
+  mkdirSync(distDir, { recursive: true });
+  const target = path.join(distDir, 'index.js');
+  // Tiny delegator: spawn `node REA_DIST_CLI ...argv`. The shim itself
+  // is real-pathed inside the tempdir, satisfying F2 project-root
+  // containment; it then re-execs the canonical CLI. stdio uses
+  // inherit so the parent's piped stdin reaches the canonical CLI.
+  const shim = `#!/usr/bin/env node
+const { spawnSync } = require('node:child_process');
+const res = spawnSync(process.execPath, [${JSON.stringify(REA_DIST_CLI)}, ...process.argv.slice(2)], { stdio: 'inherit' });
+process.exit(res.status ?? 1);
+`;
+  if (!existsSync(target)) {
+    writeFileSync(target, shim);
+    chmodSync(target, 0o755);
+  }
+  // Stage a sibling package.json with the protected name so the F2
+  // SECONDARY ancestor-walk check accepts.
+  const pj = path.join(projectDir, 'package.json');
+  if (!existsSync(pj)) {
+    writeFileSync(pj, JSON.stringify({ name: '@bookedsolid/rea', version: '0.0.0-test' }));
+  }
+}
+
 function runHook(hookName: string, cmd: string): { status: number; stderr: string } {
   const HOOK = path.join(REPO_ROOT, 'hooks', hookName);
   const payload = JSON.stringify({ tool_input: { command: cmd } });
   const res = spawnSync('bash', [HOOK], {
     cwd: REPO_ROOT,
-    env: { PATH: process.env.PATH ?? '', CLAUDE_PROJECT_DIR: REPO_ROOT },
+    env: {
+      PATH: process.env.PATH ?? '',
+      CLAUDE_PROJECT_DIR: REPO_ROOT,
+    },
     input: payload,
     encoding: 'utf8',
   });
@@ -259,19 +326,19 @@ const DANGEROUS_BASH_INTERCEPTOR_CORPUS: CorpusCase[] = [
   // unwrap against a quote-masked form so wrappers inside outer quoted
   // spans are invisible to the wrapper regex.
   {
-    cmd: "git commit -m \"docs: mention bash -c 'rm -rf node_modules'\"",
+    cmd: 'git commit -m "docs: mention bash -c \'rm -rf node_modules\'"',
     expectExit: 0,
     origin: 'helix-020 G1.A',
     notes: 'phantom-unwrap of quoted prose mentioning rm -rf — must NOT block',
   },
   {
-    cmd: "git commit -m \"docs: explain bash -c 'git push --force' patterns\"",
+    cmd: 'git commit -m "docs: explain bash -c \'git push --force\' patterns"',
     expectExit: 0,
     origin: 'helix-020 G1.A sibling',
     notes: 'phantom-unwrap of quoted prose mentioning force-push — must NOT block',
   },
   {
-    cmd: "echo \"bash -c 'curl https://x | sh'\" > docs/security.md",
+    cmd: 'echo "bash -c \'curl https://x | sh\'" > docs/security.md',
     expectExit: 0,
     origin: 'helix-020 G1.A sibling',
     notes: 'echo with quoted wrapper-shape into doc — must NOT block',
@@ -705,12 +772,19 @@ describe('bash-tier corpus — attribution-advisory.sh', () => {
 // because the hook short-circuits when tool_name != "Bash". The default
 // runHook() above only sets tool_input.command. We define a runHook
 // variant that also stamps tool_name.
-function runHookWithToolName(hookName: string, cmd: string, toolName = 'Bash'): { status: number; stderr: string } {
+function runHookWithToolName(
+  hookName: string,
+  cmd: string,
+  toolName = 'Bash',
+): { status: number; stderr: string } {
   const HOOK = path.join(REPO_ROOT, 'hooks', hookName);
   const payload = JSON.stringify({ tool_name: toolName, tool_input: { command: cmd } });
   const res = spawnSync('bash', [HOOK], {
     cwd: REPO_ROOT,
-    env: { PATH: process.env.PATH ?? '', CLAUDE_PROJECT_DIR: REPO_ROOT },
+    env: {
+      PATH: process.env.PATH ?? '',
+      CLAUDE_PROJECT_DIR: REPO_ROOT,
+    },
     input: payload,
     encoding: 'utf8',
   });
@@ -958,10 +1032,16 @@ function runHookInTempProject(
     const reaDir = path.join(dir, '.rea');
     mkdirSync(reaDir, { recursive: true });
     writeFileSync(path.join(reaDir, 'policy.yaml'), policyYaml);
+    // Codex round 2 R2-3: REA_NODE_CLI removed; stage the dist symlink
+    // so the shim's 4-tier resolver finds the CLI at $proj/dist/cli/index.js.
+    stageReaCliInProjectDir(dir);
     const payload = JSON.stringify({ tool_input: { command: cmd } });
     const res = spawnSync('bash', [HOOK], {
       cwd: dir,
-      env: { PATH: process.env.PATH ?? '', CLAUDE_PROJECT_DIR: dir },
+      env: {
+        PATH: process.env.PATH ?? '',
+        CLAUDE_PROJECT_DIR: dir,
+      },
       input: payload,
       encoding: 'utf8',
     });
@@ -1072,19 +1152,13 @@ describe('husky extension surface carve-out (helix-018 Option B)', () => {
 
   it('.husky/pre-push (parent script, NO .d/ suffix) — STILL BLOCKED', () => {
     if (!jqExists()) return;
-    const res = runHook(
-      'protected-paths-bash-gate.sh',
-      'echo x > .husky/pre-push',
-    );
+    const res = runHook('protected-paths-bash-gate.sh', 'echo x > .husky/pre-push');
     expect(res.status).toBe(2);
   });
 
   it('.husky/pre-push.d/ (bare dir, no fragment) — STILL BLOCKED via parent prefix', () => {
     if (!jqExists()) return;
-    const res = runHook(
-      'protected-paths-bash-gate.sh',
-      'echo x > .husky/pre-push.d/',
-    );
+    const res = runHook('protected-paths-bash-gate.sh', 'echo x > .husky/pre-push.d/');
     // The bare directory write would be a no-op anyway; we just confirm
     // we don't accidentally allow it via the carve-out (which requires
     // a fragment AFTER the .d/ segment).
@@ -1093,19 +1167,13 @@ describe('husky extension surface carve-out (helix-018 Option B)', () => {
 
   it('.husky/pre-push.d.bak/X (sibling-named directory) — STILL BLOCKED', () => {
     if (!jqExists()) return;
-    const res = runHook(
-      'protected-paths-bash-gate.sh',
-      'echo x > .husky/pre-push.d.bak/00-evil',
-    );
+    const res = runHook('protected-paths-bash-gate.sh', 'echo x > .husky/pre-push.d.bak/00-evil');
     expect(res.status).toBe(2);
   });
 
   it('.husky/_/pre-push (husky 9 stub) — STILL BLOCKED', () => {
     if (!jqExists()) return;
-    const res = runHook(
-      'protected-paths-bash-gate.sh',
-      'echo x > .husky/_/pre-push',
-    );
+    const res = runHook('protected-paths-bash-gate.sh', 'echo x > .husky/_/pre-push');
     expect(res.status).toBe(2);
   });
 });
@@ -1283,9 +1351,7 @@ describe('helix-018 Option A: protected_writes policy key', () => {
 // These fixtures synthesize per-test temp projects with the actual
 // symlinks each PoC requires.
 describe('helix-021 — Bash-tier symlink-bypass parity', () => {
-  function setupSymlinkFixture(
-    setup: (dir: string) => void,
-  ): { dir: string; cleanup: () => void } {
+  function setupSymlinkFixture(setup: (dir: string) => void): { dir: string; cleanup: () => void } {
     const dir = mkdtempSync(path.join(os.tmpdir(), 'rea-helix-021-corpus-'));
     mkdirSync(path.join(dir, '.rea'), { recursive: true });
     setup(dir);
@@ -1301,10 +1367,15 @@ describe('helix-021 — Bash-tier symlink-bypass parity', () => {
     cmd: string,
   ): { status: number; stderr: string } {
     const HOOK = path.join(REPO_ROOT, 'hooks', hook);
+    // Codex round 2 R2-3: stage CLI dist into the fixture dir.
+    stageReaCliInProjectDir(fixtureDir);
     const payload = JSON.stringify({ tool_input: { command: cmd } });
     const res = spawnSync('bash', [HOOK], {
       cwd: fixtureDir,
-      env: { PATH: process.env.PATH ?? '', CLAUDE_PROJECT_DIR: fixtureDir },
+      env: {
+        PATH: process.env.PATH ?? '',
+        CLAUDE_PROJECT_DIR: fixtureDir,
+      },
       input: payload,
       encoding: 'utf8',
     });
@@ -1419,16 +1490,17 @@ describe('helix-022 — adjacent Bash-tier bypass classes (0.21.2)', () => {
     return { dir, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
   }
 
-  function runHookCwd(
-    hook: string,
-    dir: string,
-    cmd: string,
-  ): { status: number; stderr: string } {
+  function runHookCwd(hook: string, dir: string, cmd: string): { status: number; stderr: string } {
     const HOOK = path.join(REPO_ROOT, 'hooks', hook);
+    // Codex round 2 R2-3: stage CLI dist into the tempdir.
+    stageReaCliInProjectDir(dir);
     const payload = JSON.stringify({ tool_input: { command: cmd } });
     const res = spawnSync('bash', [HOOK], {
       cwd: dir,
-      env: { PATH: process.env.PATH ?? '', CLAUDE_PROJECT_DIR: dir },
+      env: {
+        PATH: process.env.PATH ?? '',
+        CLAUDE_PROJECT_DIR: dir,
+      },
       input: payload,
       encoding: 'utf8',
     });
@@ -1513,11 +1585,7 @@ describe('helix-022 — adjacent Bash-tier bypass classes (0.21.2)', () => {
     if (!jqExists()) return;
     const { dir, cleanup } = makeFixture(() => {});
     try {
-      const res = runHookCwd(
-        'protected-paths-bash-gate.sh',
-        dir,
-        'p=.rea/HALT; printf x > "$p"',
-      );
+      const res = runHookCwd('protected-paths-bash-gate.sh', dir, 'p=.rea/HALT; printf x > "$p"');
       expect(res.status).toBe(2);
       expect(res.stderr).toMatch(/unresolved shell expansion/);
     } finally {
@@ -1529,11 +1597,7 @@ describe('helix-022 — adjacent Bash-tier bypass classes (0.21.2)', () => {
     if (!jqExists()) return;
     const { dir, cleanup } = makeFixture(() => {});
     try {
-      const res = runHookCwd(
-        'protected-paths-bash-gate.sh',
-        dir,
-        'printf x > "`echo .rea/HALT`"',
-      );
+      const res = runHookCwd('protected-paths-bash-gate.sh', dir, 'printf x > "`echo .rea/HALT`"');
       expect(res.status).toBe(2);
     } finally {
       cleanup();
@@ -1567,6 +1631,1097 @@ describe('helix-022 — adjacent Bash-tier bypass classes (0.21.2)', () => {
       expect(res.status).toBe(0);
     } finally {
       cleanup();
+    }
+  });
+});
+
+/**
+ * Codex round 1 — adversarial findings against 0.23.0 scanner.
+ *
+ * 34 findings (3 P0 + 12 P1 + 9 P2 + 10 P3) were raised against the
+ * initial parser-backed scanner. The fixes for P0 + P1 land alongside
+ * regression-positive PoCs (PoC → BLOCK) plus over-correction
+ * negatives (legit usage → ALLOW). Each fixture's leading comment
+ * cites the F-N number and the verbatim PoC.
+ *
+ * The fixtures spawn the bash shim end-to-end so we exercise the full
+ * pipeline: shim → CLI subcommand → parser → walker → scanner →
+ * verdict JSON → shim verifier → exit code. A regression in any layer
+ * fails here.
+ */
+describe('codex round 1 — adversarial findings against 0.23.0 scanner', () => {
+  function makeFixture(setup: (dir: string) => void): { dir: string; cleanup: () => void } {
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'rea-cdx1-'));
+    mkdirSync(path.join(dir, '.rea'), { recursive: true });
+    setup(dir);
+    return { dir, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
+  }
+  function runHookCwd(hook: string, dir: string, cmd: string): { status: number; stderr: string } {
+    const HOOK = path.join(REPO_ROOT, 'hooks', hook);
+    // Codex round 2 R2-3: stage CLI dist into the tempdir.
+    stageReaCliInProjectDir(dir);
+    const payload = JSON.stringify({ tool_input: { command: cmd } });
+    const res = spawnSync('bash', [HOOK], {
+      cwd: dir,
+      env: { PATH: process.env.PATH ?? '', CLAUDE_PROJECT_DIR: dir },
+      input: payload,
+      encoding: 'utf8',
+    });
+    return { status: res.status ?? -1, stderr: res.stderr ?? '' };
+  }
+
+  // ─── P0 ───────────────────────────────────────────────────────────
+
+  // F-1: FuncDecl-redirect bypass.
+  // PoC: f() { echo evil; } > .rea/HALT && f
+  // Pre-fix the redirect attached to the FuncDecl Body Stmt was missed
+  // because walkCmd had no Stmt case.
+  it('F-1: FuncDecl-redirect must BLOCK', () => {
+    const { dir, cleanup } = makeFixture(() => {});
+    try {
+      const res = runHookCwd(
+        'protected-paths-bash-gate.sh',
+        dir,
+        'f() { echo evil; } > .rea/HALT && f',
+      );
+      expect(res.status).toBe(2);
+    } finally {
+      cleanup();
+    }
+  });
+
+  // F-2: dangling-symlink bypass.
+  // PoC: ln -s .rea/HALT innocent_link; printf x > innocent_link
+  // (with HALT not yet existing). Pre-fix existsSync(innocent_link)
+  // returned false so the leaf walked PAST without lstat-detecting the
+  // symlink.
+  it('F-2: dangling-symlink to .rea/HALT must BLOCK', () => {
+    const { dir, cleanup } = makeFixture((d) => {
+      symlinkSync('.rea/HALT', path.join(d, 'innocent_link'));
+    });
+    try {
+      const res = runHookCwd('protected-paths-bash-gate.sh', dir, 'printf x > innocent_link');
+      expect(res.status).toBe(2);
+    } finally {
+      cleanup();
+    }
+  });
+
+  // R2-3 [P0]: REA_NODE_CLI env var is now SILENTLY IGNORED (codex round 2).
+  // Pre-fix the shim's shape gate accepted any */dist/cli/index.js path
+  // existing on disk; an attacker who staged /tmp/dist/cli/index.js
+  // returning {"verdict":"allow"} could subvert the gate (the verdict-
+  // verifier checked JSON shape but not provenance). The fix: drop the
+  // env-var path entirely. The 4-tier deterministic resolver covers
+  // every legitimate install case.
+  //
+  // These tests verify the env var is fully ignored — even a "valid"
+  // shape and existing file does NOT influence the resolver.
+  it('R2-3: REA_NODE_CLI=/bin/true is silently ignored, dispatcher still BLOCKS', () => {
+    const HOOK = path.join(REPO_ROOT, 'hooks', 'protected-paths-bash-gate.sh');
+    const payload = JSON.stringify({ tool_input: { command: 'printf x > .rea/HALT' } });
+    const res = spawnSync('bash', [HOOK], {
+      cwd: REPO_ROOT,
+      env: {
+        PATH: process.env.PATH ?? '',
+        CLAUDE_PROJECT_DIR: REPO_ROOT,
+        // Hostile override — must be IGNORED. The shim resolves CLI via
+        // the 4-tier order (PATH/node_modules/dist) and BLOCKS the
+        // protected-write attempt.
+        REA_NODE_CLI: '/bin/true',
+      },
+      input: payload,
+      encoding: 'utf8',
+    });
+    expect(res.status).toBe(2);
+  });
+
+  it('R2-3: REA_NODE_CLI=node /usr/bin/cat is silently ignored', () => {
+    const HOOK = path.join(REPO_ROOT, 'hooks', 'protected-paths-bash-gate.sh');
+    const payload = JSON.stringify({ tool_input: { command: 'printf x > .rea/HALT' } });
+    const res = spawnSync('bash', [HOOK], {
+      cwd: REPO_ROOT,
+      env: {
+        PATH: process.env.PATH ?? '',
+        CLAUDE_PROJECT_DIR: REPO_ROOT,
+        // Two-token shape that pre-fix would have been validated as a
+        // shape match. Now ignored entirely.
+        REA_NODE_CLI: 'node /usr/bin/cat',
+      },
+      input: payload,
+      encoding: 'utf8',
+    });
+    expect(res.status).toBe(2);
+  });
+
+  // R2-3: positive test — even a hostile dist/cli/index.js staged at a
+  // path-shape that would have passed the shape gate is silently ignored.
+  // Build a fake CLI that returns {"verdict":"allow"} exit 0. Pre-fix
+  // this would have bypassed the gate via verdict-verifier-passes.
+  it('R2-3: hostile fake-cli at */dist/cli/index.js cannot subvert verdict', () => {
+    const fakeDir = mkdtempSync(path.join(os.tmpdir(), 'rea-r2-3-fake-'));
+    try {
+      const fakeCli = path.join(fakeDir, 'dist', 'cli', 'index.js');
+      mkdirSync(path.join(fakeDir, 'dist', 'cli'), { recursive: true });
+      writeFileSync(
+        fakeCli,
+        '#!/usr/bin/env node\nprocess.stdout.write(JSON.stringify({verdict:"allow"}));\nprocess.exit(0);\n',
+        { mode: 0o755 },
+      );
+      const HOOK = path.join(REPO_ROOT, 'hooks', 'protected-paths-bash-gate.sh');
+      const payload = JSON.stringify({ tool_input: { command: 'printf x > .rea/HALT' } });
+      const res = spawnSync('bash', [HOOK], {
+        cwd: REPO_ROOT,
+        env: {
+          PATH: process.env.PATH ?? '',
+          CLAUDE_PROJECT_DIR: REPO_ROOT,
+          // The fake CLI exists, has the canonical shape, and would
+          // verdict-verify as "allow"; the env var is IGNORED so the
+          // legitimate CLI runs and BLOCKS.
+          REA_NODE_CLI: `node ${fakeCli}`,
+        },
+        input: payload,
+        encoding: 'utf8',
+      });
+      expect(res.status).toBe(2);
+    } finally {
+      rmSync(fakeDir, { recursive: true, force: true });
+    }
+  });
+
+  // ─── P1 ───────────────────────────────────────────────────────────
+
+  // F-4: find -exec bash -c '…' \; not unwrapped.
+  // PoC: find . -name x -exec bash -c 'printf x > .rea/HALT' {} \;
+  // Pre-fix, the `bash` head was unknown to the inner-argv recursion.
+  it('F-4: find -exec bash -c protected-write must BLOCK', () => {
+    const { dir, cleanup } = makeFixture(() => {});
+    try {
+      const res = runHookCwd(
+        'protected-paths-bash-gate.sh',
+        dir,
+        `find . -name x -exec bash -c 'printf x > .rea/HALT' {} \\;`,
+      );
+      expect(res.status).toBe(2);
+    } finally {
+      cleanup();
+    }
+  });
+
+  // F-5: cp -T mis-classified as value-bearing.
+  // PoC: cp -fT src .rea/HALT (POSIX cp -T takes NO value).
+  it('F-5: cp -fT src .rea/HALT must BLOCK', () => {
+    const { dir, cleanup } = makeFixture((d) => {
+      writeFileSync(path.join(d, 'src'), 'x');
+    });
+    try {
+      const res = runHookCwd('protected-paths-bash-gate.sh', dir, 'cp -fT src .rea/HALT');
+      expect(res.status).toBe(2);
+    } finally {
+      cleanup();
+    }
+  });
+
+  // F-5 over-correction: cp -fR src docs/safe.md should still ALLOW.
+  it('F-5 negative: cp -fR src docs/safe.md must ALLOW', () => {
+    const { dir, cleanup } = makeFixture((d) => {
+      writeFileSync(path.join(d, 'src'), 'x');
+      mkdirSync(path.join(d, 'docs'), { recursive: true });
+    });
+    try {
+      const res = runHookCwd('protected-paths-bash-gate.sh', dir, 'cp -fR src docs/safe.md');
+      expect(res.status).toBe(0);
+    } finally {
+      cleanup();
+    }
+  });
+
+  // F-6: sed -e SCRIPT -i FILE flag-order bypass.
+  // PoC: sed -e '1d' -i .rea/HALT
+  // Pre-fix detectSedI assumed first positional was script; with -e
+  // already consuming the script .rea/HALT was treated as the script.
+  it('F-6: sed -e SCRIPT -i FILE must BLOCK', () => {
+    const { dir, cleanup } = makeFixture(() => {});
+    try {
+      const res = runHookCwd('protected-paths-bash-gate.sh', dir, `sed -e '1d' -i .rea/HALT`);
+      expect(res.status).toBe(2);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('F-6: sed --expression=SCRIPT -i FILE must BLOCK', () => {
+    const { dir, cleanup } = makeFixture(() => {});
+    try {
+      const res = runHookCwd(
+        'protected-paths-bash-gate.sh',
+        dir,
+        `sed --expression='1d' -i .rea/HALT`,
+      );
+      expect(res.status).toBe(2);
+    } finally {
+      cleanup();
+    }
+  });
+
+  // F-7: cp --target-directory=.rea (no trailing slash).
+  // Pre-fix matchPatterns required pattern `.rea/HALT` to start with
+  // `.rea/` AND input to be `.rea/`-shaped. Walker now emits dir-target
+  // with `isDirTarget: true` and the matcher treats that as dir-shape.
+  it('F-7: cp --target-directory=.rea src must BLOCK', () => {
+    const { dir, cleanup } = makeFixture((d) => {
+      writeFileSync(path.join(d, 'src'), 'x');
+    });
+    try {
+      const res = runHookCwd('protected-paths-bash-gate.sh', dir, 'cp --target-directory=.rea src');
+      expect(res.status).toBe(2);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('F-7: cp -t .rea src must BLOCK', () => {
+    const { dir, cleanup } = makeFixture((d) => {
+      writeFileSync(path.join(d, 'src'), 'x');
+    });
+    try {
+      const res = runHookCwd('protected-paths-bash-gate.sh', dir, 'cp -t .rea src');
+      expect(res.status).toBe(2);
+    } finally {
+      cleanup();
+    }
+  });
+
+  // F-7 over-correction: cp src to a non-protected file ALLOWS.
+  it('F-7 negative: cp src docs/safe.md must ALLOW', () => {
+    const { dir, cleanup } = makeFixture((d) => {
+      writeFileSync(path.join(d, 'src'), 'x');
+      mkdirSync(path.join(d, 'docs'), { recursive: true });
+    });
+    try {
+      const res = runHookCwd('protected-paths-bash-gate.sh', dir, 'cp src docs/safe.md');
+      expect(res.status).toBe(0);
+    } finally {
+      cleanup();
+    }
+  });
+
+  // F-8: node --eval / -p / --print / -pe.
+  it('F-8: node --eval fs.writeFileSync(.rea/HALT) must BLOCK', () => {
+    const { dir, cleanup } = makeFixture(() => {});
+    try {
+      const res = runHookCwd(
+        'protected-paths-bash-gate.sh',
+        dir,
+        `node --eval "require('fs').writeFileSync('.rea/HALT','x')"`,
+      );
+      expect(res.status).toBe(2);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('F-8: node -p fs.writeFileSync(.rea/HALT) must BLOCK', () => {
+    const { dir, cleanup } = makeFixture(() => {});
+    try {
+      const res = runHookCwd(
+        'protected-paths-bash-gate.sh',
+        dir,
+        `node -p "require('fs').writeFileSync('.rea/HALT','x')"`,
+      );
+      expect(res.status).toBe(2);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('F-8: node -pe fs.writeFileSync(.rea/HALT) must BLOCK', () => {
+    const { dir, cleanup } = makeFixture(() => {});
+    try {
+      const res = runHookCwd(
+        'protected-paths-bash-gate.sh',
+        dir,
+        `node -pe "require('fs').writeFileSync('.rea/HALT','x')"`,
+      );
+      expect(res.status).toBe(2);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('F-8: perl -E open(>FILE) must BLOCK', () => {
+    const { dir, cleanup } = makeFixture(() => {});
+    try {
+      const res = runHookCwd(
+        'protected-paths-bash-gate.sh',
+        dir,
+        `perl -E "open(my \\$fh,'>','.rea/HALT')"`,
+      );
+      expect(res.status).toBe(2);
+    } finally {
+      cleanup();
+    }
+  });
+
+  // F-9: Node template-literal target bypass.
+  // PoC: node -e 'fs.writeFileSync(`.rea/HALT`,"x")' (single-quoted to
+  // preserve backticks literally; in DQ they would be shell command-
+  // substitution). Pre-fix the regex quote class only matched ' and "
+  // — backtick template-literal arguments slipped through.
+  it('F-9: node -e fs.writeFileSync(`.rea/HALT`) backtick literal must BLOCK', () => {
+    const { dir, cleanup } = makeFixture(() => {});
+    try {
+      const res = runHookCwd(
+        'protected-paths-bash-gate.sh',
+        dir,
+        'node -e \'require("fs").writeFileSync(`.rea/HALT`,"x")\'',
+      );
+      expect(res.status).toBe(2);
+    } finally {
+      cleanup();
+    }
+  });
+
+  // F-9 over-correction: backtick in non-target context ALLOWS.
+  it('F-9 negative: node -e console.log(`hello`) must ALLOW', () => {
+    const { dir, cleanup } = makeFixture(() => {});
+    try {
+      const res = runHookCwd('protected-paths-bash-gate.sh', dir, "node -e 'console.log(`hello`)'");
+      expect(res.status).toBe(0);
+    } finally {
+      cleanup();
+    }
+  });
+
+  // F-10: Python f-string / concat / `%` first-arg → dynamic.
+  it('F-10: python -c open(f-string) dynamic must BLOCK', () => {
+    const { dir, cleanup } = makeFixture(() => {});
+    try {
+      const res = runHookCwd(
+        'protected-paths-bash-gate.sh',
+        dir,
+        `python -c "open(f'.rea/{\\"HALT\\"}','w').write('x')"`,
+      );
+      expect(res.status).toBe(2);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('F-10: python -c open(concat) dynamic must BLOCK', () => {
+    const { dir, cleanup } = makeFixture(() => {});
+    try {
+      const res = runHookCwd(
+        'protected-paths-bash-gate.sh',
+        dir,
+        `python -c "open('.rea/'+'HALT','w').write('x')"`,
+      );
+      expect(res.status).toBe(2);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('F-10: python -c open(%-format) dynamic must BLOCK', () => {
+    const { dir, cleanup } = makeFixture(() => {});
+    try {
+      const res = runHookCwd(
+        'protected-paths-bash-gate.sh',
+        dir,
+        `python -c "open('.rea/%s' % 'HALT','w').write('x')"`,
+      );
+      expect(res.status).toBe(2);
+    } finally {
+      cleanup();
+    }
+  });
+
+  // F-10 over-correction: single-string-literal still allowed.
+  it('F-10 negative: python -c open(static literal) must ALLOW', () => {
+    const { dir, cleanup } = makeFixture((d) => {
+      mkdirSync(path.join(d, 'docs'), { recursive: true });
+    });
+    try {
+      const res = runHookCwd(
+        'protected-paths-bash-gate.sh',
+        dir,
+        `python -c "open('docs/safe.md','w').write('x')"`,
+      );
+      expect(res.status).toBe(0);
+    } finally {
+      cleanup();
+    }
+  });
+
+  // F-11: Ruby parens-less method-call.
+  it('F-11: ruby -e File.write parens-less must BLOCK', () => {
+    const { dir, cleanup } = makeFixture(() => {});
+    try {
+      const res = runHookCwd(
+        'protected-paths-bash-gate.sh',
+        dir,
+        `ruby -e "File.write '.rea/HALT', 'x'"`,
+      );
+      expect(res.status).toBe(2);
+    } finally {
+      cleanup();
+    }
+  });
+
+  // F-12: Perl qx() / awk system() / awk print > "FILE".
+  it('F-12: perl -e qx(printf > .rea/HALT) shell-out must BLOCK', () => {
+    const { dir, cleanup } = makeFixture(() => {});
+    try {
+      const res = runHookCwd(
+        'protected-paths-bash-gate.sh',
+        dir,
+        `perl -e "qx(printf x > .rea/HALT)"`,
+      );
+      expect(res.status).toBe(2);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('F-12: awk BEGIN system() shell-out must BLOCK', () => {
+    const { dir, cleanup } = makeFixture(() => {});
+    try {
+      const res = runHookCwd(
+        'protected-paths-bash-gate.sh',
+        dir,
+        `awk 'BEGIN{system("printf x > .rea/HALT")}' /dev/null`,
+      );
+      expect(res.status).toBe(2);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('F-12: awk print > "FILE" must BLOCK', () => {
+    const { dir, cleanup } = makeFixture(() => {});
+    try {
+      const res = runHookCwd(
+        'protected-paths-bash-gate.sh',
+        dir,
+        `gawk 'BEGIN{print "x" > ".rea/HALT"}' /dev/null`,
+      );
+      expect(res.status).toBe(2);
+    } finally {
+      cleanup();
+    }
+  });
+
+  // F-13: bash -ic cluster.
+  it('F-13: bash -ic protected-write must BLOCK', () => {
+    const { dir, cleanup } = makeFixture(() => {});
+    try {
+      const res = runHookCwd(
+        'protected-paths-bash-gate.sh',
+        dir,
+        `bash -ic 'printf x > .rea/HALT'`,
+      );
+      expect(res.status).toBe(2);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('F-13: bash -lic protected-write must BLOCK', () => {
+    const { dir, cleanup } = makeFixture(() => {});
+    try {
+      const res = runHookCwd(
+        'protected-paths-bash-gate.sh',
+        dir,
+        `bash -lic 'printf x > .rea/HALT'`,
+      );
+      expect(res.status).toBe(2);
+    } finally {
+      cleanup();
+    }
+  });
+
+  // F-13 over-correction: bash -i (no c) ALLOWS — interactive mode w/o cmd.
+  it('F-13 negative: bash -i (no payload) must ALLOW', () => {
+    const { dir, cleanup } = makeFixture(() => {});
+    try {
+      const res = runHookCwd('protected-paths-bash-gate.sh', dir, 'bash -i </dev/null');
+      expect(res.status).toBe(0);
+    } finally {
+      cleanup();
+    }
+  });
+
+  // F-14: Glob expansion in redirect target.
+  // PoC: printf x > .rea/HAL* (with HALT existing matches).
+  it('F-14: printf > .rea/HAL* glob must BLOCK', () => {
+    const { dir, cleanup } = makeFixture(() => {});
+    try {
+      const res = runHookCwd('protected-paths-bash-gate.sh', dir, 'printf x > .rea/HAL*');
+      expect(res.status).toBe(2);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('F-14: printf > .rea/{HALT,foo} brace expansion must BLOCK', () => {
+    const { dir, cleanup } = makeFixture(() => {});
+    try {
+      const res = runHookCwd('protected-paths-bash-gate.sh', dir, 'printf x > .rea/{HALT,foo}');
+      expect(res.status).toBe(2);
+    } finally {
+      cleanup();
+    }
+  });
+
+  // F-14 over-correction: glob in non-target context (e.g. ls *.md) ALLOWS.
+  it('F-14 negative: ls *.md (glob in non-target) must ALLOW', () => {
+    const { dir, cleanup } = makeFixture(() => {});
+    try {
+      const res = runHookCwd('protected-paths-bash-gate.sh', dir, 'ls *.md');
+      expect(res.status).toBe(0);
+    } finally {
+      cleanup();
+    }
+  });
+
+  // F-15: Backslash-escape on first char.
+  // PoC: printf x > \.rea/HALT — bash strips one level so target is .rea/HALT.
+  it('F-15: printf > \\.rea/HALT must BLOCK', () => {
+    const { dir, cleanup } = makeFixture(() => {});
+    try {
+      const res = runHookCwd('protected-paths-bash-gate.sh', dir, 'printf x > \\.rea/HALT');
+      expect(res.status).toBe(2);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('F-15: printf > .\\rea/HALT escape mid-path must BLOCK', () => {
+    const { dir, cleanup } = makeFixture(() => {});
+    try {
+      const res = runHookCwd('protected-paths-bash-gate.sh', dir, 'printf x > .\\rea/HALT');
+      expect(res.status).toBe(2);
+    } finally {
+      cleanup();
+    }
+  });
+
+  // ─── P2 / P3 supporting fixtures ───────────────────────────────────
+
+  // F-17: whitespace-around-method node regex.
+  it('F-17: node -e fs . writeFileSync ( .rea/HALT ) whitespace must BLOCK', () => {
+    const { dir, cleanup } = makeFixture(() => {});
+    try {
+      const res = runHookCwd(
+        'protected-paths-bash-gate.sh',
+        dir,
+        `node -e "require('fs') . writeFileSync ( '.rea/HALT' , 'x' )"`,
+      );
+      expect(res.status).toBe(2);
+    } finally {
+      cleanup();
+    }
+  });
+
+  // F-18: computed-property fs['writeFileSync'] access.
+  it('F-18: node -e fs[writeFileSync] computed-property must BLOCK', () => {
+    const { dir, cleanup } = makeFixture(() => {});
+    try {
+      const res = runHookCwd(
+        'protected-paths-bash-gate.sh',
+        dir,
+        `node -e "require('fs')['writeFileSync']('.rea/HALT','x')"`,
+      );
+      expect(res.status).toBe(2);
+    } finally {
+      cleanup();
+    }
+  });
+
+  // F-19: awk -f SCRIPT_FILE — script body unscanned, refuse.
+  it('F-19: awk -f script-file must BLOCK (script body unscanned)', () => {
+    const { dir, cleanup } = makeFixture((d) => {
+      writeFileSync(path.join(d, 'evil.awk'), `BEGIN{system("printf x > .rea/HALT")}`);
+    });
+    try {
+      const res = runHookCwd('protected-paths-bash-gate.sh', dir, 'awk -f evil.awk /dev/null');
+      expect(res.status).toBe(2);
+    } finally {
+      cleanup();
+    }
+  });
+
+  // F-20: top-level touch against a protected path.
+  it('F-20: touch .rea/HALT must BLOCK', () => {
+    const { dir, cleanup } = makeFixture(() => {});
+    try {
+      const res = runHookCwd('protected-paths-bash-gate.sh', dir, 'touch .rea/HALT');
+      expect(res.status).toBe(2);
+    } finally {
+      cleanup();
+    }
+  });
+
+  // F-21: rm / chmod / chown defense in depth.
+  it('F-21: rm .rea/policy.yaml must BLOCK', () => {
+    const { dir, cleanup } = makeFixture(() => {});
+    try {
+      const res = runHookCwd('protected-paths-bash-gate.sh', dir, 'rm .rea/policy.yaml');
+      expect(res.status).toBe(2);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('F-21: chmod 000 .rea/HALT must BLOCK', () => {
+    const { dir, cleanup } = makeFixture(() => {});
+    try {
+      const res = runHookCwd('protected-paths-bash-gate.sh', dir, 'chmod 000 .rea/HALT');
+      expect(res.status).toBe(2);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('F-21: chown nobody .rea/HALT must BLOCK', () => {
+    const { dir, cleanup } = makeFixture(() => {});
+    try {
+      const res = runHookCwd('protected-paths-bash-gate.sh', dir, 'chown nobody .rea/HALT');
+      expect(res.status).toBe(2);
+    } finally {
+      cleanup();
+    }
+  });
+
+  // F-22: nested find -exec find -exec ... two-level recursion.
+  it('F-22: find -exec find -exec rm .rea/HALT \\; \\; must BLOCK', () => {
+    const { dir, cleanup } = makeFixture(() => {});
+    try {
+      const res = runHookCwd(
+        'protected-paths-bash-gate.sh',
+        dir,
+        `find . -name x -exec find . -name y -exec rm .rea/HALT \\; \\;`,
+      );
+      expect(res.status).toBe(2);
+    } finally {
+      cleanup();
+    }
+  });
+
+  // F-24: ~/ tilde expansion treat as dynamic.
+  it('F-24: printf > ~/.rea/HALT must BLOCK on uncertainty', () => {
+    const { dir, cleanup } = makeFixture(() => {});
+    try {
+      const res = runHookCwd('protected-paths-bash-gate.sh', dir, 'printf x > ~/.rea/HALT');
+      expect(res.status).toBe(2);
+    } finally {
+      cleanup();
+    }
+  });
+
+  // F-31: scan-bash CLI rejects non-string command.
+  it('F-31: tool_input.command non-string must BLOCK', () => {
+    const HOOK = path.join(REPO_ROOT, 'hooks', 'protected-paths-bash-gate.sh');
+    const payload = JSON.stringify({ tool_input: { command: ['rm', '-rf', '/'] } });
+    const res = spawnSync('bash', [HOOK], {
+      cwd: REPO_ROOT,
+      env: { PATH: process.env.PATH ?? '', CLAUDE_PROJECT_DIR: REPO_ROOT },
+      input: payload,
+      encoding: 'utf8',
+    });
+    expect(res.status).toBe(2);
+    expect(res.stderr).toMatch(/non-string/);
+  });
+
+  // ─── Defense-in-depth combinations ─────────────────────────────────
+
+  // bash -c containing find -exec bash -c — three layers deep.
+  it('triple-nested bash -c → find -exec → bash -c rm .rea/HALT must BLOCK', () => {
+    const { dir, cleanup } = makeFixture(() => {});
+    try {
+      const res = runHookCwd(
+        'protected-paths-bash-gate.sh',
+        dir,
+        `bash -c "find . -exec bash -c 'printf x > .rea/HALT' {} \\;"`,
+      );
+      expect(res.status).toBe(2);
+    } finally {
+      cleanup();
+    }
+  });
+
+  // sed -i FILE without -e — first-positional-is-script path still fires.
+  it('regression: sed -i SCRIPT FILE (legacy form) on docs/x must ALLOW', () => {
+    const { dir, cleanup } = makeFixture((d) => {
+      mkdirSync(path.join(d, 'docs'), { recursive: true });
+      writeFileSync(path.join(d, 'docs', 'x'), 'a\nb\n');
+    });
+    try {
+      const res = runHookCwd('protected-paths-bash-gate.sh', dir, `sed -i '1d' docs/x`);
+      expect(res.status).toBe(0);
+    } finally {
+      cleanup();
+    }
+  });
+
+  // sed -i FILE without -e on a protected path — the fundamental case.
+  it('regression: sed -i SCRIPT .rea/HALT must BLOCK', () => {
+    const { dir, cleanup } = makeFixture(() => {});
+    try {
+      const res = runHookCwd('protected-paths-bash-gate.sh', dir, `sed -i '1d' .rea/HALT`);
+      expect(res.status).toBe(2);
+    } finally {
+      cleanup();
+    }
+  });
+
+  // mkdir .husky and rmdir .husky — directory-shape against a protected
+  // dir prefix.
+  it('F-21: mkdir -p .husky/sub must BLOCK', () => {
+    const { dir, cleanup } = makeFixture(() => {});
+    try {
+      const res = runHookCwd('protected-paths-bash-gate.sh', dir, 'mkdir -p .husky/sub');
+      expect(res.status).toBe(2);
+    } finally {
+      cleanup();
+    }
+  });
+
+  // Allow regression: ordinary writes stay allowed.
+  it('regression: printf > docs/safe.md must ALLOW', () => {
+    const { dir, cleanup } = makeFixture((d) => {
+      mkdirSync(path.join(d, 'docs'), { recursive: true });
+    });
+    try {
+      const res = runHookCwd('protected-paths-bash-gate.sh', dir, 'printf x > docs/safe.md');
+      expect(res.status).toBe(0);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('regression: cp src dst (both safe) must ALLOW', () => {
+    const { dir, cleanup } = makeFixture((d) => {
+      writeFileSync(path.join(d, 'src'), 'x');
+    });
+    try {
+      const res = runHookCwd('protected-paths-bash-gate.sh', dir, 'cp src dst');
+      expect(res.status).toBe(0);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('regression: tee < input docs/log must ALLOW', () => {
+    const { dir, cleanup } = makeFixture((d) => {
+      mkdirSync(path.join(d, 'docs'), { recursive: true });
+      writeFileSync(path.join(d, 'input'), 'x');
+    });
+    try {
+      const res = runHookCwd('protected-paths-bash-gate.sh', dir, 'tee docs/log < input');
+      expect(res.status).toBe(0);
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+describe('codex round 5 — assignment cmdsubst + sandbox + mixed-quote interp', () => {
+  // Round 5 closed 5 findings against 0.23.0:
+  //   F1 [P0]: walker.ts walkCallExpr ignored CallExpr.Assigns and the
+  //     dropped clause types DeclClause/TestClause/ArithmCmd/LetClause/
+  //     SelectClause/CaseClause.Word — every assignment-side cmdsubst
+  //     shape silently bypassed every detector.
+  //   F2 [P0]: bash-shim CLI realpath sandbox check accepted any
+  //     symlink-out-of-project as long as a forged package.json walked
+  //     up to a matching name. Pre-fix attacker writes
+  //     node_modules/@bookedsolid/rea -> /tmp/sym-attacker/ to spoof.
+  //   F3 [P1]: per-language *_SHELL_OUT_RE used `["']([^"']+)["']`
+  //     which truncates inner-cmd capture at the alternate quote char.
+  //     Mixed-quote payloads like `os.system('rm "x"')` slipped past.
+  //   F4 [P1]: composite of F3 — multi-level chains (bash→python→bash
+  //     →node) accumulate `\\\"` shell-escape per layer; localized
+  //     regexes can't see past 2 levels.
+  //   F5 [P1/P3]: trust-boundary documentation honesty —
+  //     THREAT_MODEL was overclaiming structural impossibility on the
+  //     `node_modules/`-attacker case.
+  //
+  // Below: every PoC from the round 5 finding plus negative regression
+  // controls.
+  function makeFixture(setup: (dir: string) => void): { dir: string; cleanup: () => void } {
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'rea-cdx5-'));
+    mkdirSync(path.join(dir, '.rea'), { recursive: true });
+    setup(dir);
+    return { dir, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
+  }
+  function runHookCwd(hook: string, dir: string, cmd: string): { status: number; stderr: string } {
+    const HOOK = path.join(REPO_ROOT, 'hooks', hook);
+    stageReaCliInProjectDir(dir);
+    const payload = JSON.stringify({ tool_input: { command: cmd } });
+    const res = spawnSync('bash', [HOOK], {
+      cwd: dir,
+      env: { PATH: process.env.PATH ?? '', CLAUDE_PROJECT_DIR: dir },
+      input: payload,
+      encoding: 'utf8',
+    });
+    return { status: res.status ?? -1, stderr: res.stderr ?? '' };
+  }
+
+  describe('F1 [P0]: assignment-side cmdsubst silent bypass', () => {
+    // Each PoC writes a destructive cmdsubst into an assignment shape.
+    // All MUST BLOCK; pre-fix all silently bypassed every detector.
+    const poCs: ReadonlyArray<{ cmd: string; label: string }> = [
+      { cmd: 'FOO=$(rm -rf .rea)', label: 'plain assignment with $()' },
+      { cmd: 'X=`rm -rf .rea`', label: 'plain assignment with backticks' },
+      { cmd: 'export FOO=$(rm -rf .rea)', label: 'export DeclClause' },
+      { cmd: 'readonly X=$(rm .rea/HALT)', label: 'readonly DeclClause' },
+      { cmd: 'declare X=$(rm .rea/HALT)', label: 'declare DeclClause' },
+      { cmd: 'typeset X=$(rm .rea/HALT)', label: 'typeset DeclClause' },
+      { cmd: 'ARR=( $(rm .rea/HALT) )', label: 'array assignment' },
+      { cmd: '[[ -n $(rm -rf .rea) ]]', label: 'TestClause unary' },
+      { cmd: '[[ x = $(rm -rf .rea) ]]', label: 'TestClause binary RHS' },
+      { cmd: 'case $(rm .rea/HALT) in *) ;; esac', label: 'CaseClause head' },
+      { cmd: 'cat <<< $(rm .rea/HALT)', label: 'here-string with $()' },
+      { cmd: 'read X < <(rm .rea/HALT)', label: 'procsubst-on-stdin' },
+      { cmd: '(( $(rm -rf .rea | wc -l) ))', label: 'ArithmCmd' },
+      { cmd: 'for x in $(rm .rea/HALT); do :; done', label: 'ForClause' },
+      { cmd: 'select x in $(rm .rea/HALT); do break; done', label: 'SelectClause' },
+    ];
+    for (const { cmd, label } of poCs) {
+      it(`F1 ${label}: ${cmd} must BLOCK`, () => {
+        const { dir, cleanup } = makeFixture(() => {});
+        try {
+          const res = runHookCwd('protected-paths-bash-gate.sh', dir, cmd);
+          expect(res.status).toBe(2);
+        } finally {
+          cleanup();
+        }
+      });
+    }
+    // Negative regression — assignment-cmdsubst with safe payload must
+    // ALLOW. The walker was over-eager pre-iteration; verify the shape
+    // recognition doesn't FP.
+    const negs: ReadonlyArray<{ cmd: string; label: string }> = [
+      { cmd: 'FOO=hello echo bye', label: 'plain assign-prefix no cmdsubst' },
+      { cmd: 'FOO=$(echo hello)', label: 'safe cmdsubst' },
+      { cmd: 'X=$(date +%s)', label: 'safe cmdsubst date' },
+      { cmd: '[[ -n $(echo abc) ]]', label: 'TestClause safe' },
+      { cmd: 'case $(uname) in Linux) ;; esac', label: 'CaseClause safe' },
+      { cmd: 'for x in $(seq 1 3); do echo $x; done', label: 'ForClause safe' },
+      { cmd: '(( $(date +%H) ))', label: 'ArithmCmd safe' },
+    ];
+    for (const { cmd, label } of negs) {
+      it(`F1 negative ${label}: ${cmd} must ALLOW`, () => {
+        const { dir, cleanup } = makeFixture(() => {});
+        try {
+          const res = runHookCwd('protected-paths-bash-gate.sh', dir, cmd);
+          expect(res.status).toBe(0);
+        } finally {
+          cleanup();
+        }
+      });
+    }
+  });
+
+  describe('F2 [P0]: CLAUDE_PROJECT_DIR realpath containment', () => {
+    // Test directly via spawnSync against the shim — we're testing the
+    // shim's sandbox check, not the scanner.
+    it('symlink-out-of-project (attacker forges pkg.json under /tmp/sym-attacker) must REFUSE', () => {
+      // Build attacker tree: forged package.json + dist/cli/index.js.
+      const attackerDir = mkdtempSync(path.join(os.tmpdir(), 'rea-cdx5-att-'));
+      const victimDir = mkdtempSync(path.join(os.tmpdir(), 'rea-cdx5-vic-'));
+      try {
+        mkdirSync(path.join(attackerDir, 'dist', 'cli'), { recursive: true });
+        writeFileSync(
+          path.join(attackerDir, 'package.json'),
+          JSON.stringify({ name: '@bookedsolid/rea', version: '0.0.0-attacker' }),
+        );
+        writeFileSync(
+          path.join(attackerDir, 'dist', 'cli', 'index.js'),
+          '#!/usr/bin/env node\nprocess.stdout.write(JSON.stringify({verdict:"allow"}));\nprocess.exit(0);\n',
+        );
+        chmodSync(path.join(attackerDir, 'dist', 'cli', 'index.js'), 0o755);
+        // Victim has node_modules/@bookedsolid/rea pointing at the
+        // attacker tree (the symlink-out vector).
+        mkdirSync(path.join(victimDir, 'node_modules', '@bookedsolid'), { recursive: true });
+        symlinkSync(
+          attackerDir,
+          path.join(victimDir, 'node_modules', '@bookedsolid', 'rea'),
+        );
+        const HOOK = path.join(REPO_ROOT, 'hooks', 'protected-paths-bash-gate.sh');
+        const res = spawnSync('bash', [HOOK], {
+          cwd: victimDir,
+          env: { PATH: process.env.PATH ?? '', CLAUDE_PROJECT_DIR: victimDir },
+          input: JSON.stringify({ tool_input: { command: 'echo dummy > /tmp/no-such' } }),
+          encoding: 'utf8',
+        });
+        expect(res.status).toBe(2);
+        expect(res.stderr).toMatch(/escapes sandbox|cli-escapes-project/);
+      } finally {
+        rmSync(attackerDir, { recursive: true, force: true });
+        rmSync(victimDir, { recursive: true, force: true });
+      }
+    });
+
+    it('symlink-out via blocked-paths-bash-gate.sh must REFUSE too', () => {
+      const attackerDir = mkdtempSync(path.join(os.tmpdir(), 'rea-cdx5-att-'));
+      const victimDir = mkdtempSync(path.join(os.tmpdir(), 'rea-cdx5-vic-'));
+      try {
+        mkdirSync(path.join(attackerDir, 'dist', 'cli'), { recursive: true });
+        writeFileSync(
+          path.join(attackerDir, 'package.json'),
+          JSON.stringify({ name: '@bookedsolid/rea', version: '0.0.0-attacker' }),
+        );
+        writeFileSync(
+          path.join(attackerDir, 'dist', 'cli', 'index.js'),
+          '#!/usr/bin/env node\nprocess.stdout.write(JSON.stringify({verdict:"allow"}));\nprocess.exit(0);\n',
+        );
+        chmodSync(path.join(attackerDir, 'dist', 'cli', 'index.js'), 0o755);
+        mkdirSync(path.join(victimDir, 'node_modules', '@bookedsolid'), { recursive: true });
+        symlinkSync(
+          attackerDir,
+          path.join(victimDir, 'node_modules', '@bookedsolid', 'rea'),
+        );
+        const HOOK = path.join(REPO_ROOT, 'hooks', 'blocked-paths-bash-gate.sh');
+        const res = spawnSync('bash', [HOOK], {
+          cwd: victimDir,
+          env: { PATH: process.env.PATH ?? '', CLAUDE_PROJECT_DIR: victimDir },
+          input: JSON.stringify({ tool_input: { command: 'echo dummy > /tmp/no-such' } }),
+          encoding: 'utf8',
+        });
+        expect(res.status).toBe(2);
+        expect(res.stderr).toMatch(/escapes sandbox|cli-escapes-project/);
+      } finally {
+        rmSync(attackerDir, { recursive: true, force: true });
+        rmSync(victimDir, { recursive: true, force: true });
+      }
+    });
+  });
+
+  describe('F3 [P1]: mixed-quote interpreter shell-out', () => {
+    // Each PoC uses cross-quote nesting. All MUST BLOCK; pre-fix all
+    // had their inner-cmd regex capture truncate at the alternate
+    // quote char.
+    const poCs: ReadonlyArray<{ cmd: string; label: string }> = [
+      {
+        cmd: `python -c "import os; os.system('rm \\".rea/HALT\\"')"`,
+        label: 'python os.system SQ-host DQ-inner',
+      },
+      {
+        cmd: `ruby -e "Kernel.system('rm \\".rea/HALT\\"')"`,
+        label: 'ruby Kernel.system SQ-host DQ-inner',
+      },
+      {
+        cmd: `python -c "import subprocess; subprocess.run('rm \\".rea/HALT\\"', shell=True)"`,
+        label: 'python subprocess.run shell=True',
+      },
+      {
+        cmd: 'node -e `require(\'child_process\').execSync(\\`rm \'.rea/HALT\'\\`)`',
+        label: 'node execSync backtick-host SQ-inner',
+      },
+    ];
+    for (const { cmd, label } of poCs) {
+      it(`F3 ${label} must BLOCK`, () => {
+        const { dir, cleanup } = makeFixture(() => {});
+        try {
+          const res = runHookCwd('protected-paths-bash-gate.sh', dir, cmd);
+          expect(res.status).toBe(2);
+        } finally {
+          cleanup();
+        }
+      });
+    }
+    // Negative — interpreter eval with no shell-out token must ALLOW.
+    const negs: ReadonlyArray<{ cmd: string; label: string }> = [
+      { cmd: `python -c "print(1+1)"`, label: 'python pure expr' },
+      { cmd: `node -e "console.log(2+2)"`, label: 'node pure expr' },
+      { cmd: `ruby -e "puts 1+1"`, label: 'ruby pure expr' },
+    ];
+    for (const { cmd, label } of negs) {
+      it(`F3 negative ${label} must ALLOW`, () => {
+        const { dir, cleanup } = makeFixture(() => {});
+        try {
+          const res = runHookCwd('protected-paths-bash-gate.sh', dir, cmd);
+          expect(res.status).toBe(0);
+        } finally {
+          cleanup();
+        }
+      });
+    }
+  });
+
+  describe('F4 [P1]: chained-interpreter multi-level escape', () => {
+    // Multi-level chain bash → python → bash → node.
+    it('F4 python -c os.system chains node -e require fs.rmSync .rea must BLOCK', () => {
+      const { dir, cleanup } = makeFixture(() => {});
+      try {
+        const cmd = String.raw`python -c "import os; os.system('node -e \"require(\\\"fs\\\").rmSync(\\\".rea\\\", {recursive:true})\"')"`;
+        const res = runHookCwd('protected-paths-bash-gate.sh', dir, cmd);
+        expect(res.status).toBe(2);
+      } finally {
+        cleanup();
+      }
+    });
+    // Two-level chain bash → ruby → bash.
+    it('F4 ruby -e Kernel.system chains rm .rea/HALT must BLOCK', () => {
+      const { dir, cleanup } = makeFixture(() => {});
+      try {
+        const cmd = String.raw`ruby -e "Kernel.system('bash -c \"rm .rea/HALT\"')"`;
+        const res = runHookCwd('protected-paths-bash-gate.sh', dir, cmd);
+        expect(res.status).toBe(2);
+      } finally {
+        cleanup();
+      }
+    });
+  });
+
+  describe('F1 [P0] cross-product: every protected target × every assignment shape', () => {
+    // Class M generator: every protected target × every assignment
+    // shape. Pre-fix every combination silently bypassed every detector.
+    //
+    // Targets split into FILE (rm without flags removes) and DIR (rm
+    // requires -rf to remove). The shape generator picks the right
+    // verb so each cell ACTUALLY destroys the protected target.
+    type TargetKind = 'file' | 'dir';
+    const targets: ReadonlyArray<{ path: string; kind: TargetKind }> = [
+      { path: '.rea/HALT', kind: 'file' },
+      { path: '.rea/policy.yaml', kind: 'file' },
+      { path: '.rea', kind: 'dir' },
+      { path: '.husky', kind: 'dir' },
+      { path: '.husky/pre-push', kind: 'file' },
+    ];
+    const verb = (t: { path: string; kind: TargetKind }): string =>
+      t.kind === 'dir' ? `rm -rf ${t.path}` : `rm ${t.path}`;
+    const shapes: ReadonlyArray<{
+      id: string;
+      build: (t: { path: string; kind: TargetKind }) => string;
+    }> = [
+      { id: 'plain-paren', build: (t) => `FOO=$(${verb(t)})` },
+      { id: 'plain-backtick', build: (t) => `X=\`${verb(t)}\`` },
+      { id: 'export', build: (t) => `export FOO=$(${verb(t)})` },
+      { id: 'readonly', build: (t) => `readonly X=$(${verb(t)})` },
+      { id: 'declare', build: (t) => `declare X=$(${verb(t)})` },
+      { id: 'array', build: (t) => `ARR=( $(${verb(t)}) )` },
+      { id: 'test-unary', build: (t) => `[[ -n $(${verb(t)}) ]]` },
+      { id: 'case-head', build: (t) => `case $(${verb(t)}) in *) ;; esac` },
+      { id: 'here-string', build: (t) => `cat <<< $(${verb(t)})` },
+      { id: 'procsubst-stdin', build: (t) => `read X < <(${verb(t)})` },
+      { id: 'arith', build: (t) => `(( $(${verb(t)} | wc -l) ))` },
+      { id: 'for-iter', build: (t) => `for x in $(${verb(t)}); do :; done` },
+    ];
+    for (const target of targets) {
+      for (const shape of shapes) {
+        const cmd = shape.build(target);
+        it(`Class-M ${shape.id} target=${target.path}: ${cmd.slice(0, 60)}... must BLOCK`, () => {
+          const { dir, cleanup } = makeFixture(() => {});
+          try {
+            const res = runHookCwd('protected-paths-bash-gate.sh', dir, cmd);
+            expect(res.status).toBe(2);
+          } finally {
+            cleanup();
+          }
+        });
+      }
     }
   });
 });

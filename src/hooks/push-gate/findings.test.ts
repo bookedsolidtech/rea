@@ -52,7 +52,10 @@ describe('parseFindings', () => {
 `;
     const findings = parseFindings(text);
     expect(findings).toHaveLength(1);
-    expect(findings[0]).toMatchObject({ severity: 'P2', title: 'High-level concern about the whole approach' });
+    expect(findings[0]).toMatchObject({
+      severity: 'P2',
+      title: 'High-level concern about the whole approach',
+    });
     expect(findings[0]?.file).toBeUndefined();
   });
 

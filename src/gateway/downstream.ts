@@ -308,8 +308,7 @@ export class DownstreamConnection {
         `DownstreamConnection#lastErrorMessage: expected string | null, got ${typeof msg}`,
       );
     }
-    this.#lastErrorBacking =
-      msg === null ? null : boundedDiagnosticString(msg);
+    this.#lastErrorBacking = msg === null ? null : boundedDiagnosticString(msg);
   }
 
   constructor(
@@ -683,7 +682,8 @@ export class DownstreamConnection {
           return result;
         } catch (reconnectErr) {
           this.health = 'unhealthy';
-          const errMsg = reconnectErr instanceof Error ? reconnectErr.message : String(reconnectErr);
+          const errMsg =
+            reconnectErr instanceof Error ? reconnectErr.message : String(reconnectErr);
           this.#lastErrorMessage = errMsg;
           this.logger?.error({
             event: 'downstream.reconnect_failed',

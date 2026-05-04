@@ -152,16 +152,11 @@ async function ensureDir(dir: string): Promise<void> {
  * Returns `true` if the destination already exists (regular file), `false` if
  * it is absent. Any other shape (symlink, directory, device) → throw.
  */
-async function assertSafeDestination(
-  resolvedRoot: string,
-  dstPath: string,
-): Promise<boolean> {
+async function assertSafeDestination(resolvedRoot: string, dstPath: string): Promise<boolean> {
   // Containment: resolve without following symlinks on the leaf so an attacker
   // cannot smuggle us out via a symlink in the leaf itself.
   const resolvedDst = path.resolve(dstPath);
-  const rootWithSep = resolvedRoot.endsWith(path.sep)
-    ? resolvedRoot
-    : resolvedRoot + path.sep;
+  const rootWithSep = resolvedRoot.endsWith(path.sep) ? resolvedRoot : resolvedRoot + path.sep;
   if (resolvedDst !== resolvedRoot && !resolvedDst.startsWith(rootWithSep)) {
     throw new UnsafeInstallPathError(
       'escape',
@@ -214,14 +209,9 @@ async function assertSafeDestination(
  * demand it already exists — `ensureDir` handles that. We only demand that if
  * it does exist, it's a real directory owned by the tree we're writing into.
  */
-async function assertSafeDirectory(
-  resolvedRoot: string,
-  dirPath: string,
-): Promise<void> {
+async function assertSafeDirectory(resolvedRoot: string, dirPath: string): Promise<void> {
   const resolvedDir = path.resolve(dirPath);
-  const rootWithSep = resolvedRoot.endsWith(path.sep)
-    ? resolvedRoot
-    : resolvedRoot + path.sep;
+  const rootWithSep = resolvedRoot.endsWith(path.sep) ? resolvedRoot : resolvedRoot + path.sep;
   if (resolvedDir !== resolvedRoot && !resolvedDir.startsWith(rootWithSep)) {
     throw new UnsafeInstallPathError(
       'escape',
@@ -302,9 +292,7 @@ async function snapshotAncestors(
   dstPath: string,
 ): Promise<Map<string, string>> {
   const snapshot = new Map<string, string>();
-  const rootWithSep = resolvedRoot.endsWith(path.sep)
-    ? resolvedRoot
-    : resolvedRoot + path.sep;
+  const rootWithSep = resolvedRoot.endsWith(path.sep) ? resolvedRoot : resolvedRoot + path.sep;
   const leafDir = path.dirname(path.resolve(dstPath));
   let cursor = leafDir;
   let reachedRoot = false;
@@ -387,9 +375,7 @@ async function snapshotAncestors(
  * {@link UnsafeInstallPathError} if any resolution has changed (an intermediate
  * directory was replaced with a symlink, renamed, etc.) or disappeared.
  */
-async function verifyAncestorsUnchanged(
-  snapshot: Map<string, string>,
-): Promise<void> {
+async function verifyAncestorsUnchanged(snapshot: Map<string, string>): Promise<void> {
   for (const [ancestor, originalReal] of snapshot) {
     let currentReal: string;
     try {
@@ -427,16 +413,10 @@ async function verifyAncestorsUnchanged(
  * Source-side read follows symlinks, which is fine: `srcPath` is inside PKG_ROOT
  * and the source tree is trusted.
  */
-async function writeFileExclusiveNoFollow(
-  srcPath: string,
-  dstPath: string,
-): Promise<void> {
+async function writeFileExclusiveNoFollow(srcPath: string, dstPath: string): Promise<void> {
   const contents = await fsPromises.readFile(srcPath);
   const flags =
-    fs.constants.O_WRONLY |
-    fs.constants.O_CREAT |
-    fs.constants.O_EXCL |
-    fs.constants.O_NOFOLLOW;
+    fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW;
   const fh = await fsPromises.open(dstPath, flags, 0o644);
   try {
     await fh.writeFile(contents);
@@ -483,15 +463,7 @@ async function walkAndCopy(
           warn(`nested directory beyond depth 2 ignored: ${subSrc}`);
           continue;
         }
-        await copyOne(
-          subSrc,
-          subDst,
-          relClaude(targetDir, subDst),
-          dirName,
-          options,
-          result,
-          ctx,
-        );
+        await copyOne(subSrc, subDst, relClaude(targetDir, subDst), dirName, options, result, ctx);
       }
       continue;
     }
@@ -556,10 +528,7 @@ async function copyOne(
  * would escape the resolved install root. The caller should surface this as a
  * named failure and exit non-zero; do not wrap-and-swallow.
  */
-export async function copyArtifacts(
-  targetDir: string,
-  options: CopyOptions,
-): Promise<CopyResult> {
+export async function copyArtifacts(targetDir: string, options: CopyOptions): Promise<CopyResult> {
   // Resolve the install root up front — `realpath` so a symlinked targetDir
   // (e.g. `/tmp` on macOS → `/private/tmp`) still produces a correct
   // containment root.

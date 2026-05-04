@@ -42,3 +42,6 @@ coverage/
 .scratch/
 .tmp/
 *.log
+
+# Editor backups (e.g. walker.ts.bak from sed -i'.bak' invocations)
+*.bak

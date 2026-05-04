@@ -22,8 +22,7 @@ describe('resolveBaseRef', () => {
   it('returns upstream when @{upstream} resolves', () => {
     const res = resolveBaseRef(
       fakeGit({
-        tryRevParse: (args) =>
-          args.includes('@{upstream}') ? 'origin/feature-base' : '',
+        tryRevParse: (args) => (args.includes('@{upstream}') ? 'origin/feature-base' : ''),
       }),
     );
     expect(res.ref).toBe('origin/feature-base');
@@ -126,7 +125,9 @@ describe('resolveBaseRef — last-n-commits (Fix D / 0.12.0)', () => {
     expect(res.ref).toBe('0123456789abcdef0123456789abcdef01234567');
     expect(res.source).toBe('last-n-commits');
     // The probe should have used the pushed ref, not literal HEAD.
-    const probed = seen.find((a) => a.some((x) => x.includes('beefcafe1234567890abcdef1234567890abcdef~2')));
+    const probed = seen.find((a) =>
+      a.some((x) => x.includes('beefcafe1234567890abcdef1234567890abcdef~2')),
+    );
     expect(probed).toBeDefined();
   });
 
@@ -229,8 +230,7 @@ describe('resolveBaseRef — last-n-commits (Fix D / 0.12.0)', () => {
   it('lastNCommits=0 is treated as unset (falls through to ladder)', () => {
     const res = resolveBaseRef(
       fakeGit({
-        tryRevParse: (args) =>
-          args.includes('@{upstream}') ? 'origin/feature-base' : '',
+        tryRevParse: (args) => (args.includes('@{upstream}') ? 'origin/feature-base' : ''),
       }),
       { lastNCommits: 0 },
     );

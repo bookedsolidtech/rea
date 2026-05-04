@@ -8,4 +8,4 @@ block_ai_attribution: true
 blocked_paths:
   - .env
   - .env.*
-notification_channel: ""
+notification_channel: ''

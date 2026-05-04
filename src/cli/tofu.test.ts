@@ -16,10 +16,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { fingerprintServer } from '../registry/fingerprint.js';
-import {
-  FINGERPRINT_STORE_VERSION,
-  loadFingerprintStore,
-} from '../registry/fingerprints-store.js';
+import { FINGERPRINT_STORE_VERSION, loadFingerprintStore } from '../registry/fingerprints-store.js';
 import { invalidateRegistryCache } from '../registry/loader.js';
 import type { RegistryServer } from '../registry/types.js';
 import { classifyRows, runTofuAccept, runTofuList } from './tofu.js';
@@ -200,9 +197,9 @@ describe('rea tofu accept', () => {
       throw new Error(`process.exit(${code})`);
     }) as typeof process.exit);
 
-    await expect(
-      captureIO(() => runTofuAccept({ name: 'does-not-exist' })),
-    ).rejects.toThrow(/process\.exit\(1\)/);
+    await expect(captureIO(() => runTofuAccept({ name: 'does-not-exist' }))).rejects.toThrow(
+      /process\.exit\(1\)/,
+    );
 
     exitSpy.mockRestore();
   });

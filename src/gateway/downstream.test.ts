@@ -66,10 +66,7 @@ describe('buildChildEnv', () => {
   it('env_passthrough forwards opt-in names from the host environment', () => {
     const hostEnv = { PATH: '/usr/bin', MY_DEBUG: '1', UNRELATED: 'nope' };
 
-    const { env: out } = buildChildEnv(
-      baseServer({ env_passthrough: ['MY_DEBUG'] }),
-      hostEnv,
-    );
+    const { env: out } = buildChildEnv(baseServer({ env_passthrough: ['MY_DEBUG'] }), hostEnv);
 
     expect(out.MY_DEBUG).toBe('1');
     expect(out.UNRELATED).toBeUndefined();
@@ -106,10 +103,11 @@ describe('buildChildEnv', () => {
   it('interpolates ${VAR} placeholders from the host environment', () => {
     const hostEnv = { PATH: '/usr/bin', DISCORD_BOT_TOKEN: 'abc123' };
 
-    const { env: out, missing, secretKeys } = buildChildEnv(
-      baseServer({ env: { BOT_TOKEN: '${DISCORD_BOT_TOKEN}' } }),
-      hostEnv,
-    );
+    const {
+      env: out,
+      missing,
+      secretKeys,
+    } = buildChildEnv(baseServer({ env: { BOT_TOKEN: '${DISCORD_BOT_TOKEN}' } }), hostEnv);
 
     expect(out.BOT_TOKEN).toBe('abc123');
     expect(missing).toEqual([]);
@@ -186,9 +184,15 @@ describe('DownstreamConnection startup env refusal', () => {
 // field after `connect()` so we don't need a real child process.
 // -----------------------------------------------------------------------------
 
-type StubCallTool = (args: { name: string; arguments: Record<string, unknown> }) => Promise<unknown>;
+type StubCallTool = (args: {
+  name: string;
+  arguments: Record<string, unknown>;
+}) => Promise<unknown>;
 
-function makeStubClient(callTool: StubCallTool): { callTool: StubCallTool; close: () => Promise<void> } {
+function makeStubClient(callTool: StubCallTool): {
+  callTool: StubCallTool;
+  close: () => Promise<void>;
+} {
   return {
     callTool,
     close: async () => {
@@ -485,9 +489,7 @@ describe('DownstreamConnection reconnect semantics', () => {
     // flush — `rea status` would show stale healthy=true + last_error=null
     // while the connection was actually in an unhealthy state.
     const s1 = makeStubClient(() => Promise.reject(new Error('transient blip')));
-    const s2 = makeStubClient(() =>
-      Promise.reject(new Error('reconnect failure — within flap')),
-    );
+    const s2 = makeStubClient(() => Promise.reject(new Error('reconnect failure — within flap')));
     const conn = makeConnection([s2]);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (conn as any).client = s1;

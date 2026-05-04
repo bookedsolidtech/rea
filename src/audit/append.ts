@@ -38,13 +38,7 @@ import path from 'node:path';
 import { Tier, InvocationStatus } from '../policy/types.js';
 import type { Policy } from '../policy/types.js';
 import type { AuditRecord, EmissionSource } from '../gateway/middleware/audit-types.js';
-import {
-  GENESIS_HASH,
-  computeHash,
-  fsyncFile,
-  readLastRecord,
-  withAuditLock,
-} from './fs.js';
+import { GENESIS_HASH, computeHash, fsyncFile, readLastRecord, withAuditLock } from './fs.js';
 import { maybeRotate } from '../gateway/audit/rotator.js';
 
 const REA_DIR = '.rea';

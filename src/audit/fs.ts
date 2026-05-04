@@ -71,10 +71,7 @@ const LOCK_OPTIONS: Parameters<typeof properLockfile.lock>[1] = {
  * surface as the caller's rejection — middleware catches and logs, the
  * public helper propagates.
  */
-export async function withAuditLock<T>(
-  auditFile: string,
-  fn: () => Promise<T>,
-): Promise<T> {
+export async function withAuditLock<T>(auditFile: string, fn: () => Promise<T>): Promise<T> {
   const lockTarget = path.dirname(auditFile);
   const release = await properLockfile.lock(lockTarget, LOCK_OPTIONS);
   try {

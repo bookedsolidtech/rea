@@ -125,7 +125,9 @@ function checkSettingsRegistration() {
     for (const [matcher, hookFiles] of Object.entries(byMatcher)) {
       const group = groups.find((g) => g.matcher === matcher);
       if (!group) {
-        missing.push(`${event} :: matcher "${matcher}" — group not present in dogfood settings.json`);
+        missing.push(
+          `${event} :: matcher "${matcher}" — group not present in dogfood settings.json`,
+        );
         continue;
       }
       const registered = group.hooks.map((h) => h.command ?? '');

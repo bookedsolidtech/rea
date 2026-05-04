@@ -335,15 +335,11 @@ export function compileInjectionPatterns(
   return {
     base64Token: wrapRegex(INJECTION_BASE64_PATTERN, {
       timeoutMs,
-      ...(onTimeout
-        ? { onTimeout: (_p, i) => onTimeout('INJECTION_BASE64_PATTERN', i) }
-        : {}),
+      ...(onTimeout ? { onTimeout: (_p, i) => onTimeout('INJECTION_BASE64_PATTERN', i) } : {}),
     }),
     base64Shape: wrapRegex(INJECTION_BASE64_SHAPE, {
       timeoutMs,
-      ...(onTimeout
-        ? { onTimeout: (_p, i) => onTimeout('INJECTION_BASE64_SHAPE', i) }
-        : {}),
+      ...(onTimeout ? { onTimeout: (_p, i) => onTimeout('INJECTION_BASE64_SHAPE', i) } : {}),
     }),
   };
 }
@@ -404,10 +400,7 @@ export function scanStringForInjection(
  * consumer that imported it continue to work. New code should call
  * `scanStringForInjection` directly.
  */
-export function scanForInjection(
-  input: string,
-  safe: CompiledInjectionPatterns,
-): string[] {
+export function scanForInjection(input: string, safe: CompiledInjectionPatterns): string[] {
   const result: InjectionScanResult = {
     literalMatches: new Set(),
     base64DecodedMatches: new Set(),
@@ -463,9 +456,7 @@ export function scanValueForInjection(
  * Extension point: a future "deny-tag" per-pattern metadata layer can force
  * any match to `likely_injection`. Not wired in this PR — TODO below.
  */
-export type InjectionClassification =
-  | { verdict: 'clean' }
-  | InjectionClassifierMetadata;
+export type InjectionClassification = { verdict: 'clean' } | InjectionClassifierMetadata;
 
 export function classifyInjection(
   scan: InjectionScanResult,
@@ -481,9 +472,7 @@ export function classifyInjection(
   // Dedupe: a phrase that appears both literally AND in a base64-decoded
   // payload in the same input counts once in `matched_patterns`. Union via
   // Set before sorting.
-  const matched = [
-    ...new Set([...scan.literalMatches, ...scan.base64DecodedMatches]),
-  ].sort();
+  const matched = [...new Set([...scan.literalMatches, ...scan.base64DecodedMatches])].sort();
 
   // Rule 2 — base64 always escalates, regardless of count or tier.
   if (base64Count > 0) {

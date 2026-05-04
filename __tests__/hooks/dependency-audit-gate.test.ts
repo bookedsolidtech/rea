@@ -144,9 +144,13 @@ describe('dependency-audit-gate.sh — positive-path detection (codex P1+P3 regr
   const FAKE_PKG = '@bookedsolid-typosquat-test/does-not-exist-on-npm';
 
   function networkAvailable(): boolean {
-    const res = spawnSync('curl', ['-fsS', '--max-time', '5', 'https://registry.npmjs.org/-/ping'], {
-      encoding: 'utf8',
-    });
+    const res = spawnSync(
+      'curl',
+      ['-fsS', '--max-time', '5', 'https://registry.npmjs.org/-/ping'],
+      {
+        encoding: 'utf8',
+      },
+    );
     return res.status === 0;
   }
 

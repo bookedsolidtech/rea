@@ -162,7 +162,11 @@ describe('verdict-cache — clear + prune', () => {
   });
 
   it('pruneOlderThan removes entries older than the cutoff', async () => {
-    await writeVerdict(baseDir, 'sha-old', FRESH_ENTRY({ reviewed_at: '2026-01-01T00:00:00.000Z' }));
+    await writeVerdict(
+      baseDir,
+      'sha-old',
+      FRESH_ENTRY({ reviewed_at: '2026-01-01T00:00:00.000Z' }),
+    );
     await writeVerdict(baseDir, 'sha-new', FRESH_ENTRY({ reviewed_at: new Date().toISOString() }));
     const removed = await pruneOlderThan(baseDir, 7 * 24 * 60 * 60 * 1_000); // 7 days
     expect(removed).toBe(1);

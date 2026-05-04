@@ -147,7 +147,9 @@ describe('audit middleware — metrics.incAuditLines integration', () => {
 
     try {
       const ctx = freshCtx();
-      await mw(ctx, async () => { /* terminal */ });
+      await mw(ctx, async () => {
+        /* terminal */
+      });
     } finally {
       spy.mockRestore();
     }

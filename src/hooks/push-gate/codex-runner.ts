@@ -71,7 +71,10 @@ export class CodexTimeoutError extends Error {
 
 export class CodexProtocolError extends Error {
   readonly kind = 'protocol' as const;
-  constructor(public readonly detail: string, public readonly sampleLine?: string) {
+  constructor(
+    public readonly detail: string,
+    public readonly sampleLine?: string,
+  ) {
     super(
       `codex exec review produced unexpected output: ${detail}${
         sampleLine !== undefined ? ` (sample: ${sampleLine.slice(0, 120)})` : ''
@@ -284,7 +287,9 @@ export async function runCodexReview(options: CodexRunOptions): Promise<CodexRun
     '--ephemeral',
   ];
   const args =
-    options.prompt !== undefined && options.prompt.length > 0 ? [...baseArgs, options.prompt] : baseArgs;
+    options.prompt !== undefined && options.prompt.length > 0
+      ? [...baseArgs, options.prompt]
+      : baseArgs;
 
   // 0.16.3 helix-016.1 #1 fix: pre-flight probe for the codex CLI before
   // we hand control to the long-running review subprocess. The original
@@ -376,11 +381,7 @@ export async function runCodexReview(options: CodexRunOptions): Promise<CodexRun
       clearTimeout(timer);
       if (code === null && signal !== null) {
         reject(
-          new CodexSubprocessError(
-            null,
-            signal,
-            Buffer.concat(stderrChunks).toString('utf8'),
-          ),
+          new CodexSubprocessError(null, signal, Buffer.concat(stderrChunks).toString('utf8')),
         );
         return;
       }
@@ -390,11 +391,7 @@ export async function runCodexReview(options: CodexRunOptions): Promise<CodexRun
 
   const durationSeconds = (Date.now() - started) / 1000;
   if (exitCode !== 0 && exitCode !== null) {
-    throw new CodexSubprocessError(
-      exitCode,
-      null,
-      Buffer.concat(stderrChunks).toString('utf8'),
-    );
+    throw new CodexSubprocessError(exitCode, null, Buffer.concat(stderrChunks).toString('utf8'));
   }
 
   const stdout = Buffer.concat(stdoutChunks).toString('utf8');
@@ -468,10 +465,7 @@ export function parseCodexJsonl(stdout: string): CodexJsonlParseResult {
     }
   }
   if (!parsedAny && lines.length > 0) {
-    throw new CodexProtocolError(
-      'no parseable JSONL events in stdout',
-      lines[0],
-    );
+    throw new CodexProtocolError('no parseable JSONL events in stdout', lines[0]);
   }
   return { reviewText, eventCount };
 }

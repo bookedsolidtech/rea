@@ -14,11 +14,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import {
-  classifyCommitMsgHook,
-  COMMIT_MSG_MARKER,
-  installCommitMsgHook,
-} from './commit-msg.js';
+import { classifyCommitMsgHook, COMMIT_MSG_MARKER, installCommitMsgHook } from './commit-msg.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -71,8 +67,7 @@ describe('installCommitMsgHook — core.hooksPath resolution (finding #9)', () =
     const existing = await fs.readFile(cfgPath, 'utf8');
     await fs.writeFile(
       cfgPath,
-      existing +
-        '\n[alias]\n\thooksPath = /bogus/should-not-be-used\n',
+      existing + '\n[alias]\n\thooksPath = /bogus/should-not-be-used\n',
       'utf8',
     );
 
@@ -105,11 +100,7 @@ describe('COMMIT_MSG_MARKER + classifyCommitMsgHook (Fix H / 0.13.0)', () => {
 
   it('classifies a v1-marked rea hook as rea-managed', async () => {
     const hp = path.join(tmp, 'commit-msg');
-    await fs.writeFile(
-      hp,
-      `#!/bin/sh\n${COMMIT_MSG_MARKER}\necho hi\n`,
-      { mode: 0o755 },
-    );
+    await fs.writeFile(hp, `#!/bin/sh\n${COMMIT_MSG_MARKER}\necho hi\n`, { mode: 0o755 });
     const res = await classifyCommitMsgHook(hp);
     expect(res.kind).toBe('rea-managed');
     if (res.kind === 'rea-managed') expect(res.version).toBe('v1');
@@ -117,11 +108,9 @@ describe('COMMIT_MSG_MARKER + classifyCommitMsgHook (Fix H / 0.13.0)', () => {
 
   it('classifies a marker-only-as-substring hook as foreign (anchored on line 2)', async () => {
     const hp = path.join(tmp, 'commit-msg');
-    await fs.writeFile(
-      hp,
-      `#!/bin/sh\n# header line\n${COMMIT_MSG_MARKER}\necho hi\n`,
-      { mode: 0o755 },
-    );
+    await fs.writeFile(hp, `#!/bin/sh\n# header line\n${COMMIT_MSG_MARKER}\necho hi\n`, {
+      mode: 0o755,
+    });
     const res = await classifyCommitMsgHook(hp);
     // Marker on line 3, not line 2 — must NOT be classified as managed.
     expect(res.kind).toBe('foreign');
@@ -222,11 +211,9 @@ describe('commit-msg fragment chaining (Fix H / 0.13.0)', () => {
       `#!/bin/sh\nprintf 'should-not-run\\n' >> "${log}"\n`,
       { mode: 0o644 },
     );
-    await fs.writeFile(
-      path.join(fragDir, '20-runs'),
-      `#!/bin/sh\nprintf 'runs\\n' >> "${log}"\n`,
-      { mode: 0o755 },
-    );
+    await fs.writeFile(path.join(fragDir, '20-runs'), `#!/bin/sh\nprintf 'runs\\n' >> "${log}"\n`, {
+      mode: 0o755,
+    });
     const msg = await writeMsg('chore: trigger fragments\n');
     await execFileAsync(hookPath, [msg], { cwd: repo });
     const order = (await fs.readFile(log, 'utf8')).trim().split('\n');

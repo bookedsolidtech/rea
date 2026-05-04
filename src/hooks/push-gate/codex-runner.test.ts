@@ -27,7 +27,10 @@ describe('parseCodexJsonl', () => {
 
   it('concatenates multiple agent_message items across turns', () => {
     const stream = [
-      JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'First message.' } }),
+      JSON.stringify({
+        type: 'item.completed',
+        item: { type: 'agent_message', text: 'First message.' },
+      }),
       JSON.stringify({
         type: 'item.completed',
         item: { type: 'agent_message', text: 'Second message.' },
@@ -116,7 +119,9 @@ function makeFakeSpawn(captured: { cmd: string; args: readonly string[] }[]) {
       }),
       JSON.stringify({ type: 'turn.completed' }),
     ].join('\n');
-    child.stdout = Readable.from([Buffer.from(stdoutLines)]) as ChildProcessWithoutNullStreams['stdout'];
+    child.stdout = Readable.from([
+      Buffer.from(stdoutLines),
+    ]) as ChildProcessWithoutNullStreams['stdout'];
     child.stderr = Readable.from([]) as ChildProcessWithoutNullStreams['stderr'];
     // Synthesize the `close` event after a microtask so callers can wire
     // listeners first.

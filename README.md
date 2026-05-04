@@ -152,6 +152,21 @@ PR-issue-link advisory, architecture advisory). Each hook uses
 runs a HALT check near the top. See [Hooks shipped](#hooks-shipped) for
 the full inventory.
 
+**Bash-tier scanner (parser-backed since 0.23.0).** Two hooks —
+`protected-paths-bash-gate.sh` and `blocked-paths-bash-gate.sh` — are
+shims that forward stdin to `rea hook scan-bash`, a CLI subcommand
+that parses the Bash command via `mvdan-sh@0.10.1`, walks the AST,
+and emits a verdict JSON. Pre-0.23.0 these were 500-line bash regex
+pipelines; the rewrite closes 24 known-bypass classes
+(helix-021..023 + discord-ops Round 13 + codex round 1) by replacing
+re-tokenization heuristics with structural matches against the parsed
+argv tree. The other nine hooks remain regex-based bash. The shim
+re-verifies the verdict JSON shape on return so a tampered
+`REA_NODE_CLI` env var cannot bypass. See
+[`docs/architecture/bash-scanner.md`](docs/architecture/bash-scanner.md)
+for the AST-walker design and [`docs/migration/0.23.0.md`](docs/migration/0.23.0.md)
+for consumer migration notes.
+
 The hook layer runs independently of the MCP gateway — bypassing one does
 not disable the other. That redundancy is intentional.
 

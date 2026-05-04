@@ -25,15 +25,8 @@
 import type { RegistryServer } from './types.js';
 import { Tier, InvocationStatus } from '../policy/types.js';
 import { appendAuditRecord } from '../audit/append.js';
-import {
-  loadFingerprintStore,
-  saveFingerprintStore,
-} from './fingerprints-store.js';
-import {
-  classifyServers,
-  updateStore,
-  type TofuClassification,
-} from './tofu.js';
+import { loadFingerprintStore, saveFingerprintStore } from './fingerprints-store.js';
+import { classifyServers, updateStore, type TofuClassification } from './tofu.js';
 import { createLogger, type Logger } from '../gateway/log.js';
 
 const TOFU_TOOL_NAME = 'rea.tofu';
@@ -100,11 +93,7 @@ export async function applyTofuGate(
   return { accepted, classifications };
 }
 
-async function emitSideEffects(
-  baseDir: string,
-  c: TofuClassification,
-  log: Logger,
-): Promise<void> {
+async function emitSideEffects(baseDir: string, c: TofuClassification, log: Logger): Promise<void> {
   if (c.verdict === 'unchanged') return;
 
   if (c.verdict === 'first-seen') {

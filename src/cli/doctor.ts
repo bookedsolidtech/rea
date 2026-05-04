@@ -4,14 +4,8 @@ import { loadPolicy } from '../policy/loader.js';
 import { loadRegistry } from '../registry/loader.js';
 import { loadFingerprintStore } from '../registry/fingerprints-store.js';
 import { fingerprintServer } from '../registry/fingerprint.js';
-import {
-  CodexProbe,
-  type CodexProbeState,
-} from '../gateway/observability/codex-probe.js';
-import {
-  inspectPrePushState,
-  type PrePushDoctorState,
-} from './install/pre-push.js';
+import { CodexProbe, type CodexProbeState } from '../gateway/observability/codex-probe.js';
+import { inspectPrePushState, type PrePushDoctorState } from './install/pre-push.js';
 import { summarizeTelemetry } from '../gateway/observability/codex-telemetry.js';
 import {
   CLAUDE_MD_MANIFEST_PATH,
@@ -19,10 +13,7 @@ import {
   enumerateCanonicalFiles,
 } from './install/canonical.js';
 import { buildFragment } from './install/claude-md.js';
-import {
-  canonicalSettingsSubsetHash,
-  defaultDesiredHooks,
-} from './install/settings-merge.js';
+import { canonicalSettingsSubsetHash, defaultDesiredHooks } from './install/settings-merge.js';
 import { manifestExists, readManifest } from './install/manifest-io.js';
 import { sha256OfBuffer, sha256OfFile } from './install/sha.js';
 import { POLICY_FILE, REA_DIR, REGISTRY_FILE, getPkgVersion, log, reaPath } from './utils.js';
@@ -182,9 +173,7 @@ function checkAgentsPresent(baseDir: string): CheckResult {
   if (!fs.existsSync(agentsDir)) {
     return { label: 'curated agents installed', status: 'fail', detail: `missing: ${agentsDir}` };
   }
-  const missing = EXPECTED_AGENTS.filter(
-    (name) => !fs.existsSync(path.join(agentsDir, name)),
-  );
+  const missing = EXPECTED_AGENTS.filter((name) => !fs.existsSync(path.join(agentsDir, name)));
   if (missing.length === 0) {
     return {
       label: 'curated agents installed',
@@ -202,7 +191,11 @@ function checkAgentsPresent(baseDir: string): CheckResult {
 function checkHooksInstalled(baseDir: string): CheckResult {
   const hooksDir = path.join(baseDir, '.claude', 'hooks');
   if (!fs.existsSync(hooksDir)) {
-    return { label: 'hooks installed + executable', status: 'fail', detail: `missing: ${hooksDir}` };
+    return {
+      label: 'hooks installed + executable',
+      status: 'fail',
+      detail: `missing: ${hooksDir}`,
+    };
   }
   const issues: string[] = [];
   for (const name of EXPECTED_HOOKS) {
@@ -212,7 +205,8 @@ function checkHooksInstalled(baseDir: string): CheckResult {
       continue;
     }
     const stat = fs.statSync(p);
-    if ((stat.mode & 0o111) === 0) issues.push(`${name} not executable (mode=${(stat.mode & 0o777).toString(8)})`);
+    if ((stat.mode & 0o111) === 0)
+      issues.push(`${name} not executable (mode=${(stat.mode & 0o777).toString(8)})`);
   }
   if (issues.length === 0) {
     return {
@@ -239,7 +233,9 @@ function checkSettingsJson(baseDir: string): CheckResult {
       hooks?: Record<string, Array<{ matcher?: string }>>;
     };
     const pre = parsed.hooks?.PreToolUse ?? [];
-    const matchers = new Set(pre.map((g) => g.matcher).filter((m): m is string => typeof m === 'string'));
+    const matchers = new Set(
+      pre.map((g) => g.matcher).filter((m): m is string => typeof m === 'string'),
+    );
     const needs: string[] = [];
     if (!matchers.has('Bash')) needs.push('Bash');
     // 0.16.0: matcher widened to `Write|Edit|MultiEdit|NotebookEdit`. Doctor
@@ -331,9 +327,7 @@ export function isGitRepo(baseDir: string): boolean {
   if (rawTarget === undefined) return false;
   const targetPath = rawTarget;
   if (targetPath.length === 0) return false;
-  const resolved = path.isAbsolute(targetPath)
-    ? targetPath
-    : path.join(baseDir, targetPath);
+  const resolved = path.isAbsolute(targetPath) ? targetPath : path.join(baseDir, targetPath);
   return fs.existsSync(resolved);
 }
 
@@ -411,9 +405,7 @@ function checkPrePushHook(state: PrePushDoctorState): CheckResult {
     // …), surface the .d/ migration path explicitly so consumers know
     // exactly how to keep their existing chain without losing rea coverage
     // or having `rea upgrade` clobber them again.
-    const hints = state.activePath !== null
-      ? detectPriorToolHints(state.activePath)
-      : [];
+    const hints = state.activePath !== null ? detectPriorToolHints(state.activePath) : [];
     let detail =
       `active pre-push at ${state.activePath} is present and executable but does NOT ` +
       'invoke `rea hook push-gate` — the 0.11.0 push-gate is silently bypassed. ' +
@@ -550,7 +542,8 @@ function checkExtensionFragments(baseDir: string): CheckResult {
 
 function checkCodexAgent(baseDir: string): CheckResult {
   const agentPath = path.join(baseDir, '.claude', 'agents', 'codex-adversarial.md');
-  if (fs.existsSync(agentPath)) return { label: 'codex-adversarial agent installed', status: 'pass' };
+  if (fs.existsSync(agentPath))
+    return { label: 'codex-adversarial agent installed', status: 'pass' };
   return {
     label: 'codex-adversarial agent installed',
     status: 'warn',
@@ -754,17 +747,12 @@ export function collectChecks(
     checks.push({
       label: 'git hooks',
       status: 'info',
-      detail:
-        'no `.git/` at baseDir — commit-msg / pre-push checks skipped (not a git repo)',
+      detail: 'no `.git/` at baseDir — commit-msg / pre-push checks skipped (not a git repo)',
     });
   }
 
   if (codexRequiredFromPolicy(baseDir)) {
-    checks.push(
-      checkCodexAgent(baseDir),
-      checkCodexCommand(baseDir),
-      checkCodexBinaryOnPath(),
-    );
+    checks.push(checkCodexAgent(baseDir), checkCodexCommand(baseDir), checkCodexBinaryOnPath());
     if (codexProbeState !== undefined) {
       checks.push(...checksFromProbeState(codexProbeState));
     }
@@ -776,8 +764,7 @@ export function collectChecks(
     checks.push({
       label: 'codex',
       status: 'info',
-      detail:
-        'disabled via policy.review.codex_required — skipping Codex-related checks',
+      detail: 'disabled via policy.review.codex_required — skipping Codex-related checks',
     });
   }
 
@@ -887,11 +874,7 @@ export async function collectDriftReport(baseDir: string): Promise<DriftReport> 
   // Manifest entries no longer in canonical (removed upstream), excluding
   // synthetic entries handled below.
   for (const entry of manifest.files) {
-    if (
-      entry.path === CLAUDE_MD_MANIFEST_PATH ||
-      entry.path === SETTINGS_MANIFEST_PATH
-    )
-      continue;
+    if (entry.path === CLAUDE_MD_MANIFEST_PATH || entry.path === SETTINGS_MANIFEST_PATH) continue;
     if (!canonicalByPath.has(entry.path)) {
       rows.push({
         path: entry.path,
@@ -979,9 +962,7 @@ function printDriftReport(report: DriftReport): void {
     console.log(`  [${row.status}] ${row.path}${detail}`);
   }
   console.log('');
-  console.log(
-    `  ${clean} clean, ${report.rows.length - clean} with drift/issues.`,
-  );
+  console.log(`  ${clean} clean, ${report.rows.length - clean} with drift/issues.`);
   console.log('');
 }
 
@@ -1060,12 +1041,8 @@ async function printTelemetrySummary(baseDir: string): Promise<void> {
   const summary = await summarizeTelemetry(baseDir);
   console.log('');
   log(`Telemetry — last ${summary.window_days} days`);
-  console.log(
-    `  invocations/day:        ${summary.invocations_per_day.join(', ')}`,
-  );
+  console.log(`  invocations/day:        ${summary.invocations_per_day.join(', ')}`);
   console.log(`  total estimated tokens: ${summary.total_estimated_tokens}`);
   console.log(`  rate-limited responses: ${summary.rate_limited_count}`);
-  console.log(
-    `  avg latency:            ${Math.round(summary.avg_latency_ms)} ms`,
-  );
+  console.log(`  avg latency:            ${Math.round(summary.avg_latency_ms)} ms`);
 }

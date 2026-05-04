@@ -46,10 +46,7 @@ const SOURCES: readonly ContractSource[] = [
   {
     label: 'commands/codex-review.md (slash command)',
     file: 'commands/codex-review.md',
-    signals: [
-      /## Step 3 — Verify audit entry — REQUIRED/,
-      /MUST.{0,40}emit.{0,40}audit/i,
-    ],
+    signals: [/## Step 3 — Verify audit entry — REQUIRED/, /MUST.{0,40}emit.{0,40}audit/i],
     antisignals: [
       // The pre-0.18.0 wording. If this returns, the test fails loudly.
       /audit emission is optional/i,
@@ -59,10 +56,7 @@ const SOURCES: readonly ContractSource[] = [
   {
     label: 'agents/codex-adversarial.md (agent)',
     file: 'agents/codex-adversarial.md',
-    signals: [
-      /Emit an? audit entry.{0,10}—.{0,10}REQUIRED/i,
-      /always emits/i,
-    ],
+    signals: [/Emit an? audit entry.{0,10}—.{0,10}REQUIRED/i, /always emits/i],
     antisignals: [/audit emission is optional/i],
   },
   {

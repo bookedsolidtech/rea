@@ -160,10 +160,7 @@ describe('secret-scanner.sh — MultiEdit tool (0.14.0 iron-gate fix)', () => {
     const res = runHook({
       tool_input: {
         file_path: '/tmp/foo.ts',
-        edits: [
-          { old_string: 'a' },
-          { old_string: 'b', new_string: 'safe' },
-        ],
+        edits: [{ old_string: 'a' }, { old_string: 'b', new_string: 'safe' }],
       },
     });
     expect(res.status).toBe(0);

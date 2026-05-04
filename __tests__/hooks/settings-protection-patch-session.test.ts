@@ -36,11 +36,7 @@ interface Env {
   [key: string]: string | undefined;
 }
 
-function runHook(
-  dir: string,
-  filePath: string,
-  env: Env = {},
-): HookResult {
+function runHook(dir: string, filePath: string, env: Env = {}): HookResult {
   const payload = JSON.stringify({ tool_input: { file_path: filePath } });
   const res = spawnSync('bash', [HOOK_SRC], {
     cwd: dir,
@@ -81,9 +77,7 @@ describe('settings-protection.sh — REA_HOOK_PATCH_SESSION env var (Defect I)',
   let dir: string;
 
   beforeEach(async () => {
-    dir = await fs.realpath(
-      await fs.mkdtemp(path.join(os.tmpdir(), 'rea-patch-session-')),
-    );
+    dir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-patch-session-')));
     await fs.mkdir(path.join(dir, '.rea'), { recursive: true });
     await fs.mkdir(path.join(dir, '.claude', 'hooks'), { recursive: true });
     await fs.mkdir(path.join(dir, 'hooks'), { recursive: true });
@@ -259,9 +253,7 @@ describe('settings-protection.sh — path-traversal bypass (Codex HIGH 1)', () =
   let dir: string;
 
   beforeEach(async () => {
-    dir = await fs.realpath(
-      await fs.mkdtemp(path.join(os.tmpdir(), 'rea-traversal-')),
-    );
+    dir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-traversal-')));
     await fs.mkdir(path.join(dir, '.rea'), { recursive: true });
     await fs.mkdir(path.join(dir, '.claude', 'hooks'), { recursive: true });
     await fs.mkdir(path.join(dir, 'hooks'), { recursive: true });
@@ -317,9 +309,7 @@ describe('settings-protection.sh — `.husky/*.d/` extension surface (Fix 0.13.2
   let dir: string;
 
   beforeEach(async () => {
-    dir = await fs.realpath(
-      await fs.mkdtemp(path.join(os.tmpdir(), 'rea-ext-')),
-    );
+    dir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-ext-')));
     await fs.mkdir(path.join(dir, '.husky', 'pre-push.d'), { recursive: true });
     await fs.mkdir(path.join(dir, '.husky', 'commit-msg.d'), { recursive: true });
   });

@@ -23,10 +23,7 @@ export type Middleware = (ctx: InvocationContext, next: NextFn) => Promise<void>
  * SECURITY: Once status is set to Denied, it is locked for the remainder
  * of the chain. No middleware can revert a denial.
  */
-export function executeChain(
-  middlewares: Middleware[],
-  ctx: InvocationContext,
-): Promise<void> {
+export function executeChain(middlewares: Middleware[], ctx: InvocationContext): Promise<void> {
   let index = -1;
   let deniedOnce = false;
   let savedError: string | undefined;

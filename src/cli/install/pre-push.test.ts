@@ -163,7 +163,9 @@ describe('BODY_TEMPLATE — path-with-spaces portability (Fix A / 0.12.0)', () =
     // dogfood arm must require a rea-specific package.json signal too.
     const body = fallbackHookContent();
     expect(body).toMatch(/grep -q '"name": \*"@bookedsolid\/rea"' "\$\{REA_ROOT\}\/package\.json"/);
-    expect(body).toMatch(/\[ -f "\$\{REA_ROOT\}\/dist\/cli\/index\.js" \] && \[ -f "\$\{REA_ROOT\}\/package\.json" \]/);
+    expect(body).toMatch(
+      /\[ -f "\$\{REA_ROOT\}\/dist\/cli\/index\.js" \] && \[ -f "\$\{REA_ROOT\}\/package\.json" \]/,
+    );
   });
 
   it('shipped husky body delegates via `set --` arms identically to the fallback', () => {
@@ -793,9 +795,7 @@ describe('extension-hook chaining (Fix H / 0.13.0) — `.husky/pre-push.d/*`', (
   });
 
   it('BODY parses cleanly under `sh -n` (POSIX syntax check)', async () => {
-    const tmpDir = await fs.realpath(
-      await fs.mkdtemp(path.join(os.tmpdir(), 'rea-pp-h-')),
-    );
+    const tmpDir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-pp-h-')));
     try {
       const hp = path.join(tmpDir, 'pre-push');
       await fs.writeFile(hp, fallbackHookContent(), { encoding: 'utf8', mode: 0o755 });
@@ -812,9 +812,7 @@ describe('extension-hook chaining (Fix H / 0.13.0) — `.husky/pre-push.d/*`', (
     // extension-loop body. Track invocation order via a shared log
     // file. The fragments must run after the rea body in lex order
     // (10 → 20 → 90), and the final exit code must be 0.
-    const repoDir = await fs.realpath(
-      await fs.mkdtemp(path.join(os.tmpdir(), 'rea-pp-e2e-')),
-    );
+    const repoDir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-pp-e2e-')));
     try {
       // Init a real git repo so `git rev-parse --show-toplevel` works.
       await execFileAsync('git', ['-C', repoDir, 'init', '-q']);
@@ -823,11 +821,9 @@ describe('extension-hook chaining (Fix H / 0.13.0) — `.husky/pre-push.d/*`', (
       const log = path.join(repoDir, 'order.log');
       const stubBin = path.join(repoDir, 'node_modules', '.bin', 'rea');
       await fs.mkdir(path.dirname(stubBin), { recursive: true });
-      await fs.writeFile(
-        stubBin,
-        `#!/bin/sh\nprintf 'rea\\n' >> "${log}"\nexit 0\n`,
-        { mode: 0o755 },
-      );
+      await fs.writeFile(stubBin, `#!/bin/sh\nprintf 'rea\\n' >> "${log}"\nexit 0\n`, {
+        mode: 0o755,
+      });
       // Fragments in deliberately-non-alphabetical filenames to prove
       // sort-order, not creation-order, dictates execution.
       const fragDir = path.join(repoDir, '.husky', 'pre-push.d');
@@ -866,9 +862,7 @@ describe('extension-hook chaining (Fix H / 0.13.0) — `.husky/pre-push.d/*`', (
   });
 
   it('end-to-end: a non-zero fragment fails the push (set -eu propagates)', async () => {
-    const repoDir = await fs.realpath(
-      await fs.mkdtemp(path.join(os.tmpdir(), 'rea-pp-fail-')),
-    );
+    const repoDir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-pp-fail-')));
     try {
       await execFileAsync('git', ['-C', repoDir, 'init', '-q']);
       const stubBin = path.join(repoDir, 'node_modules', '.bin', 'rea');
@@ -897,9 +891,7 @@ describe('extension-hook chaining (Fix H / 0.13.0) — `.husky/pre-push.d/*`', (
   });
 
   it('missing `.husky/pre-push.d/` is a no-op (backward compat)', async () => {
-    const repoDir = await fs.realpath(
-      await fs.mkdtemp(path.join(os.tmpdir(), 'rea-pp-noop-')),
-    );
+    const repoDir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-pp-noop-')));
     try {
       await execFileAsync('git', ['-C', repoDir, 'init', '-q']);
       const stubBin = path.join(repoDir, 'node_modules', '.bin', 'rea');
@@ -918,19 +910,15 @@ describe('extension-hook chaining (Fix H / 0.13.0) — `.husky/pre-push.d/*`', (
   });
 
   it('non-executable files in `.husky/pre-push.d/` are silently skipped', async () => {
-    const repoDir = await fs.realpath(
-      await fs.mkdtemp(path.join(os.tmpdir(), 'rea-pp-skip-')),
-    );
+    const repoDir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-pp-skip-')));
     try {
       await execFileAsync('git', ['-C', repoDir, 'init', '-q']);
       const log = path.join(repoDir, 'order.log');
       const stubBin = path.join(repoDir, 'node_modules', '.bin', 'rea');
       await fs.mkdir(path.dirname(stubBin), { recursive: true });
-      await fs.writeFile(
-        stubBin,
-        `#!/bin/sh\nprintf 'rea\\n' >> "${log}"\nexit 0\n`,
-        { mode: 0o755 },
-      );
+      await fs.writeFile(stubBin, `#!/bin/sh\nprintf 'rea\\n' >> "${log}"\nexit 0\n`, {
+        mode: 0o755,
+      });
       const fragDir = path.join(repoDir, '.husky', 'pre-push.d');
       await fs.mkdir(fragDir, { recursive: true });
       // 10-not-exec is a valid shell script BUT lacks the exec bit — must be skipped.
@@ -955,7 +943,7 @@ describe('extension-hook chaining (Fix H / 0.13.0) — `.husky/pre-push.d/*`', (
     }
   });
 
-  it('end-to-end: fragments receive git\'s original argv (Fix 0.13.2 — $@ preservation)', async () => {
+  it("end-to-end: fragments receive git's original argv (Fix 0.13.2 — $@ preservation)", async () => {
     // Regression test for the BST 2026-05-03 report. Pre-0.13.2, the rea
     // dispatch used `set -- "${REA_ROOT}/node_modules/.bin/rea" hook push-gate "$@"`
     // followed by `"$@"` to invoke. The `set --` mutated the parent shell's
@@ -965,9 +953,7 @@ describe('extension-hook chaining (Fix H / 0.13.0) — `.husky/pre-push.d/*`', (
     // linters, lint-staged-on-push wrappers, and any fragment that reads
     // $1/$2 per the standard pre-push contract. The fix wraps the dispatch
     // in a subshell `(...)` so set-- stays scoped.
-    const repoDir = await fs.realpath(
-      await fs.mkdtemp(path.join(os.tmpdir(), 'rea-pp-argv-')),
-    );
+    const repoDir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-pp-argv-')));
     try {
       await execFileAsync('git', ['-C', repoDir, 'init', '-q']);
       const reaArgvLog = path.join(repoDir, 'rea-argv.log');
@@ -1006,14 +992,12 @@ describe('extension-hook chaining (Fix H / 0.13.0) — `.husky/pre-push.d/*`', (
     }
   });
 
-  it('end-to-end: fragments receive git\'s argv even when rea CLI is multi-token (node + script path)', async () => {
+  it("end-to-end: fragments receive git's argv even when rea CLI is multi-token (node + script path)", async () => {
     // Variant of the argv preservation test using the dogfood dispatch arm
     // (`set -- node "${REA_ROOT}/dist/cli/index.js" hook push-gate "$@"`),
     // which has the most tokens and the highest blast radius for $@
     // contamination.
-    const repoDir = await fs.realpath(
-      await fs.mkdtemp(path.join(os.tmpdir(), 'rea-pp-argv2-')),
-    );
+    const repoDir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-pp-argv2-')));
     try {
       await execFileAsync('git', ['-C', repoDir, 'init', '-q']);
       // Set up the dogfood dispatch trigger: dist/cli/index.js + a

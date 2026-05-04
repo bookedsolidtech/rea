@@ -15,11 +15,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { appendAuditRecord } from '../../audit/append.js';
 import type { AuditRecord } from '../middleware/audit-types.js';
 import type { Policy } from '../../policy/types.js';
-import {
-  AutonomyLevel,
-  InvocationStatus,
-  Tier,
-} from '../../policy/types.js';
+import { AutonomyLevel, InvocationStatus, Tier } from '../../policy/types.js';
 import {
   DEFAULT_MAX_BYTES,
   ROTATION_TOOL_NAME,
@@ -74,9 +70,7 @@ describe('rotator — thresholds and filename formatting', () => {
   });
 
   it('effectiveThresholds honors operator-supplied knobs', () => {
-    const t = _effectiveThresholds(
-      makePolicy({ rotation: { max_bytes: 1024, max_age_days: 7 } }),
-    );
+    const t = _effectiveThresholds(makePolicy({ rotation: { max_bytes: 1024, max_age_days: 7 } }));
     expect(t.maxBytes).toBe(1024);
     expect(t.maxAgeMs).toBe(7 * 24 * 60 * 60 * 1000);
   });
@@ -228,9 +222,7 @@ describe('rotator — performRotation preserves hash-chain continuity', () => {
 
     // Two distinct rotated files.
     expect(first.rotatedTo).not.toBe(second.rotatedTo);
-    expect(path.basename(second.rotatedTo!)).toMatch(
-      /^audit-20260418-123456(-\d+)?\.jsonl$/,
-    );
+    expect(path.basename(second.rotatedTo!)).toMatch(/^audit-20260418-123456(-\d+)?\.jsonl$/);
   });
 });
 
@@ -285,9 +277,7 @@ describe('rotator — maybeRotate integrates policy thresholds', () => {
     expect(freshLines).toHaveLength(1);
     expect(freshLines[0]!.tool_name).toBe(ROTATION_TOOL_NAME);
     expect(freshLines[0]!.prev_hash).toBe(oldTailHash);
-    expect(freshLines[0]!.metadata?.rotated_from).toBe(
-      path.basename(result.rotatedTo!),
-    );
+    expect(freshLines[0]!.metadata?.rotated_from).toBe(path.basename(result.rotatedTo!));
   });
 });
 

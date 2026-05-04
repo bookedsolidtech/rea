@@ -55,9 +55,7 @@ function resolveDotted(obj: unknown, dottedPath: string): unknown {
 function main(): number {
   const [, , dottedPath] = process.argv;
   if (dottedPath === undefined || dottedPath.length === 0) {
-    process.stderr.write(
-      'usage: read-policy-field <dotted.path> (e.g. review.codex_required)\n',
-    );
+    process.stderr.write('usage: read-policy-field <dotted.path> (e.g. review.codex_required)\n');
     return EXIT_MALFORMED;
   }
 

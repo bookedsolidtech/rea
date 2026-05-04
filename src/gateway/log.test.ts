@@ -145,9 +145,7 @@ describe('logger — pretty mode (TTY)', () => {
     const cyclic: Cyclic = {};
     cyclic.self = cyclic;
 
-    expect(() =>
-      log.info({ event: 'weird', message: 'test', cyclic }),
-    ).not.toThrow();
+    expect(() => log.info({ event: 'weird', message: 'test', cyclic })).not.toThrow();
 
     // The record must still reach the stream. Previously the pretty-mode
     // JSON.stringify on `cyclic` would throw and the whole line was dropped.
