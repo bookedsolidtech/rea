@@ -43,10 +43,14 @@ const ReviewPolicySchema = z
      */
     auto_narrow_threshold: z.number().int().nonnegative().optional(),
     /**
-     * Codex CLI model override (0.13.4+). Pinned via `-c model="<name>"` on
-     * every `codex exec review` invocation. When unset, codex's own default
-     * applies — which today is the special-purpose `codex-auto-review`
-     * model at `medium` reasoning, NOT the flagship.
+     * Codex CLI model override (0.13.4+; runtime-default since 0.18.0).
+     * Pinned via `-c model="<name>"` on every `codex exec review`
+     * invocation. **0.18.0 iron-gate runtime default**: when unset, the
+     * runtime hardcodes `gpt-5.4` — codex's own default
+     * (`codex-auto-review` at medium) is no longer reachable through the
+     * rea push-gate. To select a different model, set this key
+     * explicitly. config.toml is consulted ONLY when the explicit value
+     * passed by rea is `undefined`, which the runtime never does.
      *
      * For serious adversarial review on consumer codebases (where verdict
      * stability matters) the recommended setting is `gpt-5.4` with

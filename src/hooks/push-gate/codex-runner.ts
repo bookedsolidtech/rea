@@ -225,21 +225,30 @@ export interface CodexRunResult {
  */
 export async function runCodexReview(options: CodexRunOptions): Promise<CodexRunResult> {
   const spawner = options.spawnImpl ?? spawn;
+  // 0.18.0 iron-gate runtime default: ALWAYS pass model + reasoning
+  // effort to codex. Pre-fix, undefined options fell back to codex's
+  // own default (`codex-auto-review` at medium reasoning), which
+  // bypassed the iron-gate intent and let weaker reviews ship. Now
+  // the runtime hardcodes `gpt-5.4` + `high` as the floor; policy
+  // can OVERRIDE to a different model/effort but cannot opt out into
+  // codex's defaults (config.toml or otherwise). The user's directive
+  // — "we want codex to be using its BEST. EVERY TIME" — is enforced
+  // here, not at the policy layer.
+  //
   // Model + reasoning overrides go BEFORE the `exec` subcommand because
   // `-c key=value` is a top-level codex CLI flag, not an `exec` flag.
   // Codex's TOML parser interprets the value, so we wrap strings in TOML
   // quotes — `-c model="gpt-5.4"` not `-c model=gpt-5.4` — to ensure the
   // value lands as a string regardless of upstream parsing changes.
-  const overrideArgs: string[] = [];
-  if (options.model !== undefined && options.model.length > 0) {
-    overrideArgs.push('-c', `model="${escapeTomlString(options.model)}"`);
-  }
-  if (options.reasoningEffort !== undefined) {
-    overrideArgs.push(
-      '-c',
-      `model_reasoning_effort="${escapeTomlString(options.reasoningEffort)}"`,
-    );
-  }
+  const effectiveModel =
+    options.model !== undefined && options.model.length > 0 ? options.model : 'gpt-5.4';
+  const effectiveReasoning = options.reasoningEffort ?? 'high';
+  const overrideArgs: string[] = [
+    '-c',
+    `model="${escapeTomlString(effectiveModel)}"`,
+    '-c',
+    `model_reasoning_effort="${escapeTomlString(effectiveReasoning)}"`,
+  ];
   const baseArgs = [
     ...overrideArgs,
     'exec',

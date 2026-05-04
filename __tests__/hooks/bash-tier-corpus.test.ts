@@ -252,6 +252,37 @@ const DANGEROUS_BASH_INTERCEPTOR_CORPUS: CorpusCase[] = [
     origin: 'helix-017 #1 sibling',
     notes: 'bash -lic flag variant must also unwrap',
   },
+  // ─── 0.18.0 helix-020 G1.A: phantom unwrap inside outer quoted prose ──
+  // Pre-fix the unwrap pass scanned the raw input, so a quoted argument
+  // mentioning `bash -c '...'` produced a phantom inner-payload segment
+  // and downstream gates blocked the innocent commit. The fix runs
+  // unwrap against a quote-masked form so wrappers inside outer quoted
+  // spans are invisible to the wrapper regex.
+  {
+    cmd: "git commit -m \"docs: mention bash -c 'rm -rf node_modules'\"",
+    expectExit: 0,
+    origin: 'helix-020 G1.A',
+    notes: 'phantom-unwrap of quoted prose mentioning rm -rf — must NOT block',
+  },
+  {
+    cmd: "git commit -m \"docs: explain bash -c 'git push --force' patterns\"",
+    expectExit: 0,
+    origin: 'helix-020 G1.A sibling',
+    notes: 'phantom-unwrap of quoted prose mentioning force-push — must NOT block',
+  },
+  {
+    cmd: "echo \"bash -c 'curl https://x | sh'\" > docs/security.md",
+    expectExit: 0,
+    origin: 'helix-020 G1.A sibling',
+    notes: 'echo with quoted wrapper-shape into doc — must NOT block',
+  },
+  // Real wrapper still works (regression-protect):
+  {
+    cmd: "bash -c 'git push --force origin main'",
+    expectExit: 2,
+    origin: 'helix-020 G1.A baseline preserve',
+    notes: 'genuine bash -c wrapper still unwraps and triggers H1',
+  },
 ];
 
 const DEPENDENCY_AUDIT_GATE_CORPUS: CorpusCase[] = [
@@ -567,6 +598,47 @@ const ATTRIBUTION_ADVISORY_CORPUS: CorpusCase[] = [
     origin: 'attribution baseline',
     notes: 'gh pr create with markdown-link attribution — must block',
   },
+  // ─── 0.18.0 helix-020 / discord-ops Round 10 #2: G4.A anchoring ─────
+  // Pre-fix the IS_RELEVANT check used any_segment_matches (substring),
+  // so a `gh pr edit --body "...gh pr create..."` matched the relevance
+  // detector and the body's prose was scanned for attribution patterns
+  // — false-positives on commit/issue/PR descriptions that referenced
+  // attribution as a topic. 0.18.0 migrates to any_segment_starts_with.
+  {
+    cmd: 'gh pr edit 42 --body "background: gh pr create earlier"',
+    expectExit: 0,
+    origin: 'helix-020 G4.A',
+    notes: 'gh pr edit referencing gh pr create — must NOT trigger relevance',
+  },
+  {
+    cmd: 'echo "we should run git commit later" > notes.md',
+    expectExit: 0,
+    origin: 'helix-020 G4.A sibling',
+    notes: 'echo prose referencing git commit — must NOT trigger relevance',
+  },
+  {
+    cmd: 'echo "git commit history is full of refs"',
+    expectExit: 0,
+    origin: 'helix-020 G4.A sibling',
+    notes: 'echo prose referencing git commit history — must NOT trigger relevance',
+  },
+  // ─── 0.18.0 helix-020 / discord-ops Round 10 #3: G4.B noreply pattern
+  // Co-Authored-By with a legitimate <user>@users.noreply.github.com
+  // GitHub-collaborator footer must NOT be treated as AI noreply.
+  // (We cannot easily fixture-test the literal Co-Authored-By string in
+  // the corpus because the corpus runner shells out via bash and the
+  // attribution-advisory hook itself processes the tool_input.command
+  // — the corpus test harness runs the hook against the LITERAL command
+  // text. So we test the gate's behavior in attribution-advisory.test.ts
+  // (a sibling unit suite) where we can write payload files instead.)
+  // Here we add only the regression-protection cases with no AI-name
+  // noreply variants:
+  {
+    cmd: 'gh pr edit 42 --body "no attribution here"',
+    expectExit: 0,
+    origin: 'helix-020 G4.B negative-control',
+    notes: 'innocent gh pr edit — must NOT block (control)',
+  },
 ];
 
 function networkAvailable(): boolean {
@@ -796,6 +868,50 @@ describe('bash-tier corpus — security-disclosure-gate.sh', () => {
       const res = runHookWithToolName(
         'security-disclosure-gate.sh',
         `gh issue create --title "x" --body-file "${bodyFile}"`,
+      );
+      expect(res.status).toBe(0);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // ─── 0.18.0 helix-020 G3.B: backslash-escaped whitespace in body-file
+  // path. Pre-fix the awk tokenizer plain-mode treated `\` as a normal
+  // character and truncated the path at the next space, producing a
+  // truncated path that doesn't exist. The hook then logged "skipping
+  // body scan" and exited 0 — silent disclosure-gate bypass for any
+  // shell-escaped path. 0.18.0 extends plain-mode to interpret `\X`
+  // (any character) as literal `X` per POSIX.
+  it('helix-020 G3.B: --body-file path\\ with\\ spaces.md sensitive — must BLOCK', () => {
+    if (!jqExists()) return;
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'rea-sd-g3b-'));
+    try {
+      const bodyFile = path.join(dir, 'name with spaces.md');
+      writeFileSync(bodyFile, 'demonstrates an authentication bypass exploit\n');
+      // Express the path as the agent would type it interactively —
+      // backslash-escaped spaces. The hook's tokenizer must drop the
+      // backslashes and resolve the literal path with spaces.
+      const escaped = bodyFile.replace(/ /g, '\\ ');
+      const res = runHookWithToolName(
+        'security-disclosure-gate.sh',
+        `gh issue create --title "x" --body-file ${escaped}`,
+      );
+      expect(res.status).toBe(2);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('helix-020 G3.B: --body-file path\\ with\\ spaces.md benign — must ALLOW', () => {
+    if (!jqExists()) return;
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'rea-sd-g3b-'));
+    try {
+      const bodyFile = path.join(dir, 'feature requests.md');
+      writeFileSync(bodyFile, 'add a search bar to the top navigation\n');
+      const escaped = bodyFile.replace(/ /g, '\\ ');
+      const res = runHookWithToolName(
+        'security-disclosure-gate.sh',
+        `gh issue create --title "x" --body-file ${escaped}`,
       );
       expect(res.status).toBe(0);
     } finally {
