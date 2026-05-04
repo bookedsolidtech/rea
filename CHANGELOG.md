@@ -1,5 +1,51 @@
 # @bookedsolid/rea
 
+## 0.21.1
+
+### Patch Changes
+
+- 5b814ef: `rea init` now preserves manually-edited policy.yaml values across re-runs.
+
+  Pre-fix the non-interactive `--yes` path (and the wizard's prompt
+  defaults) seeded every field from the layered profile, ignoring any
+  existing `.rea/policy.yaml` on disk. An operator who:
+  1. Ran `rea init --yes` (got profile defaults — autonomy L1)
+  2. Manually edited `autonomy_level: L2` in policy.yaml
+  3. Re-ran `rea init --yes` (or any tool that re-runs init)
+
+  …would silently lose the edit — policy.yaml resets to L1.
+
+  This is the same idempotency class as the `installed_at` preservation
+  shipped in 0.17.0. 0.21.1 extends preservation to every user-mutable
+  field:
+  - `autonomy_level`
+  - `max_autonomy_level`
+  - `block_ai_attribution`
+  - `blocked_paths`
+  - `notification_channel`
+  - `review.codex_required`
+
+  Reader: new `readExistingPolicyForPreservation` in `src/cli/init.ts`
+  parses the existing policy.yaml line-by-line, returns each field
+  when found, undefined otherwise. Permissive — a malformed value for
+  one field falls back to the profile default for that field only.
+
+  Wizard prompts now show the current value in the message:
+  `Starting autonomy_level (current: L2)`. Non-interactive logs
+  `preserving existing autonomy=L2, ...` when an existing policy is
+  present. Operators who want a full reset to profile defaults pass
+  `--force` (existing flag — bypasses the file-existence check
+  entirely, profile defaults apply).
+
+  Profile-switch case (existing policy declared a different profile
+  than the one requested): values are still preserved. The operator
+  can `--force` for an unconditional reset.
+
+  Test coverage: 1307 vitest tests pass (was 1304 in 0.21.0), +3 init
+  regression fixtures pinning autonomy_level, blocked_paths, and
+  block_ai_attribution preservation across `rea init` × 2 with a
+  manual edit between runs. All 6 quality gates green.
+
 ## 0.21.0
 
 ### Minor Changes
@@ -1285,13 +1331,13 @@ codex-review --also-set-cache`) on every push, produced a 1,250-line bash
 
   This release replaces the entire stack with a stateless gate:
 
-                                        git push
-                                          → .husky/pre-push → rea hook push-gate
-                                          → codex exec review --base <ref> --json
-                                          → parse verdict from streamed findings
-                                          → block on [P1] (blocking) or [P2] when concerns_blocks=true
-                                          → write .rea/last-review.json + audit record
-                                          → exit 0 / 1 (HALT) / 2 (blocked)
+                                          git push
+                                            → .husky/pre-push → rea hook push-gate
+                                            → codex exec review --base <ref> --json
+                                            → parse verdict from streamed findings
+                                            → block on [P1] (blocking) or [P2] when concerns_blocks=true
+                                            → write .rea/last-review.json + audit record
+                                            → exit 0 / 1 (HALT) / 2 (blocked)
 
   Codex is run fresh on every push. No cache. No SHA matching. No receipt
   consultation. When the gate blocks, Claude reads stderr + the
