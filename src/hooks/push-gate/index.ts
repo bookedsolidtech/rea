@@ -44,6 +44,12 @@ import {
 } from './codex-runner.js';
 import { summarizeReview, type Verdict } from './findings.js';
 import { renderBanner, writeLastReview, type LastReviewPayload } from './report.js';
+import {
+  isFlip,
+  lookupVerdict,
+  writeVerdict,
+  type VerdictCacheEntry,
+} from './verdict-cache.js';
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -161,6 +167,8 @@ const EVT_DISABLED = 'rea.push_gate.disabled';
 const EVT_SKIPPED = 'rea.push_gate.skipped';
 const EVT_EMPTY = 'rea.push_gate.empty_diff';
 const EVT_ERROR = 'rea.push_gate.error';
+const EVT_CACHE_HIT = 'rea.push_gate.cache_hit';
+const EVT_VERDICT_FLIP = 'rea.push_gate.verdict_flip';
 
 // ---------------------------------------------------------------------------
 // Composer
@@ -445,7 +453,49 @@ export async function runPushGate(deps: PushGateDeps): Promise<GateResult> {
     };
   }
 
-  // 6. Run Codex. Typed errors translate to exit 2 with distinct stderr.
+  // 6a. Verdict cache lookup (0.18.1 helixir #1, #4, #7, #8). Same-SHA
+  // pushes within the configured TTL skip the codex invocation and
+  // reuse the cached verdict — durable PASS. Cache is bypassed when
+  // policy.review.cache_ttl_ms is 0. Cache miss / expired falls
+  // through to the codex call below.
+  const cacheLookup =
+    policy.cache_ttl_ms > 0 ? lookupVerdict(deps.baseDir, headSha) : { hit: false as const };
+  if (cacheLookup.hit && cacheLookup.entry !== undefined) {
+    const cached = cacheLookup.entry;
+    const cachedBlocked =
+      cached.verdict === 'blocking'
+      || (cached.verdict === 'concerns' && policy.concerns_blocks && !isConcernsOverrideSet(env));
+    await safeAppend(appendAuditFn, deps.baseDir, EVT_CACHE_HIT, {
+      verdict: cached.verdict,
+      finding_count: cached.finding_count,
+      base_ref: base.ref,
+      base_source: base.source,
+      head_sha: headSha,
+      cached_reviewed_at: cached.reviewed_at,
+      cached_model: cached.model,
+      cached_reasoning_effort: cached.reasoning_effort,
+      blocked: cachedBlocked,
+    });
+    return {
+      status: cachedBlocked
+        ? cached.verdict === 'blocking'
+          ? 'blocking'
+          : 'concerns'
+        : cached.verdict === 'blocking'
+          ? 'blocking'
+          : cached.verdict === 'concerns'
+            ? 'concerns'
+            : 'pass',
+      exitCode: cachedBlocked ? 2 : 0,
+      summary: `${cached.verdict}: ${cached.finding_count} finding(s) (cached)`,
+      verdict: cached.verdict,
+      findingCount: cached.finding_count,
+      baseRef: base.ref,
+      headSha,
+    };
+  }
+
+  // 6b. Run Codex. Typed errors translate to exit 2 with distinct stderr.
   try {
     const codexResult = await runCodexFn({
       baseRef: base.ref,
@@ -487,6 +537,40 @@ export async function runPushGate(deps: PushGateDeps): Promise<GateResult> {
       }),
     );
 
+    // 0.18.1 verdict cache write + flip detection. The lookup at step
+    // 6a already returned miss/expired; if `cacheLookup.entry` is set,
+    // a stale entry existed — compare its verdict to the fresh one and
+    // emit a flip event when they differ. Operators can grep
+    // `rea.push_gate.verdict_flip` in the audit log to detect codex
+    // non-determinism (helixir #8).
+    if (policy.cache_ttl_ms > 0) {
+      const flipped = isFlip(cacheLookup.entry, summary.verdict);
+      if (flipped && cacheLookup.entry !== undefined) {
+        await safeAppend(appendAuditFn, deps.baseDir, EVT_VERDICT_FLIP, {
+          head_sha: headSha,
+          prior_verdict: cacheLookup.entry.verdict,
+          fresh_verdict: summary.verdict,
+          prior_reviewed_at: cacheLookup.entry.reviewed_at,
+          base_ref: base.ref,
+        });
+      }
+      const entry: VerdictCacheEntry = {
+        verdict: summary.verdict,
+        finding_count: summary.findings.length,
+        reviewed_at: deps.now !== undefined ? deps.now().toISOString() : new Date().toISOString(),
+        model: policy.codex_model ?? 'gpt-5.4',
+        reasoning_effort: policy.codex_reasoning_effort ?? 'high',
+        ttl_ms: policy.cache_ttl_ms,
+      };
+      try {
+        writeVerdict(deps.baseDir, headSha, entry);
+      } catch {
+        // Cache writes are best-effort. A failure here must NOT
+        // affect the verdict — log to stderr (already done by the
+        // caller via banner) and proceed.
+      }
+    }
+
     await safeAppend(appendAuditFn, deps.baseDir, EVT_REVIEWED, {
       verdict: summary.verdict,
       finding_count: summary.findings.length,
@@ -503,6 +587,9 @@ export async function runPushGate(deps: PushGateDeps): Promise<GateResult> {
       auto_narrowed: autoNarrowed ? true : undefined,
       original_commit_count:
         originalCommitCount !== null ? originalCommitCount : undefined,
+      flipped: cacheLookup.entry !== undefined && isFlip(cacheLookup.entry, summary.verdict)
+        ? true
+        : undefined,
     });
 
     if (blocked) {

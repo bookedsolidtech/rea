@@ -401,6 +401,25 @@ function writePolicyYaml(targetDir: string, config: ResolvedConfig, layered: Pro
     }
   }
 
+  // 0.18.1+ helixir #9: emit audit.rotation when the layered profile
+  // declared it. Empty `rotation: {}` opts in to documented defaults
+  // (50 MiB / 30 days); explicit values override.
+  if (layered.audit !== undefined) {
+    lines.push(`audit:`);
+    if (layered.audit.rotation !== undefined) {
+      const rot = layered.audit.rotation;
+      const hasFields =
+        rot.max_bytes !== undefined || rot.max_age_days !== undefined;
+      lines.push(hasFields ? `  rotation:` : `  rotation: {}`);
+      if (rot.max_bytes !== undefined) {
+        lines.push(`    max_bytes: ${rot.max_bytes}`);
+      }
+      if (rot.max_age_days !== undefined) {
+        lines.push(`    max_age_days: ${rot.max_age_days}`);
+      }
+    }
+  }
+
   // G11.4: always emit the review block explicitly. Making the value
   // visible in the generated file helps the operator notice what was
   // chosen at init time and simplifies switching modes later (edit a

@@ -58,6 +58,21 @@ export const ProfileSchema = z
     injection_detection: z.enum(['block', 'warn']).optional(),
     injection: InjectionProfileSchema.optional(),
     context_protection: ContextProtectionProfileSchema.optional(),
+    // 0.18.1+ helixir #9: profiles can ship audit-rotation defaults.
+    // The full audit policy block validates at load time via
+    // `AuditPolicySchema` in loader.ts; profiles only need to declare
+    // the rotation knob (most consumer profiles will leave this empty
+    // — the default 50 MiB / 30 days are sane).
+    audit: z
+      .object({
+        rotation: z
+          .object({
+            max_bytes: z.number().int().positive().optional(),
+            max_age_days: z.number().int().positive().optional(),
+          })
+          .optional(),
+      })
+      .optional(),
   })
   .strict();
 

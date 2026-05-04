@@ -4,6 +4,7 @@ import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   PUSH_GATE_DEFAULT_AUTO_NARROW_THRESHOLD,
+  PUSH_GATE_DEFAULT_CACHE_TTL_MS,
   PUSH_GATE_DEFAULT_CODEX_MODEL,
   PUSH_GATE_DEFAULT_CODEX_REASONING_EFFORT,
   PUSH_GATE_DEFAULT_CODEX_REQUIRED,
@@ -47,6 +48,7 @@ describe('resolvePushGatePolicy', () => {
       auto_narrow_threshold: PUSH_GATE_DEFAULT_AUTO_NARROW_THRESHOLD,
       codex_model: PUSH_GATE_DEFAULT_CODEX_MODEL,
       codex_reasoning_effort: PUSH_GATE_DEFAULT_CODEX_REASONING_EFFORT,
+      cache_ttl_ms: PUSH_GATE_DEFAULT_CACHE_TTL_MS,
       policyMissing: true,
     });
   });

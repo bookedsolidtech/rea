@@ -116,13 +116,51 @@ try {
 
   if (manifestVersion === installedVersion) process.exit(0);
 
-  // Package-manager-agnostic message. Any of `npx rea upgrade`,
+  // 0.18.1+ helixir #3: opt-in auto-upgrade. Pre-fix the drift was
+  // detected and a "run rea upgrade" nudge printed, but consumers had
+  // to run the upgrade by hand on every install. With
+  // `REA_AUTO_UPGRADE=1` (or `--yes` semantics inferred from a
+  // package.json field), the postinstall runs `rea upgrade --yes`
+  // for them. Defaults to PRINT-ONLY for back-compat — silent
+  // mutation of the consumer's `.claude/` / `.husky/` on every
+  // install would surprise existing users.
+  const autoUpgrade =
+    process.env.REA_AUTO_UPGRADE === '1' ||
+    process.env.REA_AUTO_UPGRADE === 'true';
+
+  if (autoUpgrade) {
+    // Best-effort: invoke `rea upgrade --yes`. Failures fall through to
+    // the print path so the consumer still sees the drift advisory.
+    try {
+      const reaCli = path.join(consumerRoot, 'node_modules', '.bin', 'rea');
+      if (fs.existsSync(reaCli)) {
+        const { spawnSync } = await import('node:child_process');
+        const res = spawnSync(reaCli, ['upgrade', '--yes'], {
+          cwd: consumerRoot,
+          stdio: 'inherit',
+          env: process.env,
+        });
+        if (res.status === 0) {
+          NOTE([
+            `@bookedsolid/rea: auto-upgraded from v${manifestVersion} to v${installedVersion}.`,
+            `(REA_AUTO_UPGRADE=1; set REA_AUTO_UPGRADE=0 to opt out.)`,
+          ]);
+          process.exit(0);
+        }
+      }
+    } catch {
+      // Fall through to the manual-nudge path below.
+    }
+  }
+
+  // Package-manager-agnostic nudge. Any of `npx rea upgrade`,
   // `pnpm exec rea upgrade`, or `yarn rea upgrade` works; recommending `npx`
   // covers the widest audience without privileging pnpm in error output.
   NOTE([
     `@bookedsolid/rea v${installedVersion} installed; manifest at v${manifestVersion}.`,
     `Run  \`npx rea upgrade\`  to sync .claude/, .husky/, and managed fragments.`,
     `(Or  \`npx rea doctor --drift\`  to preview without changes.)`,
+    `(Set  \`REA_AUTO_UPGRADE=1\`  to auto-run upgrade on future installs.)`,
   ]);
 } catch {
   // Any uncaught failure → silent success. Never break the consumer's install.

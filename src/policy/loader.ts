@@ -76,6 +76,15 @@ const ReviewPolicySchema = z
      * matters less than throughput.
      */
     codex_reasoning_effort: z.enum(['low', 'medium', 'high']).optional(),
+    /**
+     * Verdict cache TTL in milliseconds (0.18.1+ helixir #1, #4, #7, #8).
+     * Default 86_400_000 (24 hours). When a push of `head_sha` produces
+     * a non-blocking verdict, the result is written to
+     * `.rea/last-review.cache.json`. Subsequent pushes of the same SHA
+     * within the TTL skip the codex invocation and reuse the cached
+     * verdict. Set to 0 to disable caching (every push re-invokes codex).
+     */
+    cache_ttl_ms: z.number().int().nonnegative().optional(),
   })
   .strict();
 
