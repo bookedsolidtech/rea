@@ -86,10 +86,10 @@ proj="${CLAUDE_PROJECT_DIR:-$(pwd)}"
 # whitespace round-trip safely.
 REA_ARGV=()
 RESOLVED_CLI_PATH=""
-if [ -x "$proj/node_modules/@bookedsolid/rea/dist/cli/index.js" ]; then
+if [ -f "$proj/node_modules/@bookedsolid/rea/dist/cli/index.js" ]; then
   REA_ARGV=(node "$proj/node_modules/@bookedsolid/rea/dist/cli/index.js")
   RESOLVED_CLI_PATH="$proj/node_modules/@bookedsolid/rea/dist/cli/index.js"
-elif [ -x "$proj/dist/cli/index.js" ]; then
+elif [ -f "$proj/dist/cli/index.js" ]; then
   # rea repo dogfood: the project IS @bookedsolid/rea.
   REA_ARGV=(node "$proj/dist/cli/index.js")
   RESOLVED_CLI_PATH="$proj/dist/cli/index.js"
