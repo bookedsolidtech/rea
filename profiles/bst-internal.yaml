@@ -36,3 +36,18 @@ context_protection:
 # hash chain across the boundary.
 audit:
   rotation: {}
+# 0.20.1 helix-round-N P2: rea's own architecture-sensitive paths.
+# Hardcoded into the hook before this release; now policy-driven so
+# consumer projects don't get rea-source patterns advisory-warning on
+# their own `src/types/` directories. Empty (or unset) on other
+# profiles = silent no-op. Operators add their own
+# architecture-sensitive paths here on a per-project basis.
+architecture_review:
+  patterns:
+    - src/types/
+    - src/gateway/
+    - src/config/
+    - src/cli/commands/init/
+    - hooks/_lib/
+    - templates/
+    - profiles/

@@ -20,7 +20,7 @@
  */
 
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -1268,5 +1268,144 @@ describe('helix-018 Option A: protected_writes policy key', () => {
       `${POLICY_BASE}protected_writes:\n  - .github/workflows/\nprotected_paths_relax:\n  - .github/workflows/\n`,
     );
     expect(res.status).toBe(0);
+  });
+});
+
+// ─── helix-021 — Bash-tier symlink-bypass parity (0.20.1) ─────────
+// 0.18.0 shipped two new Bash-tier files (`blocked-paths-bash-gate.sh`,
+// `protected-paths-bash-gate.sh`) plus updates to `settings-protection.sh`.
+// Codex reproduced 3 symlink bypasses against them — the new files
+// only normalized the LOGICAL path while the Write-tier sibling
+// already canonicalized via `cd -P / pwd -P`. 0.20.1 brings the
+// Bash-tier to parity by sourcing the same `cd -P / pwd -P` helper
+// from `_lib/path-normalize.sh`.
+//
+// These fixtures synthesize per-test temp projects with the actual
+// symlinks each PoC requires.
+describe('helix-021 — Bash-tier symlink-bypass parity', () => {
+  function setupSymlinkFixture(
+    setup: (dir: string) => void,
+  ): { dir: string; cleanup: () => void } {
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'rea-helix-021-corpus-'));
+    mkdirSync(path.join(dir, '.rea'), { recursive: true });
+    setup(dir);
+    return {
+      dir,
+      cleanup: () => rmSync(dir, { recursive: true, force: true }),
+    };
+  }
+
+  function runHookFromFixture(
+    hook: string,
+    fixtureDir: string,
+    cmd: string,
+  ): { status: number; stderr: string } {
+    const HOOK = path.join(REPO_ROOT, 'hooks', hook);
+    const payload = JSON.stringify({ tool_input: { command: cmd } });
+    const res = spawnSync('bash', [HOOK], {
+      cwd: fixtureDir,
+      env: { PATH: process.env.PATH ?? '', CLAUDE_PROJECT_DIR: fixtureDir },
+      input: payload,
+      encoding: 'utf8',
+    });
+    return { status: res.status ?? -1, stderr: res.stderr ?? '' };
+  }
+
+  it('F1 protected-paths-bash-gate: ln -s ../ → linkdir/pre-push must BLOCK', () => {
+    if (!jqExists()) return;
+    const { dir, cleanup } = setupSymlinkFixture((d) => {
+      mkdirSync(path.join(d, '.husky/pre-push.d'), { recursive: true });
+      symlinkSync('../', path.join(d, '.husky/pre-push.d/linkdir'));
+    });
+    try {
+      const res = runHookFromFixture(
+        'protected-paths-bash-gate.sh',
+        dir,
+        'printf x > .husky/pre-push.d/linkdir/pre-push',
+      );
+      expect(res.status).toBe(2);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('F2 blocked-paths-bash-gate: ln -s . linkroot → linkroot/.secret must BLOCK', () => {
+    if (!jqExists()) return;
+    const { dir, cleanup } = setupSymlinkFixture((d) => {
+      writeFileSync(
+        path.join(d, '.rea/policy.yaml'),
+        `version: "1"\nprofile: bst-internal\ninstalled_by: test\ninstalled_at: "2026-05-04T00:00:00Z"\nautonomy_level: L1\nmax_autonomy_level: L2\npromotion_requires_human_approval: true\nblock_ai_attribution: true\nblocked_paths:\n  - .secret\n`,
+      );
+      symlinkSync('.', path.join(d, 'linkroot'));
+    });
+    try {
+      const res = runHookFromFixture(
+        'blocked-paths-bash-gate.sh',
+        dir,
+        'printf x > linkroot/.secret',
+      );
+      expect(res.status).toBe(2);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('F3 settings-protection: linkdir → ../pre-push.d.bak must BLOCK', () => {
+    if (!jqExists()) return;
+    const { dir, cleanup } = setupSymlinkFixture((d) => {
+      mkdirSync(path.join(d, '.husky/pre-push.d'), { recursive: true });
+      mkdirSync(path.join(d, '.husky/pre-push.d.bak'), { recursive: true });
+      symlinkSync('../pre-push.d.bak', path.join(d, '.husky/pre-push.d/linkdir'));
+    });
+    try {
+      const HOOK = path.join(REPO_ROOT, 'hooks', 'settings-protection.sh');
+      const payload = JSON.stringify({
+        tool_name: 'Write',
+        tool_input: { file_path: '.husky/pre-push.d/linkdir/test.sh', content: 'x' },
+      });
+      const res = spawnSync('bash', [HOOK], {
+        cwd: dir,
+        env: { PATH: process.env.PATH ?? '', CLAUDE_PROJECT_DIR: dir },
+        input: payload,
+        encoding: 'utf8',
+      });
+      expect(res.status).toBe(2);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('regression: > /tmp/log (legitimate external write) must ALLOW', () => {
+    if (!jqExists()) return;
+    const { dir, cleanup } = setupSymlinkFixture(() => {
+      // No symlinks needed — just verify external paths still allow.
+    });
+    try {
+      const res = runHookFromFixture(
+        'protected-paths-bash-gate.sh',
+        dir,
+        'echo log-entry > /tmp/rea-helix-021-allow-test.log',
+      );
+      expect(res.status).toBe(0);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('regression: legitimate .husky/pre-push.d/<fragment> Bash redirect must ALLOW', () => {
+    if (!jqExists()) return;
+    const { dir, cleanup } = setupSymlinkFixture((d) => {
+      mkdirSync(path.join(d, '.husky/pre-push.d'), { recursive: true });
+    });
+    try {
+      const res = runHookFromFixture(
+        'protected-paths-bash-gate.sh',
+        dir,
+        'echo "#!/bin/sh" > .husky/pre-push.d/00-act-ci',
+      );
+      expect(res.status).toBe(0);
+    } finally {
+      cleanup();
+    }
   });
 });

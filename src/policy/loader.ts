@@ -212,6 +212,17 @@ const PolicySchema = z
     redact: RedactPolicySchema.optional(),
     audit: AuditPolicySchema.optional(),
     gateway: GatewayPolicySchema.optional(),
+    // 0.20.1 helix-round-N P2: architecture-review-gate.sh patterns
+    // are now policy-driven. Pre-fix the hook hardcoded rea-internal
+    // source-tree patterns (`src/gateway/`, `hooks/_lib/`, etc.) which
+    // produced irrelevant advisory output in consumer projects.
+    // Empty (or unset) → silent no-op. bst-internal profile pins the
+    // rea-source patterns so dogfood behaves as before.
+    architecture_review: z
+      .object({
+        patterns: z.array(z.string()).optional(),
+      })
+      .optional(),
   })
   .strict();
 
