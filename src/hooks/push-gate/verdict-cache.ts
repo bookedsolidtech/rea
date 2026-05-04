@@ -67,6 +67,17 @@ export const VERDICT_CACHE_FILE = 'last-review.cache.json';
 export const VERDICT_CACHE_SCHEMA_VERSION = 2 as const;
 export const DEFAULT_CACHE_TTL_MS = 24 * 60 * 60 * 1_000; // 24h
 
+/**
+ * Soft cap on cached entry count before `writeVerdict` opportunistically
+ * prunes expired entries (0.19.1 backend-engineer P2-3). Keeps the
+ * cache file from growing unbounded over months of pushes against many
+ * SHAs — at 500 entries × ~200 bytes/entry ≈ 100 KB, we proactively
+ * drop expired entries on the next write. The prune is best-effort:
+ * if every entry is unexpired we accept the larger file rather than
+ * dropping fresh durable verdicts.
+ */
+export const VERDICT_CACHE_PRUNE_THRESHOLD = 500;
+
 export interface VerdictCacheEntry {
   verdict: ReviewVerdict;
   finding_count: number;
@@ -149,12 +160,44 @@ export async function writeVerdict(
       throw new VerdictCacheForeignSchemaError(cachePath);
     }
     const existing = readCacheFile(baseDir);
+    const merged: Record<string, VerdictCacheEntry> = {
+      ...(existing?.entries ?? {}),
+      [headSha]: entry,
+    };
+    // 0.19.1 P2-3 (backend-engineer): opportunistic prune.
+    // When the cache crosses the soft threshold, drop entries whose
+    // own ttl_ms has expired before writing. Cheap walk; bounded to
+    // O(n) at write time only when n > threshold. Prevents the cache
+    // file from growing unbounded over months of pushes.
+    const pruned =
+      Object.keys(merged).length > VERDICT_CACHE_PRUNE_THRESHOLD
+        ? _pruneExpired(merged, new Date())
+        : merged;
     const next: VerdictCacheFile = {
       schema_version: VERDICT_CACHE_SCHEMA_VERSION,
-      entries: { ...(existing?.entries ?? {}), [headSha]: entry },
+      entries: pruned,
     };
     _atomicWriteJson(cachePath, next);
   });
+}
+
+function _pruneExpired(
+  entries: Record<string, VerdictCacheEntry>,
+  now: Date,
+): Record<string, VerdictCacheEntry> {
+  const surviving: Record<string, VerdictCacheEntry> = {};
+  const nowMs = now.getTime();
+  for (const [sha, entry] of Object.entries(entries)) {
+    const reviewedAtMs = Date.parse(entry.reviewed_at);
+    if (Number.isNaN(reviewedAtMs)) {
+      surviving[sha] = entry;
+      continue;
+    }
+    if (nowMs - reviewedAtMs < entry.ttl_ms) {
+      surviving[sha] = entry;
+    }
+  }
+  return surviving;
 }
 
 /**

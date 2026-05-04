@@ -301,4 +301,16 @@ export interface Policy {
   redact?: RedactPolicy;
   audit?: AuditPolicy;
   gateway?: GatewayPolicy;
+  /**
+   * Architecture-review patterns (0.20.1+). When set, the
+   * `architecture-review-gate.sh` hook fires an advisory when a
+   * Write/Edit/MultiEdit/NotebookEdit lands on a path matching one
+   * of the patterns. When unset or empty, the hook is a silent no-op
+   * — consumers without architecture-sensitive paths see zero noise.
+   * bst-internal profile pins rea's own source-tree patterns
+   * (`src/gateway/`, `hooks/_lib/`, etc.).
+   */
+  architecture_review?: {
+    patterns?: string[];
+  };
 }

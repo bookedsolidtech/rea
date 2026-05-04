@@ -401,6 +401,17 @@ function writePolicyYaml(targetDir: string, config: ResolvedConfig, layered: Pro
     }
   }
 
+  // 0.20.1+ helix-round-N P2: emit architecture_review.patterns when
+  // the layered profile declared them. Consumers without patterns see
+  // a silent no-op from architecture-review-gate.sh.
+  if (layered.architecture_review?.patterns !== undefined) {
+    lines.push(`architecture_review:`);
+    lines.push(`  patterns:`);
+    for (const p of layered.architecture_review.patterns) {
+      lines.push(`    - ${JSON.stringify(p)}`);
+    }
+  }
+
   // 0.18.1+ helixir #9: emit audit.rotation when the layered profile
   // declared it. Empty `rotation: {}` opts in to documented defaults
   // (50 MiB / 30 days); explicit values override.

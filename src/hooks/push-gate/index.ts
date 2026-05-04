@@ -482,6 +482,11 @@ export async function runPushGate(deps: PushGateDeps): Promise<GateResult> {
     const cachedBlocked =
       cached.verdict === 'blocking'
       || (cached.verdict === 'concerns' && policy.concerns_blocks && !isConcernsOverrideSet(env));
+    // 0.19.1 P3-3 (code-reviewer): emit EVT_CACHE_HIT (forensic detail
+    // for the cache layer specifically) AND EVT_REVIEWED (the canonical
+    // verdict event with `cache_hit: true` metadata). Operators
+    // grepping `rea.push_gate.reviewed` for verdict-stability dashboards
+    // see every push, including cached ones.
     await safeAppend(appendAuditFn, deps.baseDir, EVT_CACHE_HIT, fullPolicy, {
       verdict: cached.verdict,
       finding_count: cached.finding_count,
@@ -493,16 +498,23 @@ export async function runPushGate(deps: PushGateDeps): Promise<GateResult> {
       cached_reasoning_effort: cached.reasoning_effort,
       blocked: cachedBlocked,
     });
+    await safeAppend(appendAuditFn, deps.baseDir, EVT_REVIEWED, fullPolicy, {
+      verdict: cached.verdict,
+      finding_count: cached.finding_count,
+      base_ref: base.ref,
+      base_source: base.source,
+      head_sha: headSha,
+      blocked: cachedBlocked,
+      cache_hit: true,
+      cached_reviewed_at: cached.reviewed_at,
+      cached_model: cached.model,
+      cached_reasoning_effort: cached.reasoning_effort,
+    });
+    // 0.19.1 P3-1 (backend): simplified return shape. Verdict maps
+    // 1:1 to status; cachedBlocked maps 1:1 to exitCode. The prior
+    // nested ternary recomputed the same mapping in both arms.
     return {
-      status: cachedBlocked
-        ? cached.verdict === 'blocking'
-          ? 'blocking'
-          : 'concerns'
-        : cached.verdict === 'blocking'
-          ? 'blocking'
-          : cached.verdict === 'concerns'
-            ? 'concerns'
-            : 'pass',
+      status: cached.verdict,
       exitCode: cachedBlocked ? 2 : 0,
       summary: `${cached.verdict}: ${cached.finding_count} finding(s) (cached)`,
       verdict: cached.verdict,

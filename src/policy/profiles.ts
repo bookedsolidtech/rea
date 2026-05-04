@@ -73,6 +73,12 @@ export const ProfileSchema = z
           .optional(),
       })
       .optional(),
+    // 0.20.1+ profiles can declare architecture-sensitive paths.
+    architecture_review: z
+      .object({
+        patterns: z.array(z.string()).optional(),
+      })
+      .optional(),
   })
   .strict();
 
