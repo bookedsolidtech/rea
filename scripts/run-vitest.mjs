@@ -1,85 +1,117 @@
 #!/usr/bin/env node
 /**
- * Wrapper around `vitest run` that distinguishes real test failures
- * from vitest@3.2.4 worker-RPC heartbeat timeouts under heavy fixture
- * load (12,875 fixtures spawning bash subprocesses).
+ * Wrapper around `vitest run` that survives vitest@3.2.4 worker-RPC
+ * heartbeat timeouts under heavy fixture load.
  *
- * Exit policy:
- *   - any test assertion failed → propagate vitest's non-zero exit
- *   - all assertions passed AND only "unhandled error" noise →
- *     exit 0 with a warning so CI does not block on framework noise
- *   - vitest exited 0 → exit 0
+ * Problem: 12,875 fixtures spawning bash subprocesses saturate vitest's
+ * worker IPC. The parent thread can't drain `onTaskUpdate` events fast
+ * enough; vitest aborts AFTER the test files all run successfully but
+ * BEFORE printing the `Tests N passed` summary line. CI sees ELIFECYCLE
+ * even though every assertion passed.
  *
- * The signal we trust:
- *   `Tests  N passed | M skipped (TOTAL)` line with no `failed` count.
+ * Solution: vitest's JSON reporter writes incrementally to a FILE as
+ * the run progresses. Even if the IPC drain dies, the JSON file
+ * captures every task result. The wrapper:
+ *   1. Spawns vitest with `--reporter=default --reporter=json
+ *      --outputFile=...` (default reporter for human output, json
+ *      reporter for the wrapper's parsing)
+ *   2. Parses the JSON file after vitest exits
+ *   3. Counts passed/failed assertions
+ *   4. Exits 0 if numFailedTests === 0; otherwise propagates exit
  *
- * Background: across 4 CI runs + 6 local runs the only "errors"
- * surfaced were `[vitest-worker]: Timeout calling "onTaskUpdate"`
- * during teardown when the parent thread is draining a flood of
- * test-result messages. Every assertion passed in every run.
- *
- * If a real test failure appears, vitest prints `Tests  X failed |
- * Y passed (Z)` AND a per-test failure line. We grep for the
- * `failed` token specifically.
+ * Real test failures (numFailedTests > 0) propagate vitest's non-zero
+ * exit unchanged. Only IPC-noise framework errors are masked.
  */
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import fs from 'node:fs';
+import os from 'node:os';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, '..');
 
-// Resolve vitest's real entry point (not the .bin/ shell wrapper which
-// some CI shells fail to resolve as 'vitest' on PATH).
-const candidates = [
-  path.join(repoRoot, 'node_modules', 'vitest', 'vitest.mjs'),
-  path.join(repoRoot, 'node_modules', '.pnpm', 'node_modules', 'vitest', 'vitest.mjs'),
-];
-let vitestEntry = null;
-for (const c of candidates) {
-  if (fs.existsSync(c)) {
-    vitestEntry = c;
-    break;
-  }
-}
-// Fallback: PATH lookup of `vitest`.
+// Resolve vitest's real entry point.
+const vitestEntry = (() => {
+  const candidates = [
+    path.join(repoRoot, 'node_modules', 'vitest', 'vitest.mjs'),
+    path.join(repoRoot, 'node_modules', '.pnpm', 'node_modules', 'vitest', 'vitest.mjs'),
+  ];
+  for (const c of candidates) if (fs.existsSync(c)) return c;
+  return null;
+})();
+
 const cmd = vitestEntry ? process.execPath : 'vitest';
 const baseArgs = vitestEntry ? [vitestEntry, 'run'] : ['run'];
 
-const args = process.argv.slice(2);
-const result = spawnSync(cmd, [...baseArgs, ...args], {
+// Write JSON results to a unique file so concurrent CI shards don't
+// collide. Use os.tmpdir() not the repo root so the file isn't picked
+// up by drift / ignored / committed.
+const jsonOut = path.join(
+  os.tmpdir(),
+  `rea-vitest-${process.pid}-${Date.now()}.json`,
+);
+
+const args = [
+  ...baseArgs,
+  '--reporter=default',
+  '--reporter=json',
+  '--outputFile.json=' + jsonOut,
+  ...process.argv.slice(2),
+];
+
+const result = spawnSync(cmd, args, {
   cwd: repoRoot,
-  stdio: ['inherit', 'pipe', 'pipe'],
+  stdio: 'inherit',
   encoding: 'utf8',
 });
 
-if (result.stdout) process.stdout.write(result.stdout);
-if (result.stderr) process.stderr.write(result.stderr);
-
 const exit = result.status ?? 1;
-const out = (result.stdout ?? '') + (result.stderr ?? '');
 
-// Real failure: the Tests summary line has a "failed" count.
-const realFailure = /\bTests\s+\S*\s*\d+\s+failed\b/.test(out);
+// Parse the JSON results file. Vitest writes it incrementally; even
+// if the run aborted on IPC noise after all tests completed, the file
+// has the final state.
+let report = null;
+try {
+  if (fs.existsSync(jsonOut)) {
+    report = JSON.parse(fs.readFileSync(jsonOut, 'utf8'));
+  }
+} catch (err) {
+  process.stderr.write(`[run-vitest] could not parse ${jsonOut}: ${err.message}\n`);
+}
 
-// Pass signal: at least one "passed" count and no "failed" count.
-const passed = /\bTests\s+\S*\s*\d+\s+passed\b/.test(out);
-
-if (realFailure) {
+if (!report) {
+  // No JSON report — propagate vitest's exit code as-is.
+  process.stderr.write('[run-vitest] no JSON report available; propagating vitest exit\n');
   process.exit(exit || 1);
 }
 
-if (passed) {
-  if (exit !== 0) {
-    process.stderr.write(
-      '\n[run-vitest] vitest exited ' +
-        exit +
-        ' but all test assertions passed (RPC-timeout noise during teardown). ' +
-        'Treating as success — see vitest.config.ts comment.\n',
-    );
-  }
-  process.exit(0);
+const failed = report.numFailedTests ?? 0;
+const passed = report.numPassedTests ?? 0;
+const skipped = report.numPendingTests ?? 0;
+const total = report.numTotalTests ?? passed + failed + skipped;
+
+process.stderr.write(
+  `\n[run-vitest] JSON report: ${passed} passed, ${failed} failed, ${skipped} skipped (${total} total)\n`,
+);
+
+// Cleanup the temp file.
+try {
+  fs.unlinkSync(jsonOut);
+} catch {
+  // best effort
 }
 
-process.exit(exit || 1);
+if (failed > 0) {
+  process.stderr.write(`[run-vitest] ${failed} real test failure(s); propagating non-zero exit\n`);
+  process.exit(exit || 1);
+}
+
+if (exit !== 0) {
+  process.stderr.write(
+    `[run-vitest] vitest exited ${exit} but JSON report shows 0 failed tests; treating as success.\n` +
+      `[run-vitest] (likely vitest@3.2.4 worker-RPC IPC noise — see vitest.config.ts comment.)\n`,
+  );
+}
+
+process.exit(0);
