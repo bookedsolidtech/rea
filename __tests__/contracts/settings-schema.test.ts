@@ -114,7 +114,12 @@ const HookConfigSchema = {
   // through unchanged.
 } as const;
 
-const ajv = new Ajv({ allErrors: true });
+// 0.19.0 code-reviewer P3-7: `strict: false` because the schema uses
+// `nullable: true` (OpenAPI flavor) and ajv@8 in strict mode emits
+// warnings for any non-standard keyword. The schema is pinned to JSON
+// Schema 2019-09 + nullable; tests stay deterministic with strict
+// mode off.
+const ajv = new Ajv({ allErrors: true, strict: false });
 const validate = ajv.compile(HookConfigSchema);
 
 function buildSettingsFromDefaults(): HookConfigDocument {

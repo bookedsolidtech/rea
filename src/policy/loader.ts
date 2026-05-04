@@ -62,7 +62,12 @@ const ReviewPolicySchema = z
      * NOT want to lock consumers to a hardcoded enum that drifts behind
      * upstream. Codex itself validates the model name at exec time.
      */
-    codex_model: z.string().min(1).optional(),
+    // 0.19.0 security review M4: restrict to a safe character class so
+    // a typo or malicious value can't smuggle TOML control characters
+    // (NUL, NL, CR, escape sequences) through the `-c model="<value>"`
+    // injection point. Accepts published codex model names; rejects
+    // re-quote / TOML-escape edge cases.
+    codex_model: z.string().regex(/^[a-zA-Z0-9._-]{1,64}$/).optional(),
     /**
      * Codex reasoning effort knob (0.13.4+). Pinned via
      * `-c model_reasoning_effort="<level>"` on every invocation. Only
