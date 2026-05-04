@@ -1,5 +1,80 @@
 # @bookedsolid/rea
 
+## 0.21.0
+
+### Minor Changes
+
+- ffb750b: Close helix-021 (3× Bash-tier symlink-bypass parity), 5 deferred P3 items from the 0.19.0 3-agent review, and 2 more consumer-reported findings that landed during the same window.
+
+  Bumped to MINOR because helix-021 #1, #2 and the round-N #1 finding
+  are P1 security fixes that strengthen on-disk protection beyond the
+  0.19.0/0.20.0 release notes.
+
+  ### helix-021 — Bash-tier symlink-bypass parity (3× P1/P2)
+
+  The 0.18.0 ship of `protected-paths-bash-gate.sh`,
+  `blocked-paths-bash-gate.sh`, and the `settings-protection.sh`
+  extension-surface check normalized only the LOGICAL path, while the
+  Write-tier sibling `blocked-paths-enforcer.sh` already canonicalized
+  via `cd -P / pwd -P` since 0.10.x. Codex reproduced 3 working
+  bypasses; 0.19.0's "fix" claim never landed in the bytes.
+
+  This release adds a shared `rea_resolved_relative_form` helper in
+  `_lib/path-normalize.sh` (uses the existing `resolve_parent_realpath`
+  infrastructure) and threads it through both Bash-tier gates:
+  - **F1 [P1]** `protected-paths-bash-gate.sh`: `ln -s ../ .husky/pre-push.d/linkdir; printf x > .husky/pre-push.d/linkdir/pre-push` now refuses (resolved form is `.husky/pre-push`).
+  - **F2 [P1]** `blocked-paths-bash-gate.sh`: `ln -s . linkroot; printf x > linkroot/.secret` now refuses (resolved form matches `blocked_paths`).
+  - **F3 [P2]** `settings-protection.sh §5b`: case-glob now requires a real directory boundary on the extension-surface allow-list (`*"/.husky/pre-push.d/"*` instead of `*"/.husky/pre-push.d"*`). `.husky/pre-push.d.bak/X` no longer slips through as if it were inside the surface.
+
+  The helper canonicalizes REA_ROOT (macOS `/var` ↔ `/private/var` symlink)
+  and skips absolute paths whose logical form is already outside REA_ROOT
+  (no false-refusal on legitimate `/tmp/log` writes). Empirical replay
+  of all three PoCs against the fixed hooks: every one returns exit 2.
+
+  5 new bash-tier corpus fixtures pinning the F1/F2/F3 reproducers
+  plus a `/tmp/log` regression check + a legitimate `.husky/pre-push.d/X`
+  Bash redirect.
+
+  ### Round-N consumer finding #1 [P1] — `.rea/last-review.json` protection
+
+  Pre-fix `_lib/protected-paths.sh` protected `.rea/last-review.cache.json`
+  (0.18.1+) but not `.rea/last-review.json` itself — the operator's
+  forensic snapshot of the most recent codex review. A forged
+  `last-review.json` presents a fake PASS verdict to operators reading
+  the file directly. Now both files are in `REA_PROTECTED_PATTERNS_FULL`
+  AND `REA_KILL_SWITCH_INVARIANTS` (non-relaxable).
+
+  ### Round-N consumer finding #2 [P2] — `architecture-review-gate.sh` consumer-portability
+
+  Pre-fix the hook hardcoded rea-internal source-tree patterns
+  (`src/gateway/`, `hooks/_lib/`, `profiles/`, etc.) — irrelevant
+  advisory noise in consumer projects whose architecture-sensitive
+  paths are different. Now policy-driven via
+  `policy.architecture_review.patterns`. Empty/unset → silent no-op.
+  The bst-internal profile pins the rea-source patterns so dogfood
+  behaves as before. New zod schema field; new
+  type field on `Policy`; new `writePolicyYaml` plumbing.
+
+  ### Deferred items now closed (from 0.19.0 review)
+  - **P3-3** cache-hit emits BOTH `EVT_CACHE_HIT` and `EVT_REVIEWED`
+    (with `cache_hit: true` metadata) so verdict-stability dashboards
+    see every push. Cross-file contract test extended.
+  - **P3-1** cache-hit return-shape simplified (`status: cached.verdict`
+    replaces nested ternary).
+  - **P2-3** verdict cache opportunistic prune at >500 entries inside
+    `writeVerdict`. Bounds long-lived cache files.
+  - **P3-4** settings-schema test seeds a synthetic 0.13.x consumer doc;
+    validates merge with current defaults preserves user hooks +
+    top-level fields.
+  - **P2-1/P2-2** already closed in 0.19.0 via `_atomicWriteJson` +
+    `withAuditLock`; no-op this release.
+
+  ### Test coverage
+  - 1304 vitest tests pass (was 1297 in 0.19.0), +5 helix-021 fixtures
+  - All 6 quality gates green
+  - Empirical PoC replay: every helix-021 reproducer returns exit 2;
+    legitimate writes return exit 0
+
 ## 0.20.0
 
 ### Minor Changes
@@ -1210,13 +1285,13 @@ codex-review --also-set-cache`) on every push, produced a 1,250-line bash
 
   This release replaces the entire stack with a stateless gate:
 
-                                      git push
-                                        → .husky/pre-push → rea hook push-gate
-                                        → codex exec review --base <ref> --json
-                                        → parse verdict from streamed findings
-                                        → block on [P1] (blocking) or [P2] when concerns_blocks=true
-                                        → write .rea/last-review.json + audit record
-                                        → exit 0 / 1 (HALT) / 2 (blocked)
+                                        git push
+                                          → .husky/pre-push → rea hook push-gate
+                                          → codex exec review --base <ref> --json
+                                          → parse verdict from streamed findings
+                                          → block on [P1] (blocking) or [P2] when concerns_blocks=true
+                                          → write .rea/last-review.json + audit record
+                                          → exit 0 / 1 (HALT) / 2 (blocked)
 
   Codex is run fresh on every push. No cache. No SHA matching. No receipt
   consultation. When the gate blocks, Claude reads stderr + the
