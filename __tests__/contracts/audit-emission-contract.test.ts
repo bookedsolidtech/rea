@@ -139,4 +139,37 @@ describe('cross-file audit-emission contract (Class G)', () => {
       'EVT_REVIEWED safeAppend call not present in the post-summarize success path',
     ).toBe(true);
   });
+
+  // 0.19.1 P3-3 (code-reviewer): the cache-hit path ALSO emits
+  // EVT_REVIEWED with `cache_hit: true` metadata, so operators
+  // grepping `rea.push_gate.reviewed` for verdict-stability dashboards
+  // see every push including cached ones. Pinned here so a future
+  // refactor that drops the dual-emit is loud.
+  it('runtime cache-hit branch emits BOTH EVT_CACHE_HIT and EVT_REVIEWED', () => {
+    const body = readSource('src/hooks/push-gate/index.ts');
+    // Find the cache-hit branch entry. The branch starts with the
+    // `if (cacheLookup.hit && cacheLookup.entry !== undefined)` check.
+    const branchIdx = body.indexOf('cacheLookup.hit && cacheLookup.entry');
+    expect(branchIdx, 'cache-hit branch not found').toBeGreaterThan(-1);
+    // The full branch ends at the matching `};` closing the return —
+    // approximate by reading the next ~80 lines, more than enough to
+    // contain both emit calls.
+    const branchEndIdx = body.indexOf('return {', branchIdx);
+    expect(branchEndIdx, 'cache-hit return not found').toBeGreaterThan(-1);
+    const branchBody = body.slice(branchIdx, branchEndIdx);
+    expect(
+      /safeAppend\(\s*appendAuditFn,\s*deps\.baseDir,\s*EVT_CACHE_HIT/.test(branchBody),
+      'cache-hit branch missing EVT_CACHE_HIT emit',
+    ).toBe(true);
+    expect(
+      /safeAppend\(\s*appendAuditFn,\s*deps\.baseDir,\s*EVT_REVIEWED/.test(branchBody),
+      'cache-hit branch missing EVT_REVIEWED emit (operators grep this for verdict-stability dashboards)',
+    ).toBe(true);
+    // The `cache_hit: true` field is the discriminator that lets
+    // operators filter cache hits OUT of dashboards if they want.
+    expect(
+      /cache_hit:\s*true/.test(branchBody),
+      'cache-hit EVT_REVIEWED missing `cache_hit: true` discriminator field',
+    ).toBe(true);
+  });
 });

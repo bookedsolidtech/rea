@@ -223,4 +223,61 @@ describe('Class M — .claude/settings.json conforms to Claude Code hook-config 
       }
     }
   });
+
+  // 0.19.1 P3-4 (code-reviewer): consumer-upgrade coverage. The `merge`
+  // layer is most likely to drift on consumer upgrades — a 0.13.x-shaped
+  // settings.json that already contains user-authored hooks must merge
+  // cleanly with the latest defaults and produce a schema-valid document.
+  it('mergeSettings(<existing 0.13.x consumer doc>, defaults) produces a schema-valid document', () => {
+    // Synthetic 0.13.x-era settings: includes a user-authored Bash hook,
+    // a UserPromptSubmit hook the consumer added themselves, and a
+    // top-level `model` field that should pass through unchanged.
+    const consumerSeed = {
+      model: 'claude-opus-4-7',
+      env: { CONSUMER_VAR: 'true' },
+      hooks: {
+        PreToolUse: [
+          {
+            matcher: 'Bash',
+            hooks: [
+              {
+                type: 'command',
+                command: '"$CLAUDE_PROJECT_DIR"/.claude/hooks/consumer-bash-pre.sh',
+                timeout: 8000,
+              },
+            ],
+          },
+        ],
+        UserPromptSubmit: [
+          {
+            matcher: '*',
+            hooks: [
+              {
+                type: 'command',
+                command: '"$CLAUDE_PROJECT_DIR"/scripts/consumer-prompt-log.sh',
+              },
+            ],
+          },
+        ],
+      },
+    };
+    const merged = mergeSettings(consumerSeed, defaultDesiredHooks()).merged as HookConfigDocument;
+    const ok = validate(merged);
+    if (!ok) {
+      const errs = (validate.errors ?? [])
+        .map((e) => `  ${e.instancePath || '/'}: ${e.message}`)
+        .join('\n');
+      throw new Error(`merged settings.json failed schema validation:\n${errs}`);
+    }
+    expect(ok).toBe(true);
+    // The user's UserPromptSubmit group survives the merge — rea
+    // doesn't manage that event, so the consumer hook stays.
+    const ups = merged.hooks?.UserPromptSubmit ?? [];
+    expect(ups.some((g) => g.hooks.some((h) => h.command.includes('consumer-prompt-log.sh')))).toBe(
+      true,
+    );
+    // Top-level `model` and `env` survive unchanged.
+    expect(merged.model).toBe('claude-opus-4-7');
+    expect((merged.env as Record<string, string>).CONSUMER_VAR).toBe('true');
+  });
 });
