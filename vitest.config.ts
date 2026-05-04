@@ -21,7 +21,15 @@ export default defineConfig({
     pool: 'forks',
     poolOptions: {
       forks: {
-        singleFork: false,
+        // 0.23.0 round-13: 12,875 fixtures spawning bash subprocesses
+        // saturate vitest's IPC heartbeat. Cap maxForks to 2 — high
+        // enough that test files (each ~30-300s) can run in parallel,
+        // low enough that IPC traffic doesn't overflow the heartbeat
+        // budget. Verified locally; CI's 4-core runners benefit
+        // similarly. singleFork: true was too aggressive (test files
+        // timed out at 30s).
+        maxForks: 2,
+        minForks: 1,
       },
     },
     // The remaining 2-3 vitest-worker `Timeout calling onTaskUpdate`
