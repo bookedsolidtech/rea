@@ -179,7 +179,7 @@ describe('runCodexReview — model + reasoning_effort plumbing (0.14.0)', () => 
     expect(execIdx).toBeGreaterThan(lastDashC);
   });
 
-  it('passes NO -c override flags when neither option is set (preserves codex default behavior)', async () => {
+  it('0.18.0 iron-gate: passes gpt-5.4 + high as runtime defaults when options unset (no codex-default fallback)', async () => {
     const captured: { cmd: string; args: readonly string[] }[] = [];
     await runCodexReview({
       baseRef: 'origin/main',
@@ -188,8 +188,14 @@ describe('runCodexReview — model + reasoning_effort plumbing (0.14.0)', () => 
       spawnImpl: makeFakeSpawn(captured),
     });
     const { args } = captured[0]!;
-    expect(args).not.toContain('-c');
-    expect(args[0]).toBe('exec');
+    // Runtime hardcodes gpt-5.4 + high regardless of options.
+    expect(args.filter((a) => a === '-c')).toHaveLength(2);
+    expect(args).toContain('model="gpt-5.4"');
+    expect(args).toContain('model_reasoning_effort="high"');
+    // Overrides land BEFORE the exec subcommand.
+    const lastDashC = args.lastIndexOf('-c');
+    const execIdx = args.indexOf('exec');
+    expect(execIdx).toBeGreaterThan(lastDashC);
   });
 
   it('escapes embedded quotes in the model name to prevent TOML injection', async () => {

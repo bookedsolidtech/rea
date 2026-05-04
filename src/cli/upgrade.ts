@@ -735,7 +735,21 @@ export async function runUpgrade(options: UpgradeOptions = {}): Promise<void> {
 
   const now = new Date().toISOString();
   const installedAt = existingManifest?.installed_at ?? now;
-  const profile = existingManifest?.profile ?? 'unknown';
+  // 0.18.0 helix-020 G6 fix: pre-fix the upgrade path read profile from
+  // the existing manifest only — and pre-0.2.0 manifests recorded
+  // `"unknown"` as a placeholder. Every subsequent `rea upgrade` then
+  // re-stamped `"unknown"` forever. Authoritative source for the
+  // profile is `.rea/policy.yaml`; the manifest is a derivative
+  // record. Read policy first; fall back to existing manifest only
+  // when policy load fails (covers the bootstrap case where the
+  // manifest exists but policy is malformed).
+  let profile: string;
+  try {
+    const livePolicy = loadPolicy(resolvedRoot);
+    profile = livePolicy.profile;
+  } catch {
+    profile = existingManifest?.profile ?? 'unknown';
+  }
   const freshManifest: InstallManifest = {
     version: getPkgVersion(),
     profile,
