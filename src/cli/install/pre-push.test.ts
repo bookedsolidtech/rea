@@ -201,14 +201,24 @@ describe('BODY_TEMPLATE — path-with-spaces portability (Fix A / 0.12.0)', () =
   });
 });
 
-describe('marker bumps (Fix H / 0.13.0) — v4 markers + v3/v2 legacy detection', () => {
-  it('FALLBACK_MARKER is the v4 marker', () => {
-    expect(FALLBACK_MARKER).toBe('# rea:pre-push-fallback v4');
+describe('marker bumps (0.26.0 — v5 markers + v4/v3/v2 legacy detection)', () => {
+  it('FALLBACK_MARKER is the v5 marker', () => {
+    expect(FALLBACK_MARKER).toBe('# rea:pre-push-fallback v5');
   });
 
-  it('HUSKY_GATE_MARKER and HUSKY_GATE_BODY_MARKER are v4', () => {
-    expect(HUSKY_GATE_MARKER).toBe('# rea:husky-pre-push-gate v4');
-    expect(HUSKY_GATE_BODY_MARKER).toBe('# rea:gate-body-v4');
+  it('HUSKY_GATE_MARKER and HUSKY_GATE_BODY_MARKER are v5', () => {
+    expect(HUSKY_GATE_MARKER).toBe('# rea:husky-pre-push-gate v5');
+    expect(HUSKY_GATE_BODY_MARKER).toBe('# rea:gate-body-v5');
+  });
+
+  it('isLegacyReaManagedFallback recognizes 0.13–0.25.x v4 markers (refresh-on-upgrade)', () => {
+    const v4Body = `#!/bin/sh\n# rea:pre-push-fallback v4\n# rea:gate-body-v4\nset -eu\nexec "$@"\n`;
+    expect(isLegacyReaManagedFallback(v4Body)).toBe(true);
+  });
+
+  it('isLegacyReaManagedHuskyGate recognizes 0.13–0.25.x v4 marker pair (refresh-on-upgrade)', () => {
+    const v4Body = `#!/bin/sh\n# rea:husky-pre-push-gate v4\n# rea:gate-body-v4\nset -eu\nexec "$@"\n`;
+    expect(isLegacyReaManagedHuskyGate(v4Body)).toBe(true);
   });
 
   it('isLegacyReaManagedFallback recognizes 0.12.x v3 markers (refresh-on-upgrade)', () => {
@@ -821,9 +831,16 @@ describe('extension-hook chaining (Fix H / 0.13.0) — `.husky/pre-push.d/*`', (
       const log = path.join(repoDir, 'order.log');
       const stubBin = path.join(repoDir, 'node_modules', '.bin', 'rea');
       await fs.mkdir(path.dirname(stubBin), { recursive: true });
-      await fs.writeFile(stubBin, `#!/bin/sh\nprintf 'rea\\n' >> "${log}"\nexit 0\n`, {
-        mode: 0o755,
-      });
+      // 0.26.0 — the body invokes `rea preflight --strict` BEFORE the
+      // `rea hook push-gate` dispatch. The test's intent is the
+      // `hook push-gate` arm (extension-fragment ordering); silence
+      // the preflight branch so the order log only captures the
+      // hook-push-gate invocation.
+      await fs.writeFile(
+        stubBin,
+        `#!/bin/sh\nif [ "\${1:-}" = "preflight" ]; then exit 0; fi\nprintf 'rea\\n' >> "${log}"\nexit 0\n`,
+        { mode: 0o755 },
+      );
       // Fragments in deliberately-non-alphabetical filenames to prove
       // sort-order, not creation-order, dictates execution.
       const fragDir = path.join(repoDir, '.husky', 'pre-push.d');
@@ -867,6 +884,8 @@ describe('extension-hook chaining (Fix H / 0.13.0) — `.husky/pre-push.d/*`', (
       await execFileAsync('git', ['-C', repoDir, 'init', '-q']);
       const stubBin = path.join(repoDir, 'node_modules', '.bin', 'rea');
       await fs.mkdir(path.dirname(stubBin), { recursive: true });
+      // 0.26.0 — both `rea preflight --strict` (called first by the new body)
+      // and `rea hook push-gate` (the dispatch) succeed. Fragment fails next.
       await fs.writeFile(stubBin, `#!/bin/sh\nexit 0\n`, { mode: 0o755 });
       const fragDir = path.join(repoDir, '.husky', 'pre-push.d');
       await fs.mkdir(fragDir, { recursive: true });
@@ -916,9 +935,16 @@ describe('extension-hook chaining (Fix H / 0.13.0) — `.husky/pre-push.d/*`', (
       const log = path.join(repoDir, 'order.log');
       const stubBin = path.join(repoDir, 'node_modules', '.bin', 'rea');
       await fs.mkdir(path.dirname(stubBin), { recursive: true });
-      await fs.writeFile(stubBin, `#!/bin/sh\nprintf 'rea\\n' >> "${log}"\nexit 0\n`, {
-        mode: 0o755,
-      });
+      // 0.26.0 — the body invokes `rea preflight --strict` BEFORE the
+      // `rea hook push-gate` dispatch. The test's intent is the
+      // `hook push-gate` arm (extension-fragment ordering); silence
+      // the preflight branch so the order log only captures the
+      // hook-push-gate invocation.
+      await fs.writeFile(
+        stubBin,
+        `#!/bin/sh\nif [ "\${1:-}" = "preflight" ]; then exit 0; fi\nprintf 'rea\\n' >> "${log}"\nexit 0\n`,
+        { mode: 0o755 },
+      );
       const fragDir = path.join(repoDir, '.husky', 'pre-push.d');
       await fs.mkdir(fragDir, { recursive: true });
       // 10-not-exec is a valid shell script BUT lacks the exec bit — must be skipped.
@@ -962,9 +988,11 @@ describe('extension-hook chaining (Fix H / 0.13.0) — `.husky/pre-push.d/*`', (
       await fs.mkdir(path.dirname(stubBin), { recursive: true });
       // rea CLI logs its full argv so we can assert it gets `hook push-gate
       // <remote> <url>` (the dispatched argv).
+      // 0.26.0 — silence the `rea preflight --strict` invocation that runs
+      // before the dispatch; the test's intent is the dispatch's argv.
       await fs.writeFile(
         stubBin,
-        `#!/bin/sh\nprintf '%s\\n' "$#" "$@" >> "${reaArgvLog}"\nexit 0\n`,
+        `#!/bin/sh\nif [ "\${1:-}" = "preflight" ]; then exit 0; fi\nprintf '%s\\n' "$#" "$@" >> "${reaArgvLog}"\nexit 0\n`,
         { mode: 0o755 },
       );
       const fragDir = path.join(repoDir, '.husky', 'pre-push.d');
@@ -1007,9 +1035,12 @@ describe('extension-hook chaining (Fix H / 0.13.0) — `.husky/pre-push.d/*`', (
       const reaLog = path.join(repoDir, 'rea-argv.log');
       const fragLog = path.join(repoDir, 'frag-argv.log');
       // The "rea CLI" here is actually a node script that logs its argv.
+      // 0.26.0 — the new body invokes `node dist/cli/index.js preflight --strict`
+      // BEFORE the `hook push-gate` dispatch. Silence the preflight call so
+      // the test's argv assertion captures only the dispatched argv.
       await fs.writeFile(
         distEntry,
-        `#!/usr/bin/env node\nimport('node:fs').then(({ writeFileSync, appendFileSync }) => {\n  appendFileSync(${JSON.stringify(reaLog)}, [process.argv.length - 2, ...process.argv.slice(2)].join('\\n') + '\\n');\n  process.exit(0);\n});\n`,
+        `#!/usr/bin/env node\nimport('node:fs').then(({ writeFileSync, appendFileSync }) => {\n  if (process.argv[2] === 'preflight') { process.exit(0); }\n  appendFileSync(${JSON.stringify(reaLog)}, [process.argv.length - 2, ...process.argv.slice(2)].join('\\n') + '\\n');\n  process.exit(0);\n});\n`,
       );
       await fs.writeFile(
         path.join(repoDir, 'package.json'),

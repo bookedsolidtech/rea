@@ -684,6 +684,178 @@ describe('rea doctor — non-git escape hatch', () => {
   });
 });
 
+// ── 0.26.0 round-25 P3: doctor EXPECTED_HOOKS includes local-review-gate.sh ──
+//
+// The 0.26.0 local-first enforcement layer ships a new Bash-tier hook,
+// `local-review-gate.sh`. Pre-fix doctor's EXPECTED_HOOKS list omitted it,
+// so consumer installs upgrading to 0.26.0 with `local-review-gate.sh`
+// missing-on-disk got `pass` from `rea doctor` — silently disabling the
+// new guardrail. The smoke test below pins the EXPECTED_HOOKS set so a
+// future drop of the hook from the list (or a regression in
+// `checkHooksInstalled`) trips a hard failure here.
+describe('rea doctor — EXPECTED_HOOKS coverage (round-25 P3)', () => {
+  const cleanup: string[] = [];
+
+  afterEach(async () => {
+    await Promise.all(cleanup.splice(0).map((d) => fs.rm(d, { recursive: true, force: true })));
+  });
+
+  it('hooks-installed check fails with `missing local-review-gate.sh` when the hook is absent', async () => {
+    const repo = await makeScratchRepo({ codexRequired: false });
+    cleanup.push(repo.dir);
+    // Populate every other shipped hook EXCEPT local-review-gate.sh — the
+    // canonical-hook list pinned in `src/cli/doctor.ts` MUST include the
+    // 0.26.0 entry, otherwise the absence of the file slides past doctor.
+    const hooksDir = path.join(repo.dir, '.claude', 'hooks');
+    await fs.mkdir(hooksDir, { recursive: true });
+    const everyOtherHook = [
+      'architecture-review-gate.sh',
+      'attribution-advisory.sh',
+      // 0.22.0 — round-27 F8 added to EXPECTED_HOOKS.
+      'blocked-paths-bash-gate.sh',
+      'blocked-paths-enforcer.sh',
+      'changeset-security-gate.sh',
+      'dangerous-bash-interceptor.sh',
+      'dependency-audit-gate.sh',
+      'env-file-protection.sh',
+      'pr-issue-link-gate.sh',
+      // 0.21.0 — round-27 F8 added to EXPECTED_HOOKS.
+      'protected-paths-bash-gate.sh',
+      'secret-scanner.sh',
+      'security-disclosure-gate.sh',
+      'settings-protection.sh',
+    ];
+    for (const name of everyOtherHook) {
+      const p = path.join(hooksDir, name);
+      await fs.writeFile(p, '#!/bin/bash\nexit 0\n');
+      await fs.chmod(p, 0o755);
+    }
+    const checks = collectChecks(repo.dir);
+    const hooksCheck = findCheck(checks, 'hooks installed + executable');
+    expect(hooksCheck?.status).toBe('fail');
+    // Detail must name the missing hook explicitly. If a future refactor
+    // drops `local-review-gate.sh` from EXPECTED_HOOKS, this assertion
+    // turns red — the canonical guard.
+    expect(hooksCheck?.detail).toMatch(/missing local-review-gate\.sh/);
+  });
+
+  it('hooks-installed check passes when every canonical hook (including local-review-gate.sh) is present', async () => {
+    const repo = await makeScratchRepo({ codexRequired: false });
+    cleanup.push(repo.dir);
+    const hooksDir = path.join(repo.dir, '.claude', 'hooks');
+    await fs.mkdir(hooksDir, { recursive: true });
+    const allCanonical = [
+      'architecture-review-gate.sh',
+      'attribution-advisory.sh',
+      'blocked-paths-bash-gate.sh',
+      'blocked-paths-enforcer.sh',
+      'changeset-security-gate.sh',
+      'dangerous-bash-interceptor.sh',
+      'dependency-audit-gate.sh',
+      'env-file-protection.sh',
+      'local-review-gate.sh',
+      'pr-issue-link-gate.sh',
+      'protected-paths-bash-gate.sh',
+      'secret-scanner.sh',
+      'security-disclosure-gate.sh',
+      'settings-protection.sh',
+    ];
+    for (const name of allCanonical) {
+      const p = path.join(hooksDir, name);
+      await fs.writeFile(p, '#!/bin/bash\nexit 0\n');
+      await fs.chmod(p, 0o755);
+    }
+    const checks = collectChecks(repo.dir);
+    const hooksCheck = findCheck(checks, 'hooks installed + executable');
+    expect(hooksCheck?.status).toBe('pass');
+    // Round-27 F8: 14 shipped hooks (was 12 pre-fix; added
+    // protected-paths-bash-gate.sh + blocked-paths-bash-gate.sh).
+    expect(hooksCheck?.detail).toMatch(/14 hooks present/);
+  });
+});
+
+// ── 0.26.0 round-27 F8: doctor EXPECTED_HOOKS includes the older Bash gates ──
+//
+// Pre-fix `EXPECTED_HOOKS` was missing two hooks that have shipped for
+// multiple minors:
+//   - protected-paths-bash-gate.sh (0.21.0+)
+//   - blocked-paths-bash-gate.sh   (0.22.0+)
+// Without them, doctor returned `pass` on consumer installs missing
+// these security-load-bearing hooks. The two tests below pin each
+// hook into EXPECTED_HOOKS — a regression dropping either entry from
+// the list trips a hard failure here.
+describe('rea doctor — EXPECTED_HOOKS coverage (round-27 F8)', () => {
+  const cleanup: string[] = [];
+
+  afterEach(async () => {
+    await Promise.all(cleanup.splice(0).map((d) => fs.rm(d, { recursive: true, force: true })));
+  });
+
+  it('hooks-installed check fails with `missing protected-paths-bash-gate.sh` when the hook is absent', async () => {
+    const repo = await makeScratchRepo({ codexRequired: false });
+    cleanup.push(repo.dir);
+    const hooksDir = path.join(repo.dir, '.claude', 'hooks');
+    await fs.mkdir(hooksDir, { recursive: true });
+    // Every canonical hook EXCEPT protected-paths-bash-gate.sh.
+    const everyOtherHook = [
+      'architecture-review-gate.sh',
+      'attribution-advisory.sh',
+      'blocked-paths-bash-gate.sh',
+      'blocked-paths-enforcer.sh',
+      'changeset-security-gate.sh',
+      'dangerous-bash-interceptor.sh',
+      'dependency-audit-gate.sh',
+      'env-file-protection.sh',
+      'local-review-gate.sh',
+      'pr-issue-link-gate.sh',
+      'secret-scanner.sh',
+      'security-disclosure-gate.sh',
+      'settings-protection.sh',
+    ];
+    for (const name of everyOtherHook) {
+      const p = path.join(hooksDir, name);
+      await fs.writeFile(p, '#!/bin/bash\nexit 0\n');
+      await fs.chmod(p, 0o755);
+    }
+    const checks = collectChecks(repo.dir);
+    const hooksCheck = findCheck(checks, 'hooks installed + executable');
+    expect(hooksCheck?.status).toBe('fail');
+    expect(hooksCheck?.detail).toMatch(/missing protected-paths-bash-gate\.sh/);
+  });
+
+  it('hooks-installed check fails with `missing blocked-paths-bash-gate.sh` when the hook is absent', async () => {
+    const repo = await makeScratchRepo({ codexRequired: false });
+    cleanup.push(repo.dir);
+    const hooksDir = path.join(repo.dir, '.claude', 'hooks');
+    await fs.mkdir(hooksDir, { recursive: true });
+    // Every canonical hook EXCEPT blocked-paths-bash-gate.sh.
+    const everyOtherHook = [
+      'architecture-review-gate.sh',
+      'attribution-advisory.sh',
+      'blocked-paths-enforcer.sh',
+      'changeset-security-gate.sh',
+      'dangerous-bash-interceptor.sh',
+      'dependency-audit-gate.sh',
+      'env-file-protection.sh',
+      'local-review-gate.sh',
+      'pr-issue-link-gate.sh',
+      'protected-paths-bash-gate.sh',
+      'secret-scanner.sh',
+      'security-disclosure-gate.sh',
+      'settings-protection.sh',
+    ];
+    for (const name of everyOtherHook) {
+      const p = path.join(hooksDir, name);
+      await fs.writeFile(p, '#!/bin/bash\nexit 0\n');
+      await fs.chmod(p, 0o755);
+    }
+    const checks = collectChecks(repo.dir);
+    const hooksCheck = findCheck(checks, 'hooks installed + executable');
+    expect(hooksCheck?.status).toBe('fail');
+    expect(hooksCheck?.detail).toMatch(/missing blocked-paths-bash-gate\.sh/);
+  });
+});
+
 describe('rea doctor — checkFingerprintStore (G7)', () => {
   const cleanup: string[] = [];
 

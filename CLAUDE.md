@@ -167,7 +167,7 @@ This repo is **public from the first commit**. Extra rules apply because everyth
 
 ## Hook & Command Reference
 
-Hooks at `.claude/hooks/` (copied from `hooks/` by `rea init`). 14 ship in the package; 12 are registered in the default `.claude/settings.json` and fire on Claude Code tool-invocation events. Two (`commit-review-gate.sh` and `push-review-gate-git.sh`) are shipped ready-to-wire but intentionally NOT registered by default:
+Hooks at `.claude/hooks/` (copied from `hooks/` by `rea init`). 14 ship in the package and ALL 14 are registered in the default `.claude/settings.json`. (Pre-0.26.0 the count was 11 ship / 11 registered; the 0.21.0 → 0.22.0 → 0.26.0 cycle added 3 new gates: `protected-paths-bash-gate.sh`, `blocked-paths-bash-gate.sh`, `local-review-gate.sh`.) The 0.10.x review-gate scripts (`push-review-gate.sh`, `push-review-gate-git.sh`, `commit-review-gate.sh`) and the bash push-review core were removed in 0.11.0; the push-gate is now a stateless `codex exec review` invocation wired through `.husky/pre-push` (not Claude Code hooks).
 
 - `dangerous-bash-interceptor.sh` — blocks destructive commands (`rm -rf`, `git reset --hard`, `--no-verify`, etc.)
 - `env-file-protection.sh` — blocks reads of `.env*`
@@ -175,14 +175,14 @@ Hooks at `.claude/hooks/` (copied from `hooks/` by `rea init`). 14 ship in the p
 - `security-disclosure-gate.sh` — routes security-keyword `gh issue create` to private disclosure
 - `pr-issue-link-gate.sh` — advisory warn when `gh pr create` has no linked issue
 - `attribution-advisory.sh` — blocks AI attribution in commits/PRs
+- `protected-paths-bash-gate.sh` — Bash-tier parity with `settings-protection.sh` — refuses shell writes to `.claude/`/`.husky/`/policy paths (0.21.0+)
+- `blocked-paths-bash-gate.sh` — Bash-tier parity with `blocked-paths-enforcer.sh` — refuses shell writes to `blocked_paths` policy entries (0.22.0+)
+- `local-review-gate.sh` — refuses `git push` (and optionally `git commit`) until a recent `rea.local_review` audit entry covers HEAD (0.26.0+)
 - `secret-scanner.sh` — scans writes/edits for credentials
 - `settings-protection.sh` — guards `.claude/settings.json` and `.claude/hooks/*` edits
 - `blocked-paths-enforcer.sh` — enforces `blocked_paths` from policy
 - `changeset-security-gate.sh` — checks changesets for GHSA leaks and malformed frontmatter
 - `architecture-review-gate.sh` — post-write architectural impact check
-- `commit-review-gate.sh` — `PreToolUse: Bash` matcher for `git commit`; shipped ready-to-wire but NOT registered by default (operators opt in by adding a rule)
-- `push-review-gate.sh` — pre-push review gate (Claude-Code PreToolUse adapter)
-- `push-review-gate-git.sh` — pre-push review gate (native-git adapter; sources `hooks/_lib/push-review-core.sh`, shipped for wrapper-based `.husky/pre-push` installs. `rea init`'s default installer emits a standalone inline `.husky/pre-push` body instead of a wrapper)
 
 Slash commands at `.claude/commands/`:
 

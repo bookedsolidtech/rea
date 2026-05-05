@@ -7,6 +7,8 @@ import { registerHookCommand } from './hook.js';
 import { runDoctor } from './doctor.js';
 import { runFreeze, runUnfreeze } from './freeze.js';
 import { runInit } from './init.js';
+import { registerPreflightCommand } from './preflight.js';
+import { registerReviewCommand } from './review.js';
 import { runServe } from './serve.js';
 import { runStatus } from './status.js';
 import { runTofuAccept, runTofuList } from './tofu.js';
@@ -146,6 +148,14 @@ async function main(): Promise<void> {
   // Register `rea hook push-gate` — the stateless pre-push Codex gate
   // called by `.husky/pre-push` and `.git/hooks/pre-push`.
   registerHookCommand(program);
+
+  // 0.26.0 local-first enforcement (CTO directive 2026-05-05). Two new
+  // top-level CLIs: `rea review` writes `rea.local_review` audit entries;
+  // `rea preflight` reads them and refuses pushes/commits without a
+  // recent matching entry. The husky pre-push template + Bash-tier
+  // `local-review-gate.sh` hook both delegate to `rea preflight --strict`.
+  registerReviewCommand(program);
+  registerPreflightCommand(program);
 
   const tofu = program
     .command('tofu')

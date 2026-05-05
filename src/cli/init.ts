@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import * as p from '@clack/prompts';
+import { parse as parseYaml } from 'yaml';
 import { AutonomyLevel } from '../policy/types.js';
 import { HARD_DEFAULTS, loadProfile, mergeProfiles, type Profile } from '../policy/profiles.js';
 import { copyArtifacts } from './install/copy.js';
@@ -101,6 +102,18 @@ interface ResolvedConfig {
    * operator reading the file sees the choice that was made at init time.
    */
   codexRequired: boolean;
+  /**
+   * Round-27 F6: preserved 0.26.0 local-review + commit-hygiene knobs.
+   * Each is `undefined` when the operator never set it, in which case
+   * the policy writer omits the corresponding line from the YAML output
+   * (consumers fall through to the documented 0.26.0 defaults).
+   */
+  localReviewMode?: 'enforced' | 'off';
+  localReviewRefuseAt?: 'push' | 'commit' | 'both';
+  localReviewBypassEnvVar?: string;
+  localReviewMaxAgeSeconds?: number;
+  commitHygieneWarnAtCommits?: number;
+  commitHygieneRefuseAtCommits?: number;
   fromReagent: boolean;
   reagentPolicyPath: string | null;
   reagentNotices: string[];
@@ -278,6 +291,29 @@ async function runWizard(
     blockedPaths: layeredBase.blocked_paths ?? ['.env', '.env.*'],
     notificationChannel: layeredBase.notification_channel ?? '',
     codexRequired,
+    // Round-27 F6: the wizard does NOT prompt for the 0.26.0 knobs (they
+    // are advanced config — most teams accept defaults). But when the
+    // existing on-disk policy carries them, forward them verbatim so a
+    // re-run preserves operator edits exactly the same way the --yes
+    // path does.
+    ...(existingPolicy?.localReviewMode !== undefined
+      ? { localReviewMode: existingPolicy.localReviewMode }
+      : {}),
+    ...(existingPolicy?.localReviewRefuseAt !== undefined
+      ? { localReviewRefuseAt: existingPolicy.localReviewRefuseAt }
+      : {}),
+    ...(existingPolicy?.localReviewBypassEnvVar !== undefined
+      ? { localReviewBypassEnvVar: existingPolicy.localReviewBypassEnvVar }
+      : {}),
+    ...(existingPolicy?.localReviewMaxAgeSeconds !== undefined
+      ? { localReviewMaxAgeSeconds: existingPolicy.localReviewMaxAgeSeconds }
+      : {}),
+    ...(existingPolicy?.commitHygieneWarnAtCommits !== undefined
+      ? { commitHygieneWarnAtCommits: existingPolicy.commitHygieneWarnAtCommits }
+      : {}),
+    ...(existingPolicy?.commitHygieneRefuseAtCommits !== undefined
+      ? { commitHygieneRefuseAtCommits: existingPolicy.commitHygieneRefuseAtCommits }
+      : {}),
     fromReagent,
     reagentPolicyPath,
     reagentNotices: [],
@@ -339,6 +375,22 @@ interface ExistingPolicyValues {
   blockedPaths?: string[];
   notificationChannel?: string;
   codexRequired?: boolean;
+  /**
+   * Round-27 F6 fix: preserve 0.26.0 local-review + commit-hygiene knobs
+   * across `rea init` re-runs. Pre-fix, a team opting out via
+   * `mode: off` got silently reverted on the next `rea init`, defeating
+   * the off-switch documented as a FIRST-class concern.
+   *
+   * Each field is `undefined` when the existing policy didn't set it,
+   * so the writer can distinguish "operator made an explicit choice"
+   * from "use the 0.26.0 documented default".
+   */
+  localReviewMode?: 'enforced' | 'off';
+  localReviewRefuseAt?: 'push' | 'commit' | 'both';
+  localReviewBypassEnvVar?: string;
+  localReviewMaxAgeSeconds?: number;
+  commitHygieneWarnAtCommits?: number;
+  commitHygieneRefuseAtCommits?: number;
 }
 
 /**
@@ -357,53 +409,132 @@ interface ExistingPolicyValues {
  * VALUES are still preserved. Operators who want full reset pass
  * `--force` to bypass the file-existence check entirely.
  */
+/**
+ * Round-30 F3 (structural): read the existing policy via the canonical
+ * YAML parser instead of regex-scraping the raw text.
+ *
+ * Pre-fix the preservation reader used independent line-anchored regexes
+ * (`^\s+mode:`, `^\s+warn_at_commits:`, etc.) that ONLY matched
+ * block-form scalars. The TS loader (and `policy_nested_scalar` in the
+ * bash hooks) accept inline mappings — `local_review: { mode: off }` —
+ * but the regex preservation slipped them through, leaving the values
+ * `undefined` after re-read. The writer then skipped emission, and the
+ * inline block vanished entirely on a `rea init` re-run. Round-trip
+ * lossy across the inline/block divergence.
+ *
+ * Structural fix: parse the YAML once, walk the resulting object tree,
+ * and read each preservation key by dotted path. Inline AND block forms
+ * agree at the parsed layer — the parser folds both into the same
+ * object shape — so this fix closes the inline/block divergence for
+ * EVERY preservation key (the round-29 cross-cutting observation), not
+ * just the 6 round-28 fields.
+ *
+ * Failure modes handled:
+ *   - Policy file missing — returns undefined (caller falls back to
+ *     profile defaults; same behavior as pre-fix).
+ *   - YAML malformed — returns undefined (same as pre-fix; the regex
+ *     reader returned undefined on any thrown read error).
+ *   - YAML parses but is null / not an object — returns an empty
+ *     ExistingPolicyValues (no fields to preserve; profile defaults
+ *     fill in).
+ *   - Individual fields wrong type — silently dropped (permissive
+ *     contract, same as the previous regex reader).
+ */
 function readExistingPolicyForPreservation(targetDir: string): ExistingPolicyValues | undefined {
   const policyPath = path.join(targetDir, REA_DIR, POLICY_FILE);
   if (!fs.existsSync(policyPath)) return undefined;
+  let parsed: unknown;
   try {
     const raw = fs.readFileSync(policyPath, 'utf8');
-    const out: ExistingPolicyValues = {};
-    // Profile (informational; used for stderr advisory).
-    const pm = raw.match(/^profile:\s*['"]?([a-z0-9-]+)['"]?\s*$/m);
-    if (pm) out.profile = pm[1] as ProfileName;
-    // Autonomy + ceiling (enum).
-    const am = raw.match(/^autonomy_level:\s*(L[0-3])\s*$/m);
-    const amVal = am?.[1];
-    if (amVal !== undefined && (Object.values(AutonomyLevel) as string[]).includes(amVal)) {
-      out.autonomyLevel = amVal as AutonomyLevel;
-    }
-    const mm = raw.match(/^max_autonomy_level:\s*(L[0-3])\s*$/m);
-    const mmVal = mm?.[1];
-    if (mmVal !== undefined && (Object.values(AutonomyLevel) as string[]).includes(mmVal)) {
-      out.maxAutonomyLevel = mmVal as AutonomyLevel;
-    }
-    // block_ai_attribution.
-    const bm = raw.match(/^block_ai_attribution:\s*(true|false)\s*$/m);
-    if (bm?.[1] !== undefined) out.blockAiAttribution = bm[1] === 'true';
-    // blocked_paths block-sequence — line-by-line scan.
-    const bpStart = raw.match(/^blocked_paths:\s*$/m);
-    if (bpStart) {
-      const after = raw.slice((bpStart.index ?? 0) + bpStart[0].length + 1);
-      const lines = after.split('\n');
-      const collected: string[] = [];
-      for (const line of lines) {
-        const m2 = line.match(/^\s*-\s+(?:['"]([^'"]+)['"]|(\S.*?))\s*$/);
-        if (!m2) break;
-        const v = m2[1] ?? m2[2];
-        if (v !== undefined) collected.push(v);
-      }
-      if (collected.length > 0) out.blockedPaths = collected;
-    }
-    // notification_channel.
-    const nm = raw.match(/^notification_channel:\s*['"]?([^'"\n]*)['"]?\s*$/m);
-    if (nm?.[1] !== undefined) out.notificationChannel = nm[1];
-    // review.codex_required (under nested `review:` block).
-    const cm = raw.match(/^\s+codex_required:\s*(true|false)\s*$/m);
-    if (cm?.[1] !== undefined) out.codexRequired = cm[1] === 'true';
-    return out;
+    parsed = parseYaml(raw);
   } catch {
     return undefined;
   }
+  if (parsed === null || typeof parsed !== 'object') {
+    // Empty / non-mapping document — nothing to preserve, but signal
+    // the caller that the file did exist (pre-fix returned `out` even
+    // for a fully-empty file because every regex missed without
+    // throwing). Returning `{}` matches that pre-fix shape.
+    return {};
+  }
+  const policy = parsed as Record<string, unknown>;
+  const out: ExistingPolicyValues = {};
+
+  // Top-level scalars.
+  const profile = policy['profile'];
+  if (typeof profile === 'string' && /^[a-z0-9-]+$/.test(profile)) {
+    out.profile = profile as ProfileName;
+  }
+  const autonomyLevel = policy['autonomy_level'];
+  if (typeof autonomyLevel === 'string' &&
+      (Object.values(AutonomyLevel) as string[]).includes(autonomyLevel)) {
+    out.autonomyLevel = autonomyLevel as AutonomyLevel;
+  }
+  const maxAutonomyLevel = policy['max_autonomy_level'];
+  if (typeof maxAutonomyLevel === 'string' &&
+      (Object.values(AutonomyLevel) as string[]).includes(maxAutonomyLevel)) {
+    out.maxAutonomyLevel = maxAutonomyLevel as AutonomyLevel;
+  }
+  const blockAiAttribution = policy['block_ai_attribution'];
+  if (typeof blockAiAttribution === 'boolean') out.blockAiAttribution = blockAiAttribution;
+
+  // blocked_paths is an array of strings. Pre-fix only preserved a
+  // non-empty list (an explicit `blocked_paths: []` fell through to
+  // profile defaults). Match that contract: skip the assignment when
+  // the parsed value is empty / wrong shape.
+  const blockedPaths = policy['blocked_paths'];
+  if (Array.isArray(blockedPaths)) {
+    const collected = blockedPaths.filter((v): v is string => typeof v === 'string');
+    if (collected.length > 0) out.blockedPaths = collected;
+  }
+
+  const notificationChannel = policy['notification_channel'];
+  if (typeof notificationChannel === 'string') out.notificationChannel = notificationChannel;
+
+  // Nested review.* knobs. Inline form `review: { codex_required: true }`
+  // and block form both fold to the same object at the parser layer.
+  const review = policy['review'];
+  if (review !== null && typeof review === 'object') {
+    const r = review as Record<string, unknown>;
+    if (typeof r['codex_required'] === 'boolean') out.codexRequired = r['codex_required'];
+
+    // local_review.* — round-28 F6 + round-30 F3 fields.
+    const localReview = r['local_review'];
+    if (localReview !== null && typeof localReview === 'object') {
+      const lr = localReview as Record<string, unknown>;
+      const mode = lr['mode'];
+      if (mode === 'enforced' || mode === 'off') out.localReviewMode = mode;
+      const refuseAt = lr['refuse_at'];
+      if (refuseAt === 'push' || refuseAt === 'commit' || refuseAt === 'both') {
+        out.localReviewRefuseAt = refuseAt;
+      }
+      const bypassEnvVar = lr['bypass_env_var'];
+      if (typeof bypassEnvVar === 'string' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(bypassEnvVar)) {
+        out.localReviewBypassEnvVar = bypassEnvVar;
+      }
+      const maxAge = lr['max_age_seconds'];
+      if (typeof maxAge === 'number' && Number.isFinite(maxAge) && maxAge > 0) {
+        out.localReviewMaxAgeSeconds = maxAge;
+      }
+    }
+  }
+
+  // commit_hygiene.* — top-level (NOT nested under review). Inline form
+  // `commit_hygiene: { warn_at_commits: 3 }` and block form both work.
+  const commitHygiene = policy['commit_hygiene'];
+  if (commitHygiene !== null && typeof commitHygiene === 'object') {
+    const ch = commitHygiene as Record<string, unknown>;
+    const warnAt = ch['warn_at_commits'];
+    if (typeof warnAt === 'number' && Number.isFinite(warnAt) && warnAt >= 0) {
+      out.commitHygieneWarnAtCommits = warnAt;
+    }
+    const refuseAt = ch['refuse_at_commits'];
+    if (typeof refuseAt === 'number' && Number.isFinite(refuseAt) && refuseAt >= 0) {
+      out.commitHygieneRefuseAtCommits = refuseAt;
+    }
+  }
+
+  return out;
 }
 
 function readExistingInstalledAt(policyPath: string): string | undefined {
@@ -511,6 +642,46 @@ function writePolicyYaml(targetDir: string, config: ResolvedConfig, layered: Pro
   // single line, no need to understand the default semantics).
   lines.push(`review:`);
   lines.push(`  codex_required: ${config.codexRequired ? 'true' : 'false'}`);
+
+  // Round-27 F6: emit `review.local_review` and top-level
+  // `commit_hygiene` blocks ONLY when the operator (or the prior on-disk
+  // policy) set them. Pre-fix re-running `rea init` silently dropped any
+  // 0.26.0 knobs the operator had configured — `mode: off` reverted to
+  // the documented `enforced` default, etc. We deliberately do NOT emit
+  // a block when nothing was set, so consumers reading `policy.yaml` see
+  // a clean file that documents only the operator's explicit choices.
+  const hasLocalReview =
+    config.localReviewMode !== undefined ||
+    config.localReviewRefuseAt !== undefined ||
+    config.localReviewBypassEnvVar !== undefined ||
+    config.localReviewMaxAgeSeconds !== undefined;
+  if (hasLocalReview) {
+    lines.push(`  local_review:`);
+    if (config.localReviewMode !== undefined) {
+      lines.push(`    mode: ${config.localReviewMode}`);
+    }
+    if (config.localReviewRefuseAt !== undefined) {
+      lines.push(`    refuse_at: ${config.localReviewRefuseAt}`);
+    }
+    if (config.localReviewBypassEnvVar !== undefined) {
+      lines.push(`    bypass_env_var: ${JSON.stringify(config.localReviewBypassEnvVar)}`);
+    }
+    if (config.localReviewMaxAgeSeconds !== undefined) {
+      lines.push(`    max_age_seconds: ${config.localReviewMaxAgeSeconds}`);
+    }
+  }
+  if (
+    config.commitHygieneWarnAtCommits !== undefined ||
+    config.commitHygieneRefuseAtCommits !== undefined
+  ) {
+    lines.push(`commit_hygiene:`);
+    if (config.commitHygieneWarnAtCommits !== undefined) {
+      lines.push(`  warn_at_commits: ${config.commitHygieneWarnAtCommits}`);
+    }
+    if (config.commitHygieneRefuseAtCommits !== undefined) {
+      lines.push(`  refuse_at_commits: ${config.commitHygieneRefuseAtCommits}`);
+    }
+  }
   lines.push(``);
   fs.writeFileSync(policyPath, lines.join('\n'), 'utf8');
   return policyPath;
@@ -708,6 +879,27 @@ export async function runInit(options: InitOptions): Promise<void> {
       notificationChannel:
         existingPolicy?.notificationChannel ?? layeredBase.notification_channel ?? '',
       codexRequired,
+      // Round-27 F6: forward the existing 0.26.0 knobs verbatim. Any field
+      // not set on disk stays undefined, and the writer omits it from the
+      // emitted YAML.
+      ...(existingPolicy?.localReviewMode !== undefined
+        ? { localReviewMode: existingPolicy.localReviewMode }
+        : {}),
+      ...(existingPolicy?.localReviewRefuseAt !== undefined
+        ? { localReviewRefuseAt: existingPolicy.localReviewRefuseAt }
+        : {}),
+      ...(existingPolicy?.localReviewBypassEnvVar !== undefined
+        ? { localReviewBypassEnvVar: existingPolicy.localReviewBypassEnvVar }
+        : {}),
+      ...(existingPolicy?.localReviewMaxAgeSeconds !== undefined
+        ? { localReviewMaxAgeSeconds: existingPolicy.localReviewMaxAgeSeconds }
+        : {}),
+      ...(existingPolicy?.commitHygieneWarnAtCommits !== undefined
+        ? { commitHygieneWarnAtCommits: existingPolicy.commitHygieneWarnAtCommits }
+        : {}),
+      ...(existingPolicy?.commitHygieneRefuseAtCommits !== undefined
+        ? { commitHygieneRefuseAtCommits: existingPolicy.commitHygieneRefuseAtCommits }
+        : {}),
       fromReagent,
       reagentPolicyPath,
       reagentNotices,

@@ -157,12 +157,29 @@ const EXPECTED_AGENTS = [
 const EXPECTED_HOOKS = [
   'architecture-review-gate.sh',
   'attribution-advisory.sh',
+  // 0.22.0 — Bash-tier parity with `blocked-paths-enforcer.sh`.
+  // Round-27 F8 fix: was silently missing from EXPECTED_HOOKS, so
+  // doctor returned pass on consumer installs that lacked this
+  // security-load-bearing hook (any consumer who upgraded from
+  // 0.21.x → 0.22.x without `rea upgrade` was undetected).
+  'blocked-paths-bash-gate.sh',
   'blocked-paths-enforcer.sh',
   'changeset-security-gate.sh',
   'dangerous-bash-interceptor.sh',
   'dependency-audit-gate.sh',
   'env-file-protection.sh',
+  // 0.26.0 local-first enforcement (CTO directive 2026-05-05).
+  // Round-25 P3 fix: doctor's EXPECTED_HOOKS list missed this entry.
+  // Without it, `rea doctor` returned pass on consumer installs that
+  // didn't actually have the new gate present after upgrade — silently
+  // disabling the local-first guardrail.
+  'local-review-gate.sh',
   'pr-issue-link-gate.sh',
+  // 0.21.0 — Bash-tier parity with `settings-protection.sh`.
+  // Round-27 F8 fix: same class as blocked-paths-bash-gate.sh — silently
+  // missing since 0.21.0, doctor would pass even when the hook was
+  // absent from a consumer install.
+  'protected-paths-bash-gate.sh',
   'secret-scanner.sh',
   'security-disclosure-gate.sh',
   'settings-protection.sh',

@@ -93,6 +93,37 @@ const ReviewPolicySchema = z
      * verdict. Set to 0 to disable caching (every push re-invokes codex).
      */
     cache_ttl_ms: z.number().int().nonnegative().optional(),
+    /**
+     * 0.26.0 local-first enforcement. Strict so a typo in the off-switch
+     * surface (`mode: of`, `refuse_at: pushh`) fails policy load instead
+     * of silently disabling. `bypass_env_var` is constrained to the
+     * shell-safe identifier alphabet so a nonsense value can't smuggle
+     * shell metacharacters through the Bash-tier gate that reads it.
+     */
+    local_review: z
+      .object({
+        mode: z.enum(['enforced', 'off']).optional(),
+        max_age_seconds: z.number().int().positive().optional(),
+        refuse_at: z.enum(['push', 'commit', 'both']).optional(),
+        bypass_env_var: z
+          .string()
+          .regex(/^[A-Z][A-Z0-9_]{0,63}$/)
+          .optional(),
+      })
+      .strict()
+      .optional(),
+  })
+  .strict();
+
+/**
+ * 0.26.0 commit hygiene refusal thresholds. Top-level policy block (NOT
+ * under `review`) — it's a process-discipline knob, not a review knob.
+ * `rea preflight` reads it; the push-gate ignores it.
+ */
+const CommitHygienePolicySchema = z
+  .object({
+    warn_at_commits: z.number().int().nonnegative().optional(),
+    refuse_at_commits: z.number().int().nonnegative().optional(),
   })
   .strict();
 
@@ -226,6 +257,9 @@ const PolicySchema = z
         patterns: z.array(z.string()).optional(),
       })
       .optional(),
+    // 0.26.0 commit-hygiene thresholds — top-level so it's discoverable
+    // separately from `review.local_review`. `rea preflight` consumes it.
+    commit_hygiene: CommitHygienePolicySchema.optional(),
   })
   .strict();
 

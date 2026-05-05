@@ -314,6 +314,178 @@ describe('rea init — G11.4 codex flags', () => {
     expect(secondStamp).toBe(firstStamp);
   });
 
+  // ── round-27 F6: re-run preserves 0.26.0 local_review + commit_hygiene ──
+  //
+  // 0.21.1 made the older user-mutable knobs survive re-runs of `rea init`.
+  // Round-27 F6 extends that contract to the 0.26.0 fields. Pre-fix, a team
+  // opting out via `mode: off` got silently reverted on the next re-run,
+  // defeating the off-switch documented as a FIRST-class concern.
+  it('round-27 F6: re-running rea init preserves review.local_review.mode = off', async () => {
+    const dir = await makeScratch();
+    cleanup.push(dir);
+    process.chdir(dir);
+
+    await runInit({ yes: true, profile: 'minimal', codex: false });
+    let raw = await fs.readFile(path.join(dir, '.rea', 'policy.yaml'), 'utf8');
+    // Operator opts out of local-review enforcement. Append a local_review
+    // block under the existing review: block.
+    raw = raw.replace(
+      /^(review:\s*\n  codex_required:\s*(?:true|false)\s*\n)/m,
+      '$1  local_review:\n    mode: off\n',
+    );
+    await fs.writeFile(path.join(dir, '.rea', 'policy.yaml'), raw, 'utf8');
+
+    await new Promise((r) => setTimeout(r, 20));
+    await runInit({ yes: true, profile: 'minimal', codex: false });
+    const second = await fs.readFile(path.join(dir, '.rea', 'policy.yaml'), 'utf8');
+    expect(second).toMatch(/local_review:\s*\n\s+mode:\s*off/);
+  });
+
+  it('round-27 F6: re-running rea init preserves review.local_review.refuse_at = both', async () => {
+    const dir = await makeScratch();
+    cleanup.push(dir);
+    process.chdir(dir);
+
+    await runInit({ yes: true, profile: 'minimal', codex: false });
+    let raw = await fs.readFile(path.join(dir, '.rea', 'policy.yaml'), 'utf8');
+    raw = raw.replace(
+      /^(review:\s*\n  codex_required:\s*(?:true|false)\s*\n)/m,
+      '$1  local_review:\n    refuse_at: both\n',
+    );
+    await fs.writeFile(path.join(dir, '.rea', 'policy.yaml'), raw, 'utf8');
+
+    await new Promise((r) => setTimeout(r, 20));
+    await runInit({ yes: true, profile: 'minimal', codex: false });
+    const second = await fs.readFile(path.join(dir, '.rea', 'policy.yaml'), 'utf8');
+    expect(second).toMatch(/refuse_at:\s*both/);
+  });
+
+  it('round-27 F6: re-running rea init preserves commit_hygiene thresholds', async () => {
+    const dir = await makeScratch();
+    cleanup.push(dir);
+    process.chdir(dir);
+
+    await runInit({ yes: true, profile: 'minimal', codex: false });
+    let raw = await fs.readFile(path.join(dir, '.rea', 'policy.yaml'), 'utf8');
+    // Append a commit_hygiene block at the bottom (top-level key).
+    if (!raw.endsWith('\n')) raw += '\n';
+    raw += 'commit_hygiene:\n  warn_at_commits: 3\n  refuse_at_commits: 10\n';
+    await fs.writeFile(path.join(dir, '.rea', 'policy.yaml'), raw, 'utf8');
+
+    await new Promise((r) => setTimeout(r, 20));
+    await runInit({ yes: true, profile: 'minimal', codex: false });
+    const second = await fs.readFile(path.join(dir, '.rea', 'policy.yaml'), 'utf8');
+    expect(second).toMatch(/commit_hygiene:/);
+    expect(second).toMatch(/warn_at_commits:\s*3/);
+    expect(second).toMatch(/refuse_at_commits:\s*10/);
+  });
+
+  // ── round-30 F3: inline-form preservation (structural fix) ───────────
+  //
+  // The round-28 F6 regex preservation only matched block-form scalars
+  // (`^\s+mode:`, `^\s+warn_at_commits:`). Inline form
+  // `local_review: { mode: off }` slipped through — values undefined →
+  // writer skipped emission → the inline block vanished on re-run.
+  // Round-trip lossy across the inline/block divergence.
+  //
+  // Round-30 F3 switches to YAML-parsed reads. Inline AND block forms
+  // fold to the same object at the parser layer, so both are preserved
+  // identically. The re-run may re-emit as block form (writer's choice)
+  // — what matters is the VALUES survive.
+  it('round-30 F3: re-running rea init preserves INLINE-form local_review block', async () => {
+    const dir = await makeScratch();
+    cleanup.push(dir);
+    process.chdir(dir);
+
+    await runInit({ yes: true, profile: 'minimal', codex: false });
+    let raw = await fs.readFile(path.join(dir, '.rea', 'policy.yaml'), 'utf8');
+    // Replace the auto-generated review: block with INLINE form. Before
+    // round-30 the regex preservation matched zero of these fields and
+    // the inline block was silently dropped on re-init.
+    raw = raw.replace(
+      /^review:\s*\n  codex_required:\s*(?:true|false)\s*\n/m,
+      'review:\n  codex_required: false\n  local_review: { mode: off, refuse_at: both }\n',
+    );
+    await fs.writeFile(path.join(dir, '.rea', 'policy.yaml'), raw, 'utf8');
+
+    await new Promise((r) => setTimeout(r, 20));
+    await runInit({ yes: true, profile: 'minimal', codex: false });
+    const second = await fs.readFile(path.join(dir, '.rea', 'policy.yaml'), 'utf8');
+    // Values must survive re-run. The writer re-emits as block form,
+    // which is fine — the contract is "values not lost", not "format
+    // round-trips".
+    expect(second).toMatch(/local_review:/);
+    expect(second).toMatch(/mode:\s*off/);
+    expect(second).toMatch(/refuse_at:\s*both/);
+  });
+
+  it('round-30 F3: re-running rea init preserves INLINE-form commit_hygiene block', async () => {
+    const dir = await makeScratch();
+    cleanup.push(dir);
+    process.chdir(dir);
+
+    await runInit({ yes: true, profile: 'minimal', codex: false });
+    let raw = await fs.readFile(path.join(dir, '.rea', 'policy.yaml'), 'utf8');
+    // Append top-level commit_hygiene as INLINE form.
+    if (!raw.endsWith('\n')) raw += '\n';
+    raw += 'commit_hygiene: { warn_at_commits: 7, refuse_at_commits: 21 }\n';
+    await fs.writeFile(path.join(dir, '.rea', 'policy.yaml'), raw, 'utf8');
+
+    await new Promise((r) => setTimeout(r, 20));
+    await runInit({ yes: true, profile: 'minimal', codex: false });
+    const second = await fs.readFile(path.join(dir, '.rea', 'policy.yaml'), 'utf8');
+    expect(second).toMatch(/commit_hygiene:/);
+    expect(second).toMatch(/warn_at_commits:\s*7/);
+    expect(second).toMatch(/refuse_at_commits:\s*21/);
+  });
+
+  it('round-30 F3: re-running rea init preserves MIXED inline review.local_review and block commit_hygiene', async () => {
+    // Real-world manual edits sometimes mix forms — operators copy
+    // examples from docs (block form) but write knobs by hand (inline
+    // form). Both must survive a re-run.
+    const dir = await makeScratch();
+    cleanup.push(dir);
+    process.chdir(dir);
+
+    await runInit({ yes: true, profile: 'minimal', codex: false });
+    let raw = await fs.readFile(path.join(dir, '.rea', 'policy.yaml'), 'utf8');
+    raw = raw.replace(
+      /^review:\s*\n  codex_required:\s*(?:true|false)\s*\n/m,
+      'review:\n  codex_required: false\n  local_review: { mode: off }\n',
+    );
+    if (!raw.endsWith('\n')) raw += '\n';
+    raw += 'commit_hygiene:\n  warn_at_commits: 2\n  refuse_at_commits: 8\n';
+    await fs.writeFile(path.join(dir, '.rea', 'policy.yaml'), raw, 'utf8');
+
+    await new Promise((r) => setTimeout(r, 20));
+    await runInit({ yes: true, profile: 'minimal', codex: false });
+    const second = await fs.readFile(path.join(dir, '.rea', 'policy.yaml'), 'utf8');
+    expect(second).toMatch(/mode:\s*off/);
+    expect(second).toMatch(/warn_at_commits:\s*2/);
+    expect(second).toMatch(/refuse_at_commits:\s*8/);
+  });
+
+  it('round-27 F6: re-running rea init does NOT add a local_review block when none was set', async () => {
+    // Defaults case: a fresh init (no operator edits) must NOT emit
+    // empty local_review / commit_hygiene blocks. The off-switch is
+    // opt-in by writing the block; absence means "use the documented
+    // 0.26.0 default (mode: enforced)".
+    const dir = await makeScratch();
+    cleanup.push(dir);
+    process.chdir(dir);
+
+    await runInit({ yes: true, profile: 'minimal', codex: false });
+    const first = await fs.readFile(path.join(dir, '.rea', 'policy.yaml'), 'utf8');
+    expect(first).not.toMatch(/local_review:/);
+    expect(first).not.toMatch(/commit_hygiene:/);
+
+    await new Promise((r) => setTimeout(r, 20));
+    await runInit({ yes: true, profile: 'minimal', codex: false });
+    const second = await fs.readFile(path.join(dir, '.rea', 'policy.yaml'), 'utf8');
+    expect(second).not.toMatch(/local_review:/);
+    expect(second).not.toMatch(/commit_hygiene:/);
+  });
+
   it('BUG-010: init preserves existing .gitignore content when adding managed block', async () => {
     const dir = await makeScratch();
     cleanup.push(dir);

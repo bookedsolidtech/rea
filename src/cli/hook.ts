@@ -32,6 +32,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import type { Command } from 'commander';
+import { parse as parseYaml } from 'yaml';
 import { parsePrePushStdin, runPushGate } from '../hooks/push-gate/index.js';
 import { runBlockedScan, runProtectedScan, type Verdict } from '../hooks/bash-scanner/index.js';
 import { loadPolicy } from '../policy/loader.js';
@@ -305,6 +306,116 @@ export async function runHookScanBash(options: HookScanBashOptions): Promise<voi
 }
 
 /**
+ * `rea hook policy-get <dot.path>` — single source of truth for
+ * policy-value reads from the bash-tier hooks. Round-30 F2 structural
+ * fix.
+ *
+ * Pre-fix: `hooks/_lib/policy-read.sh::policy_nested_scalar` used a
+ * regex/awk parser that ONLY handled block-form mappings. The TS loader
+ * (`src/policy/loader.ts`) accepted inline-form mappings — `local_review:
+ * { mode: off }` — but the bash reader missed them. Silent split-brain:
+ * TS preflight saw `mode=off` (no-op), bash gate saw the field as unset
+ * and fell through to the enforced default → refused the push.
+ *
+ * Fix: have the bash gate shell out HERE for nested reads. The TS
+ * `yaml.parse()` call accepts both forms identically — single source of
+ * truth, drift impossible by construction.
+ *
+ * Contract:
+ *   - `key` is dot-separated: `review.local_review.mode`. Only
+ *     scalar leaves are supported (objects/arrays print empty).
+ *   - Output is the raw scalar VALUE on stdout (no trailing newline,
+ *     no quoting). Booleans render as `true`/`false`. Numbers render
+ *     as their JS string form.
+ *   - Unknown / missing path → empty stdout, exit 0. The bash caller
+ *     treats empty as "default applies".
+ *   - Unparseable YAML → empty stdout, exit 1. Bash callers swallow
+ *     the exit and treat as default (matches pre-fix posture: any read
+ *     error returns empty rather than refusing the gate).
+ */
+export interface HookPolicyGetOptions {
+  /** Dotted path; e.g. `review.local_review.mode`. */
+  key: string;
+  /**
+   * When true, emit the resolved subtree as JSON instead of a scalar.
+   * Object/array leaves print as their JSON form; scalars print as
+   * JSON-encoded scalars (`"off"`, `42`, `true`, `null`). Missing
+   * paths print `null`. Used by the bash hooks to read an entire
+   * sub-object in one node-spawn (e.g. all `review.local_review.*`
+   * fields at once) and parse client-side via jq.
+   */
+  json?: boolean;
+  /** Override REA_ROOT. Production callers omit. */
+  reaRoot?: string;
+}
+
+export async function runHookPolicyGet(options: HookPolicyGetOptions): Promise<void> {
+  // 0.27.0+: validate the key shape so a malformed dot-path can't be
+  // exploited by a misbehaving caller. Allow only POSIX identifier
+  // segments separated by single dots; reject empty segments, slashes,
+  // shell metacharacters, etc.
+  if (!/^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$/.test(options.key)) {
+    process.stderr.write(`rea hook policy-get: invalid key ${JSON.stringify(options.key)}\n`);
+    process.exit(1);
+  }
+
+  const reaRoot = options.reaRoot ?? process.env['CLAUDE_PROJECT_DIR'] ?? process.cwd();
+  const policyPath = path.join(reaRoot, '.rea', 'policy.yaml');
+  const finishMissing = (): void => {
+    if (options.json === true) process.stdout.write('null');
+    process.exit(0);
+  };
+  if (!fs.existsSync(policyPath)) {
+    finishMissing();
+  }
+  let parsed: unknown;
+  try {
+    const raw = fs.readFileSync(policyPath, 'utf8');
+    parsed = parseYaml(raw);
+  } catch {
+    // Unparseable YAML — emit empty / null and exit 1 so the bash caller
+    // can distinguish "no value" from "actual parse failure" if it
+    // wants to (the local-review-gate caller swallows exit codes).
+    if (options.json === true) process.stdout.write('null');
+    process.exit(1);
+  }
+  if (parsed === null || typeof parsed !== 'object') {
+    finishMissing();
+  }
+  // Walk the dotted path. Bail (empty stdout / null) at any non-object
+  // intermediate.
+  const segments = options.key.split('.');
+  let cursor: unknown = parsed;
+  for (const seg of segments) {
+    if (cursor === null || typeof cursor !== 'object' || Array.isArray(cursor)) {
+      finishMissing();
+    }
+    cursor = (cursor as Record<string, unknown>)[seg];
+    if (cursor === undefined) {
+      finishMissing();
+    }
+  }
+  if (options.json === true) {
+    // Emit JSON for scalar/object/array/null. Objects + arrays serialize
+    // recursively. Bash callers parse via jq.
+    process.stdout.write(JSON.stringify(cursor ?? null));
+    process.exit(0);
+  }
+  // Scalar mode: only print scalar leaves. Objects/arrays print empty
+  // (legacy behavior from initial F2 implementation).
+  if (cursor === null) {
+    process.exit(0);
+  }
+  if (typeof cursor === 'string') {
+    process.stdout.write(cursor);
+  } else if (typeof cursor === 'number' || typeof cursor === 'boolean') {
+    process.stdout.write(String(cursor));
+  }
+  // Object/Array → no output (caller treats as unset).
+  process.exit(0);
+}
+
+/**
  * Attach the `rea hook` subcommand tree to a commander Program. Two
  * subcommands today: `push-gate` and `scan-bash`. New hooks should land
  * here rather than as top-level commands so the CLI surface stays
@@ -372,5 +483,22 @@ export function registerHookCommand(program: Command): void {
         ...(opts.base !== undefined ? { base: opts.base } : {}),
         ...(opts.lastNCommits !== undefined ? { lastNCommits: opts.lastNCommits } : {}),
       });
+    });
+
+  hook
+    .command('policy-get')
+    .description(
+      'Read a value from `.rea/policy.yaml` via the canonical YAML parser. Used by bash-tier hooks (`hooks/_lib/policy-read.sh::policy_nested_scalar`) so inline AND block YAML forms agree at a single source of truth. Default scalar mode: prints raw value or empty. With `--json`: emits JSON (scalar or object/array; missing path → `null`). Unparseable YAML → empty / null, exit 1.',
+    )
+    .argument(
+      '<key>',
+      'dotted path, e.g. `review.local_review.mode`. POSIX-identifier segments only.',
+    )
+    .option(
+      '--json',
+      'emit JSON instead of a scalar — supports object/array leaves. Bash callers can then parse with jq.',
+    )
+    .action(async (key: string, opts: { json?: boolean }) => {
+      await runHookPolicyGet({ key, ...(opts.json === true ? { json: true } : {}) });
     });
 }

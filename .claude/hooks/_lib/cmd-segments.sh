@@ -493,8 +493,21 @@ _rea_strip_prefix() {
       *)
         # Env-var assignment prefix (`KEY=value `) — only strip if the
         # token before the first space looks like NAME=value.
-        if [[ "$seg" =~ ^[A-Za-z_][A-Za-z0-9_]*=[^[:space:]]+[[:space:]]+ ]]; then
-          seg="${seg#* }"
+        #
+        # 0.26.0 round-25 P2-A fix: ANSI-C quoting `$'...'` was previously
+        # uncovered. `FOO=$'a b' git push` evaded the env-prefix stripper
+        # (whose value pattern `[^[:space:]]+` bailed at the space inside
+        # the ANSI-C body) AND the local-review-gate's raw-fallback regex.
+        # Add an explicit ANSI-C alternative here so the prefix is stripped
+        # cleanly even when the value carries embedded whitespace inside
+        # `$'...'`. Bash 3.2+ regex doesn't support non-capturing groups,
+        # so we keep the alternation flat.
+        if [[ "$seg" =~ ^[A-Za-z_][A-Za-z0-9_]*=([^[:space:]\"\'$]+|\"[^\"]*\"|\'[^\']*\'|\$\'[^\']*\')[[:space:]]+ ]]; then
+          # Compute prefix length and slice — `seg=${seg#* }` would split
+          # on the first space, which is INSIDE the value for ANSI-C and
+          # quoted forms. Slice by the matched length instead.
+          local _prefix_len=${#BASH_REMATCH[0]}
+          seg="${seg:_prefix_len}"
           seg="${seg#"${seg%%[![:space:]]*}"}"
         else
           break
@@ -620,4 +633,129 @@ any_segment_starts_with() {
     fi
   done < <(_rea_split_segments "$cmd")
   return 1
+}
+
+# Return on stdout the FIRST segment of $1 (RAW form, env-var prefixes
+# preserved) whose prefix-stripped form starts with the extended regex
+# $2. Returns empty stdout and exit 1 if no segment matches.
+#
+# Use this when a downstream check needs to scope further parsing to the
+# specific segment that triggered detection — e.g. local-review-gate's
+# inline-bypass regex must only match `VAR=val git push` shapes inside
+# the SAME segment that contained the `git push`, not anywhere in $CMD.
+# Segment-scoped capture closes the round-24 P1 bypass class where
+# `true VAR=fake git status; git push origin main` had the bypass shape
+# in segment 1 and the real push in segment 2 — the un-scoped regex
+# previously honored the bypass for the unrelated push.
+#
+# 0.26.0 helix-024 round-24 fix.
+find_first_segment_starting_with() {
+  local cmd="$1"
+  local pattern="$2"
+  local segment stripped
+  while IFS= read -r segment; do
+    stripped=$(_rea_strip_prefix "$segment")
+    if printf '%s' "$stripped" | grep -qiE "^${pattern}"; then
+      printf '%s' "$segment"
+      return 0
+    fi
+  done < <(_rea_split_segments "$cmd")
+  return 1
+}
+
+# Return on stdout the FIRST segment of $1 (RAW — no prefix-stripping,
+# but with leading whitespace trimmed for clean anchor matching) that
+# matches the extended regex $2. Returns empty stdout and exit 1 if no
+# segment matches.
+#
+# Companion to `any_segment_raw_matches`. Used by local-review-gate to
+# capture the segment whose RAW shape (env-var prefixes intact) triggered
+# the fallback `^([NAME=...])+git push` detector. The prefix-stripper's
+# regex `NAME=[^[:space:]]+[[:space:]]+` bails on quoted-value-with-spaces,
+# so `any_segment_starts_with` misses `REA_SKIP="urgent fix" git push`;
+# the raw-anchor fallback catches it. Round-24's segment-scoped bypass
+# regex must run against the SAME segment (raw form) that the fallback
+# matched, not against the whole $CMD.
+#
+# 0.26.0 helix-024 round-24 fix.
+find_first_segment_raw_matches() {
+  local cmd="$1"
+  local pattern="$2"
+  local segment
+  while IFS= read -r segment; do
+    segment="${segment#"${segment%%[![:space:]]*}"}"
+    if printf '%s' "$segment" | grep -qiE "$pattern"; then
+      printf '%s' "$segment"
+      return 0
+    fi
+  done < <(_rea_split_segments "$cmd")
+  return 1
+}
+
+# Return on stdout EVERY segment of $1 (RAW form) whose prefix-stripped
+# form starts with the extended regex $2. Each match is a separate line.
+# Returns empty stdout and exit 1 if no segments match.
+#
+# Use this when a downstream check needs to validate EVERY trigger segment
+# — e.g. local-review-gate's per-segment bypass requirement. Pre-round-25
+# fix the gate captured only the FIRST trigger segment via
+# `find_first_segment_starting_with` and scoped the inline-bypass regex
+# there. Multi-push laundering PoCs:
+#
+#   REA_SKIP="x" git push fake --dry-run; git push origin main
+#     → first push has bypass, second does not. Pre-fix: bypass honored
+#       for FIRST segment only, but the gate exited 0 globally; second
+#       (real) push went through ungated.
+#
+# Round-25 P1-B closes that class by sweeping ALL trigger segments and
+# requiring that EVERY one carries its own bypass. Any trigger segment
+# without a bypass forces preflight invocation.
+#
+# 0.26.0 helix-026 round-25 P1-B fix.
+find_all_segments_starting_with() {
+  local cmd="$1"
+  local pattern="$2"
+  local segment stripped
+  local _matched=0
+  while IFS= read -r segment; do
+    stripped=$(_rea_strip_prefix "$segment")
+    if printf '%s' "$stripped" | grep -qiE "^${pattern}"; then
+      printf '%s\n' "$segment"
+      _matched=1
+    fi
+  done < <(_rea_split_segments "$cmd")
+  if [ "$_matched" -eq 0 ]; then
+    return 1
+  fi
+  return 0
+}
+
+# Return on stdout EVERY segment of $1 (RAW — no prefix-stripping, but
+# with leading whitespace trimmed for clean anchor matching) that matches
+# the extended regex $2. Each match is a separate line. Returns empty
+# stdout and exit 1 if no segments match.
+#
+# Companion to `find_all_segments_starting_with`. Used by
+# local-review-gate's round-25 P1-B fix to sweep every trigger segment
+# whose RAW shape (env-var prefixes intact) triggered the
+# `^([NAME=...])+git push` fallback detector — so each can be validated
+# for bypass independently.
+#
+# 0.26.0 helix-026 round-25 P1-B fix.
+find_all_segments_raw_matches() {
+  local cmd="$1"
+  local pattern="$2"
+  local segment
+  local _matched=0
+  while IFS= read -r segment; do
+    segment="${segment#"${segment%%[![:space:]]*}"}"
+    if printf '%s' "$segment" | grep -qiE "$pattern"; then
+      printf '%s\n' "$segment"
+      _matched=1
+    fi
+  done < <(_rea_split_segments "$cmd")
+  if [ "$_matched" -eq 0 ]; then
+    return 1
+  fi
+  return 0
 }

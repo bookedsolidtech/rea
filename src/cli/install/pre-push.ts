@@ -69,6 +69,12 @@ const execFileAsync = promisify(execFile);
  * classification. Bump the version suffix whenever the body semantics
  * change so upgrades can migrate old installs cleanly.
  *
+ * v5 — 0.26.0 local-first enforcement: body runs `rea preflight --strict`
+ *      BEFORE the push-gate dispatch. `rea preflight` refuses the push
+ *      when no recent `rea.local_review` audit entry covers HEAD; the
+ *      legacy push-gate then runs as the second layer (codex on push).
+ *      Honors `policy.review.local_review.mode: off` and
+ *      `REA_SKIP_LOCAL_REVIEW=<reason>` for opt-out / per-push override.
  * v4 — 0.13.0 extension-hook chaining: rea body sources `.husky/pre-push.d/*`
  *      fragments after its own work and before the final `exec`, in lex
  *      order. Non-zero fragment exit fails the hook.
@@ -78,10 +84,17 @@ const execFileAsync = promisify(execFile);
  * v2 — 0.11.0 stateless push-gate body (no bash core, no audit grep).
  * v1 — 0.10.x and prior, delegated to `.claude/hooks/push-review-gate.sh`.
  */
-export const FALLBACK_MARKER = '# rea:pre-push-fallback v4';
+export const FALLBACK_MARKER = '# rea:pre-push-fallback v5';
+
+/** Legacy v4 marker (0.13.x – 0.25.x bodies). Refresh-on-upgrade. */
+export const LEGACY_FALLBACK_MARKER_V4 = '# rea:pre-push-fallback v4';
 
 /** Legacy v3 marker (0.12.x bodies). Refresh-on-upgrade. */
 export const LEGACY_FALLBACK_MARKER_V3 = '# rea:pre-push-fallback v3';
+
+// Legacy v4 marker is declared above next to the v5 (current) marker so
+// the canonical/current pair sits together. Keep this comment as an
+// anchor — `LEGACY_FALLBACK_MARKER_V4` is exported above.
 
 /** Legacy v2 marker (0.11.x bodies). Refresh-on-upgrade. */
 export const LEGACY_FALLBACK_MARKER_V2 = '# rea:pre-push-fallback v2';
@@ -95,7 +108,10 @@ export const LEGACY_FALLBACK_MARKER_V1 = '# rea:pre-push-fallback v1';
  * detects it to refresh in-place. Bump the suffix whenever the body
  * changes; pre-0.13 markers live in `LEGACY_HUSKY_GATE_MARKER_V{1,2,3}`.
  */
-export const HUSKY_GATE_MARKER = '# rea:husky-pre-push-gate v4';
+export const HUSKY_GATE_MARKER = '# rea:husky-pre-push-gate v5';
+
+/** Legacy v4 husky marker (0.13.x – 0.25.x bodies). Refresh-on-upgrade. */
+export const LEGACY_HUSKY_GATE_MARKER_V4 = '# rea:husky-pre-push-gate v4';
 
 /** Legacy v3 husky marker (0.12.x bodies). Refresh-on-upgrade. */
 export const LEGACY_HUSKY_GATE_MARKER_V3 = '# rea:husky-pre-push-gate v3';
@@ -111,7 +127,10 @@ export const LEGACY_HUSKY_GATE_MARKER_V1 = '# rea:husky-pre-push-gate v1';
  * empty body (stubbed out by a consumer) is NOT classified as rea-managed.
  * A real rea hook always carries both markers.
  */
-export const HUSKY_GATE_BODY_MARKER = '# rea:gate-body-v4';
+export const HUSKY_GATE_BODY_MARKER = '# rea:gate-body-v5';
+
+/** Legacy v4 body marker (0.13.x – 0.25.x bodies). Refresh-on-upgrade. */
+export const LEGACY_HUSKY_GATE_BODY_MARKER_V4 = '# rea:gate-body-v4';
 
 /** Legacy v3 body marker (0.12.x bodies). Refresh-on-upgrade. */
 export const LEGACY_HUSKY_GATE_BODY_MARKER_V3 = '# rea:gate-body-v3';
@@ -177,6 +196,37 @@ fi
 # stdin unchanged. \$@ on entry carries git's <remote-name> <remote-url>;
 # the subshell sees those as its initial \$@, appends them inside each
 # \`set --\` arm, and the parent's \$@ is preserved.
+
+# 0.26.0 local-first enforcement (CTO directive 2026-05-05). Run
+# \`rea preflight --strict\` BEFORE the push-gate dispatch. Preflight
+# refuses (exit 2) when no recent \`rea.local_review\` audit entry
+# covers HEAD, when commit-hygiene thresholds are exceeded, or when
+# the kill-switch is active. The legacy push-gate then runs as the
+# SECOND layer (codex on the diff). Honors:
+#   - policy.review.local_review.mode: off  → preflight is no-op
+#   - REA_SKIP_LOCAL_REVIEW="<reason>"      → bypass + audit
+# We resolve the rea binary the same way the dispatch below does.
+if (
+  if [ -x "\${REA_ROOT}/node_modules/.bin/rea" ]; then
+    "\${REA_ROOT}/node_modules/.bin/rea" preflight --strict
+  elif [ -f "\${REA_ROOT}/dist/cli/index.js" ] && [ -f "\${REA_ROOT}/package.json" ] && grep -q '"name": *"@bookedsolid/rea"' "\${REA_ROOT}/package.json" 2>/dev/null; then
+    node "\${REA_ROOT}/dist/cli/index.js" preflight --strict
+  elif command -v rea >/dev/null 2>&1; then
+    rea preflight --strict
+  elif command -v npx >/dev/null 2>&1; then
+    npx --no-install @bookedsolid/rea preflight --strict
+  else
+    printf 'rea: cannot locate the rea CLI for preflight. Install locally (\`pnpm add -D @bookedsolid/rea\`) or set policy.review.local_review.mode=off.\\n' >&2
+    exit 2
+  fi
+); then
+  preflight_status=0
+else
+  preflight_status=\$?
+fi
+if [ "\$preflight_status" -ne 0 ]; then
+  exit "\$preflight_status"
+fi
 
 if (
   if [ -x "\${REA_ROOT}/node_modules/.bin/rea" ]; then
@@ -309,6 +359,7 @@ export function isLegacyReaManagedFallback(content: string): boolean {
   if (secondLineEnd < 0) return false;
   const secondLine = content.slice(10, secondLineEnd);
   return (
+    secondLine === LEGACY_FALLBACK_MARKER_V4 ||
     secondLine === LEGACY_FALLBACK_MARKER_V3 ||
     secondLine === LEGACY_FALLBACK_MARKER_V2 ||
     secondLine === LEGACY_FALLBACK_MARKER_V1
@@ -338,6 +389,7 @@ export function isReaManagedHuskyGate(content: string): boolean {
  */
 export function isLegacyReaManagedHuskyGate(content: string): boolean {
   return (
+    hasHeaderMarkers(content, LEGACY_HUSKY_GATE_MARKER_V4, LEGACY_HUSKY_GATE_BODY_MARKER_V4) ||
     hasHeaderMarkers(content, LEGACY_HUSKY_GATE_MARKER_V3, LEGACY_HUSKY_GATE_BODY_MARKER_V3) ||
     hasHeaderMarkers(content, LEGACY_HUSKY_GATE_MARKER_V2, LEGACY_HUSKY_GATE_BODY_MARKER_V2) ||
     hasHeaderMarkers(content, LEGACY_HUSKY_GATE_MARKER_V1, LEGACY_HUSKY_GATE_BODY_MARKER_V1)
@@ -766,6 +818,8 @@ async function cleanupStaleTempFiles(dst: string): Promise<void> {
       if (
         !body.includes(FALLBACK_MARKER) &&
         !body.includes(HUSKY_GATE_MARKER) &&
+        !body.includes(LEGACY_FALLBACK_MARKER_V4) &&
+        !body.includes(LEGACY_HUSKY_GATE_MARKER_V4) &&
         !body.includes(LEGACY_FALLBACK_MARKER_V3) &&
         !body.includes(LEGACY_HUSKY_GATE_MARKER_V3) &&
         !body.includes(LEGACY_FALLBACK_MARKER_V2) &&
