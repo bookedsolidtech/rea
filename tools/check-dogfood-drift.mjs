@@ -106,6 +106,8 @@ function checkSettingsRegistration() {
         'security-disclosure-gate.sh',
         'pr-issue-link-gate.sh',
         'attribution-advisory.sh',
+        // 0.26.0 local-first enforcement (CTO directive 2026-05-05).
+        'local-review-gate.sh',
       ],
       'Write|Edit|MultiEdit|NotebookEdit': [
         'secret-scanner.sh',

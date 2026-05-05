@@ -358,6 +358,19 @@ export function defaultDesiredHooks(): DesiredHookGroup[] {
           timeout: 5000,
           statusMessage: 'Checking for AI attribution...',
         },
+        // 0.26.0 local-first enforcement (CTO directive 2026-05-05). The
+        // Bash-tier gate refuses `git push` (and optionally `git commit`)
+        // when no recent `rea.local_review` audit entry covers HEAD. Honors
+        // `policy.review.local_review.mode: off` for teams without
+        // codex/claude installed and `REA_SKIP_LOCAL_REVIEW=<reason>` for
+        // per-invocation overrides. 60s timeout because the gate may
+        // shell out to `rea preflight` which itself loads policy.
+        {
+          type: 'command',
+          command: `${base}/local-review-gate.sh`,
+          timeout: 60000,
+          statusMessage: 'Checking local-first review status...',
+        },
       ],
     },
     {

@@ -173,6 +173,86 @@ export interface ReviewPolicy {
    * a `rea.push_gate.verdict_flip` audit event and overwrite the cache.
    */
   cache_ttl_ms?: number;
+  /**
+   * Local-first review enforcement (0.26.0+ — CTO directive 2026-05-05).
+   *
+   * The push-gate is the BACKUP layer. The primary review surface is the
+   * working tree BEFORE commit, run via `rea review`, recorded as a
+   * `rea.local_review` audit entry. The Bash-tier `local-review-gate.sh`
+   * hook + husky `rea preflight --strict` refuse `git push` (and optionally
+   * `git commit`) when no recent matching audit entry exists for HEAD.
+   *
+   * The off-switch is the FIRST-class concern. Teams without codex/claude
+   * installed set `mode: off` to disable the new enforcement layers
+   * cleanly — no env-var hacks, no policy strip, no special init flag.
+   *
+   * The provider seam is the audit-record `provider` field, NOT this
+   * policy block. Future providers (Claude-subagent, Pi, Gemma) write
+   * `rea.local_review` records with their own `provider:` value; this
+   * block governs WHETHER the gate fires, not WHO runs the review.
+   */
+  local_review?: LocalReviewPolicy;
+}
+
+/**
+ * Local-first review enforcement (0.26.0+).
+ *
+ * `mode: 'enforced'` — the new Bash-tier gate, husky preflight, and
+ * `rea review` requirement all fire. Pushes are refused unless a
+ * recent matching `rea.local_review` audit entry exists OR
+ * `bypass_env_var` is set with a non-empty reason.
+ *
+ * `mode: 'off'` — every new enforcement layer becomes a silent no-op.
+ * Teams without codex/claude opt out cleanly. The push-gate (which is
+ * a separate layer governed by `codex_required`) is unaffected by this
+ * setting.
+ *
+ * Default when unset: `enforced`. The CTO directive 2026-05-05 applies
+ * to ALL rea work, OSS + enterprise — the off-switch is opt-out, never
+ * opt-in.
+ */
+export interface LocalReviewPolicy {
+  mode?: 'enforced' | 'off';
+  /**
+   * Maximum age (seconds) of a `rea.local_review` audit entry that
+   * `rea preflight` will accept as covering the current HEAD. A review
+   * older than this is treated as missing and the gate refuses.
+   * Default 86400 (24 hours).
+   */
+  max_age_seconds?: number;
+  /**
+   * Which git operations the Bash-tier gate refuses when no recent
+   * review covers HEAD.
+   *   - `'push'`   — refuse `git push` only (default)
+   *   - `'commit'` — refuse `git commit` only
+   *   - `'both'`   — refuse both
+   *
+   * The husky pre-push hook honors `'push' | 'both'`. The Bash-tier
+   * hook honors all three.
+   */
+  refuse_at?: 'push' | 'commit' | 'both';
+  /**
+   * Env-var name that, when set with a non-empty value, causes
+   * `rea preflight` to short-circuit (exit 0) AFTER writing a
+   * `rea.local_review.skipped_override` audit entry that records
+   * the reason. Default `REA_SKIP_LOCAL_REVIEW`.
+   *
+   * The override is per-invocation, audited every time, and a
+   * release valve — not a sustained way to disable enforcement.
+   * Teams that need to DISABLE enforcement set `mode: off`.
+   */
+  bypass_env_var?: string;
+}
+
+/**
+ * Commit-hygiene refusal thresholds (0.26.0+). `rea preflight` runs
+ * `git rev-list --count <base>..HEAD` and compares against these
+ * thresholds. Set to a sentinel value (e.g. very large integer) to
+ * effectively disable.
+ */
+export interface CommitHygienePolicy {
+  warn_at_commits?: number;
+  refuse_at_commits?: number;
 }
 
 /**
@@ -313,4 +393,15 @@ export interface Policy {
   architecture_review?: {
     patterns?: string[];
   };
+  /**
+   * Commit-hygiene refusal thresholds (0.26.0+). `rea preflight` checks
+   * `git rev-list --count <base>..HEAD`; `> warn_at_commits` warns
+   * (exit 1), `> refuse_at_commits` refuses (exit 2). The CTO directive
+   * 2026-05-05 sets the new BST default at warn_at=1 / refuse_at=5 to
+   * push every change toward squash-on-commit hygiene.
+   *
+   * Top-level (not under `review`) because it's a process-discipline
+   * knob, not a review knob. The push-gate doesn't consume it.
+   */
+  commit_hygiene?: CommitHygienePolicy;
 }

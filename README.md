@@ -748,8 +748,8 @@ install so teams without a Codex bench get a first-class opt-out. Flip
 
 ## Hooks shipped
 
-Eleven hooks ship in `hooks/` and are copied into `.claude/hooks/` by
-`rea init`. All eleven are wired by default in the shipped
+Fourteen hooks ship in `hooks/` and are copied into `.claude/hooks/` by
+`rea init`. All fourteen are wired by default in the shipped
 `.claude/settings.json`.
 
 | Hook | Event | Purpose | Default |
@@ -760,11 +760,14 @@ Eleven hooks ship in `hooks/` and are copied into `.claude/hooks/` by
 | `security-disclosure-gate.sh` | `PreToolUse: Bash` | Route security-keyword `gh issue create` to private disclosure | Registered |
 | `pr-issue-link-gate.sh` | `PreToolUse: Bash` | Advisory warn when `gh pr create` has no linked issue | Registered |
 | `attribution-advisory.sh` | `PreToolUse: Bash` | Block commits/PRs containing AI attribution markers | Registered |
-| `secret-scanner.sh` | `PreToolUse: Write\|Edit` | Scan file writes for credential patterns | Registered |
-| `settings-protection.sh` | `PreToolUse: Write\|Edit` | Block agent writes to `.claude/settings.json`, hook dirs, policy | Registered |
-| `blocked-paths-enforcer.sh` | `PreToolUse: Write\|Edit` | Enforce `blocked_paths` from policy | Registered |
-| `changeset-security-gate.sh` | `PreToolUse: Write\|Edit` | Guard changesets against GHSA leaks and malformed frontmatter | Registered |
-| `architecture-review-gate.sh` | `PostToolUse: Write\|Edit` | Flag edits crossing architectural boundaries (advisory) | Registered |
+| `protected-paths-bash-gate.sh` | `PreToolUse: Bash` | Bash-tier parity with `settings-protection.sh` — refuses shell writes to `.claude/`/`.husky/`/policy paths (0.21.0+) | Registered |
+| `blocked-paths-bash-gate.sh` | `PreToolUse: Bash` | Bash-tier parity with `blocked-paths-enforcer.sh` — refuses shell writes to `blocked_paths` policy entries (0.22.0+) | Registered |
+| `local-review-gate.sh` | `PreToolUse: Bash` | Refuse `git push` (and optionally `git commit`) until a recent `rea.local_review` audit entry covers HEAD (0.26.0+) | Registered |
+| `secret-scanner.sh` | `PreToolUse: Write\|Edit\|MultiEdit\|NotebookEdit` | Scan file writes for credential patterns | Registered |
+| `settings-protection.sh` | `PreToolUse: Write\|Edit\|MultiEdit\|NotebookEdit` | Block agent writes to `.claude/settings.json`, hook dirs, policy | Registered |
+| `blocked-paths-enforcer.sh` | `PreToolUse: Write\|Edit\|MultiEdit\|NotebookEdit` | Enforce `blocked_paths` from policy | Registered |
+| `changeset-security-gate.sh` | `PreToolUse: Write\|Edit\|MultiEdit\|NotebookEdit` | Guard changesets against GHSA leaks and malformed frontmatter | Registered |
+| `architecture-review-gate.sh` | `PostToolUse: Write\|Edit\|MultiEdit\|NotebookEdit` | Flag edits crossing architectural boundaries (advisory) | Registered |
 
 The 0.10.x review-gate scripts (`push-review-gate.sh`,
 `push-review-gate-git.sh`, `commit-review-gate.sh`) and the 1,250-line

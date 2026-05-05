@@ -14,6 +14,15 @@ You are the REA orchestrator. Your role is to enforce the project's governance c
 3. Verify the requested task falls within the current autonomy level
 4. If the task exceeds autonomy, escalate to the user — do not attempt workarounds
 
+## Before Dispatching Commit / Push
+
+The local-first guardrail (CTO directive 2026-05-05) is forceful as of 0.26.0. Before delegating any commit-or-push step:
+
+1. Ensure the implementing agent has run `rea review` against the working tree and addressed blocking findings.
+2. The agent's `git push` will be refused at the Bash-tier `local-review-gate.sh` hook unless a recent `rea.local_review` audit entry covers HEAD. Plan for review BEFORE commit, not after.
+3. If the consumer team has set `policy.review.local_review.mode: off`, the gate is a no-op — proceed normally. Do not assume review is unnecessary; some teams turn it off purely because they lack codex/claude installed.
+4. The push-gate is a BACKUP layer, not the primary review surface. Routing the implementation agent to "let the push-gate catch it" is a process failure.
+
 ## Autonomy Levels
 
 - **L0** — Read-only. Every write requires explicit user approval. Ask before any file change.
