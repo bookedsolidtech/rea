@@ -160,3 +160,109 @@ export function summarizeReview(reviewText: string): ReviewSummary {
     reviewText,
   };
 }
+
+/**
+ * 0.28.0 helix-029 — partition findings against a list of gitignore-style
+ * globs. Findings whose `file` path matches any glob land in
+ * `excluded`; everything else (including findings without a `file`
+ * field — codex prose without a path can't be path-filtered) lands in
+ * `kept`. The verdict is recomputed from `kept` only.
+ *
+ * Glob semantics (intentionally minimal — full gitignore parity is out
+ * of scope for the gate):
+ *
+ *   - `**` matches any number of path segments (including zero)
+ *   - `*` matches any chars within a single path segment
+ *   - `?` matches a single character within a segment
+ *   - leading `/` anchors the glob at the root (the default — paths are
+ *     repo-relative anyway)
+ *   - trailing `/` is treated as `/**` (directory match)
+ *
+ * Path normalization: backslashes → slashes (Windows checkout
+ * tolerance), leading `./` stripped. Globs are case-sensitive on every
+ * platform so a Windows checkout doesn't silently widen the filter.
+ */
+export interface FilterResult {
+  kept: Finding[];
+  excluded: Finding[];
+  verdict: Verdict;
+}
+
+export function filterFindingsByPath(findings: Finding[], globs: readonly string[]): FilterResult {
+  if (globs.length === 0) {
+    return { kept: findings, excluded: [], verdict: inferVerdict(findings) };
+  }
+  // Compile once. Anchored at start, end, slash-tolerant.
+  const compiled = globs.map(compileGlob);
+  const kept: Finding[] = [];
+  const excluded: Finding[] = [];
+  for (const f of findings) {
+    if (f.file === undefined) {
+      kept.push(f);
+      continue;
+    }
+    const norm = normalizePath(f.file);
+    let matched = false;
+    for (const re of compiled) {
+      if (re.test(norm)) {
+        matched = true;
+        break;
+      }
+    }
+    if (matched) excluded.push(f);
+    else kept.push(f);
+  }
+  return { kept, excluded, verdict: inferVerdict(kept) };
+}
+
+function normalizePath(p: string): string {
+  let out = p.replace(/\\/g, '/');
+  if (out.startsWith('./')) out = out.slice(2);
+  if (out.startsWith('/')) out = out.slice(1);
+  return out;
+}
+
+/**
+ * Compile a gitignore-style glob into a RegExp. Conservative — handles
+ * the four wildcard forms documented above and treats every other
+ * character as a literal. The cost of a too-narrow compiler is a
+ * miss-and-no-filter (the finding stays in `kept` and blocks the push,
+ * which is the safer failure mode). The cost of a too-wide compiler is
+ * a false suppression — strictly worse, since findings disappear
+ * silently. We err narrow.
+ */
+function compileGlob(rawGlob: string): RegExp {
+  let glob = rawGlob;
+  if (glob.startsWith('/')) glob = glob.slice(1);
+  // Trailing `/` → `/**` (directory match).
+  if (glob.endsWith('/')) glob = `${glob}**`;
+  let re = '';
+  for (let i = 0; i < glob.length; i += 1) {
+    const c = glob[i];
+    if (c === '*') {
+      // `**` matches any number of path segments (including zero); a
+      // single `*` matches any chars within a segment.
+      if (i + 1 < glob.length && glob[i + 1] === '*') {
+        // Consume the second `*`. If followed by `/`, also consume it
+        // so `a/**/b` matches both `a/b` (zero segments) and `a/x/b`.
+        i += 1;
+        if (i + 1 < glob.length && glob[i + 1] === '/') {
+          i += 1;
+          re += '(?:.*/)?';
+        } else {
+          re += '.*';
+        }
+      } else {
+        re += '[^/]*';
+      }
+    } else if (c === '?') {
+      re += '[^/]';
+    } else if (c !== undefined && /[.+^$|(){}[\]\\]/.test(c)) {
+      // Escape regex meta-characters.
+      re += `\\${c}`;
+    } else if (c !== undefined) {
+      re += c;
+    }
+  }
+  return new RegExp(`^${re}$`);
+}

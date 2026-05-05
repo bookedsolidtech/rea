@@ -68,6 +68,21 @@ export interface ResolvedReviewPolicy {
    * (24 hours) when policy.review.cache_ttl_ms is unset.
    */
   cache_ttl_ms: number;
+  /**
+   * 0.28.0 helix-029 — path-scoped finding filter. Gitignore-style
+   * globs (anchored to repo root). Empty when no filter is active.
+   * Includes both `policy.review.exclude_paths` AND, when
+   * `auto_exclude_managed` is on, paths from `.rea/install-manifest.json`.
+   * Resolved BEFORE the gate runs so the gate has a single list to
+   * filter against.
+   */
+  exclude_paths: string[];
+  /**
+   * 0.28.0 helix-029 — true when the resolver pulled paths from
+   * `.rea/install-manifest.json` into `exclude_paths`. Surfaced for
+   * audit shape only; the gate filter consumes `exclude_paths`.
+   */
+  auto_exclude_managed: boolean;
   /** `true` when `.rea/policy.yaml` was absent; defaults apply. */
   policyMissing: boolean;
 }
@@ -144,11 +159,34 @@ export async function resolvePushGatePolicy(baseDir: string): Promise<ResolvedRe
       codex_model: PUSH_GATE_DEFAULT_CODEX_MODEL,
       codex_reasoning_effort: PUSH_GATE_DEFAULT_CODEX_REASONING_EFFORT,
       cache_ttl_ms: PUSH_GATE_DEFAULT_CACHE_TTL_MS,
+      exclude_paths: [],
+      auto_exclude_managed: false,
       policyMissing: true,
     };
   }
   const policy: Policy = await loadPolicyAsync(baseDir);
   const review: ReviewPolicy = policy.review ?? {};
+  // 0.28.0 helix-029 — derived default for auto_exclude_managed:
+  // - true when `exclude_paths` is set AND the operator did not
+  //   explicitly disable it
+  // - false when `exclude_paths` is unset (no filter to compose)
+  // - false when explicitly set to `false`
+  const explicitGlobs = review.exclude_paths ?? [];
+  const hasExplicitGlobs = explicitGlobs.length > 0;
+  // Principal-engineer redesign: auto_exclude_managed is meaningful
+  // only when the operator signaled intent via exclude_paths. A bare
+  // `auto_exclude_managed: true` without globs is a no-op — the
+  // operator is otherwise opting OUT of any filter. Default true when
+  // exclude_paths is set; false when unset; explicit false always wins.
+  const autoExcludeDefault = hasExplicitGlobs;
+  const autoExcludeFlag = review.auto_exclude_managed ?? autoExcludeDefault;
+  const autoExcludeActive = autoExcludeFlag && hasExplicitGlobs;
+  let mergedExcludes: string[] = [...explicitGlobs];
+  if (autoExcludeActive) {
+    mergedExcludes = mergedExcludes.concat(readManifestPaths(baseDir));
+  }
+  // De-dupe — globs and manifest entries can overlap.
+  mergedExcludes = Array.from(new Set(mergedExcludes));
   return {
     codex_required: review.codex_required ?? PUSH_GATE_DEFAULT_CODEX_REQUIRED,
     concerns_blocks: review.concerns_blocks ?? PUSH_GATE_DEFAULT_CONCERNS_BLOCKS,
@@ -159,6 +197,59 @@ export async function resolvePushGatePolicy(baseDir: string): Promise<ResolvedRe
     codex_reasoning_effort:
       review.codex_reasoning_effort ?? PUSH_GATE_DEFAULT_CODEX_REASONING_EFFORT,
     cache_ttl_ms: review.cache_ttl_ms ?? PUSH_GATE_DEFAULT_CACHE_TTL_MS,
+    exclude_paths: mergedExcludes,
+    auto_exclude_managed: autoExcludeActive,
     policyMissing: false,
   };
+}
+
+/**
+ * 0.28.0 helix-029 — read repo-relative paths from
+ * `.rea/install-manifest.json` for the auto-exclude path. The manifest
+ * shape is `{ files: { "<rel-path>": { sha256: ..., source: ... } } }`
+ * (or similar). We pull only the keys (relative paths) and degrade to
+ * an empty array on parse / shape errors — auto-exclude is best-effort,
+ * never the gate's failure mode.
+ */
+function readManifestPaths(baseDir: string): string[] {
+  const manifestPath = path.join(baseDir, '.rea', 'install-manifest.json');
+  if (!fs.existsSync(manifestPath)) return [];
+  try {
+    const raw = fs.readFileSync(manifestPath, 'utf8');
+    const parsed = JSON.parse(raw) as unknown;
+    if (parsed === null || typeof parsed !== 'object') return [];
+    const obj = parsed as Record<string, unknown>;
+    const candidates: unknown[] = [];
+    // Common shapes: `{ files: {...} }` (object keyed by path), or
+    // `{ files: [...] }` (array of strings or `{path: ...}`). Be
+    // tolerant — the manifest format has shifted across rea minors.
+    if (obj.files !== undefined) {
+      if (Array.isArray(obj.files)) candidates.push(...obj.files);
+      else if (typeof obj.files === 'object' && obj.files !== null) {
+        candidates.push(...Object.keys(obj.files as Record<string, unknown>));
+      }
+    } else if (Array.isArray(obj)) {
+      candidates.push(...obj);
+    }
+    const out: string[] = [];
+    for (const c of candidates) {
+      const candidate = typeof c === 'string'
+        ? c
+        : typeof c === 'object' && c !== null && typeof (c as Record<string, unknown>).path === 'string'
+          ? ((c as Record<string, unknown>).path as string)
+          : '';
+      if (candidate.length === 0) continue;
+      // 0.28.0 codex round-1 P1: manifest entries are LITERAL paths to
+      // managed files written by `rea init`. They are NEVER glob
+      // patterns. Reject any entry containing glob metachars to prevent
+      // a manifest like `{"files":["**"]}` from suppressing every
+      // finding via the auto_exclude_managed code path. Fail closed —
+      // a tampered manifest entry is dropped, never trusted as a glob.
+      if (/[*?\[\]!]/.test(candidate)) continue;
+      out.push(candidate);
+    }
+    return out;
+  } catch {
+    return [];
+  }
 }

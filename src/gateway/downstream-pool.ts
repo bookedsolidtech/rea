@@ -37,6 +37,23 @@ export interface DownstreamHealth {
   /** Last error observed, or null if the connection is clean or never errored. */
   last_error: string | null;
   /**
+   * 0.28.0 helix-025 F1 — explicit tri-state for the connection lifecycle.
+   *
+   *   - `'never'` — the downstream has not yet been attempted (gateway
+   *     boot before the first `connectAll` lands, or connection refused
+   *     so early no error message reached the supervisor)
+   *   - `'ok'`    — most recent connect / call succeeded
+   *   - `'errored'` — currently in an error state; `last_error` is set
+   *
+   * Pre-fix the helix consumer saw `connected: false, healthy: false,
+   * last_error: null` after a downstream's child failed to spawn — the
+   * agent had no way to tell whether the connection had been attempted
+   * at all. The tri-state distinguishes "never tried" from "tried and
+   * failed" even when the underlying error never produced a renderable
+   * string (e.g. ECONNREFUSED before the supervisor wired its hooks).
+   */
+  connection_state: 'never' | 'ok' | 'errored';
+  /**
    * Number of tools advertised by the downstream on the most recent
    * successful `tools/list`, or null when never listed / listing failed.
    */
@@ -161,6 +178,7 @@ export class DownstreamPool {
         connected,
         healthy,
         last_error: conn.lastError,
+        connection_state: conn.connectionState,
         tools_count,
       });
     }

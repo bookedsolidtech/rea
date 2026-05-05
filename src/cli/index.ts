@@ -13,6 +13,7 @@ import { runServe } from './serve.js';
 import { runStatus } from './status.js';
 import { runTofuAccept, runTofuList } from './tofu.js';
 import { runUpgrade } from './upgrade.js';
+import { registerVerifyClaimCommand } from './verify-claim.js';
 import { err, getPkgVersion } from './utils.js';
 
 async function main(): Promise<void> {
@@ -156,6 +157,12 @@ async function main(): Promise<void> {
   // `local-review-gate.sh` hook both delegate to `rea preflight --strict`.
   registerReviewCommand(program);
   registerPreflightCommand(program);
+
+  // 0.28.0 — `rea verify-claim <claim-id>` replays recorded
+  // security-claim PoC batteries against the CLI under test. The
+  // centerpiece of 0.28.0 (4th structural pivot — claims as
+  // machine-verifiable artifacts).
+  registerVerifyClaimCommand(program);
 
   const tofu = program
     .command('tofu')

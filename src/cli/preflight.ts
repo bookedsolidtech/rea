@@ -181,10 +181,21 @@ export async function computePreflight(
   if (!reviewCheckSkipped) {
     const lookup = findRecentLocalReview(baseDir, headSha, maxAgeSeconds, new Date(), contentToken);
     if (!lookup.found) {
+      // 0.28.0 round-29 P3: when the most recent path-matching audit
+      // entry was blocking/error, the operator HAS reviewed — they
+      // just need to address the findings. The original message ("no
+      // recent local-review audit entry covers HEAD") makes them
+      // think they forgot to review. Distinguish the two cases.
+      const reason =
+        lookup.last_blocking_verdict === 'blocking'
+          ? 'your last local review was blocking — address findings or override'
+          : lookup.last_blocking_verdict === 'error'
+            ? 'your last local review errored — re-run `rea review` and address findings'
+            : 'no recent local-review audit entry covers HEAD';
       return {
         outcome: {
           status: 'refuse',
-          reason: 'no recent local-review audit entry covers HEAD',
+          reason,
           exitCode: 2,
           details: {
             head_sha: headSha,
@@ -192,6 +203,12 @@ export async function computePreflight(
             max_age_seconds: maxAgeSeconds,
             bypass_env_var: bypassEnvVar,
             policy_off_switch: 'policy.review.local_review.mode: off',
+            ...(lookup.last_blocking_verdict !== undefined
+              ? {
+                  last_blocking_verdict: lookup.last_blocking_verdict,
+                  last_blocking_timestamp: lookup.last_blocking_timestamp,
+                }
+              : {}),
           },
         },
         policy,
@@ -352,6 +369,23 @@ function resolveCommitCountBase(baseDir: string): string | null {
   for (const ref of primary) {
     if (resolveRef(baseDir, ref).length > 0) return ref;
   }
+  // 0.28.0 round-29 P3: develop-branch repos sometimes omit
+  // `origin/HEAD` entirely (the symbolic ref is unset until a fresh
+  // `git remote set-head origin -a`), and `origin/main` /
+  // `origin/master` may not exist when the trunk is `origin/develop`.
+  // Pre-fix the resolver silently fell through to `null`, disabling
+  // the auto-narrow check without telling the operator. Emit a single
+  // advisory line on stderr so the failure mode is visible — but do
+  // not fail; this path is best-effort and a missing trunk is a
+  // recoverable misconfiguration.
+  if (resolveRef(baseDir, 'origin/develop').length > 0) {
+    process.stderr.write(
+      `rea: preflight commit-count base falling through to origin/develop ` +
+        `(origin/HEAD/main/master not resolvable). ` +
+        `Consider: \`git remote set-head origin -a\` to seed origin/HEAD.\n`,
+    );
+    return 'origin/develop';
+  }
 
   // `@{upstream}` LAST. We additionally probe what it resolves to —
   // if it's a remote feature-branch ref under `refs/remotes/origin/`
@@ -452,6 +486,18 @@ export interface LocalReviewLookupResult {
    * (back-compat / fallback).
    */
   match_kind?: 'content_token' | 'head_sha';
+  /**
+   * 0.28.0 round-29 P3 — set when the most recent path-matching audit
+   * entry for this HEAD had verdict `blocking` (or `error`) and was
+   * therefore skipped as "not coverage". Surfacing this lets the
+   * preflight caller render a clearer message than "no recent local-
+   * review audit entry covers HEAD" — the operator hasn't forgotten
+   * to review, they've already done one and it told them to fix
+   * findings.
+   */
+  last_blocking_verdict?: 'blocking' | 'error';
+  /** ISO timestamp of the last blocking entry, when present. */
+  last_blocking_timestamp?: string;
 }
 
 export function findRecentLocalReview(
@@ -475,6 +521,13 @@ export function findRecentLocalReview(
   }
   const lines = raw.split(/\r?\n/);
   const cutoffMs = now.getTime() - maxAgeSeconds * 1000;
+  // 0.28.0 round-29 P3: track the most recent blocking/error entry that
+  // path-matched HEAD even though it didn't qualify as coverage. The
+  // not-found return path consumes this so the operator-facing message
+  // distinguishes "you haven't reviewed" from "your review found
+  // problems".
+  let lastBlockingVerdict: 'blocking' | 'error' | undefined;
+  let lastBlockingTimestamp: string | undefined;
   // Walk in reverse — most recent first.
   for (let i = lines.length - 1; i >= 0; i--) {
     const line = lines[i];
@@ -528,7 +581,18 @@ export function findRecentLocalReview(
     if (matchKind === null) continue;
 
     const verdict = typeof metadata.verdict === 'string' ? metadata.verdict : '';
-    if (verdict === 'error' || verdict === 'blocking') continue;
+    if (verdict === 'error' || verdict === 'blocking') {
+      // 0.28.0 round-29 P3 — capture the FIRST (i.e., most-recent in
+      // reverse walk) blocking/error entry that path-matched HEAD so
+      // the not-found path can render a better message. Don't
+      // overwrite a later catch — we want the most-recent one.
+      if (lastBlockingVerdict === undefined) {
+        lastBlockingVerdict = verdict as 'blocking' | 'error';
+        const ts = typeof record.timestamp === 'string' ? record.timestamp : '';
+        if (ts.length > 0) lastBlockingTimestamp = ts;
+      }
+      continue;
+    }
     const timestamp = typeof record.timestamp === 'string' ? record.timestamp : '';
     if (timestamp.length > 0) {
       const ts = Date.parse(timestamp);
@@ -536,7 +600,13 @@ export function findRecentLocalReview(
         // Older than max_age_seconds — keep walking; a more recent valid
         // record may exist further back? No: we walk newest-to-oldest so
         // anything older from here on is also stale. Stop early.
-        return { found: false };
+        return {
+          found: false,
+          ...(lastBlockingVerdict !== undefined ? { last_blocking_verdict: lastBlockingVerdict } : {}),
+          ...(lastBlockingTimestamp !== undefined
+            ? { last_blocking_timestamp: lastBlockingTimestamp }
+            : {}),
+        };
       }
     }
     return {
@@ -547,7 +617,13 @@ export function findRecentLocalReview(
       match_kind: matchKind,
     };
   }
-  return { found: false };
+  return {
+    found: false,
+    ...(lastBlockingVerdict !== undefined ? { last_blocking_verdict: lastBlockingVerdict } : {}),
+    ...(lastBlockingTimestamp !== undefined
+      ? { last_blocking_timestamp: lastBlockingTimestamp }
+      : {}),
+  };
 }
 
 async function safeAudit(

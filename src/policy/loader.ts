@@ -94,6 +94,18 @@ const ReviewPolicySchema = z
      */
     cache_ttl_ms: z.number().int().nonnegative().optional(),
     /**
+     * 0.28.0 helix-029 — path-scoped finding filter. Gitignore-style
+     * globs; findings whose `file` matches any are filtered out before
+     * verdict computation. Enables `auto_exclude_managed: true` by
+     * default; pass `auto_exclude_managed: false` explicitly to opt out.
+     */
+    exclude_paths: z.array(z.string().min(1)).optional(),
+    /**
+     * 0.28.0 helix-029 — derived default. Defaults to true when
+     * `exclude_paths` is set, false when `exclude_paths` is unset.
+     */
+    auto_exclude_managed: z.boolean().optional(),
+    /**
      * 0.26.0 local-first enforcement. Strict so a typo in the off-switch
      * surface (`mode: of`, `refuse_at: pushh`) fails policy load instead
      * of silently disabling. `bypass_env_var` is constrained to the

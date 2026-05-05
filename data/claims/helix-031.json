@@ -1,0 +1,27 @@
+{
+  "id": "helix-031",
+  "title": "shellcheck SC1078 false positive on cmd-segments.sh closed by removing legacy bash module (0.27.0)",
+  "introduced_in": "0.26.1",
+  "closed_in": "0.27.0",
+  "summary": "0.26.1 added an ANSI-C handling path inside hooks/_lib/cmd-segments.sh that confused shellcheck SC1078 (mismatched single-quote in unclosed-string). 0.27.0 removed the legacy bash cmd-segments path entirely (the parser-backed Node scanner has owned the segmentation work since 0.23.0). This claim verifies that shellcheck runs clean on every shipped hook.",
+  "pocs": [
+    {
+      "id": "SC1078-clean-protected-paths-bash-gate",
+      "type": "shellcheck",
+      "target": "hooks/protected-paths-bash-gate.sh",
+      "expected_verdict": "clean"
+    },
+    {
+      "id": "SC1078-clean-blocked-paths-bash-gate",
+      "type": "shellcheck",
+      "target": "hooks/blocked-paths-bash-gate.sh",
+      "expected_verdict": "clean"
+    },
+    {
+      "id": "SC1078-clean-local-review-gate",
+      "type": "shellcheck",
+      "target": "hooks/local-review-gate.sh",
+      "expected_verdict": "clean"
+    }
+  ]
+}

@@ -46,6 +46,7 @@
     "profiles/",
     "templates/",
     "scripts/",
+    "data/",
     ".husky/",
     "LICENSE",
     "README.md",

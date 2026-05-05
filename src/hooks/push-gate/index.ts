@@ -23,6 +23,7 @@
  */
 
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { appendAuditRecord } from '../../audit/append.js';
 import { loadPolicyAsync } from '../../policy/loader.js';
 import { Tier, InvocationStatus, type Policy } from '../../policy/types.js';
@@ -45,7 +46,7 @@ import {
   type CodexRunError,
   type GitExecutor,
 } from './codex-runner.js';
-import { summarizeReview, type Verdict } from './findings.js';
+import { filterFindingsByPath, summarizeReview, type Verdict } from './findings.js';
 import { renderBanner, writeLastReview, type LastReviewPayload } from './report.js';
 import { isFlip, lookupVerdict, writeVerdict, type VerdictCacheEntry } from './verdict-cache.js';
 
@@ -471,8 +472,22 @@ export async function runPushGate(deps: PushGateDeps): Promise<GateResult> {
   // reuse the cached verdict — durable PASS. Cache is bypassed when
   // policy.review.cache_ttl_ms is 0. Cache miss / expired falls
   // through to the codex call below.
+  //
+  // 0.28.0 codex round-1 P2: include a stable digest of
+  // policy.exclude_paths in the cache key so updates to the path
+  // filter immediately invalidate prior cached verdicts. Without
+  // this, enabling exclude_paths after a cached blocking verdict
+  // would keep refusing the push until TTL expires; disabling it
+  // would keep approving a previously-filtered pass. Digest is
+  // SHA-256 of a sorted JSON array — same input → same digest.
+  const excludeDigest = crypto
+    .createHash('sha256')
+    .update(JSON.stringify([...(policy.exclude_paths ?? [])].sort()))
+    .digest('hex')
+    .slice(0, 16);
+  const cacheKey = `${headSha}#${excludeDigest}`;
   const cacheLookup =
-    policy.cache_ttl_ms > 0 ? lookupVerdict(deps.baseDir, headSha) : { hit: false as const };
+    policy.cache_ttl_ms > 0 ? lookupVerdict(deps.baseDir, cacheKey) : { hit: false as const };
   if (cacheLookup.hit && cacheLookup.entry !== undefined) {
     const cached = cacheLookup.entry;
     const cachedBlocked =
@@ -536,7 +551,42 @@ export async function runPushGate(deps: PushGateDeps): Promise<GateResult> {
         ? { reasoningEffort: policy.codex_reasoning_effort }
         : {}),
     });
-    const summary = summarizeReview(codexResult.reviewText);
+    const rawSummary = summarizeReview(codexResult.reviewText);
+    // 0.28.0 helix-029 — apply path-scoped filter BEFORE verdict
+    // computation. When `policy.exclude_paths` is empty (the default),
+    // the filter is a no-op: kept === rawSummary.findings, excluded
+    // is empty. When set, findings whose `file` matches any glob are
+    // moved into `filtered.excluded` and the verdict recomputes from
+    // `filtered.kept` only. The audit shape stays unchanged — we add
+    // a `filtered_findings_count` counter into metadata for forensic
+    // grep but do NOT introduce a new top-level array on the audit
+    // record.
+    // Defensive `?? []` — older test fixtures and embedders that
+    // construct `ResolvedReviewPolicy` by hand may omit the field;
+    // an undefined slot would crash `filterFindingsByPath` at the
+    // `globs.length === 0` check.
+    const filtered = filterFindingsByPath(rawSummary.findings, policy.exclude_paths ?? []);
+    const summary = {
+      ...rawSummary,
+      findings: filtered.kept,
+      verdict: filtered.verdict,
+    };
+    if (filtered.excluded.length > 0) {
+      // Emit a single stderr line per excluded finding so the operator
+      // can still see them (and act — file upstream, audit, etc.) even
+      // though they no longer block the push. This is the audit-trail
+      // surface the helix bug report asked for; the `filtered_findings`
+      // array on `last-review.json` is the OPTIONAL extra layer (see
+      // below).
+      stderr(
+        `rea: ${filtered.excluded.length} finding(s) filtered by review.exclude_paths (path-scoped):\n`,
+      );
+      for (const f of filtered.excluded) {
+        stderr(
+          `  - [${f.severity}] ${f.title}${f.file !== undefined ? ` — ${f.file}${f.line !== undefined ? `:${String(f.line)}` : ''}` : ''}\n`,
+        );
+      }
+    }
     const blocked =
       summary.verdict === 'blocking' ||
       (summary.verdict === 'concerns' && policy.concerns_blocks && !isConcernsOverrideSet(env));
@@ -587,7 +637,11 @@ export async function runPushGate(deps: PushGateDeps): Promise<GateResult> {
         ttl_ms: policy.cache_ttl_ms,
       };
       try {
-        await writeVerdict(deps.baseDir, headSha, entry);
+        // 0.28.0 codex round-1 P2: write under the same compound key
+        // used for lookup so subsequent same-SHA-same-policy lookups
+        // hit cache, while same-SHA-different-policy lookups miss
+        // and produce a fresh verdict tied to the new policy state.
+        await writeVerdict(deps.baseDir, cacheKey, entry);
       } catch {
         // Cache writes are best-effort. A failure here must NOT
         // affect the verdict — log to stderr (already done by the
@@ -600,6 +654,10 @@ export async function runPushGate(deps: PushGateDeps): Promise<GateResult> {
     await safeAppend(appendAuditFn, deps.baseDir, EVT_REVIEWED, fullPolicy, {
       verdict: summary.verdict,
       finding_count: summary.findings.length,
+      // 0.28.0 helix-029: counter only — keeps the audit-record shape
+      // unchanged so no consumer parser breaks. Operators grep
+      // `filtered_findings_count` to see how many were suppressed.
+      filtered_findings_count: filtered.excluded.length > 0 ? filtered.excluded.length : undefined,
       base_ref: base.ref,
       base_source: base.source,
       head_sha: headSha,

@@ -266,6 +266,15 @@ export class DownstreamConnection {
    * instead of watching the child die again.
    */
   private unexpectedDeathAt = 0;
+  /**
+   * 0.28.0 helix-025 F1 — flips to true the first time `connect()` is
+   * invoked (regardless of outcome). Drives the `'never'` arm of the
+   * tri-state surfaced via `connectionState`. Any path that touches
+   * `this.client`, `this.#lastErrorMessage`, or `this.health` runs
+   * AFTER `connect()` has set this — so a single boolean is sufficient
+   * to tell "supervisor has tried at least once" from "never attempted".
+   */
+  private everAttemptedConnect = false;
   private health: Health = 'healthy';
   /**
    * Optional supervisor-event listener. Set via
@@ -476,8 +485,37 @@ export class DownstreamConnection {
     return boundedDiagnosticString(raw);
   }
 
+  /**
+   * 0.28.0 helix-025 F1 — explicit tri-state for the lifecycle:
+   *
+   *   `'never'`   — connect() has not yet been called (the connection
+   *                 was constructed but the gateway hasn't gotten to
+   *                 the connectAll loop, or the entire pool hasn't
+   *                 booted)
+   *   `'ok'`      — the most recent connect/call cleared lastError;
+   *                 the supervisor considers the link live
+   *   `'errored'` — there is a current error or the connection is
+   *                 unhealthy after at least one attempt
+   *
+   * The tri-state is derived — no separate state machine — so it
+   * cannot drift from the underlying connect/error flow.
+   */
+  get connectionState(): 'never' | 'ok' | 'errored' {
+    if (!this.everAttemptedConnect) return 'never';
+    if (this.health === 'unhealthy') return 'errored';
+    if (this.#lastErrorMessage !== null) return 'errored';
+    return 'ok';
+  }
+
   async connect(): Promise<void> {
     if (this.client !== null) return;
+    // 0.28.0 helix-025 F1: stamp the "ever-attempted" flag BEFORE any
+    // failure paths fire — a connect() that throws on env-resolution
+    // still counts as "we tried", so the tri-state moves out of
+    // `'never'` even when no error string is renderable. The flag
+    // never resets; once attempted, the connection is in 'ok' or
+    // 'errored' for the rest of its life.
+    this.everAttemptedConnect = true;
 
     // Resolve env BEFORE spawning. If any `${VAR}` reference in the registry's
     // explicit env: map is unset at startup, refuse to spawn this server:

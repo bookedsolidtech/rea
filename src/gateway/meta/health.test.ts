@@ -100,6 +100,7 @@ describe('__rea__health meta-tool — pure snapshot builder', () => {
         connected: true,
         healthy: true,
         last_error: null,
+        connection_state: 'ok',
         tools_count: 11,
       },
       {
@@ -108,6 +109,7 @@ describe('__rea__health meta-tool — pure snapshot builder', () => {
         connected: true,
         healthy: false,
         last_error: 'rc=1',
+        connection_state: 'errored',
         tools_count: null,
       },
       {
@@ -116,6 +118,7 @@ describe('__rea__health meta-tool — pure snapshot builder', () => {
         connected: false,
         healthy: false,
         last_error: 'boom',
+        connection_state: 'errored',
         tools_count: null,
       },
     ];
