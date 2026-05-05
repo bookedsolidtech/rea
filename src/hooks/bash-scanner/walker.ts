@@ -9094,9 +9094,35 @@ function wordToString(word: BashNode): WordValue | null {
       case 'Lit':
         value += stringifyField(part['Value']);
         break;
-      case 'SglQuoted':
-        value += stringifyField(part['Value']);
+      case 'SglQuoted': {
+        // 0.26.1 helix-028 P1-1: ANSI-C `$'...'` quoting expands
+        // `\n`/`\t`/`\xHH`/`\NNN`/`\u…`/`\cX` etc. at parse time. mvdan-sh
+        // emits `$'...'` as `SglQuoted` with `Dollar: true` and the RAW
+        // escape source in `Value` (e.g. `\n` arrives as backslash-n, not
+        // LF). Pre-fix the walker concatenated the raw value verbatim,
+        // and the downstream `stripBashBackslashEscapes` mangled `\n` →
+        // `n` (regex `\\([A-Za-z0-9./_~-])` strips backslash from any
+        // letter), turning `.rea/HALT\ntrue` into `.rea/HALTntrue` — which
+        // never matched the protected pattern. Real bash, of course,
+        // expanded `\n` to LF, so the redirect target was actually
+        // `.rea/HALT` and the kill-switch got overwritten. Decode
+        // explicitly here so downstream consumers see real bytes.
+        const raw = stringifyField(part['Value']);
+        const isAnsiC = part['Dollar'] === true;
+        if (isAnsiC) {
+          const decoded = decodeAnsiC(raw);
+          if (decoded === null) {
+            // Unsupported escape — fail closed. Mark word as dynamic so
+            // the protected/blocked path matchers refuse on uncertainty.
+            dynamic = true;
+          } else {
+            value += decoded;
+          }
+        } else {
+          value += raw;
+        }
         break;
+      }
       case 'DblQuoted': {
         const innerParts = asArray(part['Parts']);
         for (const ip of innerParts) {
@@ -9133,6 +9159,206 @@ function wordToString(word: BashNode): WordValue | null {
 function stringifyField(v: unknown): string {
   if (typeof v === 'string') return v;
   return '';
+}
+
+/**
+ * Decode bash ANSI-C `$'...'` escape sequences. Returns the decoded
+ * string, or `null` if the input contains an escape we don't support
+ * (caller must fail closed on null — treat the word as dynamic so the
+ * protected/blocked path matcher refuses on uncertainty).
+ *
+ * Bash spec covers the following escapes inside `$'...'`:
+ *   - `\\`         literal backslash
+ *   - `\'` `\"`    literal quote
+ *   - `\?`         literal question mark
+ *   - `\a` `\b`    BEL / BS
+ *   - `\e` `\E`    ESC
+ *   - `\f` `\n`    FF / LF
+ *   - `\r` `\t`    CR / TAB
+ *   - `\v`         VT
+ *   - `\NNN`       octal (1–3 digits)
+ *   - `\xHH`       hex (1–2 digits)
+ *   - `\uHHHH`     unicode codepoint (1–4 hex digits)
+ *   - `\UHHHHHHHH` unicode codepoint (1–8 hex digits)
+ *   - `\cX`        control char (X xor 0x40)
+ *
+ * 0.26.1 helix-028 P1-1.
+ */
+function decodeAnsiC(raw: string): string | null {
+  let out = '';
+  let i = 0;
+  const n = raw.length;
+  while (i < n) {
+    const ch = raw.charCodeAt(i);
+    if (ch !== 0x5c /* '\\' */) {
+      out += raw[i];
+      i += 1;
+      continue;
+    }
+    // Lone trailing backslash — bash keeps it literal.
+    if (i + 1 >= n) {
+      out += '\\';
+      i += 1;
+      continue;
+    }
+    const next = raw[i + 1] as string;
+    // Single-char escapes.
+    switch (next) {
+      case '\\':
+        out += '\\';
+        i += 2;
+        continue;
+      case "'":
+        out += "'";
+        i += 2;
+        continue;
+      case '"':
+        out += '"';
+        i += 2;
+        continue;
+      case '?':
+        out += '?';
+        i += 2;
+        continue;
+      case 'a':
+        out += '\x07';
+        i += 2;
+        continue;
+      case 'b':
+        out += '\x08';
+        i += 2;
+        continue;
+      case 'e':
+      case 'E':
+        out += '\x1b';
+        i += 2;
+        continue;
+      case 'f':
+        out += '\x0c';
+        i += 2;
+        continue;
+      case 'n':
+        out += '\n';
+        i += 2;
+        continue;
+      case 'r':
+        out += '\r';
+        i += 2;
+        continue;
+      case 't':
+        out += '\t';
+        i += 2;
+        continue;
+      case 'v':
+        out += '\x0b';
+        i += 2;
+        continue;
+      default:
+        break;
+    }
+    // \xHH — 1 or 2 hex digits.
+    if (next === 'x') {
+      let j = i + 2;
+      let hex = '';
+      while (j < n && hex.length < 2 && /[0-9a-fA-F]/.test(raw[j] as string)) {
+        hex += raw[j];
+        j += 1;
+      }
+      if (hex.length === 0) {
+        // `\x` with no digits is unspecified; bash treats it literally as
+        // backslash-x. Mirror that — preserve and continue.
+        out += '\\x';
+        i += 2;
+        continue;
+      }
+      out += String.fromCharCode(parseInt(hex, 16));
+      i = j;
+      continue;
+    }
+    // \NNN — 1, 2, or 3 octal digits. `next` itself is the first digit.
+    if (next >= '0' && next <= '7') {
+      let j = i + 1;
+      let oct = '';
+      while (j < n && oct.length < 3 && (raw[j] as string) >= '0' && (raw[j] as string) <= '7') {
+        oct += raw[j];
+        j += 1;
+      }
+      out += String.fromCharCode(parseInt(oct, 8) & 0xff);
+      i = j;
+      continue;
+    }
+    // \uHHHH — 1 to 4 hex digits.
+    if (next === 'u') {
+      let j = i + 2;
+      let hex = '';
+      while (j < n && hex.length < 4 && /[0-9a-fA-F]/.test(raw[j] as string)) {
+        hex += raw[j];
+        j += 1;
+      }
+      if (hex.length === 0) {
+        out += '\\u';
+        i += 2;
+        continue;
+      }
+      const cp = parseInt(hex, 16);
+      try {
+        out += String.fromCodePoint(cp);
+      } catch {
+        return null;
+      }
+      i = j;
+      continue;
+    }
+    // \UHHHHHHHH — 1 to 8 hex digits.
+    if (next === 'U') {
+      let j = i + 2;
+      let hex = '';
+      while (j < n && hex.length < 8 && /[0-9a-fA-F]/.test(raw[j] as string)) {
+        hex += raw[j];
+        j += 1;
+      }
+      if (hex.length === 0) {
+        out += '\\U';
+        i += 2;
+        continue;
+      }
+      const cp = parseInt(hex, 16);
+      // String.fromCodePoint throws RangeError on out-of-range values
+      // (>0x10FFFF). Bash silently truncates; we fail closed via null.
+      try {
+        out += String.fromCodePoint(cp);
+      } catch {
+        return null;
+      }
+      i = j;
+      continue;
+    }
+    // \cX — control char (X xor 0x40). X may be any printable ASCII.
+    if (next === 'c') {
+      if (i + 2 >= n) {
+        // Lone `\c` at end — treat as literal.
+        out += '\\c';
+        i += 2;
+        continue;
+      }
+      const xCh = (raw[i + 2] as string).charCodeAt(0);
+      // Standard form: bash xors with 0x40 then masks to 7 bits. So
+      // \cJ → 'J' (0x4a) ^ 0x40 = 0x0a (LF). \c? is special-cased to DEL.
+      if (raw[i + 2] === '?') {
+        out += '\x7f';
+      } else {
+        out += String.fromCharCode((xCh ^ 0x40) & 0x7f);
+      }
+      i += 3;
+      continue;
+    }
+    // Unknown escape: bash preserves `\X` literally for unknown X. We
+    // could mirror that, but the safer posture for a security scanner is
+    // to fail closed — refuse on uncertainty so an attacker can't hide
+    // payload bytes behind an escape we forgot to model.
+    return null;
+  }
+  return out;
 }
 
 function asArray(v: unknown): readonly BashNode[] {
