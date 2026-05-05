@@ -1,6 +1,6 @@
 {
   "name": "@bookedsolid/rea",
-  "version": "0.23.0",
+  "version": "0.23.1",
   "description": "Agentic governance layer for Claude Code — policy enforcement, hook-based safety gates, audit logging, and Codex-integrated adversarial review for AI-assisted projects",
   "license": "MIT",
   "author": "Booked Solid Technology <oss@bookedsolid.tech> (https://bookedsolid.tech)",
