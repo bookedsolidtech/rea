@@ -283,7 +283,1021 @@ export function walkForWrites(file: BashFile): DetectedWrite[] {
     // means no detections, which the compositor pairs with parse-fail
     // sentinels at a higher tier).
   }
+  // helix-024 F1: cd-into-protected + relative-write bypass closure.
+  // The static AST scanner doesn't model process-cwd. A command like
+  // `cd .rea && echo > HALT` emits ONLY a `redirect: HALT` detection
+  // from extractStmtRedirects — the scanner normalizes `HALT` against
+  // REA_ROOT and gets `HALT` (project-root-relative), which doesn't
+  // match `.rea/HALT` in the protected list. The kill switch is
+  // bypassed because the cd is invisible to the scanner.
+  //
+  // Closure: post-walker pass emits a synthetic detection at every
+  // `cd <DIR>` / `pushd <DIR>` / `cd $VAR` site WHEN the AST contains
+  // any write detection. The scanner runs the protected-prefix test
+  // on the cd target with `forceDirSemantics: true` — if DIR matches
+  // a protected dir-prefix (`.rea`, `.husky`, `.claude`, `.github/
+  // workflows`), refuse on uncertainty regardless of whether the
+  // relative write tokens themselves match.
+  //
+  // This pass must run AFTER the main walk so it can observe the full
+  // detection set. The helper detectCwdChangeIntoProtected scans the
+  // AST again for cd/pushd CallExprs and decides per-site whether to
+  // emit (the path-shape decision is the scanner's, not ours — we
+  // emit conservatively).
+  detectCwdChangeIntoProtected(file, out);
   return out;
+}
+
+/**
+ * helix-024 F1 closure — detect `cd <DIR>` / `pushd <DIR>` (and `cd
+ * $VAR` / `pushd $VAR` dynamic forms) and emit synthetic detections
+ * ONLY when a bare-relative-path write is reachable in execution-order
+ * from the cd within the same lexical scope. The scanner consumes these
+ * as a refuse-on-uncertainty signal.
+ *
+ * Round-14 codex P1 refinement (over-correction fix). The first
+ * iteration of this pass used a coarse global predicate: "if AST has
+ * any write, emit on every cd". That over-blocked common idioms:
+ *
+ *   - `cd "$HOME" && echo > log`                    (known-safe source)
+ *   - `cd "$REPO_ROOT" && echo > /tmp/log`          (write is absolute)
+ *   - `cd "$(pwd)" && echo > log`                   (cmdsubst safe source)
+ *   - `cd "$(git rev-parse --show-toplevel)" && pnpm test > out.log`
+ *   - `for d in src test; do cd "$d" && echo x > out; done`
+ *   - `cd /tmp && echo > log; cd .rea && cat HALT`  (cross-scope read-only)
+ *
+ * The refined predicate is:
+ *   1. **In-scope**: writes must be reachable from the cd in execution
+ *      order within the same lexical scope. Specifically:
+ *        - Sequential successor Stmts in the same StmtList container.
+ *        - For a cd in BinaryCmd.X, the entire BinaryCmd.Y subtree.
+ *        - For a cd inside a Subshell/Block/Function-body, all
+ *          subsequent stmts within that container.
+ *        - Recurses into nested compound stmts of in-scope successors
+ *          (a write inside an `if` after a cd in the same scope counts).
+ *      Writes from sibling stmts BEFORE the cd, or in unrelated scopes
+ *      (e.g., a separate top-level Stmt earlier or later that itself
+ *      has its own cd), do NOT taint this cd's emit decision.
+ *   2. **Bare-relative target**: only writes whose static path-shape is
+ *      bare-relative (no leading `/`, no `~/`, not the outside-root
+ *      sentinel) actually move when cwd changes. Absolute writes
+ *      (`/tmp/log`, `/dev/null`, `~/file`) are unaffected by the cd, so
+ *      they do not bootstrap an emit.
+ *   3. **Known-safe dynamic source**: a dynamic cd whose entire target
+ *      Word is a known-safe expansion (`$HOME`, `$PWD`, `$OLDPWD`,
+ *      `$(pwd)`, `$(git rev-parse --show-toplevel)`, `$(git rev-parse
+ *      --show-cdup)`, or a for-loop iter variable whose Items list is
+ *      all literal non-protected paths) is treated as ALLOW even with
+ *      bare-relative writes in scope. The runtime cwd cannot land in
+ *      .rea/.husky/.claude/.github/workflows/ from those sources.
+ *   4. **Conservative dynamic fallback**: any other dynamic cd target
+ *      (`$P`, `$REPO_ROOT`, arbitrary `$(...)`) WITH bare-relative
+ *      writes in scope emits `cwd_dynamic_with_writes_unresolvable` so
+ *      the scanner refuses on uncertainty. Without bare-relative writes
+ *      in scope the dynamic cd is a no-op for kill-switch purposes —
+ *      it cannot exfiltrate via writes that don't exist.
+ *
+ * Two emit shapes (preserved from round 1):
+ *   - `cwd_protected_unresolvable` — cd target is a literal path.
+ *     Scanner runs the protected-prefix test (with dir semantics).
+ *     Match → BLOCK; non-match (or outside-root) → ALLOW.
+ *   - `cwd_dynamic_with_writes_unresolvable` — dynamic cd target with
+ *     unknown-safe source AND a bare-relative write in scope. Scanner
+ *     refuses on uncertainty.
+ *
+ * Pre-existing detections from the first walker pass are unaffected —
+ * the cd synthetic is additive. A redirect to a protected path is
+ * still flagged on its own merits even if its enclosing cd is safe.
+ *
+ * Accepted false-negatives (deferred to 0.24.0+):
+ *   - `cd $(echo .rea) && echo > HALT` — cmdsubst-resolved literal.
+ *     The cd source isn't in the known-safe set so the dynamic path
+ *     fires only if there's a bare-relative write in scope; this case
+ *     would fire correctly. But `cd $(printf %s .rea) && cat HALT`
+ *     (read-only) does NOT fire because no bare-relative write exists.
+ *   - `alias evil="cd .rea && echo > HALT"; evil` — alias-then-invoke
+ *     requires modeling shell aliases at AST time, out of scope here.
+ *
+ * Performance: O(N) over AST nodes per scope walk, allocation-light.
+ * The recursion bound is the parser's own AST depth (mvdan-sh enforces
+ * its own depth caps upstream).
+ */
+function detectCwdChangeIntoProtected(file: BashFile, out: DetectedWrite[]): void {
+  // Reusable nothing-to-do shortcut: if there is literally no Stmt in the
+  // file, there is no cd to find and no write to taint.
+  const topStmts = asArray(file['Stmts']);
+  if (topStmts.length === 0) return;
+
+  // Recursively walk the AST visiting each lexical scope (StmtList).
+  // For each cd/pushd CallExpr, decide whether to emit a synthetic
+  // detection by:
+  //   - Collecting in-scope successor writes (per the predicate above).
+  //   - Filtering by bare-relative path shape.
+  //   - Classifying the cd target source.
+  //
+  // `safeForIterVars` carries the scope's set of for-iter variable
+  // names whose Items list is all literal non-protected paths. The set
+  // is inherited into nested scopes (closure-capture style) and
+  // extended on entry to a qualifying ForClause body.
+  walkScopeForCwd(topStmts, new Set<string>(), out);
+}
+
+/**
+ * Walk a list of sibling Stmts (one lexical scope), emitting cd
+ * synthetic detections per the refined predicate.
+ *
+ * Round-17 P1: `extraDownstream` carries additional AST regions that
+ * are reachable in execution order from this scope's cd-sites *beyond*
+ * later siblings. It is appended to every cd-site's downstream when
+ * descending into the Cond / Body of If/While/Until clauses, so that:
+ *   - `if cd .rea; then echo > HALT; fi` — the cond's cd sees the
+ *     then-body as downstream (cwd persists into the body).
+ *   - `if cd .rea; then :; fi; echo > HALT` — the cond's cd sees the
+ *     post-conditional sibling as downstream (cwd persists past the
+ *     conditional in bash semantics).
+ * For nested-scope descent from `descendIntoNestedScopes`, we carry the
+ * containing Stmt's own post-stmt siblings as extraDownstream so cds
+ * found inside subshells/blocks/if/while/etc. see them too.
+ */
+function walkScopeForCwd(
+  stmts: readonly BashNode[],
+  safeForIterVars: ReadonlySet<string>,
+  out: DetectedWrite[],
+  extraDownstream: readonly BashNode[] = [],
+): void {
+  for (let i = 0; i < stmts.length; i += 1) {
+    const stmt = stmts[i];
+    if (!stmt || typeof stmt !== 'object') continue;
+    // For each Stmt in this scope, consider every cd/pushd CallExpr
+    // that lives inside it (including via BinaryCmd.X). The "in-scope
+    // successor" set is:
+    //   - For a cd in this Stmt's BinaryCmd.X: that BinaryCmd's Y subtree.
+    //   - PLUS: every later sibling Stmt (i+1..end) in this scope.
+    //   - PLUS: extraDownstream (R17 cwd-persistence + post-conditional
+    //     siblings inherited from a parent scope).
+    classifyCdInStmt(stmt, stmts, i, safeForIterVars, out, extraDownstream);
+    // Recurse into nested scopes inside this Stmt — each opens its own
+    // sequential scope. The parent scope's safeForIterVars are inherited.
+    // R17 P1: this Stmt's own post-stmt siblings (stmts[i+1..]) PLUS the
+    // inherited extraDownstream become the extraDownstream for nested
+    // scopes — cwd changes inside an if/while/until/subshell/block on
+    // this Stmt persist into and past those constructs.
+    const postSiblings: BashNode[] = [];
+    for (let j = i + 1; j < stmts.length; j += 1) {
+      const s = stmts[j];
+      if (s) postSiblings.push(s);
+    }
+    for (const d of extraDownstream) postSiblings.push(d);
+    descendIntoNestedScopes(stmt, safeForIterVars, out, postSiblings);
+  }
+}
+
+/**
+ * Find every cd/pushd CallExpr in `stmt` (top-level or LHS of a
+ * BinaryCmd chain) and emit per the predicate. The "downstream-in-
+ * scope" subtree for emission is computed per-cd-site.
+ */
+function classifyCdInStmt(
+  stmt: BashNode,
+  scopeStmts: readonly BashNode[],
+  stmtIndex: number,
+  safeForIterVars: ReadonlySet<string>,
+  out: DetectedWrite[],
+  extraDownstream: readonly BashNode[] = [],
+): void {
+  const cmd = stmt['Cmd'];
+  if (!cmd || typeof cmd !== 'object') return;
+  // Each cd-site finder yields the `cd` CallExpr and the "downstream
+  // subtree" — the AST region whose writes are in scope of THIS cd.
+  // For sequential successors, downstream extends across scopeStmts[i+1..].
+  // R17 P1: extraDownstream is appended to every cd-site's downstream so
+  // cwd-persistence into the body of an if/while/until and past it is
+  // observable to the predicate.
+  const sites: Array<{ callExpr: BashNode; downstream: BashNode[] }> = [];
+  collectCdSitesInStmt(stmt, scopeStmts, stmtIndex, sites, extraDownstream);
+  for (const site of sites) {
+    emitCdDecisionIfAny(site.callExpr, site.downstream, safeForIterVars, out);
+  }
+}
+
+/**
+ * Recursively locate cd/pushd CallExprs within `stmt`. Each site's
+ * downstream subtree is the AST region containing in-scope successor
+ * writes. The traversal stays in the SAME lexical scope as the cd —
+ * it does NOT walk into Subshells / Blocks / Function bodies (those
+ * open new scopes that are handled by `walkScopeForCwd` on the
+ * containing-scope iteration).
+ */
+function collectCdSitesInStmt(
+  stmt: BashNode,
+  scopeStmts: readonly BashNode[],
+  stmtIndex: number,
+  sites: Array<{ callExpr: BashNode; downstream: BashNode[] }>,
+  extraDownstream: readonly BashNode[] = [],
+): void {
+  const cmd = stmt['Cmd'];
+  if (!cmd || typeof cmd !== 'object') return;
+  const cmdNode = cmd as BashNode;
+  const t = nodeType(cmdNode);
+  if (t === 'CallExpr') {
+    if (isCdOrPushd(cmdNode)) {
+      // Downstream: every sibling Stmt after this one in the same
+      // scope. Stmt-level redirects on later siblings are reachable
+      // because they execute sequentially after the cd.
+      const downstream: BashNode[] = [];
+      for (let j = stmtIndex + 1; j < scopeStmts.length; j += 1) {
+        const s = scopeStmts[j];
+        if (s) downstream.push(s);
+      }
+      // R17 P1: append cwd-persistence carriers (then/else/do bodies of
+      // an enclosing IfClause/WhileClause/UntilClause whose Cond holds
+      // this cd, plus the conditional's own post-stmt siblings).
+      for (const d of extraDownstream) downstream.push(d);
+      sites.push({ callExpr: cmdNode, downstream });
+    }
+    return;
+  }
+  if (t === 'BinaryCmd') {
+    // mvdan-sh BinaryCmd ops we care about for "executes after":
+    //   0xa  &&    0xb  ||    0xc  |    0xd  |&
+    // For all four, X executes (or starts piping) before Y. A cd in X
+    // is followed in execution order by Y. Pipes (0xc/0xd) DO have a
+    // separate-process boundary — `cd .rea | echo > HALT` does NOT
+    // affect the second process's cwd. We conservatively still treat
+    // pipes as "downstream" because the kill-switch is symmetric: in a
+    // subshell child the cd applies, but the redirect happens in a
+    // parallel pipe stage. The corner case yields a small over-emit
+    // for pipe-only chains; in practice `&&`/`||`/`;` are the attack
+    // shapes (per helix-024 PoCs F1-1..F1-8), so this is acceptable.
+    const x = cmdNode['X'];
+    const y = cmdNode['Y'];
+    // Recurse into X looking for cd; its downstream is Y plus the
+    // outer-scope siblings plus any inherited extraDownstream (R17 P1
+    // cwd-persistence carriers).
+    const yDownstream: BashNode[] = [];
+    if (y && typeof y === 'object') yDownstream.push(y as BashNode);
+    for (let j = stmtIndex + 1; j < scopeStmts.length; j += 1) {
+      const s = scopeStmts[j];
+      if (s) yDownstream.push(s);
+    }
+    for (const d of extraDownstream) yDownstream.push(d);
+    if (x && typeof x === 'object') {
+      collectCdSitesInBinaryX(x as BashNode, yDownstream, sites);
+    }
+    // ALSO recurse into Y for cd sites whose own downstream is the
+    // outer scope only. This covers `(non-cd) && cd .rea && echo >
+    // HALT` shapes — Y is itself a BinaryCmd with cd in its X.
+    if (y && typeof y === 'object') {
+      const yStmt = y as BashNode;
+      if (nodeType(yStmt) === 'Stmt') {
+        // Y has its own (X, Y) inner BinaryCmd if the operator chain
+        // continues. We let the outer-scope iteration via scopeStmts
+        // pick up siblings for Y's own cd; here we only need to find
+        // cd sites in Y itself with the outer downstream.
+        const outerDownstream: BashNode[] = [];
+        for (let j = stmtIndex + 1; j < scopeStmts.length; j += 1) {
+          const s = scopeStmts[j];
+          if (s) outerDownstream.push(s);
+        }
+        for (const d of extraDownstream) outerDownstream.push(d);
+        // Inner BinaryCmd in Y: walk it as if it were a Stmt with
+        // index -1 in a synthetic scope of [Y, ...outerDownstream].
+        // We pass an empty extraDownstream because outerDownstream
+        // already includes the inherited carriers.
+        const synthScope: BashNode[] = [yStmt, ...outerDownstream];
+        collectCdSitesInStmt(yStmt, synthScope, 0, sites);
+      }
+    }
+    return;
+  }
+  // Other Cmd shapes (FuncDecl, Subshell, Block, IfClause, ForClause,
+  // WhileClause, CaseClause, etc.) open new scopes — the descent into
+  // their body lists is `descendIntoNestedScopes`, not here.
+}
+
+/** Walk into a BinaryCmd.X subtree to find cd sites. */
+function collectCdSitesInBinaryX(
+  x: BashNode,
+  downstream: readonly BashNode[],
+  sites: Array<{ callExpr: BashNode; downstream: BashNode[] }>,
+): void {
+  if (nodeType(x) !== 'Stmt') return;
+  const cmd = x['Cmd'];
+  if (!cmd || typeof cmd !== 'object') return;
+  const cmdNode = cmd as BashNode;
+  const t = nodeType(cmdNode);
+  if (t === 'CallExpr') {
+    if (isCdOrPushd(cmdNode)) {
+      sites.push({ callExpr: cmdNode, downstream: downstream.slice() });
+    }
+    return;
+  }
+  if (t === 'BinaryCmd') {
+    const innerX = cmdNode['X'];
+    const innerY = cmdNode['Y'];
+    const innerDownstream: BashNode[] = [];
+    if (innerY && typeof innerY === 'object') innerDownstream.push(innerY as BashNode);
+    for (const d of downstream) innerDownstream.push(d);
+    if (innerX && typeof innerX === 'object') {
+      collectCdSitesInBinaryX(innerX as BashNode, innerDownstream, sites);
+    }
+    if (innerY && typeof innerY === 'object') {
+      collectCdSitesInBinaryX(innerY as BashNode, downstream, sites);
+    }
+    return;
+  }
+  // R17 P2: TimeClause / CoprocClause wrap a single Stmt without
+  // opening a new scope. `time cd .rea && echo > HALT` parses as
+  //   BinaryCmd(X=Stmt[TimeClause[Stmt[cd .rea]]], Y=Stmt[echo > HALT])
+  // so the cd lives one wrap-level deeper than CallExpr/BinaryCmd
+  // expects. Unwrap and recurse with the same downstream so the cd
+  // site sees the && Y as its downstream carrier.
+  if (t === 'TimeClause' || t === 'CoprocClause') {
+    const innerStmt = cmdNode['Stmt'];
+    if (innerStmt && typeof innerStmt === 'object') {
+      collectCdSitesInBinaryX(innerStmt as BashNode, downstream, sites);
+    }
+    return;
+  }
+}
+
+/**
+ * Descend into nested-scope-opening constructs inside `stmt`. For each
+ * new scope (Subshell.Stmts, Block.Stmts, ForClause.Do, WhileClause.Do,
+ * IfClause.Then/Else, FuncDecl body, CaseClause item bodies), call
+ * `walkScopeForCwd` to repeat the analysis with that scope's Stmts.
+ */
+function descendIntoNestedScopes(
+  stmt: BashNode,
+  safeForIterVars: ReadonlySet<string>,
+  out: DetectedWrite[],
+  extraDownstream: readonly BashNode[] = [],
+): void {
+  const cmd = stmt['Cmd'];
+  if (!cmd || typeof cmd !== 'object') return;
+  descendCmdScopes(cmd as BashNode, safeForIterVars, out, extraDownstream);
+  // Stmt-level redirects can contain process substitutions whose inner
+  // Stmts open their own scope. Walk via syntax.Walk for those — the
+  // ProcSubst.Stmts will itself be visited as a nested scope handled
+  // by the walker's main pass; for this F1 analysis, ProcSubst is rare
+  // enough on the cd path that we accept missing it as a deferred
+  // false-negative (documented).
+}
+
+function descendCmdScopes(
+  cmd: BashNode,
+  safeForIterVars: ReadonlySet<string>,
+  out: DetectedWrite[],
+  extraDownstream: readonly BashNode[] = [],
+): void {
+  const t = nodeType(cmd);
+  switch (t) {
+    case 'BinaryCmd': {
+      const x = cmd['X'];
+      const y = cmd['Y'];
+      if (x && typeof x === 'object')
+        descendStmtScopes(x as BashNode, safeForIterVars, out, extraDownstream);
+      if (y && typeof y === 'object')
+        descendStmtScopes(y as BashNode, safeForIterVars, out, extraDownstream);
+      break;
+    }
+    case 'Subshell':
+    case 'Block': {
+      const inner = asArray(cmd['Stmts']);
+      // R17 P1: cwd changes inside a Subshell DO NOT escape — bash forks
+      // a child shell. So Subshell's inner cd-sites should NOT inherit
+      // the parent's post-stmt siblings. Block ({...}) DOES persist cwd
+      // to the parent shell — inherit extraDownstream there.
+      const subExtra = t === 'Subshell' ? [] : extraDownstream;
+      walkScopeForCwd(inner, safeForIterVars, out, subExtra);
+      break;
+    }
+    case 'ForClause': {
+      // Extend safeForIterVars if the WordIter has all-literal-non-
+      // protected Items — the iter variable is provably bound to a
+      // safe value at runtime.
+      const loop = cmd['Loop'];
+      let nextSafe = safeForIterVars;
+      if (loop && typeof loop === 'object') {
+        const loopNode = loop as BashNode;
+        const loopType = nodeType(loopNode);
+        if (loopType === 'WordIter') {
+          const nameNode = loopNode['Name'];
+          let iterName = '';
+          if (nameNode && typeof nameNode === 'object') {
+            iterName = stringifyField((nameNode as BashNode)['Value']);
+          }
+          const items = asArray(loopNode['Items']);
+          let allSafe = items.length > 0;
+          for (const item of items) {
+            if (typeof item !== 'object' || item === null) {
+              allSafe = false;
+              break;
+            }
+            const v = wordToString(item as BashNode);
+            if (v === null || v.dynamic) {
+              allSafe = false;
+              break;
+            }
+            if (isPathPotentiallyProtected(v.value)) {
+              allSafe = false;
+              break;
+            }
+          }
+          if (allSafe && iterName.length > 0) {
+            const ext = new Set(safeForIterVars);
+            ext.add(iterName);
+            nextSafe = ext;
+          }
+        }
+        // CStyleLoop: counter variables are arithmetic, never paths;
+        // we don't try to mark them safe but we also don't need to —
+        // the body's cd would have to use arithmetic-as-path, which
+        // is degenerate and not a known attack shape.
+      }
+      const doStmts = asArray(cmd['Do']);
+      // R17 P1: a cd in a ForClause body persists cwd to the next iter
+      // and past the loop. Inherit extraDownstream into the body.
+      walkScopeForCwd(doStmts, nextSafe, out, extraDownstream);
+      break;
+    }
+    case 'WhileClause':
+    case 'UntilClause': {
+      const doStmts = asArray(cmd['Do']);
+      const cond = asArray(cmd['Cond']);
+      // R17 P1 closure: a cd in the Cond persists into the Do body
+      // (cwd applies to body when cond evaluates true) AND past the
+      // loop (cwd persists when the loop exits). Pass the body PLUS
+      // the inherited extraDownstream as carriers when walking Cond.
+      const condCarriers: BashNode[] = [];
+      for (const s of doStmts) condCarriers.push(s);
+      for (const d of extraDownstream) condCarriers.push(d);
+      walkScopeForCwd(cond, safeForIterVars, out, condCarriers);
+      // Body cd-sites inherit only the post-loop extraDownstream
+      // (cwd persists past the loop).
+      walkScopeForCwd(doStmts, safeForIterVars, out, extraDownstream);
+      break;
+    }
+    case 'IfClause': {
+      const cond = asArray(cmd['Cond']);
+      const thenStmts = asArray(cmd['Then']);
+      const elseEntry = cmd['Else'];
+      // R17 P1 closure: a cd in the Cond persists into the then-body
+      // (when cond is truthy) AND into the else-body (when cond is
+      // truthy on the last cmd in cond — cd's exit code is generally
+      // truthy on success but the cwd-change happens regardless of
+      // which branch is taken; bash semantics: side-effects from cond
+      // persist into BOTH branches and past the conditional). So the
+      // carriers for the cond walk are: then-body + else-body +
+      // inherited extraDownstream (post-conditional siblings).
+      const condCarriers: BashNode[] = [];
+      for (const s of thenStmts) condCarriers.push(s);
+      // Else can be a Cmd whose body is its own IfClause (elif chain)
+      // or a Block — flatten its Stmts into carriers via a synthetic
+      // collection. We can't easily walk its inner stmt-list without
+      // recursing into a structure that may itself contain control
+      // flow; passing the Else-Cmd's containing Stmt as a single
+      // BashNode in carriers is sufficient for the predicate (any
+      // bare-relative write inside that subtree counts).
+      if (elseEntry && typeof elseEntry === 'object') {
+        condCarriers.push(elseEntry as BashNode);
+      }
+      for (const d of extraDownstream) condCarriers.push(d);
+      walkScopeForCwd(cond, safeForIterVars, out, condCarriers);
+      // then-body cd-sites inherit only the post-conditional
+      // extraDownstream.
+      walkScopeForCwd(thenStmts, safeForIterVars, out, extraDownstream);
+      if (elseEntry && typeof elseEntry === 'object') {
+        // Else is itself an IfClause-or-StmtList in mvdan-sh; descend
+        // through its Cmd-like structure carrying extraDownstream.
+        descendCmdScopes(elseEntry as BashNode, safeForIterVars, out, extraDownstream);
+      }
+      break;
+    }
+    case 'CaseClause': {
+      const items = asArray(cmd['Items']);
+      for (const it of items) {
+        if (!it || typeof it !== 'object') continue;
+        const itStmts = asArray((it as BashNode)['Stmts']);
+        // CaseClause Word is evaluated once; cwd-side-effects in
+        // an item body persist past the case (control returns to
+        // parent scope). Inherit extraDownstream.
+        walkScopeForCwd(itStmts, safeForIterVars, out, extraDownstream);
+      }
+      break;
+    }
+    case 'FuncDecl': {
+      const body = cmd['Body'];
+      if (body && typeof body === 'object') {
+        // FuncDecl is a definition only; the body's cwd side-effects
+        // apply to the caller's scope WHEN INVOKED, not at definition
+        // time. Static analysis cannot know callers, so we conserva-
+        // tively walk the body with no inherited extraDownstream.
+        descendStmtScopes(body as BashNode, safeForIterVars, out, []);
+      }
+      break;
+    }
+    case 'TimeClause':
+    case 'CoprocClause': {
+      // R17 P2 closure: `time <stmt>` and `coproc <stmt>` wrap a single
+      // Stmt without opening a new lexical scope. A cd inside the
+      // wrapped stmt has the same cwd-persistence behavior as the
+      // unwrapped form (TimeClause runs in the current shell;
+      // CoprocClause forks a coprocess but bash-3.2+ also exposes the
+      // construct in interactive shells where cwd-persistence is
+      // observed in scripted invocations of the wrapped command).
+      // Conservative: descend into the inner Stmt carrying the
+      // inherited extraDownstream.
+      const stmt = cmd['Stmt'];
+      if (stmt && typeof stmt === 'object') {
+        descendStmtScopes(stmt as BashNode, safeForIterVars, out, extraDownstream);
+      }
+      // CoprocClause may also use a CoprocCmd field in some mvdan-sh
+      // versions; handle both shapes defensively.
+      const coprocCmd = cmd['CoprocCmd'];
+      if (coprocCmd && typeof coprocCmd === 'object') {
+        descendCmdScopes(coprocCmd as BashNode, safeForIterVars, out, extraDownstream);
+      }
+      break;
+    }
+    default:
+      // Other Cmd kinds (CallExpr, ArithmCmd, DeclClause, TestClause,
+      // LetClause, etc.) don't open new sequential scopes for our
+      // purposes. Their inner expressions can contain CmdSubst payloads
+      // that themselves are full BashFiles re-parsed elsewhere; those
+      // are handled by the main walker pass.
+      break;
+  }
+}
+
+function descendStmtScopes(
+  stmt: BashNode,
+  safeForIterVars: ReadonlySet<string>,
+  out: DetectedWrite[],
+  extraDownstream: readonly BashNode[] = [],
+): void {
+  if (nodeType(stmt) !== 'Stmt') {
+    // Some Cmd containers (FuncDecl.Body) wrap a CallExpr / Block
+    // directly. Descend on Cmd shape.
+    descendCmdScopes(stmt, safeForIterVars, out, extraDownstream);
+    return;
+  }
+  const cmd = stmt['Cmd'];
+  if (!cmd || typeof cmd !== 'object') return;
+  descendCmdScopes(cmd as BashNode, safeForIterVars, out, extraDownstream);
+}
+
+/** Test whether a CallExpr is `cd` or `pushd`. */
+function isCdOrPushd(callExpr: BashNode): boolean {
+  const args = asArray(callExpr['Args']);
+  if (args.length === 0) return false;
+  const argv: WordValue[] = [];
+  for (const arg of args) {
+    if (typeof arg !== 'object' || arg === null) continue;
+    const v = wordToString(arg as BashNode);
+    argv.push(v ?? { value: '', dynamic: true, position: { line: 0, col: 0 } });
+  }
+  if (argv.length === 0 || argv[0] === undefined) return false;
+  const stripped = stripEnvAndModifiers(argv);
+  if (stripped.length === 0 || stripped[0] === undefined) return false;
+  const head = normalizeCmdHead(stripped[0].value);
+  return head === 'cd' || head === 'pushd' || head === 'popd';
+}
+
+/**
+ * Decide whether a cd-site emits a synthetic detection. Per the
+ * refined predicate:
+ *   - Find the cd target Word.
+ *   - Search the downstream subtree for bare-relative writes.
+ *   - For literal cd targets: emit cwd_protected_unresolvable IFF a
+ *     bare-relative write exists in scope. Scanner will then run the
+ *     protected-prefix test on the literal cd target — non-protected
+ *     literals (e.g., `/tmp`) ALLOW; protected (e.g., `.rea`) BLOCK.
+ *   - For dynamic cd targets: classify the source. If known-safe →
+ *     no emit. If unknown-safe AND bare-relative write exists in scope
+ *     → emit cwd_dynamic_with_writes_unresolvable. Else → no emit.
+ */
+function emitCdDecisionIfAny(
+  callExpr: BashNode,
+  downstream: readonly BashNode[],
+  safeForIterVars: ReadonlySet<string>,
+  out: DetectedWrite[],
+): void {
+  const args = asArray(callExpr['Args']);
+  if (args.length === 0) return;
+  // Re-extract argv (we did this in isCdOrPushd; the caller already
+  // confirmed the head is cd/pushd).
+  const argv: WordValue[] = [];
+  const argWords: BashNode[] = [];
+  for (const arg of args) {
+    if (typeof arg !== 'object' || arg === null) continue;
+    const v = wordToString(arg as BashNode);
+    argv.push(v ?? { value: '', dynamic: true, position: { line: 0, col: 0 } });
+    argWords.push(arg as BashNode);
+  }
+  if (argv.length === 0 || argv[0] === undefined) return;
+  const stripped = stripEnvAndModifiers(argv);
+  if (stripped.length === 0 || stripped[0] === undefined) return;
+  const head = normalizeCmdHead(stripped[0].value);
+  if (head !== 'cd' && head !== 'pushd' && head !== 'popd') return;
+  // Find the first non-flag positional. Recover both the WordValue and
+  // the underlying Word AST node so the dynamic-source classifier can
+  // inspect the Parts directly.
+  let target: WordValue | null = null;
+  let targetWord: BashNode | null = null;
+  // Note: stripEnvAndModifiers may synthesize argv (env-prefix strip),
+  // so we cannot trust positional indices in `stripped` to align with
+  // argWords. Re-walk argv (which DOES align with argWords) and skip
+  // the leading Assigns / wrapper modifiers using the same flag-skip.
+  // Simpler: we accept that position-info (col/line) for the cd target
+  // comes from `stripped`'s WordValue.position; for AST classification
+  // we walk the original argv looking for the first non-flag positional
+  // whose value matches `target.value`.
+  for (let i = 1; i < stripped.length; i += 1) {
+    const tok = stripped[i];
+    if (tok === undefined) continue;
+    const v = tok.value;
+    if (v === '--') continue;
+    if (v === '-' || v === '+') continue;
+    if (v.startsWith('-') && v.length > 1) continue;
+    if (v.startsWith('+') && v.length > 1 && /^\+\d+$/.test(v)) continue;
+    target = tok;
+    break;
+  }
+  if (target === null) {
+    // No positional after flag-skip — bash defaults cwd to $HOME (cd /
+    // cd -L / cd -P) or to OLDPWD (cd -). popd defaults to dir-stack
+    // head. Same threat class as `cd "$HOME"` / `cd "$OLDPWD"` (R15 F1):
+    // env-var rebindable, refuse on uncertainty when bare-relative
+    // writes are in scope.
+    const downstreamWrites = collectWritesInSubtrees(downstream);
+    let hasBareRelativeWrite = false;
+    for (const w of downstreamWrites) {
+      if (isBareRelativeWrite(w)) {
+        hasBareRelativeWrite = true;
+        break;
+      }
+    }
+    if (!hasBareRelativeWrite) return;
+    out.push({
+      path: '',
+      form: 'cwd_dynamic_with_writes_unresolvable',
+      position: stripped[0]?.position ?? { line: 0, col: 0 },
+      dynamic: true,
+      originSrc: `${head} (no positional / hyphen-only / popd) defaults to $HOME or $OLDPWD or dir-stack — refusing on uncertainty`,
+    });
+    return;
+  }
+  // Try to recover the underlying Word for the cd target. If
+  // stripEnvAndModifiers inserted synthetic wrappers, this lookup may
+  // fail — we fall back to treating the target as opaque-dynamic.
+  for (let i = 0; i < argv.length; i += 1) {
+    if (argv[i] === target) {
+      targetWord = argWords[i] ?? null;
+      break;
+    }
+    // value-equality fallback when argv has been rewritten
+    if (
+      argv[i] !== undefined &&
+      argv[i]?.value === target.value &&
+      argv[i]?.dynamic === target.dynamic
+    ) {
+      targetWord = argWords[i] ?? null;
+    }
+  }
+
+  // Compute in-scope bare-relative writes. We collect ALL writes
+  // reachable in the downstream subtree and filter by bare-relative
+  // path-shape. We must include writes from the cd's BinaryCmd.Y too,
+  // which is part of `downstream`. We reuse `walkForWrites` semantics
+  // by running the same dispatcher over the downstream subtree.
+  const downstreamWrites = collectWritesInSubtrees(downstream);
+  let hasBareRelativeWrite = false;
+  for (const w of downstreamWrites) {
+    if (isBareRelativeWrite(w)) {
+      hasBareRelativeWrite = true;
+      break;
+    }
+  }
+  if (!hasBareRelativeWrite) return;
+
+  if (target.dynamic) {
+    // Classify source. Known-safe → no emit.
+    if (targetWord !== null && isKnownSafeCdSource(targetWord, safeForIterVars)) {
+      return;
+    }
+    out.push({
+      path: '',
+      form: 'cwd_dynamic_with_writes_unresolvable',
+      position: target.position,
+      dynamic: true,
+      originSrc: `${head} <dynamic> with bare-relative writes in scope — refusing on uncertainty`,
+    });
+    return;
+  }
+  // Literal target — emit and let the scanner decide protected vs
+  // non-protected via checkPathProtected with forceDirSemantics.
+  out.push({
+    path: target.value,
+    form: 'cwd_protected_unresolvable',
+    position: target.position,
+    dynamic: false,
+    isDirTarget: true,
+    originSrc: `${head} ${target.value} (bare-relative writes in scope — protected-prefix test required)`,
+  });
+}
+
+/**
+ * Collect detected writes in a list of subtrees by re-running the
+ * walker's dispatcher on each. This is safe because the dispatcher is
+ * pure (no global state) and produces the same DetectedWrite shapes as
+ * the main pass — we do NOT propagate these into the final `out` array
+ * (the main pass already covers them); we only use the path/dynamic
+ * attributes for the in-scope-bare-relative predicate.
+ */
+function collectWritesInSubtrees(subtrees: readonly BashNode[]): DetectedWrite[] {
+  const writes: DetectedWrite[] = [];
+  for (const root of subtrees) {
+    if (!root || typeof root !== 'object') continue;
+    try {
+      syntax.Walk(root, (node: BashNode | null | undefined): boolean => {
+        if (node === null || node === undefined) return true;
+        const t = nodeType(node);
+        if (t === 'Stmt') {
+          extractStmtRedirects(node, writes);
+        } else if (t === 'CallExpr') {
+          // Filter cd/pushd themselves out of the downstream-write set
+          // (a cd's own argv shouldn't bootstrap an emit on a sibling
+          // cd). All other call-expr-level write detections reach
+          // walkCallExpr.
+          if (!isCdOrPushd(node)) {
+            walkCallExpr(node, writes);
+          }
+        }
+        return true;
+      });
+    } catch {
+      // pathological subtree — fall through with whatever writes we
+      // collected so far. Fail-OPEN here is fine: missing a write means
+      // the cd won't emit, but the main walker pass already emitted
+      // the same write through its own normal traversal — the kill
+      // switch decision still rides on the main pass's verdict.
+    }
+  }
+  return writes;
+}
+
+/**
+ * A write target is "bare-relative" iff it would resolve relative to
+ * cwd at runtime — i.e., a cd before it changes which file is hit:
+ *   - Not absolute (no leading `/`).
+ *   - Not tilde-expanded (no leading `~/` or `~`).
+ *   - Has a non-empty path (empty paths are dynamic-only emits we
+ *     skip — they don't pin a cwd-relative shape).
+ *   - Static — dynamic targets are "we don't know"; conservatively we
+ *     treat them as bare-relative (could resolve either way) so the
+ *     cd-source classifier still decides.
+ */
+function isBareRelativeWrite(w: DetectedWrite): boolean {
+  // Skip detections that don't carry a path. Dynamic emits with empty
+  // path (xargs-stdin, find-exec-placeholder, nested-shell-inner) are
+  // refuse-on-uncertainty regardless of cwd — they're handled on
+  // their own merits by the scanner.
+  if (w.path.length === 0) return false;
+  // Skip the cd-class synthetic emits themselves (defensive — the
+  // walker filters cd/pushd CallExprs from the downstream set).
+  if (
+    w.form === 'cwd_protected_unresolvable' ||
+    w.form === 'cwd_dynamic_with_writes_unresolvable' ||
+    w.form === 'ln_to_protected_unresolvable'
+  ) {
+    return false;
+  }
+  if (w.path.startsWith('/')) return false;
+  if (w.path.startsWith('~/')) return false;
+  if (w.path === '~') return false;
+  // Outside-root sentinel emitted by the dynamic-target normalizer.
+  // Defensive — the walker emits raw paths here but if a future change
+  // surfaces sentinels into DetectedWrite.path, treat them as not
+  // bare-relative (already-normalized to cwd-independent shape).
+  if (w.path.startsWith('__rea_outside_root__')) return false;
+  if (w.path.startsWith('__rea_unresolved_expansion__')) return false;
+  // Dynamic empty/$VAR paths arrive here with `dynamic: true` and a
+  // string value that may be partial. Conservatively treat them as
+  // bare-relative — the cd-source classifier runs next and decides.
+  return true;
+}
+
+/**
+ * Test whether a path string is "potentially protected" — used for
+ * for-loop iter classification. A safe iter Items list contains ONLY
+ * non-protected literal paths. The check is conservative: any path
+ * starting with `.rea`, `.husky`, `.claude`, `.github`, or otherwise
+ * matching the dot-anchored protected list disqualifies the iter from
+ * being marked safe. We keep this in sync with the protected-list
+ * shape rather than hard-coding patterns; the walker only needs a
+ * coarse over-approximation here because the result only EXPANDS the
+ * known-safe set (false-positive = miss the optimization, fall back
+ * to the dynamic emit).
+ */
+function isPathPotentiallyProtected(p: string): boolean {
+  if (p.length === 0) return false;
+  // Strip a leading ./ for normalization parity with the scanner.
+  let s = p;
+  if (s.startsWith('./')) s = s.slice(2);
+  // Any path under one of the known protected dir prefixes — keep this
+  // in sync with the scanner's effective patterns (best-effort).
+  const PROTECTED_DIR_PREFIXES = ['.rea', '.husky', '.claude', '.github'];
+  for (const prefix of PROTECTED_DIR_PREFIXES) {
+    if (s === prefix) return true;
+    if (s.startsWith(`${prefix}/`)) return true;
+  }
+  return false;
+}
+
+/**
+ * Classify a dynamic cd target's source. Returns true if the entire
+ * Word's expansion is provably non-protected at runtime:
+ *   - `$HOME`, `$PWD`, `$OLDPWD` — environment vars set by the shell
+ *     to absolute paths outside the project root.
+ *   - `$(pwd)`, `$(git rev-parse --show-toplevel)`, `$(git rev-parse
+ *     --show-cdup)` — cmdsubst that resolves to the current cwd or
+ *     project-root absolute path.
+ *   - For-iter variables whose Items list is all literal non-
+ *     protected paths (`for d in src test` → `$d` is safe).
+ *
+ * Anything else (`$P`, `$REPO_ROOT`, `${VAR:-default}`, mixed
+ * literal+expansion like `prefix/$VAR`) is NOT known-safe — the
+ * scanner refuses on uncertainty.
+ */
+function isKnownSafeCdSource(
+  word: BashNode,
+  safeForIterVars: ReadonlySet<string>,
+): boolean {
+  const parts = asArray(word['Parts']);
+  if (parts.length === 0) return false;
+  // The Word must be a SINGLE Part for classification; mixed shapes
+  // like `prefix/$VAR` have multiple Parts and are not provably safe.
+  if (parts.length !== 1) return false;
+  const partRaw = parts[0];
+  if (!partRaw || typeof partRaw !== 'object') return false;
+  let part = partRaw as BashNode;
+  // Unwrap a single-Part DblQuoted — `cd "$HOME"` parses as Word ⊃
+  // DblQuoted ⊃ ParamExp{HOME}. The DblQuoted wrapper is just shell
+  // quoting and doesn't change the expansion's semantics.
+  if (nodeType(part) === 'DblQuoted') {
+    const innerParts = asArray(part['Parts']);
+    if (innerParts.length !== 1) return false;
+    const ip = innerParts[0];
+    if (!ip || typeof ip !== 'object') return false;
+    part = ip as BashNode;
+  }
+  const t = nodeType(part);
+  if (t === 'ParamExp') {
+    return isParamExpKnownSafe(part, safeForIterVars);
+  }
+  if (t === 'CmdSubst') {
+    return isCmdSubstKnownSafe(part);
+  }
+  return false;
+}
+
+/**
+ * A ParamExp is known-safe iff it's a plain reference to a safe var name.
+ *
+ * **Round-15 P1 closure — no env var name is statically safe.** Earlier
+ * iterations included `HOME`/`PWD`/`OLDPWD` in a known-safe allow-list
+ * on the assumption that the shell sets them to absolute paths outside
+ * the project root. That assumption is wrong:
+ *
+ * - **Inline assignment-prefix on the same simple command rebinds them**
+ *   (`HOME=.rea cd "$HOME"` → cwd lands in `.rea/`).
+ * - **Parent-shell exports rebind them across commands**
+ *   (`export HOME=.rea; cd "$HOME" && echo > HALT`).
+ * - **`OLDPWD` automatically tracks any previous cd**, so a previous cd
+ *   into a protected dir poisons later `cd "$OLDPWD"` references even
+ *   without explicit assignment.
+ *
+ * Static analysis cannot prove a name's runtime value, so the only safe
+ * answer is to refuse on any ParamExp expansion. The `safeForIterVars`
+ * carve-out remains because its safety property is structural — a for-
+ * loop body's iterator variable is bounded to the literal Items list,
+ * which we already statically check for protected paths.
+ */
+function isParamExpKnownSafe(
+  paramExp: BashNode,
+  safeForIterVars: ReadonlySet<string>,
+): boolean {
+  // Reject any expansion modifier — `${HOME:-junk}`, `${HOME#x}` etc.
+  // Those can introduce attacker-controlled defaults / suffixes.
+  const exp = paramExp['Exp'];
+  if (exp !== null && exp !== undefined) return false;
+  const slice = paramExp['Slice'];
+  if (slice !== null && slice !== undefined) return false;
+  const repl = paramExp['Repl'];
+  if (repl !== null && repl !== undefined) return false;
+  const index = paramExp['Index'];
+  if (index !== null && index !== undefined) return false;
+  if (paramExp['Length'] === true) return false;
+  if (paramExp['Width'] === true) return false;
+  if (paramExp['Excl'] === true) return false;
+  // Name lookup.
+  const paramNode = paramExp['Param'];
+  if (!paramNode || typeof paramNode !== 'object') return false;
+  const name = stringifyField((paramNode as BashNode)['Value']);
+  if (name.length === 0) return false;
+  // Round-15 P1: no env-var name is safe at static analysis; all are
+  // runtime-rebindable via inline assignment-prefix or parent-shell
+  // export. The set is intentionally empty — see the function docstring.
+  const KNOWN_SAFE_VARS = new Set<string>();
+  if (KNOWN_SAFE_VARS.has(name)) return true;
+  if (safeForIterVars.has(name)) return true;
+  return false;
+}
+
+/**
+ * A CmdSubst is known-safe iff its inner command is one of:
+ *   - `pwd` (no args, or only `-L` / `-P`).
+ *   - `git rev-parse` with one or more flags from a tight allow-list
+ *     that resolves to either an ABSOLUTE path or a path that steps
+ *     OUT of cwd; never INTO it.
+ *
+ * Anything else — even other read-only commands — is refused.
+ * "Known-safe" here means *the printed value cannot land inside
+ * `.rea/` / `.husky/` / `.claude/` / `.github/workflows/` at runtime
+ * regardless of where cwd happens to be*. Misclassifying a command as
+ * safe would create a real bypass; the allow-list stays small.
+ *
+ * **Round-15 P1 — `--show-prefix` removed.** `git rev-parse --show-prefix`
+ * returns the cwd-relative path INSIDE the toplevel. When the agent's
+ * cwd is `.rea/`, it returns `.rea/` (or `.husky/`, `.claude/`, etc.),
+ * landing the cd inside a protected dir. The remaining flags are safe
+ * because:
+ *   - `--show-toplevel` returns an absolute path to the repo root.
+ *   - `--show-cdup` returns a string of `../` segments that can only
+ *     step OUT of the current dir, never IN.
+ *   - `--show-superproject-working-tree` returns an absolute path to
+ *     the parent superproject (or empty when not in a submodule).
+ * All three resolve to a value that is independent of how deep cwd is
+ * inside the worktree, so they cannot be steered into protected dirs.
+ */
+function isCmdSubstKnownSafe(cmdSubst: BashNode): boolean {
+  const stmts = asArray(cmdSubst['Stmts']);
+  if (stmts.length !== 1) return false;
+  const stmt = stmts[0];
+  if (!stmt || typeof stmt !== 'object') return false;
+  const cmd = (stmt as BashNode)['Cmd'];
+  if (!cmd || typeof cmd !== 'object') return false;
+  if (nodeType(cmd as BashNode) !== 'CallExpr') return false;
+  const args = asArray((cmd as BashNode)['Args']);
+  if (args.length === 0) return false;
+  const argv: WordValue[] = [];
+  for (const arg of args) {
+    if (typeof arg !== 'object' || arg === null) continue;
+    const v = wordToString(arg as BashNode);
+    argv.push(v ?? { value: '', dynamic: true, position: { line: 0, col: 0 } });
+  }
+  // No env-prefix strip needed here — known-safe commands don't tolerate
+  // foreign env (PWD=/etc pwd is technically still pwd, but adding env
+  // is suspicious and we refuse it).
+  if (argv[0] === undefined || argv[0].dynamic) return false;
+  const head = normalizeCmdHead(argv[0].value);
+  if (head === 'pwd') {
+    // `pwd` with no args / only `-L` / `-P`. Reject anything else.
+    for (let i = 1; i < argv.length; i += 1) {
+      const a = argv[i];
+      if (a === undefined) continue;
+      if (a.dynamic) return false;
+      if (a.value === '-L' || a.value === '-P') continue;
+      return false;
+    }
+    return true;
+  }
+  if (head === 'git') {
+    // `git rev-parse <flag>` — only flags that resolve to an absolute
+    // path, or a path stepping OUT of cwd, qualify. `--show-prefix` is
+    // intentionally NOT in the set: it returns cwd-relative-to-toplevel
+    // and can be `.rea/` / `.husky/` / `.claude/` when the agent is
+    // already inside a protected dir (round-15 P1 closure).
+    // No other git subcommands qualify here because many are
+    // attacker-influenceable through `.git/config` settings.
+    if (argv.length < 3) return false;
+    if (argv[1] === undefined || argv[1].dynamic || argv[1].value !== 'rev-parse') return false;
+    const FLAGS = new Set([
+      '--show-toplevel',
+      '--show-cdup',
+      '--show-superproject-working-tree',
+    ]);
+    // All remaining args must be in FLAGS (no arbitrary refspecs).
+    for (let i = 2; i < argv.length; i += 1) {
+      const a = argv[i];
+      if (a === undefined) continue;
+      if (a.dynamic) return false;
+      if (!FLAGS.has(a.value)) return false;
+    }
+    return true;
+  }
+  return false;
 }
 
 /**
@@ -2607,7 +3621,41 @@ function detectEval(argv: WordValue[], out: DetectedWrite[]): void {
   }
   const inner = parts.join(' ');
   if (inner.length === 0) return;
-  const parsed = parseBashCommand(inner);
+  // helix-024 F2: doubly-nested eval bypass. Pre-fix the inner parse
+  // received the raw concatenation of argv tokens — for
+  // `eval "eval \"echo x > .rea/HALT\""` the outer DQ-significant
+  // escapes (`\"`) were preserved through wordToString as literal
+  // backslash-quote pairs in the joined string. The inner parser then
+  // treated them as literal characters glued onto the redirect target,
+  // producing a corrupted path (`.rea/HALT\"`) that didn't match the
+  // protected list. Mirrors the helix-022 #3 nested-shell fix: bash
+  // collapses one level of DQ-escapes BEFORE the inner shell sees the
+  // payload, so the static analyzer must do the same. detectNestedShell
+  // applies unshellEscape; detectEval pre-fix did not — that asymmetry
+  // is the bypass.
+  //
+  // After unshellEscape the inner parses correctly and walkForWrites
+  // re-dispatches CallExpr → detectEval recursively. The recursion
+  // bottoms out via the nested-shell depth model: walkForWrites on the
+  // re-parsed file inherits CURRENT_NESTED_DEPTH (set non-zero only
+  // when the parent dispatch came from detectNestedShell). For pure-
+  // eval recursion we add a dedicated CURRENT_EVAL_DEPTH counter
+  // mirroring NESTED_SHELL_DEPTH_CAP=8 — every eval re-parse increments
+  // it, every walker entry checks the cap and emits a refuse-on-
+  // uncertainty detection past the cap. This closes Finding 2 of
+  // helix-024 even for arbitrary eval-depth chains.
+  if (CURRENT_EVAL_DEPTH >= EVAL_DEPTH_CAP) {
+    out.push({
+      path: '',
+      form: 'redirect',
+      position: argv[0]?.position ?? { line: 0, col: 0 },
+      dynamic: true,
+      originSrc: 'eval recursion exceeded depth cap — refusing on uncertainty',
+    });
+    return;
+  }
+  const innerSource = unshellEscape(inner);
+  const parsed = parseBashCommand(innerSource);
   if (!parsed.ok) {
     out.push({
       path: '',
@@ -2618,7 +3666,13 @@ function detectEval(argv: WordValue[], out: DetectedWrite[]): void {
     });
     return;
   }
-  const innerWrites = walkForWrites(parsed.file);
+  CURRENT_EVAL_DEPTH += 1;
+  let innerWrites: DetectedWrite[];
+  try {
+    innerWrites = walkForWrites(parsed.file);
+  } finally {
+    CURRENT_EVAL_DEPTH -= 1;
+  }
   for (const d of innerWrites) {
     out.push({
       ...d,
@@ -2627,6 +3681,22 @@ function detectEval(argv: WordValue[], out: DetectedWrite[]): void {
     });
   }
 }
+
+/**
+ * Eval recursion depth cap. helix-024 F2: pre-fix detectEval re-parsed
+ * exactly one level — `eval "eval \"echo > .rea/HALT\""` bypassed
+ * because the inner re-parsed string carried the outer DQ-escape (`\"`)
+ * as literal characters in the redirect target, corrupting the path so
+ * it didn't match the protected list. The fix is two-part:
+ *   1. unshellEscape() the inner string before re-parsing (mirrors the
+ *      helix-022 #3 nested-shell fix).
+ *   2. Cap eval recursion at 8 levels. Past the cap, emit a synthetic
+ *      dynamic detection so the scanner refuses on uncertainty. Mirrors
+ *      NESTED_SHELL_DEPTH_CAP — same shape, separate counter so eval
+ *      and bash -c don't exhaust each other's budget.
+ */
+const EVAL_DEPTH_CAP = 8;
+let CURRENT_EVAL_DEPTH = 0;
 
 // ─────────────────────────────────────────────────────────────────────
 //  Codex round 4 Finding 7: misc utilities (patch, sort, shuf, gpg,
@@ -5472,6 +6542,26 @@ function detectLn(argv: WordValue[], out: DetectedWrite[]): void {
       // Codex round 1 F-7: -t target is a directory.
       isDirTarget: true,
     });
+    // helix-024 F3: when -t is set, every positional is a SOURCE that
+    // gets linked into the target dir. Each source whose path matches
+    // a protected pattern is a write-through-symlink risk — emit the
+    // synthetic detection on every positional so the scanner refuses
+    // on protected sources.
+    for (const src of positionals) {
+      out.push({
+        path: src.value,
+        form: 'ln_to_protected_unresolvable',
+        position: src.position,
+        dynamic: src.dynamic,
+        // Treat ln source as destructive-ancestry for the scanner
+        // match — `ln -s .rea /tmp/x` aliases the .rea directory, and
+        // a subsequent write through /tmp/x/HALT would hit .rea/HALT.
+        // Without isDestructive the scanner would match `.rea` against
+        // `.rea/HALT` only with dir-shape input; isDestructive enables
+        // the protected-ancestry path so a bare-dir source still hits.
+        isDestructive: true,
+      });
+    }
     return;
   }
   if (positionals.length >= 2) {
@@ -5482,6 +6572,34 @@ function detectLn(argv: WordValue[], out: DetectedWrite[]): void {
         form: 'ln_dest',
         position: dest.position,
         dynamic: dest.dynamic,
+      });
+    }
+    // helix-024 F3: ln SRC DEST and ln SRC1 SRC2 ... DEST_DIR. Every
+    // source argv (all positionals except the last) may be staged as
+    // a link whose write goes through SRC. If SRC is a protected path
+    // (e.g. `.rea/HALT`), the subsequent `echo > DEST` writes through
+    // the link and the kill switch is bypassed. Walker emits a
+    // synthetic `ln_to_protected_unresolvable` detection on every
+    // source; the scanner refuses on uncertainty when SRC matches the
+    // protected list. Non-protected sources fall through (NEG-5 /
+    // `ln -s /tmp/a /tmp/b` and NEG-6 / `ln -s docs/file.md /tmp/link`
+    // both ALLOW because the source side resolves outside-root or
+    // doesn't match a protected pattern).
+    for (let s = 0; s < positionals.length - 1; s += 1) {
+      const src = positionals[s];
+      if (src === undefined) continue;
+      out.push({
+        path: src.value,
+        form: 'ln_to_protected_unresolvable',
+        position: src.position,
+        dynamic: src.dynamic,
+        // Treat ln source as destructive-ancestry for the scanner
+        // match — `ln -s .rea /tmp/x` aliases the .rea directory, and
+        // a subsequent write through /tmp/x/HALT would hit .rea/HALT.
+        // Without isDestructive the scanner would match `.rea` against
+        // `.rea/HALT` only with dir-shape input; isDestructive enables
+        // the protected-ancestry path so a bare-dir source still hits.
+        isDestructive: true,
       });
     }
   }

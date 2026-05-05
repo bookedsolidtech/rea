@@ -45,6 +45,15 @@ import { allowVerdict, blockVerdict, type DetectedForm, type Verdict } from './v
  * Hardcoded historical default — when policy.protected_writes is not
  * set this is the protected list. Mirrors REA_PROTECTED_PATTERNS_FULL
  * in `hooks/_lib/protected-paths.sh`.
+ *
+ * Round-15 P3: `.github/workflows/` added so consumers without an
+ * explicit `policy.blocked_paths` entry still refuse Bash-tier writes
+ * to CI workflows. CLAUDE.md describes `.github/workflows/` as a
+ * sensitive path requiring CODEOWNERS approval; the default protected
+ * list now matches. Intentionally NOT a kill-switch invariant —
+ * consumers may legitimately relax workflow protection via
+ * `protected_paths_relax: ['.github/workflows/']` when they have no
+ * CI safety story to protect.
  */
 const HISTORICAL_DEFAULT_PROTECTED_PATTERNS: readonly string[] = [
   '.claude/settings.json',
@@ -54,6 +63,7 @@ const HISTORICAL_DEFAULT_PROTECTED_PATTERNS: readonly string[] = [
   '.rea/HALT',
   '.rea/last-review.cache.json',
   '.rea/last-review.json',
+  '.github/workflows/',
 ];
 
 /**
@@ -763,6 +773,49 @@ export function scanForProtectedViolations(
             '  inputs, or pipe to a non-parallel form (`for x; do CMD; done`).',
           ].join('\n'),
           hitPattern: '(parallel stdin unresolvable)',
+          detectedForm: d.form,
+          ...(d.position.line > 0 ? { sourcePosition: d.position } : {}),
+        });
+      }
+      // helix-024 F1: cd-into-dynamic-directory + writes-elsewhere.
+      // Walker emits when the cd/pushd target is $VAR / $(cmd) and
+      // the AST contains writes. We can't statically determine
+      // whether the dynamic target is protected; refuse on uncertainty.
+      if (d.form === 'cwd_dynamic_with_writes_unresolvable') {
+        return blockVerdict({
+          reason: [
+            'PROTECTED PATH (bash): cd/pushd target is dynamic and the command contains writes.',
+            '',
+            '  rea refuses on uncertainty. The cwd may resolve to a protected directory',
+            '  (.rea/, .husky/, .claude/, .github/workflows/) at runtime, in which case any',
+            '  subsequent relative-path write would target a protected file.',
+            '',
+            '  Resolve the variable to a literal path before the cd, OR move the writes out',
+            '  of the cd-affected scope so the scanner can verify each target individually.',
+          ].join('\n'),
+          hitPattern: '(cd dynamic + writes unresolvable)',
+          detectedForm: d.form,
+          ...(d.position.line > 0 ? { sourcePosition: d.position } : {}),
+        });
+      }
+      // helix-024 F3: ln SRC DEST whose SRC is dynamic. The link target
+      // is computed at runtime; we can't tell whether the eventual
+      // alias points at a protected path. Refuse on uncertainty when
+      // SRC is dynamic. (Literal-SRC-protected ln is handled below in
+      // the logical-form match path because the walker emits with
+      // dynamic=false for literal SRCs.)
+      if (d.form === 'ln_to_protected_unresolvable') {
+        return blockVerdict({
+          reason: [
+            'PROTECTED PATH (bash): ln source is dynamic — link may alias a protected path.',
+            '',
+            '  rea refuses on uncertainty. A subsequent write through the link would target',
+            '  the resolved source path, which the static scanner cannot verify.',
+            '',
+            '  Resolve the variable to a literal path before the ln, OR avoid creating a',
+            '  link whose source is dynamically computed.',
+          ].join('\n'),
+          hitPattern: '(ln source dynamic unresolvable)',
           detectedForm: d.form,
           ...(d.position.line > 0 ? { sourcePosition: d.position } : {}),
         });

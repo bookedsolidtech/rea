@@ -3466,6 +3466,636 @@ function classW(): GenerationResult {
 }
 
 /**
+ * Class X — helix-024 closures (cwd-relative-write + double-eval +
+ * symlink-alias-write).
+ *
+ * Pins all 14 helix-024 PoCs into the corpus PLUS a generated cross-
+ * product so future regressions in the three new walker passes
+ * (`detectCwdChangeIntoProtected`, eval-recursion depth cap, ln-source-
+ * protected detection) all surface as concrete fixture failures.
+ *
+ *   F1: every cd/pushd variant × every protected-dir target × every
+ *       write shape. Subshell forms `(cd ... && ...)`, sequence
+ *       `cd ...; ...`, dynamic `cd $VAR && ...`, pipe-into-subshell
+ *       `echo | (cd ... && tee ...)`.
+ *   F2: depth-2 / depth-3 / depth-4 nested-eval × protected target.
+ *       Every level mirrors the helix-022 #3 nested-bash-c DQ-escape
+ *       pattern.
+ *   F3: ln (-s / -sf / hard) × every protected source × subsequent
+ *       write through the alias.
+ *   X-neg: cd to non-protected, eval with no protected payload, ln
+ *       between non-protected paths, read-only `cd ..` / `ls`.
+ */
+function classX(): GenerationResult {
+  const fixtures: GeneratedFixture[] = [];
+
+  // ── F1 — cd/pushd into protected dir + relative write ─────────────
+  // Per helix-024, the kill-switch defeat is `cd <protected> && <write
+  // relative-path>`. The cd is invisible to the scanner pre-fix; post-
+  // fix `detectCwdChangeIntoProtected` emits a synthetic
+  // `cwd_protected_unresolvable` for every cd/pushd site when the AST
+  // also has writes. We test every (cd-form, protected-dir, write-
+  // shape) triple.
+  const CWD_FORMS: Array<[string, (dir: string, write: string) => string]> = [
+    ['cd-and', (dir, w) => `cd ${dir} && ${w}`],
+    ['cd-semi', (dir, w) => `cd ${dir}; ${w}`],
+    ['subshell-and', (dir, w) => `(cd ${dir} && ${w})`],
+    ['subshell-semi', (dir, w) => `(cd ${dir}; ${w})`],
+    ['pushd-and', (dir, w) => `pushd ${dir} && ${w}`],
+    ['pushd-semi', (dir, w) => `pushd ${dir}; ${w}`],
+    ['pipe-subshell', (dir, w) => `echo x | (cd ${dir} && ${w})`],
+    ['cd-block', (dir, w) => `{ cd ${dir} && ${w}; }`],
+  ];
+  // Use bare-dir ancestors as the cd target — the protected-prefix
+  // test is what blocks. Each ancestor must match a protected entry
+  // when treated as a directory shape.
+  const F1_DIRS = ['.rea', '.husky', '.claude'];
+  // Write shapes: each emits a write somewhere in the AST so the
+  // synthetic detection fires. The targets here are RELATIVE — they
+  // would land inside the cd'd dir at runtime. Pre-fix the scanner
+  // saw only the bare relative token, missed the protected prefix.
+  const F1_WRITES = [
+    'echo x > HALT',
+    'echo x > policy.yaml',
+    'echo x > settings.json',
+    'echo x > pre-push',
+    'tee out < /dev/null',
+    'printf x > out',
+  ];
+  for (const [formId, build] of CWD_FORMS) {
+    for (const dir of F1_DIRS) {
+      for (const w of F1_WRITES) {
+        fixtures.push({
+          cmd: build(dir, w),
+          expect: 'block',
+          klass: 'X',
+          label: `x-f1-${formId}-${dir.replace(/[^a-z0-9]/gi, '_')}-${w
+            .replace(/[^a-z0-9]/gi, '_')
+            .slice(0, 24)}`,
+          rationale: `helix-024 F1 ${formId} into ${dir} + ${w} must BLOCK via cwd_protected_unresolvable`,
+        });
+      }
+    }
+  }
+  // F1-dynamic: `p=.rea; cd $p && echo > HALT`. The cd target is a
+  // ParamExp; walker emits `cwd_dynamic_with_writes_unresolvable`.
+  for (const w of F1_WRITES) {
+    fixtures.push({
+      cmd: `p=.rea; cd $p && ${w}`,
+      expect: 'block',
+      klass: 'X',
+      label: `x-f1-dynvar-rea-${w.replace(/[^a-z0-9]/gi, '_').slice(0, 24)}`,
+      rationale: `helix-024 F1 dynamic cd $p (p=.rea) + ${w} must BLOCK via cwd_dynamic_with_writes_unresolvable`,
+    });
+    fixtures.push({
+      cmd: `cd $(echo .rea) && ${w}`,
+      expect: 'block',
+      klass: 'X',
+      label: `x-f1-dyncmdsubst-rea-${w.replace(/[^a-z0-9]/gi, '_').slice(0, 24)}`,
+      rationale: `helix-024 F1 dynamic cd $(...) + ${w} must BLOCK on uncertainty`,
+    });
+  }
+  // F1 — exact PoCs from the helix-024 report so a future regression
+  // in any individual variant is visible by label.
+  const F1_POCS: Array<[string, string, string]> = [
+    ['x-f1-poc-cd-rea-and-halt', 'cd .rea && echo x > HALT', 'PoC F1-1 must BLOCK'],
+    ['x-f1-poc-cd-rea-semi-halt', 'cd .rea; echo x > HALT', 'PoC F1-2 must BLOCK'],
+    ['x-f1-poc-subshell-rea-halt', '(cd .rea && echo x > HALT)', 'PoC F1-3 must BLOCK'],
+    ['x-f1-poc-pushd-rea-halt', 'pushd .rea && echo x > HALT', 'PoC F1-4 must BLOCK'],
+    ['x-f1-poc-pipe-subshell-tee', 'echo x | (cd .rea && tee HALT)', 'PoC F1-5 must BLOCK'],
+    ['x-f1-poc-dynvar-rea', 'p=.rea; cd $p && echo x > HALT', 'PoC F1-6 must BLOCK'],
+    ['x-f1-poc-cd-husky-prepush', 'cd .husky && echo x > pre-push', 'PoC F1-7 must BLOCK'],
+    [
+      'x-f1-poc-cd-claude-settings',
+      'cd .claude && echo x > settings.json',
+      'PoC F1-8 must BLOCK',
+    ],
+    // F1-9 (`cd .github/workflows && echo x > release.yml`) is
+    // intentionally OMITTED from the protected-scan corpus — that
+    // path matches via blocked_paths (not the historical-default
+    // protected list), so the protected-scan would correctly ALLOW
+    // it. The blocked-scan path is exercised in the scanner-corpus
+    // suite separately. Including it here as a positive would make
+    // the test fail on a correct verdict.
+  ];
+  for (const [label, cmd, rationale] of F1_POCS) {
+    fixtures.push({ cmd, expect: 'block', klass: 'X', label, rationale });
+  }
+
+  // ── F2 — doubly/triply/quadruply nested eval ─────────────────────
+  // Pre-fix detectEval recursed exactly 1 level. helix-024 weaponized
+  // `eval "eval \"echo > .rea/HALT\""` because the inner DQ-escapes
+  // (`\"`) survived as literals into the joined inner string and the
+  // re-parse produced a corrupted target `.rea/HALT\"` that didn't
+  // match the protected list. Post-fix unshellEscape collapses one
+  // level of DQ-escape before re-parse (mirroring the helix-022 #3
+  // nested-bash-c fix), AND the recursion is depth-capped at 8 so an
+  // arbitrary chain refuses on uncertainty past the cap.
+  for (const target of PROTECTED_TARGETS) {
+    fixtures.push({
+      cmd: `eval "eval \\"echo x > ${target}\\""`,
+      expect: 'block',
+      klass: 'X',
+      label: `x-f2-d2-dq-${target.replace(/[^a-z0-9]/gi, '_')}`,
+      rationale: `helix-024 F2 depth-2 eval (DQ inner) → ${target} must BLOCK after unshellEscape`,
+    });
+    fixtures.push({
+      cmd: `eval "eval 'echo x > ${target}'"`,
+      expect: 'block',
+      klass: 'X',
+      label: `x-f2-d2-sq-${target.replace(/[^a-z0-9]/gi, '_')}`,
+      rationale: `helix-024 F2 depth-2 eval (SQ inner) → ${target} must BLOCK`,
+    });
+    fixtures.push({
+      cmd: `eval 'eval "echo x > ${target}"'`,
+      expect: 'block',
+      klass: 'X',
+      label: `x-f2-d2-sq-outer-dq-inner-${target.replace(/[^a-z0-9]/gi, '_')}`,
+      rationale: `helix-024 F2 depth-2 eval (SQ outer / DQ inner) → ${target} must BLOCK`,
+    });
+    // depth-3: `eval "eval \"eval \\\"...\\\"\""`
+    fixtures.push({
+      cmd: `eval "eval \\"eval \\\\\\"echo x > ${target}\\\\\\"\\""`,
+      expect: 'block',
+      klass: 'X',
+      label: `x-f2-d3-${target.replace(/[^a-z0-9]/gi, '_')}`,
+      rationale: `helix-024 F2 depth-3 nested eval → ${target} must BLOCK via recursive unshellEscape`,
+    });
+  }
+  // F2 single-level negative regression — `eval "echo x > .rea/HALT"`
+  // must STILL block (single-level was already detected pre-fix; the
+  // unshellEscape change must not regress it).
+  for (const target of PROTECTED_TARGETS) {
+    fixtures.push({
+      cmd: `eval "echo x > ${target}"`,
+      expect: 'block',
+      klass: 'X',
+      label: `x-f2-d1-regression-${target.replace(/[^a-z0-9]/gi, '_')}`,
+      rationale: `helix-024 F2 regression: depth-1 eval → ${target} must STILL BLOCK`,
+    });
+  }
+
+  // ── F3 — ln SRC=protected → DEST=any → write-through-link ────────
+  // Walker emits `ln_to_protected_unresolvable` whenever `ln` argv has
+  // a literal protected source. Scanner refuses on uncertainty
+  // regardless of where DEST lands (DEST is an unprotected token in
+  // the kill-switch case — the write goes through the symlink).
+  const F3_LN_FORMS: Array<[string, string]> = [
+    ['ln-sf', 'ln -sf'],
+    ['ln-s', 'ln -s'],
+    ['ln-hard', 'ln'],
+    ['ln-symbolic', 'ln --symbolic'],
+    ['ln-force-sym', 'ln -s -f'],
+  ];
+  for (const target of PROTECTED_TARGETS) {
+    for (const [formId, lnCmd] of F3_LN_FORMS) {
+      fixtures.push({
+        cmd: `${lnCmd} ${target} /tmp/_x && echo y > /tmp/_x`,
+        expect: 'block',
+        klass: 'X',
+        label: `x-f3-${formId}-${target.replace(/[^a-z0-9]/gi, '_')}`,
+        rationale: `helix-024 F3 ${formId} SRC=${target} → /tmp/_x then write through link must BLOCK`,
+      });
+      fixtures.push({
+        cmd: `${lnCmd} ${target} /tmp/sneaky; echo y > /tmp/sneaky`,
+        expect: 'block',
+        klass: 'X',
+        label: `x-f3-${formId}-semi-${target.replace(/[^a-z0-9]/gi, '_')}`,
+        rationale: `helix-024 F3 ${formId} SRC=${target} (sequence) must BLOCK on ln source alone`,
+      });
+    }
+    // `ln -t` form: SRC is a positional, DEST is the -t directory.
+    fixtures.push({
+      cmd: `ln -s -t /tmp/dir ${target}`,
+      expect: 'block',
+      klass: 'X',
+      label: `x-f3-tdir-${target.replace(/[^a-z0-9]/gi, '_')}`,
+      rationale: `helix-024 F3 ln -s -t DEST_DIR ${target} (target-directory form) must BLOCK on protected SRC`,
+    });
+  }
+  // F3 against protected-dir ancestors — the `isDestructive: true`
+  // emit lets the protected-ancestry semantic kick in.
+  for (const dir of PROTECTED_DIR_ANCESTORS) {
+    fixtures.push({
+      cmd: `ln -s ${dir} /tmp/_x && echo y > /tmp/_x/HALT`,
+      expect: 'block',
+      klass: 'X',
+      label: `x-f3-dir-ancestor-${dir.replace(/[^a-z0-9]/gi, '_')}`,
+      rationale: `helix-024 F3 ln -s SRC=${dir} (dir ancestor) must BLOCK via protected-ancestry`,
+    });
+  }
+
+  // ── X-neg — every fix must NOT over-block ────────────────────────
+  // F1-neg: cd to non-protected dir + write. cd token is literal,
+  // walker still emits `cwd_protected_unresolvable`, but the scanner's
+  // protected-prefix test on `/tmp/scratch` etc. returns no match →
+  // ALLOW.
+  fixtures.push({
+    cmd: `cd /tmp/scratch && echo x > log`,
+    expect: 'allow',
+    klass: 'X-neg',
+    label: 'x-neg-f1-cd-tmp-write',
+    rationale: 'F1 negative: cd to /tmp/scratch (non-protected) + write must ALLOW',
+  });
+  fixtures.push({
+    cmd: `cd docs && cat README.md`,
+    expect: 'allow',
+    klass: 'X-neg',
+    label: 'x-neg-f1-cd-docs-read',
+    rationale: 'F1 negative: cd to docs + read-only must ALLOW (no write in AST)',
+  });
+  fixtures.push({
+    cmd: `cd ..`,
+    expect: 'allow',
+    klass: 'X-neg',
+    label: 'x-neg-f1-cd-parent',
+    rationale: 'F1 negative: bare cd .. must ALLOW (no write in AST)',
+  });
+  fixtures.push({
+    cmd: `cd /tmp/safe`,
+    expect: 'allow',
+    klass: 'X-neg',
+    label: 'x-neg-f1-cd-only',
+    rationale: 'F1 negative: cd-only with no following write must ALLOW',
+  });
+  fixtures.push({
+    cmd: `pushd /tmp && popd`,
+    expect: 'allow',
+    klass: 'X-neg',
+    label: 'x-neg-f1-pushd-popd',
+    rationale: 'F1 negative: pushd/popd round-trip with no write must ALLOW',
+  });
+  // R16 negatives — bare cd / cd-flag-only / popd with no bare-relative
+  // write in scope must ALLOW (read-only or absolute-write only).
+  fixtures.push({
+    cmd: `cd && cat README.md`,
+    expect: 'allow',
+    klass: 'X-neg',
+    label: 'x-neg-r16-bare-cd-read',
+    rationale: 'R16 negative: bare cd + read-only must ALLOW (no write in AST)',
+  });
+  fixtures.push({
+    cmd: `popd && ls -la`,
+    expect: 'allow',
+    klass: 'X-neg',
+    label: 'x-neg-r16-popd-ls',
+    rationale: 'R16 negative: popd + read-only must ALLOW',
+  });
+  fixtures.push({
+    cmd: `cd -L && echo > /tmp/log`,
+    expect: 'allow',
+    klass: 'X-neg',
+    label: 'x-neg-r16-cd-L-abs-write',
+    rationale: 'R16 negative: cd -L + absolute write must ALLOW (target not bare-relative)',
+  });
+  fixtures.push({
+    cmd: `cd -P && echo > /var/log/app.log`,
+    expect: 'allow',
+    klass: 'X-neg',
+    label: 'x-neg-r16-cd-P-abs-write',
+    rationale: 'R16 negative: cd -P + absolute write must ALLOW (target not bare-relative)',
+  });
+  fixtures.push({
+    cmd: `cd .rea && cat README.md`,
+    expect: 'allow',
+    klass: 'X-neg',
+    label: 'x-neg-f1-cd-rea-read',
+    rationale: 'F1 negative: cd to .rea but read-only AST must ALLOW (no write to refuse on)',
+  });
+  fixtures.push({
+    cmd: `pwd`,
+    expect: 'allow',
+    klass: 'X-neg',
+    label: 'x-neg-f1-pwd',
+    rationale: 'F1 negative: pwd alone must ALLOW',
+  });
+  fixtures.push({
+    cmd: `ls -la`,
+    expect: 'allow',
+    klass: 'X-neg',
+    label: 'x-neg-f1-ls',
+    rationale: 'F1 negative: ls -la must ALLOW',
+  });
+  // F2-neg: eval with no protected payload.
+  fixtures.push({
+    cmd: `eval "echo hello"`,
+    expect: 'allow',
+    klass: 'X-neg',
+    label: 'x-neg-f2-eval-hello',
+    rationale: 'F2 negative: eval with safe payload must ALLOW',
+  });
+  fixtures.push({
+    cmd: `eval "eval \\"echo hello\\""`,
+    expect: 'allow',
+    klass: 'X-neg',
+    label: 'x-neg-f2-eval-d2-hello',
+    rationale: 'F2 negative: depth-2 eval with safe payload must ALLOW after unshellEscape',
+  });
+  fixtures.push({
+    cmd: `eval "echo > /tmp/safe.log"`,
+    expect: 'allow',
+    klass: 'X-neg',
+    label: 'x-neg-f2-eval-tmp-write',
+    rationale: 'F2 negative: eval writing to /tmp must ALLOW',
+  });
+  // F3-neg: ln between two non-protected paths.
+  fixtures.push({
+    cmd: `ln -s /tmp/a /tmp/b`,
+    expect: 'allow',
+    klass: 'X-neg',
+    label: 'x-neg-f3-tmp-tmp',
+    rationale: 'F3 negative: ln -s /tmp/a /tmp/b (no protected path) must ALLOW',
+  });
+  fixtures.push({
+    cmd: `ln -s docs/file.md /tmp/link`,
+    expect: 'allow',
+    klass: 'X-neg',
+    label: 'x-neg-f3-docs-tmp',
+    rationale: 'F3 negative: ln -s docs/file.md /tmp/link (non-protected source) must ALLOW',
+  });
+  fixtures.push({
+    cmd: `ln -s /usr/bin/node /tmp/node`,
+    expect: 'allow',
+    klass: 'X-neg',
+    label: 'x-neg-f3-bin-tmp',
+    rationale: 'F3 negative: ln -s /usr/bin/node /tmp/node must ALLOW',
+  });
+  fixtures.push({
+    cmd: `ln /tmp/source /tmp/hardlink`,
+    expect: 'allow',
+    klass: 'X-neg',
+    label: 'x-neg-f3-hard-tmp',
+    rationale: 'F3 negative: hard link /tmp → /tmp must ALLOW',
+  });
+  // Composition: `cd safe && eval "echo hello"` — combining the three
+  // detection paths must not over-block when no protected interaction.
+  fixtures.push({
+    cmd: `cd /tmp && eval "echo hello"`,
+    expect: 'allow',
+    klass: 'X-neg',
+    label: 'x-neg-compose-cd-eval-safe',
+    rationale: 'Compose negative: cd safe + eval safe must ALLOW',
+  });
+
+  // ── Round-14 codex P1 refinement — F1 over-correction fixes ───────
+  // The first F1 iteration used a coarse global-write predicate that
+  // over-blocked these idioms. The refined predicate must ALLOW them.
+  // See `detectCwdChangeIntoProtected` doctor block in walker.ts for
+  // the four-rule predicate: in-scope, bare-relative, known-safe
+  // dynamic source, conservative dynamic fallback.
+  const R14_ALLOW: Array<[string, string, string]> = [
+    [
+      'x-neg-r14-cd-repo-root-abs-write',
+      `cd "$REPO_ROOT" && echo > /tmp/log`,
+      'R14: cd "$REPO_ROOT" + ABSOLUTE write must ALLOW (no bare-relative write in scope)',
+    ],
+    [
+      'x-neg-r14-cd-pwd-bare-write',
+      `cd "$(pwd)" && echo > log`,
+      'R14: cd "$(pwd)" + bare write must ALLOW ($(pwd) is known-safe cmdsubst)',
+    ],
+    [
+      'x-neg-r14-cd-git-toplevel-bare-write',
+      `cd "$(git rev-parse --show-toplevel)" && pnpm test > out.log`,
+      'R14: cd "$(git rev-parse --show-toplevel)" + bare write must ALLOW (CI idiom)',
+    ],
+    [
+      'x-neg-r14-for-iter-cd-bare-write',
+      `for d in src test; do cd "$d" && echo x > out; done`,
+      'R14: for d in <safe-literals>; do cd "$d" + bare write done must ALLOW (iter is safe — Items literals statically checked)',
+    ],
+    [
+      'x-neg-r14-cross-scope-tmp-and-rea-read',
+      `cd /tmp && echo > log; cd .rea && cat HALT`,
+      'R14: cross-scope (cd safe-with-write); (cd protected READ-ONLY) must ALLOW',
+    ],
+    [
+      'x-neg-r14-cd-rea-read-only-cat',
+      `cd .rea && cat HALT`,
+      'R14: cd .rea + cat (read-only, no write in scope) must ALLOW',
+    ],
+    [
+      'x-neg-r14-cd-tmp-bare-write-single',
+      `cd /tmp && echo > log`,
+      'R14: cd /tmp + bare write must ALLOW (literal cd target /tmp is non-protected)',
+    ],
+    // Auxiliary R14 ALLOW: cd in subshell with read-only AST
+    [
+      'x-neg-r14-subsh-cd-rea-read',
+      `(cd .rea && cat HALT)`,
+      'R14: subshell cd .rea + read-only must ALLOW (no write in scope)',
+    ],
+    // Auxiliary R14 ALLOW: dynamic cd unknown source but only abs writes
+    [
+      'x-neg-r14-cd-unknown-only-abs-write',
+      `cd "$P" && echo > /tmp/log`,
+      'R14: cd $P (unknown source) + ABSOLUTE-only write must ALLOW (no bare-relative in scope)',
+    ],
+  ];
+  for (const [label, cmd, rationale] of R14_ALLOW) {
+    fixtures.push({ cmd, expect: 'allow', klass: 'X-neg', label, rationale });
+  }
+
+  // R14 must-BLOCK fixtures — refined predicate must STILL catch real
+  // attacks. These are positives but live alongside the negatives so
+  // a future regression in the predicate (over-relaxation) surfaces by
+  // exact-cmd label.
+  const R14_BLOCK: Array<[string, string, string]> = [
+    [
+      'x-r14-poc-cd-rea-bare-write-baseline',
+      `cd .rea && echo x > HALT`,
+      'R14 baseline: literal protected cd + bare write must STILL BLOCK',
+    ],
+    [
+      'x-r14-poc-dyn-unknown-bare-write',
+      `cd "$P" && echo > HALT`,
+      'R14 baseline: dynamic cd unknown source + bare write must BLOCK on uncertainty',
+    ],
+    [
+      'x-r14-poc-cd-husky-nested-relative-write',
+      `cd .husky && echo x > pre-push.d/X`,
+      'R14 baseline: cd .husky + nested-relative write must STILL BLOCK',
+    ],
+    // ── Round-15 P1: env-var rebind via inline assignment-prefix ──
+    // Previously these were R14_ALLOW (incorrectly) on the assumption
+    // that $HOME / $PWD / $OLDPWD were set by the shell to safe absolute
+    // paths. They are NOT — inline assignment-prefix on the same simple
+    // command rebinds them, parent-shell exports rebind them across
+    // commands, and OLDPWD tracks any previous cd including cds into
+    // protected dirs. Static analysis cannot prove a name's runtime
+    // value, so all env-var ParamExp expansions must be refused.
+    [
+      'x-r15-poc-cd-home-bare-write',
+      `cd "$HOME" && echo > log`,
+      'R15 F1: cd "$HOME" + bare write must BLOCK (env vars rebindable via assignment-prefix or parent-shell export — refuse on uncertainty)',
+    ],
+    [
+      'x-r15-poc-pushd-home-bare-write',
+      `pushd "$HOME" && echo > out`,
+      'R15 F1: pushd "$HOME" + bare write must BLOCK (env vars rebindable via assignment-prefix or parent-shell export — refuse on uncertainty)',
+    ],
+    [
+      'x-r15-poc-cd-oldpwd-bare-write',
+      `cd "$OLDPWD" && echo > log`,
+      'R15 F1: cd "$OLDPWD" + bare write must BLOCK (OLDPWD tracks previous cd including into protected dirs — refuse on uncertainty)',
+    ],
+    [
+      'x-r15-poc-home-rebind-prefix-cd-write',
+      `HOME=.rea cd "$HOME" && echo > HALT`,
+      'R15 F1 PoC: HOME=.rea cd "$HOME" — inline assignment-prefix rebinds HOME on the same simple command; must BLOCK',
+    ],
+    [
+      'x-r15-poc-pwd-rebind-prefix-cd-write',
+      `PWD=.rea cd "$PWD" && echo > HALT`,
+      'R15 F1 PoC: PWD=.rea cd "$PWD" — inline assignment-prefix rebinds PWD; must BLOCK',
+    ],
+    [
+      'x-r15-poc-show-prefix-cd-write',
+      `cd "$(git rev-parse --show-prefix)" && echo > HALT`,
+      'R15 F2 PoC: $(git rev-parse --show-prefix) returns cwd-relative-to-toplevel — `.rea/` when agent cwd is .rea; must BLOCK',
+    ],
+    [
+      'x-r15-poc-export-home-then-cd-write',
+      `export HOME=.rea; cd "$HOME" && echo > HALT`,
+      'R15 F1 PoC: parent-shell export HOME=.rea + later cd "$HOME" — env-var rebind across commands; must BLOCK',
+    ],
+    // ── Round-16 P1: bare cd / cd flag-only / cd - / popd ──
+    // Sibling threat class to R15 F1 — bare `cd` defaults cwd to $HOME,
+    // `cd -` to $OLDPWD, `popd` to dir-stack head. All are runtime-
+    // determined and env-var rebindable; refuse on uncertainty when
+    // bare-relative writes are in scope.
+    [
+      'x-r16-poc-bare-cd-write',
+      `cd && echo > HALT`,
+      'R16: bare cd defaults to $HOME — same R15 F1 threat class, must BLOCK',
+    ],
+    [
+      'x-r16-poc-cd-dash-write',
+      `cd - && echo > HALT`,
+      'R16: cd - reverts to OLDPWD — same R15 F1 threat class, must BLOCK',
+    ],
+    [
+      'x-r16-poc-cd-L-write',
+      `cd -L && echo > HALT`,
+      'R16: cd -L (no positional) defaults to $HOME, must BLOCK',
+    ],
+    [
+      'x-r16-poc-cd-P-write',
+      `cd -P && echo > HALT`,
+      'R16: cd -P (no positional) defaults to $HOME, must BLOCK',
+    ],
+    [
+      'x-r16-poc-popd-write',
+      `popd && echo > HALT`,
+      'R16: popd reverts to dir-stack head — runtime-determined, must BLOCK',
+    ],
+    // ── Round-17 P1: IfClause / WhileClause / UntilClause Cond +
+    // cwd-persistence into body and past the conditional. The 0.23.1
+    // walker's descendCmdScopes walked Cond and Body as separate scopes,
+    // so a `cd .rea` in the Cond never saw the body's writes as
+    // downstream — and post-conditional siblings were missed too. R17
+    // closes both via extraDownstream threading: Cond carries [body,
+    // post-stmt-siblings] and Body carries [post-stmt-siblings].
+    [
+      'x-r17-poc-if-cd-then-write',
+      `if cd .rea; then echo > HALT; fi`,
+      'R17 P1: cd in if-cond, write in then-body — must BLOCK (cwd persists into body)',
+    ],
+    [
+      'x-r17-poc-if-cd-husky-prepush',
+      `if cd .husky; then echo > pre-push; fi`,
+      'R17 P1: cd in if-cond, husky/pre-push write — must BLOCK',
+    ],
+    [
+      'x-r17-poc-if-cd-then-else',
+      `if cd .rea; then echo > HALT; else echo ok; fi`,
+      'R17 P1: cd in if-cond + else branch — must BLOCK',
+    ],
+    [
+      'x-r17-poc-while-cd-then-write',
+      `while cd .rea; do echo > HALT; break; done`,
+      'R17 P1: cd in while-cond, write in do-body — must BLOCK',
+    ],
+    [
+      'x-r17-poc-until-cd-then-write',
+      `until cd .rea; do echo > HALT; done`,
+      'R17 P1: cd in until-cond, write in do-body — must BLOCK',
+    ],
+    [
+      'x-r17-poc-if-cd-binary-then-write',
+      `if true && cd .rea; then echo > HALT; fi`,
+      'R17 P1: cd in if-cond binary expr — must BLOCK',
+    ],
+    [
+      'x-r17-poc-if-cd-then-noop-postwrite',
+      `if cd .rea; then :; fi; echo > HALT`,
+      'R17 P1: cd in if-cond, write AFTER if — cwd persists, must BLOCK',
+    ],
+    // ── Round-17 P2: TimeClause / CoprocClause not descended in
+    // collectCdSitesInBinaryX before R17. `time cd .rea && echo > HALT`
+    // parses as BinaryCmd(X=Stmt[TimeClause[Stmt[cd .rea]]], Y=Stmt[echo
+    // > HALT]) — the cd lives one wrap-level deeper than CallExpr/
+    // BinaryCmd expects. R17 unwraps TimeClause/CoprocClause via the
+    // BinaryX walker so the cd site sees the && Y as downstream.
+    [
+      'x-r17-poc-time-cd-then-write',
+      `time cd .rea && echo > HALT`,
+      'R17 P2: time-wrapped cd — must BLOCK',
+    ],
+    // ── Round-17 P3: pushd no-positional / pushd -N / pushd +N. These
+    // already BLOCK incidentally via the R16 fallback (runtime-determined
+    // dir-stack manipulation refused on uncertainty), but the verdict
+    // wasn't pinned by a regression fixture before R17. Pinning ensures
+    // a future relaxation can't silently re-open the bypass.
+    [
+      'x-r17-poc-pushd-noargs-write',
+      `pushd && echo > HALT`,
+      'R17 P3: pushd (no args) swaps dir-stack — must BLOCK',
+    ],
+    [
+      'x-r17-poc-pushd-rotate-N-write',
+      `pushd -0 && echo > HALT`,
+      'R17 P3: pushd -N rotates stack — pin BLOCK verdict',
+    ],
+    [
+      'x-r17-poc-pushd-rotate-plus-write',
+      `pushd +1 && echo > HALT`,
+      'R17 P3: pushd +N rotates stack — pin BLOCK verdict',
+    ],
+  ];
+  for (const [label, cmd, rationale] of R14_BLOCK) {
+    fixtures.push({ cmd, expect: 'block', klass: 'X', label, rationale });
+  }
+
+  // ── Round-17 negative pins — R17 widens the cd-downstream reach into
+  // body/post-conditional regions, but the bare-relative-write predicate
+  // still bounds emission. These ALLOWs verify the over-block surface
+  // codex flagged in P1 stays acceptable.
+  const R17_ALLOW: Array<[string, string, string]> = [
+    [
+      'x-r17-neg-pushd-noargs-read',
+      `pushd && cat README.md`,
+      'R17: pushd no-args + read only — must ALLOW (no bare-relative WRITE in scope)',
+    ],
+    [
+      'x-r17-neg-if-cd-noprotected-write',
+      `if cd /tmp; then echo > log; fi`,
+      'R17: cd to safe dir + write — must ALLOW (literal cd target /tmp is non-protected)',
+    ],
+    [
+      'x-r17-neg-if-cd-protected-readonly',
+      `if cd .rea; then cat HALT; fi`,
+      'R17: cd to protected + read only — must ALLOW (no bare-relative WRITE in scope)',
+    ],
+  ];
+  for (const [label, cmd, rationale] of R17_ALLOW) {
+    fixtures.push({ cmd, expect: 'allow', klass: 'X-neg', label, rationale });
+  }
+
+  return { fixtures, skipped: [] };
+}
+
+/**
  * Master compose — all classes. Each class returns ALL its fixtures
  * (positives + negatives + skips). The runner picks them up.
  */
@@ -3518,6 +4148,12 @@ export function composeAdversarialCorpus(): {
     // cmake -E surface, mkfifo/mknod, find -fls/-fprint, unzip read-only
     // false-positive regression).
     ['W', classW],
+    // helix-024 — cwd-relative-write + double-eval + symlink-alias-write.
+    // Three new walker passes (`detectCwdChangeIntoProtected`, eval-
+    // recursion depth cap, `ln_to_protected_unresolvable`) close the
+    // 0.23.0 static-AST-scanner bypass classes that defeated `.rea/HALT`,
+    // `.rea/policy.yaml`, `.claude/settings.json`, and `.husky/`.
+    ['X', classX],
   ];
 
   for (const [name, fn] of classes) {
@@ -3544,6 +4180,7 @@ export function composeAdversarialCorpus(): {
     U: ['U-neg'],
     V: ['V-neg'],
     W: ['W-neg'],
+    X: ['X-neg'],
   };
   for (const [base, negs] of Object.entries(splitMap)) {
     const all = byKlass[base] ?? [];

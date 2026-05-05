@@ -630,6 +630,40 @@ describe('adversarial corpus — Class W-neg (round 12 negatives)', () => {
 });
 
 // ─────────────────────────────────────────────────────────────────────
+//  Class X — helix-024 closures (cwd-relative-write + doubly-nested
+//    eval + symlink-alias-write). Pins the 14 helix-024 PoCs plus a
+//    cross-product so the three new walker passes
+//    (detectCwdChangeIntoProtected, eval-recursion depth cap,
+//    ln_to_protected_unresolvable) all stay closed.
+// ─────────────────────────────────────────────────────────────────────
+
+describe('adversarial corpus — Class X (helix-024 closures)', () => {
+  const fixtures = corpus.byKlass['X'] ?? [];
+  it.each(fixtures.map((f) => [f.label, f]))('%s', (_label, f) => {
+    const v = p(f.cmd);
+    if (v.verdict !== f.expect) {
+      throw new Error(
+        `[Class ${f.klass}] ${f.label}\n  cmd: ${f.cmd}\n  expect=${f.expect} got=${v.verdict}\n  rationale: ${f.rationale}`,
+      );
+    }
+    expect(v.verdict).toBe(f.expect);
+  });
+});
+
+describe('adversarial corpus — Class X-neg (helix-024 negatives)', () => {
+  const fixtures = corpus.byKlass['X-neg'] ?? [];
+  it.each(fixtures.map((f) => [f.label, f]))('%s', (_label, f) => {
+    const v = p(f.cmd);
+    if (v.verdict !== f.expect) {
+      throw new Error(
+        `[Class ${f.klass}] ${f.label}\n  cmd: ${f.cmd}\n  expect=${f.expect} got=${v.verdict}\n  rationale: ${f.rationale}`,
+      );
+    }
+    expect(v.verdict).toBe(f.expect);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────
 //  Coverage assertion — corpus size pins our test surface
 // ─────────────────────────────────────────────────────────────────────
 
@@ -823,6 +857,9 @@ describe('adversarial corpus — coverage', () => {
       // Codex round 12 — F12-1..F12-9 closures.
       'W',
       'W-neg',
+      // helix-024 — cwd-relative-write + double-eval + symlink-alias-write.
+      'X',
+      'X-neg',
     ]) {
       expect(corpus.byKlass[k]?.length ?? 0).toBeGreaterThan(0);
     }

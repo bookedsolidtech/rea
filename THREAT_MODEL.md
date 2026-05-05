@@ -891,9 +891,180 @@ The scanner does NOT trust:
   Round-12 fix: early-return ALLOW from detectUnzip when any
   read-only flag (or cluster char) present. Class W (round-12
   closures — 173 positives + 18 negatives) pins the closure.
+- **cwd-relative-write kill-switch defeat** (helix-024 F1 — P1
+  closed in 0.23.1). `cd .rea && echo > HALT`,
+  `cd .husky && echo > pre-push`, `(cd .rea && echo > HALT)`,
+  `pushd .rea && echo > HALT`, `echo x | (cd .rea && tee HALT)`,
+  `p=.rea; cd $p && echo > HALT` all defeated 0.23.0. Pre-fix the
+  walker emitted only the relative redirect target (`HALT`); the
+  scanner normalized `HALT` against REA_ROOT and got `HALT`,
+  which doesn't match `.rea/HALT`. The cd was structurally
+  invisible — the walker source explicitly documented this limit.
+  Closure: new `detectCwdChangeIntoProtected` post-walker pass
+  scans the AST a second time for `cd`/`pushd` CallExprs and
+  emits a synthetic `cwd_protected_unresolvable` (literal target
+  — scanner runs the protected-prefix test with
+  `forceDirSemantics: true`) or `cwd_dynamic_with_writes_unresolvable`
+  (dynamic target — refuse on uncertainty) under a four-rule
+  refined predicate (round-14 codex P1 over-correction fix,
+  tightened in round-15 closure below):
+  (1) writes must be in-scope of the cd (sequential successors
+  in the same StmtList, or BinaryCmd.Y subtree of cd's BinaryCmd.X,
+  or nested compound stmts of those — NOT unrelated parallel
+  stmts); (2) writes must be bare-relative path-shape (absolute /
+  tilde / outside-root sentinels are unaffected by cwd); (3)
+  dynamic cd with a known-safe source is treated as ALLOW. The
+  known-safe set is intentionally narrow: NO env-var name
+  qualifies (round-15 P1 closure — `$HOME`/`$PWD`/`$OLDPWD` are
+  rebindable via inline assignment-prefix or parent-shell export,
+  and `$OLDPWD` tracks any previous cd including into protected
+  dirs); the only ParamExp source that is known-safe is a for-iter
+  variable bound to all-literal-non-protected Items. Known-safe
+  cmdsubst sources are `$(pwd)` and `$(git rev-parse <flag>)`
+  with flag in `{--show-toplevel, --show-cdup,
+  --show-superproject-working-tree}` — flags that resolve to
+  absolute paths or paths stepping OUT of cwd. `$(git rev-parse
+  --show-prefix)` is NOT known-safe (round-15 P1 closure — it
+  returns the cwd-relative path INSIDE the toplevel, so when the
+  agent is already in `.rea/` it returns `.rea/`). (4) dynamic cd
+  without bare-relative writes in scope emits nothing. Caught:
+  literal protected cd + bare-relative writes in any nested scope,
+  dynamic cd with unknown / env-var / show-prefix source +
+  bare-relative write in scope. Accepted false-negatives
+  (out of scope for hotfix, tracked for 0.24.0):
+  `cd $(echo .rea)` cmdsubst-resolved literals,
+  `alias evil="..."; evil` alias-then-invoke, for-iter loops
+  whose Items list is a cmdsubst.
+- **doubly/N-nested eval bypass** (helix-024 F2 — P1 closed in
+  0.23.1). `eval "eval \"echo > .rea/HALT\""` defeated 0.23.0.
+  Pre-fix `detectEval` re-parsed exactly one level. The outer DQ-
+  significant escapes (`\"`) survived as literal backslash-quote
+  pairs into the joined inner string, corrupting the second-
+  level redirect target (`.rea/HALT\"`) so it didn't match the
+  protected list. Same shape as the helix-022 #3 nested-bash-c
+  DQ-escape bypass — `unshellEscape` collapses one level of DQ-
+  escapes before re-parse. Closure: two-part fix. (1)
+  unshellEscape the inner string before re-parsing in detectEval
+  (parity with detectNestedShell). (2) New `EVAL_DEPTH_CAP = 8`
+  counter mirroring NESTED_SHELL_DEPTH_CAP; past the cap the
+  walker emits a synthetic dynamic detection. Eval and bash -c
+  use SEPARATE counters so a heavy mix doesn't exhaust one
+  budget through the other. Single-level `eval "echo > .rea/
+  HALT"` continues to BLOCK (no regression).
+- **symlink-alias-write kill-switch defeat** (helix-024 F3 — P1
+  closed in 0.23.1). `ln -sf .rea/HALT /tmp/_x && echo y > /tmp/
+  _x` exited 0 in 0.23.0. The static walker doesn't track
+  filesystem state across statements; the first statement stages
+  a symlink whose target is protected, the second writes through
+  the link. Neither token in isolation references a protected
+  write target — `ln`'s SRC was just a positional, DEST was
+  unprotected. Closure: detectLn emits a synthetic
+  `ln_to_protected_unresolvable` detection on every SRC positional
+  in both `ln SRC DEST` and `ln -t DEST_DIR SRC1 ...` forms. The
+  detection carries `isDestructive: true` so protected-ancestry
+  matches bare-dir SRCs (`ln -s .rea /tmp/_x` aliases the .rea
+  directory). Dynamic SRC emits the dynamic form. Class X
+  (helix-024 closures — 234 positives + 16 negatives) pins all
+  three closures. Related class deferred to 0.24.0:
+  alias-then-invoke (`alias evil="echo > .rea/HALT"; evil`)
+  requires modeling shell aliases at AST time.
+- **env-var rebind + `--show-prefix` cwd-eval bypass**
+  (helix-024 round-15 P1 — closed in 0.23.1). Round-14's
+  `detectCwdChangeIntoProtected` refined predicate ALLOWed dynamic
+  cd whose source was an env-var ParamExp from
+  `{HOME, PWD, OLDPWD}` or a cmdsubst from `git rev-parse
+  --show-prefix`. Both classes are attacker-controllable. (1) Env
+  vars rebind via inline assignment-prefix on the same simple
+  command (`HOME=.rea cd "$HOME" && echo > HALT`) and via
+  parent-shell exports across commands (`export HOME=.rea; cd
+  "$HOME" && echo > HALT`); `OLDPWD` automatically tracks any
+  previous cd, so a prior cd into a protected dir poisons later
+  `cd "$OLDPWD"`. (2) `git rev-parse --show-prefix` returns the
+  cwd-relative path INSIDE the toplevel; when the agent's cwd is
+  already `.rea/`, `cd "$(git rev-parse --show-prefix)" && echo
+  > HALT` lands inside `.rea/` with a `HALT` write target that
+  resolves against `.rea/HALT`. Closure: empty `KNOWN_SAFE_VARS`
+  in `isParamExpKnownSafe` (no env-var name is statically safe;
+  the for-iter carve-out remains because Items literals are
+  statically checked); drop `--show-prefix` from the
+  `isCmdSubstKnownSafe` FLAGS allow-list (the remaining flags
+  `--show-toplevel`, `--show-cdup`,
+  `--show-superproject-working-tree` resolve to absolute paths or
+  paths stepping OUT of cwd — never INTO it). Class X corpus
+  rehomes: 3 fixtures moved from R14_ALLOW to R14_BLOCK
+  (`cd "$HOME"` / `cd "$OLDPWD"` / `pushd "$HOME"` with bare
+  writes), 4 new BLOCK fixtures pin the round-15 PoCs
+  (`HOME=.rea cd "$HOME"`, `PWD=.rea cd "$PWD"`,
+  `cd "$(git rev-parse --show-prefix)"`,
+  `export HOME=.rea; cd "$HOME"`). Single-level eval, ln-source-
+  protected, and the literal `cd .rea` path remain unchanged. As
+  a side improvement under round-15 P3, `.github/workflows/` is
+  added to the historical default protected list so consumers
+  without an explicit `policy.blocked_paths` entry still refuse
+  Bash-tier writes to CI workflows; the path is intentionally NOT
+  a kill-switch invariant — operators may relax it via
+  `policy.protected_paths_relax`. Round-16 closure (helix-024
+  hotfix continued, sibling threat class to round-15 F1) extends
+  the refuse-on-uncertainty path to bare `cd` (defaults cwd to
+  `$HOME`), `cd -L` / `cd -P` (flag-only, also default to
+  `$HOME`), `cd -` (reverts to `$OLDPWD`), and `popd` (reverts
+  to dir-stack head): all four forms emit no positional after
+  flag-skip and previously fell through with no detection — they
+  now run the same in-scope bare-relative-write check as the
+  dynamic-target branch and emit
+  `cwd_dynamic_with_writes_unresolvable` if a bare-relative write
+  is in scope. 5 new R16_BLOCK fixtures + 4 R16-shape negatives
+  added to Class X corpus.
+  Round-17 closure (helix-024 hotfix continued, P1 + P2 + P3 +
+  P3-doc — control-flow walker gap, NOT a predicate weakness): the
+  round-14/15/16 walker visited a conditional's Cond and Body as
+  separate scopes via `walkScopeForCwd`. A `cd` inside the Cond
+  therefore had a single-command scope with no successors, never
+  collected the body's writes as downstream, and never emitted —
+  even though bash semantics keep the cwd change in the current
+  shell so it persists into the Body when the cond is truthy AND
+  past the conditional into post-stmt siblings. Closure: thread an
+  `extraDownstream` parameter through `walkScopeForCwd` →
+  `classifyCdInStmt` → `collectCdSitesInStmt` /
+  `collectCdSitesInBinaryX`. When `descendCmdScopes` enters an
+  IfClause/WhileClause/UntilClause, the Cond walk receives `[...
+  body, ...post-stmt-siblings]` as carriers; the Body walk receives
+  `[...post-stmt-siblings]`. Subshell stays cwd-isolated (forks a
+  child shell) so its inner walk does NOT inherit parent siblings.
+  The same closure adds explicit `TimeClause` / `CoprocClause`
+  cases to `descendCmdScopes` (descend into the wrapped Stmt with
+  carriers) and a TimeClause/CoprocClause unwrap in
+  `collectCdSitesInBinaryX` so `time cd .rea && echo > HALT`
+  reaches the cd site. `pushd` no-positional / `pushd -N` /
+  `pushd +N` already BLOCK incidentally via the round-16 fallback
+  (runtime-determined dir-stack manipulation refused on uncertainty),
+  but R17 P3 pins the verdict with three explicit fixtures so a
+  future predicate relaxation cannot silently re-open the bypass.
+  12 new R17_BLOCK fixtures + 3 R17_ALLOW negatives added to Class
+  X corpus, including the pragmatic-bound ALLOW for `pushd && cat
+  README.md` (no bare-relative WRITE in scope), `if cd /tmp; then
+  echo > log; fi` (literal non-protected cd target — protected-
+  prefix test ALLOWS), and `if cd .rea; then cat HALT; fi` (read-
+  only body — predicate requires a WRITE).
 
 ### 8.3 Bypass classes still possible
 
+- **`mvdan-sh@0.10.1` deprecation advisory** (helix-024 F4 — P2
+  acknowledged residual, surfaced 2026-05-04). The 0.23.0 upgrade
+  introduced `mvdan-sh@0.10.1` as a transitive runtime dependency
+  at the security boundary. The package is the JavaScript port of
+  mvdan's Go shell parser and is upstream-deprecated per
+  https://github.com/mvdan/sh/issues/1145 (Go-original is
+  actively maintained; the JS port is on hold). The deprecation
+  is a code-freeze, not a removal. Mitigations already in place:
+  (1) integrity hash pinned in pnpm-lock.yaml, (2) the project
+  fails closed on parser anomalies (parse errors → refuse on
+  uncertainty), (3) Class O exhaustiveness contract pins the
+  walker against any latent field-gap. A future mvdan-sh
+  migration / replacement is out-of-scope for the helix-024
+  hotfix; tracked for 0.24.0 evaluation. Listed as still-possible
+  rather than structurally-impossible because the security model
+  binds rea to a deprecated parser at the AST boundary.
 - **`@bookedsolid/rea` package-tier supply-chain compromise** (codex
   round 5 F5 — P1/P3 acknowledged residual). The bash-tier shim's
   CLI-resolution sandbox check (codex round 4 #2 + round 5 F2)
