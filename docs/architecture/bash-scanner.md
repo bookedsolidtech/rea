@@ -1110,6 +1110,287 @@ read-only / safe-target negatives). Composition tests cover
 wrapper + new dispatcher (`nice cmake -E rm`, `sudo mkfifo`,
 `bash -c "cmake -E rm"`, `bash -c "tar -cf"`).
 
+### Round 14 — helix-024 closures (cwd-relative-write + double-eval + symlink-alias-write)
+
+helix-024 surfaced three P1 kill-switch-bypass classes against the
+0.23.0 static AST scanner. All three exploit the gap between
+*"argv tokens contain a protected substring"* (which the scanner
+detects token-by-token) and *"the runtime write lands at a
+protected path"* (which requires reasoning the static scanner did
+not do). All three defeat `.rea/HALT`, `.rea/policy.yaml`,
+`.claude/settings.json`, and `.husky/`.
+
+**F1 [P1] — `cd <protected> && <relative-write>` defeats the
+scanner.** Pre-fix the scanner saw only the relative redirect
+target (`HALT` from `cd .rea && echo > HALT`), normalized it
+against REA_ROOT, and got `HALT` — which doesn't match
+`.rea/HALT` in the protected list. The cd was invisible. The
+walker source documented this limit explicitly: *"Cwd-relative
+tar invocations are NOT tracked — that requires a process-cwd
+model which the static scanner doesn't have."* The 0.23.0 shim
+was the dispatcher's caller; it did NOT verify cwd. Mitigation
+handoff was unfulfilled.
+
+Round-14 fix: new `detectCwdChangeIntoProtected(file, out)` post-
+walker pass that scans the AST a second time for `cd`/`pushd`
+CallExprs and emits one of two synthetic detections under the
+**refined four-rule predicate** (codex round 14 over-correction
+fix; the initial coarse predicate over-blocked common idioms
+like `cd "$HOME" && echo > log`).
+
+Predicate:
+
+1. **In-scope writes only.** A write must be reachable from the
+   cd in execution order within the SAME lexical scope:
+   sequential successor Stmts in the same StmtList, plus the
+   entire BinaryCmd.Y subtree when cd is in BinaryCmd.X, plus
+   nested-compound stmts of in-scope successors. Writes from
+   sibling Stmts before the cd, or in unrelated scopes (a
+   separate top-level Stmt earlier or later that has its own cd),
+   do NOT taint this cd's emit decision. So
+   `cd /tmp && echo > log; cd .rea && cat HALT` ALLOWs — the
+   first cd's downstream contains the safe write, the second
+   cd's downstream contains only a read.
+2. **Bare-relative target only.** Only writes whose static path-
+   shape is bare-relative (no leading `/`, no `~/`, not the
+   outside-root sentinel) actually move when cwd changes. So
+   `cd "$REPO_ROOT" && echo > /tmp/log` ALLOWs — the absolute
+   write is unaffected by the cd.
+3. **Known-safe dynamic source.** A dynamic cd whose entire
+   target Word is one of the known-safe expansions is ALLOWed
+   even with bare-relative writes in scope. The set is
+   intentionally narrow because misclassifying a name as safe
+   creates a real bypass:
+   - **No env-var name qualifies** (round-15 P1 closure). Earlier
+     iterations included `$HOME`/`$PWD`/`$OLDPWD` on the assumption
+     that the shell sets them to absolute paths outside the project
+     root. That assumption is wrong: inline assignment-prefix on the
+     same simple command rebinds them (`HOME=.rea cd "$HOME"`),
+     parent-shell exports rebind them across commands
+     (`export HOME=.rea; cd "$HOME"`), and `$OLDPWD` automatically
+     tracks any previous cd including cds into protected dirs.
+     Static analysis cannot prove a name's runtime value, so all
+     env-var ParamExp expansions fall through to rule (4).
+   - `$(pwd)` — cmdsubst that resolves to the cwd absolute path
+     itself; cwd doesn't change, so the cd is a no-op.
+   - `$(git rev-parse --show-toplevel)` — absolute path to the repo
+     root (independent of cwd depth).
+   - `$(git rev-parse --show-cdup)` — string of `../` segments that
+     can only step OUT of cwd, never IN.
+   - `$(git rev-parse --show-superproject-working-tree)` — absolute
+     path to the parent superproject (or empty when not in a
+     submodule).
+   - `$(git rev-parse --show-prefix)` is **NOT** in the cmdsubst
+     allow-list (round-15 P1 closure). It returns the cwd-relative
+     path INSIDE the toplevel — when the agent's cwd is `.rea/`
+     it returns `.rea/`, landing the cd inside a protected dir.
+   - For-iter variables whose Items list is all literal
+     non-protected paths (`for d in src test; do cd "$d" ...` →
+     `$d` is safe within the loop body). The safety property here is
+     structural: the iterator is bounded to the literal Items list,
+     which we already statically check for protected paths.
+
+   Anything else (`$P`, `$REPO_ROOT`, `$HOME`, `$PWD`, `$OLDPWD`,
+   `${VAR:-default}`, `$(git rev-parse --show-prefix)`, mixed
+   `prefix/$VAR`) is NOT known-safe — including a single modifier
+   on any var disqualifies it.
+4. **Conservative dynamic fallback.** Any other dynamic cd
+   target with a bare-relative write in scope emits
+   `cwd_dynamic_with_writes_unresolvable` so the scanner refuses
+   on uncertainty. A dynamic cd without bare-relative writes in
+   scope is a no-op — it cannot exfiltrate via writes that don't
+   exist.
+
+Two emit shapes (consumed by the scanner):
+
+- `cwd_protected_unresolvable` — cd target is a literal path.
+  Scanner runs the protected-prefix test with
+  `forceDirSemantics: true`; matches like `.rea`, `.husky`,
+  `.claude` against `.rea/HALT`, `.husky/pre-push`, etc. via the
+  dir-vs-file ancestry semantic. `cd /tmp` ALLOWs (literal but
+  outside protected list); `cd .rea` BLOCKs.
+- `cwd_dynamic_with_writes_unresolvable` — dynamic cd with
+  unknown-safe source AND a bare-relative write in scope.
+  Scanner refuses on uncertainty.
+
+Negative regressions verified by Class X-neg corpus extension:
+`cd "$REPO_ROOT" && echo > /tmp/log`,
+`cd "$(pwd)" && echo > log`, `cd "$(git rev-parse
+--show-toplevel)" && pnpm test > out.log`,
+`for d in src test; do cd "$d" && echo x > out; done`,
+`cd /tmp && echo > log; cd .rea && cat HALT`,
+`cd .rea && cat HALT`, `cd /tmp && echo > log` all ALLOW. Real
+attacks still BLOCK: `cd .rea && echo x > HALT`,
+`cd "$P" && echo > HALT`, `cd .husky && echo x > pre-push.d/X`,
+plus the round-15 P1 closures: `cd "$HOME" && echo > log`,
+`cd "$OLDPWD" && echo > log`, `pushd "$HOME" && echo > out`,
+`HOME=.rea cd "$HOME" && echo > HALT`,
+`PWD=.rea cd "$PWD" && echo > HALT`,
+`cd "$(git rev-parse --show-prefix)" && echo > HALT`,
+`export HOME=.rea; cd "$HOME" && echo > HALT`.
+
+**Accepted false-negatives (deferred to 0.24.0+).** The static
+predicate cannot model every dynamic-cd shape:
+- `cd $(echo .rea) && cat HALT` — cmdsubst that resolves to a
+  protected literal at runtime. The walker treats this as a
+  dynamic cd and emits IFF a bare-relative write is in scope; a
+  read-only follow-up does NOT fire.
+- `alias evil="cd .rea && echo > HALT"; evil` — alias-then-
+  invoke requires modeling shell aliases at AST time. Out of
+  scope for the helix-024 hotfix; tracked as a known limitation.
+- For-iter classification approximates: only literal-Items lists
+  qualify the iter variable as safe. A loop iterating over a
+  cmdsubst's output (`for d in $(ls dirs/); do cd "$d" ...`)
+  falls back to the conservative dynamic emit.
+
+**F2 [P1] — Doubly-nested eval bypasses 1-level recursion.** Pre-
+fix `detectEval` re-parsed the inner argv string exactly one
+level. For `eval "eval \"echo x > .rea/HALT\""` the outer DQ-
+significant escapes (`\"`) survived as literal backslash-quote
+pairs into the joined inner string, so the second-level re-parse
+saw a corrupted redirect target (`.rea/HALT\"`) that didn't match
+the protected list. This is the same shape as the helix-022 #3
+nested-bash-c DQ-escape fix — `unshellEscape` collapses one level
+of DQ-escapes before re-parse, mirroring what bash itself does
+between shell layers.
+
+Round-14 fix: two parts.
+- `unshellEscape` the inner string before re-parsing in
+  `detectEval`. Restores parity with `detectNestedShell`.
+- New `EVAL_DEPTH_CAP = 8` counter mirroring
+  `NESTED_SHELL_DEPTH_CAP`. Every eval re-parse increments
+  `CURRENT_EVAL_DEPTH`; past the cap, the walker emits a synthetic
+  dynamic detection and refuses on uncertainty. eval and bash -c
+  use SEPARATE counters so a heavy mix doesn't silently exhaust
+  one budget via the other.
+
+Single-level eval still BLOCKs (no regression): `eval "echo x >
+.rea/HALT"` was already detected pre-fix; the unshellEscape change
+preserves that path.
+
+**F3 [P1] — Symlink-alias-write defeats the scanner.** `ln -sf
+.rea/HALT /tmp/_x && echo y > /tmp/_x` exits 0 pre-fix because
+neither token in isolation references a protected write target —
+`ln`'s SRC was just an argv positional, and DEST was unprotected.
+The scanner doesn't track filesystem state across statements, so
+a subsequent write through `/tmp/_x` lands at `.rea/HALT` without
+any token in the second statement matching the protected list.
+
+Round-14 fix: `detectLn` emits a synthetic
+`ln_to_protected_unresolvable` detection on every SRC positional
+(both in the `ln SRC DEST` and `ln -t DEST_DIR SRC1 SRC2 ...`
+forms). The detection carries `isDestructive: true` so the
+scanner's protected-ancestry path matches bare-dir SRCs (`ln -s
+.rea /tmp/_x` aliases the `.rea` directory; without
+`isDestructive` the scanner would only match if SRC were `.rea/
+HALT` exactly). Dynamic-SRC ln (`ln -s $TARGET /tmp/_x`) emits
+the dynamic form so the scanner refuses on uncertainty.
+
+Negative regressions verified: `ln -s /tmp/a /tmp/b` ALLOWs (no
+protected SRC), `ln -s docs/file.md /tmp/link` ALLOWs (non-
+protected SRC), `ln -s /usr/bin/node /tmp/node` ALLOWs.
+
+**Deferred:** alias-then-invoke (`alias evil="echo x > .rea/HALT";
+evil`) is a related class noted in helix-024. Closing it requires
+modeling shell aliases at AST time — harder than the symlink case.
+Surfaced as 0.24.0 follow-up.
+
+**Test pinning:** Class X (269 fixtures: 244 positives + 25
+negatives after round-15 movements). Positives sweep the cross-
+product of (cd-form × protected-dir × write-shape), (eval-depth ×
+protected target × quote-shape), (ln-form × protected SRC ×
+write-through). All 14 helix-024 PoCs are pinned by exact-cmd
+label so any individual regression surfaces by name. Negatives
+include the cd-only / read-only-AST / non-protected-cd / non-
+protected-ln cases plus a composition negative
+(`cd /tmp && eval "echo hello"`) that proves the three new passes
+don't compound into over-blocks when none of the inputs are
+protected. Round-14 codex P1 refinement added 9 must-ALLOW
+fixtures (REPO_ROOT / $(pwd) / $(git rev-parse --show-toplevel) /
+for-iter / cross-scope / absolute-write-only / subshell-read-only)
+and 3 must-BLOCK fixtures (literal-protected-baseline / dynamic-
+unknown-bare-write / nested-relative-write) that pin the refined
+predicate against future over-relaxation OR over-block
+regressions. Round-15 codex P1 closure moved 3 fixtures from ALLOW
+to BLOCK ($HOME / $OLDPWD / pushd $HOME) and added 4 new BLOCK
+fixtures pinning the env-rebind + show-prefix attacks
+(HOME=.rea cd "$HOME" / PWD=.rea cd "$PWD" /
+$(git rev-parse --show-prefix) / export HOME=.rea-then-cd).
+
+**Round-15 codex P1 closure (env-var rebind + `--show-prefix`).**
+The round-14 known-safe allow-list incorrectly assumed `$HOME`,
+`$PWD`, `$OLDPWD` were set by the shell to safe absolute paths,
+and that `git rev-parse --show-prefix` was a safe cmdsubst. Both
+are attacker-controllable: env vars are rebindable via inline
+assignment-prefix on the same simple command (`HOME=.rea cd
+"$HOME"`) or via parent-shell exports across commands; `OLDPWD`
+tracks any previous cd including into protected dirs; and
+`--show-prefix` returns the cwd-relative path INSIDE the toplevel
+which is `.rea/` when the agent is already in `.rea/`. Closure:
+empty `KNOWN_SAFE_VARS` (no env-var name is statically safe — the
+for-iter carve-out remains because Items literals are statically
+checked); drop `--show-prefix` from the CmdSubst FLAGS allow-list
+(the remaining flags resolve to absolute paths or paths stepping
+OUT of cwd). Updated TSDoc on `isParamExpKnownSafe` and
+`isCmdSubstKnownSafe` to state the safety property explicitly.
+
+**Round-16 codex P1 closure (bare cd / cd flag-only / cd - / popd).**
+Sibling threat class to round-15 F1: the round-14/15 predicate
+extracted the cd target via a flag-skip loop and unconditionally
+returned with no emit when no positional remained. But bash gives
+those forms a runtime-determined default cwd: `cd` / `cd -L` /
+`cd -P` default to `$HOME`; `cd -` reverts to `$OLDPWD`; `popd`
+reverts to dir-stack head. All are env-var rebindable (via inline
+assignment-prefix or parent-shell export) or stack-state dependent,
+so they belong on the same refuse-on-uncertainty path as the
+explicit `cd "$HOME"` form. Closure: in `emitCdDecisionIfAny`,
+when target extraction yields `null`, run the same in-scope
+bare-relative-write check as the dynamic-target branch and emit
+`cwd_dynamic_with_writes_unresolvable` if any bare-relative write
+is in scope. `popd` added to `isCdOrPushd` plus the head-check
+inside `emitCdDecisionIfAny`. 5 must-BLOCK fixtures + 4 must-ALLOW
+negatives pin the predicate.
+
+`pushd` with no positional, `pushd -N`, and `pushd +N` belong to
+the same threat class. Bash semantics: `pushd` (no args) swaps the
+top two dir-stack entries, `pushd -N`/`pushd +N` rotates the stack
+by N. All are runtime-determined cwd manipulations that the static
+walker cannot resolve. Round 16's no-positional refuse-on-uncertainty
+already catches them incidentally, but round 17 P3 adds three
+explicit fixtures to pin the BLOCK verdict against future
+relaxations of the predicate.
+
+**Round-17 codex P1 / P2 closure (IfClause/WhileClause/UntilClause
+Cond + cwd-persistence; TimeClause/CoprocClause descent).** A
+discrete walker bug, not a predicate weakness: the round-14/15/16
+walker visited a conditional's Cond and Body as separate scopes via
+`walkScopeForCwd`. A `cd` inside the Cond therefore had a single-
+command scope with no successors, never collected the body's writes
+as downstream, and never emitted. Worse, the cwd change *persists*
+into the Body when the cond evaluates truthy AND past the conditional
+into post-stmt siblings (bash semantics: a cond runs in the current
+shell). Round 17 closes both via `extraDownstream` threading through
+`walkScopeForCwd` → `classifyCdInStmt` → `collectCdSitesInStmt` /
+`collectCdSitesInBinaryX`. When `descendCmdScopes` enters an
+IfClause/WhileClause/UntilClause, the Cond walk receives `[...body,
+...post-stmt-siblings]` as carriers; the Body walk receives just
+`[...post-stmt-siblings]`. Subshell stays cwd-isolated (forks a
+child shell) so its inner walk does NOT inherit parent siblings.
+`descendCmdScopes` also gains explicit `TimeClause`/`CoprocClause`
+cases that descend into the wrapped Stmt with the same carriers,
+and `collectCdSitesInBinaryX` unwraps `TimeClause`/`CoprocClause`
+when it encounters them as the LHS of a `BinaryCmd` (so `time cd
+.rea && echo > HALT` reaches the cd site). 8 P1 must-BLOCK PoCs
+(if/while/until + binary-expr cond + post-conditional siblings),
+1 P2 must-BLOCK (`time cd .rea && echo > HALT`), 3 P3 pushd
+no-positional / -N / +N must-BLOCKs, plus 3 must-ALLOW negatives
+(`pushd && cat`, `if cd /tmp; then echo > log`, `if cd .rea; then
+cat HALT`) pin the predicate. Pragmatic over-block is bounded:
+non-protected literal cd targets (e.g. `/tmp`) still ALLOW because
+the protected-prefix test is the scanner's call, and read-only
+bodies still ALLOW because the predicate requires a bare-relative
+WRITE in scope.
+
 ### Trust boundary: package-tier integrity
 
 The bash shim's CLI-resolution sandbox (round 4 #2 + round 5 F2)

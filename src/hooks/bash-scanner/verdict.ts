@@ -70,7 +70,34 @@ export type DetectedForm =
   | 'perl_e_path'
   | 'php_r_path'
   | 'process_subst_inner'
-  | 'nested_shell_inner';
+  | 'nested_shell_inner'
+  // helix-024 F1: cwd-relative-write bypass class. The walker emits
+  // these synthetic detections at every `cd <DIR>` / `pushd <DIR>` site
+  // when the same AST contains any write — refuse-on-uncertainty so
+  // the scanner refuses if DIR resolves to a protected prefix or is
+  // dynamic. Static walkers cannot model process-cwd; this is the
+  // structural defense.
+  //   `cwd_protected_unresolvable`        — cd target is a literal
+  //                                          path; scanner runs the
+  //                                          protected-prefix test
+  //                                          against it as a dir-
+  //                                          shaped target. If
+  //                                          protected → BLOCK; if
+  //                                          non-protected (or
+  //                                          outside-root) → ALLOW.
+  //   `cwd_dynamic_with_writes_unresolvable` — cd target is dynamic
+  //                                          ($VAR / $(cmd)) and the
+  //                                          AST has writes. We cannot
+  //                                          tell whether the target
+  //                                          is protected; refuse on
+  //                                          uncertainty.
+  | 'cwd_protected_unresolvable'
+  | 'cwd_dynamic_with_writes_unresolvable'
+  // helix-024 F3: ln/ln -s with a protected source path. Subsequent
+  // writes through the link cannot be statically tracked. Walker emits
+  // unconditionally on the protected-source detection — scanner refuses
+  // when SRC resolves to a protected pattern, regardless of DEST.
+  | 'ln_to_protected_unresolvable';
 
 /**
  * Source position for a detected write. 1-indexed (matches the parser's
