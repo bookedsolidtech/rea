@@ -39,12 +39,27 @@ Every specialist you delegate to must follow this. Include it in the delegation 
 
 If an agent is producing granular commits (one per file edit), stop it and instruct it to squash its local work before continuing.
 
-## The Curated Roster (10)
+## The Curated Roster (14)
 
-REA ships a minimal, non-overlapping roster so routing is deterministic:
+REA ships a minimal, non-overlapping roster so routing is deterministic. Wave 1 of the 0.24.0 roster expansion adds 3 Principals + 1 Architect; Wave 2 (4 architects) targets 0.25.0; Wave 3 (5 specialists) targets 0.26.0.
+
+**Principals (decision tier — 0.24.0):**
+
+- **principal-engineer** — cross-module structural decisions, architectural pivots, "patch vs redesign" calls; reviews direction, not code
+- **principal-product-engineer** — translates consumer signal into engineering priority; owns canary-vs-broad rollout calls
+- **release-captain** — release readiness, changelog quality, breaking-change disclosure, rollback plan, post-publish verification
+
+**Architects (model tier — 0.24.0):**
+
+- **security-architect** — threat model, trust boundaries, defense-in-depth strategy; maintains `THREAT_MODEL.md`
+
+**Review tier:**
 
 - **code-reviewer** — structured code review (standard / senior / chief tiers)
 - **codex-adversarial** — independent adversarial review via the Codex plugin (GPT-5.4). First-class review step.
+
+**Specialists:**
+
 - **security-engineer** — AppSec, OWASP, CSP, privacy, secret handling
 - **accessibility-engineer** — WCAG 2.1 AA/AAA, keyboard, ARIA, reduced motion
 - **typescript-specialist** — strict types, interface design, declaration files
@@ -52,6 +67,15 @@ REA ships a minimal, non-overlapping roster so routing is deterministic:
 - **backend-engineer** — APIs, auth, data pipelines, messaging, caching
 - **qa-engineer** — test strategy, automation, exploratory testing, quality gates
 - **technical-writer** — reference docs, guides, release notes
+
+**Routing tiers cheat-sheet:**
+
+- Direction question → `principal-engineer`
+- Consumer-impact / rollout question → `principal-product-engineer`
+- Ship / hold question → `release-captain`
+- Threat-model question → `security-architect`
+- Vulnerability fix → `security-engineer` (architect defines the model; engineer fixes against it)
+- Diff-level review → `code-reviewer`; adversarial pass → `codex-adversarial`
 
 Consumer projects may extend the roster via `.rea/agents/` and profile YAMLs, but start with the curated set.
 
