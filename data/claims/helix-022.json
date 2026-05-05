@@ -1,0 +1,51 @@
+{
+  "id": "helix-022",
+  "title": "Bash-tier bypass classes (F1 parent-doesn't-exist symlink walk-up; F2 interpreter writes; F3 nested-shell unwrap depth; F4 cp/mv argv walker; F5 fail-closed unresolved expansion in redirect targets)",
+  "introduced_in": "<=0.21.0",
+  "closed_in": "0.22.0",
+  "summary": "Five adjacent Bash-tier bypass classes against 0.21.0 closed by structural fixes: nearest-existing-ancestor resolution, shared interpreter-scanner.sh, fixed-point recursion (depth bound 8) for nested shells, explicit cp/mv destination walker, and __rea_unresolved_expansion__ sentinel for $-substitution / backticks in redirect targets.",
+  "pocs": [
+    {
+      "id": "F1.symlink-walkup-parent-missing",
+      "type": "scan-bash",
+      "input": "ln -s ../../etc/passwd .rea/no-such-dir/x; echo y > .rea/no-such-dir/x",
+      "mode": "protected",
+      "expected_verdict": "block"
+    },
+    {
+      "id": "F2.interpreter-write-node",
+      "type": "scan-bash",
+      "input": "node -e 'require(\"fs\").writeFileSync(\".rea/HALT\", \"x\")'",
+      "mode": "protected",
+      "expected_verdict": "block"
+    },
+    {
+      "id": "F2.interpreter-write-python",
+      "type": "scan-bash",
+      "input": "python3 -c 'open(\".rea/HALT\", \"w\").write(\"x\")'",
+      "mode": "protected",
+      "expected_verdict": "block"
+    },
+    {
+      "id": "F3.nested-shell-depth",
+      "type": "scan-bash",
+      "input": "bash -c 'bash -c \"bash -c \\\"echo x > .rea/HALT\\\"\"'",
+      "mode": "protected",
+      "expected_verdict": "block"
+    },
+    {
+      "id": "F4.cp-explicit-destination",
+      "type": "scan-bash",
+      "input": "cp /tmp/source -t .rea -- HALT",
+      "mode": "protected",
+      "expected_verdict": "block"
+    },
+    {
+      "id": "F5.unresolved-expansion-redirect",
+      "type": "scan-bash",
+      "input": "echo x > .rea/$(printf HALT)",
+      "mode": "protected",
+      "expected_verdict": "block"
+    }
+  ]
+}

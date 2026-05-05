@@ -111,6 +111,12 @@ export interface LiveDownstreamSnapshot {
   circuit_state: 'closed' | 'open' | 'half-open';
   retry_at: string | null;
   last_error: string | null;
+  /**
+   * 0.28.0 helix-025 F1 — `'never' | 'ok' | 'errored'` tri-state.
+   * `null` for snapshots written by pre-0.28.0 gateways that did not
+   * include the field (back-compat).
+   */
+  connection_state: 'never' | 'ok' | 'errored' | null;
   tools_count: number | null;
   open_transitions: number;
   session_blocker_emitted: boolean;
@@ -212,6 +218,13 @@ function parseDownstreamEntry(raw: unknown): LiveDownstreamSnapshot | null {
     r.circuit_state === 'open' || r.circuit_state === 'half-open' || r.circuit_state === 'closed'
       ? (r.circuit_state as 'closed' | 'open' | 'half-open')
       : 'closed';
+  // 0.28.0 helix-025 F1: tri-state. `null` when the snapshot was written
+  // by a pre-0.28.0 gateway (back-compat) — the pretty-printer renders
+  // that as "—" rather than fabricating a value.
+  const connectionState =
+    r.connection_state === 'never' || r.connection_state === 'ok' || r.connection_state === 'errored'
+      ? (r.connection_state as 'never' | 'ok' | 'errored')
+      : null;
   return {
     name: r.name,
     connected: typeof r.connected === 'boolean' ? r.connected : false,
@@ -219,6 +232,7 @@ function parseDownstreamEntry(raw: unknown): LiveDownstreamSnapshot | null {
     circuit_state: circuit,
     retry_at: typeof r.retry_at === 'string' ? r.retry_at : null,
     last_error: typeof r.last_error === 'string' ? r.last_error : null,
+    connection_state: connectionState,
     tools_count:
       typeof r.tools_count === 'number' && Number.isInteger(r.tools_count) ? r.tools_count : null,
     open_transitions:

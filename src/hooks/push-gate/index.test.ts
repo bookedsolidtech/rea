@@ -28,6 +28,10 @@ const DEFAULT_POLICY = {
   timeout_ms: PUSH_GATE_DEFAULT_TIMEOUT_MS,
   last_n_commits: undefined,
   auto_narrow_threshold: PUSH_GATE_DEFAULT_AUTO_NARROW_THRESHOLD,
+  // 0.28.0 helix-029: filter is unset by default — gate behaves as
+  // pre-0.28.0.
+  exclude_paths: [],
+  auto_exclude_managed: false,
   policyMissing: false,
 };
 
@@ -404,11 +408,8 @@ describe('runPushGate — --last-n-commits / policy.review.last_n_commits (Fix D
       baseDeps(baseDir, {
         lastNCommits: 2,
         resolvePolicy: async () => ({
-          codex_required: true,
-          concerns_blocks: true,
-          timeout_ms: 1_800_000,
+          ...DEFAULT_POLICY,
           last_n_commits: 7,
-          policyMissing: false,
         }),
         git: fakeGit({
           tryRevParse: (args) =>
@@ -493,11 +494,8 @@ describe('runPushGate — --last-n-commits / policy.review.last_n_commits (Fix D
     await runPushGate(
       baseDeps(baseDir, {
         resolvePolicy: async () => ({
-          codex_required: true,
-          concerns_blocks: true,
-          timeout_ms: 1_800_000,
+          ...DEFAULT_POLICY,
           last_n_commits: 4,
-          policyMissing: false,
         }),
         git: fakeGit({
           tryRevParse: (args) =>

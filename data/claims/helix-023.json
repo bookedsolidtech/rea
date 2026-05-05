@@ -1,0 +1,44 @@
+{
+  "id": "helix-023",
+  "title": "0.23.0 structural rewrite — bash hooks → Node-binary parser-backed scanner via mvdan-sh AST",
+  "introduced_in": "<=0.22.0",
+  "closed_in": "0.23.0",
+  "summary": "13 codex adversarial rounds + 12,875-fixture corpus across 23 classes A-W. Closure ladder 34 → 14 → 9 → 8 → 5 → 2 → 1 → 1 → 3 → 2 → 7 → 9 → 9 (round-13 deferred to 0.24.0 as denylist-asymptotic per codex). PoCs sample one fixture from each closure-ladder round to verify the parser-backed scanner still rejects them.",
+  "pocs": [
+    {
+      "id": "round1.alias-then-invoke",
+      "type": "scan-bash",
+      "input": "alias evil='echo x > .rea/HALT'; evil",
+      "mode": "protected",
+      "expected_verdict": "block"
+    },
+    {
+      "id": "round1.heredoc-into-shell",
+      "type": "scan-bash",
+      "input": "bash <<'EOF'\necho x > .rea/HALT\nEOF",
+      "mode": "protected",
+      "expected_verdict": "block"
+    },
+    {
+      "id": "round1.process-substitution",
+      "type": "scan-bash",
+      "input": "diff <(echo a) <(rm -rf .rea)",
+      "mode": "protected",
+      "expected_verdict": "block"
+    },
+    {
+      "id": "round2.tee-redirect",
+      "type": "scan-bash",
+      "input": "echo x | tee .rea/HALT",
+      "mode": "protected",
+      "expected_verdict": "block"
+    },
+    {
+      "id": "round3.pipe-into-bash",
+      "type": "scan-bash",
+      "input": "echo 'echo x > .rea/HALT' | bash",
+      "mode": "protected",
+      "expected_verdict": "block"
+    }
+  ]
+}

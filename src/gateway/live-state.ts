@@ -91,6 +91,18 @@ export interface LiveDownstreamState {
   /** ISO timestamp when the circuit is expected to move to half-open. Only present when `open`. */
   retry_at: string | null;
   last_error: string | null;
+  /**
+   * 0.28.0 helix-025 F1 — explicit tri-state for the connection
+   * lifecycle. `'never'` means the supervisor has not attempted to
+   * connect yet; `'ok'` means the most recent attempt cleared
+   * lastError; `'errored'` means a connect or call failed and the
+   * downstream is currently considered unhealthy. Mirrors
+   * `DownstreamHealth.connection_state` in `downstream-pool.ts`.
+   * Optional in the type to keep older state-file readers
+   * compatible — pre-0.28.0 snapshots that lack the field surface
+   * as `null` in `rea status` rather than crashing the parse.
+   */
+  connection_state?: 'never' | 'ok' | 'errored';
   tools_count: number | null;
   /** Cumulative circuit-open transitions counted toward SESSION_BLOCKER. */
   open_transitions: number;
@@ -581,6 +593,7 @@ export class LiveStatePublisher {
         circuit_state: circuitState,
         retry_at: retryAt,
         last_error: lastError,
+        connection_state: h.connection_state,
         tools_count: h.tools_count,
         open_transitions: blocker?.open_transitions ?? 0,
         session_blocker_emitted: blocker?.emitted ?? false,

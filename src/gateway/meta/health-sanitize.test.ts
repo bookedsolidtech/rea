@@ -100,6 +100,7 @@ function ds(name: string, last_error: string | null): DownstreamHealth {
     connected: false,
     healthy: false,
     last_error,
+    connection_state: last_error === null ? 'never' : 'errored',
     tools_count: null,
   };
 }
@@ -251,6 +252,7 @@ describe('sanitizeHealthSnapshot — BUG-011 regression', () => {
             connected: true,
             healthy: false,
             last_error: GH_CLASSIC_TOKEN,
+            connection_state: 'errored',
             tools_count: 7,
           },
         ],

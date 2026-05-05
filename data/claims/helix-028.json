@@ -1,0 +1,23 @@
+{
+  "id": "helix-028",
+  "title": "0.23.0 cmd-segments multiline awk + ANSI-C bypass classes",
+  "introduced_in": "0.23.0",
+  "closed_in": "0.26.1",
+  "summary": "Multiline awk inside command-substitutions and ANSI-C $'...' string literals were silently dropped from segment scanning. Two P1 bypass classes closed in 0.26.1: awk multiline body now flagged when destination is protected; ANSI-C strings normalize to their decoded form before scanning.",
+  "pocs": [
+    {
+      "id": "multiline-awk-redirect",
+      "type": "scan-bash",
+      "input": "awk 'BEGIN { print \"x\" > \".rea/HALT\" }'",
+      "mode": "protected",
+      "expected_verdict": "block"
+    },
+    {
+      "id": "ansi-c-string-redirect",
+      "type": "scan-bash",
+      "input": "echo $'\\x78' > .rea/HALT",
+      "mode": "protected",
+      "expected_verdict": "block"
+    }
+  ]
+}

@@ -174,6 +174,37 @@ export interface ReviewPolicy {
    */
   cache_ttl_ms?: number;
   /**
+   * 0.28.0 helix-029 — path-scoped finding filter. Gitignore-style
+   * globs against repo-relative paths. Findings whose `file` matches
+   * any glob in this list are filtered OUT before the verdict is
+   * computed, but are still emitted on stderr (so the operator can
+   * file them upstream). Useful for downstream consumers of rea who
+   * cannot patch rea-managed paths but should not be blocked from
+   * pushing while waiting on an upstream fix.
+   *
+   * Setting this list also enables `auto_exclude_managed` by default —
+   * paths from `.rea/install-manifest.json` are excluded in addition
+   * to whatever globs are listed here. Pass `auto_exclude_managed:
+   * false` to opt out and rely on `exclude_paths` alone.
+   *
+   * Empty (or unset) → no filtering, pre-0.28.0 behavior.
+   *
+   * The audit shape is unchanged; the gate emits a
+   * `filtered_findings_count` counter into the audit metadata so
+   * operators can grep `rea.push_gate.reviewed` to see how many
+   * findings were suppressed without re-parsing prose.
+   */
+  exclude_paths?: string[];
+  /**
+   * 0.28.0 helix-029 — derived default. When `exclude_paths` is set,
+   * defaults to `true` — paths from `.rea/install-manifest.json` are
+   * excluded in addition to the explicit globs. Set explicitly to
+   * `false` to rely only on `exclude_paths`. When `exclude_paths` is
+   * unset, this field is a no-op (no filter is active in the first
+   * place).
+   */
+  auto_exclude_managed?: boolean;
+  /**
    * Local-first review enforcement (0.26.0+ — CTO directive 2026-05-05).
    *
    * The push-gate is the BACKUP layer. The primary review surface is the

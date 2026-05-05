@@ -49,6 +49,9 @@ describe('resolvePushGatePolicy', () => {
       codex_model: PUSH_GATE_DEFAULT_CODEX_MODEL,
       codex_reasoning_effort: PUSH_GATE_DEFAULT_CODEX_REASONING_EFFORT,
       cache_ttl_ms: PUSH_GATE_DEFAULT_CACHE_TTL_MS,
+      // 0.28.0 helix-029: filter unset → empty list and false flag.
+      exclude_paths: [],
+      auto_exclude_managed: false,
       policyMissing: true,
     });
   });

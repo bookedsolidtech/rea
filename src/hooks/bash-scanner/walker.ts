@@ -305,7 +305,193 @@ export function walkForWrites(file: BashFile): DetectedWrite[] {
   // emit (the path-shape decision is the scanner's, not ours — we
   // emit conservatively).
   detectCwdChangeIntoProtected(file, out);
+  // 0.28.0 round-18 P2 closure (FuncDecl-then-call). Static AST does
+  // not model invocation, so a function body's writes were emitted
+  // ONLY if the body itself contained a top-level write — but the
+  // PoC `f() { echo x > .rea/HALT; }; f` has the write in the body
+  // and the call as a separate Stmt. Pre-fix the call was an opaque
+  // CallExpr whose head matched no built-in detector, so the body
+  // writes never propagated to the outer detection set.
+  //
+  // Closure: pre-pass the AST to map every FuncDecl name → list of
+  // detected writes within its body (computed by the same walker on
+  // a synthetic file rooted at the body), then on every CallExpr
+  // whose head matches a known function name, re-emit the captured
+  // writes with `originSrc: 'funcdecl_invocation:<name>'` so the
+  // scanner refuses on the same kill-switch terms it would for a
+  // direct redirect.
+  detectFuncDeclThenCall(file, out);
   return out;
+}
+
+/**
+ * 0.28.0 round-18 P2 — FuncDecl-then-call closure. Two-phase:
+ *
+ *   Phase 1 (collectFuncDeclWrites): walk every FuncDecl in the file,
+ *   compute the writes its body produces (by recursively running
+ *   walkForWrites against the body), and record them keyed by the
+ *   declared function name. Functions defined inside other constructs
+ *   (e.g., a FuncDecl nested inside an IfClause body) are still
+ *   collected — `syntax.Walk` visits them.
+ *
+ *   Phase 2 (emitFuncDeclInvocationWrites): walk every CallExpr in
+ *   the file. When the CallExpr's head normalizes to a known function
+ *   name AND we have not already attributed this CallExpr's writes
+ *   (avoid double-counting when the same CallExpr was already inside
+ *   a body whose detections we collected), append the captured writes
+ *   to `out` with the call site's position.
+ *
+ * Conservative trade-offs:
+ *
+ *   - We only RE-EMIT writes; we do not re-run the walker against
+ *     a synthesized "argv-substituted" body. Bash positional
+ *     parameters (`$1`, `$@`) inside a function body that influence
+ *     write paths are ignored — too dynamic to resolve statically
+ *     and the existing dynamic-write detectors already refuse on
+ *     unresolved expansions.
+ *
+ *   - We do not chase call chains (`f() { g; }; g() { echo > .rea/HALT; }; f`).
+ *     Each declared function's body is collected independently; an
+ *     invocation matches at most ONE name. Two-hop chains require a
+ *     follow-up closure (deferred — the PoC is one-hop, which is what
+ *     the round-18 deferral cited).
+ *
+ *   - Recursive function calls would loop the body-collection phase
+ *     unless guarded. We pass a `visited` set keyed by FuncDecl
+ *     identity so a self-referential body is walked at most once.
+ */
+function detectFuncDeclThenCall(file: BashFile, out: DetectedWrite[]): void {
+  const declWrites = collectFuncDeclWrites(file);
+  if (declWrites.size === 0) return;
+  emitFuncDeclInvocationWrites(file, declWrites, out);
+}
+
+function collectFuncDeclWrites(file: BashFile): Map<string, DetectedWrite[]> {
+  const result = new Map<string, DetectedWrite[]>();
+  const visited = new Set<BashNode>();
+  const visitor = (node: BashNode | null | undefined): boolean => {
+    if (node === null || node === undefined) return true;
+    const t = nodeType(node);
+    if (t !== 'FuncDecl') return true;
+    if (visited.has(node)) return false;
+    visited.add(node);
+    const name = funcDeclName(node);
+    if (name.length === 0) return true;
+    const body = node['Body'];
+    if (!body || typeof body !== 'object') return true;
+    // Recursively walk the body. We synthesize a BashFile-shaped
+    // wrapper so `syntax.Walk` sees a proper top-level entry point.
+    // The wrapper carries one Stmt whose Cmd is the body — when the
+    // body is itself a Stmt (Block / Subshell), we forward it
+    // directly. mvdan-sh's body shapes vary across versions; both
+    // shapes are accepted defensively.
+    const writes: DetectedWrite[] = [];
+    try {
+      walkSubtreeNoFuncDecl(body as BashNode, writes);
+    } catch {
+      // Pathological body — fail closed at the higher tier. We do
+      // not propagate errors from this post-pass; the caller already
+      // has the primary detections.
+    }
+    if (writes.length > 0) result.set(name, writes);
+    return true;
+  };
+  try {
+    syntax.Walk(file, visitor);
+  } catch {
+    // Best-effort.
+  }
+  return result;
+}
+
+/**
+ * Walk a subtree using the same dispatch as the main `walkForWrites`
+ * loop, but WITHOUT re-entering `detectFuncDeclThenCall`. Keeps the
+ * body-collection phase bounded — a self-referential function body
+ * (`f() { f; }`) would otherwise loop the post-pass forever.
+ *
+ * Mutates `out` in place.
+ */
+function walkSubtreeNoFuncDecl(root: BashNode, out: DetectedWrite[]): void {
+  try {
+    const visit = (node: BashNode | null | undefined): boolean => {
+      if (node === null || node === undefined) return true;
+      const t = nodeType(node);
+      switch (t) {
+        case 'Stmt':
+          extractStmtRedirects(node, out);
+          extractHeredocShellPayloads(node, out);
+          break;
+        case 'CallExpr':
+          walkCallExpr(node, out);
+          break;
+        case 'BinaryCmd':
+          detectPipeIntoBareShell(node, out);
+          break;
+        case 'ParamExp':
+          recurseParamExpSlice(node, visit);
+          break;
+        default:
+          break;
+      }
+      return true;
+    };
+    syntax.Walk(root, visit);
+  } catch {
+    /* swallow */
+  }
+}
+
+function emitFuncDeclInvocationWrites(
+  file: BashFile,
+  declWrites: ReadonlyMap<string, readonly DetectedWrite[]>,
+  out: DetectedWrite[],
+): void {
+  const visitor = (node: BashNode | null | undefined): boolean => {
+    if (node === null || node === undefined) return true;
+    const t = nodeType(node);
+    if (t !== 'CallExpr') return true;
+    const args = asArray(node['Args']);
+    if (args.length === 0) return true;
+    const head = args[0];
+    if (!head || typeof head !== 'object') return true;
+    const headWord = wordToString(head as BashNode);
+    if (headWord === null || headWord.value.length === 0) return true;
+    const name = normalizeCmdHead(headWord.value);
+    const captured = declWrites.get(name);
+    if (captured === undefined || captured.length === 0) return true;
+    // Re-emit each captured write with the call-site's position so
+    // the scanner's reporter shows the operator the SITE of the
+    // invocation, not the (possibly far-away) function definition.
+    const callPos = headWord.position;
+    for (const w of captured) {
+      out.push({
+        ...w,
+        position: callPos,
+        originSrc:
+          (w.originSrc !== undefined && w.originSrc.length > 0
+            ? `${w.originSrc} via funcdecl_invocation:${name}`
+            : `funcdecl_invocation:${name}`),
+      });
+    }
+    return true;
+  };
+  try {
+    syntax.Walk(file, visitor);
+  } catch {
+    /* swallow */
+  }
+}
+
+/** Extract a FuncDecl's declared name. mvdan-sh stores it on `Name.Value`. */
+function funcDeclName(funcDecl: BashNode): string {
+  const nameNode = funcDecl['Name'];
+  if (!nameNode || typeof nameNode !== 'object') return '';
+  // mvdan-sh's Lit shape: { Value: string }. The reference probe:
+  //   syntax.Walk visits Name as a Lit; .Value is the string.
+  const v = (nameNode as Record<string, unknown>)['Value'];
+  if (typeof v !== 'string') return '';
+  return v.trim();
 }
 
 /**

@@ -461,6 +461,7 @@ describe('LiveStatePublisher', () => {
         connected: false,
         healthy: false,
         last_error: leaky,
+        connection_state: 'errored',
         tools_count: null,
       },
     ]);
@@ -508,6 +509,7 @@ describe('LiveStatePublisher', () => {
         connected: true,
         healthy: false,
         last_error: raw_err,
+        connection_state: 'errored',
         tools_count: null,
       },
     ]);
