@@ -1,5 +1,25 @@
 # @bookedsolid/rea
 
+## 0.24.0
+
+### Minor Changes
+
+- 0a933c1: Roster expansion Wave 1 — 3 Principals + 1 Architect (CTO eval recommendation).
+
+  Adds 4 new specialist agents to the default rea kit, propagated to consumer
+  .claude/agents/ via the existing `rea init`/`rea upgrade` mirror:
+  - principal-engineer — cross-module structural decisions, architectural pivots
+  - principal-product-engineer — consumer signal → engineering priority
+  - release-captain — release readiness, breaking-change disclosure, rollback
+  - security-architect — threat model, trust boundaries, defense-in-depth
+
+  Also updates agents/rea-orchestrator.md routing brief to include the four
+  new agents. New smoke test in **tests**/agents/ verifies frontmatter parses
+  on every agent file and orchestrator routing references every file.
+
+  Wave 2 (4 architects) targets 0.25.0; Wave 3 (5 specialists) targets 0.26.0
+  per the CTO eval rollout plan.
+
 ## 0.23.1
 
 ### Patch Changes
@@ -1780,13 +1800,13 @@ codex-review --also-set-cache`) on every push, produced a 1,250-line bash
 
   This release replaces the entire stack with a stateless gate:
 
-                                                git push
-                                                  → .husky/pre-push → rea hook push-gate
-                                                  → codex exec review --base <ref> --json
-                                                  → parse verdict from streamed findings
-                                                  → block on [P1] (blocking) or [P2] when concerns_blocks=true
-                                                  → write .rea/last-review.json + audit record
-                                                  → exit 0 / 1 (HALT) / 2 (blocked)
+                                                  git push
+                                                    → .husky/pre-push → rea hook push-gate
+                                                    → codex exec review --base <ref> --json
+                                                    → parse verdict from streamed findings
+                                                    → block on [P1] (blocking) or [P2] when concerns_blocks=true
+                                                    → write .rea/last-review.json + audit record
+                                                    → exit 0 / 1 (HALT) / 2 (blocked)
 
   Codex is run fresh on every push. No cache. No SHA matching. No receipt
   consultation. When the gate blocks, Claude reads stderr + the
