@@ -206,7 +206,7 @@ to build a separate package that composes with REA.
   no `rea stop`, no systemd unit.
 - **Not a hosted service.** No REA Cloud, no SaaS tier, no multi-tenant
   workload isolation.
-- **Not a 70-agent roster.** Ten curated agents ship in the package.
+- **Not a 70-agent roster.** 23 curated agents ship in the package.
   Profiles layer additional specialists.
 - **Not a full policy engine.** No OPA/Rego, no CEL, no attribute-based
   access control. A YAML file with a small, fixed schema is the entire
@@ -732,7 +732,7 @@ defaults apply.
 
 | Profile | Intended use | Codex default |
 | --- | --- | --- |
-| `minimal` | Smallest possible install — curated 10 + opinionated minimal hooks | `true` |
+| `minimal` | Smallest possible install — curated 23 + opinionated minimal hooks | `true` |
 | `client-engagement` | Consulting engagement where the repo is client-owned | `true` |
 | `bst-internal` | Booked Solid internal projects; conservative posture | `true` |
 | `bst-internal-no-codex` | Same as above; no Codex CLI available | `false` |
@@ -800,13 +800,20 @@ by `rea init`.
 
 ## Curated agents
 
-Ten specialist agents ship in `agents/` and are copied into `.claude/agents/`
+23 specialist agents ship in `agents/` and are copied into `.claude/agents/`
 by `rea init`. Profiles layer additional specialists on top for specific
 project shapes.
 
 | Agent | When to use |
 | --- | --- |
 | `rea-orchestrator` | **First stop for any non-trivial task.** Reads policy, checks HALT, routes to the right specialist(s), coordinates multi-step work, enforces the plan/build/review loop. |
+| `principal-engineer` | Cross-module structural decisions, architectural pivots, "patch vs redesign" calls; reviews direction, not code. |
+| `principal-product-engineer` | Translates consumer signal into engineering priority; canary-vs-broad rollout calls. |
+| `release-captain` | Release readiness, changelog quality, breaking-change disclosure, rollback plan, post-publish verification. |
+| `security-architect` | Threat model, trust boundaries, defense-in-depth strategy; maintains `THREAT_MODEL.md`. |
+| `data-architect` | Schema design, migrations, persisted-shape evolution; owns audit-log fields, last-review.json, policy.yaml field shape. |
+| `platform-architect` | Build, CI, packaging, publish pipeline integrity; owns GitHub Actions, npm provenance, Changesets VP flow, vitest pool config. |
+| `devex-architect` | Consumer install experience; owns `rea init` / `rea upgrade` topology, `rea doctor` output, hook error message contract, the install idempotency invariant. |
 | `code-reviewer` | Structured review of a working-tree diff; surfaces correctness, clarity, and consistency issues without adversarial framing. |
 | `codex-adversarial` | Adversarial review via the Codex plugin (`/codex:adversarial-review`). Independent model perspective; produces an audit entry with verdict. |
 | `security-engineer` | Security-sensitive implementation and review — auth flows, secret handling, injection surfaces. |
@@ -814,6 +821,12 @@ project shapes.
 | `typescript-specialist` | Strict-mode TypeScript correctness, generics, narrowing, inference edge cases. |
 | `frontend-specialist` | UI component work, framework idioms (React, Lit, Astro), CSS architecture. |
 | `backend-engineer` | API design, database schema, background jobs, MCP server implementation. |
+| `ast-parser-specialist` | Shell grammars (mvdan-sh AST), parser quirks, AST-walker patterns; the parser-tier counterpart to shell-scripting-specialist. |
+| `shell-scripting-specialist` | POSIX + bash 3.2 (macOS) hook bodies, awk portability across BSD/GNU/mawk, `_lib/cmd-segments.sh` quote-mask logic. |
+| `adversarial-test-specialist` | Bypass corpus, sibling-class sweep methodology, "for every closure, find the X-prime that's still open" reasoning. |
+| `mcp-protocol-specialist` | Model Context Protocol mechanics, `@modelcontextprotocol/sdk` usage, stdio/streamable-HTTP transports, MCP-vs-Bash-tier hook matcher semantics. |
+| `observability-specialist` | Audit-log shape, event vocabulary, hash-chain integrity, structured-logging contracts, SLSA provenance pipeline. |
+| `figma-dx-specialist` | Figma's coding surfaces (Dev Mode, Code Connect, plugin/REST APIs, Variables, DTCG export, Figma-as-MCP); primary consumer is create-helix-app. |
 | `qa-engineer` | Test strategy, fixture design, regression reproducers, flake triage. |
 | `technical-writer` | User-facing documentation, API references, migration guides, changelog narratives. |
 

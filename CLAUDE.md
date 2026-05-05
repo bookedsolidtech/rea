@@ -79,6 +79,14 @@ The orchestrator (`subagent_type: "rea-orchestrator"`) is the primary routing la
 - **Review tier**: `code-reviewer`, `codex-adversarial` — review / adversarial review
 - **Domain review**: `security-engineer`, `accessibility-engineer`
 - **Implementation**: `typescript-specialist`, `frontend-specialist`, `backend-engineer`
+- **Hook / scanner specialists**:
+  - `ast-parser-specialist` — shell grammars (mvdan-sh AST), parser-tier walker patterns
+  - `shell-scripting-specialist` — POSIX + bash 3.2 hook bodies, awk portability, `_lib/cmd-segments.sh`
+  - `adversarial-test-specialist` — bypass corpus, sibling-class sweep methodology
+- **Protocol / observability**:
+  - `mcp-protocol-specialist` — Model Context Protocol mechanics, SDK usage, MCP-tier matcher semantics
+  - `observability-specialist` — audit-log shape, event vocabulary, SLSA provenance pipeline
+- **Designer experience**: `figma-dx-specialist` — Figma's coding surfaces (plugins, Code Connect, Variables, DTCG export); primary consumer is create-helix-app
 - **Quality + docs**: `qa-engineer`, `technical-writer`
 
 **Do NOT** use generic Agent calls without specifying a `subagent_type`.
@@ -133,7 +141,7 @@ Project-level instructions for AI agents working in the rea repository.
   - `src/gateway/` — supervisor, live-state publisher, SESSION_BLOCKER tracker, `__rea__health` meta-tool
   - `src/policy/` — policy loader, zod schema, types
 - `hooks/` — shipped shell hooks (source of truth — `rea init` copies from here)
-- `agents/` — curated 10-agent roster (source of truth — `rea init` copies from here)
+- `agents/` — curated 23-agent roster (source of truth — `rea init` copies from here)
 - `commands/` — 5 slash commands (source of truth — `rea init` copies from here)
 - `profiles/` — layerable profile YAMLs (client-engagement, bst-internal, bst-internal-no-codex, lit-wc, open-source, open-source-no-codex). The `-no-codex` variants match their parents but cause `rea init` to default `review.codex_required: false`.
 - `.claude/` — **this repo's own install** (dogfood): real copies of agents, commands, hooks, plus settings.json
