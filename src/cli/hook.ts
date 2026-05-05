@@ -30,13 +30,33 @@
  */
 
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import type { Command } from 'commander';
 import { parse as parseYaml } from 'yaml';
 import { parsePrePushStdin, runPushGate } from '../hooks/push-gate/index.js';
 import { runBlockedScan, runProtectedScan, type Verdict } from '../hooks/bash-scanner/index.js';
 import { loadPolicy } from '../policy/loader.js';
 import { appendAuditRecord, InvocationStatus, Tier } from '../audit/append.js';
+import {
+  CODEX_REVIEW_TOOL_NAME,
+  CODEX_REVIEW_SERVER_NAME,
+  type CodexVerdict,
+} from '../audit/codex-event.js';
+import {
+  CodexNotInstalledError,
+  CodexProtocolError,
+  CodexSubprocessError,
+  CodexTimeoutError,
+  IRON_GATE_DEFAULT_MODEL,
+  IRON_GATE_DEFAULT_REASONING,
+  createRealGitExecutor,
+  runCodexReview,
+} from '../hooks/push-gate/codex-runner.js';
+import { resolveBaseRef } from '../hooks/push-gate/base.js';
+import { resolvePushGatePolicy } from '../hooks/push-gate/policy.js';
+import { summarizeReview } from '../hooks/push-gate/findings.js';
 import { err } from './utils.js';
 
 export interface HookPushGateOptions {
@@ -416,10 +436,367 @@ export async function runHookPolicyGet(options: HookPolicyGetOptions): Promise<v
 }
 
 /**
- * Attach the `rea hook` subcommand tree to a commander Program. Two
- * subcommands today: `push-gate` and `scan-bash`. New hooks should land
- * here rather than as top-level commands so the CLI surface stays
- * navigable.
+ * `rea hook codex-review` — the canonical Bash-direct codex invocation
+ * for marathon-mode review cycles (0.27.0+).
+ *
+ * The user directive is "codex should be invoked this way always to
+ * minimize claude consumption of all the output. we just need the log
+ * at the end." This command wraps `codex exec review --json --ephemeral`
+ * with the same iron-gate model defaults the push-gate uses, tees the
+ * raw JSONL stream to a tempfile so the caller can read the
+ * un-summarized output directly, parses out the verdict + finding
+ * count, writes a `codex.review` audit entry, and prints a single terse
+ * status line to stderr. Stdout stays clean — when `--json` is set the
+ * canonical JSON summary lands there for jq-style chaining.
+ *
+ * Distinct from `rea review`:
+ *   - `rea review` writes a `rea.local_review` entry the local-review
+ *     gate consults and prints human-readable output. Treated as the
+ *     primary CLI surface for the local-first workflow.
+ *   - `rea hook codex-review` writes a `codex.review` entry (the legacy
+ *     gateway shape), keeps the raw JSONL on disk, and is intentionally
+ *     terse. Designed for thin-shim invocation from agents and slash
+ *     commands that DON'T need a Claude-paraphrased summary — the raw
+ *     JSON IS the review.
+ *
+ * Exit-code contract (mirrors push-gate convention):
+ *
+ *   0 — pass verdict
+ *   1 — concerns verdict
+ *   2 — blocking verdict, codex error, or HALT active
+ */
+export interface HookCodexReviewOptions {
+  base?: string;
+  /**
+   * Mirror of `--last-n-commits` on push-gate. When set, diff against
+   * `HEAD~N` instead of running the upstream-resolution ladder. `--base`
+   * always wins when both are set. Validated as a positive integer at
+   * the commander layer.
+   */
+  lastNCommits?: number;
+  /**
+   * Emit a single JSON line on stdout instead of a stderr-only status
+   * line. The JSON shape carries `verdict`, `finding_count`, `head_sha`,
+   * `target`, `audit_hash`, `raw_path`, and `exit_code`.
+   */
+  json?: boolean;
+  /**
+   * Override REA_ROOT. Tests set this; the production caller relies on
+   * `process.cwd()`.
+   */
+  reaRoot?: string;
+  /**
+   * Test seam — replaces the spawn of `codex exec review`. Same
+   * contract as `runCodexReview`'s `spawnImpl`. When set, the codex-
+   * availability probe is skipped (matches `runCodexReview` behavior).
+   */
+  spawnImpl?: Parameters<typeof runCodexReview>[0]['spawnImpl'];
+  /**
+   * Test seam — override the directory raw stdout is teed into. Default
+   * is `os.tmpdir()`. Tests set this so they can read the file back.
+   */
+  rawStdoutDir?: string;
+}
+
+export async function runHookCodexReview(options: HookCodexReviewOptions): Promise<void> {
+  const baseDir = options.reaRoot ?? process.cwd();
+
+  // HALT check — uniform with the rest of the hook tree.
+  const haltPath = path.join(baseDir, '.rea', 'HALT');
+  if (fs.existsSync(haltPath)) {
+    let reason = 'Reason unknown';
+    try {
+      const content = fs.readFileSync(haltPath, 'utf8');
+      reason = content.slice(0, 1024).trim() || reason;
+    } catch {
+      /* leave default */
+    }
+    process.stderr.write(
+      `REA HALT: ${reason}\nAll agent operations suspended. Run: rea unfreeze\n`,
+    );
+    process.exit(2);
+  }
+
+  // Resolve git context + base ref using the same primitives the push-
+  // gate uses. Missing HEAD short-circuits with an explicit error rather
+  // than silently coercing — `rea hook codex-review` is intended for
+  // explicit invocation, not for the unborn-HEAD bootstrap path that
+  // `rea review` handles.
+  const git = createRealGitExecutor(baseDir);
+  const headSha = git.headSha();
+  if (headSha.length === 0) {
+    process.stderr.write(
+      'rea hook codex-review: could not resolve HEAD sha — is this a valid git repo with at least one commit?\n',
+    );
+    process.exit(2);
+  }
+
+  const resolved = await resolvePushGatePolicy(baseDir);
+  const explicit = options.base !== undefined && options.base.length > 0 ? options.base : undefined;
+  const lastN = options.lastNCommits;
+  // Delegate base resolution to the shared resolver so shallow-clone /
+  // short-history clamping matches `rea hook push-gate` behavior. The
+  // resolver returns a fully-resolved SHA + source tag; on a branch
+  // shorter than `lastN`, it clamps to the deepest ancestor (or the
+  // empty-tree sentinel for orphan/single-commit history) instead of
+  // refusing the review.
+  const resolvedBase = resolveBaseRef(git, {
+    ...(explicit !== undefined ? { explicit } : {}),
+    ...(lastN !== undefined && lastN > 0 ? { lastNCommits: lastN } : {}),
+  });
+  const baseRef = resolvedBase.ref;
+  const target = resolvedBase.ref;
+
+  // Allocate the raw-stdout sink. We write to `${tmp}/rea-codex-<sha>.json`
+  // where <sha> is a short hex token derived from headSha + a random
+  // nonce so concurrent invocations on the same HEAD don't clobber each
+  // other (rare in practice — agents queue serially — but cheap to
+  // make safe).
+  const tmpRoot = options.rawStdoutDir ?? os.tmpdir();
+  const nonce = crypto.randomBytes(4).toString('hex');
+  const rawPath = path.join(tmpRoot, `rea-codex-${headSha.slice(0, 12)}-${nonce}.json`);
+  let rawStream: fs.WriteStream | null;
+  try {
+    // mode 0o600: review JSONL contains the unfiltered codex output for
+    // the repo being scanned (file paths, code excerpts, finding text).
+    // On shared workstations / CI runners other local users could read
+    // a default-mode 0644 file. Owner-only is the right floor.
+    rawStream = fs.createWriteStream(rawPath, { flags: 'w', mode: 0o600 });
+    // createWriteStream() does not throw ENOENT/EACCES/ENOSPC
+    // synchronously — it emits an `error` event later. Without a
+    // listener, the unhandled stream error terminates the process. Fall
+    // back to "no raw tee" instead so a logging failure can never crash
+    // the review itself.
+    rawStream.once('error', (err) => {
+      process.stderr.write(
+        `rea hook codex-review: raw-stdout sink at ${rawPath} failed: ${err.message}\n`,
+      );
+      rawStream = null;
+    });
+  } catch (e) {
+    // Synchronous failures (rare — usually invalid path shape) fall
+    // through the same way: the audit entry still gets written, we
+    // just lose the raw JSON tee.
+    process.stderr.write(
+      `rea hook codex-review: could not open raw-stdout sink at ${rawPath}: ${
+        e instanceof Error ? e.message : String(e)
+      }\n`,
+    );
+    rawStream = null;
+  }
+
+  // Run codex. The runner enforces iron-gate defaults internally —
+  // gpt-5.4 + high reasoning unless policy overrides — so we pass
+  // policy-resolved values straight through. spawnImpl is forwarded to
+  // the test seam.
+  let reviewText = '';
+  let durationSeconds = 0;
+  let codexError: unknown;
+  try {
+    const result = await runCodexReview({
+      baseRef,
+      cwd: baseDir,
+      timeoutMs: resolved.timeout_ms,
+      env: process.env,
+      ...(resolved.codex_model !== undefined ? { model: resolved.codex_model } : {}),
+      ...(resolved.codex_reasoning_effort !== undefined
+        ? { reasoningEffort: resolved.codex_reasoning_effort }
+        : {}),
+      ...(options.spawnImpl !== undefined ? { spawnImpl: options.spawnImpl } : {}),
+      ...(rawStream !== null
+        ? {
+            rawStdoutSink: (chunk: Buffer): void => {
+              // Defensive: swallow any write error (closed/destroyed
+              // stream, EBADF, ENOSPC). The codex-runner already
+              // wraps sink calls in try/catch so a sink failure must
+              // never change the verdict — but throwing inside the
+              // 'data' handler also triggers an uncaughtException via
+              // the readable stream. Catch it here so it stays local.
+              try {
+                if (!rawStream!.writableEnded && !rawStream!.destroyed) {
+                  rawStream!.write(chunk);
+                }
+              } catch {
+                /* sink failure is non-fatal */
+              }
+            },
+          }
+        : {}),
+    });
+    reviewText = result.reviewText;
+    durationSeconds = result.durationSeconds;
+  } catch (e) {
+    codexError = e;
+  } finally {
+    if (rawStream !== null) {
+      // End the stream — best-effort. The file is on disk either way,
+      // and the OS flushes pending writes when the FD closes.
+      try {
+        await new Promise<void>((resolve) => {
+          rawStream!.end(() => resolve());
+        });
+      } catch {
+        /* swallow */
+      }
+    }
+  }
+
+  // Translate the codex error (if any) into a verdict + audit-error
+  // shape. This mirrors `rea review`'s classifyCodexError + the push-
+  // gate's translation, but stays inline so this CLI is self-contained.
+  if (codexError !== undefined) {
+    const msg = codexError instanceof Error ? codexError.message : String(codexError);
+    const kind =
+      codexError instanceof CodexNotInstalledError
+        ? 'not-installed'
+        : codexError instanceof CodexTimeoutError
+          ? 'timeout'
+          : codexError instanceof CodexProtocolError
+            ? 'protocol'
+            : codexError instanceof CodexSubprocessError
+              ? 'subprocess'
+              : 'unknown';
+    let auditHash = '';
+    try {
+      const record = await appendAuditRecord(baseDir, {
+        tool_name: CODEX_REVIEW_TOOL_NAME,
+        server_name: CODEX_REVIEW_SERVER_NAME,
+        status: InvocationStatus.Error,
+        tier: Tier.Read,
+        metadata: {
+          head_sha: headSha,
+          target,
+          finding_count: 0,
+          verdict: 'error' as CodexVerdict,
+          summary: `codex error (${kind}): ${msg}`,
+          model: resolved.codex_model ?? IRON_GATE_DEFAULT_MODEL,
+          reasoning_effort: resolved.codex_reasoning_effort ?? IRON_GATE_DEFAULT_REASONING,
+          raw_path: rawPath,
+          duration_seconds: durationSeconds,
+        },
+      });
+      auditHash = record.hash;
+    } catch (auditErr) {
+      // Audit failure must NOT change the exit code, but we surface it.
+      process.stderr.write(
+        `rea hook codex-review: audit append failed: ${
+          auditErr instanceof Error ? auditErr.message : String(auditErr)
+        }\n`,
+      );
+    }
+    process.stderr.write(
+      `[codex-review] verdict=error kind=${kind} findings=0 audit=${auditHash.slice(0, 16)} raw=${rawPath}\n`,
+    );
+    process.stderr.write(`[codex-review] error: ${msg}\n`);
+    if (options.json === true) {
+      process.stdout.write(
+        JSON.stringify({
+          verdict: 'error',
+          kind,
+          finding_count: 0,
+          head_sha: headSha,
+          target,
+          audit_hash: auditHash,
+          raw_path: rawPath,
+          exit_code: 2,
+          message: msg,
+        }) + '\n',
+      );
+    }
+    process.exit(2);
+  }
+
+  // Codex exited cleanly — parse the review prose and translate to a
+  // verdict + finding count.
+  const summary = summarizeReview(reviewText);
+  const verdict: CodexVerdict = summary.verdict;
+  const findingCount = summary.findings.length;
+  // First non-empty paragraph of the review text becomes the audit
+  // summary line. Truncated to 240 chars so the audit log doesn't blow
+  // up on multi-paragraph review prose.
+  const summaryLine = (() => {
+    const firstPara = reviewText
+      .split(/\n{2,}/)
+      .map((p) => p.trim())
+      .find((p) => p.length > 0);
+    if (firstPara === undefined) return '';
+    const oneLine = firstPara.replace(/\s+/g, ' ');
+    return oneLine.length > 240 ? oneLine.slice(0, 237) + '...' : oneLine;
+  })();
+
+  let auditHash = '';
+  try {
+    const record = await appendAuditRecord(baseDir, {
+      tool_name: CODEX_REVIEW_TOOL_NAME,
+      server_name: CODEX_REVIEW_SERVER_NAME,
+      status: verdict === 'blocking' ? InvocationStatus.Denied : InvocationStatus.Allowed,
+      tier: Tier.Read,
+      metadata: {
+        head_sha: headSha,
+        target,
+        finding_count: findingCount,
+        verdict,
+        ...(summaryLine.length > 0 ? { summary: summaryLine } : {}),
+        model: resolved.codex_model ?? IRON_GATE_DEFAULT_MODEL,
+        reasoning_effort: resolved.codex_reasoning_effort ?? IRON_GATE_DEFAULT_REASONING,
+        raw_path: rawPath,
+        duration_seconds: durationSeconds,
+      },
+    });
+    auditHash = record.hash;
+  } catch (auditErr) {
+    process.stderr.write(
+      `rea hook codex-review: audit append failed: ${
+        auditErr instanceof Error ? auditErr.message : String(auditErr)
+      }\n`,
+    );
+  }
+
+  // Map verdict → exit code. Same as the push-gate's contract.
+  const exitCode: 0 | 1 | 2 = verdict === 'blocking' ? 2 : verdict === 'concerns' ? 1 : 0;
+
+  // Terse status line on stderr. The directive is "the codex JSON IS
+  // the review" — agents read raw_path to act on findings, not this
+  // line. The line exists so a human running this from a shell sees
+  // the verdict at a glance.
+  process.stderr.write(
+    `[codex-review] verdict=${verdict} findings=${String(findingCount)} audit=${auditHash.slice(
+      0,
+      16,
+    )} raw=${rawPath}\n`,
+  );
+
+  if (options.json === true) {
+    process.stdout.write(
+      JSON.stringify({
+        verdict,
+        finding_count: findingCount,
+        head_sha: headSha,
+        target,
+        audit_hash: auditHash,
+        raw_path: rawPath,
+        exit_code: exitCode,
+      }) + '\n',
+    );
+  }
+  process.exit(exitCode);
+}
+
+/**
+ * Attach the `rea hook` subcommand tree to a commander Program.
+ *
+ * Subcommands:
+ *   - `push-gate`     — stateless pre-push Codex review (called by husky).
+ *   - `scan-bash`     — parser-backed bash-tier scanner (called by Claude
+ *                       Code shim hooks).
+ *   - `policy-get`    — single-source-of-truth policy reader for bash hooks.
+ *   - `codex-review`  — thin Bash-direct codex invocation (0.27.0+) for
+ *                       marathon-mode review cycles. The canonical
+ *                       invocation that all agents and slash commands
+ *                       route through.
+ *
+ * New hooks should land here rather than as top-level commands so the
+ * CLI surface stays navigable.
  */
 export function registerHookCommand(program: Command): void {
   const hook = program
@@ -482,6 +859,40 @@ export function registerHookCommand(program: Command): void {
       await runHookPushGate({
         ...(opts.base !== undefined ? { base: opts.base } : {}),
         ...(opts.lastNCommits !== undefined ? { lastNCommits: opts.lastNCommits } : {}),
+      });
+    });
+
+  hook
+    .command('codex-review')
+    .description(
+      'Run `codex exec review --json --ephemeral` directly against the working tree, tee raw JSONL to a tempfile, write a `codex.review` audit entry, and emit a terse status line on stderr. Exits 0/1/2: pass/concerns/blocking. The canonical Bash-direct codex invocation (0.27.0+) — minimizes Claude consumption of codex output by NOT paraphrasing findings into prose.',
+    )
+    .option(
+      '--base <ref>',
+      'explicit base ref to diff against (default: @{upstream} → origin/HEAD → main/master)',
+    )
+    .option(
+      '--last-n-commits <n>',
+      'narrow review to the last N commits (diff against HEAD~N). Loses to --base when both are set.',
+      (raw: string): number => {
+        const n = Number(raw);
+        if (!Number.isInteger(n) || n <= 0) {
+          throw new Error(
+            `--last-n-commits must be a positive integer, got ${JSON.stringify(raw)}`,
+          );
+        }
+        return n;
+      },
+    )
+    .option(
+      '--json',
+      'emit a single-line JSON result on stdout (in addition to the stderr status line)',
+    )
+    .action(async (opts: { base?: string; lastNCommits?: number; json?: boolean }) => {
+      await runHookCodexReview({
+        ...(opts.base !== undefined ? { base: opts.base } : {}),
+        ...(opts.lastNCommits !== undefined ? { lastNCommits: opts.lastNCommits } : {}),
+        ...(opts.json === true ? { json: true } : {}),
       });
     });
 

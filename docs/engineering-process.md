@@ -88,6 +88,31 @@ knobs.
 - `codex.review` — pre-0.26.0 audit entries from the legacy gateway
   path. `rea preflight` accepts these too for back-compat.
 
+## Codex review invocation pattern (0.27.0+)
+
+Use `rea hook codex-review` (the bundled CLI) or invoke `codex exec
+review --json --ephemeral` directly. The `codex-adversarial` agent and
+`/codex-review` slash command default to the thin-shim pattern. Do
+NOT use the verbose wrapper unless you specifically need
+Claude-paraphrased findings (e.g., teaching context for someone
+unfamiliar with codex JSON shape).
+
+The CLI handles iron-gate model defaults (`gpt-5.4` + `high`
+reasoning), raw-JSONL tee to `$TMPDIR/rea-codex-<sha>-<nonce>.json`,
+audit-entry writing (`codex.review` shape), and verdict-to-exit-code
+mapping (0 pass / 1 concerns / 2 blocking). The stderr line is a
+breadcrumb pointing to the raw JSON; the raw JSON is the review.
+
+Token cost note: each wrapper-agent codex round = 3 Opus turns; the
+direct-Bash pattern = 1 Opus turn. Marathon mode prefers direct.
+
+For the local-first gate-friendly flow, use `rea review` — it writes
+`rea.local_review` (the entry the gate consults) and produces
+human-readable output. `rea hook codex-review` writes `codex.review`
+(the legacy gateway shape) and is designed for thin-shim agent
+invocation. Both run codex with the same iron-gate defaults; choose
+based on which audit entry the downstream gate is looking for.
+
 ## Provider seam (deferred)
 
 `rea.local_review` records carry a `provider:` field. Today the only

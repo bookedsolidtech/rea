@@ -230,6 +230,15 @@ export interface CodexRunOptions {
     args: readonly string[],
     options: { cwd: string; env: NodeJS.ProcessEnv },
   ) => ChildProcessWithoutNullStreams;
+  /**
+   * 0.27.0 — optional callback fired for every raw stdout chunk from
+   * `codex exec review`. Used by `rea hook codex-review` (the thin Bash-
+   * direct CLI) to tee the JSONL stream into a tempfile so the caller can
+   * read the un-summarized review JSON directly. Errors thrown from the
+   * sink are caught and ignored — sink failure must NEVER change the
+   * verdict. Receives chunks in arrival order.
+   */
+  rawStdoutSink?: (chunk: Buffer) => void;
 }
 
 export interface CodexRunResult {
@@ -360,7 +369,19 @@ export async function runCodexReview(options: CodexRunOptions): Promise<CodexRun
     }, options.timeoutMs);
     timer.unref?.();
 
-    child.stdout.on('data', (chunk: Buffer) => stdoutChunks.push(chunk));
+    child.stdout.on('data', (chunk: Buffer) => {
+      stdoutChunks.push(chunk);
+      // 0.27.0 raw-stdout tee for `rea hook codex-review`. Sink errors
+      // are swallowed — a bad sink must not make a passing review fail.
+      const sink = options.rawStdoutSink;
+      if (sink !== undefined) {
+        try {
+          sink(chunk);
+        } catch {
+          /* sink failure is non-fatal */
+        }
+      }
+    });
     child.stderr.on('data', (chunk: Buffer) => stderrChunks.push(chunk));
 
     child.on('error', (e: NodeJS.ErrnoException) => {

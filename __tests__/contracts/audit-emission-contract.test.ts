@@ -5,9 +5,8 @@
  * via the agent OR via the pre-push runtime) emits an audit entry to
  * `.rea/audit.jsonl`.
  *
- *   1. `commands/codex-review.md` — slash-command flow, Step 3.
- *   2. `agents/codex-adversarial.md` — agent flow, Step 4 (Emit audit
- *      entry — REQUIRED).
+ *   1. `commands/codex-review.md` — slash-command flow.
+ *   2. `agents/codex-adversarial.md` — agent flow.
  *   3. `src/hooks/push-gate/index.ts` — runtime, calls `safeAppend`
  *      with `EVT_REVIEWED` on every completed review.
  *
@@ -17,6 +16,13 @@
  * the two markdown documents to the runtime contract. THIS TEST
  * prevents future drift — if any of the three documents diverges from
  * the others, CI fails with a specific message naming the offender.
+ *
+ * 0.27.0 update: the agent + slash command now route through
+ * `rea hook codex-review` (the canonical Bash-direct CLI), which
+ * itself writes the `codex.review` audit entry. The "always emits"
+ * obligation didn't go away — it moved one layer down. Signal
+ * phrases updated to match: "writes a `codex.review` audit entry"
+ * is the new equivalent of "Step 4 — Emit audit entry — REQUIRED".
  *
  * The test parses each document for canonical signal phrases. It does
  * NOT enforce identical wording — only that each document declares
@@ -46,7 +52,14 @@ const SOURCES: readonly ContractSource[] = [
   {
     label: 'commands/codex-review.md (slash command)',
     file: 'commands/codex-review.md',
-    signals: [/## Step 3 — Verify audit entry — REQUIRED/, /MUST.{0,40}emit.{0,40}audit/i],
+    signals: [
+      // 0.27.0+: the slash command routes through `rea hook codex-review`
+      // which writes the `codex.review` audit entry. Either the legacy
+      // explicit-Step-3 phrasing OR the new "writes a `codex.review`
+      // audit entry" phrasing satisfies the contract.
+      /writes a `?codex\.review`? audit entry/i,
+      /audit entry is always written/i,
+    ],
     antisignals: [
       // The pre-0.18.0 wording. If this returns, the test fails loudly.
       /audit emission is optional/i,
@@ -56,7 +69,13 @@ const SOURCES: readonly ContractSource[] = [
   {
     label: 'agents/codex-adversarial.md (agent)',
     file: 'agents/codex-adversarial.md',
-    signals: [/Emit an? audit entry.{0,10}—.{0,10}REQUIRED/i, /always emits/i],
+    signals: [
+      // 0.27.0+: the agent is a thin shim around `rea hook codex-review`,
+      // which writes the entry. The agent file documents that the CLI
+      // ALWAYS writes the audit entry.
+      /writes a `?codex\.review`? audit entry/i,
+      /always.{0,20}audit/i,
+    ],
     antisignals: [/audit emission is optional/i],
   },
   {
@@ -100,21 +119,31 @@ describe('cross-file audit-emission contract (Class G)', () => {
     });
   }
 
-  it('the canonical EVT_REVIEWED constant value is identical across runtime + docs', () => {
+  it('the canonical audit-event tool_name is referenced across runtime + docs', () => {
+    // 0.27.0+: the agent + slash command route through `rea hook
+    // codex-review`, which writes `codex.review` (not the push-gate's
+    // `rea.push_gate.reviewed`). Two distinct audit-event names live
+    // in the runtime — both are part of the same contract:
+    //
+    //   - rea.push_gate.reviewed  (push-gate runtime — EVT_REVIEWED)
+    //   - codex.review            (interactive CLI — agent + slash cmd)
+    //
+    // The interactive surfaces reference `codex.review`; the runtime
+    // owns EVT_REVIEWED. Both must be present in their respective
+    // documents.
     const runtimeBody = readSource('src/hooks/push-gate/index.ts');
     const evtMatch = runtimeBody.match(/EVT_REVIEWED\s*=\s*['"]([^'"]+)['"]/);
     expect(evtMatch?.[1], 'EVT_REVIEWED const not found in runtime').toBeDefined();
-    const evtValue = evtMatch![1]!;
 
     const slashCmd = readSource('commands/codex-review.md');
     const agentDoc = readSource('agents/codex-adversarial.md');
     expect(
-      slashCmd.includes('EVT_REVIEWED') || slashCmd.includes(evtValue),
-      `commands/codex-review.md does not reference the runtime EVT_REVIEWED (${evtValue}).`,
+      slashCmd.includes('codex.review'),
+      `commands/codex-review.md does not reference the canonical audit-event tool_name (codex.review).`,
     ).toBe(true);
     expect(
-      agentDoc.includes('EVT_REVIEWED') || agentDoc.includes(evtValue),
-      `agents/codex-adversarial.md does not reference the runtime EVT_REVIEWED (${evtValue}).`,
+      agentDoc.includes('codex.review'),
+      `agents/codex-adversarial.md does not reference the canonical audit-event tool_name (codex.review).`,
     ).toBe(true);
   });
 
