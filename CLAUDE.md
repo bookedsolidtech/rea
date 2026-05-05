@@ -67,10 +67,19 @@ The orchestrator (`subagent_type: "rea-orchestrator"`) is the primary routing la
 
 **Fallback**: If the orchestrator is unavailable or the task is narrowly scoped to a single domain, route directly to a specialist from `.claude/agents/`:
 
-- `code-reviewer`, `codex-adversarial` — review / adversarial review
-- `security-engineer`, `accessibility-engineer` — domain-specific review
-- `typescript-specialist`, `frontend-specialist`, `backend-engineer` — implementation
-- `qa-engineer`, `technical-writer` — testing and documentation
+- **Principals** (direction & readiness):
+  - `principal-engineer` — cross-module structural decisions, "patch vs redesign" calls
+  - `principal-product-engineer` — consumer signal → engineering priority, canary-vs-broad-rollout
+  - `release-captain` — release readiness, breaking-change disclosure, rollback plan
+- **Architects** (design):
+  - `security-architect` — threat model, trust boundaries, defense-in-depth
+  - `data-architect` — schema, migrations, data-flow boundaries (audit log, policy.yaml)
+  - `platform-architect` — CI / build / packaging / publish pipeline
+  - `devex-architect` — install topology, doctor diagnostics, error messages, idempotency
+- **Review tier**: `code-reviewer`, `codex-adversarial` — review / adversarial review
+- **Domain review**: `security-engineer`, `accessibility-engineer`
+- **Implementation**: `typescript-specialist`, `frontend-specialist`, `backend-engineer`
+- **Quality + docs**: `qa-engineer`, `technical-writer`
 
 **Do NOT** use generic Agent calls without specifying a `subagent_type`.
 

@@ -97,10 +97,11 @@ function loadAgents(): ParsedAgent[] {
 describe('agent definitions contract', () => {
   const agents = loadAgents();
 
-  it('discovers at least the Wave 1 expanded roster (14 agents)', () => {
+  it('discovers at least the Wave 2 expanded roster (17 agents)', () => {
     // Hard floor — additions are fine; deletions need an explicit
-    // memory entry, so we enforce the lower bound.
-    expect(agents.length).toBeGreaterThanOrEqual(14);
+    // memory entry, so we enforce the lower bound. Bumped Wave 1 (14)
+    // → Wave 2 (17, +3 architects). Will bump again at Wave 3 (22).
+    expect(agents.length).toBeGreaterThanOrEqual(17);
   });
 
   it('every agent has required frontmatter fields', () => {
@@ -157,6 +158,19 @@ describe('agent definitions contract', () => {
       'release-captain',
       'security-architect',
     ]) {
+      expect(names.has(required), `${required}.md must exist in agents/`).toBe(true);
+    }
+  });
+
+  it('Wave 2 architects are present (regression pin)', () => {
+    // 0.25.0 roster expansion — 3 architect agents added per the CTO
+    // eval recommendation. data-architect owns persisted shape and
+    // migrations, platform-architect owns the build/CI/publish
+    // pipeline, devex-architect owns the consumer install / doctor /
+    // error-string surface. Their absence indicates the roster was
+    // shrunk without an explicit memory entry.
+    const names = new Set(agents.map((a) => a.basename));
+    for (const required of ['data-architect', 'platform-architect', 'devex-architect']) {
       expect(names.has(required), `${required}.md must exist in agents/`).toBe(true);
     }
   });
