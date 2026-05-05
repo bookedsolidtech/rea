@@ -1,5 +1,25 @@
 # @bookedsolid/rea
 
+## 0.23.1
+
+### Patch Changes
+
+- 7906407: Security hotfix closing helix-024 — three Bash-tier kill-switch bypass classes against the 0.23.0 static AST scanner: cwd-relative writes (`cd .rea && echo > HALT`), doubly-nested eval (`eval "eval \"...\""`), and symlink-alias writes (`ln -sf .rea/HALT /tmp/x && echo > /tmp/x`). Each defeats `.rea/HALT`, `.rea/policy.yaml`, `.claude/settings.json`, `.husky/`. F2 (eval recursion + depth cap) and F3 (ln-source-protected synthetic refusal) ship as initially designed. F1 (cd-into-protected) ships with the round-14 codex P1 refined predicate plus the round-15 codex P1 closure that tightens the known-safe allow-list against env-var rebind and `--show-prefix` attacks.
+
+  **F1 refined predicate (round-14 + round-15 codex P1).** The cd-detection requires four conditions before emitting a synthetic refusal: (1) writes are in-scope of the cd (same StmtList successor / BinaryCmd.Y / nested compounds — not unrelated parallel stmts), (2) writes are bare-relative path-shape (absolute / tilde / outside-root unaffected by cwd), (3) dynamic cd with a known-safe source is treated as ALLOW, (4) dynamic cd without bare-relative writes in scope is a no-op. The known-safe set is intentionally narrow because misclassifying creates a real bypass: NO env-var name qualifies (round-15 — `$HOME`/`$PWD`/`$OLDPWD` are rebindable via inline assignment-prefix on the same simple command or via parent-shell exports across commands, and `$OLDPWD` automatically tracks any previous cd including into protected dirs); the only ParamExp source that is known-safe is a for-iter variable bound to all-literal-non-protected Items (Items literals are statically checked). Known-safe cmdsubst sources are `$(pwd)` and `$(git rev-parse <flag>)` with flag in `{--show-toplevel, --show-cdup, --show-superproject-working-tree}` — flags that resolve to absolute paths or paths stepping OUT of cwd. `$(git rev-parse --show-prefix)` is NOT known-safe (round-15 — returns cwd-relative-to-toplevel, which is `.rea/` when the agent is already inside `.rea/`).
+
+  **Caught.** Literal protected cd + bare-relative writes in any nested scope; dynamic cd with unknown / env-var / `--show-prefix` source + bare-relative write in scope. Round-15 PoCs newly closed: `HOME=.rea cd "$HOME" && echo > HALT`, `PWD=.rea cd "$PWD" && echo > HALT`, `cd "$(git rev-parse --show-prefix)" && echo > HALT`, `export HOME=.rea; cd "$HOME" && echo > HALT`, plus the bare-write forms `cd "$HOME" && echo > log` / `cd "$OLDPWD" && echo > log` / `pushd "$HOME" && echo > out`.
+
+  **Side improvement (round-15 P3).** `.github/workflows/` added to the historical default protected list so consumers without an explicit `policy.blocked_paths` entry still refuse Bash-tier writes to CI workflows. Intentionally NOT a kill-switch invariant — operators may relax it via `policy.protected_paths_relax: ['.github/workflows/']` when they have no CI safety story to protect.
+
+  **Accepted false-negatives (deferred to 0.24.0+).** `cd $(echo .rea)` cmdsubst-resolved literals, `alias evil="..."; evil` alias-then-invoke, for-iter loops whose Items list is itself a cmdsubst.
+
+  Class X corpus pins all 14 helix-024 PoCs as regression-positive; round-14 corpus extension added 9 must-ALLOW + 3 must-BLOCK fixtures pinning the refined predicate against over-relaxation and over-block regressions; round-15 closure moved 3 fixtures from ALLOW to BLOCK (`cd "$HOME"` / `cd "$OLDPWD"` / `pushd "$HOME"` with bare writes) and added 4 new BLOCK fixtures pinning the env-rebind + show-prefix PoCs. mvdan-sh@0.10.1 deprecation advisory noted in THREAT_MODEL §8.3 (already documented).
+
+  **Round-16 closure (sibling threat class to round-15 F1).** Bare `cd` / `cd -L` / `cd -P` / `popd` with bare-relative writes in scope also refuse on uncertainty: bash defaults their cwd to `$HOME` (bare cd / flag-only) or `$OLDPWD` (`cd -`) or dir-stack head (`popd`) — all runtime-determined and env-var rebindable, same threat class as the explicit `cd "$HOME"` form. Closure: `emitCdDecisionIfAny` now runs the in-scope bare-relative-write check on the no-positional path and emits `cwd_dynamic_with_writes_unresolvable`; `popd` added to `isCdOrPushd`. 5 new R16_BLOCK fixtures (`cd && echo > HALT`, `cd - && echo > HALT`, `cd -L && echo > HALT`, `cd -P && echo > HALT`, `popd && echo > HALT`) + 4 R16-shape negatives (`cd && cat README.md`, `popd && ls -la`, `cd -L && echo > /tmp/log`, `cd -P && echo > /var/log/app.log`) added to Class X corpus.
+
+  **Round-17 closure (control-flow walker gap, NOT a predicate weakness).** Codex round-17 LOCAL pre-push found a P1 + P2 + 2 P3 in the round-14/15/16 walker. The walker visited an IfClause/WhileClause/UntilClause's Cond and Body as separate scopes via `walkScopeForCwd`, so a `cd` inside the Cond had a single-command scope with no successors, never collected the body's writes as downstream, and never emitted — even though bash semantics keep cwd in the current shell so it persists into the Body when the cond is truthy AND past the conditional into post-stmt siblings. Closure: thread an `extraDownstream` parameter through `walkScopeForCwd` → `classifyCdInStmt` → `collectCdSitesInStmt` / `collectCdSitesInBinaryX`. When `descendCmdScopes` enters an IfClause/WhileClause/UntilClause, the Cond walk receives `[...body, ...post-stmt-siblings]` as carriers; the Body walk receives `[...post-stmt-siblings]`. Subshell stays cwd-isolated (forks a child shell) so its inner walk does NOT inherit parent siblings. The same closure adds explicit `TimeClause`/`CoprocClause` cases to `descendCmdScopes` (P2: `time cd .rea && echo > HALT`) and a TimeClause/CoprocClause unwrap in `collectCdSitesInBinaryX` so the cd site is reachable from the BinaryCmd.X path. `pushd` no-positional / `pushd -N` / `pushd +N` (P3) already BLOCK incidentally via the round-16 fallback (runtime-determined dir-stack manipulation refused on uncertainty); R17 P3 pins the verdict with three explicit fixtures so a future predicate relaxation cannot silently re-open the bypass. 12 new R17_BLOCK fixtures (8 if/while/until + post-conditional + binary-expr cond, 1 time-wrapped, 3 pushd) + 3 R17_ALLOW negatives (`pushd && cat README.md`, `if cd /tmp; then echo > log; fi`, `if cd .rea; then cat HALT; fi`) added to Class X corpus pinning the pragmatic-bound over-block surface.
+
 ## 0.23.0
 
 ### Minor Changes
@@ -45,12 +65,11 @@ protected|blocked` and verify the verdict JSON shape via `node -e`
     bypass.
   - **discord-ops Round 13**: 3 findings against the bash pipeline.
     Closed-by-removal.
-  - **codex round 1 against the 0.23.0 scanner**: 34 findings — 3 P0
-    - 12 P1 + 9 P2 + 10 P3. Every P0/P1 lands a regression-positive
-      fixture in `__tests__/hooks/bash-tier-corpus.test.ts` (new
-      describe block: `codex round 1 — adversarial findings against
+  - **codex round 1 against the 0.23.0 scanner**: 34 findings — 3 P0 - 12 P1 + 9 P2 + 10 P3. Every P0/P1 lands a regression-positive
+    fixture in `__tests__/hooks/bash-tier-corpus.test.ts` (new
+    describe block: `codex round 1 — adversarial findings against
 0.23.0 scanner`). P2 fixed in-tree; P3 fixed where economical
-      (rest documented).
+    (rest documented).
   - **codex round 2 against the round-1-fixed scanner**: 14 findings —
     2 P0 (R2-3 REA_NODE_CLI hijack class via the shape-gate accepting
     any \*/dist/cli/index.js, R2-14 absolute-path command-head dispatch
@@ -96,122 +115,108 @@ bash shim subprocess sampling` describe block that spawns
     sampled fixtures and cross-checks shim verdict against in-process
     verdict). New corpus classes J/K/C-ext/D-ext/B-ext add 393 fixtures.
   - **codex round 4 against the round-3-fixed scanner**: 8 findings —
-    2 P0 + 5 P1 + 1 P2. STRUCTURAL fixes:
-    - **Finding 1 P0** (recursive directory delete bypass): `rm -rf
+    2 P0 + 5 P1 + 1 P2. STRUCTURAL fixes: - **Finding 1 P0** (recursive directory delete bypass): `rm -rf
 .rea`, `rmdir .rea`, `find .rea -delete`, `shutil.rmtree`,
-      `fs.rmSync`, `FileUtils.rm_rf` etc all flag `isDestructive` on
-      emit. New protected-ancestry match path in `matchPatterns`: when
-      an input target is an ancestor of any protected pattern AND the
-      detection is destructive, treat as a hit. Structural corpus
-      extension: `PROTECTED_DIR_ANCESTORS` and `NEGATIVE_DIR_TARGETS`
-      added to types.ts; new Class L generator (270 fixtures) closes
-      the structural gap that prevented directory-write detection.
-    - **Finding 2 P0** (workspace-bin attacker rea hijack): tier 1
-      (`command -v rea` PATH lookup) and tier 2 (`node_modules/.bin/
+    `fs.rmSync`, `FileUtils.rm_rf` etc all flag `isDestructive` on
+    emit. New protected-ancestry match path in `matchPatterns`: when
+    an input target is an ancestor of any protected pattern AND the
+    detection is destructive, treat as a hit. Structural corpus
+    extension: `PROTECTED_DIR_ANCESTORS` and `NEGATIVE_DIR_TARGETS`
+    added to types.ts; new Class L generator (270 fixtures) closes
+    the structural gap that prevented directory-write detection. - **Finding 2 P0** (workspace-bin attacker rea hijack): tier 1
+    (`command -v rea` PATH lookup) and tier 2 (`node_modules/.bin/
 rea` symlink) DROPPED from both bash shims. New 2-tier sandboxed
-      resolver uses `node_modules/@bookedsolid/rea/dist/cli/index.js`
-      (the published artifact) or `dist/cli/index.js` (rea-repo
-      dogfood). A realpath sandbox check verifies the resolved CLI
-      lives in a package directory whose `package.json` has
-      `name === "@bookedsolid/rea"`.
-    - **Finding 3 P1** (mv source-side path is a write): `detectCpMv`
-      emits SOURCE positionals as destructive write detections for `mv`.
-    - **Finding 4 P1** (find -delete unmodeled): `detectFind` rewritten
-      to emit seed paths as destructive write targets when `-delete` is
-      present; dynamic when `-name`/`-iname`/`-path` predicates narrow.
-    - **Finding 5 P1** (interpreter shell-out shapes missing): perl
-      `exec("cmd")` / `open(F, "|-", "cmd")`, ruby `Kernel.system` /
-      `Open3.capture3` / `IO.popen`, node `spawnSync("bash",["-c",
+    resolver uses `node_modules/@bookedsolid/rea/dist/cli/index.js`
+    (the published artifact) or `dist/cli/index.js` (rea-repo
+    dogfood). A realpath sandbox check verifies the resolved CLI
+    lives in a package directory whose `package.json` has
+    `name === "@bookedsolid/rea"`. - **Finding 3 P1** (mv source-side path is a write): `detectCpMv`
+    emits SOURCE positionals as destructive write detections for `mv`. - **Finding 4 P1** (find -delete unmodeled): `detectFind` rewritten
+    to emit seed paths as destructive write targets when `-delete` is
+    present; dynamic when `-name`/`-iname`/`-path` predicates narrow. - **Finding 5 P1** (interpreter shell-out shapes missing): perl
+    `exec("cmd")` / `open(F, "|-", "cmd")`, ruby `Kernel.system` /
+    `Open3.capture3` / `IO.popen`, node `spawnSync("bash",["-c",
 "cmd"])`, python `pty.spawn(["bash","-c","cmd"])` patterns added.
-      New `PYTHON_OPAQUE_SPAWN_RE` for `os.spawnv*`/`os.execv*`/
-      `pty.fork()` emits dynamic.
-    - **Finding 6 P1** (pathlib & File-class destructive APIs):
-      `Path('FILE').touch/.unlink/.rmdir/.rename`, ruby `File.delete /
+    New `PYTHON_OPAQUE_SPAWN_RE` for `os.spawnv*`/`os.execv*`/
+    `pty.fork()` emits dynamic. - **Finding 6 P1** (pathlib & File-class destructive APIs):
+    `Path('FILE').touch/.unlink/.rmdir/.rename`, ruby `File.delete /
 .unlink / .rmdir / .rename`, bare `open('FILE', 'w')`, perl
-      `unlink "FILE"` / `rename SRC DEST`. Per-substring destructive-API
-      recognition via `isMatchedDestructive` plumbs `isDestructive`
-      through interpreter-tier emissions.
-    - **Finding 7 P1** (misc utilities + procsubst-feeding-bash): new
-      `detectPatch`, `detectSort`/`detectShuf`, `detectGpg`,
-      `detectSplit`, `detectTrap` (re-parses trap command), extended
-      `detectGit` for `config --file FILE`. New procsubst-feeding-bash
-      handling: `bash <(cmd)`, `bash 0< <(cmd)`, `bash <<< "cmd"` all
-      emit dynamic detections. `extractHeredocShellPayloads` extended
-      for op codes 0x38 (RdrIn) and 0x3f (WordHdoc here-string).
-    - **Finding 8 P2** (THREAT_MODEL §8 stale + acknowledge denylist
-      architecture limit): §8.2 updated with all round-3 + round-4
-      closures. §8.3 acknowledges that a denylist scanner is structurally
-      limited — defense in depth via mvdan-sh AST + comprehensive walker
-      - adversarial corpus + per-round Codex review + fail-closed
-        defaults.
-        Total adversarial corpus across rounds: 8768 fixtures across 14
-        classes (A–I + J/K/C-ext/D-ext/B-ext + L).
+    `unlink "FILE"` / `rename SRC DEST`. Per-substring destructive-API
+    recognition via `isMatchedDestructive` plumbs `isDestructive`
+    through interpreter-tier emissions. - **Finding 7 P1** (misc utilities + procsubst-feeding-bash): new
+    `detectPatch`, `detectSort`/`detectShuf`, `detectGpg`,
+    `detectSplit`, `detectTrap` (re-parses trap command), extended
+    `detectGit` for `config --file FILE`. New procsubst-feeding-bash
+    handling: `bash <(cmd)`, `bash 0< <(cmd)`, `bash <<< "cmd"` all
+    emit dynamic detections. `extractHeredocShellPayloads` extended
+    for op codes 0x38 (RdrIn) and 0x3f (WordHdoc here-string). - **Finding 8 P2** (THREAT_MODEL §8 stale + acknowledge denylist
+    architecture limit): §8.2 updated with all round-3 + round-4
+    closures. §8.3 acknowledges that a denylist scanner is structurally
+    limited — defense in depth via mvdan-sh AST + comprehensive walker - adversarial corpus + per-round Codex review + fail-closed
+    defaults.
+    Total adversarial corpus across rounds: 8768 fixtures across 14
+    classes (A–I + J/K/C-ext/D-ext/B-ext + L).
   - **codex round 5 against the round-4-fixed scanner**: 5 findings —
-    2 P0 + 3 P1. STRUCTURAL fixes:
-    - **F1 P0** (assignment-side cmdsubst silent bypass): walker
-      short-circuited at `args.length === 0` and ignored
-      `CallExpr.Assigns`; clauses `DeclClause`, `TestClause`,
-      `ArithmCmd`, `LetClause`, `SelectClause`, and `CaseClause.Word`
-      fell to walkCmd's default. `extractStmtRedirects` didn't walk
-      redirect Words on read ops. Pre-fix `FOO=$(rm -rf .rea)`,
-      `export X=$(rm)`, `[[ -n $(rm) ]]`, `case $(rm) in`,
-      `cat <<< $(rm)`, `read X < <(rm)`, `(( $(rm) ))`,
-      `for x in $(rm)` all silently bypassed every detector. New
-      `walkAssignsForSubstNodes` walks every `Assign.Value` /
-      `Assign.Array.Elems[*].Value` / `Assign.Index` for embedded
-      CmdSubst/ProcSubst/ArithmExp; new `walkTestExpr` recurses
-      through UnaryTest/BinaryTest/ParenTest leaves; walkCmd cases
-      added for every dropped clause type; `extractStmtRedirects`
-      walks the Word for cmdsubst regardless of operator.
-    - **F2 P0** (CLAUDE_PROJECT_DIR sandbox bypass via symlink-out):
-      pre-fix the realpath check only walked up looking for a
-      `package.json` with `name === "@bookedsolid/rea"`. An attacker
-      who could write a symlink at `node_modules/@bookedsolid/rea`
-      pointing to `/tmp/sym-attacker/` containing a forged
-      `package.json` + a forged `dist/cli/index.js` that exits 0 with
-      `{"verdict":"allow"}` defeated the sandbox. PRIMARY check now
-      is `realpath(cli).startsWith(realpath(CLAUDE_PROJECT_DIR) + sep)`;
-      the pkg.json walk-up remains as the SECONDARY guard for
-      intra-project hijacks.
-    - **F3 P1** (mixed-quote interpreter shell-out): per-language
-      `*_SHELL_OUT_RE` arrays gained quote-aware variants
-      `(["'])((?:(?!\1)[^\\]|\\.)+)\1` per call site. Closes
-      mixed-quote-nesting bypasses like `os.system('rm "x"')`. The
-      scanner's loop now picks the LAST non-empty non-quote capture,
-      working with both single-capture (old) and two-capture (new)
-      shapes. Plus a fail-closed shell-out fallback that emits a
-      dynamic detection when the payload contains a shell-out API
-      token but no shell-out regex extracted a clean payload — the
-      `SHELL_OUT_API_TOKENS` table is conservative: every
-      unconditional shell-out call site is included; conditional ones
-      (subprocess.\* with `shell=True`) match only with the
-      `shell=True` co-occurrence to avoid blocking legit argv-form
-      `subprocess.run`.
-    - **F4 P1** (chained-interpreter multi-level escape): pre-fix
-      `python -c "import os; os.system('node -e \"require(\\\"fs
+    2 P0 + 3 P1. STRUCTURAL fixes: - **F1 P0** (assignment-side cmdsubst silent bypass): walker
+    short-circuited at `args.length === 0` and ignored
+    `CallExpr.Assigns`; clauses `DeclClause`, `TestClause`,
+    `ArithmCmd`, `LetClause`, `SelectClause`, and `CaseClause.Word`
+    fell to walkCmd's default. `extractStmtRedirects` didn't walk
+    redirect Words on read ops. Pre-fix `FOO=$(rm -rf .rea)`,
+    `export X=$(rm)`, `[[ -n $(rm) ]]`, `case $(rm) in`,
+    `cat <<< $(rm)`, `read X < <(rm)`, `(( $(rm) ))`,
+    `for x in $(rm)` all silently bypassed every detector. New
+    `walkAssignsForSubstNodes` walks every `Assign.Value` /
+    `Assign.Array.Elems[*].Value` / `Assign.Index` for embedded
+    CmdSubst/ProcSubst/ArithmExp; new `walkTestExpr` recurses
+    through UnaryTest/BinaryTest/ParenTest leaves; walkCmd cases
+    added for every dropped clause type; `extractStmtRedirects`
+    walks the Word for cmdsubst regardless of operator. - **F2 P0** (CLAUDE_PROJECT_DIR sandbox bypass via symlink-out):
+    pre-fix the realpath check only walked up looking for a
+    `package.json` with `name === "@bookedsolid/rea"`. An attacker
+    who could write a symlink at `node_modules/@bookedsolid/rea`
+    pointing to `/tmp/sym-attacker/` containing a forged
+    `package.json` + a forged `dist/cli/index.js` that exits 0 with
+    `{"verdict":"allow"}` defeated the sandbox. PRIMARY check now
+    is `realpath(cli).startsWith(realpath(CLAUDE_PROJECT_DIR) + sep)`;
+    the pkg.json walk-up remains as the SECONDARY guard for
+    intra-project hijacks. - **F3 P1** (mixed-quote interpreter shell-out): per-language
+    `*_SHELL_OUT_RE` arrays gained quote-aware variants
+    `(["'])((?:(?!\1)[^\\]|\\.)+)\1` per call site. Closes
+    mixed-quote-nesting bypasses like `os.system('rm "x"')`. The
+    scanner's loop now picks the LAST non-empty non-quote capture,
+    working with both single-capture (old) and two-capture (new)
+    shapes. Plus a fail-closed shell-out fallback that emits a
+    dynamic detection when the payload contains a shell-out API
+    token but no shell-out regex extracted a clean payload — the
+    `SHELL_OUT_API_TOKENS` table is conservative: every
+    unconditional shell-out call site is included; conditional ones
+    (subprocess.\* with `shell=True`) match only with the
+    `shell=True` co-occurrence to avoid blocking legit argv-form
+    `subprocess.run`. - **F4 P1** (chained-interpreter multi-level escape): pre-fix
+    `python -c "import os; os.system('node -e \"require(\\\"fs
 \\\").rmSync(\\\".rea\\\", ...)\"')"` allowed because each
-      layer accumulates a `\\\"` shell-escape level and the
-      per-language path-quote regex rejects `(\\"` after the call
-      paren. Fix: `looksLikeChainedInterpreter` heuristic — when a
-      shell-out body itself contains a known interpreter binary head
-      followed by an eval flag (`-c`/`-e`/`--eval`/`-pe`/`-ic`), emit
-      a dynamic detection. Closes every multi-level chain we've
-      observed without iterating unshellEscape (which would
-      over-strip single-level `\\\"` literals).
-    - **F5 P1/P3** (THREAT_MODEL trust-boundary honesty): §8.2 was
-      overclaiming structural impossibility for the
-      `node_modules/`-attacker case. Updated
-      `protected-paths-bash-gate.sh` docstring + THREAT_MODEL §8.3 +
-      `docs/architecture/bash-scanner.md` to clearly distinguish:
-      (a) the realpath sandbox catches PATH-attacker, workspace-bin,
-      symlink-out-of-project, and intra-project-without-pkg.json
-      hijacks (structural); (b) it does NOT catch a forged
-      `dist/cli/index.js` + matching `package.json` written directly
-      into `node_modules/` — that's a package-tier supply-chain
-      compromise (npm provenance scope), not a hook-tier defense.
-      Total adversarial corpus rises to 8861 fixtures with the new
-      Class M (assignment-side cmdsubst × every protected target ×
-      every shape) plus round-5 PoC fixtures and quote-mixing variants.
+    layer accumulates a `\\\"` shell-escape level and the
+    per-language path-quote regex rejects `(\\"` after the call
+    paren. Fix: `looksLikeChainedInterpreter` heuristic — when a
+    shell-out body itself contains a known interpreter binary head
+    followed by an eval flag (`-c`/`-e`/`--eval`/`-pe`/`-ic`), emit
+    a dynamic detection. Closes every multi-level chain we've
+    observed without iterating unshellEscape (which would
+    over-strip single-level `\\\"` literals). - **F5 P1/P3** (THREAT_MODEL trust-boundary honesty): §8.2 was
+    overclaiming structural impossibility for the
+    `node_modules/`-attacker case. Updated
+    `protected-paths-bash-gate.sh` docstring + THREAT_MODEL §8.3 +
+    `docs/architecture/bash-scanner.md` to clearly distinguish:
+    (a) the realpath sandbox catches PATH-attacker, workspace-bin,
+    symlink-out-of-project, and intra-project-without-pkg.json
+    hijacks (structural); (b) it does NOT catch a forged
+    `dist/cli/index.js` + matching `package.json` written directly
+    into `node_modules/` — that's a package-tier supply-chain
+    compromise (npm provenance scope), not a hook-tier defense.
+    Total adversarial corpus rises to 8861 fixtures with the new
+    Class M (assignment-side cmdsubst × every protected target ×
+    every shape) plus round-5 PoC fixtures and quote-mixing variants.
   - **codex round 6 against the round-5-fixed scanner**: 2 P0s in
     the same architectural class as round 5 — `WhileClause.Cond`
     and `ForClause.CStyleLoop.{Init,Cond,Post}` slots silently
@@ -1775,13 +1780,13 @@ codex-review --also-set-cache`) on every push, produced a 1,250-line bash
 
   This release replaces the entire stack with a stateless gate:
 
-                                              git push
-                                                → .husky/pre-push → rea hook push-gate
-                                                → codex exec review --base <ref> --json
-                                                → parse verdict from streamed findings
-                                                → block on [P1] (blocking) or [P2] when concerns_blocks=true
-                                                → write .rea/last-review.json + audit record
-                                                → exit 0 / 1 (HALT) / 2 (blocked)
+                                                git push
+                                                  → .husky/pre-push → rea hook push-gate
+                                                  → codex exec review --base <ref> --json
+                                                  → parse verdict from streamed findings
+                                                  → block on [P1] (blocking) or [P2] when concerns_blocks=true
+                                                  → write .rea/last-review.json + audit record
+                                                  → exit 0 / 1 (HALT) / 2 (blocked)
 
   Codex is run fresh on every push. No cache. No SHA matching. No receipt
   consultation. When the gate blocks, Claude reads stderr + the
