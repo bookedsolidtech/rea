@@ -287,9 +287,17 @@ export function reaCommandTier(command: string): Tier | null {
   const subcommandTier: Tier | null = ((): Tier | null => {
     switch (sub) {
       case 'check':
-      case 'doctor':
       case 'status':
         return Tier.Read;
+      case 'doctor': {
+        // 0.29.0 — `rea doctor --smoke` appends a probe
+        // `rea.delegation_signal` record to `.rea/audit.jsonl` to
+        // verify the end-to-end pipeline. That makes it a writer
+        // (hash-chain mutation) and therefore Write-tier — bare
+        // `rea doctor` stays Read. Codex round 3 P2 (2026-05-12).
+        if (tokens.slice(idx + 1).includes('--smoke')) return Tier.Write;
+        return Tier.Read;
+      }
       case 'hook': {
         // `rea hook push-gate` is execution-only — it runs codex exec review
         // and writes `.rea/last-review.json` + an audit record, but the
@@ -297,10 +305,20 @@ export function reaCommandTier(command: string): Tier | null {
         // hook is not blocked at L1 (symmetric to the 0.10.x reasoning for
         // `audit record codex-review`).
         if (sub2 === 'push-gate') return Tier.Read;
+        // 0.29.0 — `rea hook delegation-signal` reads stdin, appends a
+        // single audit record, and exits 0. Read-tier: observational
+        // telemetry with no policy effect and no behavior change to the
+        // underlying Agent/Skill dispatch.
+        if (sub2 === 'delegation-signal') return Tier.Read;
         return Tier.Write;
       }
       case 'audit': {
         if (sub2 === 'verify') return Tier.Read;
+        // 0.29.0 — `rea audit specialists` is a read-only reader for
+        // the delegation-telemetry MVP. Classify Read so L0 sessions
+        // can summarize delegation patterns without tripping the
+        // Write-tier default. Codex round 3 P2 (2026-05-12).
+        if (sub2 === 'specialists') return Tier.Read;
         if (sub2 === 'rotate') return Tier.Write;
         return Tier.Write;
       }

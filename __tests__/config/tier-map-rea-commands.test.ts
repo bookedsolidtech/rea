@@ -38,6 +38,15 @@ describe('reaCommandTier — fully-trusted invocations (absolute path only)', ()
     ['/usr/local/bin/rea audit verify', Tier.Read],
     ['/usr/local/bin/rea hook push-gate', Tier.Read],
     ['/opt/app/node_modules/.bin/rea hook push-gate --base origin/main', Tier.Read],
+    // 0.29.0 — `rea hook delegation-signal` is observational telemetry
+    // (a single audit record, no policy effect). Read tier so L0
+    // sessions can still emit the signal.
+    ['/usr/local/bin/rea hook delegation-signal', Tier.Read],
+    ['/opt/app/node_modules/.bin/rea hook delegation-signal --detach', Tier.Read],
+    // 0.29.0 — `rea audit specialists` reads only. Read tier so the
+    // command is usable from a documented read-only / L0 posture.
+    ['/usr/local/bin/rea audit specialists', Tier.Read],
+    ['/usr/local/bin/rea audit specialists --json', Tier.Read],
   ])('%s → Read', (cmd, expected) => {
     expect(reaCommandTier(cmd)).toBe(expected);
   });
@@ -49,6 +58,10 @@ describe('reaCommandTier — fully-trusted invocations (absolute path only)', ()
     ['/usr/local/bin/rea upgrade --yes', Tier.Write],
     ['/usr/local/bin/rea unfreeze --yes', Tier.Write],
     ['/usr/local/bin/rea something-unrecognized', Tier.Write],
+    // 0.29.0 — `rea doctor --smoke` writes a probe audit record, so
+    // it's Write-tier even though bare `rea doctor` stays Read.
+    ['/usr/local/bin/rea doctor --smoke', Tier.Write],
+    ['/opt/app/node_modules/.bin/rea doctor --smoke --metrics', Tier.Write],
     // Removed subcommand — falls through to the default Write tier.
     ['/usr/local/bin/rea cache set abc pass --branch feat/x --base main', Tier.Write],
     ['/usr/local/bin/rea audit record codex-review --head-sha abc --verdict pass', Tier.Write],

@@ -751,6 +751,9 @@ describe('rea doctor — EXPECTED_HOOKS coverage (round-25 P3)', () => {
       'blocked-paths-enforcer.sh',
       'changeset-security-gate.sh',
       'dangerous-bash-interceptor.sh',
+      // 0.29.0 — delegation-telemetry MVP. Without this entry the
+      // EXPECTED_HOOKS list grew to 15 and the test below fails fast.
+      'delegation-capture.sh',
       'dependency-audit-gate.sh',
       'env-file-protection.sh',
       'local-review-gate.sh',
@@ -768,9 +771,9 @@ describe('rea doctor — EXPECTED_HOOKS coverage (round-25 P3)', () => {
     const checks = collectChecks(repo.dir);
     const hooksCheck = findCheck(checks, 'hooks installed + executable');
     expect(hooksCheck?.status).toBe('pass');
-    // Round-27 F8: 14 shipped hooks (was 12 pre-fix; added
-    // protected-paths-bash-gate.sh + blocked-paths-bash-gate.sh).
-    expect(hooksCheck?.detail).toMatch(/14 hooks present/);
+    // 0.29.0 — 15 shipped hooks (was 14; 0.29.0 added
+    // delegation-capture.sh as the Agent|Skill PreToolUse signal).
+    expect(hooksCheck?.detail).toMatch(/15 hooks present/);
   });
 });
 
@@ -1092,5 +1095,106 @@ describe('rea doctor — checkExtensionFragments (Fix H / 0.13.0)', () => {
     expect(ext?.status).toBe('info');
     expect(ext?.detail).toMatch(/commit-msg\.d\/10-cm/);
     expect(ext?.detail).toMatch(/pre-push\.d\/20-pp/);
+  });
+});
+
+/**
+ * 0.29.0 — delegation-capture hook registration check. Loud failure
+ * mode is the priority: a consumer who upgrades 0.28.x → 0.29.x
+ * without re-running `rea init` or `rea upgrade` must see the
+ * mismatch surface as a hard fail in `rea doctor`.
+ */
+describe('rea doctor — delegation-capture hook registered (0.29.0)', () => {
+  const cleanup: string[] = [];
+
+  afterEach(async () => {
+    await Promise.all(cleanup.splice(0).map((d) => fs.rm(d, { recursive: true, force: true })));
+  });
+
+  async function writeSettings(repoDir: string, settings: unknown): Promise<void> {
+    await fs.mkdir(path.join(repoDir, '.claude'), { recursive: true });
+    await fs.writeFile(
+      path.join(repoDir, '.claude', 'settings.json'),
+      JSON.stringify(settings, null, 2),
+    );
+  }
+
+  // 0.29.0 posture: advisory (warn), not hard fail. Existing consumer
+  // installs (and the repo's own dogfood) won't have the matcher
+  // registered until `rea upgrade` propagates the template. Promotion
+  // to fail is scheduled for 0.30.0 — by which point consumer
+  // installs have had time to update. Codex round 2 P2.
+  it('warns (advisory) when .claude/settings.json is missing', async () => {
+    const repo = await makeScratchRepo({ codexRequired: false });
+    cleanup.push(repo.dir);
+    const checks = collectChecks(repo.dir);
+    const check = findCheck(checks, 'delegation-capture hook registered');
+    expect(check?.status).toBe('warn');
+    expect(check?.detail).toMatch(/missing|rea upgrade|rea init/);
+  });
+
+  it('warns (advisory) when no Agent|Skill matcher group is registered', async () => {
+    const repo = await makeScratchRepo({ codexRequired: false });
+    cleanup.push(repo.dir);
+    await writeSettings(repo.dir, {
+      hooks: {
+        PreToolUse: [
+          {
+            matcher: 'Bash',
+            hooks: [
+              { type: 'command', command: '$CLAUDE_PROJECT_DIR/.claude/hooks/x.sh' },
+            ],
+          },
+        ],
+      },
+    });
+    const checks = collectChecks(repo.dir);
+    const check = findCheck(checks, 'delegation-capture hook registered');
+    expect(check?.status).toBe('warn');
+    expect(check?.detail).toMatch(/Agent\|Skill/);
+  });
+
+  it('warns (advisory) when Agent|Skill matcher exists but no delegation-capture.sh command is present', async () => {
+    const repo = await makeScratchRepo({ codexRequired: false });
+    cleanup.push(repo.dir);
+    await writeSettings(repo.dir, {
+      hooks: {
+        PreToolUse: [
+          {
+            matcher: 'Agent|Skill',
+            hooks: [
+              { type: 'command', command: '$CLAUDE_PROJECT_DIR/.claude/hooks/other.sh' },
+            ],
+          },
+        ],
+      },
+    });
+    const checks = collectChecks(repo.dir);
+    const check = findCheck(checks, 'delegation-capture hook registered');
+    expect(check?.status).toBe('warn');
+  });
+
+  it('passes when Agent|Skill matcher references delegation-capture.sh', async () => {
+    const repo = await makeScratchRepo({ codexRequired: false });
+    cleanup.push(repo.dir);
+    await writeSettings(repo.dir, {
+      hooks: {
+        PreToolUse: [
+          {
+            matcher: 'Agent|Skill',
+            hooks: [
+              {
+                type: 'command',
+                command:
+                  '$CLAUDE_PROJECT_DIR/.claude/hooks/delegation-capture.sh',
+              },
+            ],
+          },
+        ],
+      },
+    });
+    const checks = collectChecks(repo.dir);
+    const check = findCheck(checks, 'delegation-capture hook registered');
+    expect(check?.status).toBe('pass');
   });
 });
