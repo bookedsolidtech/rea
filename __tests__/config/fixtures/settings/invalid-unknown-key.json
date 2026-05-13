@@ -1,0 +1,6 @@
+{
+  "hooks": {
+    "PreToolUse": []
+  },
+  "unknownTopLevelKey": "should-fail-strict-parse"
+}

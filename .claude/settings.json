@@ -65,6 +65,17 @@
         ]
       },
       {
+        "matcher": "Agent|Skill",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/delegation-capture.sh",
+            "timeout": 5000,
+            "statusMessage": "Recording delegation signal..."
+          }
+        ]
+      },
+      {
         "matcher": "Write|Edit|MultiEdit|NotebookEdit",
         "hooks": [
           {

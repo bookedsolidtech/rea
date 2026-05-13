@@ -208,13 +208,20 @@ async function main(): Promise<void> {
       '--smoke',
       'also run the 0.29.0 delegation-signal round-trip (writes a probe `rea.delegation_signal` audit record and verifies chain integrity)',
     )
-    .action(async (opts: { metrics?: boolean; drift?: boolean; smoke?: boolean }) => {
-      await runDoctor({
-        ...(opts.metrics === true ? { metrics: true } : {}),
-        ...(opts.drift === true ? { drift: true } : {}),
-        ...(opts.smoke === true ? { smoke: true } : {}),
-      });
-    });
+    .option(
+      '--strict',
+      '0.30.0 Class M — promote settings.json schema warnings (zod parse failures, path traversal, missing rea hooks) to hard fail. Use in CI gates.',
+    )
+    .action(
+      async (opts: { metrics?: boolean; drift?: boolean; smoke?: boolean; strict?: boolean }) => {
+        await runDoctor({
+          ...(opts.metrics === true ? { metrics: true } : {}),
+          ...(opts.drift === true ? { drift: true } : {}),
+          ...(opts.smoke === true ? { smoke: true } : {}),
+          ...(opts.strict === true ? { strict: true } : {}),
+        });
+      },
+    );
 
   await program.parseAsync(process.argv);
 }

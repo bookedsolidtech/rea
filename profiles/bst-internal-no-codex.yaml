@@ -43,3 +43,18 @@ context_protection:
     - pnpm run test
     - pnpm run lint
   max_bash_output_lines: 100
+# 0.30.0 attribution augmenter — opt-in.
+# Husky prepare-commit-msg hook appends a Co-Authored-By trailer to
+# every commit when enabled. Even the bst-internal profile ships
+# `enabled: false` so other BST contributors using the profile don't
+# silently route their commits onto the profile author's GitHub
+# heatmap; opt-in lives in repo-local edits to .rea/policy.yaml.
+# attribution:
+#   co_author:
+#     enabled: true
+#     name: 'Your Name'
+#     email: 'you@example.com'
+#     skip_merge: false
+attribution:
+  co_author:
+    enabled: false

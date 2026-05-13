@@ -51,3 +51,19 @@ architecture_review:
     - hooks/_lib/
     - templates/
     - profiles/
+# 0.30.0 attribution augmenter — opt-in.
+# Husky prepare-commit-msg hook appends a Co-Authored-By trailer to
+# every commit when enabled. Even the bst-internal profile ships
+# `enabled: false` so other BST contributors using the profile don't
+# silently route their commits onto the profile author's GitHub
+# heatmap; opt-in lives in repo-local edits to .rea/policy.yaml
+# because the identity to roll commits onto is per-developer.
+# attribution:
+#   co_author:
+#     enabled: true
+#     name: 'Your Name'
+#     email: 'you@example.com'
+#     skip_merge: false
+attribution:
+  co_author:
+    enabled: false

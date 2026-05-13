@@ -59,6 +59,10 @@ are on the vanilla-git path — install husky first.
 - `.husky/pre-push` — package-managed; **do not edit**. Refreshed on every
   `rea upgrade`.
 - `.husky/commit-msg` — package-managed; **do not edit**. Same.
+- `.husky/prepare-commit-msg` — package-managed (added in 0.30.0).
+  Drives the optional `attribution.co_author` augmenter; **do not edit**.
+  No-op when `policy.attribution.co_author.enabled !== true`, so it is
+  safe to ship under every profile (default disabled).
 - `.git/hooks/pre-push` (fallback when `core.hooksPath` is unset).
 - `.claude/hooks/*.sh` — protection + audit + advisory hooks.
 - `.claude/agents/*.md`, `.claude/commands/*.md`.
@@ -124,6 +128,77 @@ chmod +x .husky/commit-msg.d/01-commitlint
 Re-run `rea upgrade`. The package-managed `.husky/commit-msg` body now
 runs first (HALT check, AI-attribution block when policy enables it),
 then runs your fragment.
+
+## Conflict pattern: existing prepare-commit-msg (rea 0.30.0+)
+
+You probably have a hook that templates the message, adds a Jira
+ticket prefix, or inserts a branch name:
+
+```sh
+#!/bin/sh
+# .husky/prepare-commit-msg — user-authored
+COMMIT_MSG_FILE=$1
+BRANCH=$(git rev-parse --abbrev-ref HEAD)
+echo "[$BRANCH] $(cat "$COMMIT_MSG_FILE")" > "$COMMIT_MSG_FILE"
+```
+
+**rea 0.30.0+ refuses to overwrite a foreign `.husky/prepare-commit-msg`.**
+On `rea init` you'll see a `[fail]` from `rea doctor`:
+
+```
+[fail] prepare-commit-msg hook (attribution augmenter)
+       (attribution.co_author.enabled: true but the prepare-commit-msg
+        hook is foreign (no rea marker) — remove the existing hook
+        and re-run `rea init`, or set enabled: false.)
+```
+
+### Migration
+
+Two paths, depending on whether you intend to use the rea augmenter.
+
+**Path A — you want the augmenter (Co-Authored-By trailer)**
+
+Move your branch-prefix logic into rea's chained body. As of 0.30.0
+rea's prepare-commit-msg body does NOT support `.husky/prepare-commit-msg.d/*`
+fragments yet (it's on the 0.31.0 roadmap). For now, port the logic
+into a wrapper invoked by `commit-msg.d` instead:
+
+```bash
+mkdir -p .husky/commit-msg.d
+cat > .husky/commit-msg.d/00-branch-prefix <<'EOF'
+#!/bin/sh
+# Branch-prefix logic moved from prepare-commit-msg to commit-msg.d
+# (runs AFTER rea's augmenter, before the commit is finalized).
+BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)
+case $(head -1 "$1") in
+  "[$BRANCH]"*) ;;  # already prefixed
+  *) printf '[%s] %s' "$BRANCH" "$(cat "$1")" > "$1" ;;
+esac
+EOF
+chmod +x .husky/commit-msg.d/00-branch-prefix
+```
+
+Then remove the old `.husky/prepare-commit-msg`:
+
+```bash
+rm .husky/prepare-commit-msg .git/hooks/prepare-commit-msg
+```
+
+Re-run `rea init`. rea's prepare-commit-msg now installs cleanly.
+
+**Path B — you do NOT want the augmenter**
+
+Leave your existing hook in place. Set the augmenter off explicitly:
+
+```yaml
+# .rea/policy.yaml
+attribution:
+  co_author:
+    enabled: false
+```
+
+`rea doctor` reports `[warn]` (not fail) for the foreign hook —
+your commits keep going through your existing logic.
 
 ## Conflict pattern: lint-staged on pre-push
 

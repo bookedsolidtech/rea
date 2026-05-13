@@ -21,3 +21,17 @@ context_protection:
     - pnpm run build
     - pnpm run test
   max_bash_output_lines: 100
+# 0.30.0 attribution augmenter — opt-in.
+# Husky prepare-commit-msg hook appends a Co-Authored-By trailer to
+# every commit when enabled. client-engagement profile ships
+# `enabled: false`; opt-in lives in repo-local edits to .rea/policy.yaml
+# because the identity to roll commits onto is per-developer.
+# attribution:
+#   co_author:
+#     enabled: true
+#     name: 'Your Name'
+#     email: 'you@example.com'
+#     skip_merge: false
+attribution:
+  co_author:
+    enabled: false

@@ -9,3 +9,19 @@ blocked_paths:
   - .env
   - .env.*
 notification_channel: ''
+# 0.30.0 attribution augmenter — opt-in.
+# When enabled: true, the husky prepare-commit-msg hook appends a
+# Co-Authored-By trailer to every commit (or every non-merge commit
+# when skip_merge: true). Idempotent on email match (case-insensitive).
+# Profile defaults are off; opt in per-repo via .rea/policy.yaml —
+# the identity to roll commits onto is per-developer.
+#
+# attribution:
+#   co_author:
+#     enabled: true
+#     name: 'Your Name'
+#     email: 'you@example.com'
+#     skip_merge: false
+attribution:
+  co_author:
+    enabled: false

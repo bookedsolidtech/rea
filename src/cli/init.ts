@@ -15,6 +15,7 @@ import {
   writeSettingsAtomic,
 } from './install/settings-merge.js';
 import { installCommitMsgHook } from './install/commit-msg.js';
+import { installPrepareCommitMsgHook } from './install/prepare-commit-msg.js';
 import { installPrePushFallback } from './install/pre-push.js';
 import { CodexProbe } from '../gateway/observability/codex-probe.js';
 import { buildFragment, writeClaudeMdFragment } from './install/claude-md.js';
@@ -114,6 +115,18 @@ interface ResolvedConfig {
   localReviewMaxAgeSeconds?: number;
   commitHygieneWarnAtCommits?: number;
   commitHygieneRefuseAtCommits?: number;
+  /**
+   * 0.30.0 attribution augmenter. Preserved across re-init from a prior
+   * on-disk policy and seeded from the chosen profile on first install.
+   * Every shipped profile pins `enabled: false`, so the default for new
+   * installs is "block ready, opt in by editing the policy".
+   */
+  attributionCoAuthor?: {
+    enabled?: boolean;
+    name?: string;
+    email?: string;
+    skipMerge?: boolean;
+  };
   fromReagent: boolean;
   reagentPolicyPath: string | null;
   reagentNotices: string[];
@@ -314,9 +327,57 @@ async function runWizard(
     ...(existingPolicy?.commitHygieneRefuseAtCommits !== undefined
       ? { commitHygieneRefuseAtCommits: existingPolicy.commitHygieneRefuseAtCommits }
       : {}),
+    // 0.30.0 attribution augmenter — preserved across re-init OR
+    // seeded from the layered profile (every shipped profile pins
+    // `enabled: false`). Conditional spread so undefined → key omitted
+    // (the field is exact-optional).
+    ...attributionConfigSpread(layeredBase, existingPolicy),
     fromReagent,
     reagentPolicyPath,
     reagentNotices: [],
+  };
+}
+
+/**
+ * Compute the attribution-augmenter config spread to inject into a
+ * partial `ResolvedConfig` literal. Returns `{}` when neither the
+ * existing on-disk policy nor the layered profile declared the
+ * augmenter — the policy writer then omits the block entirely so
+ * consumers who haven't seen 0.30.0 don't get a mystery YAML block.
+ *
+ * Returns `{ attributionCoAuthor: ... }` otherwise. Using a spread
+ * helper instead of a value-returning function lets `exactOptionalProperty
+ * Types` distinguish "omitted" from "explicitly undefined" — required
+ * by the strict tsconfig.
+ */
+function attributionConfigSpread(
+  layered: Profile,
+  existing: ExistingPolicyValues | undefined,
+): { attributionCoAuthor?: NonNullable<ResolvedConfig['attributionCoAuthor']> } {
+  const preserved = existing?.attributionCoAuthor;
+  if (preserved !== undefined) {
+    return {
+      attributionCoAuthor: {
+        ...(preserved.enabled !== undefined ? { enabled: preserved.enabled } : {}),
+        ...(preserved.name !== undefined ? { name: preserved.name } : {}),
+        ...(preserved.email !== undefined ? { email: preserved.email } : {}),
+        ...(preserved.skipMerge !== undefined ? { skipMerge: preserved.skipMerge } : {}),
+      },
+    };
+  }
+  const fromProfile = layered.attribution?.co_author;
+  if (fromProfile === undefined) return {};
+  return {
+    attributionCoAuthor: {
+      ...(fromProfile.enabled !== undefined ? { enabled: fromProfile.enabled } : {}),
+      ...(fromProfile.name !== undefined && fromProfile.name.length > 0
+        ? { name: fromProfile.name }
+        : {}),
+      ...(fromProfile.email !== undefined && fromProfile.email.length > 0
+        ? { email: fromProfile.email }
+        : {}),
+      ...(fromProfile.skip_merge !== undefined ? { skipMerge: fromProfile.skip_merge } : {}),
+    },
   };
 }
 
@@ -391,6 +452,18 @@ interface ExistingPolicyValues {
   localReviewMaxAgeSeconds?: number;
   commitHygieneWarnAtCommits?: number;
   commitHygieneRefuseAtCommits?: number;
+  /**
+   * 0.30.0 attribution augmenter. Preserved across `rea init` re-runs
+   * so an operator who set `attribution.co_author.enabled: true` with
+   * a configured identity does not silently get reverted to the
+   * profile-default `enabled: false` on the next init.
+   */
+  attributionCoAuthor?: {
+    enabled?: boolean;
+    name?: string;
+    email?: string;
+    skipMerge?: boolean;
+  };
 }
 
 /**
@@ -466,13 +539,17 @@ function readExistingPolicyForPreservation(targetDir: string): ExistingPolicyVal
     out.profile = profile as ProfileName;
   }
   const autonomyLevel = policy['autonomy_level'];
-  if (typeof autonomyLevel === 'string' &&
-      (Object.values(AutonomyLevel) as string[]).includes(autonomyLevel)) {
+  if (
+    typeof autonomyLevel === 'string' &&
+    (Object.values(AutonomyLevel) as string[]).includes(autonomyLevel)
+  ) {
     out.autonomyLevel = autonomyLevel as AutonomyLevel;
   }
   const maxAutonomyLevel = policy['max_autonomy_level'];
-  if (typeof maxAutonomyLevel === 'string' &&
-      (Object.values(AutonomyLevel) as string[]).includes(maxAutonomyLevel)) {
+  if (
+    typeof maxAutonomyLevel === 'string' &&
+    (Object.values(AutonomyLevel) as string[]).includes(maxAutonomyLevel)
+  ) {
     out.maxAutonomyLevel = maxAutonomyLevel as AutonomyLevel;
   }
   const blockAiAttribution = policy['block_ai_attribution'];
@@ -531,6 +608,38 @@ function readExistingPolicyForPreservation(targetDir: string): ExistingPolicyVal
     const refuseAt = ch['refuse_at_commits'];
     if (typeof refuseAt === 'number' && Number.isFinite(refuseAt) && refuseAt >= 0) {
       out.commitHygieneRefuseAtCommits = refuseAt;
+    }
+  }
+
+  // 0.30.0 attribution augmenter. Preserve every field the operator
+  // may have configured so re-running `rea init` doesn't silently
+  // revert an opt-in. Block AND inline forms agree at the parser
+  // layer.
+  const attribution = policy['attribution'];
+  if (attribution !== null && typeof attribution === 'object') {
+    const attr = attribution as Record<string, unknown>;
+    const coAuthor = attr['co_author'];
+    if (coAuthor !== null && typeof coAuthor === 'object') {
+      const ca = coAuthor as Record<string, unknown>;
+      const preserved: NonNullable<ExistingPolicyValues['attributionCoAuthor']> = {};
+      let any = false;
+      if (typeof ca['enabled'] === 'boolean') {
+        preserved.enabled = ca['enabled'];
+        any = true;
+      }
+      if (typeof ca['name'] === 'string') {
+        preserved.name = ca['name'];
+        any = true;
+      }
+      if (typeof ca['email'] === 'string') {
+        preserved.email = ca['email'];
+        any = true;
+      }
+      if (typeof ca['skip_merge'] === 'boolean') {
+        preserved.skipMerge = ca['skip_merge'];
+        any = true;
+      }
+      if (any) out.attributionCoAuthor = preserved;
     }
   }
 
@@ -615,6 +724,29 @@ function writePolicyYaml(targetDir: string, config: ResolvedConfig, layered: Pro
     lines.push(`  patterns:`);
     for (const p of layered.architecture_review.patterns) {
       lines.push(`    - ${JSON.stringify(p)}`);
+    }
+  }
+
+  // 0.30.0 attribution augmenter — emit the block whenever the layered
+  // profile (or a preserved on-disk policy) declared it. We always emit
+  // a fully-explicit `enabled` so an operator reading the file can
+  // confirm the current state at a glance without falling back to
+  // schema defaults. Identity (name/email) is omitted when empty —
+  // operators opt in by hand-editing those two fields, which keeps
+  // the policy file diff-clean on profile re-init.
+  const attr = config.attributionCoAuthor;
+  if (attr !== undefined) {
+    lines.push(`attribution:`);
+    lines.push(`  co_author:`);
+    lines.push(`    enabled: ${attr.enabled === true ? 'true' : 'false'}`);
+    if (attr.name !== undefined && attr.name.length > 0) {
+      lines.push(`    name: ${JSON.stringify(attr.name)}`);
+    }
+    if (attr.email !== undefined && attr.email.length > 0) {
+      lines.push(`    email: ${JSON.stringify(attr.email)}`);
+    }
+    if (attr.skipMerge !== undefined) {
+      lines.push(`    skip_merge: ${attr.skipMerge ? 'true' : 'false'}`);
     }
   }
 
@@ -900,6 +1032,10 @@ export async function runInit(options: InitOptions): Promise<void> {
       ...(existingPolicy?.commitHygieneRefuseAtCommits !== undefined
         ? { commitHygieneRefuseAtCommits: existingPolicy.commitHygieneRefuseAtCommits }
         : {}),
+      // 0.30.0 attribution augmenter — preserved across re-init OR
+      // seeded from the layered profile. Same precedence as the
+      // wizard path above. Conditional spread for exact-optional.
+      ...attributionConfigSpread(layeredBase, existingPolicy),
       fromReagent,
       reagentPolicyPath,
       reagentNotices,
@@ -937,6 +1073,12 @@ export async function runInit(options: InitOptions): Promise<void> {
   await writeSettingsAtomic(settingsPath, mergeResult.merged);
 
   const commitMsgResult = await installCommitMsgHook(targetDir);
+  // 0.30.0 attribution augmenter — install the prepare-commit-msg
+  // hook unconditionally. The hook is a no-op when
+  // policy.attribution.co_author.enabled !== true, so it is safe to
+  // ship under every profile; consumers opt in by editing their
+  // .rea/policy.yaml.
+  const prepareCommitMsgResult = await installPrepareCommitMsgHook(targetDir);
   const prePushResult = await installPrePushFallback({ targetDir });
 
   const fragmentInput = {
@@ -972,6 +1114,18 @@ export async function runInit(options: InitOptions): Promise<void> {
     console.log(`  + ${path.relative(targetDir, commitMsgResult.gitHook)}`);
   if (commitMsgResult.huskyHook)
     console.log(`  + ${path.relative(targetDir, commitMsgResult.huskyHook)}`);
+  if (prepareCommitMsgResult.gitHook) {
+    const verb = prepareCommitMsgResult.refreshed === true ? '~' : '+';
+    console.log(
+      `  ${verb} ${path.relative(targetDir, prepareCommitMsgResult.gitHook)} (attribution augmenter)`,
+    );
+  }
+  if (prepareCommitMsgResult.huskyHook) {
+    const verb = prepareCommitMsgResult.refreshed === true ? '~' : '+';
+    console.log(
+      `  ${verb} ${path.relative(targetDir, prepareCommitMsgResult.huskyHook)} (attribution augmenter)`,
+    );
+  }
   if (prePushResult.written !== undefined) {
     const verb = prePushResult.decision.action === 'refresh' ? '~' : '+';
     console.log(`  ${verb} ${path.relative(targetDir, prePushResult.written)} (pre-push fallback)`);
@@ -1003,6 +1157,7 @@ export async function runInit(options: InitOptions): Promise<void> {
     for (const w of mergeResult.warnings) warn(w);
   }
   for (const w of commitMsgResult.warnings) warn(w);
+  for (const w of prepareCommitMsgResult.warnings) warn(w);
   for (const w of prePushResult.warnings) warn(w);
   for (const n of config.reagentNotices) warn(n);
 
