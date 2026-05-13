@@ -336,6 +336,51 @@ export interface AuditPolicy {
 }
 
 /**
+ * Attribution augmenter policy (0.30.0+).
+ *
+ * Drives the husky `prepare-commit-msg` hook that appends a single
+ * `Co-Authored-By: <name> <email>` trailer to every commit message. The
+ * intended use case: a contributor whose enterprise git identity (e.g.
+ * `alice@enterprise.example`) differs from their personal GitHub identity
+ * (e.g. `alice@personal.example`) — GitHub's contribution graph keys off
+ * the commit author/co-author email, so adding the personal address as a
+ * trailer rolls the work onto their personal heatmap.
+ *
+ * The augmenter does NOT modify the primary author line. It appends a
+ * trailer only — and is idempotent: re-running on a message that already
+ * contains the trailer (by email match, case-insensitive) is a no-op.
+ *
+ * Note: this is orthogonal to the `attribution-advisory.sh` Bash hook
+ * and the `block_ai_attribution` enforcement in the commit-msg hook.
+ * Those reject AI-tool noreply emails + AI assistant names. A
+ * human-authored `Co-Authored-By: Real Name <real@email.tld>` trailer
+ * is not AI attribution and is not blocked.
+ *
+ * Profile defaults: every shipped profile leaves `co_author.enabled:
+ * false`. The opt-in lives in repo-local edits to `.rea/policy.yaml`,
+ * never in the profile, because the identity to roll commits onto is
+ * inherently per-developer.
+ */
+export interface AttributionPolicy {
+  co_author?: AttributionCoAuthorPolicy;
+}
+
+/**
+ * Co-author trailer config. When `enabled: true`, BOTH `name` AND `email`
+ * must be non-empty — the policy loader fails closed with a clear error
+ * message when one is empty. `skip_merge: true` skips augmentation on
+ * merge commits (commit source `merge`) only; all other sources
+ * (`message`, `template`, `squash`, `commit`) are always augmented when
+ * enabled.
+ */
+export interface AttributionCoAuthorPolicy {
+  enabled?: boolean;
+  name?: string;
+  email?: string;
+  skip_merge?: boolean;
+}
+
+/**
  * G9 — injection tier escalation knobs. The classifier bucketed matches into
  * `clean` / `suspicious` / `likely_injection`; this block governs what happens
  * to the `suspicious` bucket (a single literal match at write/destructive tier,
@@ -435,4 +480,12 @@ export interface Policy {
    * knob, not a review knob. The push-gate doesn't consume it.
    */
   commit_hygiene?: CommitHygienePolicy;
+  /**
+   * Attribution augmenter (0.30.0+). When `co_author.enabled: true`, the
+   * husky `prepare-commit-msg` hook appends a `Co-Authored-By:` trailer
+   * to every commit (or every non-merge commit when `skip_merge: true`).
+   * Idempotent — repeated runs over a message that already carries the
+   * trailer are no-ops. See `AttributionPolicy` for the full contract.
+   */
+  attribution?: AttributionPolicy;
 }

@@ -31,3 +31,16 @@ blocked_paths:
   - .github/workflows/release.yml
   - .github/workflows/publish.yml
 notification_channel: ''
+# 0.30.0 attribution augmenter — opt-in.
+# Husky prepare-commit-msg hook appends a Co-Authored-By trailer to
+# every commit when enabled. Profile defaults are off — opt in
+# per-repo via .rea/policy.yaml because the identity is per-developer.
+# attribution:
+#   co_author:
+#     enabled: true
+#     name: 'Your Name'
+#     email: 'you@example.com'
+#     skip_merge: false
+attribution:
+  co_author:
+    enabled: false

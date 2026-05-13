@@ -79,6 +79,31 @@ export const ProfileSchema = z
         patterns: z.array(z.string()).optional(),
       })
       .optional(),
+    // 0.30.0+ attribution augmenter — every shipped profile pins
+    // `enabled: false`. Opt-in is repo-local (.rea/policy.yaml edit)
+    // because the identity to roll commits onto is per-developer; a
+    // profile that pinned `enabled: true` would route every other
+    // contributor's commits onto the profile author's heatmap.
+    //
+    // The profile-layer schema mirrors the policy-loader's
+    // `AttributionPolicySchema` but does NOT apply the cross-field
+    // refinement — a profile that ships `enabled: false` doesn't need
+    // a `name`/`email` to validate. Cross-field validation only runs
+    // at the policy-loader layer where the materialized file is parsed.
+    attribution: z
+      .object({
+        co_author: z
+          .object({
+            enabled: z.boolean().optional(),
+            name: z.string().optional(),
+            email: z.string().optional(),
+            skip_merge: z.boolean().optional(),
+          })
+          .strict()
+          .optional(),
+      })
+      .strict()
+      .optional(),
   })
   .strict();
 

@@ -225,6 +225,73 @@ const GatewayPolicySchema = z
   })
   .strict();
 
+/**
+ * 0.30.0 — attribution augmenter policy. The husky `prepare-commit-msg`
+ * hook appends a `Co-Authored-By: <name> <email>` trailer to every commit
+ * when `co_author.enabled: true`. Idempotent (skip if the email already
+ * appears on a `Co-Authored-By:` line, case-insensitive); skips merge
+ * commits when `skip_merge: true`.
+ *
+ * Cross-field refinement: when `enabled: true`, BOTH `name` AND `email`
+ * MUST be non-empty. Fail-closed at policy load — pre-fix a partial
+ * config (`enabled: true` with empty `email`) would silently fail at
+ * hook fire time, producing zero-name trailers and confusing audit
+ * records. Loud failure at load surfaces the misconfiguration immediately.
+ *
+ * Email validation is permissive (`<local>@<host>.<tld>` shape) — codex
+ * + claude + github noreply emails all pass; the only reject case is a
+ * malformed string (spaces, angle brackets, missing `@` or domain dot).
+ * Stricter validation is the consumer's job — RFC 5322 is too permissive
+ * for an opt-in audit footprint anyway.
+ */
+const AttributionCoAuthorSchema = z
+  .object({
+    enabled: z.boolean().optional(),
+    name: z.string().optional(),
+    email: z
+      .string()
+      .regex(/^[^\s<>@]+@[^\s<>@]+\.[^\s<>@]+$/, {
+        message:
+          'attribution.co_author.email must match <local>@<host>.<tld> ' +
+          '(no spaces, no angle brackets, must contain @ and a dot in the host)',
+      })
+      .optional()
+      .or(z.literal('')),
+    skip_merge: z.boolean().optional(),
+  })
+  .strict()
+  .superRefine((val, ctx) => {
+    if (val.enabled !== true) return;
+    const name = (val.name ?? '').trim();
+    const email = (val.email ?? '').trim();
+    if (name.length === 0) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['name'],
+        message:
+          'attribution.co_author.enabled: true requires a non-empty `name`. ' +
+          'Either set `name: "Your Name"` and `email: "you@example.com"`, or ' +
+          'set `enabled: false` to disable the augmenter.',
+      });
+    }
+    if (email.length === 0) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['email'],
+        message:
+          'attribution.co_author.enabled: true requires a non-empty `email`. ' +
+          'Either set `name: "Your Name"` and `email: "you@example.com"`, or ' +
+          'set `enabled: false` to disable the augmenter.',
+      });
+    }
+  });
+
+const AttributionPolicySchema = z
+  .object({
+    co_author: AttributionCoAuthorSchema.optional(),
+  })
+  .strict();
+
 const PolicySchema = z
   .object({
     version: z.string(),
@@ -272,6 +339,11 @@ const PolicySchema = z
     // 0.26.0 commit-hygiene thresholds — top-level so it's discoverable
     // separately from `review.local_review`. `rea preflight` consumes it.
     commit_hygiene: CommitHygienePolicySchema.optional(),
+    // 0.30.0 attribution augmenter — drives the husky
+    // `prepare-commit-msg` hook. The cross-field refinement on
+    // `AttributionCoAuthorSchema` fails closed when `enabled: true` but
+    // `name`/`email` are empty so we never ship a half-configured trailer.
+    attribution: AttributionPolicySchema.optional(),
   })
   .strict();
 

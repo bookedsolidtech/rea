@@ -63,7 +63,9 @@ import {
   readSettings,
   writeSettingsAtomic,
 } from './install/settings-merge.js';
+import { validateSettings } from '../config/settings-schema.js';
 import { ensureReaGitignore } from './install/gitignore.js';
+import { installPrepareCommitMsgHook } from './install/prepare-commit-msg.js';
 import { manifestExists, readManifest, writeManifestAtomic } from './install/manifest-io.js';
 import { type InstallManifest, type ManifestEntry } from './install/manifest-schema.js';
 import { sha256OfBuffer, sha256OfFile } from './install/sha.js';
@@ -485,6 +487,19 @@ async function upgradeSettings(
   // pointless work. Pruning first means the merge sees a clean baseline.
   const pruned = pruneHookCommands(settings, STALE_HOOK_COMMAND_TOKENS);
   const mergeResult = mergeSettings(pruned.merged, desired);
+  // 0.30.0 Class M — validate the merged result with the non-strict
+  // schema before writing. If the merged output would fail zod parse,
+  // refuse the write and leave the consumer settings untouched. This
+  // matches the 0.21.1 idempotency contract: rea never produces a
+  // broken settings.json — when in doubt, do nothing.
+  const validation = validateSettings(mergeResult.merged);
+  if (!validation.parsed) {
+    throw new Error(
+      `rea upgrade: refusing to write .claude/settings.json because the merged result ` +
+        `fails schema validation. This is a safety guardrail — your existing file ` +
+        `is unchanged. zod errors: ${validation.errors.join('; ')}`,
+    );
+  }
   if (opts.dryRun !== true) {
     await writeSettingsAtomic(settingsPath, mergeResult.merged);
   }
@@ -701,6 +716,26 @@ export async function runUpgrade(options: UpgradeOptions = {}): Promise<void> {
       sha256: mdResult.sha,
       source: 'claude-md',
     });
+  }
+
+  // 0.30.0 — install the prepare-commit-msg augmenter on upgrade too
+  // (codex round 1 P1: consumers upgrading from 0.29.x to 0.30.0 would
+  // not get the new husky hook unless they re-ran `rea init`). The
+  // hook is a no-op when policy.attribution.co_author.enabled !== true,
+  // so installing unconditionally is safe; consumers opt in by editing
+  // .rea/policy.yaml. The installer's marker-classification path
+  // refuses to overwrite foreign hooks — same shape as 0.13.2
+  // pre-push foreign-hook handling.
+  if (!dryRun) {
+    const pcmResult = await installPrepareCommitMsgHook(resolvedRoot);
+    if (pcmResult.skippedForeign) {
+      warn(`  · .husky/prepare-commit-msg (kept; foreign hook detected — see MIGRATING.md)`);
+    } else if (pcmResult.huskyHook ?? pcmResult.gitHook) {
+      const target = pcmResult.huskyHook ?? pcmResult.gitHook;
+      const marker = pcmResult.refreshed ? '~' : '+';
+      console.log(`  ${marker} ${target} (attribution augmenter)`);
+    }
+    for (const w of pcmResult.warnings) warn(w);
   }
 
   // BUG-010 — ensure `.gitignore` carries every runtime artifact entry. This

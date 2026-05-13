@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import fsPromises from 'node:fs/promises';
@@ -7,7 +8,12 @@ import { loadRegistry } from '../registry/loader.js';
 import { loadFingerprintStore } from '../registry/fingerprints-store.js';
 import { fingerprintServer } from '../registry/fingerprint.js';
 import { CodexProbe, type CodexProbeState } from '../gateway/observability/codex-probe.js';
-import { inspectPrePushState, type PrePushDoctorState } from './install/pre-push.js';
+import {
+  inspectPrePushState,
+  isHusky9Stub,
+  resolveHusky9StubTarget,
+  type PrePushDoctorState,
+} from './install/pre-push.js';
 import { summarizeTelemetry } from '../gateway/observability/codex-telemetry.js';
 import {
   CLAUDE_MD_MANIFEST_PATH,
@@ -20,6 +26,11 @@ import { manifestExists, readManifest } from './install/manifest-io.js';
 import { sha256OfBuffer, sha256OfFile } from './install/sha.js';
 import { DELEGATION_SIGNAL_TOOL_NAME } from '../audit/delegation-event.js';
 import { computeHash } from '../audit/fs.js';
+import {
+  PREPARE_COMMIT_MSG_BODY_MARKER,
+  PREPARE_COMMIT_MSG_MARKER,
+} from './install/prepare-commit-msg.js';
+import { validateSettings } from '../config/settings-schema.js';
 import { POLICY_FILE, REA_DIR, REGISTRY_FILE, getPkgVersion, log, reaPath } from './utils.js';
 
 export interface CheckResult {
@@ -145,7 +156,15 @@ function checkRegistryParses(baseDir: string, registryPath: string): CheckResult
   }
 }
 
-const EXPECTED_AGENTS = [
+/**
+ * 0.30.0 (Class M settings.json schema) — `EXPECTED_HOOKS` is exported
+ * so the schema validator at `src/config/settings-schema.ts` can
+ * cross-check rea-shipped hook filenames against entries it sees in
+ * a consumer's `.claude/settings.json`. The validator's `--strict`
+ * mode FAILS when a known rea-managed hook is missing from the
+ * consumer's registration; default mode logs a warn.
+ */
+export const EXPECTED_AGENTS = [
   'accessibility-engineer.md',
   'backend-engineer.md',
   'code-reviewer.md',
@@ -158,7 +177,7 @@ const EXPECTED_AGENTS = [
   'typescript-specialist.md',
 ];
 
-const EXPECTED_HOOKS = [
+export const EXPECTED_HOOKS = [
   'architecture-review-gate.sh',
   'attribution-advisory.sh',
   // 0.22.0 — Bash-tier parity with `blocked-paths-enforcer.sh`.
@@ -244,6 +263,84 @@ function checkHooksInstalled(baseDir: string): CheckResult {
     };
   }
   return { label: 'hooks installed + executable', status: 'fail', detail: issues.join('; ') };
+}
+
+/**
+ * 0.30.0 Class M — validate `.claude/settings.json` against the zod
+ * schema in `src/config/settings-schema.ts`.
+ *
+ * Status posture:
+ *
+ *   - `strict: false` (default `rea doctor`) — emit a warn when:
+ *       - zod parse fails (unknown top-level key, missing matcher,
+ *         malformed hook entry, etc.),
+ *       - any `command` contains a `..` traversal after stripping
+ *         `$CLAUDE_PROJECT_DIR`,
+ *       - any rea-shipped hook from `EXPECTED_HOOKS` is missing from
+ *         the consumer's registrations.
+ *     The harness keeps working — the schema only refuses to call
+ *     malformed hook entries; we surface the issue without breaking
+ *     the install.
+ *
+ *   - `strict: true` (`rea doctor --strict`) — fail (hard) on the
+ *     same conditions. Used by CI gates that want a hard floor on
+ *     consumer settings.
+ *
+ * Returns `pass` when everything cleared. Returns one `CheckResult`
+ * per concern; called once and emits one result. Combined with the
+ * existing `checkSettingsJson` (which checks for the historical Bash
+ * + Write|Edit|MultiEdit|NotebookEdit matchers), gives consumers a
+ * complete picture.
+ */
+export function checkSettingsSchema(baseDir: string, strict: boolean): CheckResult {
+  const label = strict ? 'settings.json schema (strict)' : 'settings.json schema (advisory)';
+  const settingsPath = path.join(baseDir, '.claude', 'settings.json');
+  if (!fs.existsSync(settingsPath)) {
+    return {
+      label,
+      status: strict ? 'fail' : 'warn',
+      detail: `missing: ${settingsPath}`,
+    };
+  }
+  let raw: string;
+  try {
+    raw = fs.readFileSync(settingsPath, 'utf8');
+  } catch (e) {
+    return {
+      label,
+      status: strict ? 'fail' : 'warn',
+      detail: e instanceof Error ? e.message : String(e),
+    };
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (e) {
+    return {
+      label,
+      status: 'fail',
+      detail: `malformed JSON: ${e instanceof Error ? e.message : String(e)}`,
+    };
+  }
+  const result = validateSettings(parsed);
+  const issues: string[] = [];
+  if (!result.parsed) {
+    issues.push(...result.errors.map((e) => `schema: ${e}`));
+  }
+  for (const t of result.traversalFindings) {
+    issues.push(`traversal: ${t.event}[${t.matcher}].hooks[${t.index}].command — ${t.reason}`);
+  }
+  for (const missing of result.missingReaHooks) {
+    issues.push(`missing rea hook: ${missing} not registered in PreToolUse/PostToolUse`);
+  }
+  if (issues.length === 0) {
+    return { label, status: 'pass' };
+  }
+  return {
+    label,
+    status: strict ? 'fail' : 'warn',
+    detail: issues.join('; '),
+  };
 }
 
 function checkSettingsJson(baseDir: string): CheckResult {
@@ -357,6 +454,174 @@ export function isGitRepo(baseDir: string): boolean {
   if (targetPath.length === 0) return false;
   const resolved = path.isAbsolute(targetPath) ? targetPath : path.join(baseDir, targetPath);
   return fs.existsSync(resolved);
+}
+
+/**
+ * 0.30.0 attribution augmenter — verify the husky `prepare-commit-msg`
+ * hook state matches what `policy.attribution.co_author.enabled` asks
+ * for. Four buckets:
+ *
+ *   1. `enabled: true` + hook present + rea-managed marker → pass.
+ *   2. `enabled: true` + hook missing OR marker mismatched → fail.
+ *      Defense in depth: the loader's cross-field refinement should
+ *      already have rejected `enabled: true` without identity, but
+ *      we surface a missing hook file separately.
+ *   3. `enabled: true` + name OR email empty → fail. The loader should
+ *      have already caught this; surfacing here ensures `rea doctor`
+ *      reports a clean state for the entire augmenter surface.
+ *   4. `enabled: false` (or absent) + hook present (rea-managed) → pass
+ *      (no-op — hook ships under every install).
+ *   5. `enabled: false` (or absent) + foreign file → warn. The operator
+ *      has a `prepare-commit-msg` outside rea's marker; their commits
+ *      get whatever it does, which is fine.
+ *   6. `enabled: false` + hook absent → pass (vanilla state).
+ *
+ * Returns `info` when the rea-shipped `.git/hooks/prepare-commit-msg`
+ * lives under a hooksPath we couldn't resolve (treat as same as case
+ * 6 from doctor's perspective).
+ */
+/**
+ * Resolve the active git hooks directory for the doctor's prepare-commit-msg
+ * check. Mirrors `installCommitMsgHook`'s `readHooksPathFromGit` but
+ * synchronous (doctor is sync end-to-end). Honors `core.hooksPath` when set
+ * (husky 9 installs land at `.husky/_/`); falls back to `.git/hooks/`
+ * otherwise. Codex round 1 P2: prior implementation always looked at
+ * `.git/hooks/prepare-commit-msg`, false-reporting missing on any consumer
+ * running husky.
+ */
+function resolveHooksDirSync(baseDir: string): string {
+  try {
+    const out = execFileSync('git', ['-C', baseDir, 'config', '--get', 'core.hooksPath'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    const trimmed = out.trim();
+    if (trimmed.length > 0) {
+      return path.isAbsolute(trimmed) ? trimmed : path.join(baseDir, trimmed);
+    }
+  } catch {
+    // git missing or `core.hooksPath` unset — fall through to default.
+  }
+  return path.join(baseDir, '.git', 'hooks');
+}
+
+export function checkPrepareCommitMsgHook(baseDir: string): CheckResult {
+  const label = 'prepare-commit-msg hook (attribution augmenter)';
+  const hooksDir = resolveHooksDirSync(baseDir);
+  const hookPath = path.join(hooksDir, 'prepare-commit-msg');
+  let policyAttr:
+    | { enabled?: boolean; name?: string; email?: string; skip_merge?: boolean }
+    | undefined;
+  try {
+    const policy = loadPolicy(baseDir);
+    policyAttr = policy.attribution?.co_author;
+  } catch {
+    // policy-parse failure is surfaced elsewhere; default to "absent"
+    policyAttr = undefined;
+  }
+
+  const enabled = policyAttr?.enabled === true;
+  const hookExists = fs.existsSync(hookPath);
+  let hookIsReaManaged = false;
+  let hookMarkerMismatch = false;
+  if (hookExists) {
+    try {
+      let content = fs.readFileSync(hookPath, 'utf8');
+      // Codex round 3 P2: Husky 9 (`core.hooksPath=.husky/_`) auto-
+      // generates a stub like `. "${0%/*}/h"` at the active hooks path.
+      // Git dispatches through that stub to `.husky/prepare-commit-msg`
+      // (the canonical body, which IS rea-managed). Follow the
+      // indirection so doctor classifies the canonical body, not the
+      // stub. Same pattern as installer + pre-push doctor checks.
+      if (isHusky9Stub(content)) {
+        const target = resolveHusky9StubTarget(hookPath);
+        if (target !== null && target !== hookPath && fs.existsSync(target)) {
+          try {
+            content = fs.readFileSync(target, 'utf8');
+          } catch {
+            // canonical body unreadable — fall through with stub content,
+            // which will classify as foreign and surface a clear error.
+          }
+        }
+      }
+      const lines = content.split('\n');
+      hookIsReaManaged =
+        content.startsWith('#!/bin/sh\n') &&
+        lines[1] === PREPARE_COMMIT_MSG_MARKER &&
+        lines[2] === PREPARE_COMMIT_MSG_BODY_MARKER;
+      if (
+        !hookIsReaManaged &&
+        content.includes('rea:prepare-commit-msg') &&
+        lines[1] !== PREPARE_COMMIT_MSG_MARKER
+      ) {
+        hookMarkerMismatch = true;
+      }
+    } catch {
+      hookIsReaManaged = false;
+    }
+  }
+
+  if (enabled) {
+    if (!hookExists) {
+      return {
+        label,
+        status: 'fail',
+        detail:
+          'attribution.co_author.enabled: true but .git/hooks/prepare-commit-msg is missing — ' +
+          'run `rea init` to install the hook, or set enabled: false.',
+      };
+    }
+    if (!hookIsReaManaged) {
+      const reason = hookMarkerMismatch
+        ? 'marker mismatch (older rea or hand-edited)'
+        : 'no rea marker';
+      return {
+        label,
+        status: 'fail',
+        detail:
+          `attribution.co_author.enabled: true but the prepare-commit-msg hook is foreign (${reason}) — ` +
+          'remove the existing hook and re-run `rea init`, or set enabled: false.',
+      };
+    }
+    const name = (policyAttr?.name ?? '').trim();
+    const email = (policyAttr?.email ?? '').trim();
+    if (name.length === 0 || email.length === 0) {
+      const which = name.length === 0 ? 'name' : 'email';
+      return {
+        label,
+        status: 'fail',
+        detail:
+          `attribution.co_author.enabled: true but ${which} is empty — ` +
+          'the policy loader should have rejected this; if you are seeing this, edit ' +
+          '.rea/policy.yaml and either set both name+email or set enabled: false.',
+      };
+    }
+    return {
+      label,
+      status: 'pass',
+      detail: `enabled — trailer: ${name} <${email}>`,
+    };
+  }
+
+  // enabled: false (or absent).
+  if (!hookExists) {
+    return { label, status: 'pass', detail: 'disabled (no hook installed — vanilla state)' };
+  }
+  if (hookIsReaManaged) {
+    return {
+      label,
+      status: 'pass',
+      detail: 'disabled (rea-managed hook present, runs as no-op)',
+    };
+  }
+  return {
+    label,
+    status: 'warn',
+    detail:
+      'foreign prepare-commit-msg hook present — rea would refuse to overwrite. ' +
+      'When you enable attribution.co_author.enabled, the existing hook must be ' +
+      'removed or migrated to a fragment first.',
+  };
 }
 
 function checkCommitMsgHook(baseDir: string): CheckResult {
@@ -791,9 +1056,7 @@ export function checkDelegationHookRegistered(baseDir: string): CheckResult {
         '(NOT `Task|Skill` — `TaskCreate`/`TaskList` are unrelated todo-list tools).',
     };
   }
-  const cmds = (group.hooks ?? []).map((h) =>
-    typeof h.command === 'string' ? h.command : '',
-  );
+  const cmds = (group.hooks ?? []).map((h) => (typeof h.command === 'string' ? h.command : ''));
   if (!cmds.some((c) => c.includes('delegation-capture.sh'))) {
     return {
       label,
@@ -935,7 +1198,8 @@ export async function checkDelegationRoundTrip(baseDir: string): Promise<CheckRe
     return {
       label: 'delegation-signal round-trip',
       status: 'fail',
-      detail: `CLI exited 0 but no `+
+      detail:
+        `CLI exited 0 but no ` +
         `rea.delegation_signal record with probe-tag ${probeTag} found in audit.jsonl`,
     };
   }
@@ -1004,6 +1268,7 @@ export function collectChecks(
   baseDir: string,
   codexProbeState?: CodexProbeState,
   prePushState?: PrePushDoctorState,
+  options: { strict?: boolean } = {},
 ): CheckResult[] {
   const policyPath = reaPath(baseDir, POLICY_FILE);
   const registryPath = reaPath(baseDir, REGISTRY_FILE);
@@ -1016,6 +1281,11 @@ export function collectChecks(
     checkAgentsPresent(baseDir),
     checkHooksInstalled(baseDir),
     checkSettingsJson(baseDir),
+    // 0.30.0 Class M — strict zod schema check of the full
+    // .claude/settings.json shape. Complements checkSettingsJson
+    // (matcher coverage) and checkDelegationHookRegistered (Agent|Skill
+    // wiring). Hard fail under `--strict`, warn by default.
+    checkSettingsSchema(baseDir, options.strict === true),
     // 0.29.0 — delegation-telemetry MVP wiring check. Separate from
     // checkSettingsJson because that check only validates the
     // existence of the Bash + Write|Edit|MultiEdit|NotebookEdit
@@ -1030,6 +1300,10 @@ export function collectChecks(
   // other non-source-code directories that consume rea governance.
   if (isGitRepo(baseDir)) {
     checks.push(checkCommitMsgHook(baseDir));
+    // 0.30.0 attribution augmenter — only check when policy.attribution
+    // is declared. Vanilla installs without the block see no check
+    // (cleaner output for consumers who don't opt in).
+    checks.push(checkPrepareCommitMsgHook(baseDir));
     if (prePushState !== undefined) {
       checks.push(checkPrePushHook(prePushState));
     }
@@ -1080,6 +1354,13 @@ export interface RunDoctorOptions {
    * audit log with probe records.
    */
   smoke?: boolean;
+  /**
+   * 0.30.0 — when true, every advisory check (settings.json schema
+   * cross-check, prepare-commit-msg foreign-hook warn, etc.) is
+   * promoted to hard fail. Used by CI gates that want a strict floor
+   * on consumer installs. Default `false`.
+   */
+  strict?: boolean;
 }
 
 export interface DriftRow {
@@ -1292,7 +1573,9 @@ export async function runDoctor(opts: RunDoctorOptions = {}): Promise<void> {
     prePushState = undefined;
   }
 
-  const checks = collectChecks(baseDir, probeState, prePushState);
+  const checks = collectChecks(baseDir, probeState, prePushState, {
+    strict: opts.strict === true,
+  });
   // G7: async fingerprint-store check. Kept out of `collectChecks` so the
   // existing sync contract stays intact for downstream consumers; appended
   // here so runDoctor surfaces it inline.
