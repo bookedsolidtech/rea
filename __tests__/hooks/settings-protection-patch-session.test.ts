@@ -305,6 +305,132 @@ describe('settings-protection.sh — path-traversal bypass (Codex HIGH 1)', () =
   });
 });
 
+/**
+ * 0.29.0 — interior `/./` segment rejection. Sibling class to the `..`
+ * traversal guard above. `normalize_path` strips the LEADING `./` but
+ * does not collapse interior `/./` segments (which would corrupt `..`
+ * reasoning), so a path like `.claude/hooks/./settings.json` survived
+ * normalization with the literal `/./` intact and the §6 prefix-matcher
+ * (which compares against `.claude/hooks/`) saw `.claude/hooks/./settings.json`
+ * — DID match the prefix but the patch-session allowlist would have let
+ * it through; meanwhile `.claude/./settings.json` would miss the literal
+ * `.claude/settings.json` block entirely.
+ *
+ * The conservative closure (per Jake 2026-05-12): refuse outright with
+ * the same wording as the `..` guard. Corpus pairs shell-scripting-
+ * specialist with adversarial-test-specialist; we enumerate the encoded,
+ * repeated, and mixed-with-`..` shapes.
+ */
+describe('settings-protection.sh — interior dot-segment rejection (0.29.0 helix-/./-class)', () => {
+  let dir: string;
+
+  beforeEach(async () => {
+    dir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-dotseg-')));
+    await fs.mkdir(path.join(dir, '.rea'), { recursive: true });
+    await fs.mkdir(path.join(dir, '.claude', 'hooks'), { recursive: true });
+    await fs.mkdir(path.join(dir, '.husky'), { recursive: true });
+  });
+
+  afterEach(async () => {
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
+  it('rejects .claude/./settings.json (interior dot, hard-protected target)', () => {
+    if (!jqExists()) return;
+    const abs = `${dir}/.claude/./settings.json`;
+    const res = runHook(dir, abs);
+    expect(res.status).toBe(2);
+    expect(res.stderr).toMatch(/interior dot-segment rejected/);
+  });
+
+  it('rejects .rea/./policy.yaml even with REA_HOOK_PATCH_SESSION set', () => {
+    if (!jqExists()) return;
+    const abs = `${dir}/.rea/./policy.yaml`;
+    const res = runHook(dir, abs, { REA_HOOK_PATCH_SESSION: 'attempt bypass' });
+    expect(res.status).toBe(2);
+    expect(res.stderr).toMatch(/interior dot-segment rejected/);
+  });
+
+  it('rejects .husky/./pre-push (interior dot in package-managed body)', () => {
+    if (!jqExists()) return;
+    const abs = `${dir}/.husky/./pre-push`;
+    const res = runHook(dir, abs);
+    expect(res.status).toBe(2);
+    expect(res.stderr).toMatch(/interior dot-segment rejected/);
+  });
+
+  it('rejects repeated interior dot segments (.claude/././settings.json)', () => {
+    if (!jqExists()) return;
+    const abs = `${dir}/.claude/././settings.json`;
+    const res = runHook(dir, abs);
+    expect(res.status).toBe(2);
+    expect(res.stderr).toMatch(/interior dot-segment rejected/);
+  });
+
+  it('rejects URL-encoded interior dot (.claude/%2E/settings.json)', () => {
+    if (!jqExists()) return;
+    // %2E decodes to `.` in normalize_path; after backslash-translate and
+    // leading-./ strip the form is `.claude/./settings.json`.
+    const abs = `${dir}/.claude/%2E/settings.json`;
+    const res = runHook(dir, abs);
+    expect(res.status).toBe(2);
+    expect(res.stderr).toMatch(/interior dot-segment rejected/);
+  });
+
+  it('rejects mixed-case URL-encoded interior dot (.claude/%2e/settings.json)', () => {
+    if (!jqExists()) return;
+    const abs = `${dir}/.claude/%2e/settings.json`;
+    const res = runHook(dir, abs);
+    expect(res.status).toBe(2);
+  });
+
+  it('rejects double-slash sibling (.claude/.//settings.json)', () => {
+    if (!jqExists()) return;
+    const abs = `${dir}/.claude/.//settings.json`;
+    const res = runHook(dir, abs);
+    expect(res.status).toBe(2);
+    expect(res.stderr).toMatch(/interior dot-segment rejected/);
+  });
+
+  it('rejects interior dot in extension surface (.husky/pre-push.d/./fragment)', () => {
+    if (!jqExists()) return;
+    // The extension surface is documented-writable, but an interior `/./`
+    // segment must still be refused — it indicates an attempt to bypass
+    // the literal/prefix matcher even within an allowed surface. The
+    // §5a-bis guard runs BEFORE the §5b allowlist, so this rejects.
+    const abs = `${dir}/.husky/pre-push.d/./fragment`;
+    const res = runHook(dir, abs);
+    expect(res.status).toBe(2);
+    expect(res.stderr).toMatch(/interior dot-segment rejected/);
+  });
+
+  it('allows benign leading-./ canonical path (./hooks/something.sh)', () => {
+    if (!jqExists()) return;
+    // normalize_path strips the leading `./`, so the form becomes
+    // `hooks/something.sh`. With REA_HOOK_PATCH_SESSION set and the path
+    // under hooks/, this should be permitted by the patch-session
+    // allowlist. Without the env var it would block per the §6c
+    // patch-session-pattern rule (which is the existing behavior).
+    // Here we verify the dot-segment guard does NOT false-positive on
+    // pure leading `./`.
+    const abs = `${dir}/./hooks/something.sh`;
+    const res = runHook(dir, abs);
+    // Status may be 0 (allowed) or 2 (blocked by patch-session rule),
+    // but NEVER with "interior dot-segment" wording.
+    expect(res.stderr).not.toMatch(/interior dot-segment rejected/);
+  });
+
+  it('allows benign filename containing dots (src/foo.bar.test.ts)', async () => {
+    if (!jqExists()) return;
+    // `foo.bar.test.ts` is a legit filename — the `*/./* ` pattern
+    // requires `.` between slashes, not within a filename.
+    await fs.mkdir(path.join(dir, 'src'), { recursive: true });
+    const abs = `${dir}/src/foo.bar.test.ts`;
+    const res = runHook(dir, abs);
+    expect(res.status).toBe(0);
+  });
+});
+
 describe('settings-protection.sh — `.husky/*.d/` extension surface (Fix 0.13.2)', () => {
   let dir: string;
 

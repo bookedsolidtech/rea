@@ -114,6 +114,24 @@ Consumer projects may extend the roster via `.rea/agents/` and profile YAMLs, bu
 4. Delegate with full context — include file paths, constraints from policy.yaml, acceptance criteria, and the commit-discipline note above
 5. Verify outputs before reporting completion — do not trust agent summaries at face value. Read the files, check git status, confirm the build.
 
+## Self-review when the orchestrator implements directly (0.29.0+)
+
+There are sessions where the orchestrator must implement work itself instead of dispatching:
+
+- Subagent dispatch is unavailable (no Task tool in the current harness, exempt-subagent scenario).
+- The task is narrowly scoped to a single small surface where the dispatch overhead exceeds the implementation cost.
+- A codex round between specialist hand-offs is being used as the de facto specialist tier (the "Option C" iteration pattern from the 0.29.0 marathon).
+
+In every such case, you MUST still apply the specialist discipline that delegation would have enforced. This is not optional — the structural risk of "one Opus turn implements five surfaces" is exactly the failure mode that principal-engineer review caught in the 0.28.0 cycle (manifest glob-injection P1 + cache-staleness P2, both pre-commit). Reach the same closure shape by:
+
+1. **Name the specialists you are channeling.** Before each surface, state which specialist's discipline applies (e.g. "shell-scripting-specialist + adversarial-test-specialist for the bash gate corpus; typescript-specialist for the CLI; platform-architect for the workflow"). State it out loud so the user can spot a mis-cast role.
+2. **Codex round between surfaces, not just at the end.** A single end-of-build codex round across 5 surfaces buries P1s in noise. One round per surface keeps the signal sharp. The 0.27.0 direct-Bash codex CLI is cheap enough at one Opus turn per round to make this routine.
+3. **Explicit threat-model framing for security-tier changes.** When patching a hook, name the bypass class, the conservative-vs-narrow reading, and the sibling shapes the class implies. Refuse to commit until the corpus enumerates every shape the class includes.
+4. **Single-commit-per-PR discipline still applies.** Squash local work before push. The pre-push gate's stateless codex review runs once against the squashed diff; granular commits multiply the review burden without surfacing new findings.
+5. **Defer ruthlessly.** Trimmed-scope greenlights from the user are a maximum, not a minimum. The marathon's 0.28.0 lesson was "principal-engineer trimmed the 11-item plate to 6 with crisp deferral reasons." Apply the same lens during direct-implementation: if surface 6 needs structural rework, defer it to the next minor with the reason in the changeset rather than ship a half-baked closure.
+
+A self-review checkpoint after each surface (read the diff back, run the targeted tests, fire codex against the working tree) IS the specialist tier when no subagent is in the path. Skip the checkpoint and the structural lesson resets.
+
 ## The Plan / Build / Review Loop (default workflow)
 
 REA's default engineering workflow is three-legged, with Review performed by a different model than Build:

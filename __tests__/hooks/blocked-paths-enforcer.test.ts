@@ -193,6 +193,169 @@ describe('blocked-paths-enforcer.sh — path-traversal rejection (0.14.0 iron-ga
   });
 });
 
+/**
+ * 0.29.0 — sibling class to `..` traversal. `normalize_path` strips the
+ * LEADING `./` but deliberately does not collapse interior `/./` segments
+ * (collapsing them would corrupt `..` reasoning). That leaves a bypass:
+ * `foo/./CODEOWNERS` resolves on disk to `foo/CODEOWNERS`, but the
+ * literal/prefix-match loops compare against the un-collapsed string and
+ * miss `CODEOWNERS`. The conservative closure (per Jake 2026-05-12)
+ * treats every interior `/./` exactly like `..`.
+ *
+ * Corpus designed by pairing shell-scripting-specialist + adversarial-test-
+ * specialist on the sibling-shape sweep methodology: enumerate every
+ * encoding + composition that produces an interior single-dot segment.
+ */
+describe('blocked-paths-enforcer.sh — interior dot-segment rejection (0.29.0 helix-/./-class)', () => {
+  let dir: string;
+
+  beforeEach(async () => {
+    dir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-blocked-paths-dot-')));
+    await fs.mkdir(path.join(dir, '.rea'), { recursive: true });
+    await fs.writeFile(path.join(dir, '.rea', 'policy.yaml'), POLICY_WITH_CODEOWNERS);
+  });
+
+  afterEach(async () => {
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
+  it('rejects foo/./CODEOWNERS (interior single-dot segment)', () => {
+    if (!jqExists()) return;
+    // Pre-0.29.0: this would compare `foo/./CODEOWNERS` against the literal
+    // `CODEOWNERS` entry, fail to match, and exit 0 — the downstream Write
+    // tool would then resolve `/.` and write CODEOWNERS anyway. Post-fix:
+    // §5a-bis interior-dot-reject blocks at exit 2.
+    const target = `${dir}/foo/./CODEOWNERS`;
+    const res = runHook(dir, target);
+    expect(res.status).toBe(2);
+    expect(res.stderr).toMatch(/interior dot-segment rejected/);
+  });
+
+  it('rejects ./CODEOWNERS only when interior (NOT a leading-./ benign case)', () => {
+    if (!jqExists()) return;
+    // Leading `./` is stripped by normalize_path — `.//CODEOWNERS` is the
+    // operative shape because the slash after `./` survives. Verify the
+    // hook still blocks via the LITERAL-match path (not the dot-segment
+    // guard) since `normalize_path` collapses the leading `./` and the
+    // path becomes a plain `/CODEOWNERS`-style match.
+    const target = `${dir}/./CODEOWNERS`;
+    const res = runHook(dir, target);
+    expect(res.status).toBe(2);
+    // Either reason is acceptable here — both close the bypass.
+    expect(res.stderr).toMatch(/BLOCKED PATH|interior dot-segment/);
+  });
+
+  it('rejects repeated interior dot segments (foo/././CODEOWNERS)', () => {
+    if (!jqExists()) return;
+    const target = `${dir}/foo/././CODEOWNERS`;
+    const res = runHook(dir, target);
+    expect(res.status).toBe(2);
+    expect(res.stderr).toMatch(/interior dot-segment rejected/);
+  });
+
+  it('rejects .//.-class (interior dot followed by extra slash)', () => {
+    if (!jqExists()) return;
+    // `foo/.//CODEOWNERS` — `/./ ` is interior; the double-slash is
+    // independent. The case-pattern `*/./*` matches the `/./` substring
+    // regardless of trailing `/`.
+    const target = `${dir}/foo/.//CODEOWNERS`;
+    const res = runHook(dir, target);
+    expect(res.status).toBe(2);
+    expect(res.stderr).toMatch(/interior dot-segment rejected/);
+  });
+
+  it('rejects URL-encoded interior dot segment (foo/%2E/CODEOWNERS)', () => {
+    if (!jqExists()) return;
+    // `normalize_path` URL-decodes `%2E` to `.` BEFORE the §5a-bis check,
+    // so the normalized form becomes `foo/./CODEOWNERS` and the guard
+    // fires. The raw-form encoded guard (`*%2E/*`) is a defense-in-depth
+    // companion that triggers even if URL-decoding ever drops the entry.
+    const target = `${dir}/foo/%2E/CODEOWNERS`;
+    const res = runHook(dir, target);
+    expect(res.status).toBe(2);
+    expect(res.stderr).toMatch(/interior dot-segment rejected/);
+  });
+
+  it('rejects URL-encoded interior dot-slash (foo/.%2FCODEOWNERS)', () => {
+    if (!jqExists()) return;
+    // `.%2F` decodes to `./` mid-path. After URL-decode + leading-./
+    // strip, the normalized form contains `/./` interior.
+    const target = `${dir}/foo/.%2FCODEOWNERS`;
+    const res = runHook(dir, target);
+    expect(res.status).toBe(2);
+    expect(res.stderr).toMatch(/interior dot-segment rejected/);
+  });
+
+  it('rejects mixed-case URL-encoded interior dot (foo/%2e/CODEOWNERS)', () => {
+    if (!jqExists()) return;
+    const target = `${dir}/foo/%2e/CODEOWNERS`;
+    const res = runHook(dir, target);
+    expect(res.status).toBe(2);
+    expect(res.stderr).toMatch(/interior dot-segment rejected/);
+  });
+
+  it('rejects interior dot under a directory prefix (.github/./workflows/release.yml)', () => {
+    if (!jqExists()) return;
+    // `.github/workflows/` is the policy entry. Without the §5a-bis guard,
+    // `.github/./workflows/release.yml` would compare against `.github/workflows/`
+    // as a prefix-match (which still works because the prefix is literal
+    // `.github/`), but a more constructed case like below would slip:
+    // `.github/./workflows/./release.yml`. Pin both shapes.
+    const target = `${dir}/.github/./workflows/release.yml`;
+    const res = runHook(dir, target);
+    expect(res.status).toBe(2);
+    expect(res.stderr).toMatch(/interior dot-segment rejected/);
+  });
+
+  it('rejects interior dot in .env target (foo/./.env)', () => {
+    if (!jqExists()) return;
+    const target = `${dir}/foo/./.env`;
+    const res = runHook(dir, target);
+    expect(res.status).toBe(2);
+    expect(res.stderr).toMatch(/interior dot-segment rejected/);
+  });
+
+  it('allows benign paths that contain "." as part of a filename', () => {
+    if (!jqExists()) return;
+    // `foo.bar/baz.ts` and `foo.` are NOT interior dot segments —
+    // `.` is a literal substring of the filename. The case-pattern
+    // `*/./*` anchors on the surrounding slashes.
+    const target = path.join(dir, 'src', 'foo.bar', 'baz.ts');
+    const res = runHook(dir, target);
+    expect(res.status).toBe(0);
+  });
+
+  it('allows a leading "./" without interior segments (canonical relative)', () => {
+    if (!jqExists()) return;
+    // Pure leading `./` is stripped by normalize_path before §5a-bis runs.
+    // Result: an unrelated file under src/ is allowed.
+    const target = `${dir}/./src/foo.ts`;
+    const res = runHook(dir, target);
+    expect(res.status).toBe(0);
+  });
+
+  it('allows percent-encoded leading "./" (codex round 1 P2-1 regression)', () => {
+    if (!jqExists()) return;
+    // %2E%2F decodes to `./` in normalize_path. The leading-strip loop
+    // removes it. Resulting NORMALIZED form is `src/foo.ts` — no
+    // interior `/./` segment. A pre-fix raw-form encoded guard would
+    // have wrongly flagged this as a dot-segment bypass. Pin the fix.
+    const target = `${dir}/%2E%2Fsrc/foo.ts`;
+    const res = runHook(dir, target);
+    expect(res.status).toBe(0);
+    expect(res.stderr).not.toMatch(/interior dot-segment rejected/);
+  });
+
+  it('allows percent-encoded leading ".%2F" (sibling encoded form)', () => {
+    if (!jqExists()) return;
+    // `.%2F` decodes to `./`; same logic as the above test.
+    const target = `${dir}/.%2Fsrc/foo.ts`;
+    const res = runHook(dir, target);
+    expect(res.status).toBe(0);
+    expect(res.stderr).not.toMatch(/interior dot-segment rejected/);
+  });
+});
+
 describe('blocked-paths-enforcer.sh — agent-writable allowlist (regression)', () => {
   let dir: string;
 
