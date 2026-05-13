@@ -2,6 +2,7 @@
 
 import { Command } from 'commander';
 import { runAuditRotate, runAuditVerify } from './audit.js';
+import { registerAuditSpecialistsSubcommand } from './audit-specialists.js';
 import { runCheck } from './check.js';
 import { registerHookCommand } from './hook.js';
 import { runDoctor } from './doctor.js';
@@ -146,6 +147,11 @@ async function main(): Promise<void> {
       await runAuditVerify({ ...(opts.since !== undefined ? { since: opts.since } : {}) });
     });
 
+  // 0.29.0 — `rea audit specialists` reader for delegation-telemetry
+  // records. Read-only; honors $CLAUDE_SESSION_ID for current-session
+  // filtering. v1 omits --since / --session (deferred to 0.29.1).
+  registerAuditSpecialistsSubcommand(audit);
+
   // Register `rea hook push-gate` — the stateless pre-push Codex gate
   // called by `.husky/pre-push` and `.git/hooks/pre-push`.
   registerHookCommand(program);
@@ -198,10 +204,15 @@ async function main(): Promise<void> {
     .description('Validate the install: policy parses, .rea/ layout, hooks, Codex plugin.')
     .option('--metrics', 'also print a 7-day summary of Codex telemetry (G11.5)')
     .option('--drift', 'report drift vs. the install manifest (read-only; does not mutate)')
-    .action(async (opts: { metrics?: boolean; drift?: boolean }) => {
+    .option(
+      '--smoke',
+      'also run the 0.29.0 delegation-signal round-trip (writes a probe `rea.delegation_signal` audit record and verifies chain integrity)',
+    )
+    .action(async (opts: { metrics?: boolean; drift?: boolean; smoke?: boolean }) => {
       await runDoctor({
         ...(opts.metrics === true ? { metrics: true } : {}),
         ...(opts.drift === true ? { drift: true } : {}),
+        ...(opts.smoke === true ? { smoke: true } : {}),
       });
     });
 

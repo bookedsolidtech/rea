@@ -374,6 +374,26 @@ export function defaultDesiredHooks(): DesiredHookGroup[] {
       ],
     },
     {
+      // 0.29.0 delegation-telemetry MVP. The matcher is `Agent|Skill` —
+      // the two delegation tools in current Claude Code. NOT `Task|Skill`:
+      // `TaskCreate`/`TaskList`/`TaskUpdate` are unrelated todo-list tools
+      // and MUST NOT match. The hook is observational; its only effect is
+      // to append a `rea.delegation_signal` audit record. Worst-case
+      // latency budget is 50ms even under audit-chain contention (the
+      // signal is backgrounded and the CLI uses a 2s lock-acquisition
+      // fallback that exits 0 on timeout).
+      event: 'PreToolUse',
+      matcher: 'Agent|Skill',
+      hooks: [
+        {
+          type: 'command',
+          command: `${base}/delegation-capture.sh`,
+          timeout: 5000,
+          statusMessage: 'Recording delegation signal...',
+        },
+      ],
+    },
+    {
       event: 'PreToolUse',
       matcher: 'Write|Edit|MultiEdit|NotebookEdit',
       hooks: [

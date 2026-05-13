@@ -45,6 +45,19 @@ import {
   type CodexVerdict,
 } from '../audit/codex-event.js';
 import {
+  DELEGATION_SIGNAL_TOOL_NAME,
+  DELEGATION_SIGNAL_SERVER_NAME,
+  DELEGATION_SIGNAL_SCHEMA_VERSION,
+  DelegationSignalMetadataSchema,
+  type DelegationSignalMetadata,
+  type DelegationTool,
+} from '../audit/delegation-event.js';
+import {
+  compileDefaultSecretPatterns,
+  redactSecrets,
+  type CompiledSecretPattern,
+} from '../gateway/middleware/redact.js';
+import {
   CodexNotInstalledError,
   CodexProtocolError,
   CodexSubprocessError,
@@ -782,18 +795,380 @@ export async function runHookCodexReview(options: HookCodexReviewOptions): Promi
   process.exit(exitCode);
 }
 
+// ---------------------------------------------------------------------------
+// `rea hook delegation-signal` — 0.29.0 delegation-telemetry MVP
+// ---------------------------------------------------------------------------
+
+/**
+ * Shape of the Claude Code PreToolUse hook payload for the two
+ * delegation tools we care about. Defensive — every field is optional
+ * because the payload is untrusted (a different harness, a future
+ * Claude Code release, a misconfigured runner). The CLI extracts what
+ * it recognizes and drops the rest.
+ */
+interface DelegationSignalStdinPayload {
+  tool_name?: unknown;
+  session_id?: unknown;
+  hook_event_timestamp?: unknown;
+  tool_input?: {
+    subagent_type?: unknown;
+    skill?: unknown;
+    description?: unknown;
+    prompt?: unknown;
+    parent_subagent_type?: unknown;
+  };
+}
+
+export interface HookDelegationSignalOptions {
+  /**
+   * Run the audit append in the background and return immediately. The
+   * shell hook stub sets this so the worst-case latency of the
+   * `Agent|Skill` PreToolUse hook stays in the tens-of-milliseconds
+   * range even when the audit chain is under cross-process contention.
+   */
+  detach?: boolean;
+  /**
+   * Override REA_ROOT. Tests set this; the production caller relies on
+   * `process.cwd()` or the `$CLAUDE_PROJECT_DIR` env var.
+   */
+  reaRoot?: string;
+  /**
+   * Lock-acquisition timeout in milliseconds. If `appendAuditRecord`
+   * hasn't returned within this budget, the CLI exits 0 with a stderr
+   * warning. The append is fire-and-forget at that point — we'd rather
+   * drop a single signal than block Claude Code's tool dispatch on
+   * audit-log contention. Default: 2000 ms.
+   */
+  lockTimeoutMs?: number;
+}
+
+/**
+ * Cached default secret patterns for the redact path. Compiling the
+ * regex set is non-trivial (it spawns a worker per pattern), so cache
+ * across invocations. CLI process lifecycle is short enough that this
+ * is effectively per-process.
+ */
+let _delegationSecretPatterns: CompiledSecretPattern[] | null = null;
+function getDelegationSecretPatterns(): CompiledSecretPattern[] {
+  if (_delegationSecretPatterns === null) {
+    // Per-pattern timeout budget. The redact-safe wrapper runs each
+    // regex in a worker thread, and the worker spawn itself takes
+    // ~1ms on hot paths but 50–200ms cold. The spec asked for 50ms
+    // but that value caused spurious timeouts in cold-process tests
+    // (the very first PreToolUse hook invocation in a fresh shell)
+    // and converted every input into the timeout sentinel, leaking
+    // false-positive redactions. 250ms is generous enough to absorb
+    // a cold worker spawn while still bounded enough that the
+    // delegation-capture hook stays well under its 5s settings.json
+    // timeout. The hook itself backgrounds the CLI call so this
+    // budget never gates Claude Code's tool dispatch.
+    _delegationSecretPatterns = compileDefaultSecretPatterns({ timeoutMs: 250 });
+  }
+  return _delegationSecretPatterns;
+}
+
+/**
+ * Apply `redactSecrets` to a single string field. Returns the
+ * (possibly redacted) string plus the list of pattern names that
+ * fired. On timeout, returns `'[REDACTED: pattern timeout]'` (the
+ * sentinel from redact.ts) and the timeout pattern name so the audit
+ * envelope still records the redaction happened.
+ *
+ * Best-effort: any exception in the redact path returns the input
+ * unchanged + an empty pattern list. The audit record is observational
+ * — failing the whole signal because the redact timer threw would lose
+ * the signal entirely.
+ */
+/**
+ * Sentinel emitted when redaction is unable to make a definitive
+ * decision (regex timeout, worker error). The redactor's invariant is
+ * "never let a potentially secret-bearing string pass through
+ * unredacted on failure" — that invariant MUST hold for the
+ * delegation-signal path too. Falling back to the raw input on
+ * timeout would silently leak a planted credential into
+ * .rea/audit.jsonl. Codex round 2 P1 (2026-05-12).
+ */
+const REDACT_INDETERMINATE_SENTINEL = '[REDACTED: indeterminate]';
+
+function redactField(value: string): { value: string; patterns: string[] } {
+  try {
+    const { output, redacted, timedOut } = redactSecrets(
+      value,
+      getDelegationSecretPatterns(),
+    );
+    // Timeout: the redactor's `[REDACTED: pattern timeout]` output
+    // already says "I couldn't decide". Treat that as a full-field
+    // redaction here too — under no circumstance let the raw input
+    // through when the scanner failed to complete. This is the
+    // fail-closed posture redact.ts itself takes; we mirror it.
+    // The redactor's own telemetry separately records the timeout
+    // (REDACT_TIMEOUT_METADATA_KEY), so observability isn't lost.
+    if (timedOut) {
+      return {
+        value: REDACT_INDETERMINATE_SENTINEL,
+        patterns: ['redact_timeout'],
+      };
+    }
+    if (redacted.length === 0) return { value, patterns: [] };
+    // The redact contract replaces matched substrings with `[REDACTED]`.
+    // For a short identifier field like `subagent_type`, treat any hit
+    // as a full-field redaction so a partial match doesn't leak the
+    // surrounding context.
+    return { value: output.includes('[REDACTED') ? '[REDACTED]' : output, patterns: redacted };
+  } catch {
+    // Synchronous redactor exception (extremely rare — the wrapper
+    // catches its own errors). Fail closed: indeterminate sentinel.
+    return {
+      value: REDACT_INDETERMINATE_SENTINEL,
+      patterns: ['redact_error'],
+    };
+  }
+}
+
+/**
+ * The actual audit-write — wrapped so it can run inline (default) or
+ * as a detached background tail call (`--detach`). Returns the
+ * promise; the caller decides whether to await it.
+ */
+async function writeDelegationSignal(
+  baseDir: string,
+  metadata: DelegationSignalMetadata,
+  redactedFields: string[],
+  sessionId: string,
+): Promise<void> {
+  // Defense-in-depth: validate the metadata shape against the strict
+  // zod schema before handing it off to `appendAuditRecord`. A future
+  // refactor that introduces a field-name typo here would otherwise
+  // silently land a malformed line in the chain.
+  const parsed = DelegationSignalMetadataSchema.safeParse(metadata);
+  if (!parsed.success) {
+    process.stderr.write(
+      `[rea] delegation-signal: metadata failed strict-mode validation: ${parsed.error.message}\n`,
+    );
+    return;
+  }
+  await appendAuditRecord(baseDir, {
+    tool_name: DELEGATION_SIGNAL_TOOL_NAME,
+    server_name: DELEGATION_SIGNAL_SERVER_NAME,
+    tier: Tier.Read,
+    status: InvocationStatus.Allowed,
+    session_id: sessionId,
+    ...(redactedFields.length > 0 ? { redacted_fields: redactedFields } : {}),
+    metadata: parsed.data as unknown as Record<string, unknown>,
+  });
+}
+
+/**
+ * Read the hook stdin payload, redact + hash, and either await the
+ * audit append OR fire-and-forget it (when `--detach` is set).
+ *
+ * Exit-code contract: ALWAYS exit 0. The delegation signal is
+ * observational, not gating — failure to write the record must NOT
+ * block Claude Code's tool dispatch. Errors are surfaced on stderr.
+ */
+export async function runHookDelegationSignal(
+  options: HookDelegationSignalOptions,
+): Promise<void> {
+  const baseDir =
+    options.reaRoot ?? process.env['CLAUDE_PROJECT_DIR'] ?? process.cwd();
+  const lockTimeoutMs = options.lockTimeoutMs ?? 2000;
+
+  // Read stdin. TTY → empty (no harness payload available, nothing to
+  // emit — exit 0 silently). Timeout 1s; the hook shim feeds us a
+  // small JSON blob that fully prints in milliseconds.
+  const stdinRaw = process.stdin.isTTY ? '' : await readStdinWithTimeout(1_000);
+  if (stdinRaw.length === 0) {
+    process.exit(0);
+  }
+
+  let payload: DelegationSignalStdinPayload;
+  try {
+    payload = JSON.parse(stdinRaw) as DelegationSignalStdinPayload;
+  } catch (e) {
+    // Malformed payload — observational signal only, exit 0 silently
+    // with stderr breadcrumb. Failing here would propagate to the hook
+    // shim and risk blocking the underlying Agent/Skill dispatch.
+    process.stderr.write(
+      `[rea] delegation-signal: malformed stdin JSON (${
+        e instanceof Error ? e.message : String(e)
+      }), signal dropped\n`,
+    );
+    process.exit(0);
+  }
+
+  // Resolve which delegation tool fired. Anything else is a misfire at
+  // the matcher layer (Claude Code routed a non-delegation tool to us)
+  // — exit 0 silently.
+  const rawToolName = typeof payload.tool_name === 'string' ? payload.tool_name : '';
+  const delegationTool: DelegationTool | null =
+    rawToolName === 'Agent' ? 'Agent' : rawToolName === 'Skill' ? 'Skill' : null;
+  if (delegationTool === null) {
+    process.exit(0);
+  }
+
+  // Extract the agent / skill name. Agent → tool_input.subagent_type;
+  // Skill → tool_input.skill. Missing → emit a placeholder ('unknown')
+  // so the chain still records the delegation event.
+  const ti = payload.tool_input ?? {};
+  let rawSubagentType = '';
+  if (delegationTool === 'Agent' && typeof ti.subagent_type === 'string') {
+    rawSubagentType = ti.subagent_type;
+  } else if (delegationTool === 'Skill' && typeof ti.skill === 'string') {
+    rawSubagentType = ti.skill;
+  }
+  if (rawSubagentType.length === 0) rawSubagentType = 'unknown';
+
+  // Parent subagent — Claude Code surfaces this either as
+  // `tool_input.parent_subagent_type` (when the dispatcher attaches
+  // it to the payload) or as the `CLAUDE_PARENT_SUBAGENT` env var
+  // (the alternate source the integrated spec calls out). Payload
+  // wins when both are present — payload is closer to the originating
+  // event and the env var can be stale across subprocess fan-out.
+  // Codex round 4 P2 (2026-05-12): pre-fix the env-var source was
+  // ignored and every nested delegation was recorded as null,
+  // defeating the parent/child telemetry the field was added for.
+  let rawParent: string | null = null;
+  if (typeof ti.parent_subagent_type === 'string' && ti.parent_subagent_type.length > 0) {
+    rawParent = ti.parent_subagent_type;
+  } else {
+    const envParent = process.env['CLAUDE_PARENT_SUBAGENT'];
+    if (typeof envParent === 'string' && envParent.length > 0) {
+      rawParent = envParent;
+    }
+  }
+
+  // Description / prompt → SHA-256, never persisted in clear.
+  // Agent dispatches the prompt under `description`; Skill under
+  // `prompt`. When neither is present we hash the empty string so the
+  // field is always present.
+  const rawDescription =
+    delegationTool === 'Agent' && typeof ti.description === 'string'
+      ? ti.description
+      : delegationTool === 'Skill' && typeof ti.prompt === 'string'
+        ? ti.prompt
+        : '';
+  const descriptionHash = crypto.createHash('sha256').update(rawDescription).digest('hex');
+
+  // Run subagent_type + parent_subagent_type through the redact path.
+  // A planted credential string in either field is replaced with
+  // [REDACTED] before landing in the audit log.
+  const redactedFields: string[] = [];
+  const sub = redactField(rawSubagentType);
+  if (sub.patterns.length > 0) {
+    redactedFields.push('metadata.subagent_type');
+  }
+  let parentValue: string | null = rawParent;
+  if (rawParent !== null) {
+    const parentRed = redactField(rawParent);
+    parentValue = parentRed.value;
+    if (parentRed.patterns.length > 0) {
+      redactedFields.push('metadata.parent_subagent_type');
+    }
+  }
+
+  const sessionIdObserved =
+    typeof payload.session_id === 'string' && payload.session_id.length > 0
+      ? payload.session_id
+      : 'unknown';
+  const hookEventTimestamp =
+    typeof payload.hook_event_timestamp === 'string' && payload.hook_event_timestamp.length > 0
+      ? payload.hook_event_timestamp
+      : undefined;
+
+  const metadata: DelegationSignalMetadata = {
+    schema_version: DELEGATION_SIGNAL_SCHEMA_VERSION,
+    delegation_tool: delegationTool,
+    subagent_type: sub.value,
+    session_id_observed: sessionIdObserved,
+    parent_subagent_type: parentValue,
+    invocation_description_sha256: descriptionHash,
+    ...(hookEventTimestamp !== undefined ? { hook_event_timestamp: hookEventTimestamp } : {}),
+  };
+
+  // Audit envelope `session_id` carries the observed session so a
+  // future reader can correlate without traversing metadata. (The
+  // envelope value is duplicated in metadata.session_id_observed for
+  // record-self-containment.)
+  const writePromise = writeDelegationSignal(
+    baseDir,
+    metadata,
+    redactedFields,
+    sessionIdObserved,
+  );
+
+  // The audit append must complete BEFORE this CLI process exits.
+  // Earlier iterations treated `--detach` as "fire-and-forget at the
+  // CLI level", but Node terminates a process when the event loop has
+  // no more sync work — and `appendAuditRecord()` is async filesystem
+  // work that does NOT keep the process alive across `process.exit`.
+  // The fire-and-forget concept lives one level UP, in the SHELL hook:
+  // the .sh stub backgrounds this entire CLI invocation with `&` +
+  // `disown` so Claude Code's tool dispatch is not blocked. From inside
+  // the CLI we always wait for the append.
+  //
+  // Codex round 1 P1 (2026-05-12): the previous implementation called
+  // `process.exit(0)` immediately after kicking off the promise under
+  // `--detach`. Tests stubbed `process.exit` so the promise still ran
+  // to completion in-test, masking the bug. In production every
+  // Agent/Skill dispatch silently dropped its delegation record.
+  //
+  // `--detach` is RETAINED as a flag for backwards compat with the
+  // shell hook stub's `--detach &` argv (and to document that the
+  // shell hook is the backgrounding layer, not the CLI). Its only
+  // remaining effect is the doc comment and an audit-append-failure
+  // mode that NEVER emits to stderr (no parent shell is listening
+  // when the CLI ran detached).
+  const detached = options.detach === true;
+  let timer: NodeJS.Timeout | null = null;
+  try {
+    await Promise.race([
+      writePromise,
+      new Promise<'timeout'>((resolve) => {
+        timer = setTimeout(() => resolve('timeout'), lockTimeoutMs);
+        timer.unref?.();
+      }).then((tag) => {
+        if (tag === 'timeout') {
+          if (!detached) {
+            process.stderr.write(`[rea] delegation-signal: lock timeout, signal dropped\n`);
+          }
+          // Surface the eventual error so it doesn't escape as an
+          // unhandled rejection after we've exited the await.
+          writePromise.catch(() => {
+            /* already reported via stderr */
+          });
+          return;
+        }
+      }),
+    ]);
+  } catch (e) {
+    // Append failure (e.g. ENOSPC) — surface to stderr unless we ran
+    // detached (no parent shell is listening).
+    if (!detached) {
+      process.stderr.write(
+        `[rea] delegation-signal: audit append failed: ${
+          e instanceof Error ? e.message : String(e)
+        }\n`,
+      );
+    }
+  } finally {
+    if (timer !== null) clearTimeout(timer);
+  }
+  process.exit(0);
+}
+
 /**
  * Attach the `rea hook` subcommand tree to a commander Program.
  *
  * Subcommands:
- *   - `push-gate`     — stateless pre-push Codex review (called by husky).
- *   - `scan-bash`     — parser-backed bash-tier scanner (called by Claude
- *                       Code shim hooks).
- *   - `policy-get`    — single-source-of-truth policy reader for bash hooks.
- *   - `codex-review`  — thin Bash-direct codex invocation (0.27.0+) for
- *                       marathon-mode review cycles. The canonical
- *                       invocation that all agents and slash commands
- *                       route through.
+ *   - `push-gate`           — stateless pre-push Codex review (called by husky).
+ *   - `scan-bash`           — parser-backed bash-tier scanner (called by Claude
+ *                             Code shim hooks).
+ *   - `policy-get`          — single-source-of-truth policy reader for bash hooks.
+ *   - `codex-review`        — thin Bash-direct codex invocation (0.27.0+) for
+ *                             marathon-mode review cycles.
+ *   - `delegation-signal`   — 0.29.0 delegation-telemetry MVP. Reads a Claude
+ *                             Code PreToolUse hook payload for `Agent` / `Skill`
+ *                             and emits a `rea.delegation_signal` audit record.
  *
  * New hooks should land here rather than as top-level commands so the
  * CLI surface stays navigable.
@@ -893,6 +1268,35 @@ export function registerHookCommand(program: Command): void {
         ...(opts.base !== undefined ? { base: opts.base } : {}),
         ...(opts.lastNCommits !== undefined ? { lastNCommits: opts.lastNCommits } : {}),
         ...(opts.json === true ? { json: true } : {}),
+      });
+    });
+
+  hook
+    .command('delegation-signal')
+    .description(
+      'Read a Claude Code PreToolUse hook payload for `Agent` or `Skill` from stdin and emit a `rea.delegation_signal` audit record (0.29.0+). Observational telemetry only — exit ALWAYS 0; failure to write the record never blocks tool dispatch. The hook shim at `.claude/hooks/delegation-capture.sh` invokes this with `--detach` so the Agent/Skill call proceeds without waiting on the audit lock.',
+    )
+    .option(
+      '--detach',
+      'fire the audit append in the background and return immediately. Set by the shell hook stub so worst-case latency stays low under lock contention.',
+    )
+    .option(
+      '--lock-timeout-ms <n>',
+      'milliseconds to wait for the audit-chain lock before dropping the signal. Default 2000.',
+      (raw: string): number => {
+        const n = Number(raw);
+        if (!Number.isInteger(n) || n <= 0) {
+          throw new Error(
+            `--lock-timeout-ms must be a positive integer, got ${JSON.stringify(raw)}`,
+          );
+        }
+        return n;
+      },
+    )
+    .action(async (opts: { detach?: boolean; lockTimeoutMs?: number }) => {
+      await runHookDelegationSignal({
+        ...(opts.detach === true ? { detach: true } : {}),
+        ...(opts.lockTimeoutMs !== undefined ? { lockTimeoutMs: opts.lockTimeoutMs } : {}),
       });
     });
 

@@ -277,3 +277,12 @@ export {
   type LocalReviewSkippedOverrideMetadata,
   type LocalReviewSkippedUnavailableMetadata,
 } from './local-review-event.js';
+export {
+  DELEGATION_SIGNAL_TOOL_NAME,
+  DELEGATION_SIGNAL_SERVER_NAME,
+  DELEGATION_SIGNAL_SCHEMA_VERSION,
+  DelegationSignalMetadataSchema,
+  type DelegationTool,
+  type DelegationSignalMetadata,
+  type DelegationSignalMetadataParsed,
+} from './delegation-event.js';
