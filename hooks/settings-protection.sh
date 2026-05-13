@@ -128,6 +128,45 @@ if [[ "$raw_has_traversal" -eq 1 ]] || [[ "$norm_has_traversal" -eq 1 ]]; then
   exit 2
 fi
 
+# ── 5a-bis. Reject interior single-dot segments (0.29.0 helix-/./-class) ─────
+# Companion to the `..` guard above. The `normalize_path` helper deliberately
+# does NOT collapse interior `./` segments because doing so would corrupt
+# `..` traversals — but that leaves a parallel bypass class. A path like
+# `.husky/./pre-push` resolves on disk to `.husky/pre-push`, yet the literal/
+# prefix matchers in §6 compare against the un-collapsed `.husky/./pre-push`
+# string and miss the match.
+#
+# Conservative reading (per Jake 2026-05-12): treat any interior `./`
+# segment exactly like a `..` segment — refuse outright, force the caller
+# to send a canonical path. The corpus design pairs shell-scripting-specialist
+# with adversarial-test-specialist; the canonical attack shapes are:
+#
+#   .husky/./pre-push                  — single segment
+#   .husky/././pre-push                — repeated segments
+#   .husky/.//pre-push                 — `./` immediately followed by another `/`
+#   .claude/hooks/./_lib/halt-check.sh — inside a protected directory
+#   %2E%2F                             — percent-encoded `./`, caught after URL-decode
+#   .\.\pre-push                       — backslash variant, normalize_path → `./`
+#
+# Only the NORMALIZED form is checked (not the raw form) because raw `./foo`
+# at start-of-string is a legitimate relative path; `normalize_path` already
+# strips leading `./` segments, so anything that survives into the normalized
+# form's `/./` shape is INTERIOR by construction.
+norm_has_dot_segment=0
+case "/$NORMALIZED/" in
+  */./*) norm_has_dot_segment=1 ;;
+esac
+if [[ "$norm_has_dot_segment" -eq 1 ]]; then
+  {
+    printf 'SETTINGS PROTECTION: interior dot-segment rejected\n'
+    printf '\n'
+    printf '  File: %s\n' "$SAFE_FILE_PATH"
+    printf "  Rule: path contains an interior '/./' segment; rewrite to a\n"
+    printf '        canonical project-relative path without dot segments.\n'
+  } >&2
+  exit 2
+fi
+
 # Compute lower-cased path early so the §5b allow-list (and §6/§6b matchers
 # below) all reference a single normalized variable.
 LOWER_NORM=$(printf '%s' "$NORMALIZED" | tr '[:upper:]' '[:lower:]')

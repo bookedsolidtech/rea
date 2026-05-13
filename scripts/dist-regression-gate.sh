@@ -167,8 +167,52 @@ trap 'rm -rf -- "$WORK"' EXIT HUP INT TERM
 # a new tarball was published. The release.yml rebuild+verify step
 # remains the catching net at publish time, so skipping here does not
 # re-open the BUG-013 attack surface for the merge-to-main path.
-if ! ( cd "$WORK" && npm pack "${PKG_NAME}@${PREV_VERSION}" --silent >/dev/null 2>&1 ); then
-  log "skip — npm pack ${PKG_NAME}@${PREV_VERSION} failed (network issue or registry outage)"
+#
+# 0.29.0: bounded retry loop for npm CDN propagation lag. The memory
+# entries for 0.9.0, 0.12.0, 0.13.0, 0.28.0, and 0.28.1 all note
+# "release verify flaked on npm CDN lag" — `npm view` returns the
+# version metadata but `npm pack` against the same version times out
+# or 404s because the tarball blob has not propagated to all CDN edges
+# yet. The CI-side workflow already has a 12×10s retry (release.yml
+# phase 2); this script runs locally / in PR CI where the failure
+# window is shorter but still occurs.
+#
+# Shape: initial attempt + three retries with sleeps 2s / 8s / 30s.
+# Total worst-case wait = 2 + 8 + 30 = 40s, all on the failure path.
+# That covers the empirically observed CDN propagation window (cf.
+# release.yml phase 2 retry loops) while bounding the local-/ PR-side
+# blocking time to under a minute on a genuine outage.
+NPM_PACK_OK=0
+NPM_PACK_DELAYS=(2 8 30)
+NPM_PACK_ATTEMPTS=$((${#NPM_PACK_DELAYS[@]} + 1))
+# Codex round 1 P2-2: use bash arithmetic for-loop instead of `$(seq 1 N)`.
+# `seq` is not in the preflight tool list (line 104: npm jq git shasum tar)
+# and `set -e` at the top of the script would exit 127 inside the loop body
+# on minimal images that lack it (Alpine, some BusyBox shells). Bash's
+# arithmetic for-loop is a builtin and works on every supported version.
+for ((attempt = 1; attempt <= NPM_PACK_ATTEMPTS; attempt++)); do
+  if ( cd "$WORK" && npm pack "${PKG_NAME}@${PREV_VERSION}" --silent >/dev/null 2>&1 ); then
+    if [ "$attempt" -gt 1 ]; then
+      log "npm pack succeeded after ${attempt} attempt(s) (CDN propagation lag)"
+    fi
+    NPM_PACK_OK=1
+    break
+  fi
+  # Clean up any partial artifact npm pack may have left in $WORK
+  # before retrying so the next attempt has a clean slate.
+  find "$WORK" -maxdepth 1 -type f -name '*.tgz' -delete 2>/dev/null || true
+  if [ "$attempt" -lt "$NPM_PACK_ATTEMPTS" ]; then
+    # Bash array is 0-indexed; $attempt is 1-indexed; index into
+    # NPM_PACK_DELAYS at $attempt-1 to read the delay AFTER this
+    # failed attempt (before the next try).
+    idx=$((attempt - 1))
+    delay="${NPM_PACK_DELAYS[$idx]}"
+    log "npm pack attempt ${attempt}/${NPM_PACK_ATTEMPTS} failed; sleeping ${delay}s for CDN propagation"
+    sleep "$delay"
+  fi
+done
+if [ "$NPM_PACK_OK" -ne 1 ]; then
+  log "skip — npm pack ${PKG_NAME}@${PREV_VERSION} failed after ${NPM_PACK_ATTEMPTS} attempts (network issue, registry outage, or persistent CDN lag)"
   exit 0
 fi
 

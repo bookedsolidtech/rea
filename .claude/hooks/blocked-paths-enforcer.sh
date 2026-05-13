@@ -145,6 +145,45 @@ if [[ "$raw_has_traversal" -eq 1 ]] || [[ "$norm_has_traversal" -eq 1 ]]; then
   exit 2
 fi
 
+# ── 5a-bis. Reject interior single-dot segments (0.29.0 helix-/./-class) ─────
+# Parallel to the `..` guard above. `normalize_path` does NOT collapse
+# interior `./` segments — that would corrupt `..` traversals — which leaves
+# a bypass class. A blocked entry of `.env` does not match `foo/./.env`
+# (the literal-comparison loop is byte-for-byte), so an attacker who can
+# influence the file_path string can dodge the policy entry.
+#
+# The conservative closure (per Jake 2026-05-12): treat any interior `/./`
+# segment exactly like `..`. The NORMALIZED form is the safe surface for
+# the check — `normalize_path` already stripped leading `./` segments, so
+# any `/./` that survives is interior by construction. A raw-form check
+# would false-positive on benign `./foo` paths (codex round 1 P2: a path
+# like `%2E%2Fsrc/foo.ts` decodes to `./src/foo.ts` which is the same
+# leading-`./` allowed shape the comment at the top of `normalize_path`
+# documents — guarding against it on the raw form would block legit
+# writes under `src/` and friends).
+#
+# URL-encoded companion: `.%2F` / `%2E/` / `%2E%2F` decode to `./` via
+# `normalize_path` (which knows `%2E` → `.` and `%2F` → `/`). After
+# URL-decode + leading-`./` strip, any encoded INTERIOR form hits the
+# normalized `*/./* ` check. No raw-form encoded guard is needed — the
+# normalize_path path already covers every encoded shape the helper
+# decodes, and shapes it doesn't decode wouldn't resolve to an interior
+# `./` segment on disk either.
+norm_has_dot_segment=0
+case "/$NORMALIZED/" in
+  */./*) norm_has_dot_segment=1 ;;
+esac
+if [[ "$norm_has_dot_segment" -eq 1 ]]; then
+  {
+    printf 'BLOCKED PATH: interior dot-segment rejected\n'
+    printf '\n'
+    printf '  File: %s\n' "$FILE_PATH"
+    printf "  Rule: path contains an interior '/./' segment; rewrite to a\n"
+    printf '        canonical project-relative path without dot segments.\n'
+  } >&2
+  exit 2
+fi
+
 for writable in "${AGENT_WRITABLE[@]}"; do
   if [[ "$NORMALIZED" == "$writable" ]] || [[ "$NORMALIZED" == "$writable"* && "$writable" == */ ]]; then
     exit 0
