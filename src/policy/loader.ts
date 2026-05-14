@@ -244,10 +244,26 @@ const GatewayPolicySchema = z
  * Stricter validation is the consumer's job — RFC 5322 is too permissive
  * for an opt-in audit footprint anyway.
  */
+// 0.30.1 round-5 P2: the `name` value lands verbatim inside a
+// `Co-Authored-By: <name> <email>` git trailer. A newline or carriage
+// return in `name` would split the trailer across lines — git's
+// `interpret-trailers` would drop the continuation and the augmenter
+// could even inject arbitrary extra trailer lines. Reject any ASCII
+// control character (newline, CR, tab, NUL, …) in `name`.
+const CONTROL_CHAR_RE = /[\x00-\x1f\x7f]/;
+
 const AttributionCoAuthorSchema = z
   .object({
     enabled: z.boolean().optional(),
-    name: z.string().optional(),
+    name: z
+      .string()
+      .refine((v) => !CONTROL_CHAR_RE.test(v), {
+        message:
+          'attribution.co_author.name must not contain control characters ' +
+          '(newlines, tabs, carriage returns) — the value is written verbatim ' +
+          'into a single-line Co-Authored-By git trailer.',
+      })
+      .optional(),
     email: z
       .string()
       .regex(/^[^\s<>@]+@[^\s<>@]+\.[^\s<>@]+$/, {

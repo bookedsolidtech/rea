@@ -88,12 +88,31 @@ rea_invoke() {
 ENABLED=$(rea_invoke hook policy-get attribution.co_author.enabled 2>/dev/null)
 REA_RC=$?
 
+# REA_RC interpretation:
+#   0          — rea CLI ran and returned a value (or empty for an
+#                unset key). Use the CLI reads.
+#   non-zero   — rea CLI unreachable (127 sentinel), too old to know
+#                `hook policy-get`, OR the policy YAML is unparseable.
+#                In every one of those cases the policy file ITSELF
+#                may still be valid block-form YAML, so fall back to
+#                the embedded python3 parser. The realistic invalid-
+#                config case — `enabled: true` with an empty name or
+#                email — is caught downstream by the `[ -z "$CO_NAME" ]`
+#                defense-in-depth guard, which exits 0 without
+#                augmenting regardless of which reader produced the
+#                values. (An earlier 0.30.1 revision fail-closed on
+#                non-127 exit codes; codex round 1 showed that
+#                regressed the supported stale-CLI / pre-`pnpm i` flow,
+#                because an old `rea` exits non-zero exactly like an
+#                unparseable policy — the two are indistinguishable by
+#                exit code.)
 if [ "$REA_RC" = "0" ]; then
   CO_NAME=$(rea_invoke hook policy-get attribution.co_author.name 2>/dev/null || printf '')
   CO_EMAIL=$(rea_invoke hook policy-get attribution.co_author.email 2>/dev/null || printf '')
   SKIP_MERGE=$(rea_invoke hook policy-get attribution.co_author.skip_merge 2>/dev/null || printf 'false')
 elif command -v python3 >/dev/null 2>&1; then
-  # rea CLI unreachable — fall back to Python block-form parser.
+  # rea CLI unreachable / stale / policy unparseable — fall back to the
+  # Python block-form parser.
   CO_AUTHOR_PARSE=$(python3 - "$POLICY_FILE" <<'PY' 2>/dev/null
 import re
 import sys

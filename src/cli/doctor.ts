@@ -322,7 +322,7 @@ export function checkSettingsSchema(baseDir: string, strict: boolean): CheckResu
       detail: `malformed JSON: ${e instanceof Error ? e.message : String(e)}`,
     };
   }
-  const result = validateSettings(parsed);
+  const result = validateSettings(parsed, { strict });
   const issues: string[] = [];
   if (!result.parsed) {
     issues.push(...result.errors.map((e) => `schema: ${e}`));
@@ -482,12 +482,22 @@ export function isGitRepo(baseDir: string): boolean {
  */
 /**
  * Resolve the active git hooks directory for the doctor's prepare-commit-msg
- * check. Mirrors `installCommitMsgHook`'s `readHooksPathFromGit` but
- * synchronous (doctor is sync end-to-end). Honors `core.hooksPath` when set
- * (husky 9 installs land at `.husky/_/`); falls back to `.git/hooks/`
- * otherwise. Codex round 1 P2: prior implementation always looked at
- * `.git/hooks/prepare-commit-msg`, false-reporting missing on any consumer
- * running husky.
+ * check. Mirrors `installPrepareCommitMsgHook`'s resolution order
+ * (synchronous — doctor is sync end-to-end):
+ *
+ *   1. `core.hooksPath` — explicit operator override (husky 9 installs
+ *      land at `.husky/_/`). Honored verbatim.
+ *   2. `git rev-parse --git-path hooks` — resolves the canonical hooks
+ *      dir even when `.git` is a FILE (linked worktrees, submodules).
+ *      0.30.1 round-5 P2: the prior implementation hardcoded
+ *      `.git/hooks`, which is wrong for worktrees/submodules where
+ *      `.git` is a gitdir pointer file, not a directory.
+ *   3. `.git/hooks` — last-resort fallback when git itself is missing.
+ *
+ * The Husky 9 STUB indirection (active file at the resolved path is a
+ * `. "${0%/*}/h"` stub that dispatches to `.husky/prepare-commit-msg`)
+ * is followed separately inside `checkPrepareCommitMsgHook` via
+ * `isHusky9Stub` / `resolveHusky9StubTarget`.
  */
 function resolveHooksDirSync(baseDir: string): string {
   try {
@@ -500,7 +510,19 @@ function resolveHooksDirSync(baseDir: string): string {
       return path.isAbsolute(trimmed) ? trimmed : path.join(baseDir, trimmed);
     }
   } catch {
-    // git missing or `core.hooksPath` unset — fall through to default.
+    // git missing or `core.hooksPath` unset — fall through.
+  }
+  try {
+    const out = execFileSync('git', ['-C', baseDir, 'rev-parse', '--git-path', 'hooks'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    const trimmed = out.trim();
+    if (trimmed.length > 0) {
+      return path.isAbsolute(trimmed) ? trimmed : path.join(baseDir, trimmed);
+    }
+  } catch {
+    // git missing — fall through to the literal default.
   }
   return path.join(baseDir, '.git', 'hooks');
 }

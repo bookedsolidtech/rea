@@ -78,6 +78,26 @@ describe('SettingsSchema — rejection cases', () => {
     expect(result.errors).toEqual([]);
   });
 
+  it('REJECTS unknown top-level keys with { strict: true } — 0.30.1 round-5 P2', () => {
+    // 0.30.1 round-5 P2: `validateSettings` now accepts a `strict`
+    // selector. With strict, the unknown top-level key fails the parse
+    // (this is the `rea doctor --strict` CI-gate path). Without it, the
+    // same input passes (lenient default — see the test above).
+    const fixture = loadFixture('invalid-unknown-key.json');
+    const lenient = validateSettings(fixture);
+    expect(lenient.parsed).toBe(true);
+    const strict = validateSettings(fixture, { strict: true });
+    expect(strict.parsed).toBe(false);
+    expect(strict.errors.some((e) => /Unrecognized key|unrecognized_keys/i.test(e))).toBe(true);
+  });
+
+  it('strict mode still accepts a well-formed settings file', () => {
+    // Strict only rejects UNKNOWN keys — a clean file passes both modes.
+    const result = validateSettings(loadFixture('oss-minimal.json'), { strict: true });
+    expect(result.parsed).toBe(true);
+    expect(result.errors).toEqual([]);
+  });
+
   it('rejects an empty matcher string', () => {
     const result = validateSettings(loadFixture('invalid-empty-matcher.json'));
     expect(result.parsed).toBe(false);

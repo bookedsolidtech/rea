@@ -160,6 +160,51 @@ describe('AttributionPolicy — cross-field refinement', () => {
     const policy = loadPolicy(dir);
     expect(policy.attribution).toBeUndefined();
   });
+
+  // 0.30.1 round-5 P2 — the `name` value is written verbatim into a
+  // single-line `Co-Authored-By:` git trailer. A newline or other
+  // control char would split the trailer and could inject extra
+  // trailer lines. The schema must reject control chars in `name`.
+  it('REJECTS a name containing a newline (control-char guard)', async () => {
+    await writePolicy(
+      dir,
+      'attribution:\n  co_author:\n    enabled: true\n' +
+        '    name: "Real Name\\nCo-Authored-By: Injected <evil@example.com>"\n' +
+        '    email: "real@example.com"\n',
+    );
+    expect(() => loadPolicy(dir)).toThrow(/control character/);
+  });
+
+  it('REJECTS a name containing a carriage return', async () => {
+    await writePolicy(
+      dir,
+      'attribution:\n  co_author:\n    enabled: true\n' +
+        '    name: "Real\\rName"\n' +
+        '    email: "real@example.com"\n',
+    );
+    expect(() => loadPolicy(dir)).toThrow(/control character/);
+  });
+
+  it('REJECTS a name containing a tab', async () => {
+    await writePolicy(
+      dir,
+      'attribution:\n  co_author:\n    enabled: true\n' +
+        '    name: "Real\\tName"\n' +
+        '    email: "real@example.com"\n',
+    );
+    expect(() => loadPolicy(dir)).toThrow(/control character/);
+  });
+
+  it('accepts a name with non-ASCII letters (control-char guard is not over-broad)', async () => {
+    await writePolicy(
+      dir,
+      'attribution:\n  co_author:\n    enabled: true\n' +
+        '    name: "Joăo Strawn-Müller"\n' +
+        '    email: "real@example.com"\n',
+    );
+    const policy = loadPolicy(dir);
+    expect(policy.attribution?.co_author?.name).toBe('Joăo Strawn-Müller');
+  });
 });
 
 describe('AttributionPolicy — all shipped profiles parse with enabled: false', () => {
