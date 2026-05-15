@@ -296,4 +296,33 @@ describe('prepare-commit-msg augmenter', () => {
     const body = await fs.readFile(msg, 'utf8');
     expect(body).toBe('feat: x\n');
   });
+
+  // 0.30.1 — a stale `rea` (one that predates `hook policy-get` and so
+  // exits non-zero) must NOT block augmentation: the policy file itself
+  // can still be valid block-form YAML, and the python3 fallback should
+  // read it. Codex round 1 of 0.30.1 caught an earlier revision that
+  // fail-closed on non-127 exit codes — regressing exactly this flow.
+  it('stale rea CLI (non-zero exit) still augments via the python3 fallback', async () => {
+    const hookPath = path.join(dir, '.husky', 'prepare-commit-msg');
+    await setupRepo(
+      dir,
+      'attribution:\n  co_author:\n    enabled: true\n' +
+        '    name: "Real Name"\n    email: "real@example.com"\n',
+    );
+    await fs.copyFile(HOOK_TEMPLATE, hookPath);
+    await fs.chmod(hookPath, 0o755);
+    // Fake `rea` that exits 1 — simulates an old CLI that doesn't know
+    // `hook policy-get`. rea_invoke finds it via `command -v rea`.
+    const fakeBinDir = path.join(dir, 'fake-bin');
+    await fs.mkdir(fakeBinDir, { recursive: true });
+    await fs.writeFile(path.join(fakeBinDir, 'rea'), '#!/bin/sh\nexit 1\n', { mode: 0o755 });
+    const msg = await writeMsg(dir, 'feat: implement feature\n');
+    const r = await runHook(hookPath, msg, 'message', {
+      PATH: `${fakeBinDir}:${process.env.PATH ?? ''}`,
+    });
+    expect(r.code).toBe(0);
+    const body = await fs.readFile(msg, 'utf8');
+    // python3 fallback read the valid block-form policy → trailer added.
+    expect(body).toContain('Co-Authored-By: Real Name <real@example.com>');
+  });
 });

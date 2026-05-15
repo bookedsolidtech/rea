@@ -7,17 +7,22 @@
  * on which checks are present and their status.
  */
 
+import { execFile } from 'node:child_process';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { promisify } from 'node:util';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   checkCodexBinaryOnPath,
   checkFingerprintStore,
+  checkPrepareCommitMsgHook,
   checksFromProbeState,
   collectChecks,
   type CheckResult,
 } from './doctor.js';
+
+const execFileAsync = promisify(execFile);
 import { FINGERPRINT_STORE_VERSION, saveFingerprintStore } from '../registry/fingerprints-store.js';
 import { fingerprintServer } from '../registry/fingerprint.js';
 import type { RegistryServer } from '../registry/types.js';
@@ -1196,5 +1201,64 @@ describe('rea doctor — delegation-capture hook registered (0.29.0)', () => {
     const checks = collectChecks(repo.dir);
     const check = findCheck(checks, 'delegation-capture hook registered');
     expect(check?.status).toBe('pass');
+  });
+});
+
+describe('rea doctor — checkPrepareCommitMsgHook hooks-dir resolution (0.30.1 round-5 P2)', () => {
+  const cleanup: string[] = [];
+
+  afterEach(async () => {
+    await Promise.all(cleanup.splice(0).map((d) => fs.rm(d, { recursive: true, force: true })));
+  });
+
+  async function initRepo(): Promise<string> {
+    const dir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-doctor-pcm-')));
+    cleanup.push(dir);
+    await execFileAsync('git', ['-C', dir, 'init', '--quiet']);
+    await execFileAsync('git', ['-C', dir, 'config', 'user.email', 'test@example.com']);
+    await execFileAsync('git', ['-C', dir, 'config', 'user.name', 'test']);
+    await fs.mkdir(path.join(dir, '.rea'), { recursive: true });
+    await fs.writeFile(
+      path.join(dir, '.rea', 'policy.yaml'),
+      ['version: "1"', 'profile: "minimal"', 'installed_by: "t"', ''].join('\n'),
+    );
+    return dir;
+  }
+
+  // 0.30.1 round-5 P2: resolveHooksDirSync now consults
+  // `git rev-parse --git-path hooks` between the core.hooksPath check
+  // and the `.git/hooks` literal fallback. In a vanilla repo that
+  // resolves to `.git/hooks`; the value matters for worktrees /
+  // submodules where `.git` is a pointer file, not a directory.
+  it('resolves the canonical hooks dir in a vanilla git repo (no core.hooksPath)', async () => {
+    const dir = await initRepo();
+    // No attribution policy → enabled is false → check should be pass
+    // ("disabled, no hook installed — vanilla state"), proving the
+    // resolver returned a real directory and did not throw.
+    const result = checkPrepareCommitMsgHook(dir);
+    expect(result.status).toBe('pass');
+    expect(result.label).toMatch(/prepare-commit-msg/);
+  });
+
+  it('resolves through core.hooksPath when explicitly set', async () => {
+    const dir = await initRepo();
+    const customHooks = path.join(dir, '.husky', '_');
+    await fs.mkdir(customHooks, { recursive: true });
+    await execFileAsync('git', ['-C', dir, 'config', 'core.hooksPath', '.husky/_']);
+    // Still no policy → still pass, but the resolution path went
+    // through the core.hooksPath branch rather than git-path/default.
+    const result = checkPrepareCommitMsgHook(dir);
+    expect(result.status).toBe('pass');
+  });
+
+  it('does not throw when run outside a git repo (resolver falls through to literal default)', async () => {
+    const dir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-doctor-nogit-')));
+    cleanup.push(dir);
+    await fs.mkdir(path.join(dir, '.rea'), { recursive: true });
+    await fs.writeFile(
+      path.join(dir, '.rea', 'policy.yaml'),
+      ['version: "1"', 'profile: "minimal"', 'installed_by: "t"', ''].join('\n'),
+    );
+    expect(() => checkPrepareCommitMsgHook(dir)).not.toThrow();
   });
 });

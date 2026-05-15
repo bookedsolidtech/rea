@@ -224,8 +224,21 @@ export interface SettingsValidationResult {
  * best-effort scan of any `hooks: { PreToolUse: [...] }` shape we
  * recognize, so the operator still sees traversal + missing-hooks
  * findings.
+ *
+ * `strict` selects the schema:
+ *   - `false` (default) — `SettingsSchema`, top-level `.passthrough()`.
+ *     Unknown harness keys pass. Used by `rea upgrade` and advisory
+ *     `rea doctor`.
+ *   - `true` — `SettingsSchemaStrict`, top-level `.strict()`. Unknown
+ *     keys fail the parse. Used only by `rea doctor --strict` (the CI
+ *     gate path). 0.30.1 round-5 P2: the strict schema existed since
+ *     0.30.0 but `validateSettings` never accepted the selector, so
+ *     `rea doctor --strict` silently ran the lenient schema.
  */
-export function validateSettings(input: unknown): SettingsValidationResult {
+export function validateSettings(
+  input: unknown,
+  options: { strict?: boolean } = {},
+): SettingsValidationResult {
   const result: SettingsValidationResult = {
     parsed: false,
     settings: null,
@@ -235,7 +248,8 @@ export function validateSettings(input: unknown): SettingsValidationResult {
     warnings: [],
   };
 
-  const parsed = SettingsSchema.safeParse(input);
+  const schema = options.strict === true ? SettingsSchemaStrict : SettingsSchema;
+  const parsed = schema.safeParse(input);
   if (parsed.success) {
     result.parsed = true;
     result.settings = parsed.data;
