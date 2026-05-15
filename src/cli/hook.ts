@@ -37,6 +37,10 @@ import type { Command } from 'commander';
 import { parse as parseYaml } from 'yaml';
 import { parsePrePushStdin, runPushGate } from '../hooks/push-gate/index.js';
 import { runBlockedScan, runProtectedScan, type Verdict } from '../hooks/bash-scanner/index.js';
+import { checkHalt, formatHaltBanner } from '../hooks/_lib/halt-check.js';
+import { runHookPrIssueLinkGate } from '../hooks/pr-issue-link-gate/index.js';
+import { runHookSecurityDisclosureGate } from '../hooks/security-disclosure-gate/index.js';
+import { runHookAttributionAdvisory } from '../hooks/attribution-advisory/index.js';
 import { loadPolicy } from '../policy/loader.js';
 import { appendAuditRecord, InvocationStatus, Tier } from '../audit/append.js';
 import {
@@ -202,18 +206,12 @@ export async function runHookScanBash(options: HookScanBashOptions): Promise<voi
   // HALT check — uniform with the bash hooks. We exit 2 (block) so
   // the shim refuses the command in the same way settings-protection
   // and the bash gates do.
-  const haltPath = path.join(reaRoot, '.rea', 'HALT');
-  if (fs.existsSync(haltPath)) {
-    let reason = 'Reason unknown';
-    try {
-      const content = fs.readFileSync(haltPath, 'utf8');
-      reason = content.slice(0, 1024).trim() || reason;
-    } catch {
-      /* leave default */
-    }
-    process.stderr.write(
-      `REA HALT: ${reason}\nAll agent operations suspended. Run: rea unfreeze\n`,
-    );
+  // 0.32.0: shared via `src/hooks/_lib/halt-check.ts` so the Phase 1
+  // pilots and the codex-review hook below all emit the same banner
+  // byte-for-byte and apply the same fail-closed read posture.
+  const halt = checkHalt(reaRoot);
+  if (halt.halted) {
+    process.stderr.write(formatHaltBanner(halt.reason));
     const haltVerdict: Verdict = {
       verdict: 'block',
       reason: 'rea HALT active',
@@ -516,18 +514,10 @@ export async function runHookCodexReview(options: HookCodexReviewOptions): Promi
   const baseDir = options.reaRoot ?? process.cwd();
 
   // HALT check — uniform with the rest of the hook tree.
-  const haltPath = path.join(baseDir, '.rea', 'HALT');
-  if (fs.existsSync(haltPath)) {
-    let reason = 'Reason unknown';
-    try {
-      const content = fs.readFileSync(haltPath, 'utf8');
-      reason = content.slice(0, 1024).trim() || reason;
-    } catch {
-      /* leave default */
-    }
-    process.stderr.write(
-      `REA HALT: ${reason}\nAll agent operations suspended. Run: rea unfreeze\n`,
-    );
+  // 0.32.0: shared via `src/hooks/_lib/halt-check.ts`.
+  const halt = checkHalt(baseDir);
+  if (halt.halted) {
+    process.stderr.write(formatHaltBanner(halt.reason));
     process.exit(2);
   }
 
@@ -1314,6 +1304,33 @@ export function registerHookCommand(program: Command): void {
     )
     .action(async () => {
       await runHookDelegationAdvisory();
+    });
+
+  hook
+    .command('pr-issue-link-gate')
+    .description(
+      'Node-binary port of `hooks/pr-issue-link-gate.sh` (0.32.0). Reads a Claude Code PreToolUse Bash payload from stdin; when the command is `gh pr create` without a `closes/fixes/resolves #N` reference, prints an advisory banner to stderr. ALWAYS exits 0 except HALT (exit 2) or malformed payload (exit 2, fail-closed). The bash shim at `hooks/pr-issue-link-gate.sh` invokes this.',
+    )
+    .action(async () => {
+      await runHookPrIssueLinkGate();
+    });
+
+  hook
+    .command('security-disclosure-gate')
+    .description(
+      'Node-binary port of `hooks/security-disclosure-gate.sh` (0.32.0). Reads a Claude Code PreToolUse Bash payload from stdin; when the command is `gh issue create` AND title/body/body-file contents match a SECURITY_PATTERNS keyword, emits a deny JSON on stdout and exits 2. Routing depends on REA_DISCLOSURE_MODE: advisory (default, redirect to GHSA), issues (private repo, redirect to labeled issue), disabled (pass through).',
+    )
+    .action(async () => {
+      await runHookSecurityDisclosureGate();
+    });
+
+  hook
+    .command('attribution-advisory')
+    .description(
+      'Node-binary port of `hooks/attribution-advisory.sh` (0.32.0). Opt-in via policy.yaml `block_ai_attribution: true`. Reads a Claude Code PreToolUse Bash payload from stdin; when the command is `git commit` or `gh pr create|edit` AND contains structural AI attribution markers (Co-Authored-By with vendor noreply, AI tool names, "Generated with [X]", markdown-linked tools, 🤖 Generated), exits 2 with banner. Otherwise exits 0.',
+    )
+    .action(async () => {
+      await runHookAttributionAdvisory();
     });
 
   hook

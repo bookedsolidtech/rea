@@ -1150,6 +1150,19 @@ describe('husky extension surface carve-out (helix-018 Option B)', () => {
     expect(res.status).toBe(0);
   });
 
+  // 0.32.0 codex round 2 P1: prepare-commit-msg.d joins the
+  // bash-tier carve-out to match the Write-tier allow-list shipped
+  // earlier in 0.32.0. Pre-fix, the redirect was blocked even
+  // though the documented migration uses `cat > .husky/prepare-commit-msg.d/...`.
+  it('.husky/prepare-commit-msg.d/X — Bash redirect ALLOWED (0.32.0 carve-out)', () => {
+    if (!jqExists()) return;
+    const res = runHook(
+      'protected-paths-bash-gate.sh',
+      'echo x > .husky/prepare-commit-msg.d/50-helix-cem-drift',
+    );
+    expect(res.status).toBe(0);
+  });
+
   it('.husky/pre-push (parent script, NO .d/ suffix) — STILL BLOCKED', () => {
     if (!jqExists()) return;
     const res = runHook('protected-paths-bash-gate.sh', 'echo x > .husky/pre-push');
@@ -1168,6 +1181,24 @@ describe('husky extension surface carve-out (helix-018 Option B)', () => {
   it('.husky/pre-push.d.bak/X (sibling-named directory) — STILL BLOCKED', () => {
     if (!jqExists()) return;
     const res = runHook('protected-paths-bash-gate.sh', 'echo x > .husky/pre-push.d.bak/00-evil');
+    expect(res.status).toBe(2);
+  });
+
+  it('.husky/prepare-commit-msg.d.bak/X (sibling-named directory) — STILL BLOCKED', () => {
+    if (!jqExists()) return;
+    const res = runHook(
+      'protected-paths-bash-gate.sh',
+      'echo x > .husky/prepare-commit-msg.d.bak/00-evil',
+    );
+    expect(res.status).toBe(2);
+  });
+
+  it('.husky/prepare-commit-msg (parent body, NO .d/) — STILL BLOCKED', () => {
+    if (!jqExists()) return;
+    const res = runHook(
+      'protected-paths-bash-gate.sh',
+      'echo x > .husky/prepare-commit-msg',
+    );
     expect(res.status).toBe(2);
   });
 
@@ -1207,6 +1238,12 @@ describe('settings-protection.sh §5b — Write-tier .d/ allow-list (helix-018 #
   it('.husky/commit-msg.d/X — Write tool ALLOWED', () => {
     if (!jqExists()) return;
     const res = runWriteHook('.husky/commit-msg.d/30-helix-styles');
+    expect(res.status).toBe(0);
+  });
+
+  it('.husky/prepare-commit-msg.d/X — Write tool ALLOWED (0.32.0 carve-out)', () => {
+    if (!jqExists()) return;
+    const res = runWriteHook('.husky/prepare-commit-msg.d/50-helix-augmenter');
     expect(res.status).toBe(0);
   });
 

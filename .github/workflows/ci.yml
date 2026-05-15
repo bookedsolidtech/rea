@@ -105,6 +105,12 @@ jobs:
         run: pnpm build
 
       - name: Test
+        env:
+          # 0.32.0 round-7 P3 — Class G package-byte-fidelity tests are
+          # opt-in (`pnpm pack` per invocation costs several seconds, too
+          # expensive for the dev inner loop). CI enables them so the
+          # packaging regressions they catch are gated on every PR.
+          RUN_PACK_TESTS: '1'
         run: pnpm test
 
   build:
