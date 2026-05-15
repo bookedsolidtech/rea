@@ -297,6 +297,135 @@ describe('prepare-commit-msg augmenter', () => {
     expect(body).toBe('feat: x\n');
   });
 
+  // 0.32.0 — `.husky/prepare-commit-msg.d/*` extension surface.
+  // The augmenter MUST source every executable fragment in lex order
+  // AFTER appending its own Co-Authored-By trailer, with non-zero exits
+  // logged-and-continued (the hook is additive; broken consumer
+  // fragments can't take down `git commit`).
+  it('runs prepare-commit-msg.d/ fragments after the augmenter', async () => {
+    const hookPath = path.join(dir, '.husky', 'prepare-commit-msg');
+    await setupRepo(
+      dir,
+      'attribution:\n  co_author:\n    enabled: true\n' +
+        '    name: "Real Name"\n    email: "real@example.com"\n',
+    );
+    await fs.copyFile(HOOK_TEMPLATE, hookPath);
+    await fs.chmod(hookPath, 0o755);
+    const extDir = path.join(dir, '.husky', 'prepare-commit-msg.d');
+    await fs.mkdir(extDir, { recursive: true });
+    // Fragment appends a sentinel line. Runs AFTER the augmenter — so
+    // the file should contain BOTH the trailer and the sentinel.
+    await fs.writeFile(
+      path.join(extDir, '01-marker'),
+      '#!/bin/sh\nprintf "fragment-ran-after-augmenter\\n" >> "$1"\n',
+      { mode: 0o755 },
+    );
+    const msg = await writeMsg(dir, 'feat: x\n');
+    const r = await runHook(hookPath, msg, 'message');
+    expect(r.code).toBe(0);
+    const body = await fs.readFile(msg, 'utf8');
+    expect(body).toContain('Co-Authored-By: Real Name <real@example.com>');
+    expect(body).toContain('fragment-ran-after-augmenter');
+    // The augmenter MUST run first — verify ordering: the trailer line
+    // appears BEFORE the fragment's sentinel.
+    const trailerIdx = body.indexOf('Co-Authored-By:');
+    const sentinelIdx = body.indexOf('fragment-ran-after-augmenter');
+    expect(trailerIdx).toBeLessThan(sentinelIdx);
+  });
+
+  it('runs prepare-commit-msg.d/ fragments in lex order', async () => {
+    const hookPath = path.join(dir, '.husky', 'prepare-commit-msg');
+    await setupRepo(
+      dir,
+      'attribution:\n  co_author:\n    enabled: false\n', // disabled — only test ordering
+    );
+    await fs.copyFile(HOOK_TEMPLATE, hookPath);
+    await fs.chmod(hookPath, 0o755);
+    const extDir = path.join(dir, '.husky', 'prepare-commit-msg.d');
+    await fs.mkdir(extDir, { recursive: true });
+    await fs.writeFile(
+      path.join(extDir, '02-second'),
+      '#!/bin/sh\nprintf "second\\n" >> "$1"\n',
+      { mode: 0o755 },
+    );
+    await fs.writeFile(
+      path.join(extDir, '01-first'),
+      '#!/bin/sh\nprintf "first\\n" >> "$1"\n',
+      { mode: 0o755 },
+    );
+    const msg = await writeMsg(dir, 'feat: x\n');
+    const r = await runHook(hookPath, msg, 'message');
+    expect(r.code).toBe(0);
+    const body = await fs.readFile(msg, 'utf8');
+    expect(body.indexOf('first')).toBeLessThan(body.indexOf('second'));
+  });
+
+  it('skips non-executable prepare-commit-msg.d/ entries', async () => {
+    const hookPath = path.join(dir, '.husky', 'prepare-commit-msg');
+    await setupRepo(
+      dir,
+      'attribution:\n  co_author:\n    enabled: false\n',
+    );
+    await fs.copyFile(HOOK_TEMPLATE, hookPath);
+    await fs.chmod(hookPath, 0o755);
+    const extDir = path.join(dir, '.husky', 'prepare-commit-msg.d');
+    await fs.mkdir(extDir, { recursive: true });
+    // Non-executable (mode 0o644) — must be skipped.
+    await fs.writeFile(
+      path.join(extDir, '01-not-exec'),
+      '#!/bin/sh\nprintf "should-not-run\\n" >> "$1"\n',
+      { mode: 0o644 },
+    );
+    const msg = await writeMsg(dir, 'feat: x\n');
+    const r = await runHook(hookPath, msg, 'message');
+    expect(r.code).toBe(0);
+    const body = await fs.readFile(msg, 'utf8');
+    expect(body).not.toContain('should-not-run');
+  });
+
+  it('continues past a failing prepare-commit-msg.d/ fragment', async () => {
+    const hookPath = path.join(dir, '.husky', 'prepare-commit-msg');
+    await setupRepo(
+      dir,
+      'attribution:\n  co_author:\n    enabled: false\n',
+    );
+    await fs.copyFile(HOOK_TEMPLATE, hookPath);
+    await fs.chmod(hookPath, 0o755);
+    const extDir = path.join(dir, '.husky', 'prepare-commit-msg.d');
+    await fs.mkdir(extDir, { recursive: true });
+    await fs.writeFile(
+      path.join(extDir, '01-broken'),
+      '#!/bin/sh\nexit 1\n',
+      { mode: 0o755 },
+    );
+    await fs.writeFile(
+      path.join(extDir, '02-after'),
+      '#!/bin/sh\nprintf "after-broken\\n" >> "$1"\n',
+      { mode: 0o755 },
+    );
+    const msg = await writeMsg(dir, 'feat: x\n');
+    const r = await runHook(hookPath, msg, 'message');
+    expect(r.code).toBe(0);
+    expect(r.stderr).toContain('prepare-commit-msg.d fragment exited non-zero');
+    const body = await fs.readFile(msg, 'utf8');
+    expect(body).toContain('after-broken');
+  });
+
+  it('handles missing prepare-commit-msg.d/ directory as a no-op', async () => {
+    const hookPath = path.join(dir, '.husky', 'prepare-commit-msg');
+    await setupRepo(
+      dir,
+      'attribution:\n  co_author:\n    enabled: false\n',
+    );
+    await fs.copyFile(HOOK_TEMPLATE, hookPath);
+    await fs.chmod(hookPath, 0o755);
+    // Do NOT create .husky/prepare-commit-msg.d at all.
+    const msg = await writeMsg(dir, 'feat: x\n');
+    const r = await runHook(hookPath, msg, 'message');
+    expect(r.code).toBe(0);
+    expect(r.stderr).toBe('');
+  });
+
   // 0.30.1 — a stale `rea` (one that predates `hook policy-get` and so
   // exits non-zero) must NOT block augmentation: the policy file itself
   // can still be valid block-form YAML, and the python3 fallback should

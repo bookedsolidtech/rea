@@ -172,13 +172,25 @@ function isKillSwitchInvariant(p: string): boolean {
 /**
  * Test whether a normalized lowercase project-relative path falls
  * inside the documented husky extension surface
- * (`.husky/{commit-msg,pre-push,pre-commit}.d/<fragment>`).
+ * (`.husky/{commit-msg,pre-push,pre-commit,prepare-commit-msg}.d/<fragment>`).
  *
  * The bare directory itself (`.husky/pre-push.d/`) and the dir node
  * (`.husky/pre-push.d`) do NOT match — only fragments inside.
+ *
+ * 0.32.0 codex round 2 P1: `.husky/prepare-commit-msg.d/` joined the
+ * carve-out to match settings-protection.sh §5b and the bash-tier
+ * `rea_path_is_extension_surface` helper. Without this, the new
+ * prepare-commit-msg migration path documented in MIGRATING.md was
+ * still refused by the Node-binary protected-scan even though the
+ * Write/Edit allow-list permitted it.
  */
 function isExtensionSurface(pathLc: string): boolean {
-  const surfaces = ['.husky/commit-msg.d/', '.husky/pre-push.d/', '.husky/pre-commit.d/'];
+  const surfaces = [
+    '.husky/commit-msg.d/',
+    '.husky/pre-push.d/',
+    '.husky/pre-commit.d/',
+    '.husky/prepare-commit-msg.d/',
+  ];
   for (const s of surfaces) {
     if (pathLc.startsWith(s) && pathLc.length > s.length) {
       return true;

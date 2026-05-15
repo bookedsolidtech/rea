@@ -36,28 +36,65 @@ set -u
 COMMIT_MSG_FILE="${1:-}"
 COMMIT_SOURCE="${2:-}"
 
+REA_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+
+# Forward declaration — the extension-chain runner is defined further
+# down (after $REA_ROOT is set so the dir lookup is anchored). We call
+# it from every "augmenter skipped" exit point so consumer fragments
+# under .husky/prepare-commit-msg.d/* run regardless of whether rea's
+# own augmenter ran. The function fires fragments in lex order,
+# logs-and-continues on non-zero exits, and is a no-op if the dir is
+# absent or empty.
+#
+# 0.32.0 Phase 3: the pre-0.32.0 layout exited early at every
+# precondition gate, which made the extension surface unreachable
+# when (a) attribution was disabled, (b) HALT was active, or (c)
+# REA_SKIP_ATTRIBUTION was set. The new layout runs the chain at the
+# end of every exit path EXCEPT when the message file itself is
+# missing/unparseable (no point running fragments against a path that
+# doesn't exist).
+run_extension_chain() {
+  ext_dir="${REA_ROOT}/.husky/prepare-commit-msg.d"
+  if [ -d "$ext_dir" ]; then
+    for frag in "$ext_dir"/*; do
+      [ -e "$frag" ] || continue
+      [ -f "$frag" ] || continue
+      [ -x "$frag" ] || continue
+      if ! "$frag" "$COMMIT_MSG_FILE" "$COMMIT_SOURCE"; then
+        printf 'rea: prepare-commit-msg.d fragment exited non-zero: %s (continuing)\n' \
+          "$(basename "$frag")" >&2
+      fi
+    done
+  fi
+}
+
 # Skip conditions: any missing precondition exits 0 silently. The hook
 # is purely additive; refusing here would break commits with no upside.
 
-# Missing message file → nothing to augment.
+# Missing message file → nothing to augment AND nothing for fragments
+# to act on either. Exit immediately without running the chain.
 if [ -z "$COMMIT_MSG_FILE" ] || [ ! -f "$COMMIT_MSG_FILE" ]; then
   exit 0
 fi
 
-# Per-invocation override.
+# Per-invocation override — skip the augmenter, but still run consumer
+# fragments. The flag is named REA_SKIP_ATTRIBUTION, not REA_SKIP_HOOK,
+# precisely so the rest of the chain runs.
 if [ -n "${REA_SKIP_ATTRIBUTION:-}" ]; then
+  run_extension_chain
   exit 0
 fi
 
-REA_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
-
-# HALT kill switch — refuse to mutate anything while frozen.
+# HALT kill switch — refuse to mutate anything while frozen. The
+# extension chain is also skipped under HALT: a frozen system means
+# "no agent-side actions" and consumer fragments are agent-side too.
 if [ -f "${REA_ROOT}/.rea/HALT" ]; then
   exit 0
 fi
 
 POLICY_FILE="${REA_ROOT}/.rea/policy.yaml"
 if [ ! -f "$POLICY_FILE" ]; then
+  run_extension_chain
   exit 0
 fi
 
@@ -172,6 +209,7 @@ print(enabled); print(name); print(email); print(skip_merge)
 PY
 )
   if [ -z "$CO_AUTHOR_PARSE" ]; then
+    run_extension_chain
     exit 0
   fi
   ENABLED=$(printf '%s\n' "$CO_AUTHOR_PARSE" | sed -n '1p')
@@ -179,11 +217,15 @@ PY
   CO_EMAIL=$(printf '%s\n' "$CO_AUTHOR_PARSE" | sed -n '3p')
   SKIP_MERGE=$(printf '%s\n' "$CO_AUTHOR_PARSE" | sed -n '4p')
 else
-  # Neither rea CLI nor python3 reachable — silent no-op.
+  # Neither rea CLI nor python3 reachable — silent no-op for the
+  # augmenter, but still run consumer fragments. The chain doesn't
+  # need policy values; it just runs `.husky/prepare-commit-msg.d/*`.
+  run_extension_chain
   exit 0
 fi
 
 if [ "$ENABLED" != "true" ]; then
+  run_extension_chain
   exit 0
 fi
 
@@ -204,11 +246,13 @@ if [ -z "$CO_NAME" ] || [ -z "$CO_EMAIL" ]; then
     "$([ -z "$CO_NAME" ] && [ -z "$CO_EMAIL" ] && printf '+')" \
     "$([ -z "$CO_EMAIL" ] && printf email)" >&2
   printf 'rea: edit .rea/policy.yaml — set name + email, OR set enabled: false.\n' >&2
+  run_extension_chain
   exit 0
 fi
 
 # skip_merge: true → skip when commit source is 'merge'.
 if [ "$SKIP_MERGE" = "true" ] && [ "$COMMIT_SOURCE" = "merge" ]; then
+  run_extension_chain
   exit 0
 fi
 
@@ -226,6 +270,7 @@ LOWER_EMAIL=$(printf '%s' "$CO_EMAIL" | tr '[:upper:]' '[:lower:]')
 ESCAPED_EMAIL=$(printf '%s' "$LOWER_EMAIL" | sed 's/[.[\*^$(){}+?|]/\\&/g')
 if grep -iE "^co-authored-by:[[:space:]]*[^<]*<${ESCAPED_EMAIL}>[[:space:]]*$" \
   "$COMMIT_MSG_FILE" >/dev/null 2>&1; then
+  run_extension_chain
   exit 0
 fi
 
@@ -311,4 +356,33 @@ awk '
 } > "${COMMIT_MSG_FILE}.rea-tmp" && mv "${COMMIT_MSG_FILE}.rea-tmp" "$COMMIT_MSG_FILE"
 
 rm -f "$TMP_BODY_TRIMMED"
+
+# ── Extension-hook chaining ───────────────────────────────────────────────────
+# 0.32.0 — `.husky/prepare-commit-msg.d/*` extension surface mirrors
+# the `.husky/commit-msg.d/*` and `.husky/pre-push.d/*` patterns from
+# 0.13.0. Source every executable file under
+# `.husky/prepare-commit-msg.d/` in lexical order. Missing directory
+# is a no-op (backward compatible). Each fragment receives the same
+# `$1` (commit message file path) and `$2` (commit source) that git
+# delivered to this hook so consumers can layer on their own
+# augmenters (lint-staged --on-prepare, branch-name-injection,
+# ticket-reference-prepend, …) without losing rea coverage.
+#
+# Fragments run AFTER rea's attribution augmenter so the
+# `Co-Authored-By` trailer is already in the file before any consumer
+# fragment reads it; that lets a fragment reorder trailers, dedupe,
+# or run its own template substitution against the augmented body.
+#
+# A non-zero exit from a fragment does NOT fail the commit — this
+# hook is purely additive (its bash counterpart `commit-msg` is the
+# blocking gate). We log the failure to stderr and continue so a
+# broken consumer fragment can't take down `git commit`.
+#
+# The actual chain body lives in `run_extension_chain` (defined near
+# the top of the file). The reason for the early definition: several
+# augmenter-skip exit paths (enabled: false, missing identity, idempo-
+# tency hit, skip_merge match) need to run the chain too, so consumer
+# fragments fire regardless of whether rea's own augmenter activated.
+run_extension_chain
+
 exit 0

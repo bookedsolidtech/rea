@@ -78,13 +78,16 @@ are on the vanilla-git path — install husky first.
 The only files rea touches are explicitly enumerated above. Everything
 else is the consumer's surface.
 
-## Extension surface (added in 0.13.0)
+## Extension surface (added in 0.13.0; expanded in 0.32.0)
 
-`.husky/pre-push.d/*` and `.husky/commit-msg.d/*` are the
-**upgrade-safe** place to layer your own gates. Files in those
-directories must be executable; rea sources them in lex order AFTER
-its own governance work succeeds. A non-zero exit from any fragment
-fails the hook (matches husky's normal chaining).
+`.husky/pre-push.d/*`, `.husky/commit-msg.d/*`, and (as of 0.32.0)
+`.husky/prepare-commit-msg.d/*` are the **upgrade-safe** place to
+layer your own gates. Files in those directories must be executable;
+rea sources them in lex order AFTER its own governance work succeeds.
+A non-zero exit from any fragment fails the hook (matches husky's
+normal chaining) — EXCEPT for the `prepare-commit-msg.d/*` lane,
+which logs and continues so a broken fragment can't take down `git
+commit`.
 
 - Fragment receives positional args from git (`<remote-name> <remote-url>`
   for pre-push, `<commit-msg-file>` for commit-msg).
@@ -158,25 +161,31 @@ Two paths, depending on whether you intend to use the rea augmenter.
 
 **Path A — you want the augmenter (Co-Authored-By trailer)**
 
-Move your branch-prefix logic into rea's chained body. As of 0.30.0
-rea's prepare-commit-msg body does NOT support `.husky/prepare-commit-msg.d/*`
-fragments yet (it's on the 0.31.0 roadmap). For now, port the logic
-into a wrapper invoked by `commit-msg.d` instead:
+Move your branch-prefix logic into a `.husky/prepare-commit-msg.d/*`
+fragment. As of **0.32.0** rea's prepare-commit-msg body sources every
+executable file in `.husky/prepare-commit-msg.d/` in lexical order
+AFTER its own attribution augmenter runs (mirrors the
+`commit-msg.d/*` and `pre-push.d/*` extension surfaces from 0.13.0).
+Each fragment receives the same `$1` (commit-message file path) and
+`$2` (commit source) git delivered to the hook:
 
 ```bash
-mkdir -p .husky/commit-msg.d
-cat > .husky/commit-msg.d/00-branch-prefix <<'EOF'
+mkdir -p .husky/prepare-commit-msg.d
+cat > .husky/prepare-commit-msg.d/00-branch-prefix <<'EOF'
 #!/bin/sh
-# Branch-prefix logic moved from prepare-commit-msg to commit-msg.d
-# (runs AFTER rea's augmenter, before the commit is finalized).
+# Runs AFTER rea's Co-Authored-By augmenter. $1 = commit-msg file.
 BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)
 case $(head -1 "$1") in
   "[$BRANCH]"*) ;;  # already prefixed
   *) printf '[%s] %s' "$BRANCH" "$(cat "$1")" > "$1" ;;
 esac
 EOF
-chmod +x .husky/commit-msg.d/00-branch-prefix
+chmod +x .husky/prepare-commit-msg.d/00-branch-prefix
 ```
+
+A non-zero exit from a fragment does NOT fail the commit (the augmenter
+hook is purely additive; the blocking gate is `commit-msg`). Broken
+fragments log to stderr and the hook continues.
 
 Then remove the old `.husky/prepare-commit-msg`:
 

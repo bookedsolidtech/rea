@@ -1,0 +1,58 @@
+--- /Volumes/Development/booked/rea/.claude/hooks/settings-protection.sh	2026-05-12 21:19:51
++++ /Volumes/Development/booked/rea/hooks/settings-protection.sh	2026-05-14 23:50:17
+@@ -172,10 +172,12 @@
+ LOWER_NORM=$(printf '%s' "$NORMALIZED" | tr '[:upper:]' '[:lower:]')
+ 
+ # ── 5b. Extension-surface allow-list ──────────────────────────────────────────
+-# `.husky/commit-msg.d/*` and `.husky/pre-push.d/*` are the documented
+-# consumer extension surface (Fix H / 0.13.0). Consumers — and the agents
+-# that govern those consumers — are expected to write here freely so they
+-# can layer commitlint, lint-staged, branch-policy, act-CI, etc. without
++# `.husky/commit-msg.d/*`, `.husky/pre-push.d/*`, and (0.32.0+)
++# `.husky/prepare-commit-msg.d/*` are the documented consumer
++# extension surface (Fix H / 0.13.0; Phase 3 / 0.32.0 for the
++# prepare-commit-msg lane). Consumers — and the agents that govern
++# those consumers — are expected to write here freely so they can
++# layer commitlint, lint-staged, branch-policy, act-CI, etc. without
+ # losing rea coverage on `rea upgrade`.
+ #
+ # The §6 PROTECTED_PATTERNS list below has `.husky/` as a prefix block,
+@@ -216,14 +218,14 @@
+ # subshell pattern (no Python or readlink -f dependency required).
+ # Closes the path-string→symlink bypass completely.
+ case "$LOWER_NORM" in
+-  .husky/commit-msg.d/*|.husky/pre-push.d/*)
++  .husky/commit-msg.d/*|.husky/pre-push.d/*|.husky/prepare-commit-msg.d/*)
+     if [ -L "$FILE_PATH" ]; then
+       {
+         printf 'SETTINGS PROTECTION: symlink in extension surface refused\n'
+         printf '\n'
+         printf '  File: %s\n' "$SAFE_FILE_PATH"
+-        printf '  Rule: .husky/commit-msg.d/* and .husky/pre-push.d/* must be\n'
+-        printf '        regular files (a symlink could resolve to a protected\n'
++        printf '  Rule: .husky/{commit-msg,pre-push,prepare-commit-msg}.d/* must\n'
++        printf '        be regular files (a symlink could resolve to a protected\n'
+         printf '        package-managed body and bypass §6 protection).\n'
+       } >&2
+       exit 2
+@@ -245,8 +247,10 @@
+         # to `.husky/pre-push.d.bak/...` and slipped through.
+         # The trailing `/` on each pattern (and the explicit
+         # exact-match arm) requires a real directory boundary.
++        # 0.32.0 Phase 3: `.husky/prepare-commit-msg.d/` joins the
++        # allow-list (mirrors commit-msg.d/pre-push.d patterns).
+         case "$resolved_parent" in
+-          */.husky/commit-msg.d|*/.husky/commit-msg.d/*|*/.husky/pre-push.d|*/.husky/pre-push.d/*) : ;;
++          */.husky/commit-msg.d|*/.husky/commit-msg.d/*|*/.husky/pre-push.d|*/.husky/pre-push.d/*|*/.husky/prepare-commit-msg.d|*/.husky/prepare-commit-msg.d/*) : ;;
+           *)
+             {
+               printf 'SETTINGS PROTECTION: extension path resolves outside surface\n'
+@@ -254,7 +258,7 @@
+               printf '  Logical:  %s\n' "$SAFE_FILE_PATH"
+               printf '  Resolved: %s\n' "$resolved_parent"
+               printf '  Rule: an intermediate directory of the extension path is a\n'
+-              printf '        symlink whose target leaves .husky/{commit-msg,pre-push}.d/.\n'
++              printf '        symlink whose target leaves .husky/{commit-msg,pre-push,prepare-commit-msg}.d/.\n'
+               printf '        Refused to prevent symlinked-parent bypass of the\n'
+               printf '        package-managed body protection.\n'
+             } >&2

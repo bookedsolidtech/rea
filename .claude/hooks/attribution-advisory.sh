@@ -1,162 +1,170 @@
 #!/bin/bash
 # PreToolUse hook: attribution-advisory.sh
-# Fires BEFORE every Bash tool call.
+# 0.32.0+ — Node-binary shim for `rea hook attribution-advisory`.
 #
-# OPT-IN: Only enforces when .rea/policy.yaml contains:
-#   block_ai_attribution: true
+# Pre-0.32.0 the gate's full body lived here as bash (162 LOC,
+# including the AI-attribution pattern catalog and segment-relevance
+# gating). The migration to the parser-backed Node binary moves all
+# of that into `src/hooks/attribution-advisory/index.ts`. This shim
+# is the Claude Code dispatcher's view of the hook — it forwards
+# stdin to the CLI and exits with whatever the CLI returns.
 #
-# When disabled (default), this hook does nothing.
-# When enabled, BLOCKS (exit 2) gh pr create/edit and git commit commands
-# that contain structural AI attribution markers.
+# Behavioral contract is preserved byte-for-byte: exit 0 on
+# disabled-policy / non-relevant / clean-command, exit 2 on HALT /
+# attribution detected / malformed payload (fail-closed).
 #
-# Exit codes:
-#   0 = allow (disabled, no attribution found, or not a relevant command)
-#   2 = block (attribution detected, or HALT is active)
+# # CLI-resolution trust boundary
+#
+# Codex round 1 P1 (2026-05-15): realpath sandbox check + version
+# probe. Mirrors delegation-advisory.sh §3. Defends against
+# symlink-out + tarball-replacement attacks on the resolved CLI AND
+# stale-node_modules version skew that would otherwise turn every
+# Bash dispatch into a hard failure.
 
 set -uo pipefail
 
-# ── 1. Read ALL stdin immediately before doing anything else ──────────────────
-INPUT=$(cat)
-
-# ── 2. Dependency check ───────────────────────────────────────────────────────
-if ! command -v jq >/dev/null 2>&1; then
-  printf 'REA ERROR: jq is required but not installed.\n' >&2
-  printf 'Install: brew install jq  OR  apt-get install -y jq\n' >&2
-  exit 2
-fi
-
-# ── 3. HALT check ─────────────────────────────────────────────────────────────
-# 0.16.0: HALT check sourced from shared _lib/halt-check.sh.
+# 1. HALT check.
 # shellcheck source=_lib/halt-check.sh
 source "$(dirname "$0")/_lib/halt-check.sh"
 check_halt
 REA_ROOT=$(rea_root)
 
-# ── 4. Check if attribution blocking is enabled ──────────────────────────────
-POLICY_FILE="${REA_ROOT}/.rea/policy.yaml"
-if [ ! -f "$POLICY_FILE" ]; then
-  exit 0
+proj="${CLAUDE_PROJECT_DIR:-$REA_ROOT}"
+
+# 2. Relevance pre-gate (0.32.0 round-5 P1, round-6 fix). PreToolUse
+#    Bash matchers fire on EVERY shell command, but this hook only
+#    enforces against `git commit` / `gh pr create|edit`. Capture
+#    stdin + check relevance FIRST so unrelated commands (ls,
+#    pnpm test, …) exit 0 even when the CLI is missing/stale/
+#    sandboxed-out.
+#
+#    Match the pattern ANYWHERE in the command string (after the
+#    opening quote, then `[^"]*` for any leading shell prefix —
+#    `sudo`, `time`, env assignments like `FOO=x git commit …`).
+#    Round-6 P1: prior round-5 pattern anchored at the start of the
+#    JSON value and missed all prefixed forms.
+INPUT=$(cat)
+# Substring scan (NOT JSON-aware). Round-7 P2: any JSON-aware regex
+# anchored on `"command":"...` gets tripped by escaped quotes in
+# quoted env prefixes (`FOO="two words" git commit …` → the payload
+# carries `\"two words\"` and `[^"]*` stops at the escaped quote).
+# Plain substring match has no such edge: it over-triggers only on
+# the rare case where the pattern appears inside a quoted argument
+# (`echo "gh pr create"`), and the Node body handles that correctly.
+# This hook only fires on `tool_name=Bash`, so we don't risk matching
+# unrelated payload shapes.
+RELEVANT=0
+if printf '%s' "$INPUT" | grep -qE '(git[[:space:]]+commit|gh[[:space:]]+pr[[:space:]]+(create|edit))'; then
+  RELEVANT=1
 fi
-if ! grep -qE '^block_ai_attribution:[[:space:]]*true' "$POLICY_FILE" 2>/dev/null; then
-  exit 0
-fi
-
-# ── 5. Parse tool_input.command from the hook payload ─────────────────────────
-CMD=$(printf '%s' "$INPUT" | jq -r '.tool_input.command // empty' 2>/dev/null)
-
-if [[ -z "$CMD" ]]; then
-  exit 0
-fi
-
-# 0.15.0: source the shared shell-segment splitter. Pre-fix, the
-# attribution patterns greped the FULL command — `git commit -m "Note:
-# Co-Authored-By with AI was removed in 0.14"` matched and the commit
-# was blocked even though the message was COMMENTING on attribution
-# rather than including it. Per-segment anchoring scopes detection to
-# segments whose first token is `git commit` / `gh pr create|edit`.
-# shellcheck source=_lib/cmd-segments.sh
-source "$(dirname "$0")/_lib/cmd-segments.sh"
-
-# ── 6. Check if this is a relevant command ────────────────────────────────────
-# 0.18.0 helix-020 / discord-ops Round 10 #2 fix (G4.A): use
-# `any_segment_starts_with`, not `any_segment_matches`. The pre-fix
-# matcher used the unanchored form, so a segment like
-#   gh pr edit --body "tracked: gh pr create earlier in the run"
-# triggered IS_RELEVANT=1 because the substring `gh pr create` was
-# anywhere in the segment. The downstream attribution check then
-# scanned the body for the markdown-link / Co-Authored-By patterns,
-# and ANY mention of those terms in the body's prose got blocked
-# even though the actual command was a `gh pr edit` whose intent had
-# nothing to do with structural attribution. The same anchoring fix
-# `dangerous-bash-interceptor.sh` got in 0.16.3 F5 finally lands here.
-IS_RELEVANT=0
-
-if any_segment_starts_with "$CMD" 'gh[[:space:]]+pr[[:space:]]+(create|edit)'; then
-  IS_RELEVANT=1
-fi
-
-if any_segment_starts_with "$CMD" 'git[[:space:]]+commit'; then
-  IS_RELEVANT=1
-fi
-
-if [[ $IS_RELEVANT -eq 0 ]]; then
+if [ "$RELEVANT" -eq 0 ]; then
+  # Irrelevant Bash call — nothing the pre-0.32.0 body would have
+  # processed. Always exit 0 regardless of CLI state.
   exit 0
 fi
 
-# ── 7. Check for structural AI attribution markers ───────────────────────────
-
-FOUND=0
-
-# Co-Authored-By with noreply@ email
-# 0.18.0 helix-020 / discord-ops Round 10 #3 fix (G4.B): exclude
-# GitHub's legitimate `<user>@users.noreply.github.com` collaborator
-# footers from the noreply match. Pre-fix the regex `Co-Authored-By:.*noreply@`
-# matched both AI-tool noreply addresses (anthropic.com, openai.com,
-# github-copilot, etc.) AND GitHub's per-user noreply form, blocking
-# legitimate human collaborator credits. The new regex requires
-# `noreply@` to be followed by something that ISN'T `users.noreply.github.com`
-# — covered via a negative-lookahead simulation: match `noreply@` then
-# either end-of-line, whitespace, `>`, or a domain that does NOT begin
-# with `users.noreply.github.com`. Posix ERE has no lookarounds, so we
-# enumerate the allowed-prefix shapes explicitly. The "AI names" branch
-# below catches Co-Authored-By with named tools regardless of the email
-# domain, so dropping `users.noreply.github.com` from the noreply
-# pattern only relaxes the check for human collaborators — never for AI.
-if any_segment_matches "$CMD" 'Co-Authored-By:.*noreply@(anthropic\.com|openai\.com|github-copilot|github\.com|claude\.ai|chatgpt\.com|googlemail\.com|google\.com|cursor\.com|codeium\.com|tabnine\.com|amazon\.com|amazonaws\.com|amazon-q\.amazonaws\.com|cody\.dev|sourcegraph\.com|mistral\.ai|xai-org|x\.ai|inflection\.ai|perplexity\.ai|replit\.com|jetbrains\.com|bito\.ai|pieces\.app|phind\.com|you\.com)'; then
-  FOUND=1
+# 2b. Policy short-circuit (round-6 P2). The pre-0.32.0 bash body
+#     no-op'd when `block_ai_attribution` was absent or false. Without
+#     this check, an unbuilt/stale install would refuse `git commit`
+#     even on repos that DELIBERATELY disable the attribution gate.
+#     Read the policy via a simple grep — the canonical loader
+#     handles inline forms but we only need block form here, and a
+#     conservative "true-and-only-true counts" rule matches the
+#     intent (false / absent / inline-only all → no enforcement).
+POLICY_FILE="$REA_ROOT/.rea/policy.yaml"
+if [ ! -f "$POLICY_FILE" ] || ! grep -qE '^block_ai_attribution:[[:space:]]*true([[:space:]]|$)' "$POLICY_FILE"; then
+  # Attribution blocking disabled — pre-0.32.0 bash body would have
+  # exited 0 here. Don't refuse on stale-install grounds.
+  exit 0
 fi
 
-# Co-Authored-By with known AI names
-if any_segment_matches "$CMD" 'Co-Authored-By:.*\b(Claude|Sonnet|Opus|Haiku|Copilot|GPT|ChatGPT|Gemini|Cursor|Codeium|Tabnine|Amazon Q|CodeWhisperer|Devin|Windsurf|Cline|Aider|Anthropic|OpenAI|GitHub Copilot)\b'; then
-  FOUND=1
+# 3. Resolve the rea CLI.
+REA_ARGV=()
+RESOLVED_CLI_PATH=""
+if [ -f "$proj/node_modules/@bookedsolid/rea/dist/cli/index.js" ]; then
+  REA_ARGV=(node "$proj/node_modules/@bookedsolid/rea/dist/cli/index.js")
+  RESOLVED_CLI_PATH="$proj/node_modules/@bookedsolid/rea/dist/cli/index.js"
+elif [ -f "$proj/dist/cli/index.js" ]; then
+  REA_ARGV=(node "$proj/dist/cli/index.js")
+  RESOLVED_CLI_PATH="$proj/dist/cli/index.js"
 fi
 
-# "Generated/Built/Powered with/by [AI Tool]" lines
-if any_segment_matches "$CMD" '(Generated|Created|Built|Powered|Authored|Written|Produced)[[:space:]]+(with|by)[[:space:]]+(Claude|Copilot|GPT|ChatGPT|Gemini|Cursor|Codeium|Tabnine|CodeWhisperer|Devin|Windsurf|Cline|Aider|AI|an? AI)\b'; then
-  FOUND=1
-fi
-
-# Markdown-linked attribution
-# 0.16.2 helix-017 P3 #4: anchor on `[Text](` (markdown link shape) so
-# legitimate bracketed mentions like `gh pr edit --body "support [Claude
-# Code] hook output"` don't false-positive. The actual attribution we
-# care about is structural — `Generated with [Claude Code](https://...)`.
-if any_segment_matches "$CMD" '\[Claude Code\]\(|\[GitHub Copilot\]\(|\[ChatGPT\]\(|\[Gemini\]\(|\[Cursor\]\('; then
-  FOUND=1
-fi
-
-# Emoji attribution
-if any_segment_matches "$CMD" '🤖.*[Gg]enerated'; then
-  FOUND=1
-fi
-
-if [[ $FOUND -eq 1 ]]; then
-  {
-    printf '\n'
-    printf '═══════════════════════════════════════════════════════════════════\n'
-    printf '  BLOCKED: AI attribution detected in command\n'
-    printf '═══════════════════════════════════════════════════════════════════\n'
-    printf '\n'
-    printf '  Your command contains structural AI attribution markers.\n'
-    printf '\n'
-    printf '  What gets BLOCKED (structural attribution):\n'
-    printf '    - Co-Authored-By with AI names or noreply@ emails\n'
-    printf '    - "Generated with/by [AI Tool]" footer lines\n'
-    printf '    - Markdown-linked tool names: [Claude Code](...)\n'
-    printf '    - Emoji attribution: 🤖 Generated...\n'
-    printf '\n'
-    printf '  What is ALLOWED (legitimate references):\n'
-    printf '    - "Fix Claude API integration"\n'
-    printf '    - "Update OpenAI SDK version"\n'
-    printf '    - "Add Copilot config"\n'
-    printf '\n'
-    printf '  Remove the attribution markers and rewrite the command.\n'
-    printf '  To disable: set block_ai_attribution: false in .rea/policy.yaml\n'
-    printf '═══════════════════════════════════════════════════════════════════\n'
-    printf '\n'
-  } >&2
+if [ "${#REA_ARGV[@]}" -eq 0 ]; then
+  # 0.32.0 round-4 P2: when `block_ai_attribution: true`, this hook is
+  # blocking-tier — the pre-0.32.0 bash body enforced the policy
+  # without a compiled CLI. Falling through to exit 0 would silently
+  # let AI-attribution patterns through every git commit / gh pr
+  # create-or-edit until the operator rebuilds. Fail closed and tell
+  # the operator how to restore protection.
+  printf 'rea: attribution-advisory cannot run — the rea CLI is not built.\n' >&2
+  printf 'Run `pnpm install && pnpm build` (or `npm install` for a consumer install) to restore protection.\n' >&2
+  printf 'This shim fails closed because the pre-0.32.0 bash body enforced attribution policy without a CLI.\n' >&2
   exit 2
 fi
 
-# No attribution found — allow
-exit 0
+# 3. Realpath sandbox check.
+if ! command -v node >/dev/null 2>&1; then
+  printf 'rea: attribution-advisory cannot run — `node` is not on PATH.\n' >&2
+  printf 'Install Node 22+ (engines.node) to restore enforcement.\n' >&2
+  exit 2
+fi
+
+sandbox_check=$(node -e '
+  const fs = require("fs");
+  const path = require("path");
+  const cli = process.argv[1];
+  const projDir = process.argv[2];
+  let real, realProj;
+  try { real = fs.realpathSync(cli); } catch (e) {
+    process.stdout.write("bad:realpath"); process.exit(1);
+  }
+  try { realProj = fs.realpathSync(projDir); } catch (e) {
+    process.stdout.write("bad:realpath-proj"); process.exit(1);
+  }
+  const sep = path.sep;
+  const projWithSep = realProj.endsWith(sep) ? realProj : realProj + sep;
+  if (!(real === realProj || real.startsWith(projWithSep))) {
+    process.stdout.write("bad:cli-escapes-project"); process.exit(1);
+  }
+  let cur = path.dirname(path.dirname(path.dirname(real)));
+  let found = false;
+  for (let i = 0; i < 20 && cur && cur !== path.dirname(cur); i += 1) {
+    const pj = path.join(cur, "package.json");
+    if (fs.existsSync(pj)) {
+      try {
+        const data = JSON.parse(fs.readFileSync(pj, "utf8"));
+        if (data && data.name === "@bookedsolid/rea") { found = true; break; }
+      } catch (e) { /* keep walking */ }
+    }
+    cur = path.dirname(cur);
+  }
+  if (!found) { process.stdout.write("bad:no-rea-pkg-json"); process.exit(1); }
+  process.stdout.write("ok");
+' -- "$RESOLVED_CLI_PATH" "$proj" 2>/dev/null)
+
+if [ "$sandbox_check" != "ok" ]; then
+  # 0.32.0 round-4 P2: fail closed (blocking-tier when policy enables —
+  # see top-of-file rationale). Sandbox failure means the CLI cannot
+  # be authenticated; refuse rather than silently bypass.
+  printf 'rea: attribution-advisory FAILED sandbox check (%s) — refusing.\n' "$sandbox_check" >&2
+  exit 2
+fi
+
+# 4. Version-probe: confirm the resolved CLI implements
+#    `hook attribution-advisory`. Codex round 1 P1.
+probe_out=$("${REA_ARGV[@]}" hook attribution-advisory --help 2>&1)
+probe_status=$?
+if [ "$probe_status" -ne 0 ] || ! printf '%s' "$probe_out" | grep -q -e 'attribution-advisory'; then
+  # 0.32.0 round-4 P2: stale/older CLI without the new subcommand is
+  # NOT advisory-tier fall-through — the bash body it replaces
+  # enforced when policy enabled. Fail closed and tell the operator
+  # exactly how to fix.
+  printf 'rea: this shim requires the `rea hook attribution-advisory` subcommand (introduced in 0.32.0).\n' >&2
+  printf 'The resolved CLI at %s does not implement it.\n' "$RESOLVED_CLI_PATH" >&2
+  printf 'Run `pnpm install` (or `npm install`) to sync the CLI; refusing in the meantime to preserve enforcement.\n' >&2
+  exit 2
+fi
+
+# 5. Forward stdin (already captured up-front for the relevance gate).
+printf '%s' "$INPUT" | "${REA_ARGV[@]}" hook attribution-advisory
+exit $?

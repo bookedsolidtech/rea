@@ -242,7 +242,7 @@ _rea_load_protected_patterns() {
 }
 
 # Test whether a project-relative path is in the documented husky
-# extension surface (`.husky/commit-msg.d/*`, `.husky/pre-push.d/*`).
+# extension surface (`.husky/{commit-msg,pre-push,pre-commit,prepare-commit-msg}.d/*`).
 # Returns 0 on match, 1 on no match. Case-insensitive.
 #
 # 0.16.4 helix-018 Option B: settings-protection.sh §5b has carved
@@ -253,17 +253,24 @@ _rea_load_protected_patterns() {
 # redirect was refused by the bash-gate even though the equivalent
 # Write-tool call would succeed. This helper bakes the carve-out
 # into the shared lib so every caller inherits it uniformly.
+#
+# 0.32.0 codex round 2 P1: `.husky/prepare-commit-msg.d/*` joins the
+# carve-out to match settings-protection.sh §5b — the Write-tier
+# allow-list shipped earlier in 0.32.0 was incomplete without the
+# Bash-tier parity. Without this update, the migration path in
+# MIGRATING.md (`cat > .husky/prepare-commit-msg.d/...`) is refused
+# by `protected-paths-bash-gate.sh` even though Write/Edit succeeds.
 rea_path_is_extension_surface() {
   local p_lc
   p_lc=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
   case "$p_lc" in
-    .husky/commit-msg.d/*|.husky/pre-push.d/*|.husky/pre-commit.d/*)
+    .husky/commit-msg.d/*|.husky/pre-push.d/*|.husky/pre-commit.d/*|.husky/prepare-commit-msg.d/*)
       # Refuse the bare directory itself — only fragments INSIDE
       # the surface count. `.husky/pre-push.d/` (trailing slash, no
       # fragment) and `.husky/pre-push.d` (the dir node) both fall
       # through to the protection check via the parent prefix.
       case "$p_lc" in
-        .husky/commit-msg.d/|.husky/pre-push.d/|.husky/pre-commit.d/) return 1 ;;
+        .husky/commit-msg.d/|.husky/pre-push.d/|.husky/pre-commit.d/|.husky/prepare-commit-msg.d/) return 1 ;;
       esac
       return 0
       ;;
