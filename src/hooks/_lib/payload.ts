@@ -133,6 +133,131 @@ export function parseHookPayload(raw: string | Buffer): HookPayload {
 }
 
 /**
+ * Result of a write-tier hook payload extraction. Covers all four
+ * write-class tools (Write, Edit, MultiEdit, NotebookEdit).
+ */
+export interface WriteHookPayload {
+  /** `tool_name` from the payload, or `''` when absent. */
+  toolName: string;
+  /**
+   * `tool_input.file_path` (Write/Edit/MultiEdit) OR
+   * `tool_input.notebook_path` (NotebookEdit), or `''` when absent.
+   */
+  filePath: string;
+  /**
+   * Concatenated content payload. Resolution order matches
+   * `hooks/_lib/payload-read.sh::extract_write_content`:
+   *
+   *   1. `tool_input.content`                     (Write)
+   *   2. `tool_input.new_string`                  (Edit)
+   *   3. `tool_input.edits[].new_string` joined   (MultiEdit, `\n`)
+   *   4. `tool_input.new_source`                  (NotebookEdit cell)
+   *
+   * Returns `''` when none of these are present. Defensive coercion:
+   * a non-string `new_string`, non-array `edits`, or non-string
+   * fragments fail closed (treated as missing) rather than throwing —
+   * mirrors the bash hook's `.tool_input.new_string // ""` + the
+   * type-guard branches added in 0.16.0.
+   */
+  content: string;
+}
+
+interface RawWritePayload {
+  tool_name?: unknown;
+  tool_input?: {
+    file_path?: unknown;
+    notebook_path?: unknown;
+    content?: unknown;
+    new_string?: unknown;
+    new_source?: unknown;
+    edits?: unknown;
+  } | null;
+}
+
+/**
+ * Parse a Claude Code Write/Edit/MultiEdit/NotebookEdit stdin payload.
+ *
+ * Same fail-closed posture as `parseHookPayload`: malformed JSON →
+ * throws `MalformedPayloadError`; type-mismatched fields → throws
+ * `TypePayloadError`. Callers fail-closed on these for blocking-tier
+ * gates (changeset-security-gate refuses on uncertainty).
+ */
+export function parseWriteHookPayload(raw: string | Buffer): WriteHookPayload {
+  const text = typeof raw === 'string' ? raw : raw.toString('utf8');
+  if (text.trim().length === 0) {
+    return { toolName: '', filePath: '', content: '' };
+  }
+  let parsed: RawWritePayload;
+  try {
+    parsed = JSON.parse(text) as RawWritePayload;
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    throw new MalformedPayloadError(
+      `hook payload is not valid JSON: ${detail}`,
+    );
+  }
+  if (parsed === null) {
+    return { toolName: '', filePath: '', content: '' };
+  }
+  if (typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new MalformedPayloadError(
+      `hook payload top-level is ${Array.isArray(parsed) ? 'array' : typeof parsed}, expected object`,
+    );
+  }
+  const toolName = typeof parsed.tool_name === 'string' ? parsed.tool_name : '';
+  const ti = parsed.tool_input;
+  let filePath = '';
+  let content = '';
+  if (ti !== undefined && ti !== null) {
+    if (typeof ti !== 'object') {
+      throw new TypePayloadError(
+        `hook payload tool_input is ${typeof ti}, expected object`,
+      );
+    }
+    // file_path or notebook_path. Both are optional; either string or absent.
+    if (ti.file_path !== undefined) {
+      if (typeof ti.file_path !== 'string') {
+        throw new TypePayloadError(
+          `hook payload tool_input.file_path is ${typeof ti.file_path}, expected string`,
+        );
+      }
+      filePath = ti.file_path;
+    } else if (ti.notebook_path !== undefined) {
+      if (typeof ti.notebook_path !== 'string') {
+        throw new TypePayloadError(
+          `hook payload tool_input.notebook_path is ${typeof ti.notebook_path}, expected string`,
+        );
+      }
+      filePath = ti.notebook_path;
+    }
+    // Content extraction — same priority order as the bash hook.
+    if (typeof ti.content === 'string' && ti.content.length > 0) {
+      content = ti.content;
+    } else if (typeof ti.new_string === 'string' && ti.new_string.length > 0) {
+      content = ti.new_string;
+    } else if (Array.isArray(ti.edits) && ti.edits.length > 0) {
+      // Defensive: non-string `new_string` fragments collapse to ''
+      // (matches the bash helper's `// ""` + `tostring`). The
+      // concatenation order is bash hook's `join("\n")`.
+      const parts: string[] = [];
+      for (const edit of ti.edits as unknown[]) {
+        if (edit === null || typeof edit !== 'object') continue;
+        const e = edit as { new_string?: unknown };
+        if (typeof e.new_string === 'string') {
+          parts.push(e.new_string);
+        } else {
+          parts.push('');
+        }
+      }
+      content = parts.join('\n');
+    } else if (typeof ti.new_source === 'string' && ti.new_source.length > 0) {
+      content = ti.new_source;
+    }
+  }
+  return { toolName, filePath, content };
+}
+
+/**
  * Read all of stdin into a string with a soft byte cap and a hard
  * timeout. Mirrors the `readStdinWithTimeout` helper in
  * `src/cli/hook.ts` (which scans a fixed timeout but no byte cap).

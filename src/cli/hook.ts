@@ -41,6 +41,10 @@ import { checkHalt, formatHaltBanner } from '../hooks/_lib/halt-check.js';
 import { runHookPrIssueLinkGate } from '../hooks/pr-issue-link-gate/index.js';
 import { runHookSecurityDisclosureGate } from '../hooks/security-disclosure-gate/index.js';
 import { runHookAttributionAdvisory } from '../hooks/attribution-advisory/index.js';
+import { runHookEnvFileProtection } from '../hooks/env-file-protection/index.js';
+import { runHookDependencyAuditGate } from '../hooks/dependency-audit-gate/index.js';
+import { runHookChangesetSecurityGate } from '../hooks/changeset-security-gate/index.js';
+import { runHookArchitectureReviewGate } from '../hooks/architecture-review-gate/index.js';
 import { loadPolicy } from '../policy/loader.js';
 import { appendAuditRecord, InvocationStatus, Tier } from '../audit/append.js';
 import {
@@ -1331,6 +1335,42 @@ export function registerHookCommand(program: Command): void {
     )
     .action(async () => {
       await runHookAttributionAdvisory();
+    });
+
+  hook
+    .command('env-file-protection')
+    .description(
+      'Node-binary port of `hooks/env-file-protection.sh` (0.33.0). Reads a Claude Code PreToolUse Bash payload from stdin; when the command sources, cps, or reads a `.env*`/`.envrc` file via text-reading utilities (cat/head/tail/grep/sed/awk/etc.), exits 2 with banner. Same-segment co-occurrence required for the utility-vs-filename match so multi-segment commands do not false-positive.',
+    )
+    .action(async () => {
+      await runHookEnvFileProtection();
+    });
+
+  hook
+    .command('dependency-audit-gate')
+    .description(
+      'Node-binary port of `hooks/dependency-audit-gate.sh` (0.33.0). Reads a Claude Code PreToolUse Bash payload from stdin; when the command is `(npm|pnpm|yarn) (install|i|add) <pkg>`, verifies each named package exists on the npm registry via `npm view <pkg> name` (5s timeout, capped at 5 packages/command). Exit 2 with multi-line banner on any missing package, otherwise exit 0.',
+    )
+    .action(async () => {
+      await runHookDependencyAuditGate();
+    });
+
+  hook
+    .command('changeset-security-gate')
+    .description(
+      'Node-binary port of `hooks/changeset-security-gate.sh` (0.33.0). Reads a Claude Code PreToolUse Write/Edit/MultiEdit/NotebookEdit payload from stdin; for writes targeting `.changeset/*.md`, blocks GHSA/CVE pre-disclosure and validates frontmatter (`---`-delimited block with `<pkg>: (patch|minor|major)` + non-empty description). MultiEdit short-circuits frontmatter validation because fragments are not full files. Block emissions use the Claude Code JSON-on-stdout protocol.',
+    )
+    .action(async () => {
+      await runHookChangesetSecurityGate();
+    });
+
+  hook
+    .command('architecture-review-gate')
+    .description(
+      'Node-binary port of `hooks/architecture-review-gate.sh` (0.33.0). PostToolUse Write/Edit advisory. Reads `policy.architecture_review.patterns` and prints an advisory banner to stderr when the just-written file matches a configured prefix. ALWAYS exits 0 unless HALT (exit 2). Path normalization handles Windows backslashes + URL-encoding; empty/unset patterns short-circuit silently.',
+    )
+    .action(async () => {
+      await runHookArchitectureReviewGate();
     });
 
   hook

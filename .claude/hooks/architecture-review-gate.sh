@@ -1,101 +1,116 @@
 #!/bin/bash
 # PostToolUse hook: architecture-review-gate.sh
-# Fires AFTER every Write or Edit tool call.
-# Lightweight advisory: flags when writing to architecture-sensitive paths.
-# Does NOT block — only returns advisory context.
+# 0.33.0+ — Node-binary shim for `rea hook architecture-review-gate`.
 #
-# Exit codes:
-#   0 = always (advisory only, never blocks)
+# Pre-0.33.0 the gate's full body lived here as bash (101 LOC, policy-
+# driven prefix-match against `architecture_review.patterns`). The
+# migration moves all of that into `src/hooks/architecture-review-gate/
+# index.ts`.
+#
+# Behavioral contract is preserved byte-for-byte: ALWAYS exit 0
+# (advisory-only) except under HALT (exit 2). The hook fires for ALL
+# Write/Edit PostToolUse events, but the Node body short-circuits to
+# exit 0 when patterns are unset/empty — so the cost of running the
+# CLI on every write is bounded.
+#
+# # CLI-resolution trust boundary
+#
+# Realpath sandbox check + version probe. Same shape as the 0.32.0
+# pilots.
+#
+# # Fail-OPEN posture
+#
+# architecture-review-gate is ADVISORY-only — the pre-0.33.0 bash body
+# never refused (exit 0 only). The early-exit branches (CLI missing,
+# node missing, sandbox failed, version skew) all exit 0 silently
+# because there is nothing to "preserve protection" for. The HALT
+# check is the only path to exit 2.
 
 set -uo pipefail
 
-# ── 1. Read ALL stdin immediately ─────────────────────────────────────────────
-INPUT=$(cat)
-
-# ── 2. Dependency check ──────────────────────────────────────────────────────
-if ! command -v jq >/dev/null 2>&1; then
-  exit 0
-fi
-
-# ── 3. HALT check ────────────────────────────────────────────────────────────
-# 0.16.0: HALT check sourced from shared _lib/halt-check.sh.
+# 1. HALT check.
 # shellcheck source=_lib/halt-check.sh
 source "$(dirname "$0")/_lib/halt-check.sh"
 check_halt
 REA_ROOT=$(rea_root)
 
-# ── 4. Check if enabled ──────────────────────────────────────────────────────
-POLICY_FILE="${REA_ROOT}/.rea/policy.yaml"
-if [[ -f "$POLICY_FILE" ]]; then
-  if grep -qE 'architecture_advisory:[[:space:]]*false' "$POLICY_FILE" 2>/dev/null; then
-    exit 0
-  fi
+proj="${CLAUDE_PROJECT_DIR:-$REA_ROOT}"
+
+# 2. No relevance pre-gate — architecture-review-gate fires on every
+#    Write/Edit, and the cost of the Node body's early-out (load
+#    policy, check patterns array, prefix-match) is well under the
+#    cost of a sandbox/probe pair. Capture stdin once.
+INPUT=$(cat)
+
+# 3. Resolve the rea CLI. Advisory-tier: exit 0 silently on missing
+#    CLI — nothing to enforce.
+REA_ARGV=()
+RESOLVED_CLI_PATH=""
+if [ -f "$proj/node_modules/@bookedsolid/rea/dist/cli/index.js" ]; then
+  REA_ARGV=(node "$proj/node_modules/@bookedsolid/rea/dist/cli/index.js")
+  RESOLVED_CLI_PATH="$proj/node_modules/@bookedsolid/rea/dist/cli/index.js"
+elif [ -f "$proj/dist/cli/index.js" ]; then
+  REA_ARGV=(node "$proj/dist/cli/index.js")
+  RESOLVED_CLI_PATH="$proj/dist/cli/index.js"
 fi
 
-# ── 5. Extract file path ─────────────────────────────────────────────────────
-FILE_PATH=$(printf '%s' "$INPUT" | jq -r '.tool_input.file_path // empty' 2>/dev/null)
-
-if [[ -z "$FILE_PATH" ]]; then
+if [ "${#REA_ARGV[@]}" -eq 0 ]; then
   exit 0
 fi
 
-# 0.16.0 fix D.1: normalize via shared `_lib/path-normalize.sh` so
-# Windows / Git Bash backslash paths and URL-encoded forms are handled
-# uniformly with the rest of the hook layer. Pre-fix, this hook only
-# stripped $REA_ROOT prefix — `src\gateway\foo.ts` (Windows) or
-# `src%2Fgateway%2Ffoo.ts` (URL-encoded) silently bypassed the
-# architectural review.
-# shellcheck source=_lib/path-normalize.sh
-source "$(dirname "$0")/_lib/path-normalize.sh"
-FILE_PATH=$(normalize_path "$FILE_PATH")
-
-# ── 6. Check architecture-sensitive paths ─────────────────────────────────────
-# 0.20.1 helix-round-N P2: read patterns from policy. Pre-fix the
-# rea-internal source-tree patterns (`src/gateway/`, `hooks/_lib/`,
-# `profiles/`, etc.) shipped as hardcoded defaults — irrelevant noise
-# in consumer projects whose architecture-sensitive paths are
-# different. Consumers with their own architecture surfaces declare
-# them in `.rea/policy.yaml::architecture_review.patterns`. The
-# bst-internal profile pins the rea-source patterns so the dogfood
-# install behaves the same as before; consumers without a pattern
-# set get a silent no-op.
-# shellcheck source=_lib/policy-read.sh
-source "$(dirname "$0")/_lib/policy-read.sh"
-
-ARCH_PATTERNS=()
-while IFS= read -r entry; do
-  [[ -z "$entry" ]] && continue
-  ARCH_PATTERNS+=("$entry")
-done < <(policy_list "architecture_review.patterns" 2>/dev/null || true)
-
-if [[ ${#ARCH_PATTERNS[@]} -eq 0 ]]; then
-  # Empty/unset policy → silent no-op. Consumers who haven't declared
-  # architecture-sensitive paths see zero advisory output.
+# 4. Realpath sandbox check. Advisory-tier: exit 0 silently on
+#    sandbox failure (with a single-line breadcrumb to stderr).
+if ! command -v node >/dev/null 2>&1; then
   exit 0
 fi
 
-MATCHED=""
-for pattern in "${ARCH_PATTERNS[@]}"; do
-  if [[ "$FILE_PATH" == "$pattern"* ]]; then
-    MATCHED="$pattern"
-    break
-  fi
-done
+sandbox_check=$(node -e '
+  const fs = require("fs");
+  const path = require("path");
+  const cli = process.argv[1];
+  const projDir = process.argv[2];
+  let real, realProj;
+  try { real = fs.realpathSync(cli); } catch (e) {
+    process.stdout.write("bad:realpath"); process.exit(1);
+  }
+  try { realProj = fs.realpathSync(projDir); } catch (e) {
+    process.stdout.write("bad:realpath-proj"); process.exit(1);
+  }
+  const sep = path.sep;
+  const projWithSep = realProj.endsWith(sep) ? realProj : realProj + sep;
+  if (!(real === realProj || real.startsWith(projWithSep))) {
+    process.stdout.write("bad:cli-escapes-project"); process.exit(1);
+  }
+  let cur = path.dirname(path.dirname(path.dirname(real)));
+  let found = false;
+  for (let i = 0; i < 20 && cur && cur !== path.dirname(cur); i += 1) {
+    const pj = path.join(cur, "package.json");
+    if (fs.existsSync(pj)) {
+      try {
+        const data = JSON.parse(fs.readFileSync(pj, "utf8"));
+        if (data && data.name === "@bookedsolid/rea") { found = true; break; }
+      } catch (e) { /* keep walking */ }
+    }
+    cur = path.dirname(cur);
+  }
+  if (!found) { process.stdout.write("bad:no-rea-pkg-json"); process.exit(1); }
+  process.stdout.write("ok");
+' -- "$RESOLVED_CLI_PATH" "$proj" 2>/dev/null)
 
-if [[ -z "$MATCHED" ]]; then
+if [ "$sandbox_check" != "ok" ]; then
+  printf 'rea: architecture-review-gate skipped (sandbox check: %s)\n' "$sandbox_check" >&2
   exit 0
 fi
 
-# ── 7. Advisory output ───────────────────────────────────────────────────────
-{
-  printf 'ARCHITECTURE ADVISORY: Sensitive path modified\n'
-  printf '\n'
-  printf '  File: %s\n' "$FILE_PATH"
-  printf '  Category: %s\n' "$MATCHED"
-  printf '\n'
-  printf '  This file is in an architecture-sensitive directory.\n'
-  printf '  Consider: Does this change maintain backward compatibility?\n'
-  printf '  Consider: Should this be reviewed by the principal-engineer agent?\n'
-} >&2
+# 5. Version-probe. Advisory-tier: exit 0 on probe failure.
+probe_out=$("${REA_ARGV[@]}" hook architecture-review-gate --help 2>&1)
+probe_status=$?
+if [ "$probe_status" -ne 0 ] || ! printf '%s' "$probe_out" | grep -q -e 'architecture-review-gate'; then
+  printf 'rea: this shim requires the `rea hook architecture-review-gate` subcommand (introduced in 0.33.0).\n' >&2
+  printf 'Run `pnpm install` (or `npm install`) to sync the CLI; falling through silently.\n' >&2
+  exit 0
+fi
 
-exit 0
+# 6. Forward stdin.
+printf '%s' "$INPUT" | "${REA_ARGV[@]}" hook architecture-review-gate
+exit $?
