@@ -14,6 +14,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   parseHookPayload,
+  parseWriteHookPayload,
   MalformedPayloadError,
   TypePayloadError,
 } from './payload.js';
@@ -163,5 +164,110 @@ describe('parseHookPayload', () => {
       tool_input: { command: cmd },
     });
     expect(parseHookPayload(payload).command).toBe(cmd);
+  });
+});
+
+describe('parseWriteHookPayload', () => {
+  it('returns blank for empty string', () => {
+    expect(parseWriteHookPayload('')).toEqual({
+      toolName: '',
+      filePath: '',
+      content: '',
+    });
+  });
+
+  it('throws MalformedPayloadError on bad JSON', () => {
+    expect(() => parseWriteHookPayload('{not')).toThrow(MalformedPayloadError);
+  });
+
+  it('extracts Write content', () => {
+    const r = parseWriteHookPayload(
+      JSON.stringify({
+        tool_name: 'Write',
+        tool_input: { file_path: '/a/b.md', content: 'hello' },
+      }),
+    );
+    expect(r).toEqual({ toolName: 'Write', filePath: '/a/b.md', content: 'hello' });
+  });
+
+  it('extracts Edit new_string', () => {
+    const r = parseWriteHookPayload(
+      JSON.stringify({
+        tool_name: 'Edit',
+        tool_input: { file_path: '/a/b.md', new_string: 'updated' },
+      }),
+    );
+    expect(r.content).toBe('updated');
+  });
+
+  it('extracts MultiEdit edits joined by \\n', () => {
+    const r = parseWriteHookPayload(
+      JSON.stringify({
+        tool_name: 'MultiEdit',
+        tool_input: {
+          file_path: '/a/b.md',
+          edits: [
+            { old_string: 'x', new_string: 'fragment1' },
+            { old_string: 'y', new_string: 'fragment2' },
+          ],
+        },
+      }),
+    );
+    expect(r.content).toBe('fragment1\nfragment2');
+  });
+
+  it('extracts NotebookEdit new_source', () => {
+    const r = parseWriteHookPayload(
+      JSON.stringify({
+        tool_name: 'NotebookEdit',
+        tool_input: { notebook_path: '/a/n.ipynb', new_source: 'cell body' },
+      }),
+    );
+    expect(r).toEqual({
+      toolName: 'NotebookEdit',
+      filePath: '/a/n.ipynb',
+      content: 'cell body',
+    });
+  });
+
+  it('content priority: content > new_string > edits > new_source', () => {
+    // When multiple fields are present, content wins. Mirrors the bash
+    // helper's elif-cascade.
+    const r = parseWriteHookPayload(
+      JSON.stringify({
+        tool_name: 'Write',
+        tool_input: {
+          file_path: '/a',
+          content: 'WIN',
+          new_string: 'lose',
+          edits: [{ new_string: 'lose' }],
+          new_source: 'lose',
+        },
+      }),
+    );
+    expect(r.content).toBe('WIN');
+  });
+
+  it('fails closed on non-string file_path', () => {
+    expect(() =>
+      parseWriteHookPayload(
+        JSON.stringify({ tool_name: 'Write', tool_input: { file_path: 42 } }),
+      ),
+    ).toThrow(TypePayloadError);
+  });
+
+  it('handles MultiEdit fragments with non-string new_string defensively', () => {
+    const r = parseWriteHookPayload(
+      JSON.stringify({
+        tool_name: 'MultiEdit',
+        tool_input: {
+          file_path: '/a',
+          edits: [{ new_string: 'ok' }, { new_string: 42 }, { new_string: 'fine' }],
+        },
+      }),
+    );
+    // Non-string fragments collapse to '' rather than throwing —
+    // matches bash payload-read.sh `// "" | tostring`.
+    expect(r.content).toBe('ok\n\nfine');
   });
 });

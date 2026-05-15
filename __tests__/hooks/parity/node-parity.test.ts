@@ -33,6 +33,10 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { runPrIssueLinkGate } from '../../../src/hooks/pr-issue-link-gate/index.js';
 import { runAttributionAdvisory } from '../../../src/hooks/attribution-advisory/index.js';
 import { runSecurityDisclosureGate } from '../../../src/hooks/security-disclosure-gate/index.js';
+import { runEnvFileProtection } from '../../../src/hooks/env-file-protection/index.js';
+import { runDependencyAuditGate } from '../../../src/hooks/dependency-audit-gate/index.js';
+import { runChangesetSecurityGate } from '../../../src/hooks/changeset-security-gate/index.js';
+import { runArchitectureReviewGate } from '../../../src/hooks/architecture-review-gate/index.js';
 
 const IS_WINDOWS = process.platform === 'win32';
 const SKIP = process.env['SKIP_BASH_PARITY'] === '1' || IS_WINDOWS;
@@ -301,5 +305,247 @@ describe.runIf(!SKIP)('security-disclosure-gate bash↔node parity', () => {
     });
     expect(node.exitCode).toBe(0);
     expect(bash.exitCode).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 0.33.0 ports — env-file-protection, dependency-audit-gate,
+//                 changeset-security-gate, architecture-review-gate
+// ---------------------------------------------------------------------------
+
+describe.runIf(!SKIP)('env-file-protection bash↔node parity', () => {
+  let root: string;
+  beforeEach(() => {
+    root = mkRoot();
+  });
+  afterEach(() => {
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('both pass through irrelevant commands', async () => {
+    const input = payload('ls -la');
+    const bash = await runBaseline('env-file-protection.sh.pre-0.33.0', input, root);
+    const node = await runEnvFileProtection({ reaRoot: root, stdinOverride: input });
+    expect(node.exitCode).toBe(0);
+    expect(bash.exitCode).toBe(0);
+  });
+
+  it('both block `cat .env`', async () => {
+    const input = payload('cat .env');
+    const bash = await runBaseline('env-file-protection.sh.pre-0.33.0', input, root);
+    const node = await runEnvFileProtection({ reaRoot: root, stdinOverride: input });
+    expect(node.exitCode).toBe(2);
+    expect(bash.exitCode).toBe(2);
+    expect(node.stderr).toContain('ENV FILE PROTECTION');
+    expect(bash.stderr).toContain('ENV FILE PROTECTION');
+  });
+
+  it('both block `source .env`', async () => {
+    const input = payload('source .env.production');
+    const bash = await runBaseline('env-file-protection.sh.pre-0.33.0', input, root);
+    const node = await runEnvFileProtection({ reaRoot: root, stdinOverride: input });
+    expect(node.exitCode).toBe(2);
+    expect(bash.exitCode).toBe(2);
+  });
+
+  it('both allow commit messages mentioning .env', async () => {
+    const input = payload(`git commit -m "fix: stop sourcing .env in scripts"`);
+    const bash = await runBaseline('env-file-protection.sh.pre-0.33.0', input, root);
+    const node = await runEnvFileProtection({ reaRoot: root, stdinOverride: input });
+    expect(node.exitCode).toBe(0);
+    expect(bash.exitCode).toBe(0);
+  });
+
+  it('both allow multi-segment commands where utility and .env are in different segments', async () => {
+    const input = payload('echo "log: cat broken" ; touch foo.env');
+    const bash = await runBaseline('env-file-protection.sh.pre-0.33.0', input, root);
+    const node = await runEnvFileProtection({ reaRoot: root, stdinOverride: input });
+    expect(node.exitCode).toBe(0);
+    expect(bash.exitCode).toBe(0);
+  });
+});
+
+describe.runIf(!SKIP)('dependency-audit-gate bash↔node parity', () => {
+  let root: string;
+  beforeEach(() => {
+    root = mkRoot();
+  });
+  afterEach(() => {
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('both pass through non-install commands', async () => {
+    const input = payload('ls');
+    const bash = await runBaseline('dependency-audit-gate.sh.pre-0.33.0', input, root);
+    const node = await runDependencyAuditGate({
+      reaRoot: root,
+      stdinOverride: input,
+      verifyPackage: async () => true,
+    });
+    expect(node.exitCode).toBe(0);
+    expect(bash.exitCode).toBe(0);
+  });
+
+  it('both allow commit messages mentioning install', async () => {
+    const input = payload(`git commit -m "chore: bump pnpm install pinning"`);
+    const bash = await runBaseline('dependency-audit-gate.sh.pre-0.33.0', input, root);
+    const node = await runDependencyAuditGate({
+      reaRoot: root,
+      stdinOverride: input,
+      verifyPackage: async () => false, // would block if extracted
+    });
+    expect(node.exitCode).toBe(0);
+    expect(bash.exitCode).toBe(0);
+  });
+
+  it('both allow a known-real package install', async () => {
+    const input = payload('npm install lodash');
+    const bash = await runBaseline('dependency-audit-gate.sh.pre-0.33.0', input, root);
+    const node = await runDependencyAuditGate({
+      reaRoot: root,
+      stdinOverride: input,
+      verifyPackage: async () => true,
+    });
+    expect(node.exitCode).toBe(0);
+    // The bash side actually calls `npm view lodash name` — assume the
+    // CI runner has network and the package is real. If offline, bash
+    // returns exit 2 and we'd need to SKIP this — but the existing
+    // parity test infra runs in CI with network already.
+    expect(bash.exitCode).toBe(0);
+  });
+});
+
+describe.runIf(!SKIP)('changeset-security-gate bash↔node parity', () => {
+  let root: string;
+  beforeEach(() => {
+    root = mkRoot();
+  });
+  afterEach(() => {
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  const writePayload = (filePath: string, content: string, toolName = 'Write'): string =>
+    JSON.stringify({
+      tool_name: toolName,
+      tool_input: { file_path: filePath, content },
+    });
+
+  it('both pass through non-changeset files', async () => {
+    const input = writePayload('src/foo.ts', 'GHSA-aaaa-bbbb-cccc');
+    const bash = await runBaseline('changeset-security-gate.sh.pre-0.33.0', input, root);
+    const node = await runChangesetSecurityGate({ reaRoot: root, stdinOverride: input });
+    expect(node.exitCode).toBe(0);
+    expect(bash.exitCode).toBe(0);
+  });
+
+  it('both block GHSA in a changeset', async () => {
+    const input = writePayload(
+      '.changeset/x.md',
+      `---\n'@bookedsolid/rea': patch\n---\n\nfix GHSA-3w3m-7gg4-f82g\n`,
+    );
+    const bash = await runBaseline('changeset-security-gate.sh.pre-0.33.0', input, root);
+    const node = await runChangesetSecurityGate({ reaRoot: root, stdinOverride: input });
+    expect(node.exitCode).toBe(2);
+    expect(bash.exitCode).toBe(2);
+    const bashOutput = bash.stdout + bash.stderr;
+    const nodeOutput = node.stdout + node.stderr;
+    expect(bashOutput).toContain('GHSA-');
+    expect(nodeOutput).toContain('GHSA-');
+  });
+
+  it('both block missing frontmatter', async () => {
+    const input = writePayload('.changeset/x.md', 'no frontmatter at all\n');
+    const bash = await runBaseline('changeset-security-gate.sh.pre-0.33.0', input, root);
+    const node = await runChangesetSecurityGate({ reaRoot: root, stdinOverride: input });
+    expect(node.exitCode).toBe(2);
+    expect(bash.exitCode).toBe(2);
+  });
+
+  it('both allow a clean changeset', async () => {
+    const input = writePayload(
+      '.changeset/x.md',
+      `---\n'@bookedsolid/rea': patch\n---\n\nfix(something): legit fix\n`,
+    );
+    const bash = await runBaseline('changeset-security-gate.sh.pre-0.33.0', input, root);
+    const node = await runChangesetSecurityGate({ reaRoot: root, stdinOverride: input });
+    expect(node.exitCode).toBe(0);
+    expect(bash.exitCode).toBe(0);
+  });
+});
+
+describe.runIf(!SKIP)('architecture-review-gate bash↔node parity', () => {
+  let root: string;
+  beforeEach(() => {
+    root = mkRoot();
+    fs.mkdirSync(path.join(root, '.rea'), { recursive: true });
+    fs.writeFileSync(
+      path.join(root, '.rea', 'policy.yaml'),
+      `version: "1"
+profile: "test"
+installed_by: "test"
+installed_at: "2026-05-15T00:00:00Z"
+autonomy_level: L1
+max_autonomy_level: L2
+promotion_requires_human_approval: true
+block_ai_attribution: false
+blocked_paths: []
+architecture_review:
+  patterns:
+    - src/gateway/
+    - hooks/_lib/
+`,
+    );
+  });
+  afterEach(() => {
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('both silent when patterns do not match', async () => {
+    const input = JSON.stringify({
+      tool_name: 'Edit',
+      tool_input: { file_path: 'README.md' },
+    });
+    const bash = await runBaseline('architecture-review-gate.sh.pre-0.33.0', input, root);
+    const node = await runArchitectureReviewGate({ reaRoot: root, stdinOverride: input });
+    expect(node.exitCode).toBe(0);
+    expect(bash.exitCode).toBe(0);
+    expect(node.stderr).toBe('');
+    expect(bash.stderr).toBe('');
+  });
+
+  it('both exit 0 on src/gateway/ writes (node emits advisory; bash depends on `rea hook policy-get` availability)', async () => {
+    const input = JSON.stringify({
+      tool_name: 'Edit',
+      tool_input: { file_path: 'src/gateway/foo.ts' },
+    });
+    const bash = await runBaseline('architecture-review-gate.sh.pre-0.33.0', input, root);
+    const node = await runArchitectureReviewGate({ reaRoot: root, stdinOverride: input });
+    // Both must exit 0 — this hook is advisory-only.
+    expect(node.exitCode).toBe(0);
+    expect(bash.exitCode).toBe(0);
+    // The Node port uses the canonical YAML loader (nested-key support
+    // works without spawning a CLI). The bash port routes through
+    // `policy_list` which spawns `rea hook policy-get` for nested-key
+    // reads; in this parity harness no CLI is built, so bash is
+    // expected to silently no-op. The 0.33.0 migration FIXES this
+    // class of "no CLI → silent no-op" by collapsing the bash body
+    // into a one-shot Node subprocess.
+    expect(node.stderr).toContain('ARCHITECTURE ADVISORY');
+    // bash.stderr is not asserted — the bash baseline's correctness
+    // here is environment-dependent. The Node port lifts that.
+  });
+
+  it('both silent when policy file is missing (no patterns)', async () => {
+    fs.rmSync(path.join(root, '.rea', 'policy.yaml'));
+    const input = JSON.stringify({
+      tool_name: 'Edit',
+      tool_input: { file_path: 'src/gateway/foo.ts' },
+    });
+    const bash = await runBaseline('architecture-review-gate.sh.pre-0.33.0', input, root);
+    const node = await runArchitectureReviewGate({ reaRoot: root, stdinOverride: input });
+    expect(node.exitCode).toBe(0);
+    expect(bash.exitCode).toBe(0);
+    expect(node.stderr).toBe('');
+    expect(bash.stderr).toBe('');
   });
 });
