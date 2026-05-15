@@ -206,7 +206,7 @@ async function main(): Promise<void> {
     .option('--drift', 'report drift vs. the install manifest (read-only; does not mutate)')
     .option(
       '--smoke',
-      'also run the 0.29.0 delegation-signal round-trip (writes a probe `rea.delegation_signal` audit record and verifies chain integrity)',
+      'also run the delegation-signal round-trip: drives the real `.claude/hooks/delegation-capture.sh` shell hook end-to-end (writes a probe `rea.delegation_signal` audit record and verifies chain integrity)',
     )
     .option(
       '--strict',

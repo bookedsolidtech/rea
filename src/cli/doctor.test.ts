@@ -15,6 +15,7 @@ import { promisify } from 'node:util';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   checkCodexBinaryOnPath,
+  checkDelegationRoundTrip,
   checkFingerprintStore,
   checkPrepareCommitMsgHook,
   checksFromProbeState,
@@ -756,8 +757,13 @@ describe('rea doctor — EXPECTED_HOOKS coverage (round-25 P3)', () => {
       'blocked-paths-enforcer.sh',
       'changeset-security-gate.sh',
       'dangerous-bash-interceptor.sh',
-      // 0.29.0 — delegation-telemetry MVP. Without this entry the
-      // EXPECTED_HOOKS list grew to 15 and the test below fails fast.
+      // 0.31.0 — `delegation-advisory.sh` is INTENTIONALLY ABSENT from
+      // this list. It is NOT in `EXPECTED_HOOKS` for 0.31.0 (staged
+      // rollout — see the EXPECTED_HOOKS comment in doctor.ts), so the
+      // count below stays at 15. It joins both lists in the same future
+      // minor that promotes the advisory registration check to `fail`.
+      // 0.29.0 — delegation-telemetry MVP. The Agent|Skill PreToolUse
+      // capture hook.
       'delegation-capture.sh',
       'dependency-audit-gate.sh',
       'env-file-protection.sh',
@@ -776,8 +782,10 @@ describe('rea doctor — EXPECTED_HOOKS coverage (round-25 P3)', () => {
     const checks = collectChecks(repo.dir);
     const hooksCheck = findCheck(checks, 'hooks installed + executable');
     expect(hooksCheck?.status).toBe('pass');
-    // 0.29.0 — 15 shipped hooks (was 14; 0.29.0 added
-    // delegation-capture.sh as the Agent|Skill PreToolUse signal).
+    // 0.31.0 — 15 shipped hooks. `delegation-advisory.sh` ships in the
+    // package this release but is deliberately kept out of
+    // `EXPECTED_HOOKS` (staged rollout) so doctor stays green on
+    // pre-`rea upgrade` consumer installs.
     expect(hooksCheck?.detail).toMatch(/15 hooks present/);
   });
 });
@@ -1104,12 +1112,18 @@ describe('rea doctor — checkExtensionFragments (Fix H / 0.13.0)', () => {
 });
 
 /**
- * 0.29.0 — delegation-capture hook registration check. Loud failure
- * mode is the priority: a consumer who upgrades 0.28.x → 0.29.x
- * without re-running `rea init` or `rea upgrade` must see the
- * mismatch surface as a hard fail in `rea doctor`.
+ * delegation-capture hook registration check.
+ *
+ * 0.29.0 shipped this as `warn` (advisory) — the `Agent|Skill`
+ * matcher was a brand-new `defaultDesiredHooks()` entry and consumer
+ * installs needed an upgrade cycle to catch up. 0.31.0 makes good on
+ * the long-promised promotion: the matcher has been in the desired
+ * set for multiple minors, so a still-missing registration is now a
+ * hard `fail` — a consumer who skipped `rea upgrade` sees the
+ * governance gap loudly. The three pre-fix `warn` cases below are now
+ * `fail`.
  */
-describe('rea doctor — delegation-capture hook registered (0.29.0)', () => {
+describe('rea doctor — delegation-capture hook registered (0.31.0: warn → fail)', () => {
   const cleanup: string[] = [];
 
   afterEach(async () => {
@@ -1124,21 +1138,16 @@ describe('rea doctor — delegation-capture hook registered (0.29.0)', () => {
     );
   }
 
-  // 0.29.0 posture: advisory (warn), not hard fail. Existing consumer
-  // installs (and the repo's own dogfood) won't have the matcher
-  // registered until `rea upgrade` propagates the template. Promotion
-  // to fail is scheduled for 0.30.0 — by which point consumer
-  // installs have had time to update. Codex round 2 P2.
-  it('warns (advisory) when .claude/settings.json is missing', async () => {
+  it('fails when .claude/settings.json is missing', async () => {
     const repo = await makeScratchRepo({ codexRequired: false });
     cleanup.push(repo.dir);
     const checks = collectChecks(repo.dir);
     const check = findCheck(checks, 'delegation-capture hook registered');
-    expect(check?.status).toBe('warn');
+    expect(check?.status).toBe('fail');
     expect(check?.detail).toMatch(/missing|rea upgrade|rea init/);
   });
 
-  it('warns (advisory) when no Agent|Skill matcher group is registered', async () => {
+  it('fails when no Agent|Skill matcher group is registered', async () => {
     const repo = await makeScratchRepo({ codexRequired: false });
     cleanup.push(repo.dir);
     await writeSettings(repo.dir, {
@@ -1155,11 +1164,11 @@ describe('rea doctor — delegation-capture hook registered (0.29.0)', () => {
     });
     const checks = collectChecks(repo.dir);
     const check = findCheck(checks, 'delegation-capture hook registered');
-    expect(check?.status).toBe('warn');
+    expect(check?.status).toBe('fail');
     expect(check?.detail).toMatch(/Agent\|Skill/);
   });
 
-  it('warns (advisory) when Agent|Skill matcher exists but no delegation-capture.sh command is present', async () => {
+  it('fails when Agent|Skill matcher exists but no delegation-capture.sh command is present', async () => {
     const repo = await makeScratchRepo({ codexRequired: false });
     cleanup.push(repo.dir);
     await writeSettings(repo.dir, {
@@ -1176,7 +1185,7 @@ describe('rea doctor — delegation-capture hook registered (0.29.0)', () => {
     });
     const checks = collectChecks(repo.dir);
     const check = findCheck(checks, 'delegation-capture hook registered');
-    expect(check?.status).toBe('warn');
+    expect(check?.status).toBe('fail');
   });
 
   it('passes when Agent|Skill matcher references delegation-capture.sh', async () => {
@@ -1201,6 +1210,192 @@ describe('rea doctor — delegation-capture hook registered (0.29.0)', () => {
     const checks = collectChecks(repo.dir);
     const check = findCheck(checks, 'delegation-capture hook registered');
     expect(check?.status).toBe('pass');
+  });
+});
+
+/**
+ * 0.31.0 — delegation-advisory hook registration check
+ * (`checkDelegationAdvisoryHookRegistered`). Posture is `warn`
+ * (advisory) for 0.31.0 — the PostToolUse
+ * `Bash|Edit|Write|MultiEdit|NotebookEdit` group is a brand-new
+ * `defaultDesiredHooks()` entry, the exact upgrade-lag situation
+ * `checkDelegationHookRegistered` faced in 0.29.0. A future minor
+ * promotes it to `fail` once consumer installs have caught up.
+ */
+describe('rea doctor — delegation-advisory hook registered (0.31.0)', () => {
+  const cleanup: string[] = [];
+
+  afterEach(async () => {
+    await Promise.all(cleanup.splice(0).map((d) => fs.rm(d, { recursive: true, force: true })));
+  });
+
+  async function writeSettings(repoDir: string, settings: unknown): Promise<void> {
+    await fs.mkdir(path.join(repoDir, '.claude'), { recursive: true });
+    await fs.writeFile(
+      path.join(repoDir, '.claude', 'settings.json'),
+      JSON.stringify(settings, null, 2),
+    );
+  }
+
+  /** Lay down a stub `.claude/hooks/delegation-advisory.sh` so the
+   * file-presence half of the check (round-2 P2) is satisfied. */
+  async function writeAdvisoryHookFile(repoDir: string): Promise<void> {
+    const hooksDir = path.join(repoDir, '.claude', 'hooks');
+    await fs.mkdir(hooksDir, { recursive: true });
+    const p = path.join(hooksDir, 'delegation-advisory.sh');
+    await fs.writeFile(p, '#!/bin/bash\nexit 0\n');
+    await fs.chmod(p, 0o755);
+  }
+
+  it('warns (advisory) when .claude/settings.json is missing', async () => {
+    const repo = await makeScratchRepo({ codexRequired: false });
+    cleanup.push(repo.dir);
+    const checks = collectChecks(repo.dir);
+    const check = findCheck(checks, 'delegation-advisory hook registered');
+    expect(check?.status).toBe('warn');
+    expect(check?.detail).toMatch(/missing|rea upgrade|rea init/);
+  });
+
+  it('warns (advisory) when no Bash|Edit|Write|MultiEdit|NotebookEdit PostToolUse group is registered', async () => {
+    const repo = await makeScratchRepo({ codexRequired: false });
+    cleanup.push(repo.dir);
+    await writeSettings(repo.dir, {
+      hooks: {
+        PostToolUse: [
+          {
+            matcher: 'Write|Edit|MultiEdit|NotebookEdit',
+            hooks: [
+              {
+                type: 'command',
+                command: '$CLAUDE_PROJECT_DIR/.claude/hooks/architecture-review-gate.sh',
+              },
+            ],
+          },
+        ],
+      },
+    });
+    const checks = collectChecks(repo.dir);
+    const check = findCheck(checks, 'delegation-advisory hook registered');
+    expect(check?.status).toBe('warn');
+    // Detail must name the matcher AND call out the Bash inclusion —
+    // the nudge counts every write-class tool call, not just edits.
+    expect(check?.detail).toMatch(/Bash\|Edit\|Write\|MultiEdit\|NotebookEdit/);
+    expect(check?.detail).toMatch(/Bash/);
+  });
+
+  it('warns (advisory) when the matcher group exists but no delegation-advisory.sh command is present', async () => {
+    const repo = await makeScratchRepo({ codexRequired: false });
+    cleanup.push(repo.dir);
+    await writeSettings(repo.dir, {
+      hooks: {
+        PostToolUse: [
+          {
+            matcher: 'Bash|Edit|Write|MultiEdit|NotebookEdit',
+            hooks: [
+              { type: 'command', command: '$CLAUDE_PROJECT_DIR/.claude/hooks/other.sh' },
+            ],
+          },
+        ],
+      },
+    });
+    const checks = collectChecks(repo.dir);
+    const check = findCheck(checks, 'delegation-advisory hook registered');
+    expect(check?.status).toBe('warn');
+  });
+
+  it('passes when the matcher group references delegation-advisory.sh AND the hook file exists', async () => {
+    const repo = await makeScratchRepo({ codexRequired: false });
+    cleanup.push(repo.dir);
+    await writeSettings(repo.dir, {
+      hooks: {
+        PostToolUse: [
+          {
+            matcher: 'Bash|Edit|Write|MultiEdit|NotebookEdit',
+            hooks: [
+              {
+                type: 'command',
+                command: '$CLAUDE_PROJECT_DIR/.claude/hooks/delegation-advisory.sh',
+              },
+            ],
+          },
+        ],
+      },
+    });
+    await writeAdvisoryHookFile(repo.dir);
+    const checks = collectChecks(repo.dir);
+    const check = findCheck(checks, 'delegation-advisory hook registered');
+    expect(check?.status).toBe('pass');
+  });
+
+  it('warns (advisory) when settings.json registers the hook but the .sh file is missing (round-2 P2)', async () => {
+    // Regression pin: `delegation-advisory.sh` is intentionally OUT of
+    // `EXPECTED_HOOKS` for 0.31.0, so `checkHooksInstalled` does NOT
+    // cover it. This registration check is the ONLY 0.31.0 doctor
+    // signal for the new hook — it must catch the case where
+    // settings.json references the command but a partial `rea upgrade`
+    // / manual drift left the actual script absent. Without the
+    // file-presence check, doctor would report `pass` while every
+    // matching PostToolUse dispatch shells out to a nonexistent path.
+    const repo = await makeScratchRepo({ codexRequired: false });
+    cleanup.push(repo.dir);
+    await writeSettings(repo.dir, {
+      hooks: {
+        PostToolUse: [
+          {
+            matcher: 'Bash|Edit|Write|MultiEdit|NotebookEdit',
+            hooks: [
+              {
+                type: 'command',
+                command: '$CLAUDE_PROJECT_DIR/.claude/hooks/delegation-advisory.sh',
+              },
+            ],
+          },
+        ],
+      },
+    });
+    // Deliberately do NOT call writeAdvisoryHookFile — the file is missing.
+    const checks = collectChecks(repo.dir);
+    const check = findCheck(checks, 'delegation-advisory hook registered');
+    expect(check?.status).toBe('warn');
+    expect(check?.detail).toMatch(/hook file is missing/);
+    expect(check?.detail).toMatch(/delegation-advisory\.sh/);
+  });
+
+  it('warns (advisory) when the hook file exists but is not executable (round-3 P2)', async () => {
+    // Regression pin: a script copied without its mode bits (manual
+    // `cp`, archive extracted without `+x` preservation) cannot be
+    // launched by Claude Code from settings.json. `checkHooksInstalled`
+    // does this `0o111` check for every `EXPECTED_HOOKS` entry; because
+    // `delegation-advisory.sh` is held out of that list for 0.31.0, the
+    // parity check has to live in this registration check instead.
+    const repo = await makeScratchRepo({ codexRequired: false });
+    cleanup.push(repo.dir);
+    await writeSettings(repo.dir, {
+      hooks: {
+        PostToolUse: [
+          {
+            matcher: 'Bash|Edit|Write|MultiEdit|NotebookEdit',
+            hooks: [
+              {
+                type: 'command',
+                command: '$CLAUDE_PROJECT_DIR/.claude/hooks/delegation-advisory.sh',
+              },
+            ],
+          },
+        ],
+      },
+    });
+    // Lay the file down but strip the executable bits (mode 0o644).
+    const hooksDir = path.join(repo.dir, '.claude', 'hooks');
+    await fs.mkdir(hooksDir, { recursive: true });
+    const hookPath = path.join(hooksDir, 'delegation-advisory.sh');
+    await fs.writeFile(hookPath, '#!/bin/bash\nexit 0\n');
+    await fs.chmod(hookPath, 0o644);
+    const checks = collectChecks(repo.dir);
+    const check = findCheck(checks, 'delegation-advisory hook registered');
+    expect(check?.status).toBe('warn');
+    expect(check?.detail).toMatch(/not executable/);
+    expect(check?.detail).toMatch(/mode=644/);
   });
 });
 
@@ -1260,5 +1455,93 @@ describe('rea doctor — checkPrepareCommitMsgHook hooks-dir resolution (0.30.1 
       ['version: "1"', 'profile: "minimal"', 'installed_by: "t"', ''].join('\n'),
     );
     expect(() => checkPrepareCommitMsgHook(dir)).not.toThrow();
+  });
+});
+
+/**
+ * 0.31.0 — `checkDelegationRoundTrip` now drives the REAL
+ * `.claude/hooks/delegation-capture.sh` shell hook end-to-end (it used
+ * to spawn `rea hook delegation-signal` directly). These tests pin:
+ *   - graceful `warn` degradation when a prerequisite is missing
+ *     (no shell hook installed; no sandboxed CLI in scope)
+ *   - a `pass` when the full chain is wired: the shim resolves +
+ *     sandbox-checks the CLI, the CLI writes the probe record, and
+ *     chain integrity holds
+ */
+describe('rea doctor — checkDelegationRoundTrip drives the shell hook (0.31.0)', () => {
+  const cleanup: string[] = [];
+  const REPO_ROOT = path.resolve(__dirname, '..', '..');
+
+  afterEach(async () => {
+    await Promise.all(cleanup.splice(0).map((d) => fs.rm(d, { recursive: true, force: true })));
+  });
+
+  async function mkBase(): Promise<string> {
+    const dir = await fs.realpath(
+      await fs.mkdtemp(path.join(os.tmpdir(), 'rea-deleg-roundtrip-')),
+    );
+    cleanup.push(dir);
+    await fs.mkdir(path.join(dir, '.rea'), { recursive: true });
+    return dir;
+  }
+
+  it('warns when the delegation-capture.sh shell hook is not installed', async () => {
+    const dir = await mkBase();
+    // No .claude/hooks/delegation-capture.sh.
+    const result = await checkDelegationRoundTrip(dir);
+    expect(result.status).toBe('warn');
+    expect(result.detail).toMatch(/shell hook not installed|rea init|rea upgrade/);
+  });
+
+  it('warns when the shell hook is present but no sandboxed rea CLI is in scope', async () => {
+    const dir = await mkBase();
+    // Install the shell hook from the repo source, but DON'T stage a
+    // CLI — neither node_modules/@bookedsolid/rea nor <dir>/dist.
+    const hooksDir = path.join(dir, '.claude', 'hooks');
+    await fs.mkdir(hooksDir, { recursive: true });
+    await fs.copyFile(
+      path.join(REPO_ROOT, 'hooks', 'delegation-capture.sh'),
+      path.join(hooksDir, 'delegation-capture.sh'),
+    );
+    await fs.chmod(path.join(hooksDir, 'delegation-capture.sh'), 0o755);
+    const result = await checkDelegationRoundTrip(dir);
+    expect(result.status).toBe('warn');
+    expect(result.detail).toMatch(/no sandboxed rea CLI|pnpm build|pnpm i/);
+  });
+
+  it('passes the full chain when the shell hook + a sandboxed CLI are staged', async () => {
+    const distCli = path.join(REPO_ROOT, 'dist', 'cli', 'index.js');
+    // Build not present — skip rather than fail (CI builds before test).
+    try {
+      await fs.access(distCli);
+    } catch {
+      return;
+    }
+    const dir = await mkBase();
+    // 1. Install the shell hook (consumer install path).
+    const hooksDir = path.join(dir, '.claude', 'hooks');
+    await fs.mkdir(hooksDir, { recursive: true });
+    // The shim sources _lib/halt-check.sh — copy the whole hooks tree.
+    await fs.cp(path.join(REPO_ROOT, 'hooks'), hooksDir, { recursive: true });
+    // 2. Stage a sandboxed dogfood CLI INSIDE the tempdir: copy dist/,
+    //    symlink node_modules (so `require` resolves), write a
+    //    package.json declaring @bookedsolid/rea. The shim's sandbox
+    //    check then passes legitimately — realpath(cli) stays inside
+    //    realpath(dir) AND an ancestor package.json declares the name.
+    await fs.cp(path.join(REPO_ROOT, 'dist'), path.join(dir, 'dist'), { recursive: true });
+    await fs.symlink(
+      path.join(REPO_ROOT, 'node_modules'),
+      path.join(dir, 'node_modules'),
+      'dir',
+    );
+    await fs.writeFile(
+      path.join(dir, 'package.json'),
+      JSON.stringify({ name: '@bookedsolid/rea', version: '0.0.0-test' }),
+    );
+    const result = await checkDelegationRoundTrip(dir);
+    // The probe record landed via the real shell-hook → CLI chain and
+    // chain integrity verified.
+    expect(result.status).toBe('pass');
+    expect(result.detail).toMatch(/delegation-capture\.sh shell hook/);
   });
 });

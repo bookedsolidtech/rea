@@ -104,6 +104,22 @@ export const ProfileSchema = z
       })
       .strict()
       .optional(),
+    // 0.31.0+ delegation-advisory nudge. `bst-internal*` profiles pin
+    // `enabled: true`; external profiles ship `enabled: false`. The
+    // profile-layer schema mirrors the policy-loader's
+    // `DelegationAdvisoryPolicySchema` but leaves every field optional
+    // — defaults are applied at the policy-loader layer when the
+    // materialized file is parsed, so a profile that only declares
+    // `enabled` doesn't need to also restate `threshold`. Strict mode
+    // still rejects typos at init time.
+    delegation_advisory: z
+      .object({
+        enabled: z.boolean().optional(),
+        threshold: z.number().int().positive().optional(),
+        exempt_subagents: z.array(z.string()).optional(),
+      })
+      .strict()
+      .optional(),
   })
   .strict();
 

@@ -70,6 +70,7 @@ import {
 import { resolveBaseRef } from '../hooks/push-gate/base.js';
 import { resolvePushGatePolicy } from '../hooks/push-gate/policy.js';
 import { summarizeReview } from '../hooks/push-gate/findings.js';
+import { runHookDelegationAdvisory } from './delegation-advisory.js';
 import { err } from './utils.js';
 
 export interface HookPushGateOptions {
@@ -1169,6 +1170,12 @@ export async function runHookDelegationSignal(
  *   - `delegation-signal`   — 0.29.0 delegation-telemetry MVP. Reads a Claude
  *                             Code PreToolUse hook payload for `Agent` / `Skill`
  *                             and emits a `rea.delegation_signal` audit record.
+ *   - `delegation-advisory` — 0.31.0 delegation nudge. Reads a Claude Code
+ *                             PostToolUse hook payload for the write-class
+ *                             tools, maintains a per-session counter, and emits
+ *                             a one-time stderr advisory when the session
+ *                             crosses `policy.delegation_advisory.threshold`
+ *                             without dispatching a curated specialist.
  *
  * New hooks should land here rather than as top-level commands so the
  * CLI surface stays navigable.
@@ -1298,6 +1305,15 @@ export function registerHookCommand(program: Command): void {
         ...(opts.detach === true ? { detach: true } : {}),
         ...(opts.lockTimeoutMs !== undefined ? { lockTimeoutMs: opts.lockTimeoutMs } : {}),
       });
+    });
+
+  hook
+    .command('delegation-advisory')
+    .description(
+      'Read a Claude Code PostToolUse hook payload for a write-class tool (Bash/Edit/Write/MultiEdit/NotebookEdit) from stdin, bump a per-session write-class counter, and emit a one-time stderr advisory when the session crosses `policy.delegation_advisory.threshold` without dispatching a curated specialist (0.31.0+). Advisory only — exit ALWAYS 0 except HALT (exit 2). Disabled unless `policy.delegation_advisory.enabled: true`. The hook shim at `.claude/hooks/delegation-advisory.sh` invokes this.',
+    )
+    .action(async () => {
+      await runHookDelegationAdvisory();
     });
 
   hook
