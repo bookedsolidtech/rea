@@ -67,3 +67,16 @@ architecture_review:
 attribution:
   co_author:
     enabled: false
+# 0.31.0 delegation-advisory nudge — enabled for bst-internal.
+# The delegation-advisory.sh PostToolUse hook emits a one-time stderr
+# advisory when a session crosses `threshold` write-class tool calls
+# (Bash/Edit/Write/MultiEdit/NotebookEdit) without dispatching a
+# curated specialist. Advisory only — never blocks a tool call. BST's
+# own delegation discipline (CLAUDE.md routes all non-trivial work
+# through rea-orchestrator) is load-bearing, so the nudge ships on.
+# `exempt_subagents` omitted → the schema default applies
+# (general-purpose, Explore, Plan, output-style-setup, statusline-setup
+# don't count as real delegation).
+delegation_advisory:
+  enabled: true
+  threshold: 25

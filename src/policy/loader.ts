@@ -308,6 +308,46 @@ const AttributionPolicySchema = z
   })
   .strict();
 
+/**
+ * 0.31.0 — delegation-advisory nudge policy. Drives the
+ * `delegation-advisory.sh` PostToolUse hook (matcher
+ * `Bash|Edit|Write|MultiEdit|NotebookEdit`): when a session crosses
+ * `threshold` write-class tool calls without a `rea.delegation_signal`
+ * record (to a non-exempt subagent), the hook emits a one-time stderr
+ * advisory. The hook is advisory-only — exit 0 always except HALT.
+ *
+ * Defaults live here at the schema layer, not in the hook: a vanilla
+ * install with no `delegation_advisory` block gets `enabled: false`
+ * (silent no-op), `threshold: 25`, and the 5-entry built-in exempt
+ * list. The `bst-internal*` profiles pin `enabled: true`; OSS profiles
+ * leave it `false` so consumers opt in.
+ *
+ * `threshold` is a positive integer — a single write-class count
+ * rather than the 0.29.0 design memo's "15 edits + 5 Bash" split.
+ * Modeling the threshold as one number keeps the hook's counter file
+ * a single integer and the policy surface a single knob; the
+ * distinction between an Edit and a Bash call doesn't change the
+ * signal the nudge exists to send ("you've done a lot solo").
+ *
+ * Strict mode rejects unknown keys so a typo (`thresholds`,
+ * `exempt_subagent`) fails loudly at policy load.
+ */
+const DelegationAdvisoryPolicySchema = z
+  .object({
+    enabled: z.boolean().default(false),
+    threshold: z.number().int().positive().default(25),
+    exempt_subagents: z
+      .array(z.string())
+      .default([
+        'general-purpose',
+        'Explore',
+        'Plan',
+        'output-style-setup',
+        'statusline-setup',
+      ]),
+  })
+  .strict();
+
 const PolicySchema = z
   .object({
     version: z.string(),
@@ -360,6 +400,13 @@ const PolicySchema = z
     // `AttributionCoAuthorSchema` fails closed when `enabled: true` but
     // `name`/`email` are empty so we never ship a half-configured trailer.
     attribution: AttributionPolicySchema.optional(),
+    // 0.31.0 delegation-advisory nudge — drives the
+    // `delegation-advisory.sh` PostToolUse hook. `.optional()` so a
+    // vanilla install with no block sees the hook as a silent no-op
+    // (the hook reads `enabled` via `rea hook policy-get` and exits 0
+    // when unset/false). When the block IS present the inner schema
+    // supplies defaults for any omitted field.
+    delegation_advisory: DelegationAdvisoryPolicySchema.optional(),
   })
   .strict();
 

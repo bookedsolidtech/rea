@@ -435,5 +435,30 @@ export function defaultDesiredHooks(): DesiredHookGroup[] {
         },
       ],
     },
+    {
+      // 0.31.0 delegation-telemetry completion — the *nudge*. The
+      // matcher is `Bash|Edit|Write|MultiEdit|NotebookEdit`: every
+      // write-class tool call (note this group INCLUDES Bash, unlike
+      // the architecture-review group above). The hook maintains a
+      // per-session counter and emits a one-time stderr advisory when
+      // a session crosses `policy.delegation_advisory.threshold`
+      // without dispatching a curated specialist. Advisory only — it
+      // never blocks a tool call, and `policy.delegation_advisory`
+      // defaults to disabled (only `bst-internal*` profiles pin
+      // `enabled: true`), so a vanilla install sees the hook as a
+      // silent no-op. Kept as its own matcher group rather than
+      // chained onto the architecture-review group because the
+      // matcher string differs (Bash is in this one, not that one).
+      event: 'PostToolUse',
+      matcher: 'Bash|Edit|Write|MultiEdit|NotebookEdit',
+      hooks: [
+        {
+          type: 'command',
+          command: `${base}/delegation-advisory.sh`,
+          timeout: 10000,
+          statusMessage: 'Checking delegation cadence...',
+        },
+      ],
+    },
   ];
 }

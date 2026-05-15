@@ -116,6 +116,17 @@
             "statusMessage": "Checking architecture impact..."
           }
         ]
+      },
+      {
+        "matcher": "Bash|Edit|Write|MultiEdit|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/delegation-advisory.sh",
+            "timeout": 10000,
+            "statusMessage": "Checking delegation cadence..."
+          }
+        ]
       }
     ]
   }

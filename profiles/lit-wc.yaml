@@ -29,3 +29,13 @@ notification_channel: ''
 attribution:
   co_author:
     enabled: false
+# 0.31.0 delegation-advisory nudge — disabled for lit-wc.
+# The delegation-advisory.sh PostToolUse hook emits a one-time stderr
+# advisory when a session crosses `threshold` write-class tool calls
+# without dispatching a curated specialist. External profiles ship
+# `enabled: false` — opt in per-repo via .rea/policy.yaml:
+#   delegation_advisory:
+#     enabled: true
+#     threshold: 25
+delegation_advisory:
+  enabled: false

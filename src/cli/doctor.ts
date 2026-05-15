@@ -189,6 +189,22 @@ export const EXPECTED_HOOKS = [
   'blocked-paths-enforcer.sh',
   'changeset-security-gate.sh',
   'dangerous-bash-interceptor.sh',
+  // 0.31.0 — `delegation-advisory.sh` is INTENTIONALLY NOT in this list.
+  // It is the brand-new PostToolUse delegation-nudge hook this release
+  // ships; adding it to EXPECTED_HOOKS would make `checkHooksInstalled`
+  // hard-`fail` on every pre-0.31.0 consumer install (and on this repo's
+  // own dogfood) the instant they upgrade the rea binary but before they
+  // run `rea upgrade` to lay down the new hook file — a regression that
+  // turns a green doctor red purely from upgrade lag. This mirrors the
+  // staged rollout `delegation-capture.sh` itself used: the file-presence
+  // entry joins EXPECTED_HOOKS in the SAME future minor that promotes
+  // `checkDelegationAdvisoryHookRegistered` from `warn` to `fail`, once
+  // consumers have had upgrade-lag time. Until then, a missing
+  // `delegation-advisory.sh` surfaces only through that `warn`-tier
+  // registration check — proportionate, since the hook is advisory at
+  // runtime and never blocks a tool call. See `git blame` on the 0.29.0
+  // round-2 P2 comment on `checkDelegationHookRegistered` for the prior
+  // application of this exact discipline.
   // 0.29.0 — delegation-telemetry MVP. The PreToolUse hook on
   // matcher `Agent|Skill` emits a `rea.delegation_signal` audit record
   // on every subagent / skill dispatch. Observational only — fails
@@ -1020,37 +1036,133 @@ function codexRequiredFromPolicy(baseDir: string): boolean {
  * `.claude/settings.json` under PreToolUse with matcher `Agent|Skill`
  * AND that the hook file exists at the expected dogfood path.
  *
- * Status posture for 0.29.0:
+ * Status posture:
  *
- * The 0.29.0 release introduces a new desired-hook entry in
- * `defaultDesiredHooks()` that `rea init` and `rea upgrade` will merge
- * into consumer `.claude/settings.json` files. Existing consumer
- * installs (and this repo's own dogfood, which is locked from
- * agent-driven edits by `settings-protection.sh`) won't have the
- * matcher registered until the operator runs `rea upgrade`.
+ * 0.29.0 shipped this check as `warn` (advisory) — the
+ * `defaultDesiredHooks()` entry was new, and existing consumer
+ * installs (plus this repo's own dogfood, locked from agent-driven
+ * edits by `settings-protection.sh`) wouldn't have the matcher
+ * registered until the operator ran `rea upgrade`. The comments
+ * promised promotion to `fail` "in 0.30.0".
  *
- * To keep the upgrade-lag period from breaking `rea doctor`, the
- * check is `warn` (not `fail`) for 0.29.0. The detail message names
- * the exact command to fix and points at the canonical
- * `delegation-capture.sh` install. After 0.29.0+1 consumer-install
- * cycles have propagated, this should be promoted to `fail` so a
- * skipped upgrade is loud rather than silent. Codex round 2 P2
- * (2026-05-12).
+ * **0.31.0 makes good on that promise.** The 0.29.0 → 0.30.x consumer
+ * cycles have propagated; the `Agent|Skill` matcher has been in
+ * `defaultDesiredHooks()` for multiple minors. A consumer install
+ * that still lacks the registration is a real governance gap (the
+ * delegation telemetry — and now the 0.31.0 nudge — silently does
+ * nothing), so the check is `fail`. The detail message still names
+ * the exact `rea upgrade` fix.
  *
  * Hook-file presence is verified separately by `checkHooksInstalled`
- * via `EXPECTED_HOOKS` — that path stays at the hard-`fail` posture
- * because file presence is part of the install manifest and doesn't
- * suffer the same template-propagation lag.
+ * via `EXPECTED_HOOKS` — that path was always hard-`fail`.
  */
 export function checkDelegationHookRegistered(baseDir: string): CheckResult {
   const label = 'delegation-capture hook registered';
+  // 0.31.0 — promoted from `warn` to `fail` (see the docstring).
+  const REFUSE = 'fail' as const;
+  const settingsPath = path.join(baseDir, '.claude', 'settings.json');
+  if (!fs.existsSync(settingsPath)) {
+    return {
+      label,
+      status: REFUSE,
+      detail: `missing: ${settingsPath} — run \`rea upgrade\` or \`rea init\``,
+    };
+  }
+  let parsed: {
+    hooks?: Record<string, Array<{ matcher?: string; hooks?: Array<{ command?: string }> }>>;
+  };
+  try {
+    parsed = JSON.parse(fs.readFileSync(settingsPath, 'utf8')) as typeof parsed;
+  } catch (e) {
+    return {
+      label,
+      status: REFUSE,
+      detail: e instanceof Error ? e.message : String(e),
+    };
+  }
+  const groups = parsed.hooks?.PreToolUse ?? [];
+  const group = groups.find((g) => g.matcher === 'Agent|Skill');
+  if (group === undefined) {
+    return {
+      label,
+      status: REFUSE,
+      detail:
+        'no PreToolUse group with matcher "Agent|Skill" found in .claude/settings.json — ' +
+        'run `rea upgrade` to install. ' +
+        'NOTE: matcher MUST be exactly `Agent|Skill` ' +
+        '(NOT `Task|Skill` — `TaskCreate`/`TaskList` are unrelated todo-list tools).',
+    };
+  }
+  const cmds = (group.hooks ?? []).map((h) => (typeof h.command === 'string' ? h.command : ''));
+  if (!cmds.some((c) => c.includes('delegation-capture.sh'))) {
+    return {
+      label,
+      status: REFUSE,
+      detail:
+        'Agent|Skill matcher exists but no delegation-capture.sh command found in its hooks list',
+    };
+  }
+  return { label, status: 'pass' };
+}
+
+/**
+ * 0.31.0 — verify the delegation-advisory hook is registered in
+ * `.claude/settings.json` under PostToolUse with matcher
+ * `Bash|Edit|Write|MultiEdit|NotebookEdit`, that a
+ * `delegation-advisory.sh` command is present in that group, AND that
+ * the `.claude/hooks/delegation-advisory.sh` file actually exists.
+ *
+ * Status posture: `warn` (advisory) for 0.31.0. This is a brand-new
+ * `defaultDesiredHooks()` entry — the exact same upgrade-lag situation
+ * `checkDelegationHookRegistered` faced in 0.29.0. Existing consumer
+ * installs (and this repo's own dogfood, locked from agent-driven
+ * edits by `settings-protection.sh`) won't have the PostToolUse group
+ * until the operator runs `rea upgrade`. Holding at `warn` for one
+ * release cycle keeps `rea doctor` green during propagation; a future
+ * minor promotes it to `fail` once consumer installs have caught up —
+ * the same ratchet `checkDelegationHookRegistered` just completed.
+ *
+ * The hook is ALSO advisory at runtime (it never blocks a tool call,
+ * and `policy.delegation_advisory` defaults to disabled), so a missing
+ * registration is a lower-stakes gap than a missing security gate —
+ * `warn` is proportionate even setting the upgrade-lag aside.
+ *
+ * # Why this check verifies file presence AND executability (round-2/3 P2)
+ *
+ * `delegation-advisory.sh` is deliberately NOT in `EXPECTED_HOOKS` for
+ * 0.31.0 (staged rollout — see the `EXPECTED_HOOKS` comment). That
+ * leaves THIS function as the only 0.31.0 doctor signal covering the
+ * new hook, so it must check the file too:
+ *
+ *   - File MISSING — a settings.json that references
+ *     `delegation-advisory.sh` while the actual script is absent (a
+ *     partial `rea upgrade`, manual drift) would otherwise report
+ *     `pass`, and every matching PostToolUse dispatch would shell out
+ *     to a nonexistent path.
+ *   - File present but NOT EXECUTABLE — a script copied without its
+ *     mode bits (a manual `cp`, an archive extracted without `+x`
+ *     preservation) cannot be launched by Claude Code from
+ *     `settings.json` at all. `checkHooksInstalled` performs this exact
+ *     `0o111` check for every `EXPECTED_HOOKS` entry; because
+ *     `delegation-advisory.sh` is held out of that list, the parity
+ *     check has to live here.
+ *
+ * Both failures are held at the same `warn` tier as the registration
+ * failures: consistent posture for 0.31.0, and they promote to `fail`
+ * alongside them — at which point `delegation-advisory.sh` also joins
+ * `EXPECTED_HOOKS` and gets the hard-`fail` `checkHooksInstalled`
+ * coverage (presence + executability) the other hooks have.
+ */
+export function checkDelegationAdvisoryHookRegistered(baseDir: string): CheckResult {
+  const label = 'delegation-advisory hook registered';
   const ADVISORY = 'warn' as const;
+  const MATCHER = 'Bash|Edit|Write|MultiEdit|NotebookEdit';
   const settingsPath = path.join(baseDir, '.claude', 'settings.json');
   if (!fs.existsSync(settingsPath)) {
     return {
       label,
       status: ADVISORY,
-      detail: `missing: ${settingsPath} — run \`rea upgrade\` or \`rea init\` (advisory in 0.29.0; promoted to fail in 0.30.0)`,
+      detail: `missing: ${settingsPath} — run \`rea upgrade\` or \`rea init\` (advisory in 0.31.0)`,
     };
   }
   let parsed: {
@@ -1065,26 +1177,56 @@ export function checkDelegationHookRegistered(baseDir: string): CheckResult {
       detail: e instanceof Error ? e.message : String(e),
     };
   }
-  const groups = parsed.hooks?.PreToolUse ?? [];
-  const group = groups.find((g) => g.matcher === 'Agent|Skill');
+  const groups = parsed.hooks?.PostToolUse ?? [];
+  const group = groups.find((g) => g.matcher === MATCHER);
   if (group === undefined) {
     return {
       label,
       status: ADVISORY,
       detail:
-        'no PreToolUse group with matcher "Agent|Skill" found in .claude/settings.json — ' +
-        'run `rea upgrade` to install (advisory in 0.29.0; promoted to fail in 0.30.0). ' +
-        'NOTE: matcher MUST be exactly `Agent|Skill` ' +
-        '(NOT `Task|Skill` — `TaskCreate`/`TaskList` are unrelated todo-list tools).',
+        `no PostToolUse group with matcher "${MATCHER}" found in .claude/settings.json — ` +
+        'run `rea upgrade` to install (advisory in 0.31.0; promoted to fail in a later minor). ' +
+        'NOTE: the matcher INCLUDES Bash — the delegation nudge counts every write-class ' +
+        'tool call, not just file edits.',
     };
   }
   const cmds = (group.hooks ?? []).map((h) => (typeof h.command === 'string' ? h.command : ''));
-  if (!cmds.some((c) => c.includes('delegation-capture.sh'))) {
+  if (!cmds.some((c) => c.includes('delegation-advisory.sh'))) {
+    return {
+      label,
+      status: ADVISORY,
+      detail: `${MATCHER} matcher exists but no delegation-advisory.sh command found in its hooks list`,
+    };
+  }
+  // Round-2/3 P2: the registration string is present — now confirm the
+  // hook file it points at actually exists AND is executable. Because
+  // `delegation-advisory.sh` is intentionally out of `EXPECTED_HOOKS`
+  // for 0.31.0, `checkHooksInstalled` does NOT cover it; this is the
+  // only signal, so it owns both the presence and the `0o111` checks
+  // that `checkHooksInstalled` does for every other shipped hook.
+  const hookFile = path.join(baseDir, '.claude', 'hooks', 'delegation-advisory.sh');
+  let hookStat: fs.Stats;
+  try {
+    hookStat = fs.statSync(hookFile);
+  } catch {
     return {
       label,
       status: ADVISORY,
       detail:
-        'Agent|Skill matcher exists but no delegation-capture.sh command found in its hooks list',
+        `${MATCHER} matcher references delegation-advisory.sh but the hook file is missing: ` +
+        `${hookFile} — run \`rea upgrade\` to lay it down (advisory in 0.31.0). ` +
+        'Without the file every matching PostToolUse dispatch shells out to a nonexistent path.',
+    };
+  }
+  if ((hookStat.mode & 0o111) === 0) {
+    return {
+      label,
+      status: ADVISORY,
+      detail:
+        `${MATCHER} matcher references delegation-advisory.sh but the hook file is not executable ` +
+        `(mode=${(hookStat.mode & 0o777).toString(8)}): ${hookFile} — ` +
+        'run `rea upgrade` or `chmod +x` it (advisory in 0.31.0). ' +
+        'A non-executable hook cannot be launched by Claude Code from settings.json.',
     };
   }
   return { label, status: 'pass' };
@@ -1092,44 +1234,110 @@ export function checkDelegationHookRegistered(baseDir: string): CheckResult {
 
 /**
  * 0.29.0 — synthetic round-trip of the delegation-signal audit path.
- * Drives a synthetic Claude Code PreToolUse hook payload through the
- * REAL `rea hook delegation-signal` CLI by spawning a child process
- * (same path the shell hook hits) and asserts:
+ * 0.31.0 — drives the REAL `.claude/hooks/delegation-capture.sh` shell
+ * hook, not just the `rea hook delegation-signal` CLI underneath it.
  *
- *   - The CLI exited 0.
- *   - A new `rea.delegation_signal` record landed on disk.
+ * Feeds a synthetic Claude Code PreToolUse hook payload to the shell
+ * hook (the exact entry point Claude Code's `Agent|Skill` matcher
+ * invokes in production) and asserts:
+ *
+ *   - The shell hook exited 0.
+ *   - A new `rea.delegation_signal` record landed on disk — the smoke
+ *     check POLLS for it, because `delegation-capture.sh` backgrounds
+ *     + disowns the CLI (`& disown`) so the shell hook returns before
+ *     the audit append completes.
  *   - The record's metadata contains the probe tag (so we don't
  *     mistakenly attribute an existing record to our run).
+ *   - The recorded `invocation_description_sha256` matches the
+ *     expected hash of the probe description.
  *   - Chain integrity holds (recomputed hash == stored hash).
  *
- * Codex round 1 P2 (2026-05-12): the previous implementation called
- * `appendAuditRecord()` directly — short-circuiting stdin parsing,
- * SHA-256 hashing, redact-secrets timing, and the `process.exit`
- * ordering that round 1's P1 exposed. That made the smoke check
- * report success even when the real production path was broken.
+ * # Why drive the shell hook, not the CLI directly
  *
- * This rewrite exercises the same surface the `Agent|Skill`
- * PreToolUse hook does in production, so future regressions in
- * stdin parsing, hashing, redaction, or process-lifecycle behavior
- * fail the smoke check loudly.
+ * 0.29.0's version spawned `rea hook delegation-signal` directly. That
+ * exercised the CLI's stdin parsing / hashing / redaction / process-
+ * lifecycle — but NOT the shell shim's own logic: the 2-tier sandboxed
+ * CLI resolution, the realpath sandbox check, the `& disown`
+ * backgrounding. A regression in the shim (a botched resolution order,
+ * a sandbox check that rejects the legitimate dogfood CLI, a
+ * backgrounding bug that drops the signal) would pass 0.29.0's smoke
+ * check while breaking production. 0.31.0 closes that gap: the smoke
+ * check now invokes `bash .claude/hooks/delegation-capture.sh` and
+ * the CLI is reached only through the shim.
  *
- * Gated behind `--smoke` so a casual `rea doctor` doesn't write
- * probe records on every invocation. Operators run
- * `rea doctor --smoke` after install / upgrade to confirm the
- * pipeline is wired end-to-end.
+ * # Prerequisites and graceful degradation
+ *
+ * The check needs THREE things and degrades to `warn` (not `fail`)
+ * when any is absent — a missing prerequisite is an environment gap,
+ * not a wiring regression:
+ *
+ *   - `bash` on PATH.
+ *   - `.claude/hooks/delegation-capture.sh` present (the consumer
+ *     install path; absent before `rea init` / `rea upgrade`).
+ *   - A sandboxed rea CLI the shim can resolve — either
+ *     `<baseDir>/node_modules/@bookedsolid/rea/dist/cli/index.js` OR
+ *     `<baseDir>/dist/cli/index.js` (the rea-repo dogfood). Without
+ *     one the shim silently drops the signal by design, so the smoke
+ *     check would time out waiting for a record that will never land.
+ *
+ * Gated behind `--smoke` so a casual `rea doctor` doesn't write probe
+ * records on every invocation. Operators run `rea doctor --smoke`
+ * after install / upgrade to confirm the pipeline is wired end-to-end.
  */
 export async function checkDelegationRoundTrip(baseDir: string): Promise<CheckResult> {
+  const label = 'delegation-signal round-trip';
   const probeTag = `doctor-smoke-${process.pid}-${Date.now()}`;
-  // Resolve the rea CLI binary the same way the shell hook does.
-  // First-class: this very process is running rea, so `process.argv[1]`
-  // is the right entrypoint. Fall back to the dist path in
-  // node_modules.
-  const cliEntry = process.argv[1];
-  if (cliEntry === undefined || cliEntry.length === 0) {
+
+  // Prerequisite 1: the shell hook file. The consumer install path is
+  // `.claude/hooks/delegation-capture.sh`; that is the exact file
+  // Claude Code's matcher invokes. We do NOT fall back to the source
+  // `hooks/` copy — the point of the smoke check is to validate the
+  // INSTALLED artifact.
+  const hookPath = path.join(baseDir, '.claude', 'hooks', 'delegation-capture.sh');
+  if (!fs.existsSync(hookPath)) {
     return {
-      label: 'delegation-signal round-trip',
-      status: 'fail',
-      detail: 'could not resolve the rea CLI entrypoint (process.argv[1] empty)',
+      label,
+      status: 'warn',
+      detail:
+        `shell hook not installed at ${hookPath} — run \`rea init\` / \`rea upgrade\`. ` +
+        'Smoke check needs the installed hook to drive the full chain.',
+    };
+  }
+
+  // Prerequisite 2: bash on PATH.
+  const { spawnSync } = await import('node:child_process');
+  const bashProbe = spawnSync('bash', ['--version'], { encoding: 'utf8' });
+  if (bashProbe.status !== 0) {
+    return {
+      label,
+      status: 'warn',
+      detail: 'bash not available — cannot drive the delegation-capture.sh shell hook',
+    };
+  }
+
+  // Prerequisite 3: a sandboxed rea CLI the shim can resolve. The
+  // shim's 2-tier order is node_modules/@bookedsolid/rea/dist/... then
+  // <proj>/dist/cli/index.js. If NEITHER exists the shim drops the
+  // signal silently (by design) and the poll below would just time
+  // out — surface the real reason instead.
+  const consumerCli = path.join(
+    baseDir,
+    'node_modules',
+    '@bookedsolid',
+    'rea',
+    'dist',
+    'cli',
+    'index.js',
+  );
+  const dogfoodCli = path.join(baseDir, 'dist', 'cli', 'index.js');
+  if (!fs.existsSync(consumerCli) && !fs.existsSync(dogfoodCli)) {
+    return {
+      label,
+      status: 'warn',
+      detail:
+        'no sandboxed rea CLI in scope (need node_modules/@bookedsolid/rea/dist/cli/index.js ' +
+        'or <baseDir>/dist/cli/index.js) — the shell hook drops the signal silently here. ' +
+        'Run `pnpm build` (dogfood) or `pnpm i` (consumer) first.',
     };
   }
 
@@ -1154,13 +1362,13 @@ export async function checkDelegationRoundTrip(baseDir: string): Promise<CheckRe
   });
   const auditPath = path.join(baseDir, '.rea', 'audit.jsonl');
 
-  // Synchronously spawn the CLI. The blocking wait is appropriate for
-  // a doctor check — the operator just typed `rea doctor --smoke` and
-  // is waiting for output anyway. `--detach` is NOT passed: we want
-  // the CLI to await its own append (the post-P1 fix) and exit
-  // cleanly.
-  const { spawnSync } = await import('node:child_process');
-  const res = spawnSync(process.execPath, [cliEntry, 'hook', 'delegation-signal'], {
+  // Drive the REAL shell hook. `delegation-capture.sh` reads the
+  // payload on stdin, resolves + sandbox-checks the rea CLI, then
+  // backgrounds `rea hook delegation-signal --detach` with `& disown`.
+  // The hook itself returns near-instantly; the audit append lands
+  // asynchronously. CLAUDE_PROJECT_DIR is set so the shim resolves the
+  // same baseDir doctor is checking.
+  const res = spawnSync('bash', [hookPath], {
     cwd: baseDir,
     input: payload,
     encoding: 'utf8',
@@ -1169,60 +1377,76 @@ export async function checkDelegationRoundTrip(baseDir: string): Promise<CheckRe
   });
   if (res.error !== undefined) {
     return {
-      label: 'delegation-signal round-trip',
+      label,
       status: 'fail',
-      detail: `CLI spawn failed: ${res.error.message}`,
+      detail: `shell hook spawn failed: ${res.error.message}`,
     };
   }
   if (res.status !== 0) {
     return {
-      label: 'delegation-signal round-trip',
+      label,
       status: 'fail',
-      detail: `CLI exited ${res.status ?? 'null'}; stderr: ${(res.stderr ?? '').slice(0, 240)}`,
+      detail: `shell hook exited ${res.status ?? 'null'}; stderr: ${(res.stderr ?? '').slice(0, 240)}`,
     };
   }
 
-  // Read the audit log and find the record carrying our probe tag.
-  let raw: string;
-  try {
-    raw = await fsPromises.readFile(auditPath, 'utf8');
-  } catch (e) {
-    return {
-      label: 'delegation-signal round-trip',
-      status: 'fail',
-      detail: `audit log read failed: ${e instanceof Error ? e.message : String(e)}`,
+  // The shell hook backgrounds the CLI — poll the audit log for our
+  // probe record. Budget: 10s, checked every 150ms. The audit append
+  // is local-filesystem work behind a lockfile; under normal
+  // conditions it lands in well under a second.
+  interface MatchedRecord {
+    line: string;
+    parsed: {
+      tool_name?: string;
+      metadata?: { subagent_type?: string; invocation_description_sha256?: string };
+      hash?: string;
     };
   }
-  const lines = raw.split('\n').filter((l) => l.length > 0);
-  type MatchedMeta = {
-    subagent_type?: string;
-    invocation_description_sha256?: string;
-  };
-  let matched: {
-    line: string;
-    parsed: { tool_name?: string; metadata?: MatchedMeta; hash?: string };
-  } | null = null;
-  for (const line of lines) {
-    try {
-      const p = JSON.parse(line) as {
-        tool_name?: string;
-        metadata?: MatchedMeta;
-        hash?: string;
-      };
-      if (p.tool_name === DELEGATION_SIGNAL_TOOL_NAME && p.metadata?.subagent_type === probeTag) {
-        matched = { line, parsed: p };
+  /** Scan one audit-file's content for the probe record; null when absent. */
+  const scanForProbe = (raw: string): MatchedRecord | null => {
+    let found: MatchedRecord | null = null;
+    for (const line of raw.split('\n')) {
+      if (line.length === 0) continue;
+      try {
+        const p = JSON.parse(line) as MatchedRecord['parsed'];
+        if (
+          p.tool_name === DELEGATION_SIGNAL_TOOL_NAME &&
+          p.metadata?.subagent_type === probeTag
+        ) {
+          found = { line, parsed: p };
+        }
+      } catch {
+        // skip malformed
       }
-    } catch {
-      // skip malformed
     }
+    return found;
+  };
+  let matched: MatchedRecord | null = null;
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline) {
+    let raw: string | null = null;
+    try {
+      raw = await fsPromises.readFile(auditPath, 'utf8');
+    } catch {
+      // Audit file may not exist yet on a brand-new install — keep
+      // polling; the first append creates it.
+      raw = null;
+    }
+    if (raw !== null) {
+      matched = scanForProbe(raw);
+      if (matched !== null) break;
+    }
+    await new Promise((r) => setTimeout(r, 150));
   }
   if (matched === null) {
     return {
-      label: 'delegation-signal round-trip',
+      label,
       status: 'fail',
       detail:
-        `CLI exited 0 but no ` +
-        `rea.delegation_signal record with probe-tag ${probeTag} found in audit.jsonl`,
+        `shell hook exited 0 but no rea.delegation_signal record with probe-tag ` +
+        `${probeTag} appeared in audit.jsonl within 10s — the shim resolved/sandboxed ` +
+        `the CLI but the backgrounded append never landed (check shell-hook stderr: ` +
+        `${(res.stderr ?? '').slice(0, 160)})`,
     };
   }
   // Codex round 4 P3 (2026-05-12): assert the recorded
@@ -1232,7 +1456,7 @@ export async function checkDelegationRoundTrip(baseDir: string): Promise<CheckRe
   const recordedDescHash = matched.parsed.metadata?.invocation_description_sha256;
   if (recordedDescHash !== expectedDescriptionHash) {
     return {
-      label: 'delegation-signal round-trip',
+      label,
       status: 'fail',
       detail:
         `recorded invocation_description_sha256 mismatch: ` +
@@ -1249,7 +1473,7 @@ export async function checkDelegationRoundTrip(baseDir: string): Promise<CheckRe
   const storedHash = recordParsed.hash;
   if (typeof storedHash !== 'string' || storedHash.length !== 64) {
     return {
-      label: 'delegation-signal round-trip',
+      label,
       status: 'fail',
       detail: 'probe record has no valid `hash` field',
     };
@@ -1259,15 +1483,18 @@ export async function checkDelegationRoundTrip(baseDir: string): Promise<CheckRe
   const recomputed = computeHash(rest as unknown as Parameters<typeof computeHash>[0]);
   if (recomputed !== storedHash) {
     return {
-      label: 'delegation-signal round-trip',
+      label,
       status: 'fail',
       detail: `chain integrity broken: stored=${storedHash} recomputed=${recomputed}`,
     };
   }
   return {
-    label: 'delegation-signal round-trip',
+    label,
     status: 'pass',
-    detail: `probe via real CLI (hash=${storedHash.slice(0, 16)}, tag=${probeTag.slice(-8)})`,
+    detail: `probe via real .claude/hooks/delegation-capture.sh shell hook (hash=${storedHash.slice(
+      0,
+      16,
+    )}, tag=${probeTag.slice(-8)})`,
   };
 }
 
@@ -1312,8 +1539,14 @@ export function collectChecks(
     // checkSettingsJson because that check only validates the
     // existence of the Bash + Write|Edit|MultiEdit|NotebookEdit
     // matcher groups. The Agent|Skill matcher is new and needs its
-    // own pass/fail signal.
+    // own pass/fail signal. 0.31.0 — promoted warn → fail.
     checkDelegationHookRegistered(baseDir),
+    // 0.31.0 — delegation-telemetry completion. The PostToolUse
+    // `Bash|Edit|Write|MultiEdit|NotebookEdit` matcher group drives
+    // the delegation-advisory nudge hook. Advisory (warn) for 0.31.0
+    // — same upgrade-lag ratchet checkDelegationHookRegistered went
+    // through in 0.29.0.
+    checkDelegationAdvisoryHookRegistered(baseDir),
   ];
 
   // Non-git escape hatch: when `.git/` is absent, both git-hook checks are

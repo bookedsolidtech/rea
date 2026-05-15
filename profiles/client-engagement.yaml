@@ -35,3 +35,14 @@ context_protection:
 attribution:
   co_author:
     enabled: false
+# 0.31.0 delegation-advisory nudge — disabled for client-engagement.
+# The delegation-advisory.sh PostToolUse hook emits a one-time stderr
+# advisory when a session crosses `threshold` write-class tool calls
+# without dispatching a curated specialist. Client projects vary too
+# much in their delegation conventions to ship the nudge on by
+# default — opt in per-repo via .rea/policy.yaml:
+#   delegation_advisory:
+#     enabled: true
+#     threshold: 25
+delegation_advisory:
+  enabled: false

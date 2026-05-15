@@ -381,6 +381,60 @@ export interface AttributionCoAuthorPolicy {
 }
 
 /**
+ * Delegation-advisory nudge policy (0.31.0+).
+ *
+ * 0.29.0 shipped the delegation-telemetry *observability* layer (the
+ * `Agent|Skill` PreToolUse capture hook + `rea audit specialists`
+ * reader). 0.31.0 closes the loop with the *nudge*: the
+ * `delegation-advisory.sh` PostToolUse hook (matcher
+ * `Bash|Edit|Write|MultiEdit|NotebookEdit`) counts the current
+ * session's write-class tool calls and, when that count crosses
+ * `threshold` WITHOUT a `rea.delegation_signal` record landing in the
+ * session, prints a one-time stderr advisory: "this session has done a
+ * lot of work without delegating to a specialist".
+ *
+ * The advisory is purely informational — the hook always exits 0
+ * (except under HALT, which exits 2 to keep the kill-switch contract
+ * uniform). It NEVER blocks a tool call.
+ *
+ * Profile defaults: `enabled: true` for the `bst-internal*` profiles
+ * (BST's own delegation discipline is load-bearing); `enabled: false`
+ * for every external profile (`open-source*`, `minimal`,
+ * `client-engagement`, `lit-wc`) — OSS consumers opt in per-repo via
+ * `.rea/policy.yaml`, since "you should delegate more" is an opinion
+ * not every team shares.
+ */
+export interface DelegationAdvisoryPolicy {
+  /**
+   * Master switch. When `false` (or the whole block is omitted) the
+   * `delegation-advisory.sh` hook is a silent no-op. Default `false` at
+   * the schema layer; `bst-internal*` profiles pin `true`.
+   */
+  enabled?: boolean;
+  /**
+   * Write-class tool-call count at which the advisory fires. The
+   * `delegation-advisory.sh` hook maintains a per-session counter file
+   * and emits the nudge the first time the counter reaches this value
+   * with zero delegation signals recorded for the session. Default
+   * `25` — a session that has run 25 Bash/Edit/Write/MultiEdit/
+   * NotebookEdit calls without once dispatching a specialist is doing
+   * meaningful work solo. Must be a positive integer.
+   */
+  threshold?: number;
+  /**
+   * Subagent / skill names that do NOT count as "real delegation" for
+   * the purpose of suppressing the advisory. A session that only ever
+   * delegated to `general-purpose` / `Explore` / `Plan` (the built-in
+   * Claude Code helpers) has not actually routed work to a curated
+   * specialist, so those signals don't reset the nudge. Default:
+   * `["general-purpose", "Explore", "Plan", "output-style-setup",
+   * "statusline-setup"]`. A delegation signal whose `subagent_type` is
+   * in this list is ignored when deciding whether to fire.
+   */
+  exempt_subagents?: string[];
+}
+
+/**
  * G9 — injection tier escalation knobs. The classifier bucketed matches into
  * `clean` / `suspicious` / `likely_injection`; this block governs what happens
  * to the `suspicious` bucket (a single literal match at write/destructive tier,
@@ -488,4 +542,12 @@ export interface Policy {
    * trailer are no-ops. See `AttributionPolicy` for the full contract.
    */
   attribution?: AttributionPolicy;
+  /**
+   * Delegation-advisory nudge (0.31.0+). When `enabled: true`, the
+   * `delegation-advisory.sh` PostToolUse hook emits a one-time stderr
+   * advisory when a session crosses `threshold` write-class tool calls
+   * without dispatching a curated specialist. Advisory only — never
+   * blocks. See `DelegationAdvisoryPolicy` for the full contract.
+   */
+  delegation_advisory?: DelegationAdvisoryPolicy;
 }

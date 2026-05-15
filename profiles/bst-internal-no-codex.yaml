@@ -58,3 +58,15 @@ context_protection:
 attribution:
   co_author:
     enabled: false
+# 0.31.0 delegation-advisory nudge — enabled for bst-internal-no-codex.
+# This is a bst-internal variant, so it inherits BST's delegation
+# discipline: the delegation-advisory.sh PostToolUse hook emits a
+# one-time stderr advisory when a session crosses `threshold`
+# write-class tool calls (Bash/Edit/Write/MultiEdit/NotebookEdit)
+# without dispatching a curated specialist. Advisory only — never
+# blocks. `exempt_subagents` omitted → schema default applies
+# (general-purpose, Explore, Plan, output-style-setup,
+# statusline-setup don't count as real delegation).
+delegation_advisory:
+  enabled: true
+  threshold: 25
