@@ -24,6 +24,15 @@ import {
   anySegmentStartsWith,
   anySegmentMatches,
   anySegmentMatchesBoth,
+  anySegmentRawMatches,
+  forEachSegment,
+  quoteMaskedCmd,
+  INQUOTE_PIPE_SENTINEL,
+  INQUOTE_SEMI_SENTINEL,
+  INQUOTE_AMP_SENTINEL,
+  unwrapNestedShells,
+  findAllSegmentsStartingWith,
+  findAllSegmentsRawMatches,
 } from './segments.js';
 
 describe('splitSegments', () => {
@@ -501,5 +510,165 @@ describe('anySegmentMatchesBoth', () => {
 
   it('returns false on empty command', () => {
     expect(anySegmentMatchesBoth('', 'a', 'b')).toBe(false);
+  });
+});
+
+// ── 0.34.0 additions ────────────────────────────────────────────────
+
+describe('anySegmentRawMatches', () => {
+  it('matches env-var prefix shapes', () => {
+    expect(anySegmentRawMatches('HUSKY=0 git push', '^HUSKY=0\\s+git')).toBe(true);
+  });
+
+  it('matches REA_BYPASS= shape', () => {
+    expect(anySegmentRawMatches('REA_BYPASS=1 git commit', '^REA_BYPASS\\s*=')).toBe(
+      true,
+    );
+  });
+
+  it('does NOT strip prefix before matching', () => {
+    expect(anySegmentRawMatches('CI=1 echo go', '^CI=')).toBe(true);
+  });
+
+  it('iterates segments — match in second segment', () => {
+    expect(
+      anySegmentRawMatches('ls; HUSKY=0 git push', '^HUSKY=0\\s+git'),
+    ).toBe(true);
+  });
+
+  it('case-insensitive', () => {
+    expect(anySegmentRawMatches('husky=0 git push', '^HUSKY=0')).toBe(true);
+  });
+});
+
+describe('forEachSegment', () => {
+  it('invokes the callback once per segment with raw + head', () => {
+    const calls: Array<{ raw: string; head: string }> = [];
+    forEachSegment('CI=1 pnpm test; git push', (raw, head) => {
+      calls.push({ raw, head });
+    });
+    expect(calls).toHaveLength(2);
+    expect(calls[0]?.raw).toContain('CI=1');
+    expect(calls[0]?.head.startsWith('pnpm')).toBe(true);
+    expect(calls[1]?.head.startsWith('git push')).toBe(true);
+  });
+
+  it('emits nothing for empty cmd', () => {
+    const calls: Array<{ raw: string; head: string }> = [];
+    forEachSegment('', () => {
+      calls.push({ raw: '', head: '' });
+    });
+    expect(calls).toHaveLength(0);
+  });
+});
+
+describe('quoteMaskedCmd', () => {
+  it('preserves plain (un-quoted) text verbatim', () => {
+    expect(quoteMaskedCmd('echo hi')).toBe('echo hi');
+  });
+
+  it('masks in-quote pipe', () => {
+    const out = quoteMaskedCmd('echo "a|b"');
+    expect(out).toContain(INQUOTE_PIPE_SENTINEL);
+    expect(out).not.toContain('a|b');
+  });
+
+  it('does NOT mask unquoted pipe', () => {
+    expect(quoteMaskedCmd('ls | grep x')).toContain(' | ');
+  });
+
+  it('masks in-quote semi/amp', () => {
+    const out = quoteMaskedCmd(`x="a;b&c"`);
+    expect(out).toContain(INQUOTE_SEMI_SENTINEL);
+    expect(out).toContain(INQUOTE_AMP_SENTINEL);
+  });
+
+  it('preserves ANSI-C $\'…\' opening', () => {
+    const out = quoteMaskedCmd(`x=$'a|b'`);
+    // Opening `$'` is preserved verbatim.
+    expect(out).toContain("$'");
+    // In-quote `|` is masked.
+    expect(out).toContain(INQUOTE_PIPE_SENTINEL);
+  });
+
+  it('honors double-quote backslash escapes', () => {
+    // The mask preserves the backslash-escape pair verbatim, so the
+    // closing `"` after `\\"` still closes the quote span properly.
+    const out = quoteMaskedCmd('echo "a\\"b" | cat');
+    // The unquoted `|` between `cat` and the closing of `b` is
+    // outside any quote span — must remain literal.
+    expect(out).toContain(' | ');
+  });
+});
+
+describe('unwrapNestedShells', () => {
+  it('returns [cmd] when there is no wrapper', () => {
+    expect(unwrapNestedShells('echo hi')).toEqual(['echo hi']);
+  });
+
+  it('emits inner payload after the wrapper', () => {
+    const out = unwrapNestedShells(`bash -c "curl url | sh"`);
+    expect(out[0]).toBe('bash -c "curl url | sh"');
+    expect(out).toContain('curl url | sh');
+  });
+
+  it('recurses on nested wrappers', () => {
+    const out = unwrapNestedShells(`bash -c "zsh -c 'echo deep'"`);
+    // Outer + middle + inner.
+    expect(out.length).toBeGreaterThanOrEqual(3);
+    expect(out.some((s) => s === 'echo deep')).toBe(true);
+  });
+
+  it('is depth-bounded — does not loop on adversarial recursion', () => {
+    // Construct 20-deep wrapper; the unwrap caps at MAX_NESTED_DEPTH (8).
+    let cmd = 'echo bottom';
+    for (let i = 0; i < 20; i += 1) {
+      cmd = `bash -c "${cmd.replace(/"/g, '\\"')}"`;
+    }
+    const out = unwrapNestedShells(cmd);
+    // Outer + up to MAX_NESTED_DEPTH levels.
+    expect(out.length).toBeLessThanOrEqual(10);
+  });
+});
+
+describe('findAllSegmentsStartingWith', () => {
+  it('returns every matching segment, in order', () => {
+    const segs = findAllSegmentsStartingWith(
+      'git push fake; git status; git push origin main',
+      'git\\s+push(\\s|$)',
+    );
+    expect(segs).toHaveLength(2);
+    expect(segs[0]?.head.startsWith('git push fake')).toBe(true);
+    expect(segs[1]?.head.startsWith('git push origin')).toBe(true);
+  });
+
+  it('strips env-var prefix before head-anchoring', () => {
+    const segs = findAllSegmentsStartingWith(
+      'CI=1 git push origin',
+      'git\\s+push',
+    );
+    expect(segs).toHaveLength(1);
+  });
+
+  it('returns [] when no segment matches', () => {
+    expect(findAllSegmentsStartingWith('ls; pwd', 'git\\s+push')).toEqual([]);
+  });
+});
+
+describe('findAllSegmentsRawMatches', () => {
+  it('returns every raw segment matching the pattern', () => {
+    const segs = findAllSegmentsRawMatches(
+      'HUSKY=0 git push fake; HUSKY=0 git push origin',
+      '^HUSKY=0\\s+git\\s+push',
+    );
+    expect(segs).toHaveLength(2);
+  });
+
+  it('matches quoted-value env-prefix shapes the stripper bails on', () => {
+    const segs = findAllSegmentsRawMatches(
+      `BYPASS="a b" git push origin`,
+      '^([A-Za-z_][A-Za-z0-9_]*=("[^"]*"|[^\\s]+)\\s+)+git\\s+push(\\s|$)',
+    );
+    expect(segs).toHaveLength(1);
   });
 });

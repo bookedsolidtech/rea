@@ -45,6 +45,9 @@ import { runHookEnvFileProtection } from '../hooks/env-file-protection/index.js'
 import { runHookDependencyAuditGate } from '../hooks/dependency-audit-gate/index.js';
 import { runHookChangesetSecurityGate } from '../hooks/changeset-security-gate/index.js';
 import { runHookArchitectureReviewGate } from '../hooks/architecture-review-gate/index.js';
+import { runHookDangerousBashInterceptor } from '../hooks/dangerous-bash-interceptor/index.js';
+import { runHookLocalReviewGate } from '../hooks/local-review-gate/index.js';
+import { runHookSecretScanner } from '../hooks/secret-scanner/index.js';
 import { loadPolicy } from '../policy/loader.js';
 import { appendAuditRecord, InvocationStatus, Tier } from '../audit/append.js';
 import {
@@ -1371,6 +1374,33 @@ export function registerHookCommand(program: Command): void {
     )
     .action(async () => {
       await runHookArchitectureReviewGate();
+    });
+
+  hook
+    .command('dangerous-bash-interceptor')
+    .description(
+      'Node-binary port of `hooks/dangerous-bash-interceptor.sh` (0.34.0). PreToolUse Bash gate that blocks destructive commands. Catalog of 17 HIGH (H1-H17) + 1 MEDIUM (M1) rules: force-push, --no-verify, HUSKY=0, rm -rf broad targets, curl|sh pipe-RCE, REA_BYPASS, alias/function-with-bypass, psql DROP, context_protection delegate enforcement. Exit 2 on HIGH match, 0 on MEDIUM-only advisory or pass-through.',
+    )
+    .action(async () => {
+      await runHookDangerousBashInterceptor();
+    });
+
+  hook
+    .command('local-review-gate')
+    .description(
+      'Node-binary port of `hooks/local-review-gate.sh` (0.34.0). PreToolUse Bash gate refusing `git push` (and optionally `git commit`) until a recent `rea.local_review` audit entry covers HEAD. Honors `policy.review.local_review.{mode=off|enforced, refuse_at=push|commit|both, bypass_env_var}`. Mode=off short-circuits silently; bypass var (default REA_SKIP_LOCAL_REVIEW) accepts process-env (global) or per-segment inline `VAR="<reason>" git push` shapes. CTO directive 2026-05-05 enforcement.',
+    )
+    .action(async () => {
+      await runHookLocalReviewGate();
+    });
+
+  hook
+    .command('secret-scanner')
+    .description(
+      'Node-binary port of `hooks/secret-scanner.sh` (0.34.0). PreToolUse Write/Edit/MultiEdit/NotebookEdit pre-write credential gate. Catalog of 12 HIGH + 5 MEDIUM patterns (AWS, Anthropic, GitHub, Stripe live/test, Supabase JWT, generic SECRET=, private-key armor, DB connection strings). awk-style line filter strips shell comments and `process.env.VAR` RHS assignments; `is_placeholder` filter drops `<your_key>`/`test_token`/`aaaaaaa` shapes. HIGH match → exit 2; MEDIUM-only → exit 0 with advisory. Suffix-excludes `.env.example`/`.env.sample`.',
+    )
+    .action(async () => {
+      await runHookSecretScanner();
     });
 
   hook
