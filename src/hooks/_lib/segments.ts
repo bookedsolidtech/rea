@@ -473,6 +473,49 @@ function splitSegmentsRecursive(cmd: string, depth: number): CommandSegment[] {
 }
 
 /**
+ * Test whether a flag token is a `-c`-class introducer.
+ *
+ * Bash accepts `-c` combined with any other short single-char flags in
+ * a single short-flag bundle: `-c`, `-lc`, `-lic`, `-cli`, `-lci`,
+ * `-cil`, `-ilc`, etc. The bash cmd-segments.sh `WRAP` regex lists
+ * a non-exhaustive defensive subset (`c|lc|lic|ic|cl|cli|li|il`) but
+ * bash itself accepts ANY short-flag bundle that contains a `c`.
+ *
+ * The TS detector mirrors bash semantics: a SHORT-flag bundle
+ * (`-letters`, single leading `-`) whose letter set contains `c` is
+ * an introducer. The separated `--c` long-flag form is also
+ * recognized for parity with the bash WRAP regex's `--c` alternation.
+ *
+ * Long flags (`--rcfile`, `--noprofile`, `--login`, `--init-file`)
+ * are NOT introducers regardless of whether they contain the letter
+ * `c` — bash's long-options namespace is disjoint from the `-c`
+ * payload-execute semantics.
+ *
+ * 0.36.0 audit-trail:
+ *   - Charter item 4 / 0.34.0 codex round-7 P2 #1: pre-fix the test
+ *     was `/c/i.test(flag.replace(/^--?/, ''))` which over-matched on
+ *     every flag with a `c` in its name (`--rcfile`, `--noprofile`).
+ *   - 0.36.0 codex round-1 P1: the first fix attempt used an explicit
+ *     allowlist `Set` mirroring the bash WRAP regex's explicit
+ *     alternation, which was a NARROWING vs the pre-fix behavior —
+ *     valid combined-flag forms like `-lci`, `-cil`, `-ilc` were not
+ *     in the allowlist and stopped unwrapping, reopening a bypass
+ *     surface against env-file-protection / dependency-audit-gate /
+ *     dangerous-bash matchers. This function restores parity with
+ *     bash itself: any short-flag bundle containing `c` qualifies.
+ */
+function isCDashIntroducer(flag: string): boolean {
+  // Separated long-flag form (rare but bash accepts it).
+  if (flag === '--c') return true;
+  // Short-flag bundle: single leading `-`, then one-or-more letters.
+  // The bundle is a `-c` introducer iff it contains the letter `c`
+  // (any position, any other-letters mix).
+  const m = /^-([A-Za-z]+)$/.exec(flag);
+  if (m === null) return false;
+  return /c/i.test(m[1] ?? '');
+}
+
+/**
  * Recognize a nested-shell wrapper segment and return the unquoted
  * payload string. Returns `null` when the segment is not a wrapper.
  *
@@ -559,15 +602,28 @@ function extractNestedShellPayload(head: string): string | null {
     const flag = flagMatch[0] ?? '';
     cursor += flag.length;
 
-    // Recognized flag-token shapes:
-    //   `-c` `-l` `-i` `-e` `-lc` `-lic` `-ic` `-cl` `-cli` `-li` `-il`
-    //   `--c` `--noprofile` (etc.) — we don't enforce the full list,
-    //   just that it's `-<letters>` or `--<letters>`.
+    // Recognized flag-token shapes (parity with cmd-segments.sh WRAP):
+    //   - pre-flags (no `-c` yet): `-l`, `-i`, `-e`, `-li`, `-il`,
+    //     `--noprofile`, `--rcfile`, `--login` (etc.)
+    //   - `-c`-class introducer: exactly `-c`, `-lc`, `-lic`, `-cl`,
+    //     `-cli`, `-li`, `-il`, `-ic` (the bash WRAP regex's
+    //     `-(c|lc|lic|ic|cl|cli|li|il)` set), OR separated `--c`.
+    //
+    // 0.36.0 audit-trail (charter item 4 / 0.34.0 codex round-7 P2 #1):
+    // pre-fix the test `/c/i.test(flag.replace(/^--?/, ''))` treated
+    // ANY flag containing the letter `c` as a `-c` introducer. This
+    // false-positived on benign flags like `--rcfile`, `--noprofile`
+    // (with `c` in the name), causing the walker to "commit" to a -c
+    // unwrap, advance past the flag, and then either fail to find a
+    // quoted payload or unwrap something that was never a shell-payload
+    // body. Net effect: over-trigger of nested-shell unwrap, with
+    // downstream advisory matchers seeing payloads that weren't ever
+    // shell-payloads. Fix restricts the introducer set to the exact
+    // WRAP-regex shapes; any other flag shape continues the flag walk
+    // (still valid — pre-flags before `-c` are accepted) but does NOT
+    // mark `sawCFlag = true`.
     if (!/^--?[A-Za-z]+$/.test(flag)) return null;
-
-    // Does this flag contain `c` (the -c introducer letter)?
-    // `--c` also counts (rare but bash accepts).
-    if (/c/i.test(flag.replace(/^--?/, ''))) {
+    if (isCDashIntroducer(flag)) {
       sawCFlag = true;
       // Continue the loop — the payload is the NEXT non-flag token.
       // (Bash's argv parser stops walking flags as soon as it sees -c,
@@ -575,6 +631,8 @@ function extractNestedShellPayload(head: string): string | null {
       // safety; the bash WRAP regex similarly tolerates trailing
       // flag-like tokens before the quoted body.)
     }
+    // Else: a pre-flag (e.g. `-l`, `--rcfile`, `--noprofile`) — keep
+    // walking; if a later token IS in `CDASH_INTRODUCERS` we'll fire.
   }
   if (!sawCFlag) return null;
   if (cursor >= trimmed.length) return null;
