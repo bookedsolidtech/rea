@@ -81,13 +81,19 @@ if [ "${#REA_ARGV[@]}" -eq 0 ]; then
     *".rea/last-review"*) CLI_MISSING_RELEVANT=1 ;;
     *".claude\\"*|*".husky\\"*|*".rea\\"*) CLI_MISSING_RELEVANT=1 ;;
   esac
-  # Codex round-1 P2 fix: scan policy.protected_writes entries too so a
-  # consumer-defined protected path isn't silently allowed when the CLI
-  # is missing. Read the policy via the same awk parser the consumer-
-  # facing relevance pre-gates use for blocked_paths.
+  # 0.37.0: route protected_writes reads through the unified
+  # policy-reader (Tier 1 CLI → Tier 2 python3 → Tier 3 awk
+  # block-form). Pre-0.37.0 the inline awk parser missed flow-form
+  # arrays (`protected_writes: [path/a, path/b]`) on CLI-missing
+  # installs, silently allowing writes to consumer-defined protected
+  # paths. The 4-tier ladder closes the bypass via Tier 2 whenever
+  # python3 + PyYAML are reachable; Tier 3 preserves the pre-0.37.0
+  # block-only posture as a no-dep fallback.
   if [ "$CLI_MISSING_RELEVANT" -eq 0 ]; then
     POLICY_FILE="${REA_ROOT}/.rea/policy.yaml"
     if [ -f "$POLICY_FILE" ]; then
+      # shellcheck source=_lib/policy-reader.sh
+      source "$(dirname "$0")/_lib/policy-reader.sh"
       while IFS= read -r entry; do
         [ -z "$entry" ] && continue
         base="$entry"
@@ -98,17 +104,7 @@ if [ "${#REA_ARGV[@]}" -eq 0 ]; then
         case "$CLI_MISSING_CMD" in
           *"$base"*) CLI_MISSING_RELEVANT=1; break ;;
         esac
-      done < <(awk '
-        /^protected_writes:/ { in_block=1; next }
-        in_block && /^[[:space:]]*-/ {
-          sub(/^[[:space:]]*-[[:space:]]*/, "")
-          gsub(/^["'\'']/, "")
-          gsub(/["'\'']$/, "")
-          print
-          next
-        }
-        in_block && /^[^[:space:]-]/ { in_block=0 }
-      ' "$POLICY_FILE" 2>/dev/null)
+      done < <(policy_reader_get_list protected_writes 2>/dev/null)
     fi
   fi
   if [ "$CLI_MISSING_RELEVANT" -eq 0 ]; then

@@ -158,100 +158,130 @@ if [ "${#REA_ARGV[@]}" -gt 0 ] && command -v node >/dev/null 2>&1; then
   fi
 fi
 
-# Helper: read a `local_review.<leaf>` policy key. Tries
-# `rea hook policy-get review.local_review --json` (one node-spawn for
-# the whole subtree) first — that path handles inline + block YAML
-# identically since it goes through the canonical `yaml.parse()`.
-# Falls back to a block-form awk parser when the CLI isn't available
-# or jq isn't installed. Empty stdout → "default applies".
+# 0.37.0: route policy reads through the unified policy-reader. The
+# pre-0.37.0 helper here was a hand-rolled dual-tier (CLI subtree
+# JSON + per-leaf awk block-form parser). The new helper consolidates
+# CLI + python3 + awk into a single 4-tier ladder, so inline-form
+# mappings like `local_review: { mode: off, refuse_at: commit }` now
+# work even on installs where the CLI is unreachable AND python3 +
+# PyYAML are available (the previous bash awk fallback missed inline
+# forms entirely — silent no-op on stale-CLI installs).
 #
-# 0.34.0 round-2 P2 fix: pre-fix the shim only ran the block-form awk
-# parser, so inline-form mappings like
-# `local_review: { mode: off, refuse_at: commit }` silently no-op'd on
-# stale-CLI installs (the canonical loader DOES handle them — only the
-# shim was block-only). Hybrid policy reader mirrors the pattern used
-# by prepare-commit-msg's augmenter.
+# Behavior preserved: empty stdout → "default applies"; the helper
+# returns 0 even when the key is unset, so the existing callers'
+# `case` statements work unchanged.
 #
-# The subtree JSON is fetched ONCE per Bash event (cached in
-# `_lrg_subtree_json`) so we don't pay 3x node-spawn cost. The cache
-# variable is "" until first call, "<none>" if the CLI / jq path
-# returned no usable JSON (so awk fallback runs), or the JSON body.
-_lrg_subtree_json=""
-_lrg_read_policy() {
-  # $1 = dotted key (e.g. `review.local_review.mode`)
-  local key="$1"
-  local leaf="${key##*.}"
-  # 1. First call: try `rea hook policy-get review.local_review --json`.
-  #    Subsequent calls reuse the cached subtree.
-  if [ -z "$_lrg_subtree_json" ]; then
-    if [ "${#REA_ARGV[@]}" -gt 0 ] && command -v jq >/dev/null 2>&1; then
-      local json
-      json=$("${REA_ARGV[@]}" hook policy-get review.local_review --json 2>/dev/null || true)
-      # `null` indicates the path was unset — leaves jq to print
-      # `null` for any leaf, which we treat as "default applies".
-      if [ -n "$json" ]; then
-        _lrg_subtree_json="$json"
-      else
-        _lrg_subtree_json="<none>"
-      fi
-    else
-      _lrg_subtree_json="<none>"
-    fi
+# Codex round 4 P2 (2026-05-16): local-review-gate fires on EVERY Bash
+# PreToolUse event and reads three leaves from `review.local_review`
+# (mode + refuse_at + bypass_env_var). The unified reader's CLI tier
+# spawns a fresh `rea hook policy-get` per leaf, so the hot path went
+# from 1 CLI startup (the pre-0.37.0 subtree call) to 4 (version probe
+# + 3 leaves). Restore the subtree-cache shape: fetch
+# `review.local_review` as JSON once, then extract leaves locally. Falls
+# back to per-leaf reads when the subtree call returns null/empty (e.g.
+# Tier 3 awk can't serve subtree — that's documented and the per-leaf
+# block-form parser handles those cases via the unified reader's
+# fall-through ladder).
+# shellcheck source=_lib/policy-reader.sh
+source "$(dirname "$0")/_lib/policy-reader.sh"
+
+# Subtree cache: populated lazily on first read. Empty string means
+# "not yet attempted"; "null" means "attempted, key unset"; any other
+# value is the JSON object.
+_LRG_LR_SUBTREE_JSON=""
+
+_lrg_load_local_review_subtree() {
+  if [ -n "$_LRG_LR_SUBTREE_JSON" ]; then
+    return 0
   fi
-  # 2. If we have JSON, ask jq for the leaf.
-  if [ "$_lrg_subtree_json" != "<none>" ]; then
+  local sub
+  sub=$(policy_reader_get_subtree_json review.local_review 2>/dev/null)
+  if [ -z "$sub" ]; then
+    _LRG_LR_SUBTREE_JSON="null"
+  else
+    _LRG_LR_SUBTREE_JSON="$sub"
+  fi
+}
+
+# Extract a leaf from the cached subtree JSON. When subtree retrieval
+# failed (e.g. Tier 3 awk fallback), or the leaf isn't present in the
+# JSON, returns empty + non-zero so the caller can fall back to a
+# per-leaf read.
+_lrg_subtree_leaf() {
+  local leaf="$1"
+  if [ -z "$_LRG_LR_SUBTREE_JSON" ] || [ "$_LRG_LR_SUBTREE_JSON" = "null" ]; then
+    return 1
+  fi
+  # Try jq first; fall back to a python3 one-liner. Same hardened
+  # invocation shape as policy-reader.sh's no-jq fallback (env -u +
+  # PYTHONSAFEPATH + sys.path scrub).
+  if command -v jq >/dev/null 2>&1; then
     local out
-    out=$(printf '%s' "$_lrg_subtree_json" | jq -r --arg k "$leaf" '
-      if type == "object" and has($k) and (.[$k] != null) then .[$k] | tostring else "" end
-    ' 2>/dev/null || true)
+    out=$(printf '%s' "$_LRG_LR_SUBTREE_JSON" | jq -r --arg k "$leaf" '
+      .[$k] as $v
+      | if $v == null then empty
+        elif ($v|type) == "string" or ($v|type) == "number" or ($v|type) == "boolean"
+          then $v | tostring
+        else empty
+        end
+    ' 2>/dev/null)
     if [ -n "$out" ]; then
       printf '%s' "$out"
       return 0
     fi
-    # JSON path present but leaf unset → fall through to default. Do
-    # NOT also try the awk parser; the canonical loader is the source
-    # of truth here.
-    return 0
+    return 1
   fi
-  # 3. Fallback: block-form awk parser (legacy 0.34.0 round-1 path).
-  #    Only covers `review.local_review.<leaf>`. Inline-form mappings
-  #    fall through to "" → defaults — which is the SAME posture as the
-  #    pre-0.34.0 bash hook, but now with the CLI path above providing
-  #    inline-form support whenever the CLI is reachable.
-  if [ ! -f "$POLICY_FILE" ] || ! command -v awk >/dev/null 2>&1; then
-    return 0
+  if command -v python3 >/dev/null 2>&1; then
+    local out
+    out=$(env -u PYTHONPATH -u PYTHONHOME -u PYTHONSTARTUP \
+      PYTHONSAFEPATH=1 python3 -c '
+import sys
+import os
+_cwd = os.getcwd()
+_cwd_real = os.path.realpath(_cwd)
+sys.path[:] = [p for p in sys.path if p not in ("", ".", _cwd, _cwd_real)]
+import json
+try:
+    doc = json.loads(sys.argv[1])
+except Exception:
+    sys.exit(0)
+leaf = sys.argv[2]
+if isinstance(doc, dict) and leaf in doc:
+    v = doc[leaf]
+    if isinstance(v, bool):
+        sys.stdout.write("true" if v else "false")
+    elif isinstance(v, (int, float, str)):
+        sys.stdout.write(str(v))
+' "$_LRG_LR_SUBTREE_JSON" "$leaf" 2>/dev/null)
+    if [ -n "$out" ]; then
+      printf '%s' "$out"
+      return 0
+    fi
   fi
+  return 1
+}
+
+_lrg_read_policy() {
+  # $1 = dotted key (e.g. `review.local_review.mode`)
+  #
+  # For `review.local_review.*` leaves, try the subtree cache first
+  # (one CLI startup serves all three leaves). Fall back to a per-key
+  # read for everything else — and for leaves that the subtree cache
+  # couldn't produce (e.g. Tier 3 awk fallback where subtree mode is
+  # unsupported).
+  local key="$1"
   case "$key" in
-    review.local_review.mode)
-      awk '
-        /^review[[:space:]]*:[[:space:]]*$/ { in_review=1; next }
-        /^[^[:space:]]/                     { in_review=0; in_lr=0; next }
-        in_review && /^[[:space:]]+local_review[[:space:]]*:[[:space:]]*$/ { in_lr=1; next }
-        in_lr && /^[[:space:]]{2,}[a-zA-Z]/ {
-          if ($1 ~ /^mode:/) { print $2; exit }
-        }
-        in_lr && /^[[:space:]]{0,2}[a-zA-Z]/ && !/^[[:space:]]+local_review/ { in_lr=0 }
-      ' "$POLICY_FILE" 2>/dev/null | tr -d '"' | tr -d "'" | head -1
-      ;;
-    review.local_review.refuse_at)
-      awk '
-        /^review[[:space:]]*:[[:space:]]*$/ { in_review=1; next }
-        /^[^[:space:]]/                     { in_review=0; in_lr=0; next }
-        in_review && /^[[:space:]]+local_review[[:space:]]*:[[:space:]]*$/ { in_lr=1; next }
-        in_lr && /^[[:space:]]{2,}refuse_at[[:space:]]*:/ { print $2; exit }
-        in_lr && /^[[:space:]]{0,2}[a-zA-Z]/ && !/^[[:space:]]+local_review/ && !/^[[:space:]]+(mode|refuse_at|bypass_env_var|max_age_seconds)/ { in_lr=0 }
-      ' "$POLICY_FILE" 2>/dev/null | tr -d '"' | tr -d "'" | head -1
-      ;;
-    review.local_review.bypass_env_var)
-      awk '
-        /^review[[:space:]]*:[[:space:]]*$/ { in_review=1; next }
-        /^[^[:space:]]/                     { in_review=0; in_lr=0; next }
-        in_review && /^[[:space:]]+local_review[[:space:]]*:[[:space:]]*$/ { in_lr=1; next }
-        in_lr && /^[[:space:]]{2,}bypass_env_var[[:space:]]*:/ { print $2; exit }
-        in_lr && /^[[:space:]]{0,2}[a-zA-Z]/ && !/^[[:space:]]+local_review/ && !/^[[:space:]]+(mode|refuse_at|bypass_env_var|max_age_seconds)/ { in_lr=0 }
-      ' "$POLICY_FILE" 2>/dev/null | tr -d '"' | tr -d "'" | head -1
+    review.local_review.*)
+      _lrg_load_local_review_subtree
+      local leaf="${key##*.}"
+      local v
+      if v=$(_lrg_subtree_leaf "$leaf"); then
+        printf '%s' "$v"
+        return 0
+      fi
       ;;
   esac
+  policy_reader_get "$key" 2>/dev/null
 }
 
 # 4. Mode-off short-circuit. Mirrors the bash hook's
