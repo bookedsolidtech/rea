@@ -82,26 +82,26 @@ if [ "${#REA_ARGV[@]}" -eq 0 ]; then
   if [ ! -f "$POLICY_FILE" ]; then
     exit 0
   fi
+  # 0.37.0: route blocked_paths reads through the unified
+  # policy-reader (Tier 1 CLI → Tier 2 python3 → Tier 3 awk
+  # block-form). Pre-0.37.0 the per-shim awk parser missed flow-form
+  # arrays (`blocked_paths: [.env, .env.*, ...]`), silently exiting 0
+  # on relevant Bash calls when the CLI was unreachable. The
+  # 4-tier ladder closes that bypass via Tier 2 whenever python3 +
+  # PyYAML are available (common on macOS Homebrew + most Linux
+  # distros); falls through to Tier 3 (block-form only) otherwise.
+  # shellcheck source=_lib/policy-reader.sh
+  source "$(dirname "$0")/_lib/policy-reader.sh"
   # Substring scan: does the command mention any blocked_paths entry?
   # Coarse — over-trigger is fine, under-trigger is the bypass we MUST
-  # avoid. Strip YAML quotes/comments via a minimal awk filter.
+  # avoid.
   CLI_MISSING_RELEVANT=0
   while IFS= read -r entry; do
     [ -z "$entry" ] && continue
     case "$CLI_MISSING_CMD" in
       *"$entry"*) CLI_MISSING_RELEVANT=1; break ;;
     esac
-  done < <(awk '
-    /^blocked_paths:/ { in_block=1; next }
-    in_block && /^[[:space:]]*-/ {
-      sub(/^[[:space:]]*-[[:space:]]*/, "")
-      gsub(/^["'\'']/, "")
-      gsub(/["'\'']$/, "")
-      print
-      next
-    }
-    in_block && /^[^[:space:]-]/ { in_block=0 }
-  ' "$POLICY_FILE" 2>/dev/null)
+  done < <(policy_reader_get_list blocked_paths 2>/dev/null)
   if [ "$CLI_MISSING_RELEVANT" -eq 0 ]; then
     exit 0
   fi
