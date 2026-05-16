@@ -1,4 +1,4 @@
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import fsPromises from 'node:fs/promises';
@@ -977,6 +977,612 @@ export function checkCodexBinaryOnPath(): CheckResult {
 }
 
 /**
+ * 0.39.0 — `rea doctor` visibility into the 4-tier shim policy reader.
+ *
+ * `hooks/_lib/policy-reader.sh` (introduced 0.37.0) is the unified
+ * shim-side policy reader. Each shim sources it and reads policy
+ * values via a graceful-degradation ladder:
+ *
+ *   Tier 1: `rea hook policy-get --json` — canonical TS loader.
+ *   Tier 2: `python3` + stdlib `yaml` (PyYAML).
+ *   Tier 3: `awk` block-form parser (last resort, block-form ONLY).
+ *   Tier 4: fail-closed sentinel.
+ *
+ * The Tier 1/2 path handles BOTH block-form and flow-form YAML
+ * (`local_review: { mode: off }`). Tier 3 only handles block-form, so
+ * a consumer with flow-form policy AND no reachable CLI AND no python3
+ * silently no-ops on every shim fallback path — exactly the split-brain
+ * 0.37.0 set out to fix. The risk persists if the consumer's box lacks
+ * the upper tiers; operators currently have no way to see which tier
+ * their shims would actually use.
+ *
+ * These doctor checks surface the tier inventory so the gap is visible
+ * before it produces a silent regression. Each check is independent and
+ * uses optional probe-function injection so unit tests can simulate any
+ * combination of tier availability without manipulating PATH.
+ *
+ * Pure environment probes — no policy read, no shim spawn. Doctor calls
+ * each one in turn and the summary check aggregates the verdicts.
+ */
+
+/**
+ * Cheap PATH walker — returns the absolute path of `bin` when found
+ * with an executable bit set, or `null` otherwise. Mirrors
+ * `resolveCodexBinary`'s POSIX path but generalized for any binary.
+ *
+ * Windows path: walks PATHEXT and the bare name like `resolveCodexBinary`
+ * does for `codex`. Most consumer machines that run the shim ladder are
+ * POSIX (the shim is bash); Windows support is best-effort.
+ */
+function resolveBinaryOnPath(bin: string): string | null {
+  const isWindows = process.platform === 'win32';
+  const pathEnv = process.env.PATH ?? process.env.Path ?? '';
+  if (pathEnv.length === 0) return null;
+  const sep = isWindows ? ';' : ':';
+  const entries = pathEnv.split(sep).filter((p) => p.length > 0);
+
+  if (isWindows) {
+    const pathExt = (process.env.PATHEXT ?? '.COM;.EXE;.BAT;.CMD').split(';');
+    for (const dir of entries) {
+      for (const ext of pathExt) {
+        const candidate = path.join(dir, `${bin}${ext}`);
+        try {
+          const st = fs.statSync(candidate);
+          if (st.isFile()) return candidate;
+        } catch {
+          // not present — keep walking
+        }
+      }
+      const bare = path.join(dir, bin);
+      try {
+        const st = fs.statSync(bare);
+        if (st.isFile()) return bare;
+      } catch {
+        // not present — keep walking
+      }
+    }
+    return null;
+  }
+
+  for (const dir of entries) {
+    const candidate = path.join(dir, bin);
+    try {
+      const st = fs.statSync(candidate);
+      if (st.isFile() && (st.mode & 0o111) !== 0) return candidate;
+    } catch {
+      // not present — keep walking
+    }
+  }
+  return null;
+}
+
+/**
+ * Probe interface accepted by the policy-reader tier checks. Each
+ * field is optional; when omitted the check uses the real-environment
+ * default (PATH walk, spawnSync). Tests inject stubs to get
+ * deterministic, fast verdicts without touching the real filesystem or
+ * spawning subprocesses.
+ *
+ * - `cliDistExists` — does the rea CLI binary exist on disk at one of
+ *   the two shim-resolved paths? Cheap (single `existsSync`). Used to
+ *   give a clear "missing vs. broken" error message when Tier 1 is
+ *   unreachable.
+ * - `cliInvokable` — does the resolved CLI actually respond to
+ *   `rea hook policy-get version --json`? The expensive probe (one
+ *   subprocess spawn). Mirrors EXACTLY what `_pr_load_full_json`
+ *   does in `hooks/_lib/policy-reader.sh` so a stale or broken dist
+ *   reports `warn` here — same outcome the real shim ladder would
+ *   produce. Codex round-1 P2 (2026-05-16).
+ * - `python3OnPath` / `python3PyYamlReachable` — Tier 2 reachability.
+ *   `python3PyYamlReachable` returns `true` when both python3 AND the
+ *   `yaml` stdlib (PyYAML) can be imported (the Tier 2 loader needs
+ *   both).
+ * - `awkOnPath` / `jqOnPath` — Tier 3 + JSON-accelerator reachability.
+ */
+export interface PolicyReaderProbes {
+  cliDistExists?: (baseDir: string) => boolean;
+  cliInvokable?: (baseDir: string) => boolean;
+  python3OnPath?: () => string | null;
+  python3PyYamlReachable?: () => boolean;
+  awkOnPath?: () => string | null;
+  jqOnPath?: () => string | null;
+}
+
+/** Resolve the shim's preferred CLI dist path, or null when no layout matches. */
+function resolveCliDistPath(baseDir: string): string | null {
+  // The shim's Tier 1 path requires the rea CLI binary to be
+  // resolvable from the consumer's tree. Two layouts cover every
+  // real-world install:
+  //   1. <baseDir>/node_modules/@bookedsolid/rea/dist/cli/index.js
+  //      (consumer install — `pnpm i @bookedsolid/rea`)
+  //   2. <baseDir>/dist/cli/index.js
+  //      (rea-repo dogfood after `pnpm build`)
+  // Either presence is enough for the shim's sandboxed CLI resolution
+  // (see hooks/_lib/shim-runtime.sh).
+  const consumerCli = path.join(
+    baseDir,
+    'node_modules',
+    '@bookedsolid',
+    'rea',
+    'dist',
+    'cli',
+    'index.js',
+  );
+  if (fs.existsSync(consumerCli)) return consumerCli;
+  const dogfoodCli = path.join(baseDir, 'dist', 'cli', 'index.js');
+  if (fs.existsSync(dogfoodCli)) return dogfoodCli;
+  return null;
+}
+
+function defaultCliDistExists(baseDir: string): boolean {
+  return resolveCliDistPath(baseDir) !== null;
+}
+
+/**
+ * Sandbox check — mirrors `shim_sandbox_check` in
+ * `hooks/_lib/shim-runtime.sh` (introduced 0.38.0).
+ *
+ * Codex round-2 P1 (2026-05-16): the pre-fix `defaultCliInvokable`
+ * spawned the resolved CLI WITHOUT this validation. An attacker who
+ * could plant a `dist/cli/index.js` outside `realpath(baseDir)` (via
+ * a symlink) — OR plant one inside the tree but WITHOUT an ancestor
+ * `package.json` whose `name === "@bookedsolid/rea"` — would have
+ * their forged code executed every time doctor probed Tier 1
+ * reachability. The real shim chain refuses these layouts; the
+ * doctor probe MUST refuse them identically so it cannot be tricked
+ * into reporting `pass` on a layout the production shims would
+ * never trust.
+ *
+ * Returns `true` when:
+ *   1. `realpath(cli)` resolves AND lives INSIDE `realpath(baseDir)`
+ *      (no symlink-out of the project)
+ *   2. an ancestor `package.json` (walking up from
+ *      `dirname(dirname(dirname(real)))` — i.e. the package root for
+ *      a `dist/cli/index.js` shape) has `name === "@bookedsolid/rea"`
+ *      (max 20 hops)
+ *
+ * Returns `false` on any failure (realpath miss, escapes-project,
+ * missing/wrong package.json). Doctor's Tier 1 check then treats a
+ * sandbox-failed CLI identically to a CLI-missing layout — both
+ * report `warn` ("Tier 1 unreachable") rather than `pass`.
+ *
+ * This mirrors the bash logic EXACTLY:
+ *   - `fs.realpathSync` on both paths (no symlink slippage)
+ *   - path-prefix containment via `realProj + sep` (so a sibling
+ *     directory whose name STARTS with realProj cannot match)
+ *   - ancestor walk capped at 20 hops with a filesystem-root break
+ *     (`cur === path.dirname(cur)`)
+ *   - JSON parse failures in any candidate `package.json` are
+ *     swallowed and the walk continues (mirrors the bash `try/catch`)
+ *
+ * Kept in sync with the bash helper: any future change to the
+ * sandbox-check shape (e.g. CLI-shape enforcement) MUST be applied
+ * in both places.
+ */
+function sandboxCheckCli(cli: string, baseDir: string): boolean {
+  let real: string;
+  let realProj: string;
+  try {
+    real = fs.realpathSync(cli);
+  } catch {
+    return false;
+  }
+  try {
+    realProj = fs.realpathSync(baseDir);
+  } catch {
+    return false;
+  }
+  const sep = path.sep;
+  const projWithSep = realProj.endsWith(sep) ? realProj : realProj + sep;
+  if (!(real === realProj || real.startsWith(projWithSep))) {
+    return false;
+  }
+  // Walk ancestor directories from the package root (3 levels up
+  // from a `<root>/dist/cli/index.js` shape) looking for a
+  // package.json whose `name === "@bookedsolid/rea"`. Max 20 hops
+  // with a filesystem-root break so we never loop forever on
+  // exotic mount layouts.
+  let cur = path.dirname(path.dirname(path.dirname(real)));
+  for (let i = 0; i < 20 && cur && cur !== path.dirname(cur); i += 1) {
+    const pj = path.join(cur, 'package.json');
+    if (fs.existsSync(pj)) {
+      try {
+        const data = JSON.parse(fs.readFileSync(pj, 'utf8')) as { name?: unknown };
+        if (data && data.name === '@bookedsolid/rea') {
+          return true;
+        }
+      } catch {
+        // keep walking — malformed package.json on the path is not fatal
+      }
+    }
+    cur = path.dirname(cur);
+  }
+  return false;
+}
+
+/**
+ * Codex round-1 P2 (2026-05-16): the file-presence probe alone allows
+ * a stale or broken dist (e.g. an upgrade-lagged consumer who never
+ * re-ran `pnpm build`) to falsely report `pass` while the real shim
+ * ladder in `hooks/_lib/policy-reader.sh` would skip Tier 1 because
+ * `rea hook policy-get version --json` exits non-zero. We mirror that
+ * exact probe verbatim — same key (`version`), same `--json` flag,
+ * same accept-criterion (exit 0 + non-empty stdout).
+ *
+ * Codex round-2 P1 (2026-05-16): BEFORE invoking the resolved CLI,
+ * apply the same realpath + ancestor-package.json sandbox check the
+ * shims apply in `hooks/_lib/shim-runtime.sh::shim_sandbox_check`.
+ * Pre-fix, an attacker who could plant a `dist/cli/index.js` via a
+ * symlink-out (or without a `@bookedsolid/rea` package.json ancestor)
+ * would have their forged code executed every probe call — yet the
+ * real shim ladder would refuse the same layout. This probe MUST
+ * refuse identically so it cannot mis-report `pass` on an
+ * unsandboxed CLI.
+ *
+ * Returns `true` when the CLI responds correctly; `false` when the
+ * dist is missing OR present-but-broken OR present-but-unsandboxed.
+ * Doctor's Tier 1 check then surfaces the difference: missing →
+ * install guidance; broken/unsandboxed → rebuild guidance. (The
+ * unsandboxed branch deliberately collapses into the "broken" bucket
+ * because either way Tier 1 is unreachable for the shim chain.)
+ *
+ * 8s timeout: the CLI's `hook policy-get` path is local-only (zod
+ * load + YAML parse + JSON walk); on any reasonable machine it
+ * resolves in under a second. The timeout is a defense against a CLI
+ * that hangs on import (a broken postinstall, a missing native module)
+ * rather than a normal-operation budget.
+ */
+function defaultCliInvokable(baseDir: string): boolean {
+  const cli = resolveCliDistPath(baseDir);
+  if (cli === null) return false;
+  // Codex round-2 P1: sandbox check BEFORE spawn. Pre-fix the probe
+  // spawned arbitrary code that happened to live at the expected
+  // shim-resolved path; if a symlink-out OR a missing rea
+  // package.json ancestor existed, we executed an attacker payload.
+  if (!sandboxCheckCli(cli, baseDir)) return false;
+  try {
+    const res = spawnSync('node', [cli, 'hook', 'policy-get', 'version', '--json'], {
+      cwd: baseDir,
+      timeout: 8_000,
+      // Tier 1 reads policy.yaml at REA_ROOT — propagate so the probe
+      // honors the same scope the real shim chain would (a missing
+      // `CLAUDE_PROJECT_DIR` falls back to cwd, which doctor has
+      // already set).
+      env: { ...process.env, CLAUDE_PROJECT_DIR: baseDir },
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    if (res.status !== 0) return false;
+    const out = (res.stdout ?? '').trim();
+    return out.length > 0;
+  } catch {
+    return false;
+  }
+}
+
+function defaultPython3PyYamlReachable(): boolean {
+  // The Tier 2 loader runs `python3 -c "import yaml"`. We mirror that
+  // probe verbatim so a `yaml`-installable-but-broken interpreter is
+  // not falsely reported as "reachable". Apply the SAME env scrub
+  // (PYTHONPATH / PYTHONHOME / PYTHONSTARTUP unset, PYTHONSAFEPATH=1)
+  // that policy-reader.sh applies, so a repo-local `yaml.py` cannot
+  // shadow the stdlib copy here either — otherwise this probe would
+  // report `true` against a malicious repo where the actual loader
+  // would (correctly) refuse to import.
+  //
+  // Codex round-3 P1 (2026-05-16): `PYTHONSAFEPATH=1` is the env-var
+  // form of `python3 -P` and is only honored on Python 3.11+. On
+  // Python 3.4-3.10 (still installed by default on macOS Big Sur /
+  // Monterey / Ventura, RHEL 8, Ubuntu 20.04, …) it is SILENTLY
+  // IGNORED — meaning the interpreter will still prepend `""`/`"."`/
+  // CWD to `sys.path[0]` and import a repo-local `./yaml.py` instead
+  // of the stdlib copy. The production loader in
+  // hooks/_lib/policy-reader.sh closes this gap with a defensive
+  // sys.path scrub at the top of every `python3 -c` body (see the
+  // "Codex round 2 P1" comment block in policy-reader.sh:256-267).
+  // We MUST mirror that scrub here — without it, a malicious repo
+  // could plant `./yaml.py`, get this probe to report `true`, while
+  // the real Tier 2 loader (which DOES scrub) refuses to import and
+  // falls through to Tier 3. The doctor verdict would then point
+  // operators at the wrong tier when diagnosing a stuck shim.
+  try {
+    const probeEnv: NodeJS.ProcessEnv = { ...process.env, PYTHONSAFEPATH: '1' };
+    delete probeEnv['PYTHONPATH'];
+    delete probeEnv['PYTHONHOME'];
+    delete probeEnv['PYTHONSTARTUP'];
+    // Same scrub shape as policy-reader.sh's Tier 2 body — strip
+    // empty/CWD entries from sys.path BEFORE the `import yaml` so
+    // the probe and the production loader produce the same answer
+    // on Python 3.4-3.10.
+    const probeBody = [
+      'import sys',
+      'import os',
+      '_cwd = os.getcwd()',
+      '_cwd_real = os.path.realpath(_cwd)',
+      'sys.path[:] = [p for p in sys.path if p not in ("", ".", _cwd, _cwd_real)]',
+      'import yaml',
+    ].join('\n');
+    const res = spawnSync('python3', ['-c', probeBody], {
+      env: probeEnv,
+      timeout: 5_000,
+      stdio: ['ignore', 'ignore', 'ignore'],
+    });
+    return res.status === 0;
+  } catch {
+    return false;
+  }
+}
+
+const DEFAULT_PROBES: Required<PolicyReaderProbes> = {
+  cliDistExists: defaultCliDistExists,
+  cliInvokable: defaultCliInvokable,
+  python3OnPath: () => resolveBinaryOnPath('python3'),
+  python3PyYamlReachable: defaultPython3PyYamlReachable,
+  awkOnPath: () => resolveBinaryOnPath('awk'),
+  jqOnPath: () => resolveBinaryOnPath('jq'),
+};
+
+function resolveProbes(probes: PolicyReaderProbes | undefined): Required<PolicyReaderProbes> {
+  if (probes === undefined) return DEFAULT_PROBES;
+  return { ...DEFAULT_PROBES, ...probes };
+}
+
+/**
+ * Tier 1 — `rea hook policy-get`. Reachable when the rea CLI is
+ * present at one of the two shim-resolved paths (consumer install OR
+ * dogfood `dist/`) AND actually responds to `rea hook policy-get
+ * version --json`. The shim ladder uses that exact invocation as its
+ * Tier 1 probe (see `_pr_load_full_json` in `hooks/_lib/policy-reader.sh`);
+ * mirroring it here means a stale or broken dist (file present but
+ * import-throws / postinstall failed) reports `warn` — matching the
+ * real fall-through to Tier 2/3 the shim would do at runtime.
+ *
+ * Three states:
+ *   - dist present + CLI responds → `pass` (canonical loader fully wired).
+ *   - dist present + CLI broken → `warn` (stale build, missing native
+ *     module, broken postinstall — needs `pnpm build` / `rea upgrade`).
+ *   - dist absent → `warn` (not installed; Tier 2/3 still cover).
+ *
+ * Codex round-1 P2 (2026-05-16) replaced the file-existence-only
+ * probe with this CLI-invocation probe — pre-fix, a consumer with
+ * `dist/cli/index.js` present but throwing on load would see `pass`
+ * here while every real shim would silently fall through.
+ */
+export function checkPolicyReaderTier1(
+  baseDir: string,
+  probes?: PolicyReaderProbes,
+): CheckResult {
+  const label = 'policy-reader Tier 1 (rea CLI)';
+  const p = resolveProbes(probes);
+  const distPresent = p.cliDistExists(baseDir);
+  if (!distPresent) {
+    return {
+      label,
+      status: 'warn',
+      detail:
+        'rea CLI dist not found at node_modules/@bookedsolid/rea/dist/cli/index.js or <baseDir>/dist/cli/index.js — ' +
+        'shims fall through to Tier 2/3 (works, but loses validated schema + full subtree shapes). ' +
+        'Consumer: run `pnpm i @bookedsolid/rea`. Dogfood: run `pnpm build`.',
+    };
+  }
+  if (!p.cliInvokable(baseDir)) {
+    return {
+      label,
+      status: 'warn',
+      detail:
+        'rea CLI dist exists but `rea hook policy-get version --json` failed — the dist is ' +
+        'stale or broken (incomplete build, missing native module, broken postinstall). The ' +
+        'shim ladder will skip Tier 1 and fall through to Tier 2/3 just as this probe did. ' +
+        'Run `pnpm build` (dogfood) or `rea upgrade` (consumer) to rebuild.',
+    };
+  }
+  return {
+    label,
+    status: 'pass',
+    detail:
+      'rea CLI dist responds to `hook policy-get version --json` — canonical loader fully wired',
+  };
+}
+
+/**
+ * Tier 2 — python3 + stdlib `yaml` (PyYAML). Handles BOTH block-form
+ * and flow-form YAML; the practical floor when Tier 1 is unreachable.
+ *
+ * Three states:
+ *   - python3 present + PyYAML importable → `pass`.
+ *   - python3 present, PyYAML missing → `warn` (the loader will fall
+ *     through to Tier 3, which only handles block-form).
+ *   - python3 absent → `warn` (same Tier 3 fall-through).
+ *
+ * Never `fail` — Tier 3 is still a valid floor for block-form policy.
+ * The warning highlights the silent no-op risk for flow-form lookups
+ * when CLI is also unreachable.
+ */
+export function checkPolicyReaderTier2(probes?: PolicyReaderProbes): CheckResult {
+  const label = 'policy-reader Tier 2 (python3 + PyYAML)';
+  const p = resolveProbes(probes);
+  const py = p.python3OnPath();
+  if (py === null) {
+    return {
+      label,
+      status: 'warn',
+      detail:
+        'python3 not on PATH — Tier 2 unavailable. Shims fall through to Tier 3 (awk, ' +
+        'block-form only). Flow-form policy (e.g. `local_review: { mode: off }`) silently ' +
+        'no-ops when the rea CLI is also unreachable. Install python3 to close this gap.',
+    };
+  }
+  if (!p.python3PyYamlReachable()) {
+    return {
+      label,
+      status: 'warn',
+      detail:
+        `python3 found at ${py} but \`import yaml\` failed — PyYAML missing. ` +
+        'Shims fall through to Tier 3 (awk, block-form only). Flow-form policy silently ' +
+        'no-ops when the rea CLI is also unreachable. Install: `pip3 install pyyaml`.',
+    };
+  }
+  return {
+    label,
+    status: 'pass',
+    detail: `python3 + PyYAML reachable at ${py} — flow-form policy parses correctly`,
+  };
+}
+
+/**
+ * Tier 3 — awk block-form parser. Last-resort no-dep fallback.
+ * Practically always present (POSIX requirement); hard-fail only when
+ * truly absent (in which case the consumer has ZERO working fallback
+ * tiers and any CLI-absent shim invocation will silently fail-closed
+ * on every policy lookup).
+ */
+export function checkPolicyReaderTier3(probes?: PolicyReaderProbes): CheckResult {
+  const label = 'policy-reader Tier 3 (awk)';
+  const p = resolveProbes(probes);
+  const awk = p.awkOnPath();
+  if (awk !== null) {
+    return {
+      label,
+      status: 'pass',
+      detail: `awk at ${awk} — block-form fallback available`,
+    };
+  }
+  return {
+    label,
+    status: 'fail',
+    detail:
+      'awk not on PATH — no fallback tier reachable. If the rea CLI and python3+PyYAML are ' +
+      'ALSO unreachable, every shim policy lookup fails closed. This is unusual; awk is a ' +
+      'POSIX requirement. Install awk (`mawk`, `gawk`, or `nawk`).',
+  };
+}
+
+/**
+ * jq — optional accelerator used by Tier 1/2's JSON subtree parsing.
+ * Per the 0.37.0 round-1 P2 fix the helper falls back to a python3
+ * walker when jq is absent (still correct, just an extra spawn per
+ * leaf). `warn` when missing so operators know they're paying the
+ * latency cost.
+ *
+ * `info` when present — no action needed, just confirming the
+ * accelerator is wired.
+ */
+export function checkPolicyReaderJq(probes?: PolicyReaderProbes): CheckResult {
+  const label = 'policy-reader jq (JSON accelerator)';
+  const p = resolveProbes(probes);
+  const jq = p.jqOnPath();
+  if (jq !== null) {
+    return {
+      label,
+      status: 'pass',
+      detail: `jq at ${jq} — used by Tier 1/2 JSON subtree walking`,
+    };
+  }
+  return {
+    label,
+    status: 'warn',
+    detail:
+      'jq not on PATH — Tier 1/2 fall back to a python3 JSON walker per leaf (correct, ' +
+      'just slower). Install jq to reduce per-leaf spawn overhead.',
+  };
+}
+
+/**
+ * Summary roll-up: which tiers are reachable, what's the effective
+ * floor when the CLI is unreachable, and is flow-form policy at risk
+ * of silent no-op.
+ *
+ * Four verdicts:
+ *   - `pass` — Tier 1 OR Tier 2 reachable AND a JSON list walker
+ *     (jq or python3) is available. Flow-form scalars AND flow-form
+ *     arrays both parse correctly via whichever tier is hit first.
+ *   - `warn` (flow-form-lists-degraded) — Tier 1 reachable but neither
+ *     jq nor python3 on PATH. Flow-form SCALARS parse correctly via
+ *     the CLI's JSON output, but `policy_reader_get_list` cannot
+ *     iterate the resulting JSON array — it falls through to Tier 3
+ *     awk, which silently misses flow-form arrays like
+ *     `blocked_paths: [.env, ...]`. Codex round-1 P2 (2026-05-16).
+ *   - `warn` (Tier-3-only) — Only Tier 3 (awk) reachable. Block-form
+ *     policy works; flow-form scalars AND arrays both silently no-op
+ *     on every shim fallback.
+ *   - `fail` — No tiers reachable. Shims fail closed on every policy
+ *     lookup. (Practically requires losing awk too — see Tier 3.)
+ *
+ * Tier 2 implies python3 is on PATH (it's the interpreter that runs
+ * the loader), so when Tier 2 is reachable the list-iteration python3
+ * fallback is also reachable — only the Tier-1-without-list-walker
+ * shape can produce the degraded warning.
+ */
+export function checkPolicyReaderTierSummary(
+  baseDir: string,
+  probes?: PolicyReaderProbes,
+): CheckResult {
+  const label = 'policy-reader effective floor';
+  const p = resolveProbes(probes);
+  // Mirror Tier 1's two-stage check — dist present + CLI invokable.
+  // A stale/broken dist that fails the invokable probe is treated as
+  // "Tier 1 not reachable" so the summary matches what the shim
+  // ladder would actually do at runtime.
+  const tier1 = p.cliDistExists(baseDir) && p.cliInvokable(baseDir);
+  const py = p.python3OnPath();
+  const tier2 = py !== null && p.python3PyYamlReachable();
+  const tier3 = p.awkOnPath() !== null;
+  const jq = p.jqOnPath();
+  // List iteration after Tier 1/2 needs jq OR python3 to walk the
+  // JSON. Tier 2 implies python3 on PATH (the interpreter that ran
+  // the loader); so the only "lists broken" shape is Tier 1 reachable
+  // but neither jq nor python3 on PATH.
+  const listWalker = jq !== null || py !== null;
+
+  const reachable: string[] = [];
+  if (tier1) reachable.push('Tier 1 (CLI)');
+  if (tier2) reachable.push('Tier 2 (python3+PyYAML)');
+  if (tier3) reachable.push('Tier 3 (awk)');
+
+  if (tier1 || tier2) {
+    if (!listWalker) {
+      // Tier 1 + no python3/jq. flow-form scalars work; flow-form
+      // arrays silently no-op via Tier 3 fallthrough. (Tier 2 path
+      // is unreachable here because Tier 2 requires python3.)
+      return {
+        label,
+        status: 'warn',
+        detail:
+          `${reachable.join(', ')} reachable — flow-form scalars parse via Tier 1 CLI, ` +
+          'BUT neither jq nor python3 is on PATH so `policy_reader_get_list` cannot iterate ' +
+          'the resulting JSON arrays. Flow-form list policy (e.g. `blocked_paths: [.env, ...]`) ' +
+          'silently falls through to Tier 3 awk and misses inline arrays. Install jq ' +
+          '(`brew install jq` / `apt-get install jq`) or python3 to close the gap.',
+      };
+    }
+    return {
+      label,
+      status: 'pass',
+      detail: `${reachable.join(', ')} reachable — flow-form policy parses correctly`,
+    };
+  }
+  if (tier3) {
+    return {
+      label,
+      status: 'warn',
+      detail:
+        'only Tier 3 (awk, block-form ONLY) reachable — flow-form policy ' +
+        '(e.g. `local_review: { mode: off }`, `blocked_paths: [.env, ...]`) silently ' +
+        'no-ops on every shim fallback path. Restore Tier 1 (rea CLI dist) or Tier 2 ' +
+        '(python3 + PyYAML) to close the gap.',
+    };
+  }
+  return {
+    label,
+    status: 'fail',
+    detail:
+      'no policy-reader tier reachable — every shim policy lookup fails closed. ' +
+      'Install at least one of: rea CLI dist (Tier 1), python3 + PyYAML (Tier 2), ' +
+      'awk (Tier 3).',
+  };
+}
+
+/**
  * Translate a `CodexProbeState` into two doctor CheckResults: one for
  * responsiveness (pass/warn) and one informational line about the last
  * probe time. Extracted so tests can feed a stub state without running
@@ -1531,9 +2137,16 @@ export function collectChecks(
   const registryPath = reaPath(baseDir, REGISTRY_FILE);
   const reaDirPath = path.join(baseDir, REA_DIR);
 
+  // Run checkPolicyParses up-front so we can both push its result and
+  // use the verdict to gate the 0.39.0 policy-reader tier checks below.
+  // A malformed policy file should NOT trigger the tier-reachability
+  // probes — those reports would misattribute a parse failure to a
+  // runtime/install problem (codex round-3 P2, 2026-05-16).
+  const policyParsesResult = checkPolicyParses(baseDir, policyPath);
+
   const checks: CheckResult[] = [
     checkFileExists('.rea/ directory exists', reaDirPath, true),
-    checkPolicyParses(baseDir, policyPath),
+    policyParsesResult,
     checkRegistryParses(baseDir, registryPath),
     checkAgentsPresent(baseDir),
     checkHooksInstalled(baseDir),
@@ -1556,6 +2169,30 @@ export function collectChecks(
     // went through in 0.29.0 → 0.30.0, after 4 release cycles of
     // propagation).
     checkDelegationAdvisoryHookRegistered(baseDir),
+    // 0.39.0 — policy-reader tier visibility. Surfaces which tiers of
+    // the 4-tier `hooks/_lib/policy-reader.sh` ladder are reachable in
+    // this environment so operators can SEE whether flow-form policy
+    // would silently no-op when the CLI is unreachable.
+    //
+    // Codex round-3 P2 (2026-05-16): gated on `policyParsesResult`
+    // being a `pass` — NOT just `existsSync(policyPath)`. A
+    // malformed policy file (present but unparseable) should report
+    // exactly ONE failure — the parse-error from `checkPolicyParses`
+    // above — and not also light up the tier probes with misleading
+    // "Tier 1 dist exists but failed" or summary "ladder degraded"
+    // diagnostics that misattribute a config bug to an
+    // install/runtime problem. The parse-failure row already tells
+    // the operator the right thing to fix; adding more downstream
+    // noise would obscure it.
+    ...(policyParsesResult.status === 'pass'
+      ? [
+          checkPolicyReaderTier1(baseDir),
+          checkPolicyReaderTier2(),
+          checkPolicyReaderTier3(),
+          checkPolicyReaderJq(),
+          checkPolicyReaderTierSummary(baseDir),
+        ]
+      : []),
   ];
 
   // Non-git escape hatch: when `.git/` is absent, both git-hook checks are
