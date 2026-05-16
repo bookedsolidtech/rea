@@ -1,5 +1,33 @@
 # @bookedsolid/rea
 
+## 0.38.1
+
+### Patch Changes
+
+- 58fc565: fix(0.38.1): preserve disabled-policy short-circuit when `node` is absent
+
+  Round-2 P2 from 0.38.0 codex review. Pre-fix, when `node` was absent
+  on the consumer's PATH, the shim-runtime exited 2 (blocking-tier) or
+  0 (advisory-tier) IMMEDIATELY without ever calling
+  `shim_policy_short_circuit`. A blocking-tier shim whose policy said
+  "disabled" still refused — contradicting the pre-port body's
+  no-op-on-disabled posture.
+
+  Fix: reorder shim_run flow so the policy short-circuit fires before
+  the node-missing banner. The 4-tier policy reader from 0.37.0 degrades
+  to Tier 2 (python3) / Tier 3 (awk) when node is unavailable — neither
+  tier requires node, so policy reads still produce correct answers.
+
+  When the policy short-circuit returns false (enforcement IS desired)
+  but node is unavailable, we now emit the dedicated node-missing
+  banner (blocking-tier) or exit 0 silently (advisory-tier) — same as
+  pre-fix behavior for the non-disabled-by-policy case.
+
+  3 new test cases in `__tests__/hooks/_lib/shim-runtime.test.ts`
+  pinning the corrected ordering: blocking + disabled-by-policy + no
+  node → exit 0; blocking + enabled + no node → banner + exit 2;
+  advisory + disabled + no node → exit 0.
+
 ## 0.38.0
 
 ### Minor Changes
@@ -3251,13 +3279,13 @@ codex-review --also-set-cache`) on every push, produced a 1,250-line bash
 
   This release replaces the entire stack with a stateless gate:
 
-                                                                                      git push
-                                                                                        → .husky/pre-push → rea hook push-gate
-                                                                                        → codex exec review --base <ref> --json
-                                                                                        → parse verdict from streamed findings
-                                                                                        → block on [P1] (blocking) or [P2] when concerns_blocks=true
-                                                                                        → write .rea/last-review.json + audit record
-                                                                                        → exit 0 / 1 (HALT) / 2 (blocked)
+                                                                                        git push
+                                                                                          → .husky/pre-push → rea hook push-gate
+                                                                                          → codex exec review --base <ref> --json
+                                                                                          → parse verdict from streamed findings
+                                                                                          → block on [P1] (blocking) or [P2] when concerns_blocks=true
+                                                                                          → write .rea/last-review.json + audit record
+                                                                                          → exit 0 / 1 (HALT) / 2 (blocked)
 
   Codex is run fresh on every push. No cache. No SHA matching. No receipt
   consultation. When the gate blocks, Claude reads stderr + the
