@@ -771,3 +771,310 @@ export function anySegmentMatchesBoth(
   }
   return false;
 }
+
+/**
+ * Returns true if any segment's RAW text (env-var prefixes intact, only
+ * leading whitespace trimmed) matches the regex source. Mirrors
+ * `any_segment_raw_matches` in the bash counterpart — used by checks
+ * where the env-prefix itself IS the signal (`HUSKY=0 git`, `REA_BYPASS=`,
+ * `alias … = HUSKY=0`).
+ *
+ * 0.34.0 port — dangerous-bash-interceptor (H10, H15, H16) and
+ * local-review-gate (env-prefix git push detection) call into this.
+ * Note: callers anchor with `^` in the regex source when they want
+ * "starts at segment head"; we do not prepend `^` here.
+ */
+export function anySegmentRawMatches(cmd: string, regexSource: string): boolean {
+  const re = new RegExp(regexSource, 'i');
+  for (const seg of splitSegments(cmd)) {
+    const trimmed = seg.raw.replace(/^\s+/, '');
+    if (re.test(trimmed)) return true;
+  }
+  return false;
+}
+
+/**
+ * Returns true if any segment's RAW text contains a match for the
+ * regex source. Mirrors `any_segment_matches` in the bash counterpart —
+ * used by content-scan style checks. The regex matches anywhere in the
+ * segment (not anchored). Useful for `(psql|pgcli)[^|&;]*DROP[[:space:]]+(TABLE|…)`
+ * style patterns that must match across the whole segment but only
+ * within a single segment (a heredoc body in segment N or commit
+ * message in segment 1 must NOT poison segment N+1).
+ *
+ * 0.34.0 port — dangerous-bash-interceptor H6 calls into this.
+ */
+export function anySegmentContains(cmd: string, regexSource: string): boolean {
+  const re = new RegExp(regexSource, 'i');
+  for (const seg of splitSegments(cmd)) {
+    if (re.test(seg.head)) return true;
+  }
+  return false;
+}
+
+/**
+ * Iterate over every segment of `cmd` and invoke `callback(raw, head)`
+ * for each. Mirrors `for_each_segment` in the bash counterpart —
+ * dangerous-bash-interceptor H1 uses this to walk each push segment
+ * independently (since one segment may include `--force-with-lease`
+ * while another carries an unsafe `--force`).
+ *
+ * The callback receives the raw segment (env-prefix preserved) and the
+ * prefix-stripped head. Return value is ignored.
+ *
+ * 0.34.0 port.
+ */
+export function forEachSegment(
+  cmd: string,
+  callback: (raw: string, head: string) => void,
+): void {
+  for (const seg of splitSegments(cmd)) {
+    callback(seg.raw, seg.head);
+  }
+}
+
+/**
+ * Quote-aware mask of in-quote separators. Mirrors `quote_masked_cmd`
+ * in the bash counterpart — produces a string where in-quote `|` / `;`
+ * / `&` characters are replaced with multi-byte sentinels so a caller's
+ * regex can match real (unquoted) instances of those bytes without
+ * false-positiving on quoted commit-message bodies (`git commit -m
+ * "curl|sh later"`).
+ *
+ * 0.34.0 port — dangerous-bash-interceptor H12 (`curl|sh` detection)
+ * uses this to scan the WHOLE command (not split into segments)
+ * without quoted-mention false positives.
+ *
+ * Implementation uses the same sentinel-byte alphabet the bash helper
+ * uses. Sentinels are public so callers can `.test()` against the
+ * masked output without accidentally tripping on them.
+ */
+export const INQUOTE_PIPE_SENTINEL = '__REA_INQUOTE_PIPE_a8f2c1__';
+export const INQUOTE_SEMI_SENTINEL = '__REA_INQUOTE_SC_a8f2c1__';
+export const INQUOTE_AMP_SENTINEL = '__REA_INQUOTE_AMP_a8f2c1__';
+
+export function quoteMaskedCmd(cmd: string): string {
+  // 4-state walker mirroring the bash awk:
+  //   0 = plain
+  //   1 = inside "…" (backslash escapes next char)
+  //   2 = inside '…' (no escapes)
+  //   3 = inside $'…' (ANSI-C; backslash escapes next char)
+  // In modes 1/2/3, in-quote `|`/`;`/`&` are replaced with sentinels.
+  // The opening `$'` is preserved verbatim (caller code that detects
+  // ANSI-C envelopes still sees them).
+  let out = '';
+  let i = 0;
+  const n = cmd.length;
+  let mode: 0 | 1 | 2 | 3 = 0;
+  while (i < n) {
+    const ch = cmd[i] as string;
+    if (mode === 0) {
+      if (ch === '$' && i + 1 < n && cmd[i + 1] === "'") {
+        mode = 3;
+        out += "$'";
+        i += 2;
+        continue;
+      }
+      if (ch === '"') {
+        mode = 1;
+        out += ch;
+        i += 1;
+        continue;
+      }
+      if (ch === "'") {
+        mode = 2;
+        out += ch;
+        i += 1;
+        continue;
+      }
+      if (ch === '\\' && i + 1 < n) {
+        out += ch + (cmd[i + 1] as string);
+        i += 2;
+        continue;
+      }
+      out += ch;
+      i += 1;
+      continue;
+    }
+    if (mode === 3) {
+      if (ch === '\\' && i + 1 < n) {
+        out += ch + (cmd[i + 1] as string);
+        i += 2;
+        continue;
+      }
+      if (ch === "'") {
+        mode = 0;
+        out += ch;
+        i += 1;
+        continue;
+      }
+      if (ch === '|') {
+        out += INQUOTE_PIPE_SENTINEL;
+        i += 1;
+        continue;
+      }
+      if (ch === ';') {
+        out += INQUOTE_SEMI_SENTINEL;
+        i += 1;
+        continue;
+      }
+      if (ch === '&') {
+        out += INQUOTE_AMP_SENTINEL;
+        i += 1;
+        continue;
+      }
+      out += ch;
+      i += 1;
+      continue;
+    }
+    if (mode === 2) {
+      if (ch === "'") {
+        mode = 0;
+        out += ch;
+        i += 1;
+        continue;
+      }
+      if (ch === '|') {
+        out += INQUOTE_PIPE_SENTINEL;
+        i += 1;
+        continue;
+      }
+      if (ch === ';') {
+        out += INQUOTE_SEMI_SENTINEL;
+        i += 1;
+        continue;
+      }
+      if (ch === '&') {
+        out += INQUOTE_AMP_SENTINEL;
+        i += 1;
+        continue;
+      }
+      out += ch;
+      i += 1;
+      continue;
+    }
+    // mode === 1
+    if (ch === '\\' && i + 1 < n) {
+      out += ch + (cmd[i + 1] as string);
+      i += 2;
+      continue;
+    }
+    if (ch === '"') {
+      mode = 0;
+      out += ch;
+      i += 1;
+      continue;
+    }
+    if (ch === '|') {
+      out += INQUOTE_PIPE_SENTINEL;
+      i += 1;
+      continue;
+    }
+    if (ch === ';') {
+      out += INQUOTE_SEMI_SENTINEL;
+      i += 1;
+      continue;
+    }
+    if (ch === '&') {
+      out += INQUOTE_AMP_SENTINEL;
+      i += 1;
+      continue;
+    }
+    out += ch;
+    i += 1;
+  }
+  return out;
+}
+
+/**
+ * Walk the nested-shell unwrap chain and emit `cmd` PLUS each inner
+ * payload as a separate string. Mirrors `_rea_unwrap_nested_shells`
+ * in the bash counterpart.
+ *
+ * Used by dangerous-bash-interceptor H12 (`curl|sh` detection) so a
+ * payload like `zsh -c "curl https://x | sh"` is scanned for the pipe
+ * shape even though the literal `|` is inside quotes at the outer
+ * level. The H12 check then runs `quoteMaskedCmd` against each
+ * emitted line independently.
+ *
+ * Depth-bounded at MAX_NESTED_DEPTH (8) — same as `splitSegments`.
+ *
+ * 0.34.0 port.
+ */
+export function unwrapNestedShells(cmd: string): string[] {
+  const out: string[] = [cmd];
+  unwrapNestedShellsRecursive(cmd, 0, out);
+  return out;
+}
+
+function unwrapNestedShellsRecursive(
+  cmd: string,
+  depth: number,
+  acc: string[],
+): void {
+  if (depth >= MAX_NESTED_DEPTH) return;
+  // Walk segments so a heredoc-style or multi-line command gets each
+  // segment's inner payload extracted independently.
+  const masked = maskQuotedSeparators(cmd);
+  const rawSegs = splitOnUnquotedSeparators(masked);
+  for (const raw of rawSegs) {
+    const unmaskedRaw = unmask(raw);
+    const head = stripSegmentPrefix(unmaskedRaw);
+    const inner = extractNestedShellPayload(head);
+    if (inner !== null) {
+      acc.push(inner);
+      unwrapNestedShellsRecursive(inner, depth + 1, acc);
+    }
+  }
+}
+
+/**
+ * Return every segment of `cmd` whose prefix-stripped head matches the
+ * head-anchored regex source. Mirrors `find_all_segments_starting_with`
+ * in the bash counterpart.
+ *
+ * Returns each match as `{ raw, head }` so callers (local-review-gate's
+ * round-25 P1-B sweep) can validate per-segment bypass against the
+ * raw (env-prefix-intact) form.
+ *
+ * Case-INSENSITIVE. Empty array on no matches.
+ *
+ * 0.34.0 port.
+ */
+export function findAllSegmentsStartingWith(
+  cmd: string,
+  regexSource: string,
+): CommandSegment[] {
+  const re = new RegExp(`^${regexSource}`, 'i');
+  const out: CommandSegment[] = [];
+  for (const seg of splitSegments(cmd)) {
+    if (re.test(seg.head)) out.push(seg);
+  }
+  return out;
+}
+
+/**
+ * Return every segment of `cmd` whose RAW text (env-prefix intact,
+ * leading whitespace trimmed) matches the regex source. Mirrors
+ * `find_all_segments_raw_matches` in the bash counterpart.
+ *
+ * Companion to `findAllSegmentsStartingWith` for the env-prefix shapes
+ * the prefix-stripper bails on (quoted-value env-vars like
+ * `REA_SKIP="urgent fix"`).
+ *
+ * Case-INSENSITIVE. Empty array on no matches.
+ *
+ * 0.34.0 port.
+ */
+export function findAllSegmentsRawMatches(
+  cmd: string,
+  regexSource: string,
+): CommandSegment[] {
+  const re = new RegExp(regexSource, 'i');
+  const out: CommandSegment[] = [];
+  for (const seg of splitSegments(cmd)) {
+    const trimmed = seg.raw.replace(/^\s+/, '');
+    if (re.test(trimmed)) out.push(seg);
+  }
+  return out;
+}

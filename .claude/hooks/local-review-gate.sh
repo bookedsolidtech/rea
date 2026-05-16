@@ -1,460 +1,573 @@
 #!/bin/bash
 # PreToolUse hook: local-review-gate.sh
-# 0.26.0+ — forceful local-first delegation enforcement.
+# 0.34.0+ — Node-binary shim for `rea hook local-review-gate`.
 #
-# Fires BEFORE every Bash tool call. Detects `git push` (and optionally
-# `git commit` per policy) and refuses the command unless a recent
-# `rea.local_review` audit entry covers HEAD.
+# Pre-0.34.0 the gate's full body lived here as bash (460 LOC,
+# including the per-trigger inline-bypass walker, multi-segment
+# laundering defense, and the friendly refusal banner). The migration
+# to the Node binary moves the per-segment trigger detection +
+# preflight call into `src/hooks/local-review-gate/index.ts`. This
+# shim is the Claude Code dispatcher's view of the hook — it
+# forwards stdin to the CLI and exits with whatever the CLI returns.
 #
-# This is the AGENT-SPECIFIC enforcement layer — Claude Code's Bash
-# tool fires PreToolUse hooks BEFORE the command runs, so an agent
-# trying `git push` is stopped HERE, before husky even sees it. Husky
-# is the second layer (terminal users + CI), `rea preflight` is the
-# workhorse both layers call.
+# Behavioral contract is preserved byte-for-byte: exit 0 on
+# pass-through / mode=off / bypassed / preflight-allow, exit 2 on
+# HALT / preflight-refuse / malformed payload.
 #
-# The forceful aspect is exactly what CTO directive 2026-05-05 asked
-# for: "an agent driving rea via Bash tool literally cannot push
-# without first creating a `rea.local_review` audit entry, OR
-# explicitly invoking the override, OR having the policy set to `off`
-# for the team."
+# # Shim short-circuits (codex round-1 P1+P2 fixes)
 #
-# Off-switch (FIRST-class concern): `policy.review.local_review.mode: off`
-# — the gate becomes a silent no-op. Teams without codex/claude opt out
-# cleanly via policy.
+# The 0.34.0 round-0 shim deferred ALL decisions to the CLI, including
+# `mode: off` and the bypass env-var. That regressed two documented
+# workflows on fresh/unbuilt installs:
+#   - codex-less teams with `policy.review.local_review.mode: off` must
+#     still be able to `git push` even when the rea CLI isn't built.
+#   - operators with the audited bypass env-var set (default
+#     `REA_SKIP_LOCAL_REVIEW=<reason>`) must still be able to push.
+# Round-1 P1 fix: read the mode + bypass env-var INLINE in the shim
+# BEFORE any CLI resolution. These two short-circuits exit 0 cleanly
+# without spawning node. The full enforcement (multi-trigger sweep,
+# inline-bypass evaluation, preflight call) still lives in the CLI.
 #
-# Per-invocation override: REA_SKIP_LOCAL_REVIEW="<reason>" — the gate
-# allows the command and `rea preflight` audits the bypass.
+# # CLI-resolution trust boundary
 #
-# Exit codes:
-#   0 = allow (mode=off, override set, recent review found, non-git command)
-#   2 = refuse (no recent review covering HEAD)
+# Mirrors the 0.32.0 final shim shape. The resolved CLI MUST live
+# INSIDE realpath(CLAUDE_PROJECT_DIR) AND have an ancestor
+# `package.json` whose `name` is `@bookedsolid/rea`.
+#
+# # Fail-closed posture
+#
+# local-review-gate is BLOCKING-tier — the pre-0.34.0 bash body
+# refused `git push` (and optionally `git commit`) without a recent
+# audit entry. The early-exit branches (CLI missing, node missing,
+# sandbox failed, version skew) fail closed AFTER the relevance
+# pre-gate passes AND AFTER the mode/bypass short-circuits.
+#
+# # Relevance pre-gate
+#
+# Round-1 P2 fix: the substring scan must NOT mark commands as
+# relevant when `git push`/`git commit` only appears inside a quoted
+# argument body (`echo "remember git push later"`,
+# `git commit -m "doc: explain git push --force"`). Pre-fix the
+# substring scan saw these as relevant → entered fail-closed branch
+# when CLI was missing. Fix: anchor the substring scan on segment
+# heads via a stripped-prefix check, matching the CLI's segment-aware
+# detector.
 
 set -uo pipefail
 
-# Source shared command segmenter — same parser the dangerous-bash and
-# protected-paths hooks use. Lets us detect `git push`/`git commit` even
-# when nested inside `bash -c "..."`, behind env-var prefixes, or chained
-# with `&&` / `;`.
-# shellcheck source=_lib/cmd-segments.sh
-source "$(dirname "$0")/_lib/cmd-segments.sh"
-
-# 1. Read stdin (Claude Code hook payload).
-INPUT=$(cat)
-
-# 2. Dependency check.
-if ! command -v jq >/dev/null 2>&1; then
-  printf 'REA ERROR: jq is required but not installed.\n' >&2
-  exit 2
-fi
-
-# 3. HALT check (kill-switch wins over everything).
+# 1. HALT check.
 # shellcheck source=_lib/halt-check.sh
 source "$(dirname "$0")/_lib/halt-check.sh"
 check_halt
 REA_ROOT=$(rea_root)
 
-# 4. Source policy reader (needed to read mode + refuse_at + bypass_env_var).
-# shellcheck source=_lib/policy-read.sh
-source "$(dirname "$0")/_lib/policy-read.sh"
+proj="${CLAUDE_PROJECT_DIR:-$REA_ROOT}"
 
-# 5. Off-switch — silent no-op when policy says so.
-LOCAL_REVIEW_MODE=$(policy_get_local_review_mode)
-if [[ "$LOCAL_REVIEW_MODE" == "off" ]]; then
+# 2. Read stdin once. Used by the relevance pre-gate, the bypass
+#    short-circuit, AND the CLI forward.
+INPUT=$(cat)
+
+# 2b. Early bypass-env-var short-circuit (round-7 P2 fix). The
+#     pre-0.34.0 bash body honored the operator-exported bypass var
+#     BEFORE any policy read. The round-1+ shim deferred the bypass
+#     check to section 6, which sits AFTER the policy-reader spawns
+#     the CLI for mode/refuse_at lookups (section 4 + section 5). On
+#     unbuilt installs OR when the CLI fails the sandbox check, those
+#     policy reads can no-op silently — but the audited bypass should
+#     STILL short-circuit so operators can push through the gate.
+#
+#     We can only check the DEFAULT var name (REA_SKIP_LOCAL_REVIEW)
+#     this early because the policy-renamed `bypass_env_var` requires
+#     a policy read. The policy-aware re-check at section 6 still runs
+#     for renamed vars when the CLI is reachable. Operators who rename
+#     the var AND have a broken CLI fall back to the section-6 awk
+#     parser (block-form only) — same posture as pre-fix; this early
+#     gate only adds coverage for the default-var case.
+EARLY_BYPASS_VALUE="${REA_SKIP_LOCAL_REVIEW:-}"
+if [ -n "$EARLY_BYPASS_VALUE" ]; then
   exit 0
 fi
 
-# 6. Parse `tool_input.command` from the hook payload.
-CMD=$(printf '%s' "$INPUT" | jq -r '.tool_input.command // empty' 2>/dev/null)
-if [[ -z "$CMD" ]]; then
+# 3. Resolve the rea CLI path early — used (a) by the policy reader
+#    fallback below to honor inline `local_review: { mode: ... }`
+#    mappings, and (b) by the forward step at the bottom. Stored as
+#    REA_ARGV so the same array drives both calls.
+POLICY_FILE="$proj/.rea/policy.yaml"
+REA_ARGV=()
+RESOLVED_CLI_PATH=""
+if [ -f "$proj/node_modules/@bookedsolid/rea/dist/cli/index.js" ]; then
+  REA_ARGV=(node "$proj/node_modules/@bookedsolid/rea/dist/cli/index.js")
+  RESOLVED_CLI_PATH="$proj/node_modules/@bookedsolid/rea/dist/cli/index.js"
+elif [ -f "$proj/dist/cli/index.js" ]; then
+  REA_ARGV=(node "$proj/dist/cli/index.js")
+  RESOLVED_CLI_PATH="$proj/dist/cli/index.js"
+fi
+
+# Round-5 P1 fix: sandbox-check the resolved CLI BEFORE any policy-get
+# invocation. Pre-fix `_lrg_read_policy()` could spawn the resolved CLI
+# (section 4 mode-off check, section 5 refuse_at) BEFORE the section-7
+# sandbox validation — a symlinked or swapped `dist/cli/index.js`
+# would execute during policy lookup, defeating the realpath /
+# package.json trust boundary that the shim is supposed to enforce.
+# We now validate the CLI's realpath sits inside CLAUDE_PROJECT_DIR
+# AND has an ancestor `package.json` with name `@bookedsolid/rea`
+# BEFORE the policy reader is allowed to spawn it. On failure we
+# zero out REA_ARGV so the policy reader falls through to the awk
+# block-form parser (which never spawns anything), and the eventual
+# CLI-forward step at section 7 will refuse with the sandbox banner.
+if [ "${#REA_ARGV[@]}" -gt 0 ] && command -v node >/dev/null 2>&1; then
+  sandbox_check_early=$(node -e '
+    const fs = require("fs");
+    const path = require("path");
+    const cli = process.argv[1];
+    const projDir = process.argv[2];
+    let real, realProj;
+    try { real = fs.realpathSync(cli); } catch (e) {
+      process.stdout.write("bad:realpath"); process.exit(1);
+    }
+    try { realProj = fs.realpathSync(projDir); } catch (e) {
+      process.stdout.write("bad:realpath-proj"); process.exit(1);
+    }
+    const sep = path.sep;
+    const projWithSep = realProj.endsWith(sep) ? realProj : realProj + sep;
+    if (!(real === realProj || real.startsWith(projWithSep))) {
+      process.stdout.write("bad:cli-escapes-project"); process.exit(1);
+    }
+    let cur = path.dirname(path.dirname(path.dirname(real)));
+    let found = false;
+    for (let i = 0; i < 20 && cur && cur !== path.dirname(cur); i += 1) {
+      const pj = path.join(cur, "package.json");
+      if (fs.existsSync(pj)) {
+        try {
+          const data = JSON.parse(fs.readFileSync(pj, "utf8"));
+          if (data && data.name === "@bookedsolid/rea") { found = true; break; }
+        } catch (e) { /* keep walking */ }
+      }
+      cur = path.dirname(cur);
+    }
+    if (!found) { process.stdout.write("bad:no-rea-pkg-json"); process.exit(1); }
+    process.stdout.write("ok");
+  ' -- "$RESOLVED_CLI_PATH" "$proj" 2>/dev/null)
+  if [ "$sandbox_check_early" != "ok" ]; then
+    # Sandbox failed. Stash the failure reason and clear REA_ARGV so
+    # the policy reader falls through to awk. The section-7 forward
+    # step will re-run the sandbox check and emit the canonical
+    # refusal banner to stderr.
+    SANDBOX_EARLY_FAILURE="$sandbox_check_early"
+    REA_ARGV=()
+  fi
+fi
+
+# Helper: read a `local_review.<leaf>` policy key. Tries
+# `rea hook policy-get review.local_review --json` (one node-spawn for
+# the whole subtree) first — that path handles inline + block YAML
+# identically since it goes through the canonical `yaml.parse()`.
+# Falls back to a block-form awk parser when the CLI isn't available
+# or jq isn't installed. Empty stdout → "default applies".
+#
+# 0.34.0 round-2 P2 fix: pre-fix the shim only ran the block-form awk
+# parser, so inline-form mappings like
+# `local_review: { mode: off, refuse_at: commit }` silently no-op'd on
+# stale-CLI installs (the canonical loader DOES handle them — only the
+# shim was block-only). Hybrid policy reader mirrors the pattern used
+# by prepare-commit-msg's augmenter.
+#
+# The subtree JSON is fetched ONCE per Bash event (cached in
+# `_lrg_subtree_json`) so we don't pay 3x node-spawn cost. The cache
+# variable is "" until first call, "<none>" if the CLI / jq path
+# returned no usable JSON (so awk fallback runs), or the JSON body.
+_lrg_subtree_json=""
+_lrg_read_policy() {
+  # $1 = dotted key (e.g. `review.local_review.mode`)
+  local key="$1"
+  local leaf="${key##*.}"
+  # 1. First call: try `rea hook policy-get review.local_review --json`.
+  #    Subsequent calls reuse the cached subtree.
+  if [ -z "$_lrg_subtree_json" ]; then
+    if [ "${#REA_ARGV[@]}" -gt 0 ] && command -v jq >/dev/null 2>&1; then
+      local json
+      json=$("${REA_ARGV[@]}" hook policy-get review.local_review --json 2>/dev/null || true)
+      # `null` indicates the path was unset — leaves jq to print
+      # `null` for any leaf, which we treat as "default applies".
+      if [ -n "$json" ]; then
+        _lrg_subtree_json="$json"
+      else
+        _lrg_subtree_json="<none>"
+      fi
+    else
+      _lrg_subtree_json="<none>"
+    fi
+  fi
+  # 2. If we have JSON, ask jq for the leaf.
+  if [ "$_lrg_subtree_json" != "<none>" ]; then
+    local out
+    out=$(printf '%s' "$_lrg_subtree_json" | jq -r --arg k "$leaf" '
+      if type == "object" and has($k) and (.[$k] != null) then .[$k] | tostring else "" end
+    ' 2>/dev/null || true)
+    if [ -n "$out" ]; then
+      printf '%s' "$out"
+      return 0
+    fi
+    # JSON path present but leaf unset → fall through to default. Do
+    # NOT also try the awk parser; the canonical loader is the source
+    # of truth here.
+    return 0
+  fi
+  # 3. Fallback: block-form awk parser (legacy 0.34.0 round-1 path).
+  #    Only covers `review.local_review.<leaf>`. Inline-form mappings
+  #    fall through to "" → defaults — which is the SAME posture as the
+  #    pre-0.34.0 bash hook, but now with the CLI path above providing
+  #    inline-form support whenever the CLI is reachable.
+  if [ ! -f "$POLICY_FILE" ] || ! command -v awk >/dev/null 2>&1; then
+    return 0
+  fi
+  case "$key" in
+    review.local_review.mode)
+      awk '
+        /^review[[:space:]]*:[[:space:]]*$/ { in_review=1; next }
+        /^[^[:space:]]/                     { in_review=0; in_lr=0; next }
+        in_review && /^[[:space:]]+local_review[[:space:]]*:[[:space:]]*$/ { in_lr=1; next }
+        in_lr && /^[[:space:]]{2,}[a-zA-Z]/ {
+          if ($1 ~ /^mode:/) { print $2; exit }
+        }
+        in_lr && /^[[:space:]]{0,2}[a-zA-Z]/ && !/^[[:space:]]+local_review/ { in_lr=0 }
+      ' "$POLICY_FILE" 2>/dev/null | tr -d '"' | tr -d "'" | head -1
+      ;;
+    review.local_review.refuse_at)
+      awk '
+        /^review[[:space:]]*:[[:space:]]*$/ { in_review=1; next }
+        /^[^[:space:]]/                     { in_review=0; in_lr=0; next }
+        in_review && /^[[:space:]]+local_review[[:space:]]*:[[:space:]]*$/ { in_lr=1; next }
+        in_lr && /^[[:space:]]{2,}refuse_at[[:space:]]*:/ { print $2; exit }
+        in_lr && /^[[:space:]]{0,2}[a-zA-Z]/ && !/^[[:space:]]+local_review/ && !/^[[:space:]]+(mode|refuse_at|bypass_env_var|max_age_seconds)/ { in_lr=0 }
+      ' "$POLICY_FILE" 2>/dev/null | tr -d '"' | tr -d "'" | head -1
+      ;;
+    review.local_review.bypass_env_var)
+      awk '
+        /^review[[:space:]]*:[[:space:]]*$/ { in_review=1; next }
+        /^[^[:space:]]/                     { in_review=0; in_lr=0; next }
+        in_review && /^[[:space:]]+local_review[[:space:]]*:[[:space:]]*$/ { in_lr=1; next }
+        in_lr && /^[[:space:]]{2,}bypass_env_var[[:space:]]*:/ { print $2; exit }
+        in_lr && /^[[:space:]]{0,2}[a-zA-Z]/ && !/^[[:space:]]+local_review/ && !/^[[:space:]]+(mode|refuse_at|bypass_env_var|max_age_seconds)/ { in_lr=0 }
+      ' "$POLICY_FILE" 2>/dev/null | tr -d '"' | tr -d "'" | head -1
+      ;;
+  esac
+}
+
+# 4. Mode-off short-circuit. Mirrors the bash hook's
+#    `policy_get_local_review_mode` check at the top — `off` → silent
+#    no-op BEFORE any other work.
+LOCAL_REVIEW_MODE=$(_lrg_read_policy review.local_review.mode)
+if [ "$LOCAL_REVIEW_MODE" = "off" ]; then
   exit 0
 fi
 
-# 7. Determine which git ops to refuse from policy.review.local_review.refuse_at
-#    (default 'push').
-REFUSE_AT=$(policy_get_local_review_refuse_at)
-[[ -z "$REFUSE_AT" ]] && REFUSE_AT='push'
-
-REFUSE_PUSH=0
-REFUSE_COMMIT=0
+# 5. Read `refuse_at` to scope the relevance pre-gate. Under the
+#    default `refuse_at: push`, a `git commit` segment is NOT refused
+#    by the CLI — so when the CLI is missing, the shim should let
+#    `git commit -m "..."` pass without hitting fail-closed. Mirrors
+#    the bash hook's posture: a non-refused git op does not enter
+#    the preflight-refuse branch.
+REFUSE_AT="push"
+POLICY_REFUSE=$(_lrg_read_policy review.local_review.refuse_at)
+case "$POLICY_REFUSE" in push|commit|both) REFUSE_AT="$POLICY_REFUSE" ;; esac
+# Build trigger-head alternation based on refuse_at.
 case "$REFUSE_AT" in
-  push)   REFUSE_PUSH=1 ;;
-  commit) REFUSE_COMMIT=1 ;;
-  both)   REFUSE_PUSH=1; REFUSE_COMMIT=1 ;;
-  *)      REFUSE_PUSH=1 ;;  # Unknown value falls back to safest default.
+  push)   TRIGGER_RE='git[[:space:]]+push' ;;
+  commit) TRIGGER_RE='git[[:space:]]+commit' ;;
+  both)   TRIGGER_RE='git[[:space:]]+(push|commit)' ;;
 esac
 
-# 8. Detect git push / git commit in any segment of the command.
+# Relevance pre-gate. Anchor on the trigger regex at the head of each
+# ;/&&/||/| separated segment — this matches the CLI's segment-aware
+# detector and avoids false-positives on quoted arguments like
+# `git commit -m "doc: git push later"`.
 #
-# We use `any_segment_starts_with` so:
-#   - `git push origin main`           → matches push
-#   - `git commit -m "msg"`            → matches commit
-#   - `cd /tmp && git push`            → matches push (segment after &&)
-#   - `echo "git push later"`          → does NOT match (echo, not git)
-#   - `git log --oneline | git push`   → matches push (last segment)
+# The check is approximate (it uses a coarse quote masker that the CLI
+# does properly via mvdan-sh) because if it errs on the side of
+# relevant→true, the CLI's real segment walker will sort it out. We
+# only want to short-circuit confidently-non-relevant cases (where
+# there's NO trigger head in any segment) so unbuilt installs don't
+# fail closed on benign Bash calls.
 #
-# We don't try to match `git commit --amend` separately — an amend
-# rewrites HEAD, so it's the same coverage problem as a fresh commit.
-#
-# 0.26.0 codex round-23 P2 fix: `any_segment_starts_with` strips env-var
-# prefixes via `_rea_strip_prefix`, whose regex `^NAME=[^[:space:]]+[[:space:]]+`
-# stops at the first space inside a quoted value. For
-# `REA_SKIP_LOCAL_REVIEW="urgent fix" git push origin main` the stripper
-# bails halfway and the segment never starts with `git`, so the original
-# detector returned false → NEEDS_PREFLIGHT=0 → hook exits 0 BEFORE the
-# bypass-detection block ever ran (broke the documented "agent literally
-# cannot push without an audit entry" guarantee).
-#
-# Fix: add an `any_segment_raw_matches` fallback whose pattern requires
-# one or more env-var assignments (with quoted-value support) BEFORE the
-# `git push`/`git commit` token. This anchors strictly on shapes the
-# stripper would have eaten if values were unquoted, so it cannot
-# false-positive on `echo "git push later"` (segment doesn't start with
-# `NAME=...`) or on a quoted-mention inside a body.
-NEEDS_PREFLIGHT=0
-GIT_OP_LABEL=''
-# 0.26.0 round-25 P1-B fix: capture EVERY trigger segment, not just the
-# first. Pre-fix `find_first_segment_starting_with` returned only the
-# first matching segment; if a multi-push command contained two pushes
-# (e.g. `BYPASS=fake git push fake-remote --dry-run; git push origin main`),
-# the bypass on segment 1 was honored globally and segment 2 (the real
-# push to origin/main) went through ungated. Round-25 fix: collect every
-# trigger segment into a newline-delimited list, then in step 9b validate
-# each one independently. Bypass succeeds only if EVERY trigger segment
-# carries its own bypass (process-env or inline). Any trigger without a
-# bypass forces preflight invocation.
-#
-# Newline-delimited; empty when NEEDS_PREFLIGHT=0.
-TRIGGER_SEGMENTS=''
-
-# Raw-fallback regex shared between push and commit detection — anchors
-# `^(NAME=value...)+git[[:space:]]+(push|commit)` at segment start. The
-# prefix-stripper bails on quoted-value-with-spaces, so this fallback is
-# the path that catches `REA_SKIP="urgent fix" git push`.
-#
-# 0.26.0 round-25 P2-A fix: extend the value-shape alternation to accept
-# ANSI-C form `$'...'` (literal `$` followed by single-quoted body). Pre-
-# fix `FOO=$'a b' git push` matched no shape — `_REA_RAW_INLINE_RE_PUSH`
-# failed AND `_rea_strip_prefix` bailed — so detection silently dropped
-# and the gate exited 0 BEFORE the bypass-detection block, defeating the
-# documented "agent literally cannot push without an audit entry"
-# guarantee under `refuse_at: commit/both` (ANSI-C form is rare for
-# commits but covered for symmetry).
-_REA_RAW_INLINE_RE_PUSH='^([A-Za-z_][A-Za-z0-9_]*=("[^"]*"|'"'"'[^'"'"']*'"'"'|\$'"'"'[^'"'"']*'"'"'|[^[:space:]]+)[[:space:]]+)+git[[:space:]]+push([[:space:]]|$)'
-_REA_RAW_INLINE_RE_COMMIT='^([A-Za-z_][A-Za-z0-9_]*=("[^"]*"|'"'"'[^'"'"']*'"'"'|\$'"'"'[^'"'"']*'"'"'|[^[:space:]]+)[[:space:]]+)+git[[:space:]]+commit([[:space:]]|$)'
-
-# Helper: append a segment list to TRIGGER_SEGMENTS (newline-delimited),
-# preserving order and skipping empties.
-_rea_append_triggers() {
-  local list="$1"
-  if [[ -z "$list" ]]; then
-    return 0
+# 0.34.0 round-2 P1 fix: the env-prefix-strip MUST accept quoted
+# values. Pre-fix the strip pattern was
+# `[A-Za-z_][A-Za-z0-9_]*=[^[:space:]]+[[:space:]]+`, which silently
+# missed shapes like `GIT_SSH_COMMAND="ssh -i ~/.ssh/id"  git push`
+# because the `[^[:space:]]+` value group stops at the first space
+# inside the quotes. We mirror the segments.ts `matchEnvAssignLength`
+# helper — accept value shapes `"..."`, `'...'`, `\S*` (zero-or-more
+# so bare `FOO= cmd` resolves too). The strip runs ITERATIVELY so
+# stacked env prefixes (`A="x" B='y' C=z git push`) all get peeled.
+RELEVANT=0
+PROBE=""
+JQ_PARSE_FAILED=0
+# 0.34.0 round-4 P2 fix: capture jq's exit code SEPARATELY rather than
+# swallowing it with `|| true`. Malformed PreToolUse payload (invalid
+# JSON, schema mismatch) pre-fix → empty PROBE → RELEVANT=0 fast path
+# → silent bypass. Post-fix we distinguish:
+#   - jq exit 0 + non-empty stdout → use as PROBE (the normal path)
+#   - jq exit 0 + empty stdout     → non-Bash payload / empty cmd, RELEVANT=0
+#   - jq exit != 0 (parse failure) → JQ_PARSE_FAILED=1, force RELEVANT=1
+#                                    so we skip the awk pre-gate and
+#                                    forward straight to the CLI body
+#                                    which fails closed on malformed
+#                                    payloads via Zod. Substring-only
+#                                    fallback was insufficient because
+#                                    raw JSON often won't contain
+#                                    `git push` literally and would
+#                                    still short-circuit to exit 0.
+if command -v jq >/dev/null 2>&1; then
+  PROBE=$(printf '%s' "$INPUT" | jq -r '.tool_input.command // ""' 2>/dev/null)
+  jq_status=$?
+  if [ "$jq_status" -ne 0 ]; then
+    JQ_PARSE_FAILED=1
   fi
-  if [[ -z "$TRIGGER_SEGMENTS" ]]; then
-    TRIGGER_SEGMENTS="$list"
-  else
-    TRIGGER_SEGMENTS="${TRIGGER_SEGMENTS}"$'\n'"${list}"
-  fi
-}
-
-if [[ $REFUSE_PUSH -eq 1 ]]; then
-  # Sweep ALL push trigger segments. A multi-push command must validate
-  # bypass on EACH trigger; first-only capture leaks the laundering class.
-  _push_segs_stripped=$(find_all_segments_starting_with "$CMD" 'git[[:space:]]+push([[:space:]]|$)' || true)
-  if [[ -n "$_push_segs_stripped" ]]; then
-    NEEDS_PREFLIGHT=1
-    GIT_OP_LABEL='git push'
-    _rea_append_triggers "$_push_segs_stripped"
-  fi
-  # ALSO sweep raw-form push trigger segments (env-prefix shapes the
-  # stripper bails on). Combined with the stripped sweep this gives full
-  # coverage. Note: a segment matched by the stripped sweep may ALSO
-  # match the raw sweep — that's fine, we de-dupe in the bypass loop.
-  _push_segs_raw=$(find_all_segments_raw_matches "$CMD" "$_REA_RAW_INLINE_RE_PUSH" || true)
-  if [[ -n "$_push_segs_raw" ]]; then
-    NEEDS_PREFLIGHT=1
-    GIT_OP_LABEL='git push'
-    _rea_append_triggers "$_push_segs_raw"
-  fi
-fi
-
-if [[ $REFUSE_COMMIT -eq 1 ]]; then
-  # `git commit` alone (interactive editor) is also covered — once committed,
-  # HEAD moves and any subsequent push would refuse anyway. Catching it here
-  # prevents the agent from doing N commits and only discovering the gate
-  # at push time.
-  _commit_segs_stripped=$(find_all_segments_starting_with "$CMD" 'git[[:space:]]+commit([[:space:]]|$)' || true)
-  if [[ -n "$_commit_segs_stripped" ]]; then
-    NEEDS_PREFLIGHT=1
-    [[ -z "$GIT_OP_LABEL" ]] && GIT_OP_LABEL='git commit'
-    _rea_append_triggers "$_commit_segs_stripped"
-  fi
-  _commit_segs_raw=$(find_all_segments_raw_matches "$CMD" "$_REA_RAW_INLINE_RE_COMMIT" || true)
-  if [[ -n "$_commit_segs_raw" ]]; then
-    NEEDS_PREFLIGHT=1
-    [[ -z "$GIT_OP_LABEL" ]] && GIT_OP_LABEL='git commit'
-    _rea_append_triggers "$_commit_segs_raw"
-  fi
-fi
-
-if [[ $NEEDS_PREFLIGHT -eq 0 ]]; then
-  # Not a git push or git commit — let it through.
-  if [[ "${REA_LOCAL_REVIEW_DEBUG_TRACE:-}" == "1" ]]; then
-    printf 'rea-local-review-trace: detect=none\n' >&2
-  fi
-  exit 0
-fi
-
-# 9. Per-invocation override env-var. Default REA_SKIP_LOCAL_REVIEW; the
-#    policy can rename the var (e.g. for organizations that want a
-#    bespoke audit signature). When set with a non-empty value the gate
-#    allows the command — `rea preflight` itself will audit the bypass
-#    when invoked downstream.
-BYPASS_VAR=$(policy_get_local_review_bypass_env_var)
-[[ -z "$BYPASS_VAR" ]] && BYPASS_VAR='REA_SKIP_LOCAL_REVIEW'
-
-# 9a. Read the configured env-var from the hook's PROCESS env (indirect
-#     expansion, bash 3.2 compatible). This catches the case where the
-#     operator exported the var BEFORE invoking Claude Code.
-BYPASS_VALUE="${!BYPASS_VAR:-}"
-
-# 9b. Detect inline `VAR=value [VAR=value...] git ...` assignment for
-#     EACH trigger segment. POSIX shells parse `VAR=value cmd` as a
-#     single-call env override — the variable lives in the spawned cmd's
-#     env only, never in the hook's process env. ${!BYPASS_VAR} therefore
-#     returns empty for the override form
-#     `REA_SKIP_LOCAL_REVIEW="reason" git push` and the gate would
-#     silently refuse a documented escape hatch. Detect the inline
-#     assignment so the hook honors it.
-#
-#     0.26.0 round-25 P1-B fix: pre-fix the gate captured only the FIRST
-#     trigger segment and validated bypass against it. Multi-push
-#     laundering PoCs:
-#       BYPASS=fake git push fake-remote --dry-run; git push origin main
-#         → bypass on segment 1 honored, segment 2 (real push) ungated.
-#     Round-25 fix: iterate over EVERY trigger segment in TRIGGER_SEGMENTS.
-#     Bypass succeeds globally only if EVERY trigger segment carries its
-#     own bypass (process-env covers all uniformly; otherwise each
-#     trigger segment must have an inline bypass). Any trigger segment
-#     without bypass forces preflight invocation.
-#
-#     Empty values MUST NOT bypass (REA_SKIP_LOCAL_REVIEW="" must refuse,
-#     same as missing). The value-capture group requires at least one
-#     non-quote / non-whitespace char inside whatever quoting form was
-#     used; explicit length-check after match also enforces non-empty.
-
-# Validate bypass_env_var is a POSIX env-var name. If the policy returns
-# junk (regex metachars, empty), skip inline detection (the gate then
-# requires preflight unless process-env BYPASS_VALUE is set).
-_BYPASS_VAR_VALID=0
-if [[ "$BYPASS_VAR" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
-  _BYPASS_VAR_VALID=1
-fi
-
-# Three accepted value shapes for inline bypass:
-#   VAR=word              (no quotes; value = chars up to whitespace)
-#   VAR="quoted"          (double-quoted; value between the quotes)
-#   VAR='quoted'          (single-quoted; value between the quotes)
-# (ANSI-C `VAR=$'a b'` is also recognized via the prefix-stripper in
-# round-25 P2-A, but bypass detection still anchors on the conventional
-# three quote forms — ANSI-C as a bypass value is not a documented
-# escape hatch, only as an env-prefix shape.)
-# The trailing `git` anchor (with optional intervening env assignments)
-# prevents echo / commit-message false-positives.
-_INLINE_TAIL_RE='([[:space:]]+([A-Za-z_][A-Za-z0-9_]*=([^[:space:]"'"'"']*|"[^"]*"|'"'"'[^'"'"']*'"'"')[[:space:]]+)*git([[:space:]]|$))'
-
-# Round-30 F1 sibling-sweep: allow ZERO-or-more LEADING env-var prefixes
-# at segment start before the bypass var. POSIX-legal shapes like
-# `GIT_TRACE=1 REA_SKIP_LOCAL_REVIEW="reason" git push` were rejected by
-# the round-27 F1 anchor tightening (`^[[:space:]]*${BYPASS_VAR}=`).
-# This sub-pattern matches the same env-prefix shapes as
-# `_REA_RAW_INLINE_RE_PUSH` so the comment-tail safety property
-# round-27 F1 added is preserved (comments don't start at segment
-# start).
-_INLINE_LEAD_PREFIX_RE='^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*=("[^"]*"|'"'"'[^'"'"']*'"'"'|\$'"'"'[^'"'"']*'"'"'|[^[:space:]]+)[[:space:]]+)*'
-
-# Per-segment bypass evaluator. Echoes the inline bypass value (if any)
-# on stdout for the supplied segment. Empty stdout means no inline bypass
-# was detected for that segment.
-_rea_evaluate_inline_bypass() {
-  local seg="$1"
-  if [[ $_BYPASS_VAR_VALID -eq 0 || -z "$seg" ]]; then
-    return 0
-  fi
-  local masked
-  masked=$(quote_masked_cmd "$seg")
-  # Round-27 F1 fix: anchor at SEGMENT START (post-mask, post-strip).
-  # Pre-round-27 the alternation `(^|[[:space:]])` allowed the bypass
-  # shape to appear anywhere in the segment — including inside a `#`
-  # shell-comment tail. PoC: `git push origin main # see PR —
-  # REA_SKIP_LOCAL_REVIEW=fake git push`. The `# REA_SKIP_LOCAL_REVIEW=fake`
-  # portion was whitespace-prefixed and matched the unquoted alternative,
-  # yielding val=fake and authorizing the real `git push origin main`.
-  #
-  # Round-27 F1 anchored at `^[[:space:]]*` — segment start after leading
-  # whitespace. Comment tails are not segment start (they sit AFTER a
-  # `git push` or other primary command), so the anchor refuses them.
-  # Round-30 F1 sibling-sweep extends the anchor to also accept leading
-  # env-var prefix shapes (`GIT_TRACE=1 BAR=baz REA_SKIP=...`) since
-  # those ALSO sit at segment start by construction. Comment-tail safety
-  # is preserved because `#` is not part of the env-prefix grammar.
-  local val=""
-  # _INLINE_LEAD_PREFIX_RE adds 2 capture groups (outer iteration body +
-  # inner value-shape). The bypass value capture is the 3rd group:
-  # BASH_REMATCH[3].
-  if [[ "$masked" =~ ${_INLINE_LEAD_PREFIX_RE}${BYPASS_VAR}=\"([^\"]*)\"${_INLINE_TAIL_RE} ]]; then
-    val="${BASH_REMATCH[3]}"
-  elif [[ "$masked" =~ ${_INLINE_LEAD_PREFIX_RE}${BYPASS_VAR}=\'([^\']*)\'${_INLINE_TAIL_RE} ]]; then
-    val="${BASH_REMATCH[3]}"
-  elif [[ "$masked" =~ ${_INLINE_LEAD_PREFIX_RE}${BYPASS_VAR}=([^[:space:]\"\']+)${_INLINE_TAIL_RE} ]]; then
-    val="${BASH_REMATCH[3]}"
-  fi
-  # Non-empty value only — empty string from any of the three regexes
-  # (e.g. VAR="") MUST NOT bypass.
-  if [[ -n "$val" ]]; then
-    printf '%s' "$val"
-  fi
-}
-
-# Round-25 P1-B sweep: every trigger segment must independently authorize
-# the bypass. Process-env is global (a single non-empty value covers all
-# trigger segments); inline is per-segment.
-ALL_BYPASSED=1
-INLINE_BYPASS_VALUE=""
-ANY_INLINE_VALUE=""
-# Track first-failed segment for refusal trace (debug only).
-FIRST_UNCOVERED_SEGMENT=""
-
-# When the operator's process env carries a non-empty bypass, that single
-# value covers every trigger segment uniformly — process-env is a
-# session-wide override, not a per-segment one. Skip the per-segment
-# inline scan entirely in that case.
-if [[ -n "$BYPASS_VALUE" ]]; then
-  ALL_BYPASSED=1
 else
-  # Iterate trigger segments via process-substitution to preserve the
-  # newline-delimited list. Empty/duplicate entries are silently skipped.
-  _seen_segments=""
-  while IFS= read -r _seg; do
-    [[ -z "$_seg" ]] && continue
-    # De-dupe: a segment matched by both the stripped and raw sweeps
-    # appears twice. Compare against a delimited concatenation of seen
-    # segments to avoid re-evaluating the same one.
-    if [[ "$_seen_segments" == *$'\x1f'"$_seg"$'\x1f'* ]]; then
-      continue
-    fi
-    _seen_segments="${_seen_segments}"$'\x1f'"${_seg}"$'\x1f'
-    _seg_inline=$(_rea_evaluate_inline_bypass "$_seg")
-    if [[ -z "$_seg_inline" ]]; then
-      ALL_BYPASSED=0
-      [[ -z "$FIRST_UNCOVERED_SEGMENT" ]] && FIRST_UNCOVERED_SEGMENT="$_seg"
-      # Don't break — keep scanning so trace can report the count below.
-    else
-      # Capture the FIRST observed inline bypass value for the trace
-      # message (so legitimate single-trigger flows still report
-      # `reason=...`). Not load-bearing for the decision itself — the
-      # ALL_BYPASSED gate is what governs the exit.
-      [[ -z "$ANY_INLINE_VALUE" ]] && ANY_INLINE_VALUE="$_seg_inline"
-    fi
-  done <<< "$TRIGGER_SEGMENTS"
+  # 0.34.0 round-6 P1 fix: pre-fix the shim set `PROBE="$INPUT"` (the
+  # raw JSON payload) when jq was missing, then ran the awk relevance
+  # scan over JSON instead of a bare command. A payload containing
+  # `git push origin main` came through as e.g.
+  # `{"tool_name":"Bash","tool_input":{"command":"git push origin main"}}`
+  # → the `^git push` anchor never matched → RELEVANT=0 → silent
+  # bypass on every jq-less machine. Fix: treat jq-missing the same
+  # as a parse failure — force RELEVANT=1 and let the CLI body decide.
+  # The CLI uses native Node JSON parsing so jq is not required for
+  # the actual enforcement.
+  JQ_PARSE_FAILED=1
 fi
-
-# 9c. Allow ONLY when every trigger segment authorized bypass (process-env
-#     covers globally; inline must be present on each segment). Failure
-#     of any single trigger segment forces preflight invocation.
-if [[ $ALL_BYPASSED -eq 1 ]]; then
-  if [[ -n "$BYPASS_VALUE" ]]; then
-    INLINE_BYPASS_VALUE=""
-  else
-    INLINE_BYPASS_VALUE="$ANY_INLINE_VALUE"
-  fi
-  # Override active — allow. The downstream `rea preflight` (in husky
-  # or otherwise) will write the audit override entry. We do NOT write
-  # one here because that would double-audit any push that crosses both
-  # the bash-tier and the husky tier.
-  #
-  # Test-only debug trace: when REA_LOCAL_REVIEW_DEBUG_TRACE=1 the gate
-  # emits a structured marker on stderr identifying the branch taken
-  # (bypass-process-env, bypass-inline, or refuse). Production never
-  # sets this env var; the trace is silent by default. The trace lets
-  # the codex round-23 P2 regression test distinguish "honored as
-  # bypass" from "command shape unrecognized → silent exit" — both
-  # exit 0 and produce no other output.
-  if [[ "${REA_LOCAL_REVIEW_DEBUG_TRACE:-}" == "1" ]]; then
-    if [[ -n "$INLINE_BYPASS_VALUE" ]]; then
-      printf 'rea-local-review-trace: bypass=inline reason=%q op=%s\n' \
-        "$INLINE_BYPASS_VALUE" "$GIT_OP_LABEL" >&2
-    else
-      printf 'rea-local-review-trace: bypass=process-env reason=%q op=%s\n' \
-        "$BYPASS_VALUE" "$GIT_OP_LABEL" >&2
-    fi
-  fi
-  exit 0
-fi
-# Round-25 P1-B trace: surface that at least one trigger segment lacked
-# a bypass (the laundering-class signal). Production stays silent.
-if [[ "${REA_LOCAL_REVIEW_DEBUG_TRACE:-}" == "1" ]]; then
-  printf 'rea-local-review-trace: refuse op=%s reason=trigger-without-bypass\n' \
-    "$GIT_OP_LABEL" >&2
-fi
-
-# 10. Resolve the rea binary the same way the husky pre-push template
-#     does — local node_modules first, dogfood dist next, PATH, then npx.
+# Split on shell separators then look for a segment whose head is
+# the configured trigger. The awk here masks chars inside `"..."`
+# and `'...'` spans before splitting — same posture as the CLI's
+# `splitSegments` but coarser (no nested-shell unwrap; the CLI handles
+# that). For relevance-pre-gate purposes the masker is sufficient.
 #
-# Round-30 F1 fix: align this 4-branch ladder with
-# templates/pre-push.local-first.sh:55-61 and the canonical husky body in
-# src/cli/install/pre-push.ts. Pre-fix the gate stopped at PATH and fell
-# open with the "could not locate" advisory whenever the operator only
-# had npx available (pnpm dlx-style installs, npx --no-install cache
-# hits, CI nodes that don't `npm i`). Adding the `npx --no-install`
-# branch closes that drift.
-REA_BIN=()
-if [ -x "${REA_ROOT}/node_modules/.bin/rea" ]; then
-  REA_BIN=("${REA_ROOT}/node_modules/.bin/rea")
-elif [ -f "${REA_ROOT}/dist/cli/index.js" ] \
-   && [ -f "${REA_ROOT}/package.json" ] \
-   && grep -q '"name": *"@bookedsolid/rea"' "${REA_ROOT}/package.json" 2>/dev/null; then
-  REA_BIN=(node "${REA_ROOT}/dist/cli/index.js")
-elif command -v rea >/dev/null 2>&1; then
-  REA_BIN=(rea)
-elif command -v npx >/dev/null 2>&1; then
-  # Last resort: npx will resolve the package from npm or the cache.
-  # Pass `--no-install` so a rare cache-cold machine surfaces a clear
-  # error instead of silently downloading at hook time.
-  REA_BIN=(npx --no-install @bookedsolid/rea)
+# IMPORTANT: the env-prefix strip runs on the UNMASKED `seg` (post
+# substring split) so the value's original quote characters are still
+# present. Strip patterns accept quoted (`"..."`, `'...'`) AND
+# unquoted (`\S*`) values so quoted env prefixes don't hide the
+# trigger.
+# Round-4 P2: if jq couldn't parse the payload, skip the awk pre-gate
+# entirely and force RELEVANT=1 so the CLI body decides. The CLI's Zod
+# parser fails closed on schema violations.
+if [ "$JQ_PARSE_FAILED" -eq 1 ]; then
+  RELEVANT=1
+elif [ -n "$PROBE" ]; then
+  RELEVANT=$(printf '%s' "$PROBE" | awk '
+    BEGIN {
+      mode = 0  # 0=plain, 1=dquote, 2=squote
+    }
+    {
+      line = $0
+      out  = ""
+      i    = 1
+      n    = length(line)
+      while (i <= n) {
+        ch = substr(line, i, 1)
+        if (mode == 0) {
+          if (ch == "\\" && i < n) { out = out " "; i += 2; continue }
+          if (ch == "\"") { mode = 1; out = out ch; i++; continue }
+          if (ch == "\047") { mode = 2; out = out ch; i++; continue }
+          out = out ch
+          i++
+        } else if (mode == 1) {
+          if (ch == "\\" && i < n) { out = out "x"; i += 2; continue }
+          if (ch == "\"") { mode = 0; out = out ch; i++; continue }
+          out = out "x"
+          i++
+        } else {
+          if (ch == "\047") { mode = 0; out = out ch; i++; continue }
+          out = out "x"
+          i++
+        }
+      }
+      print out
+    }
+  ' | tr ';|&' '\n\n\n' | awk -v trigger="^${TRIGGER_RE}([[:space:]]|$)" '
+    {
+      seg = $0
+      # Strip leading whitespace and common prefixes (sudo, exec,
+      # time, VAR=value). Coarse — the CLI does this properly.
+      sub(/^[[:space:]]+/, "", seg)
+      # Iteratively strip env-var assignment prefix VAR=<value> +
+      # one-or-more spaces. <value> may be a double-quoted string,
+      # a single-quoted string, or a bare token (zero-or-more
+      # non-space chars). Quote characters in this comment are
+      # intentionally avoided — see round-4 P1 fix: a literal
+      # single-quote inside an awk comment inside a single-quoted
+      # shell heredoc terminates the bash string and causes
+      # "awk: syntax error" at runtime, swallowed by `|| true`.
+      # Try quoted shapes first; bare last. Run until no more prefixes
+      # match (POSIX-legal stacked-env-prefix support).
+      changed = 1
+      while (changed) {
+        changed = 0
+        if (match(seg, /^[A-Za-z_][A-Za-z0-9_]*="[^"]*"[[:space:]]+/)) {
+          seg = substr(seg, RLENGTH + 1); changed = 1; continue
+        }
+        if (match(seg, /^[A-Za-z_][A-Za-z0-9_]*='\''[^'\'']*'\''[[:space:]]+/)) {
+          seg = substr(seg, RLENGTH + 1); changed = 1; continue
+        }
+        if (match(seg, /^[A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+/)) {
+          seg = substr(seg, RLENGTH + 1); changed = 1; continue
+        }
+      }
+      # Iteratively strip keyword prefixes. Round-5 P1 fix: the pre-
+      # fix `sub` only stripped ONE keyword, so `time sudo git push`
+      # left `sudo git push` and missed the trigger. Loop until no
+      # more keyword prefixes match. Coarse — the CLI does this
+      # properly with full builtin-tokenization.
+      kchanged = 1
+      while (kchanged) {
+        kchanged = 0
+        if (sub(/^(sudo|exec|time|then|do|else|fi|nice|nohup|stdbuf|env)[[:space:]]+/, "", seg)) {
+          kchanged = 1
+        }
+      }
+      # Round-5 P1 fix: if the (post-strip) segment head is a known
+      # shell wrapper WITH a `-c`-class flag (so there IS a payload
+      # to inspect), FORCE relevance and let the CLI walk it. Pre-
+      # round-5-P1 `bash -c "git push ..."` had its payload masked
+      # by the quote masker → no trigger at head → exit 0 silent
+      # bypass. The CLI does full nested-shell unwrapping via
+      # mvdan-sh; the shim should not try to compete.
+      #
+      # Round-6 P2 fix: the round-5 pattern matched ANY segment
+      # whose head started with a shell name, including benign
+      # bash-script-execution like `bash scripts/setup.sh`. That
+      # hit the fail-closed branch on unbuilt installs with "rea
+      # CLI is not built", even though the pre-0.34 hook only
+      # gated actual git push / git commit commands. Fix: require
+      # a -c-class flag (combined form -c, -lc, -lic, -cl, -cli,
+      # -li, -il, -ic — the bash WRAP pattern set) OR a separated
+      # --c flag, before forcing relevance.
+      # IMPORTANT: comments here avoid bare single-quote characters
+      # to prevent terminating the surrounding bash single-quoted
+      # string at runtime — see round-4 P1 lesson (awk: syntax
+      # error swallowed by `|| true`).
+      if (match(seg, /^(bash|sh|zsh|dash|ksh|mksh|oksh|posh|yash|csh|tcsh|fish)[[:space:]]+(-([a-z]*c[a-z]*)|--c)([[:space:]]|$)/)) {
+        print "1"
+        exit
+      }
+      # Pre-flag variants: bash -l -c PAYLOAD, bash --noprofile -c
+      # PAYLOAD. Match shell then one-or-more flags then a -c-class
+      # flag. Comments deliberately have no inline quotes (round-4
+      # P1 lesson).
+      if (match(seg, /^(bash|sh|zsh|dash|ksh|mksh|oksh|posh|yash|csh|tcsh|fish)([[:space:]]+(-[a-z]+|--[a-z]+))+[[:space:]]+(-([a-z]*c[a-z]*)|--c)([[:space:]]|$)/)) {
+        print "1"
+        exit
+      }
+      if (seg ~ trigger) {
+        print "1"
+        exit
+      }
+    }
+    END { print "0" }
+  ' | head -1)
+  # Fallback for environments without awk (vanishingly rare on the
+  # platforms rea supports): default to relevant=1 — over-trigger is
+  # safer than under-trigger.
+  case "$RELEVANT" in 0|1) ;; *) RELEVANT=1 ;; esac
 fi
-
-if [[ ${#REA_BIN[@]} -eq 0 ]]; then
-  # Fail OPEN when rea itself can't be found — the agent's bash command
-  # would have failed downstream too, and refusing here would be a
-  # confusing error. Log to stderr so the operator sees the gap.
-  printf 'rea: local-review-gate skipped — could not locate rea CLI. Install: pnpm add -D @bookedsolid/rea\n' >&2
+if [ "$RELEVANT" -eq 0 ]; then
   exit 0
 fi
 
-# 11. Run `rea preflight --strict` and use its exit code.
-"${REA_BIN[@]}" preflight --strict
-PREFLIGHT_STATUS=$?
-
-if [[ $PREFLIGHT_STATUS -eq 0 ]]; then
+# 6. Bypass env-var short-circuit. The bash hook honored the
+#    operator-exported `REA_SKIP_LOCAL_REVIEW` (or the policy-renamed
+#    var) BEFORE invoking preflight. We mirror that here so an
+#    audited bypass works even when the CLI isn't built.
+#
+#    Policy-driven var name: read `policy.review.local_review.bypass_env_var`
+#    if present; default to `REA_SKIP_LOCAL_REVIEW`. The CLI does its
+#    own per-segment inline-bypass evaluation; the shim only checks
+#    the operator-exported (process-env) form.
+BYPASS_VAR="REA_SKIP_LOCAL_REVIEW"
+POLICY_VAR=$(_lrg_read_policy review.local_review.bypass_env_var)
+# Only honor POSIX-identifier-shaped names. Junk falls back to default.
+if printf '%s' "$POLICY_VAR" | grep -qE '^[A-Za-z_][A-Za-z0-9_]*$'; then
+  BYPASS_VAR="$POLICY_VAR"
+fi
+# Read the configured env-var via indirect expansion (bash 3.2 compatible).
+BYPASS_VALUE="${!BYPASS_VAR:-}"
+if [ -n "$BYPASS_VALUE" ]; then
+  # Operator-exported bypass — allow. The CLI's per-segment inline
+  # bypass and multi-trigger laundering defense run when the CLI is
+  # reached; this shim short-circuit only covers the global
+  # process-env shape.
   exit 0
 fi
 
-# Refuse — print a friendly explanation tied to the git op the agent
-# tried to run. Exit 2 so Claude Code refuses the Bash command.
-{
-  printf 'BASH BLOCKED: %s — local-first review required\n' "$GIT_OP_LABEL"
-  printf '\n'
-  printf '  rea preflight refused (exit %d). The local-first guardrail (CTO directive\n' "$PREFLIGHT_STATUS"
-  printf '  2026-05-05) requires a recent codex review of the working tree before any\n'
-  printf '  push or commit.\n'
-  printf '\n'
-  printf '  To unblock, do ONE of:\n'
-  printf '    1. Run `rea review` first — writes the canonical audit entry.\n'
-  printf '    2. Set %s="<reason>" — per-invocation override (audited).\n' "$BYPASS_VAR"
-  printf '    3. Edit .rea/policy.yaml — set:\n'
-  printf '         review:\n'
-  printf '           local_review:\n'
-  printf '             mode: off\n'
-  printf '       (use this if your team does not have codex/claude installed)\n'
-} >&2
-exit 2
+# 7. CLI sandbox + forward. REA_ARGV / RESOLVED_CLI_PATH were resolved
+#    at section 3 above (they're needed by the policy-get fallback for
+#    inline-form support). If they're empty, the CLI isn't built — OR
+#    the early sandbox check (round-5 P1) cleared them. Distinguish.
+if [ "${#REA_ARGV[@]}" -eq 0 ]; then
+  if [ -n "${SANDBOX_EARLY_FAILURE:-}" ]; then
+    printf 'rea: local-review-gate FAILED sandbox check (%s) — refusing.\n' "$SANDBOX_EARLY_FAILURE" >&2
+    exit 2
+  fi
+  printf 'rea: local-review-gate cannot run — the rea CLI is not built.\n' >&2
+  printf 'Run `pnpm install && pnpm build` (or `npm install` for a consumer install) to restore protection.\n' >&2
+  printf 'This shim fails closed because the pre-0.34.0 bash body enforced local-first review without a CLI.\n' >&2
+  exit 2
+fi
+
+# 8. Realpath sandbox check.
+if ! command -v node >/dev/null 2>&1; then
+  printf 'rea: local-review-gate cannot run — `node` is not on PATH.\n' >&2
+  printf 'Install Node 22+ (engines.node) to restore local-first review enforcement.\n' >&2
+  exit 2
+fi
+
+sandbox_check=$(node -e '
+  const fs = require("fs");
+  const path = require("path");
+  const cli = process.argv[1];
+  const projDir = process.argv[2];
+  let real, realProj;
+  try { real = fs.realpathSync(cli); } catch (e) {
+    process.stdout.write("bad:realpath"); process.exit(1);
+  }
+  try { realProj = fs.realpathSync(projDir); } catch (e) {
+    process.stdout.write("bad:realpath-proj"); process.exit(1);
+  }
+  const sep = path.sep;
+  const projWithSep = realProj.endsWith(sep) ? realProj : realProj + sep;
+  if (!(real === realProj || real.startsWith(projWithSep))) {
+    process.stdout.write("bad:cli-escapes-project"); process.exit(1);
+  }
+  let cur = path.dirname(path.dirname(path.dirname(real)));
+  let found = false;
+  for (let i = 0; i < 20 && cur && cur !== path.dirname(cur); i += 1) {
+    const pj = path.join(cur, "package.json");
+    if (fs.existsSync(pj)) {
+      try {
+        const data = JSON.parse(fs.readFileSync(pj, "utf8"));
+        if (data && data.name === "@bookedsolid/rea") { found = true; break; }
+      } catch (e) { /* keep walking */ }
+    }
+    cur = path.dirname(cur);
+  }
+  if (!found) { process.stdout.write("bad:no-rea-pkg-json"); process.exit(1); }
+  process.stdout.write("ok");
+' -- "$RESOLVED_CLI_PATH" "$proj" 2>/dev/null)
+
+if [ "$sandbox_check" != "ok" ]; then
+  printf 'rea: local-review-gate FAILED sandbox check (%s) — refusing.\n' "$sandbox_check" >&2
+  exit 2
+fi
+
+# 9. Version-probe.
+probe_out=$("${REA_ARGV[@]}" hook local-review-gate --help 2>&1)
+probe_status=$?
+if [ "$probe_status" -ne 0 ] || ! printf '%s' "$probe_out" | grep -q -e 'local-review-gate'; then
+  printf 'rea: this shim requires the `rea hook local-review-gate` subcommand (introduced in 0.34.0).\n' >&2
+  printf 'The resolved CLI at %s does not implement it.\n' "$RESOLVED_CLI_PATH" >&2
+  printf 'Run `pnpm install` (or `npm install`) to sync the CLI; refusing in the meantime to preserve enforcement.\n' >&2
+  exit 2
+fi
+
+# 10. Forward stdin (already captured up-front).
+printf '%s' "$INPUT" | "${REA_ARGV[@]}" hook local-review-gate
+exit $?
