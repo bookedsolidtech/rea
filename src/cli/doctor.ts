@@ -1083,7 +1083,20 @@ export interface PolicyReaderProbes {
   cliDistExists?: (baseDir: string) => boolean;
   cliInvokable?: (baseDir: string) => boolean;
   python3OnPath?: () => string | null;
-  python3PyYamlReachable?: () => boolean;
+  /**
+   * 0.40.0 charter item 3 — accepts the consumer's `baseDir` so the
+   * probe can thread it as `cwd` to the spawned `python3 -c` process.
+   * Pre-fix, the spawn happened in doctor's own cwd, which meant the
+   * sys.path scrub (which removes "", ".", CWD, realpath(CWD) to
+   * mirror policy-reader.sh's defense against a malicious repo-local
+   * `./yaml.py`) operated on the wrong directory when `rea doctor`
+   * was invoked from outside the consumer tree (e.g. `cd /tmp && rea
+   * doctor --base-dir /Users/.../consumer-repo`).
+   *
+   * Probes that don't care about cwd (test stubs, fakes) can simply
+   * ignore the argument; the default production probe uses it.
+   */
+  python3PyYamlReachable?: (baseDir: string) => boolean;
   awkOnPath?: () => string | null;
   jqOnPath?: () => string | null;
 }
@@ -1260,7 +1273,7 @@ function defaultCliInvokable(baseDir: string): boolean {
   }
 }
 
-function defaultPython3PyYamlReachable(): boolean {
+function defaultPython3PyYamlReachable(baseDir: string): boolean {
   // The Tier 2 loader runs `python3 -c "import yaml"`. We mirror that
   // probe verbatim so a `yaml`-installable-but-broken interpreter is
   // not falsely reported as "reachable". Apply the SAME env scrub
@@ -1302,7 +1315,16 @@ function defaultPython3PyYamlReachable(): boolean {
       'sys.path[:] = [p for p in sys.path if p not in ("", ".", _cwd, _cwd_real)]',
       'import yaml',
     ].join('\n');
+    // 0.40.0 charter item 3 — thread `baseDir` as cwd so the sys.path
+    // scrub above strips THIS consumer's repo root (the directory the
+    // production shim chain runs from), not doctor's own cwd. Pre-fix,
+    // `rea doctor --base-dir <consumer>` invoked from `/tmp/foo` would
+    // scrub against `/tmp/foo`, leaving any `<consumer>/yaml.py`
+    // shadowing potential undetected — exactly the multi-repo workflow
+    // every other doctor probe (cliInvokable, …) already handles by
+    // setting cwd to baseDir.
     const res = spawnSync('python3', ['-c', probeBody], {
+      cwd: baseDir,
       env: probeEnv,
       timeout: 5_000,
       stdio: ['ignore', 'ignore', 'ignore'],
@@ -1398,7 +1420,10 @@ export function checkPolicyReaderTier1(
  * The warning highlights the silent no-op risk for flow-form lookups
  * when CLI is also unreachable.
  */
-export function checkPolicyReaderTier2(probes?: PolicyReaderProbes): CheckResult {
+export function checkPolicyReaderTier2(
+  baseDir: string,
+  probes?: PolicyReaderProbes,
+): CheckResult {
   const label = 'policy-reader Tier 2 (python3 + PyYAML)';
   const p = resolveProbes(probes);
   const py = p.python3OnPath();
@@ -1412,7 +1437,7 @@ export function checkPolicyReaderTier2(probes?: PolicyReaderProbes): CheckResult
         'no-ops when the rea CLI is also unreachable. Install python3 to close this gap.',
     };
   }
-  if (!p.python3PyYamlReachable()) {
+  if (!p.python3PyYamlReachable(baseDir)) {
     return {
       label,
       status: 'warn',
@@ -1431,12 +1456,41 @@ export function checkPolicyReaderTier2(probes?: PolicyReaderProbes): CheckResult
 
 /**
  * Tier 3 — awk block-form parser. Last-resort no-dep fallback.
- * Practically always present (POSIX requirement); hard-fail only when
- * truly absent (in which case the consumer has ZERO working fallback
- * tiers and any CLI-absent shim invocation will silently fail-closed
- * on every policy lookup).
+ * Practically always present (POSIX requirement).
+ *
+ * 0.40.0 charter item 2 — conditional verdict, refined by codex
+ * round 1 P2:
+ *   - awk present                                            → `pass`
+ *   - awk absent AND Tier 2 reachable                        → `warn`
+ *     (Tier 2 implies python3, which is a list-walker)
+ *   - awk absent AND Tier 1 reachable AND a list walker
+ *     (jq OR python3) is on PATH                             → `warn`
+ *   - awk absent AND Tier 1 reachable BUT no list walker     → `fail`
+ *     (codex round 1 P2 — list-valued policy reads silently
+ *     fail-closed even though scalar reads work, so the
+ *     downgrade-to-warn is misleading; doctor would exit 0 on a
+ *     broken install)
+ *   - awk absent AND no other tier reachable                 → `fail`
+ *
+ * Pre-fix the absent-awk branch always returned `fail` — but when
+ * Tier 1 (rea CLI) AND/OR Tier 2 (python3+PyYAML) are reachable AND
+ * the list walker exists, the operator's effective floor is fine even
+ * without awk; Tier 3 is the LAST fallback, not a hard requirement.
+ * The summary check (`checkPolicyReaderTierSummary`) already
+ * aggregates correctly; this per-tier verdict now reflects the same
+ * severity logic so an operator who reads ONLY the Tier 3 row isn't
+ * misled into thinking the install is broken on a perfectly-
+ * functional box that has python3 + jq + the rea CLI all wired but
+ * happens to lack awk.
+ *
+ * Takes `baseDir` so it can evaluate Tier 1's two-stage check (dist
+ * present + CLI invokable) and Tier 2's reachability. Probes are
+ * threaded through identically.
  */
-export function checkPolicyReaderTier3(probes?: PolicyReaderProbes): CheckResult {
+export function checkPolicyReaderTier3(
+  baseDir: string,
+  probes?: PolicyReaderProbes,
+): CheckResult {
   const label = 'policy-reader Tier 3 (awk)';
   const p = resolveProbes(probes);
   const awk = p.awkOnPath();
@@ -1445,6 +1499,63 @@ export function checkPolicyReaderTier3(probes?: PolicyReaderProbes): CheckResult
       label,
       status: 'pass',
       detail: `awk at ${awk} — block-form fallback available`,
+    };
+  }
+  // 0.40.0 — awk is absent. Decide whether this is `warn` (other tiers
+  // cover) or `fail` (catastrophic — no working policy lookup tier).
+  // Mirror Tier 1's two-stage check (dist + invokable) and Tier 2's
+  // python3 + PyYAML pair so the verdict here matches what the shim
+  // ladder would actually do at runtime.
+  const tier1 = p.cliDistExists(baseDir) && p.cliInvokable(baseDir);
+  const tier2 = p.python3OnPath() !== null && p.python3PyYamlReachable(baseDir);
+  // Codex round 1 P2 (2026-05-16): the downgrade-to-warn branch needs
+  // a list walker too. `policy_reader_get_list` (the helper that reads
+  // list-valued keys like `blocked_paths`) iterates the parsed JSON
+  // array via jq OR python3, falling back to Tier 3 awk for inline
+  // arrays. With awk gone AND no jq AND no python3, list-valued
+  // policy reads silently fail-closed even when Tier 1 is reachable —
+  // `blocked-paths-bash-gate.sh` etc. would see an EMPTY blocked-paths
+  // set and stop enforcing entries the operator declared. Pre-fix
+  // this concrete shape (cliInvokable + no python3 + no jq + no awk)
+  // returned `warn` and the doctor exited 0 on a broken install.
+  // Post-fix the downgrade requires a list walker; otherwise we stay
+  // on `fail`. Tier 2 implies python3 on PATH (the interpreter that
+  // ran PyYAML), so Tier 2 always brings list-walker support — no
+  // additional check needed for the Tier-2 branch.
+  const py = p.python3OnPath();
+  const listWalker = p.jqOnPath() !== null || py !== null;
+  if (tier2 || (tier1 && listWalker)) {
+    const reachable: string[] = [];
+    if (tier1) reachable.push('Tier 1 (rea CLI)');
+    if (tier2) reachable.push('Tier 2 (python3+PyYAML)');
+    return {
+      label,
+      status: 'warn',
+      detail:
+        `awk not on PATH — Tier 3 (block-form fallback) unreachable. ${reachable.join(
+          ' and ',
+        )} ` +
+        'still cover the shim ladder, so policy lookups continue to work; this is a ' +
+        'soft degradation, not a hard failure. Install awk (`mawk`, `gawk`, or `nawk`) ' +
+        'to restore the last-resort fallback.',
+    };
+  }
+  // Codex round 1 P2: separate "no list walker" diagnosis from the
+  // catastrophic "no tier at all" case. Tier 1 reachable but no jq
+  // AND no python3 AND no awk means list-valued policy reads
+  // fail-closed silently — distinct from the truly-empty
+  // no-CLI-no-python-no-awk shape, and worth a precise remediation.
+  if (tier1) {
+    return {
+      label,
+      status: 'fail',
+      detail:
+        'awk not on PATH AND neither jq nor python3 is on PATH — Tier 1 (rea CLI) parses ' +
+        'flow-form scalars, but `policy_reader_get_list` cannot iterate list-valued keys ' +
+        '(e.g. `blocked_paths: [.env, ...]`) without jq, python3, OR awk to walk the ' +
+        'resulting JSON arrays. Affected hooks (`blocked-paths-bash-gate.sh`, ' +
+        '`blocked-paths-enforcer.sh`, …) see an EMPTY list and silently stop enforcing. ' +
+        'Install awk OR jq OR python3 to restore list-iteration.',
     };
   }
   return {
@@ -1525,7 +1636,7 @@ export function checkPolicyReaderTierSummary(
   // ladder would actually do at runtime.
   const tier1 = p.cliDistExists(baseDir) && p.cliInvokable(baseDir);
   const py = p.python3OnPath();
-  const tier2 = py !== null && p.python3PyYamlReachable();
+  const tier2 = py !== null && p.python3PyYamlReachable(baseDir);
   const tier3 = p.awkOnPath() !== null;
   const jq = p.jqOnPath();
   // List iteration after Tier 1/2 needs jq OR python3 to walk the
@@ -2187,8 +2298,8 @@ export function collectChecks(
     ...(policyParsesResult.status === 'pass'
       ? [
           checkPolicyReaderTier1(baseDir),
-          checkPolicyReaderTier2(),
-          checkPolicyReaderTier3(),
+          checkPolicyReaderTier2(baseDir),
+          checkPolicyReaderTier3(baseDir),
           checkPolicyReaderJq(),
           checkPolicyReaderTierSummary(baseDir),
         ]

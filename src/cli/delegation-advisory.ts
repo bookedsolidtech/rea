@@ -119,7 +119,48 @@ export interface HookDelegationAdvisoryOptions {
    * Production omits.
    */
   stdinOverride?: string;
+  /**
+   * Test seam — override the sleep used by
+   * `sessionHasRealDelegation`'s poll-and-backoff loop. Production
+   * omits and uses real `setTimeout`-backed sleeps; tests pass a
+   * controllable fake so the race-coverage tests don't wall-clock on
+   * the real 500ms budget.
+   *
+   * 0.40.0 charter item 1.
+   */
+  sleepOverride?: (ms: number) => Promise<void>;
 }
+
+/**
+ * Backoff schedule (in milliseconds) for `sessionHasRealDelegation`'s
+ * poll-and-backoff loop.
+ *
+ * 0.40.0 charter item 1 — closes the `& disown` race between
+ * `delegation-capture.sh` (which fire-and-forgets `rea hook
+ * delegation-signal --detach &` for sub-50ms PreToolUse latency) and the
+ * `delegation-advisory.sh` PostToolUse path (which reads the audit log
+ * to decide whether the session has delegated). A `git commit` landing
+ * within the narrow window between an Agent dispatch and the audit
+ * append-on-disk would read the stale chain, see no delegation, fire
+ * the nudge spuriously, AND write the `.fired` sentinel — silencing
+ * every future advisory in the session even though delegation DID
+ * happen.
+ *
+ * The schedule is delays BETWEEN re-reads (NOT cumulative): 50ms,
+ * 150ms, 300ms. Total worst-case 500ms — acceptable hot-path budget
+ * for a PostToolUse hook running on `Bash|Edit|Write|MultiEdit|
+ * NotebookEdit`. The first read is immediate (no upfront delay), so a
+ * session that DID delegate before threshold-crossing pays zero extra
+ * latency. Only the rare "we crossed threshold while a recent
+ * delegation signal hasn't yet hit disk" case pays the full budget,
+ * and only ONCE per session (the `.fired` sentinel suppresses future
+ * scans).
+ *
+ * Exported for the race-coverage test in
+ * `delegation-advisory.test.ts` so it can assert on the schedule
+ * without duplicating the constant.
+ */
+export const DELEGATION_POLL_BACKOFF_MS: readonly number[] = [50, 150, 300];
 
 /**
  * Maximum length of the human-readable prefix in a state key. The full
@@ -301,11 +342,27 @@ export function advisoryMessage(count: number, threshold: number): string {
  * `since` anchor is `undefined` and behavior is the pre-0.31.0
  * single-file walk.
  */
-async function sessionHasRealDelegation(
+/**
+ * Real-clock sleep used by the production poll-and-backoff loop.
+ * Factored out so tests can swap it for a fake controllable scheduler
+ * via `HookDelegationAdvisoryOptions.sleepOverride`.
+ */
+function realSleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Single audit-chain scan: returns `'delegated'` when a real
+ * delegation signal is found, `'not-delegated'` when scanning succeeds
+ * but no real signal is in the chain, and `'unreadable'` when audit
+ * loading throws (the chain is missing / unreadable). Split out from
+ * the polling loop so each retry runs identical scan logic.
+ */
+async function scanForRealDelegationOnce(
   reaRoot: string,
   sessionId: string,
   exemptSubagents: readonly string[],
-): Promise<boolean> {
+): Promise<'delegated' | 'not-delegated' | 'unreadable'> {
   let records: DelegationRecord[];
   try {
     // Resolve the rotated-file set the same way `rea audit specialists`
@@ -317,12 +374,9 @@ async function sessionHasRealDelegation(
     const loaded = await loadDelegationRecords(reaRoot, sessionId, sinceAnchor);
     records = loaded.records;
   } catch {
-    // Audit log unreadable — we cannot prove the session delegated, so
-    // we DON'T fire (fail toward silence, not toward a false-positive
-    // nudge). Returning `true` here suppresses the advisory.
-    return true;
+    return 'unreadable';
   }
-  if (records.length === 0) return false;
+  if (records.length === 0) return 'not-delegated';
   const roster = discoverRoster(reaRoot);
   for (const rec of records) {
     if (
@@ -333,8 +387,46 @@ async function sessionHasRealDelegation(
         exempt: exemptSubagents,
       })
     ) {
-      return true;
+      return 'delegated';
     }
+  }
+  return 'not-delegated';
+}
+
+async function sessionHasRealDelegation(
+  reaRoot: string,
+  sessionId: string,
+  exemptSubagents: readonly string[],
+  sleep: (ms: number) => Promise<void> = realSleep,
+): Promise<boolean> {
+  // 0.40.0 charter item 1 — poll-and-backoff before declaring
+  // "no delegation in this session".
+  //
+  // The producer (`delegation-capture.sh`) calls `rea hook
+  // delegation-signal --detach &` to fire-and-forget the audit append.
+  // For sub-50ms PreToolUse latency this is the right call, but it
+  // opens a narrow race: a write-class call (Bash/Edit/Write/…)
+  // landing in the same tick as an Agent/Skill dispatch can run this
+  // predicate BEFORE the audit append commits to disk. Pre-fix, the
+  // function then returned `false`, the caller fired the advisory,
+  // wrote the `.fired` sentinel, and silenced every future nudge in
+  // the session — even though delegation DID happen.
+  //
+  // Each retry runs a full audit scan. The first scan is immediate
+  // (no upfront delay); subsequent scans wait per
+  // `DELEGATION_POLL_BACKOFF_MS`. Worst-case total: 50+150+300 = 500ms
+  // for the four-scan path. We exit early as soon as a delegation is
+  // observed OR the chain becomes unreadable (preserving the pre-fix
+  // "audit log unreadable → suppress the advisory" posture so a
+  // missing chain never produces a false-positive nudge).
+  let outcome = await scanForRealDelegationOnce(reaRoot, sessionId, exemptSubagents);
+  if (outcome === 'delegated') return true;
+  if (outcome === 'unreadable') return true;
+  for (const waitMs of DELEGATION_POLL_BACKOFF_MS) {
+    await sleep(waitMs);
+    outcome = await scanForRealDelegationOnce(reaRoot, sessionId, exemptSubagents);
+    if (outcome === 'delegated') return true;
+    if (outcome === 'unreadable') return true;
   }
   return false;
 }
@@ -472,6 +564,7 @@ export async function computeDelegationAdvisory(
     reaRoot,
     auditSessionId,
     policy.exemptSubagents,
+    options.sleepOverride,
   );
   if (delegated) {
     // Session DID delegate to a real specialist — no nudge warranted.
