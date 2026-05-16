@@ -694,6 +694,90 @@ shim_run
   });
 });
 
+describe('hooks/_lib/shim-runtime.sh — node-missing + policy short-circuit (0.38.1 round-2 P2)', () => {
+  let projectDir: string;
+  beforeEach(() => {
+    projectDir = makeProjectDir();
+    installPkgJson(projectDir);
+  });
+  afterEach(() => {
+    fs.rmSync(projectDir, { recursive: true, force: true });
+  });
+
+  // Pre-0.38.1 the node-missing check fired BEFORE shim_policy_short_circuit,
+  // so a blocking-tier shim whose policy said "disabled" still refused
+  // when node was absent. Post-fix the policy short-circuit runs first;
+  // the 4-tier policy reader degrades to Tier 2 (python3) / Tier 3 (awk)
+  // when node is unavailable.
+  it('blocking-tier: policy short-circuit fires even when node is absent', () => {
+    if (!bashExists()) return;
+    // Install fake CLI so REA_ARGV is populated (then we strip node).
+    installFakeCliGoodProbe(projectDir, 'test-shim');
+    const body = `
+SHIM_FAIL_OPEN=0
+shim_policy_short_circuit() {
+  # Simulate a policy read that says "disabled" — should exit 0
+  # regardless of whether the CLI / node is reachable.
+  return 0
+}
+${STD_BODY}
+`;
+    const r = runShim({
+      shimBody: body,
+      payload: 'PAYLOAD',
+      projectDir,
+      // Strip node from PATH — emulates a system with rea installed but
+      // no node interpreter on PATH.
+      env: { PATH: '/usr/bin:/bin' },
+    });
+    expect(r.status, `expected 0 (policy disabled), got ${r.status}; stderr: ${r.stderr}`).toBe(0);
+  });
+
+  it('blocking-tier: node-missing banner fires when policy did NOT short-circuit', () => {
+    if (!bashExists()) return;
+    installFakeCliGoodProbe(projectDir, 'test-shim');
+    const body = `
+SHIM_FAIL_OPEN=0
+shim_policy_short_circuit() {
+  # Simulate a policy read that says "enabled" — should fall through
+  # to node-missing banner since CLI cannot be sandbox-validated.
+  return 1
+}
+${STD_BODY}
+`;
+    const r = runShim({
+      shimBody: body,
+      payload: 'PAYLOAD',
+      projectDir,
+      env: { PATH: '/usr/bin:/bin' },
+    });
+    expect(r.status).toBe(2);
+    expect(r.stderr).toMatch(/node/i);
+  });
+
+  it('advisory-tier: node-missing exits 0 silently after policy short-circuit chance', () => {
+    if (!bashExists()) return;
+    installFakeCliGoodProbe(projectDir, 'test-shim');
+    const body = `
+SHIM_FAIL_OPEN=1
+shim_policy_short_circuit() {
+  # Even advisory shims should get policy-short-circuit BEFORE the
+  # advisory-silent-exit-0 path. Set return 0 → exit 0 unambiguously
+  # (advisory + disabled-by-policy converge to exit 0).
+  return 0
+}
+${STD_BODY}
+`;
+    const r = runShim({
+      shimBody: body,
+      payload: 'PAYLOAD',
+      projectDir,
+      env: { PATH: '/usr/bin:/bin' },
+    });
+    expect(r.status).toBe(0);
+  });
+});
+
 describe('hooks/_lib/shim-runtime.sh — shim line-budget assertion', () => {
   // 0.38.0 charter: every shim should be ≤120 LOC post-extraction.
   // local-review-gate is the documented exception (hot-path subtree
