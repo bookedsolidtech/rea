@@ -189,22 +189,19 @@ export const EXPECTED_HOOKS = [
   'blocked-paths-enforcer.sh',
   'changeset-security-gate.sh',
   'dangerous-bash-interceptor.sh',
-  // 0.31.0 — `delegation-advisory.sh` is INTENTIONALLY NOT in this list.
-  // It is the brand-new PostToolUse delegation-nudge hook this release
-  // ships; adding it to EXPECTED_HOOKS would make `checkHooksInstalled`
-  // hard-`fail` on every pre-0.31.0 consumer install (and on this repo's
-  // own dogfood) the instant they upgrade the rea binary but before they
-  // run `rea upgrade` to lay down the new hook file — a regression that
-  // turns a green doctor red purely from upgrade lag. This mirrors the
-  // staged rollout `delegation-capture.sh` itself used: the file-presence
-  // entry joins EXPECTED_HOOKS in the SAME future minor that promotes
-  // `checkDelegationAdvisoryHookRegistered` from `warn` to `fail`, once
-  // consumers have had upgrade-lag time. Until then, a missing
-  // `delegation-advisory.sh` surfaces only through that `warn`-tier
-  // registration check — proportionate, since the hook is advisory at
-  // runtime and never blocks a tool call. See `git blame` on the 0.29.0
-  // round-2 P2 comment on `checkDelegationHookRegistered` for the prior
-  // application of this exact discipline.
+  // 0.36.0 — `delegation-advisory.sh` PROMOTED to EXPECTED_HOOKS (charter
+  // follow-through from 0.31.0). Originally held out in 0.31.0 to give
+  // consumers an upgrade-lag window: adding a brand-new hook to
+  // EXPECTED_HOOKS would have hard-`fail`ed `checkHooksInstalled` on
+  // every pre-0.31.0 install the instant they bumped the rea binary, a
+  // regression that turns a green doctor red purely from upgrade lag.
+  // After 4 releases of propagation (0.32, 0.33, 0.34, 0.35), the lag
+  // window has closed — consumers running `rea upgrade` since 0.31.0
+  // have laid the hook down. Same ratchet `delegation-capture.sh` went
+  // through 0.29.0 → 0.30.0. Promotion happens in lockstep with
+  // `checkDelegationAdvisoryHookRegistered` flipping `warn` → `fail`
+  // (see that function for the matching commentary).
+  'delegation-advisory.sh',
   // 0.29.0 — delegation-telemetry MVP. The PreToolUse hook on
   // matcher `Agent|Skill` emits a `rea.delegation_signal` audit record
   // on every subagent / skill dispatch. Observational only — fails
@@ -1155,14 +1152,25 @@ export function checkDelegationHookRegistered(baseDir: string): CheckResult {
  */
 export function checkDelegationAdvisoryHookRegistered(baseDir: string): CheckResult {
   const label = 'delegation-advisory hook registered';
-  const ADVISORY = 'warn' as const;
+  // 0.36.0 — promoted from `warn` (advisory in 0.31.0) to `fail` (hard)
+  // per the staged-rollout ratchet. After 4 releases of upgrade-lag
+  // propagation (0.32, 0.33, 0.34, 0.35), consumer installs that have
+  // run `rea upgrade` since 0.31.0 already carry the PostToolUse
+  // `Bash|Edit|Write|MultiEdit|NotebookEdit` group. Any install that
+  // still lacks it after that window is genuinely missing the nudge
+  // and `fail` is the proportionate signal. Companion change:
+  // `delegation-advisory.sh` joined `EXPECTED_HOOKS` in the same
+  // commit, so `checkHooksInstalled` also covers the file-presence +
+  // executability checks now (this function still does both directly
+  // as defense-in-depth, mirroring `checkDelegationHookRegistered`).
+  const REFUSE = 'fail' as const;
   const MATCHER = 'Bash|Edit|Write|MultiEdit|NotebookEdit';
   const settingsPath = path.join(baseDir, '.claude', 'settings.json');
   if (!fs.existsSync(settingsPath)) {
     return {
       label,
-      status: ADVISORY,
-      detail: `missing: ${settingsPath} — run \`rea upgrade\` or \`rea init\` (advisory in 0.31.0)`,
+      status: REFUSE,
+      detail: `missing: ${settingsPath} — run \`rea upgrade\` or \`rea init\``,
     };
   }
   let parsed: {
@@ -1173,7 +1181,7 @@ export function checkDelegationAdvisoryHookRegistered(baseDir: string): CheckRes
   } catch (e) {
     return {
       label,
-      status: ADVISORY,
+      status: REFUSE,
       detail: e instanceof Error ? e.message : String(e),
     };
   }
@@ -1182,10 +1190,10 @@ export function checkDelegationAdvisoryHookRegistered(baseDir: string): CheckRes
   if (group === undefined) {
     return {
       label,
-      status: ADVISORY,
+      status: REFUSE,
       detail:
         `no PostToolUse group with matcher "${MATCHER}" found in .claude/settings.json — ` +
-        'run `rea upgrade` to install (advisory in 0.31.0; promoted to fail in a later minor). ' +
+        'run `rea upgrade` to install. ' +
         'NOTE: the matcher INCLUDES Bash — the delegation nudge counts every write-class ' +
         'tool call, not just file edits.',
     };
@@ -1194,16 +1202,16 @@ export function checkDelegationAdvisoryHookRegistered(baseDir: string): CheckRes
   if (!cmds.some((c) => c.includes('delegation-advisory.sh'))) {
     return {
       label,
-      status: ADVISORY,
+      status: REFUSE,
       detail: `${MATCHER} matcher exists but no delegation-advisory.sh command found in its hooks list`,
     };
   }
-  // Round-2/3 P2: the registration string is present — now confirm the
-  // hook file it points at actually exists AND is executable. Because
-  // `delegation-advisory.sh` is intentionally out of `EXPECTED_HOOKS`
-  // for 0.31.0, `checkHooksInstalled` does NOT cover it; this is the
-  // only signal, so it owns both the presence and the `0o111` checks
-  // that `checkHooksInstalled` does for every other shipped hook.
+  // 0.31.0 round-2/3 P2: the registration string is present — now
+  // confirm the hook file it points at actually exists AND is
+  // executable. Kept after the 0.36.0 EXPECTED_HOOKS promotion as
+  // defense-in-depth (the same `0o111` check `checkHooksInstalled`
+  // does, scoped to this hook so the failure message can name the
+  // exact remediation rather than a generic "missing X" enumeration).
   const hookFile = path.join(baseDir, '.claude', 'hooks', 'delegation-advisory.sh');
   let hookStat: fs.Stats;
   try {
@@ -1211,21 +1219,21 @@ export function checkDelegationAdvisoryHookRegistered(baseDir: string): CheckRes
   } catch {
     return {
       label,
-      status: ADVISORY,
+      status: REFUSE,
       detail:
         `${MATCHER} matcher references delegation-advisory.sh but the hook file is missing: ` +
-        `${hookFile} — run \`rea upgrade\` to lay it down (advisory in 0.31.0). ` +
+        `${hookFile} — run \`rea upgrade\` to lay it down. ` +
         'Without the file every matching PostToolUse dispatch shells out to a nonexistent path.',
     };
   }
   if ((hookStat.mode & 0o111) === 0) {
     return {
       label,
-      status: ADVISORY,
+      status: REFUSE,
       detail:
         `${MATCHER} matcher references delegation-advisory.sh but the hook file is not executable ` +
         `(mode=${(hookStat.mode & 0o777).toString(8)}): ${hookFile} — ` +
-        'run `rea upgrade` or `chmod +x` it (advisory in 0.31.0). ' +
+        'run `rea upgrade` or `chmod +x` it. ' +
         'A non-executable hook cannot be launched by Claude Code from settings.json.',
     };
   }
@@ -1543,9 +1551,10 @@ export function collectChecks(
     checkDelegationHookRegistered(baseDir),
     // 0.31.0 — delegation-telemetry completion. The PostToolUse
     // `Bash|Edit|Write|MultiEdit|NotebookEdit` matcher group drives
-    // the delegation-advisory nudge hook. Advisory (warn) for 0.31.0
-    // — same upgrade-lag ratchet checkDelegationHookRegistered went
-    // through in 0.29.0.
+    // the delegation-advisory nudge hook. 0.36.0 — promoted warn →
+    // fail (same upgrade-lag ratchet checkDelegationHookRegistered
+    // went through in 0.29.0 → 0.30.0, after 4 release cycles of
+    // propagation).
     checkDelegationAdvisoryHookRegistered(baseDir),
   ];
 

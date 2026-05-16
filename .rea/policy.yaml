@@ -32,3 +32,23 @@ review:
   # rea pre-publish missed across the helix-014 / 015 / 016 cycle.
   codex_model: gpt-5.4
   codex_reasoning_effort: high
+# 0.36.0 charter item 2 — dogfood `policy.delegation_advisory.enabled: true`.
+# 0.31.0 introduced the delegation-advisory hook (PostToolUse on matcher
+# `Bash|Edit|Write|MultiEdit|NotebookEdit`); the policy gate stayed
+# `false` by default to give consumers an opt-in window. 0.31.0 round-4
+# P3 noted that rea's OWN dogfood didn't turn the gate on either — every
+# other security/governance posture this repo ships is dogfooded, this
+# one wasn't. 0.36.0 closes that gap. Threshold is the schema default
+# (25 write-class calls) — see `DelegationAdvisoryPolicySchema` in
+# `src/policy/loader.ts`. Exempt list mirrors the schema default so an
+# explicit policy block doesn't accidentally narrow the set vs the
+# default.
+delegation_advisory:
+  enabled: true
+  threshold: 25
+  exempt_subagents:
+    - general-purpose
+    - Explore
+    - Plan
+    - output-style-setup
+    - statusline-setup

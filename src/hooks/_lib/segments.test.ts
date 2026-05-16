@@ -471,6 +471,114 @@ describe('nested-shell unwrapping (helix-017 #3 parity)', () => {
     // Wrapper itself is one segment; no inner unwrap.
     expect(segs).toHaveLength(1);
   });
+
+  // ── 0.36.0 charter item 4 / 0.34.0 codex round-7 P2 #1: tighten -c detection
+  //
+  // Pre-fix the introducer test was `flag contains the letter c`,
+  // which over-matched on any flag with `c` in its name (`--rcfile`,
+  // `--profile=...`, etc). The walker would commit to a `-c` unwrap,
+  // advance past the false-positive flag, then either fail to find a
+  // quoted payload or hand a non-shell payload to the downstream
+  // advisory matchers. Fix restricts the introducer set to the exact
+  // bash WRAP set (`-c|-lc|-lic|-ic|-cl|-cli|-li|-il|--c`); pre-flags
+  // (any other `-letters` shape) are accepted and walked past but do
+  // NOT mark `sawCFlag = true`.
+
+  it('unwraps `bash -c PAYLOAD` (canonical baseline)', () => {
+    const segs = splitSegments(`bash -c 'rm /tmp/x'`);
+    const heads = segs.map((s) => s.head);
+    expect(heads.some((h) => /^rm\s+\/tmp\/x/i.test(h))).toBe(true);
+  });
+
+  it('unwraps `bash -lc PAYLOAD` (combined-c, login shell)', () => {
+    const segs = splitSegments(`bash -lc 'rm /tmp/x'`);
+    const heads = segs.map((s) => s.head);
+    expect(heads.some((h) => /^rm\s+\/tmp\/x/i.test(h))).toBe(true);
+  });
+
+  it('does NOT unwrap `bash --rcfile PAYLOAD` (no -c introducer; pre-fix false-positive)', () => {
+    // Pre-fix: `--rcfile` contains `c` so the walker set
+    // `sawCFlag = true`, advanced past the flag, and treated `'foo'`
+    // as the -c payload — handing a non-shell body to downstream
+    // advisory matchers. Post-fix: `--rcfile` isn't in
+    // `CDASH_INTRODUCERS`, so it's walked past as a pre-flag; the
+    // next token doesn't start with `-` (it's the quoted body), the
+    // walker breaks out of the flag loop, `sawCFlag` is false, and
+    // the wrapper returns null (no unwrap). The whole command stays
+    // as a single segment.
+    const segs = splitSegments(`bash --rcfile 'foo'`);
+    expect(segs).toHaveLength(1);
+  });
+
+  it('does NOT unwrap `bash --noprofile` alone (no -c, pre-fix false-positive on `c` in `--noprofile`)', () => {
+    const segs = splitSegments(`bash --noprofile`);
+    expect(segs).toHaveLength(1);
+  });
+
+  it('does NOT unwrap `bash --profile=name -c` (=-bearing flag rejected by `[A-Za-z]+$`)', () => {
+    // Bash WRAP regex's flag-token pattern (`-[a-zA-Z]+`) and ours
+    // both reject `--profile=name` because of the `=`. Parity: the
+    // walker returns null on the first malformed flag, NOT after
+    // walking past it. The whole command stays one segment.
+    const segs = splitSegments(`bash --profile=name -c 'rm /tmp/x'`);
+    expect(segs).toHaveLength(1);
+  });
+
+  it('unwraps `bash --noprofile -c PAYLOAD` (pre-flag handled, -c separate)', () => {
+    // The pre-flag `--noprofile` (which contains `c`) is walked past
+    // without setting `sawCFlag`; the next token `-c` IS in
+    // `CDASH_INTRODUCERS` so unwrap fires.
+    const segs = splitSegments(`bash --noprofile -c 'rm /tmp/x'`);
+    const heads = segs.map((s) => s.head);
+    expect(heads.some((h) => /^rm\s+\/tmp\/x/i.test(h))).toBe(true);
+  });
+
+  it('unwraps `bash --login -c PAYLOAD` (pre-flag-with-c walked past, -c separate)', () => {
+    const segs = splitSegments(`bash --login -c 'gh issue create --title pwn'`);
+    const heads = segs.map((s) => s.head);
+    expect(heads.some((h) => /^gh\s+issue\s+create/i.test(h))).toBe(true);
+  });
+
+  // ── 0.36.0 codex round-1 P1: combined-flag bundle parity with bash ──
+  //
+  // Bash accepts `-c` combined with any short single-char flags in any
+  // order: `-lci`, `-cil`, `-ilc`, `-cli`, `-lic`, etc. The 0.36.0
+  // first-fix `CDASH_INTRODUCERS` allowlist mirrored only the bash
+  // WRAP regex's explicit list (`c|lc|lic|ic|cl|cli|li|il`), missing
+  // `-lci`, `-cil`, `-ilc`. That was a NARROWING vs the pre-fix
+  // behavior and reopened a bypass surface for
+  // env-file-protection / dependency-audit-gate / dangerous-bash.
+  // Fix moved to a function `isCDashIntroducer` that mirrors bash:
+  // any short-flag bundle containing `c` qualifies.
+
+  it('unwraps `bash -lci PAYLOAD` (3-char bundle, c-bearing)', () => {
+    const segs = splitSegments(`bash -lci 'git push --force'`);
+    const heads = segs.map((s) => s.head);
+    expect(heads.some((h) => /^git\s+push/i.test(h))).toBe(true);
+  });
+
+  it('unwraps `bash -cil PAYLOAD` (3-char bundle, c-leading)', () => {
+    const segs = splitSegments(`bash -cil 'cat .env'`);
+    const heads = segs.map((s) => s.head);
+    expect(heads.some((h) => /^cat\s+\.env/i.test(h))).toBe(true);
+  });
+
+  it('unwraps `bash -ilc PAYLOAD` (3-char bundle, c-trailing)', () => {
+    const segs = splitSegments(`bash -ilc 'npm install evil'`);
+    const heads = segs.map((s) => s.head);
+    expect(heads.some((h) => /^npm\s+install\s+evil/i.test(h))).toBe(true);
+  });
+
+  it('does NOT unwrap `bash -li PAYLOAD` (bundle without c)', () => {
+    // `-li` doesn't contain `c`. Bash treats this as login+interactive
+    // with no -c semantics, so the next token isn't a -c payload.
+    // (Note: the bash WRAP regex DOES include `-li`/`-il` in its
+    // explicit list as a defensive over-match, but executing
+    // `bash -li 'foo'` does NOT run `foo` as a -c body — so the TS
+    // walker correctly returns null.)
+    const segs = splitSegments(`bash -li 'somecommand'`);
+    expect(segs).toHaveLength(1);
+  });
 });
 
 describe('anySegmentMatchesBoth', () => {

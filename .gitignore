@@ -36,6 +36,7 @@ coverage/
 .rea/fingerprints.json.bak.*
 .rea/last-review.json
 .rea/policy.yaml.bak-*
+.rea/.delegation-advisory/
 .claude/worktrees/
 
 # Scratch space

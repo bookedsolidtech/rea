@@ -41,8 +41,18 @@ const FAKE_GH_PAT = 'github_' + 'pat_' + 'A'.repeat(82);
 const FAKE_STRIPE_LIVE = 's' + 'k_live_' + 'A'.repeat(24);
 const FAKE_STRIPE_TEST = 'p' + 'k_test_' + 'A'.repeat(24);
 const FAKE_WHSEC = 'wh' + 'sec_' + 'A'.repeat(40);
+// 0.36.0 — quoted form (canonical HIGH match). The 0.34.0-introduced TS
+// regex made the quote optional via `?` and matched unquoted forms too,
+// upgrading them from MEDIUM to HIGH vs the bash baseline; 0.36.0 charter
+// item 5 restored byte-parity (quote required for HIGH). See the
+// `describe('Supabase parity', ...)` block lower in this file for the
+// matrix.
 const FAKE_SUPA_SR =
+  'SUPA' + 'BASE_SERVICE_ROLE_KEY="eyJ' + 'A'.repeat(60) + '"';
+const FAKE_SUPA_SR_UNQUOTED =
   'SUPA' + 'BASE_SERVICE_ROLE_KEY=eyJ' + 'A'.repeat(60);
+const FAKE_SUPA_SR_YAML =
+  "SUPA" + "BASE_SERVICE_ROLE_KEY: 'eyJ" + 'A'.repeat(60) + "'";
 // Generic secret assignment — split so the literal in this file doesn't
 // match the regex `(SECRET|PASSWORD|PRIVATE_KEY|API_SECRET)\s*=\s*"…"`.
 const SECRET_DQ = ['SE', 'CRET'].join('') + '="' + 'a'.repeat(40) + '"';
@@ -408,6 +418,174 @@ describe('secret-scanner: pattern catalog', () => {
     expect(hit).toBeDefined();
     // 60 + '...' suffix on overlong.
     expect(hit?.snippet.length).toBeLessThanOrEqual(63);
+  });
+});
+
+// ── 0.36.0 charter item 5 / 0.34.0 codex round-7 P2 #2: Supabase parity ──
+//
+// Pre-0.34.0 the bash hook required a quote introducer for the HIGH
+// `Supabase service role key (JWT)` pattern (`["']`, no `?`). The
+// 0.34.0 TS port introduced an optional quote via `["']?`, which
+// upgraded unquoted `.env` assignments from MEDIUM advisory (matched
+// by the lower-down `.env credential assignment` pattern) to HIGH
+// blocking — a posture regression vs the bash baseline that
+// over-blocks legitimate `.env` files in source. 0.36.0 restores
+// byte-parity by dropping the `?`.
+describe('secret-scanner: Supabase SERVICE_ROLE_KEY quote parity (0.34.0 round-7 P2 #2)', () => {
+  it('quoted (double-quote): SUPABASE_SERVICE_ROLE_KEY="eyJ..." → HIGH', () => {
+    const r = scanContent(FAKE_SUPA_SR);
+    const hit = r.find((m) => m.label === 'Supabase service role key (JWT)');
+    expect(hit).toBeDefined();
+    expect(hit?.severity).toBe('HIGH');
+  });
+
+  it('quoted (single-quote): SUPABASE_SERVICE_ROLE_KEY=\'eyJ...\' → HIGH', () => {
+    const body =
+      'SUPA' + "BASE_SERVICE_ROLE_KEY='eyJ" + 'A'.repeat(60) + "'";
+    const r = scanContent(body);
+    const hit = r.find((m) => m.label === 'Supabase service role key (JWT)');
+    expect(hit).toBeDefined();
+    expect(hit?.severity).toBe('HIGH');
+  });
+
+  it('unquoted: SUPABASE_SERVICE_ROLE_KEY=eyJ... → MEDIUM (parity with bash baseline)', () => {
+    // Bash baseline: the HIGH pattern requires a quote introducer,
+    // so unquoted .env lines fall through to the broader MEDIUM
+    // `.env credential assignment` pattern. TS post-0.36.0 matches
+    // that: no HIGH `Supabase service role key (JWT)` match, but a
+    // MEDIUM `.env credential assignment` match.
+    const r = scanContent(FAKE_SUPA_SR_UNQUOTED);
+    const highHit = r.find(
+      (m) => m.label === 'Supabase service role key (JWT)',
+    );
+    expect(highHit).toBeUndefined();
+    const medHit = r.find((m) => m.label === '.env credential assignment');
+    expect(medHit).toBeDefined();
+    expect(medHit?.severity).toBe('MEDIUM');
+  });
+
+  it('unquoted with `export` prefix: export SUPABASE_SERVICE_ROLE_KEY=eyJ... → MEDIUM via the unquoted-non-.env pattern (0.36.0 codex round-2 P1)', () => {
+    // Codex round-2 P1 closure: the pre-0.34.0 bash hook (and the
+    // 0.36.0-restored TS posture) only caught unquoted forms via the
+    // `.env credential assignment` pattern, which anchors `^FOO=`.
+    // `export FOO=…` in a shell entrypoint slipped through both. The
+    // new `Supabase service role key (JWT, unquoted non-.env shape)`
+    // MEDIUM rule closes that gap as a strict improvement over the
+    // bash baseline. Round-4 P1: rule was narrowed in round-3 to 5
+    // specific keyword prefixes (`export`/`readonly`/`declare`/
+    // `local`/`typeset`), then re-broadened in round-4 to "any
+    // non-line-start position" so Dockerfile `ENV FOO=…`, k8s
+    // manifests, ad-hoc shell `; FOO=…`, etc. are all covered.
+    const body =
+      'export SUPA' + 'BASE_SERVICE_ROLE_KEY=eyJ' + 'A'.repeat(60);
+    const r = scanContent(body);
+    const unquotedHit = r.find(
+      (m) =>
+        m.label === 'Supabase service role key (JWT, unquoted non-.env shape)',
+    );
+    expect(unquotedHit).toBeDefined();
+    expect(unquotedHit?.severity).toBe('MEDIUM');
+    // And the HIGH rule does NOT fire (quote required) — parity.
+    const highHit = r.find(
+      (m) => m.label === 'Supabase service role key (JWT)',
+    );
+    expect(highHit).toBeUndefined();
+  });
+
+  it('unquoted with `ENV` prefix (Dockerfile): ENV SUPABASE_SERVICE_ROLE_KEY=eyJ... → MEDIUM (0.36.0 codex round-4 P1)', () => {
+    // Round-4 P1 closure: round-3's narrow shell-keyword allowlist
+    // left Dockerfile ENV directives and other non-`.env`-shape
+    // assignments uncovered. Round-4 broadened to "any non-line-start
+    // position".
+    const body =
+      'ENV SUPA' + 'BASE_SERVICE_ROLE_KEY=eyJ' + 'A'.repeat(60);
+    const r = scanContent(body);
+    const unquotedHit = r.find(
+      (m) =>
+        m.label === 'Supabase service role key (JWT, unquoted non-.env shape)',
+    );
+    expect(unquotedHit).toBeDefined();
+    expect(unquotedHit?.severity).toBe('MEDIUM');
+  });
+
+  it('unquoted inline shell (`; SUPABASE_SERVICE_ROLE_KEY=…; bar`) → MEDIUM (0.36.0 codex round-4 P1)', () => {
+    const body =
+      'do_thing; SUPA' + 'BASE_SERVICE_ROLE_KEY=eyJ' + 'A'.repeat(60);
+    const r = scanContent(body);
+    const unquotedHit = r.find(
+      (m) =>
+        m.label === 'Supabase service role key (JWT, unquoted non-.env shape)',
+    );
+    expect(unquotedHit).toBeDefined();
+    expect(unquotedHit?.severity).toBe('MEDIUM');
+  });
+
+  it('plain `.env`-style unquoted line fires the broader `.env credential assignment` MEDIUM but NOT the unquoted-non-.env rule (0.36.0 codex round-3 P3 no-double-fire)', () => {
+    // Round-3 P3: pre-narrowing, `SUPABASE_SERVICE_ROLE_KEY=eyJ…`
+    // produced TWO MEDIUM findings (the new unquoted-anywhere rule
+    // AND the broader `.env credential assignment` pattern). Each
+    // secret should produce exactly one finding. The narrowed rule
+    // requires a `export`/`readonly`/`declare`/`local`/`typeset`
+    // prefix, so a bare line only fires the `.env` pattern.
+    const r = scanContent(FAKE_SUPA_SR_UNQUOTED);
+    const unquotedShapedHit = r.find(
+      (m) =>
+        m.label === 'Supabase service role key (JWT, unquoted non-.env shape)',
+    );
+    expect(unquotedShapedHit).toBeUndefined();
+    const envHit = r.find((m) => m.label === '.env credential assignment');
+    expect(envHit).toBeDefined();
+    expect(envHit?.severity).toBe('MEDIUM');
+  });
+
+  it('quoted forms do NOT double-fire on the unquoted-non-.env pattern (negative-lookahead pin)', () => {
+    // The unquoted-MEDIUM pattern uses `(?!["'])` so a quoted value
+    // doesn't also produce a MEDIUM hit alongside the HIGH match.
+    const r = scanContent(FAKE_SUPA_SR);
+    const unquotedHits = r.filter(
+      (m) =>
+        m.label === 'Supabase service role key (JWT, unquoted non-.env shape)',
+    );
+    expect(unquotedHits).toHaveLength(0);
+  });
+
+  it('yaml form with colon (SUPABASE_SERVICE_ROLE_KEY: \'eyJ...\') → no HIGH (bash also requires `=`)', () => {
+    // Bash hook's regex anchors `=`, not `:`. The yaml `:` form does
+    // not match either tier — this test pins that parity. A future
+    // pattern that ALSO covers yaml `:` is a separate, intentional
+    // policy widening (not silent drift from a regex tweak).
+    const r = scanContent(FAKE_SUPA_SR_YAML);
+    const highHit = r.find(
+      (m) => m.label === 'Supabase service role key (JWT)',
+    );
+    expect(highHit).toBeUndefined();
+  });
+
+  it('SUPABASE_ANON_KEY: unquoted form does NOT fire MEDIUM Supabase-anon match (parity with bash)', () => {
+    // Sibling fix: the MEDIUM `Supabase anon key in non-client context`
+    // pattern also dropped its `?`. Unquoted anon-key assignments
+    // are acceptable (anon keys are public-facing) and SUPABASE_ANON_KEY
+    // is intentionally NOT in the broader `.env credential assignment`
+    // MEDIUM list either — so an unquoted form should produce zero
+    // matches.
+    const body =
+      'SUPA' + 'BASE_ANON_KEY=eyJ' + 'A'.repeat(60);
+    const r = scanContent(body);
+    const anonHit = r.find(
+      (m) => m.label === 'Supabase anon key in non-client context',
+    );
+    expect(anonHit).toBeUndefined();
+  });
+
+  it('SUPABASE_ANON_KEY: quoted form DOES fire MEDIUM (canonical advisory case)', () => {
+    const body =
+      'SUPA' + 'BASE_ANON_KEY="eyJ' + 'A'.repeat(60) + '"';
+    const r = scanContent(body);
+    const anonHit = r.find(
+      (m) => m.label === 'Supabase anon key in non-client context',
+    );
+    expect(anonHit).toBeDefined();
+    expect(anonHit?.severity).toBe('MEDIUM');
   });
 });
 

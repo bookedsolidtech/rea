@@ -179,7 +179,22 @@ const SECRET_PATTERNS: ReadonlyArray<SecretPatternDescriptor> = [
   {
     severity: 'HIGH',
     label: 'Supabase service role key (JWT)',
-    regex: /SUPABASE_SERVICE_ROLE_KEY\s*=\s*["']?eyJ[A-Za-z0-9._-]{50,}/g,
+    // 0.36.0 audit-trail (charter item 5 / 0.34.0 codex round-7 P2 #2):
+    // restore byte-parity with the pre-0.34.0 bash body. The bash hook
+    // required a quote introducer (`["']`, no `?`); only quoted
+    // assignments matched HIGH. Pre-fix this TS regex made the quote
+    // OPTIONAL (`["']?`), which upgraded an unquoted `.env` line like
+    // `SUPABASE_SERVICE_ROLE_KEY=eyJ...` from MEDIUM advisory (matched
+    // by the lower-down `.env credential assignment` pattern) to HIGH
+    // blocking. That over-blocks legitimate `.env` files committed to
+    // public repos and breaks parity with consumers still on the bash
+    // body. Fix: drop the `?` so the quote is required, matching bash
+    // exactly. Unquoted assignments continue to fire MEDIUM via the
+    // `.env credential assignment` pattern below (line ~190); the only
+    // change is that they no longer ALSO fire HIGH here. The `[\"']`
+    // character class accepts both single and double quotes
+    // (mirroring the bash `["\'"'"']` literal).
+    regex: /SUPABASE_SERVICE_ROLE_KEY\s*=\s*["']eyJ[A-Za-z0-9._-]{50,}/g,
   },
   // ── MEDIUM severity (advisory) ───────────────────────────────────
   {
@@ -208,8 +223,56 @@ const SECRET_PATTERNS: ReadonlyArray<SecretPatternDescriptor> = [
   },
   {
     severity: 'MEDIUM',
+    label: 'Supabase service role key (JWT, unquoted non-.env shape)',
+    // 0.36.0 codex round-2 P1 → round-3 P3 → round-4 P1 evolution.
+    //
+    // Background:
+    //   - Round 1: 0.34.0-introduced HIGH regex had `["']?` (quote
+    //     optional) which over-blocked unquoted .env lines vs the
+    //     pre-0.34.0 bash baseline. Charter item 5 dropped the `?`.
+    //   - Round 2 P1: dropping the `?` left a gap for unquoted forms
+    //     outside `^FOO=` shape (`export FOO=…` etc.) that ALSO
+    //     existed in the bash baseline. Added an unquoted-anywhere
+    //     MEDIUM rule to close it.
+    //   - Round 3 P3: unquoted-anywhere double-fired with the broader
+    //     `.env credential assignment` MEDIUM on plain `^FOO=` lines.
+    //     Narrowed to only fire on 5 specific shell-keyword prefixes
+    //     (`export`, `readonly`, `declare`, `local`, `typeset`).
+    //   - Round 4 P1: too narrow — left other unquoted shapes
+    //     (Dockerfile `ENV FOO=…`, k8s manifests, ad-hoc shell
+    //     `FOO=…; bar`) entirely unscanned.
+    //
+    // Round-4 resolution: fire on any unquoted assignment that is
+    // NOT at the start of a line (`^`). The `.env credential
+    // assignment` MEDIUM pattern owns `^FOO=…`; this rule owns
+    // everything else (`ENV FOO=…`, `export FOO=…`, `; FOO=…`,
+    // template-string `${FOO=…}`, etc.). Implemented via a
+    // multi-line regex with a look-behind for "anything except a
+    // line start". JS regex doesn't support a direct "not at line
+    // start" assertion, so we require at least one non-newline char
+    // before `SUPABASE_SERVICE_ROLE_KEY` on the same line.
+    //
+    // The `(?!["'])` look-ahead refuses when the value starts with
+    // a quote so the same secret isn't double-reported by the HIGH
+    // pattern above. Result: each secret produces exactly one
+    // MEDIUM finding regardless of shape, and the HIGH rule keeps
+    // exclusive ownership of quoted forms.
+    regex:
+      /(?<=[^\n\r])\bSUPABASE_SERVICE_ROLE_KEY\s*=\s*(?!["'])eyJ[A-Za-z0-9._-]{50,}/gm,
+  },
+  {
+    severity: 'MEDIUM',
     label: 'Supabase anon key in non-client context',
-    regex: /SUPABASE_ANON_KEY\s*=\s*["']?eyJ[A-Za-z0-9._-]{50,}/g,
+    // 0.36.0 audit-trail (charter item 5 / 0.34.0 codex round-7 P2 #2,
+    // sibling fix): same parity restoration as the SUPABASE_SERVICE_ROLE_KEY
+    // pattern above — bash hook required a quote introducer, TS pattern
+    // had it optional via `?`. Removed for byte-parity. Unquoted .env
+    // forms continue to be advisory via the broader `.env credential
+    // assignment` MEDIUM pattern (where SUPABASE_ANON_KEY is NOT one of
+    // the named keys — anon-key prose in unquoted .env is acceptable
+    // since anon keys are public; only QUOTED-in-source matches stay
+    // an advisory MEDIUM here).
+    regex: /SUPABASE_ANON_KEY\s*=\s*["']eyJ[A-Za-z0-9._-]{50,}/g,
   },
 ];
 
