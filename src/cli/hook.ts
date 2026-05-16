@@ -48,6 +48,10 @@ import { runHookArchitectureReviewGate } from '../hooks/architecture-review-gate
 import { runHookDangerousBashInterceptor } from '../hooks/dangerous-bash-interceptor/index.js';
 import { runHookLocalReviewGate } from '../hooks/local-review-gate/index.js';
 import { runHookSecretScanner } from '../hooks/secret-scanner/index.js';
+import { runHookBlockedPathsBashGate } from '../hooks/blocked-paths-bash-gate/index.js';
+import { runHookProtectedPathsBashGate } from '../hooks/protected-paths-bash-gate/index.js';
+import { runHookBlockedPathsEnforcer } from '../hooks/blocked-paths-enforcer/index.js';
+import { runHookSettingsProtection } from '../hooks/settings-protection/index.js';
 import { loadPolicy } from '../policy/loader.js';
 import { appendAuditRecord, InvocationStatus, Tier } from '../audit/append.js';
 import {
@@ -1401,6 +1405,42 @@ export function registerHookCommand(program: Command): void {
     )
     .action(async () => {
       await runHookSecretScanner();
+    });
+
+  hook
+    .command('blocked-paths-bash-gate')
+    .description(
+      'Node-binary port of `hooks/blocked-paths-bash-gate.sh` (0.35.0). PreToolUse Bash gate refusing shell writes to `policy.blocked_paths` entries. Calls the AST-backed `runBlockedScan` directly (no shim→CLI→scanner subprocess hop). Permissive policy read — partial/migrating policy.yaml does NOT collapse the blocked_paths list. Empty list → no-op. Verdict `block` → exit 2; `allow` → exit 0.',
+    )
+    .action(async () => {
+      await runHookBlockedPathsBashGate();
+    });
+
+  hook
+    .command('protected-paths-bash-gate')
+    .description(
+      'Node-binary port of `hooks/protected-paths-bash-gate.sh` (0.35.0). PreToolUse Bash gate refusing shell-redirect/cp/mv/install/etc. to protected paths (.claude/settings.json, .claude/hooks/*, .husky/*, .rea/policy.yaml, .rea/HALT). Honors `policy.protected_writes` (full override) + `policy.protected_paths_relax` (subtractor). REA_HOOK_PATCH_SESSION relaxes .claude/hooks/ for the session.',
+    )
+    .action(async () => {
+      await runHookProtectedPathsBashGate();
+    });
+
+  hook
+    .command('blocked-paths-enforcer')
+    .description(
+      'Node-binary port of `hooks/blocked-paths-enforcer.sh` (0.35.0). PreToolUse Write/Edit/MultiEdit/NotebookEdit gate refusing writes to `policy.blocked_paths` entries. §5a path-traversal reject + §5a-bis interior `/./` reject + §H.2 intermediate-symlink resolution. Agent-writable allow-list (.rea/tasks.jsonl, .rea/audit/) short-circuits before policy match.',
+    )
+    .action(async () => {
+      await runHookBlockedPathsEnforcer();
+    });
+
+  hook
+    .command('settings-protection')
+    .description(
+      'Node-binary port of `hooks/settings-protection.sh` (0.35.0, the LARGEST hook in the repo at 582 LOC of bash). PreToolUse Write/Edit/MultiEdit/NotebookEdit gate protecting .claude/settings.json, .claude/hooks/*, .husky/*, .rea/policy.yaml, .rea/HALT, .rea/last-review.{json,cache.json}. Honors `protected_writes` (full override) + `protected_paths_relax` (subtractor, kill-switch invariants non-relaxable). §5b extension-surface allow-list for .husky/{commit-msg,pre-push,pre-commit,prepare-commit-msg}.d/* with final-component and intermediate-directory symlink refusal. §6c intermediate-symlink resolution. §6b REA_HOOK_PATCH_SESSION unlock for .claude/hooks/ with hash-chained audit append (fail-closed on append failure).',
+    )
+    .action(async () => {
+      await runHookSettingsProtection();
     });
 
   hook

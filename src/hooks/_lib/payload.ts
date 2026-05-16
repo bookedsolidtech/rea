@@ -124,7 +124,7 @@ export function parseHookPayload(raw: string | Buffer): HookPayload {
     const c = ti.command;
     if (c !== undefined && typeof c !== 'string') {
       throw new TypePayloadError(
-        `hook payload tool_input.command is ${typeof c}, expected string`,
+        `hook payload tool_input.command is non-string (got ${typeof c}); expected string`,
       );
     }
     if (typeof c === 'string') command = c;

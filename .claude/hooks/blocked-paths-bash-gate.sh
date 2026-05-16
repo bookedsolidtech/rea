@@ -1,26 +1,58 @@
-#!/usr/bin/env bash
+#!/bin/bash
 # PreToolUse hook: blocked-paths-bash-gate.sh
+# 0.35.0+ — Node-binary shim for `rea hook blocked-paths-bash-gate`.
 #
-# 0.23.0+ — thin shim. Forwards stdin to `rea hook scan-bash --mode blocked`.
-# See protected-paths-bash-gate.sh for the architectural rationale + CLI
-# resolution strategy + verdict-verification model; this shim differs
-# only in the --mode flag.
+# Pre-0.35.0 this was a thin bash shim over `rea hook scan-bash --mode
+# blocked` (the parser-backed AST walker that closes 9 bypass classes
+# from helix-023 + discord-ops Round 13 — see `src/hooks/bash-scanner/`).
+# The full bash body is preserved at
+# `__tests__/hooks/parity/baselines/blocked-paths-bash-gate.sh.pre-0.35.0`.
 #
-# Codex round 4 Finding 2: 2-tier sandboxed resolver (drops PATH lookup
-# and node_modules/.bin/rea symlink). See protected-paths-bash-gate.sh
-# for rationale.
+# This shim now resolves the CLI through the same 2-tier sandboxed
+# resolver as the 0.32.0+ pilots and calls `rea hook blocked-paths-
+# bash-gate` directly — eliminating the shim → CLI → scanner-module
+# subprocess hop entirely.
 #
-# Codex round 2 R2-3: REA_NODE_CLI env-var honoring REMOVED.
+# Behavioral contract is preserved byte-for-byte: exit 0 on allow,
+# exit 2 on HALT / verdict block / malformed payload / sandbox fail.
 #
-# Exit codes:
-#   0 = allow
-#   2 = block (verdict, missing CLI, malformed payload, verdict mismatch)
+# # CLI-resolution trust boundary
+#
+# Mirrors the 0.32.0 final shim shape. The resolved CLI MUST live
+# INSIDE realpath(CLAUDE_PROJECT_DIR) AND have an ancestor
+# `package.json` whose `name` is `@bookedsolid/rea`. Defends against
+# symlink-out and tarball-replacement attacks on the resolved CLI.
+#
+# # Fail-closed posture
+#
+# blocked-paths-bash-gate is a Tier-1 security gate (PreToolUse Bash).
+# The pre-0.35.0 bash body refused on uncertainty for every failure
+# class. Early-exit branches (CLI missing, node missing, sandbox failed,
+# version skew) fail closed AFTER the relevance pre-gate passes.
+# Irrelevant Bash calls exit 0 regardless of CLI state.
+#
+# # Relevance pre-gate
+#
+# Same posture as 0.34.0 dangerous-bash + secret-scanner. When the CLI
+# is missing, refuse only when the extracted command MENTIONS a path
+# from `policy.blocked_paths`. Empty policy → no enforcement, exit 0.
+# This unblocks the install path itself: `npx rea init`, pre-`pnpm build`
+# checkouts can still run benign Bash like `ls`/`mkdir`/`pnpm install`.
 
 set -uo pipefail
 
-proj="${CLAUDE_PROJECT_DIR:-$(pwd)}"
+# 1. HALT check.
+# shellcheck source=_lib/halt-check.sh
+source "$(dirname "$0")/_lib/halt-check.sh"
+check_halt
+REA_ROOT=$(rea_root)
 
-# 2-tier sandboxed CLI resolver. NO PATH lookup, NO env-var override.
+proj="${CLAUDE_PROJECT_DIR:-$REA_ROOT}"
+
+# 2. Capture stdin once.
+INPUT=$(cat)
+
+# 3. Resolve the rea CLI through the fixed 2-tier sandboxed order.
 REA_ARGV=()
 RESOLVED_CLI_PATH=""
 if [ -f "$proj/node_modules/@bookedsolid/rea/dist/cli/index.js" ]; then
@@ -31,49 +63,83 @@ elif [ -f "$proj/dist/cli/index.js" ]; then
   RESOLVED_CLI_PATH="$proj/dist/cli/index.js"
 fi
 
+# 3b. Relevance pre-gate. Only used when the CLI is missing.
 if [ "${#REA_ARGV[@]}" -eq 0 ]; then
-  printf 'rea: CLI not found at sandboxed tiers (node_modules/@bookedsolid/rea/dist or dist/).\n' >&2
-  printf 'Install @bookedsolid/rea via npm/pnpm and run `rea doctor`.\n' >&2
-  printf 'Refusing the Bash command on uncertainty.\n' >&2
+  CLI_MISSING_CMD=""
+  if command -v jq >/dev/null 2>&1; then
+    CLI_MISSING_CMD=$(printf '%s' "$INPUT" | jq -r '
+      (.tool_input.command // "") | tostring
+    ' 2>/dev/null || true)
+  else
+    CLI_MISSING_CMD="$INPUT"
+  fi
+  if [ -z "$CLI_MISSING_CMD" ]; then
+    # Empty/non-Bash payload → pre-0.35.0 body would have exited 0.
+    exit 0
+  fi
+  # Empty policy.blocked_paths → no enforcement, exit 0.
+  POLICY_FILE="${REA_ROOT}/.rea/policy.yaml"
+  if [ ! -f "$POLICY_FILE" ]; then
+    exit 0
+  fi
+  # Substring scan: does the command mention any blocked_paths entry?
+  # Coarse — over-trigger is fine, under-trigger is the bypass we MUST
+  # avoid. Strip YAML quotes/comments via a minimal awk filter.
+  CLI_MISSING_RELEVANT=0
+  while IFS= read -r entry; do
+    [ -z "$entry" ] && continue
+    case "$CLI_MISSING_CMD" in
+      *"$entry"*) CLI_MISSING_RELEVANT=1; break ;;
+    esac
+  done < <(awk '
+    /^blocked_paths:/ { in_block=1; next }
+    in_block && /^[[:space:]]*-/ {
+      sub(/^[[:space:]]*-[[:space:]]*/, "")
+      gsub(/^["'\'']/, "")
+      gsub(/["'\'']$/, "")
+      print
+      next
+    }
+    in_block && /^[^[:space:]-]/ { in_block=0 }
+  ' "$POLICY_FILE" 2>/dev/null)
+  if [ "$CLI_MISSING_RELEVANT" -eq 0 ]; then
+    exit 0
+  fi
+  printf 'rea: blocked-paths-bash-gate cannot run — the rea CLI is not built.\n' >&2
+  printf 'Run `pnpm install && pnpm build` (or `npm install` for a consumer install) to restore protection.\n' >&2
+  printf 'This shim fails closed because the pre-0.35.0 bash body enforced blocked_paths refusal without a CLI.\n' >&2
   exit 2
 fi
 
-# Codex round 4 Finding 2 + round 5 F2 tier defense: realpath the
-# resolved CLI; PRIMARY check is project-root containment, SECONDARY
-# is ancestor `package.json` with the protected name. See
-# protected-paths-bash-gate.sh for the full rationale.
+# 4. Realpath sandbox check.
 if ! command -v node >/dev/null 2>&1; then
-  printf 'rea: node not on PATH (required to realpath verify scan-bash CLI). Refusing.\n' >&2
+  printf 'rea: blocked-paths-bash-gate cannot run — `node` is not on PATH.\n' >&2
+  printf 'Install Node 22+ (engines.node) to restore blocked_paths refusal.\n' >&2
   exit 2
 fi
+
 sandbox_check=$(node -e '
   const fs = require("fs");
   const path = require("path");
   const cli = process.argv[1];
   const projDir = process.argv[2];
-  let real;
+  let real, realProj;
   try { real = fs.realpathSync(cli); } catch (e) {
-    process.stdout.write("bad:realpath:" + (e && e.message ? e.message : String(e)));
-    process.exit(1);
+    process.stdout.write("bad:realpath"); process.exit(1);
   }
-  // PRIMARY (round 5 F2): realCli must live INSIDE realProj. Catches
-  // node_modules/@bookedsolid/rea -> /tmp/sym-attacker symlink-out.
-  let realProj;
   try { realProj = fs.realpathSync(projDir); } catch (e) {
-    process.stdout.write("bad:realpath-proj:" + (e && e.message ? e.message : String(e)));
-    process.exit(1);
+    process.stdout.write("bad:realpath-proj"); process.exit(1);
   }
-  const projWithSep = realProj.endsWith(path.sep) ? realProj : realProj + path.sep;
+  const sep = path.sep;
+  const projWithSep = realProj.endsWith(sep) ? realProj : realProj + sep;
   if (!(real === realProj || real.startsWith(projWithSep))) {
-    process.stdout.write("bad:cli-escapes-project:" + real + ":proj=" + realProj);
-    process.exit(1);
+    process.stdout.write("bad:cli-escapes-project"); process.exit(1);
   }
-  // SECONDARY (round 4 #2): shape + ancestor `package.json` with
-  // `@bookedsolid/rea`. Guards against intra-project hijack.
+  // Codex round-1 P1 fix: enforce dist/cli/index.js shape (see
+  // settings-protection.sh).
   const expectedEnd = path.join("dist", "cli", "index.js");
   if (!real.endsWith(path.sep + expectedEnd) && real !== "/" + expectedEnd) {
-    process.stdout.write("bad:cli-shape:" + real);
-    process.exit(1);
+    process.stdout.write("bad:cli-shape"); process.exit(1);
   }
   let cur = path.dirname(path.dirname(path.dirname(real)));
   let found = false;
@@ -82,94 +148,30 @@ sandbox_check=$(node -e '
     if (fs.existsSync(pj)) {
       try {
         const data = JSON.parse(fs.readFileSync(pj, "utf8"));
-        if (data && data.name === "@bookedsolid/rea") {
-          found = true;
-          break;
-        }
-      } catch (e) {
-        // Continue.
-      }
+        if (data && data.name === "@bookedsolid/rea") { found = true; break; }
+      } catch (e) { /* keep walking */ }
     }
     cur = path.dirname(cur);
   }
-  if (!found) {
-    process.stdout.write("bad:no-rea-pkg:" + real);
-    process.exit(1);
-  }
+  if (!found) { process.stdout.write("bad:no-rea-pkg-json"); process.exit(1); }
   process.stdout.write("ok");
-  process.exit(0);
-' "$RESOLVED_CLI_PATH" "$proj" 2>&1)
-sandbox_status=$?
-if [ "$sandbox_status" -ne 0 ] || [ "$sandbox_check" != "ok" ]; then
-  printf 'rea: scan-bash CLI realpath escapes sandbox (%s). Refusing.\n' "$sandbox_check" >&2
+' -- "$RESOLVED_CLI_PATH" "$proj" 2>/dev/null)
+
+if [ "$sandbox_check" != "ok" ]; then
+  printf 'rea: blocked-paths-bash-gate FAILED sandbox check (%s) — refusing.\n' "$sandbox_check" >&2
   exit 2
 fi
 
-# 0.28.0 helix-027 (bash total-lockout postmortem) — version-probe per
-# shim. See protected-paths-bash-gate.sh for the full rationale; this
-# shim mirrors the behavior to detect a stale CLI before payload reach.
-probe_out=$("${REA_ARGV[@]}" hook scan-bash --help 2>&1)
+# 5. Version-probe.
+probe_out=$("${REA_ARGV[@]}" hook blocked-paths-bash-gate --help 2>&1)
 probe_status=$?
-if [ "$probe_status" -ne 0 ] || ! printf '%s' "$probe_out" | grep -q -e 'scan-bash' -e '--mode'; then
-  printf 'rea: this shim requires the `rea hook scan-bash` subcommand (introduced in 0.23.0).\n' >&2
+if [ "$probe_status" -ne 0 ] || ! printf '%s' "$probe_out" | grep -q -e 'blocked-paths-bash-gate'; then
+  printf 'rea: this shim requires the `rea hook blocked-paths-bash-gate` subcommand (introduced in 0.35.0).\n' >&2
   printf 'The resolved CLI at %s does not implement it.\n' "$RESOLVED_CLI_PATH" >&2
-  printf 'Run `pnpm install` (or `npm install`) to sync the CLI to the version this shim expects.\n' >&2
+  printf 'Run `pnpm install` (or `npm install`) to sync the CLI; refusing in the meantime to preserve enforcement.\n' >&2
   exit 2
 fi
 
-payload=$(cat)
-if [ -z "$payload" ]; then
-  exit 0
-fi
-
-verdict=$(printf '%s' "$payload" | "${REA_ARGV[@]}" hook scan-bash --mode blocked)
-status=$?
-
-verifier='try {
-  const raw = require("fs").readFileSync(0, "utf8");
-  if (raw.trim().length === 0) { process.stdout.write("bad:empty"); process.exit(1); }
-  const v = JSON.parse(raw);
-  if (typeof v !== "object" || v === null || Array.isArray(v)) {
-    process.stdout.write("bad:non-object"); process.exit(1);
-  }
-  if (v.verdict !== "allow" && v.verdict !== "block") {
-    process.stdout.write("bad:verdict-shape:" + String(v.verdict)); process.exit(1);
-  }
-  process.stdout.write("ok:" + v.verdict); process.exit(0);
-} catch (e) {
-  process.stdout.write("bad:" + (e && e.message ? e.message : String(e))); process.exit(1);
-}'
-
-verdict_check=$(printf '%s' "$verdict" | node -e "$verifier" 2>&1)
-verdict_check_status=$?
-
-case "$status" in
-  0)
-    if [ "$verdict_check_status" -ne 0 ]; then
-      printf 'rea: scan-bash exited 0 but verdict JSON is malformed (%s). Refusing on uncertainty.\n' "$verdict_check" >&2
-      exit 2
-    fi
-    if [ "$verdict_check" != "ok:allow" ]; then
-      printf 'rea: scan-bash exit 0 but verdict says %s. Refusing on uncertainty.\n' "$verdict_check" >&2
-      exit 2
-    fi
-    exit 0
-    ;;
-  2)
-    if [ "$verdict_check_status" -ne 0 ]; then
-      exit 2
-    fi
-    if [ "$verdict_check" != "ok:block" ]; then
-      printf 'rea: scan-bash exit 2 but verdict says %s. Refusing on uncertainty.\n' "$verdict_check" >&2
-      exit 2
-    fi
-    exit 2
-    ;;
-  *)
-    printf 'rea: scan-bash exited %d (expected 0/2). Refusing on uncertainty.\n' "$status" >&2
-    if [ -n "$verdict" ]; then
-      printf 'rea: scan-bash stdout was: %s\n' "$verdict" >&2
-    fi
-    exit 2
-    ;;
-esac
+# 6. Forward stdin (already captured up-front).
+printf '%s' "$INPUT" | "${REA_ARGV[@]}" hook blocked-paths-bash-gate
+exit $?
