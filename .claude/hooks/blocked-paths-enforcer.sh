@@ -1,284 +1,180 @@
 #!/bin/bash
 # PreToolUse hook: blocked-paths-enforcer.sh
-# Fires BEFORE every Write or Edit tool call.
-# Reads blocked_paths from .rea/policy.yaml and blocks matching writes.
+# 0.35.0+ — Node-binary shim for `rea hook blocked-paths-enforcer`.
 #
-# This enforces the policy layer at the hook level — even if an agent ignores
-# the CLAUDE.md rules or skips the orchestrator, the hook will catch it.
+# Pre-0.35.0 the gate's full body lived here as bash (284 LOC). The
+# full bash body is preserved at
+# `__tests__/hooks/parity/baselines/blocked-paths-enforcer.sh.pre-0.35.0`.
 #
-# Exit codes:
-#   0 = allow (path not blocked)
-#   2 = block (path matches a blocked_paths entry)
+# Migration moves the enforcement logic (path normalization, traversal
+# reject, glob/prefix/exact matching, symlink resolution, agent-
+# writable allow-list) into `src/hooks/blocked-paths-enforcer/index.ts`.
+# This shim is the Claude Code dispatcher's view of the hook — it
+# forwards stdin to the CLI and exits with whatever the CLI returns.
+#
+# Behavioral contract is preserved byte-for-byte: exit 0 on allow,
+# exit 2 on HALT / blocked-paths match / malformed payload.
+#
+# # CLI-resolution trust boundary
+#
+# Mirrors the 0.32.0 final shim shape.
+#
+# # Fail-closed posture
+#
+# blocked-paths-enforcer is a Write/Edit/MultiEdit/NotebookEdit tier
+# security gate. The pre-0.35.0 bash body refused on uncertainty.
+# Early-exit branches fail closed AFTER the relevance pre-gate passes.
+#
+# # Relevance pre-gate
+#
+# Extract file_path / notebook_path from the payload, substring-scan
+# against the policy's blocked_paths entries. When CLI is missing AND
+# no policy.blocked_paths entry matches, exit 0. Empty/missing policy
+# → no enforcement, exit 0.
 
 set -uo pipefail
 
-# ── 1. Read ALL stdin immediately ─────────────────────────────────────────────
-INPUT=$(cat)
-
-# ── 2. Dependency check ──────────────────────────────────────────────────────
-if ! command -v jq >/dev/null 2>&1; then
-  printf 'REA ERROR: jq is required but not installed.\n' >&2
-  printf 'Install: brew install jq  OR  apt-get install -y jq\n' >&2
-  exit 2
-fi
-
-# ── 3. HALT check ────────────────────────────────────────────────────────────
-# 0.16.0: HALT check sourced from shared _lib/halt-check.sh.
+# 1. HALT check.
 # shellcheck source=_lib/halt-check.sh
 source "$(dirname "$0")/_lib/halt-check.sh"
 check_halt
 REA_ROOT=$(rea_root)
 
-# ── 4. Extract file path from payload ─────────────────────────────────────────
-FILE_PATH=$(printf '%s' "$INPUT" | jq -r '.tool_input.file_path // empty' 2>/dev/null)
+proj="${CLAUDE_PROJECT_DIR:-$REA_ROOT}"
 
-if [[ -z "$FILE_PATH" ]]; then
-  exit 0
+# 2. Capture stdin once.
+INPUT=$(cat)
+
+# 3. Resolve the rea CLI through the fixed 2-tier sandboxed order.
+REA_ARGV=()
+RESOLVED_CLI_PATH=""
+if [ -f "$proj/node_modules/@bookedsolid/rea/dist/cli/index.js" ]; then
+  REA_ARGV=(node "$proj/node_modules/@bookedsolid/rea/dist/cli/index.js")
+  RESOLVED_CLI_PATH="$proj/node_modules/@bookedsolid/rea/dist/cli/index.js"
+elif [ -f "$proj/dist/cli/index.js" ]; then
+  REA_ARGV=(node "$proj/dist/cli/index.js")
+  RESOLVED_CLI_PATH="$proj/dist/cli/index.js"
 fi
 
-# ── 5. Load blocked_paths from policy ─────────────────────────────────────────
-POLICY_FILE="${REA_ROOT}/.rea/policy.yaml"
-
-if [[ ! -f "$POLICY_FILE" ]]; then
-  exit 0
-fi
-
-# Parse blocked_paths using grep + sed (avoid yaml parser dependency)
-# Handles both inline array [] and block sequence - "..." formats
-BLOCKED_PATHS=()
-IN_BLOCK=0
-while IFS= read -r line; do
-  # Check if we're entering blocked_paths section
-  if printf '%s' "$line" | grep -qE '^blocked_paths:'; then
-    # Check for inline empty array
-    if printf '%s' "$line" | grep -qE 'blocked_paths:[[:space:]]*\[\]'; then
-      break
-    fi
-    # Check for inline array with values
-    if printf '%s' "$line" | grep -qE 'blocked_paths:[[:space:]]*\['; then
-      # Extract inline array items
-      items=$(printf '%s' "$line" | sed 's/.*\[//; s/\].*//; s/,/ /g')
-      for item in $items; do
-        cleaned=$(printf '%s' "$item" | sed "s/^[[:space:]]*[\"']//; s/[\"'][[:space:]]*$//")
-        if [[ -n "$cleaned" ]]; then
-          BLOCKED_PATHS+=("$cleaned")
-        fi
-      done
-      break
-    fi
-    IN_BLOCK=1
-    continue
+# 3b. Relevance pre-gate. Only used when the CLI is missing.
+if [ "${#REA_ARGV[@]}" -eq 0 ]; then
+  CLI_MISSING_FILE_PATH=""
+  if command -v jq >/dev/null 2>&1; then
+    CLI_MISSING_FILE_PATH=$(printf '%s' "$INPUT" | jq -r '
+      (.tool_input.file_path // .tool_input.notebook_path // "") | tostring
+    ' 2>/dev/null || true)
+  else
+    CLI_MISSING_FILE_PATH="$INPUT"
   fi
-
-  if [[ $IN_BLOCK -eq 1 ]]; then
-    # Block sequence items start with "  - "
-    if printf '%s' "$line" | grep -qE '^[[:space:]]+-'; then
-      cleaned=$(printf '%s' "$line" | sed 's/^[[:space:]]*-[[:space:]]*//; s/^"//; s/"$//; s/^'"'"'//; s/'"'"'$//')
-      if [[ -n "$cleaned" ]]; then
-        BLOCKED_PATHS+=("$cleaned")
-      fi
-    else
-      # Non-indented line means we've left the block
-      break
-    fi
-  fi
-done < "$POLICY_FILE"
-
-if [[ ${#BLOCKED_PATHS[@]} -eq 0 ]]; then
-  exit 0
-fi
-
-# ── 6. Agent-writable allowlist ───────────────────────────────────────────────
-# These paths under .rea/ must always be writable by agents regardless of
-# what blocked_paths says. Blocking the whole .rea/ directory in policy
-# is a common default, but tasks.jsonl is the PM data store — agents must
-# write there. Settings-protection.sh guards the sensitive files explicitly.
-AGENT_WRITABLE=(
-  '.rea/tasks.jsonl'
-  '.rea/audit/'
-)
-
-# 0.16.0: normalize_path migrated to shared `_lib/path-normalize.sh`.
-# Both this hook AND settings-protection.sh consume the same helper
-# so URL-decoding / backslash-translation / `./`-stripping cannot
-# drift between them again.
-# shellcheck source=_lib/path-normalize.sh
-source "$(dirname "$0")/_lib/path-normalize.sh"
-
-NORMALIZED=$(normalize_path "$FILE_PATH")
-
-# ── 5a. Path-traversal rejection (0.14.0 iron-gate fix) ───────────────────────
-# Reject any path containing a `..` segment BEFORE the literal-match below.
-# Without this, `foo/../CODEOWNERS` would get past `normalize_path()` (which
-# only strips leading project root + URL-decodes) and the literal-match
-# loop would compare `foo/../CODEOWNERS` against the literal `CODEOWNERS`
-# entry — which doesn't match, so the policy lets the write through. The
-# downstream Write/Edit tool then resolves the traversal and writes to
-# `CODEOWNERS` anyway, defeating the gate.
-#
-# Mirrors settings-protection.sh §5a (which has had this guard since
-# 0.10.x). Both pre- and post-decode forms are checked because
-# normalize_path() URL-decodes earlier and an attacker could split the
-# traversal across encodings (`%2E%2E/`, `..%2F`, etc.).
-raw_has_traversal=0
-norm_has_traversal=0
-case "/$FILE_PATH/" in
-  */../*) raw_has_traversal=1 ;;
-esac
-case "/$NORMALIZED/" in
-  */../*) norm_has_traversal=1 ;;
-esac
-# Also catch URL-encoded traversal in case some tool routes raw-encoded
-# paths through here (e.g. file:// inputs). normalize_path()'s decoder
-# only handles a fixed set; an unrecognized encoding would slip past.
-case "$FILE_PATH" in
-  *%2[Ee]%2[Ee]*|*%2[Ee].*|*.%2[Ee]*) raw_has_traversal=1 ;;
-esac
-if [[ "$raw_has_traversal" -eq 1 ]] || [[ "$norm_has_traversal" -eq 1 ]]; then
-  {
-    printf 'BLOCKED PATH: path traversal rejected\n'
-    printf '\n'
-    printf '  File: %s\n' "$FILE_PATH"
-    printf "  Rule: path contains a '..' segment; rewrite to a canonical\n"
-    printf '        project-relative path without traversal.\n'
-  } >&2
-  exit 2
-fi
-
-# ── 5a-bis. Reject interior single-dot segments (0.29.0 helix-/./-class) ─────
-# Parallel to the `..` guard above. `normalize_path` does NOT collapse
-# interior `./` segments — that would corrupt `..` traversals — which leaves
-# a bypass class. A blocked entry of `.env` does not match `foo/./.env`
-# (the literal-comparison loop is byte-for-byte), so an attacker who can
-# influence the file_path string can dodge the policy entry.
-#
-# The conservative closure (per Jake 2026-05-12): treat any interior `/./`
-# segment exactly like `..`. The NORMALIZED form is the safe surface for
-# the check — `normalize_path` already stripped leading `./` segments, so
-# any `/./` that survives is interior by construction. A raw-form check
-# would false-positive on benign `./foo` paths (codex round 1 P2: a path
-# like `%2E%2Fsrc/foo.ts` decodes to `./src/foo.ts` which is the same
-# leading-`./` allowed shape the comment at the top of `normalize_path`
-# documents — guarding against it on the raw form would block legit
-# writes under `src/` and friends).
-#
-# URL-encoded companion: `.%2F` / `%2E/` / `%2E%2F` decode to `./` via
-# `normalize_path` (which knows `%2E` → `.` and `%2F` → `/`). After
-# URL-decode + leading-`./` strip, any encoded INTERIOR form hits the
-# normalized `*/./* ` check. No raw-form encoded guard is needed — the
-# normalize_path path already covers every encoded shape the helper
-# decodes, and shapes it doesn't decode wouldn't resolve to an interior
-# `./` segment on disk either.
-norm_has_dot_segment=0
-case "/$NORMALIZED/" in
-  */./*) norm_has_dot_segment=1 ;;
-esac
-if [[ "$norm_has_dot_segment" -eq 1 ]]; then
-  {
-    printf 'BLOCKED PATH: interior dot-segment rejected\n'
-    printf '\n'
-    printf '  File: %s\n' "$FILE_PATH"
-    printf "  Rule: path contains an interior '/./' segment; rewrite to a\n"
-    printf '        canonical project-relative path without dot segments.\n'
-  } >&2
-  exit 2
-fi
-
-for writable in "${AGENT_WRITABLE[@]}"; do
-  if [[ "$NORMALIZED" == "$writable" ]] || [[ "$NORMALIZED" == "$writable"* && "$writable" == */ ]]; then
+  if [ -z "$CLI_MISSING_FILE_PATH" ]; then
     exit 0
   fi
-done
-
-# ── 7. Match against blocked_paths ───────────────────────────────────────────
-LOWER_NORM=$(printf '%s' "$NORMALIZED" | tr '[:upper:]' '[:lower:]')
-
-for blocked in "${BLOCKED_PATHS[@]}"; do
-  LOWER_BLOCKED=$(printf '%s' "$blocked" | tr '[:upper:]' '[:lower:]')
-
-  # Directory match (blocked path ends with /)
-  if [[ "$LOWER_BLOCKED" == */ ]]; then
-    if [[ "$LOWER_NORM" == "$LOWER_BLOCKED"* ]] || [[ "$LOWER_NORM" == "${LOWER_BLOCKED%/}" ]]; then
-      {
-        printf 'BLOCKED PATH: Write denied by policy\n'
-        printf '\n'
-        printf '  File: %s\n' "$FILE_PATH"
-        printf '  Blocked by: %s\n' "$blocked"
-        printf '  Source: .rea/policy.yaml → blocked_paths\n'
-        printf '\n'
-        printf '  This path is protected by policy. To modify it, a human must\n'
-        printf '  either update blocked_paths in policy.yaml or edit the file directly.\n'
-      } >&2
-      exit 2
-    fi
-    continue
+  POLICY_FILE="${REA_ROOT}/.rea/policy.yaml"
+  if [ ! -f "$POLICY_FILE" ]; then
+    exit 0
   fi
-
-  # Glob pattern match (contains *)
-  if [[ "$blocked" == *'*'* ]]; then
-    # Convert glob to regex: . → \., * → .*
-    regex=$(printf '%s' "$LOWER_BLOCKED" | sed 's/\./\\./g; s/\*/.*/g')
-    if printf '%s' "$LOWER_NORM" | grep -qE "^${regex}$"; then
-      {
-        printf 'BLOCKED PATH: Write denied by policy\n'
-        printf '\n'
-        printf '  File: %s\n' "$FILE_PATH"
-        printf '  Blocked by: %s (glob pattern)\n' "$blocked"
-        printf '  Source: .rea/policy.yaml → blocked_paths\n'
-      } >&2
-      exit 2
-    fi
-    continue
+  CLI_MISSING_RELEVANT=0
+  while IFS= read -r entry; do
+    [ -z "$entry" ] && continue
+    # Substring scan — for directory prefixes the entry ends with /
+    # and any file_path under it matches. Glob entries fall back to
+    # the same substring test (over-trigger is fine — the CLI does
+    # the precise evaluation when reachable).
+    base="$entry"
+    case "$base" in
+      */) base="${base%/}" ;;
+    esac
+    # Strip glob wildcards for substring testing — `src/*.ts` becomes
+    # `src/` + `.ts`. The simplest safe form is to scan the literal
+    # part before the first `*`.
+    case "$base" in
+      *'*'*) base="${base%%\**}" ;;
+    esac
+    [ -z "$base" ] && continue
+    case "$CLI_MISSING_FILE_PATH" in
+      *"$base"*) CLI_MISSING_RELEVANT=1; break ;;
+    esac
+  done < <(awk '
+    /^blocked_paths:/ { in_block=1; next }
+    in_block && /^[[:space:]]*-/ {
+      sub(/^[[:space:]]*-[[:space:]]*/, "")
+      gsub(/^["'\'']/, "")
+      gsub(/["'\'']$/, "")
+      print
+      next
+    }
+    in_block && /^[^[:space:]-]/ { in_block=0 }
+  ' "$POLICY_FILE" 2>/dev/null)
+  if [ "$CLI_MISSING_RELEVANT" -eq 0 ]; then
+    exit 0
   fi
-
-  # Exact match
-  if [[ "$LOWER_NORM" == "$LOWER_BLOCKED" ]]; then
-    {
-      printf 'BLOCKED PATH: Write denied by policy\n'
-      printf '\n'
-      printf '  File: %s\n' "$FILE_PATH"
-      printf '  Blocked by: %s\n' "$blocked"
-      printf '  Source: .rea/policy.yaml → blocked_paths\n'
-    } >&2
-    exit 2
-  fi
-done
-
-# ── 0.16.0 fix H.2: intermediate-symlink resolution ──────────────────────────
-# Same shape as Helix Finding 2 against blocked_paths policy entries.
-# If `secrets/` is in blocked_paths and an attacker creates
-# `pretty/ -> ../secrets/`, then writes `pretty/foo`, the literal-match
-# loop above sees `pretty/foo` (no match) and exits 0 — the downstream
-# Write tool follows the symlink and lands the body in `secrets/foo`.
-# Mirrors settings-protection.sh §6c.
-if [[ -e "$FILE_PATH" || -d "$(dirname -- "$FILE_PATH")" ]]; then
-  parent_dir=$(dirname -- "$FILE_PATH")
-  if [[ -d "$parent_dir" ]]; then
-    resolved_parent=$(cd -P -- "$parent_dir" 2>/dev/null && pwd -P 2>/dev/null) || resolved_parent=""
-    if [[ -n "$resolved_parent" && "$resolved_parent" == "$REA_ROOT"/* ]]; then
-      relative_resolved="${resolved_parent#"$REA_ROOT"/}"
-      resolved_target="${relative_resolved}/$(basename -- "$FILE_PATH")"
-      resolved_target_lc=$(printf '%s' "$resolved_target" | tr '[:upper:]' '[:lower:]')
-      for blocked in "${BLOCKED_PATHS[@]}"; do
-        blocked_lc=$(printf '%s' "$blocked" | tr '[:upper:]' '[:lower:]')
-        if [[ "$resolved_target_lc" == "$blocked_lc" ]] || \
-           { [[ "$blocked_lc" == */ ]] && [[ "$resolved_target_lc" == "$blocked_lc"* ]]; }; then
-          {
-            printf 'BLOCKED PATH: intermediate-symlink resolution blocked\n'
-            printf '\n'
-            printf '  Logical:  %s\n' "$FILE_PATH"
-            printf '  Resolved: %s\n' "$resolved_target"
-            printf '  Blocked by: %s\n' "$blocked"
-            printf '  Source: .rea/policy.yaml → blocked_paths\n'
-            printf '\n'
-            printf '  Rule: an intermediate directory of the path is a symlink\n'
-            printf '        whose target falls inside a blocked policy entry.\n'
-          } >&2
-          exit 2
-        fi
-      done
-    fi
-  fi
+  printf 'rea: blocked-paths-enforcer cannot run — the rea CLI is not built.\n' >&2
+  printf 'Run `pnpm install && pnpm build` (or `npm install` for a consumer install) to restore protection.\n' >&2
+  printf 'This shim fails closed because the pre-0.35.0 bash body enforced blocked_paths refusal without a CLI.\n' >&2
+  exit 2
 fi
 
-exit 0
+# 4. Realpath sandbox check.
+if ! command -v node >/dev/null 2>&1; then
+  printf 'rea: blocked-paths-enforcer cannot run — `node` is not on PATH.\n' >&2
+  printf 'Install Node 22+ (engines.node) to restore blocked_paths refusal.\n' >&2
+  exit 2
+fi
+
+sandbox_check=$(node -e '
+  const fs = require("fs");
+  const path = require("path");
+  const cli = process.argv[1];
+  const projDir = process.argv[2];
+  let real, realProj;
+  try { real = fs.realpathSync(cli); } catch (e) {
+    process.stdout.write("bad:realpath"); process.exit(1);
+  }
+  try { realProj = fs.realpathSync(projDir); } catch (e) {
+    process.stdout.write("bad:realpath-proj"); process.exit(1);
+  }
+  const sep = path.sep;
+  const projWithSep = realProj.endsWith(sep) ? realProj : realProj + sep;
+  if (!(real === realProj || real.startsWith(projWithSep))) {
+    process.stdout.write("bad:cli-escapes-project"); process.exit(1);
+  }
+  // Codex round-1 P1 fix: enforce dist/cli/index.js shape (see
+  // settings-protection.sh).
+  const expectedEnd = path.join("dist", "cli", "index.js");
+  if (!real.endsWith(path.sep + expectedEnd) && real !== "/" + expectedEnd) {
+    process.stdout.write("bad:cli-shape"); process.exit(1);
+  }
+  let cur = path.dirname(path.dirname(path.dirname(real)));
+  let found = false;
+  for (let i = 0; i < 20 && cur && cur !== path.dirname(cur); i += 1) {
+    const pj = path.join(cur, "package.json");
+    if (fs.existsSync(pj)) {
+      try {
+        const data = JSON.parse(fs.readFileSync(pj, "utf8"));
+        if (data && data.name === "@bookedsolid/rea") { found = true; break; }
+      } catch (e) { /* keep walking */ }
+    }
+    cur = path.dirname(cur);
+  }
+  if (!found) { process.stdout.write("bad:no-rea-pkg-json"); process.exit(1); }
+  process.stdout.write("ok");
+' -- "$RESOLVED_CLI_PATH" "$proj" 2>/dev/null)
+
+if [ "$sandbox_check" != "ok" ]; then
+  printf 'rea: blocked-paths-enforcer FAILED sandbox check (%s) — refusing.\n' "$sandbox_check" >&2
+  exit 2
+fi
+
+# 5. Version-probe.
+probe_out=$("${REA_ARGV[@]}" hook blocked-paths-enforcer --help 2>&1)
+probe_status=$?
+if [ "$probe_status" -ne 0 ] || ! printf '%s' "$probe_out" | grep -q -e 'blocked-paths-enforcer'; then
+  printf 'rea: this shim requires the `rea hook blocked-paths-enforcer` subcommand (introduced in 0.35.0).\n' >&2
+  printf 'The resolved CLI at %s does not implement it.\n' "$RESOLVED_CLI_PATH" >&2
+  printf 'Run `pnpm install` (or `npm install`) to sync the CLI; refusing in the meantime to preserve enforcement.\n' >&2
+  exit 2
+fi
+
+# 6. Forward stdin (already captured up-front).
+printf '%s' "$INPUT" | "${REA_ARGV[@]}" hook blocked-paths-enforcer
+exit $?

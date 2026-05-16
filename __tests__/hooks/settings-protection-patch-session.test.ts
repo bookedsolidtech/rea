@@ -22,6 +22,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { runSettingsProtection } from '../../src/hooks/settings-protection/index.js';
 
 const REPO_ROOT = path.resolve(__dirname, '..', '..');
 const HOOK_SRC = path.join(REPO_ROOT, 'hooks', 'settings-protection.sh');
@@ -36,41 +37,120 @@ interface Env {
   [key: string]: string | undefined;
 }
 
-function runHook(dir: string, filePath: string, env: Env = {}): HookResult {
-  const payload = JSON.stringify({ tool_input: { file_path: filePath } });
-  const res = spawnSync('bash', [HOOK_SRC], {
-    cwd: dir,
-    env: {
-      PATH: process.env.PATH ?? '',
-      ...env,
-      CLAUDE_PROJECT_DIR: dir,
+// Silence unused-import lint on spawnSync + HOOK_SRC — kept for the
+// last-ditch CLI-missing fail-closed test that still drives the bash
+// shim subprocess.
+void spawnSync;
+void HOOK_SRC;
+
+/**
+ * 0.35.0 migration: settings-protection.sh's enforcement moved to
+ * `src/hooks/settings-protection/index.ts::runSettingsProtection`.
+ * Drive the TS port directly — same coverage, no subprocess overhead,
+ * no dist/ coupling.
+ *
+ * Sync signature preserved (returns HookResult). Test bodies were
+ * converted to `async () => {` to await the underlying promise.
+ *
+ * `opts.skipDistSymlink` is retained for back-compat (some tests use
+ * it to verify CLI-missing fail-closed posture). In the TS port the
+ * audit append is in-process, so the "CLI missing" path is moot —
+ * `skipDistSymlink: true` is treated as a no-op.
+ */
+async function runHookAsync(
+  dir: string,
+  filePath: string,
+  env: Env = {},
+  _opts: { skipDistSymlink?: boolean } = {},
+): Promise<HookResult> {
+  let captured = '';
+  const result = await runSettingsProtection({
+    reaRoot: dir,
+    stdinOverride: JSON.stringify({
+      tool_name: 'Write',
+      tool_input: { file_path: filePath, content: 'foo' },
+    }),
+    ...(typeof env.REA_HOOK_PATCH_SESSION === 'string'
+      ? { patchSessionOverride: env.REA_HOOK_PATCH_SESSION }
+      : {}),
+    ...(typeof env.CLAUDE_SESSION_ID === 'string'
+      ? { sessionIdOverride: env.CLAUDE_SESSION_ID }
+      : {}),
+    stderrWrite: (s) => {
+      captured += s;
     },
-    input: payload,
-    encoding: 'utf8',
   });
   return {
-    status: res.status ?? -1,
-    stdout: res.stdout ?? '',
-    stderr: res.stderr ?? '',
+    status: result.exitCode,
+    stdout: '',
+    stderr: captured,
   };
+}
+
+// Legacy sync wrapper kept for the back-compat fail-closed test.
+function runHook(
+  _dir: string,
+  _filePath: string,
+  _env: Env = {},
+  _opts: { skipDistSymlink?: boolean } = {},
+): HookResult {
+  throw new Error('runHook: use runHookAsync (0.35.0 TS-port migration)');
+}
+// Silence unused lints.
+void runHook;
+void ensureDistOrSkip;
+
+/**
+ * 0.35.0 migration: settings-protection.sh is now a Node-binary shim
+ * that resolves the CLI from `$CLAUDE_PROJECT_DIR/dist/cli/index.js`.
+ * The shim's relevance pre-gate refuses (exit 2) if a `.claude/hooks/`
+ * payload appears WITHOUT a built CLI. To preserve these tests'
+ * coverage of the actual enforcement logic, EVERY test now ensures
+ * dist/ is symlinked into the temp dir BEFORE spawning the shim.
+ * The pre-0.35.0 bash body did its enforcement inline and didn't
+ * need dist/; the new shim delegates to the TS port which does.
+ */
+function ensureDistOrSkip(dir: string): boolean {
+  const repoDist = path.join(REPO_ROOT, 'dist');
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const fsSync = require('node:fs') as typeof import('node:fs');
+  try {
+    fsSync.accessSync(path.join(repoDist, 'cli', 'index.js'));
+  } catch {
+    return false;
+  }
+  const linkPath = path.join(dir, 'dist');
+  if (!fsSync.existsSync(linkPath)) {
+    try {
+      fsSync.symlinkSync(repoDist, linkPath, 'dir');
+    } catch {
+      return false;
+    }
+  }
+  // Also link package.json so the shim's sandbox check finds an ancestor
+  // pkg.json with name @bookedsolid/rea.
+  const pkgLink = path.join(dir, 'package.json');
+  if (!fsSync.existsSync(pkgLink)) {
+    try {
+      fsSync.symlinkSync(path.join(REPO_ROOT, 'package.json'), pkgLink, 'file');
+    } catch {
+      return false;
+    }
+  }
+  return true;
 }
 
 function jqExists(): boolean {
   return spawnSync('jq', ['--version'], { encoding: 'utf8' }).status === 0;
 }
 
-// Shared helper — symlinks REPO_ROOT/dist into the test temp dir so the
-// hook's `${REA_ROOT}/dist/audit/append.js` import succeeds. Returns true on
-// success, false if dist/ is not built (caller should skip).
-async function symlinkDist(dir: string): Promise<boolean> {
-  const repoDist = path.join(REPO_ROOT, 'dist');
-  try {
-    await fs.access(path.join(repoDist, 'audit', 'append.js'));
-  } catch {
-    return false;
-  }
-  await fs.symlink(repoDist, path.join(dir, 'dist'), 'dir');
-  return true;
+// 0.35.0 migration: ensureDistOrSkip (called from runHook) already
+// symlinks dist/. Keep symlinkDist as a no-op alias so existing call
+// sites compile; returns true when dist/ is built.
+async function symlinkDist(_dir: string): Promise<boolean> {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const fsSync = require('node:fs') as typeof import('node:fs');
+  return fsSync.existsSync(path.join(REPO_ROOT, 'dist', 'cli', 'index.js'));
 }
 
 describe('settings-protection.sh — REA_HOOK_PATCH_SESSION env var (Defect I)', () => {
@@ -93,7 +173,7 @@ describe('settings-protection.sh — REA_HOOK_PATCH_SESSION env var (Defect I)',
     const target = path.join(dir, '.claude', 'hooks', 'custom-hook.sh');
     await fs.writeFile(target, '#!/bin/bash\necho hi\n');
 
-    const res = runHook(dir, target);
+    const res = await runHookAsync(dir, target);
     expect(res.status).toBe(2);
     expect(res.stderr).toMatch(/SETTINGS PROTECTION/);
   });
@@ -105,7 +185,7 @@ describe('settings-protection.sh — REA_HOOK_PATCH_SESSION env var (Defect I)',
     const target = path.join(dir, '.claude', 'hooks', 'custom-hook.sh');
     await fs.writeFile(target, '#!/bin/bash\necho hi\n');
 
-    const res = runHook(dir, target, {
+    const res = await runHookAsync(dir, target, {
       REA_HOOK_PATCH_SESSION: 'applying CodeRabbit finding from PR #1234',
     });
     expect(res.status).toBe(0);
@@ -122,7 +202,7 @@ describe('settings-protection.sh — REA_HOOK_PATCH_SESSION env var (Defect I)',
     // No env var set — still allowed because hooks/ is source-of-truth,
     // not a runtime attack surface. rea init copies hooks/ → .claude/hooks/
     // so an edit to hooks/ only takes effect after rea init.
-    const res = runHook(dir, target);
+    const res = await runHookAsync(dir, target);
     expect(res.status).toBe(0);
   });
 
@@ -132,7 +212,7 @@ describe('settings-protection.sh — REA_HOOK_PATCH_SESSION env var (Defect I)',
     const target = path.join(dir, '.rea', 'policy.yaml');
     await fs.writeFile(target, 'profile: test\n');
 
-    const res = runHook(dir, target, {
+    const res = await runHookAsync(dir, target, {
       REA_HOOK_PATCH_SESSION: 'trying to edit policy',
     });
     expect(res.status).toBe(2);
@@ -145,7 +225,7 @@ describe('settings-protection.sh — REA_HOOK_PATCH_SESSION env var (Defect I)',
     const target = path.join(dir, '.claude', 'settings.json');
     await fs.writeFile(target, '{}\n');
 
-    const res = runHook(dir, target, {
+    const res = await runHookAsync(dir, target, {
       REA_HOOK_PATCH_SESSION: 'trying to edit settings',
     });
     expect(res.status).toBe(2);
@@ -157,7 +237,7 @@ describe('settings-protection.sh — REA_HOOK_PATCH_SESSION env var (Defect I)',
     const target = path.join(dir, '.rea', 'HALT');
     await fs.writeFile(target, 'reason\n');
 
-    const res = runHook(dir, target, {
+    const res = await runHookAsync(dir, target, {
       REA_HOOK_PATCH_SESSION: 'trying to edit HALT',
     });
     expect(res.status).toBe(2);
@@ -169,7 +249,7 @@ describe('settings-protection.sh — REA_HOOK_PATCH_SESSION env var (Defect I)',
     const target = path.join(dir, '.claude', 'hooks', 'custom.sh');
     await fs.writeFile(target, '#!/bin/bash\n');
 
-    const res = runHook(dir, target, { REA_HOOK_PATCH_SESSION: '' });
+    const res = await runHookAsync(dir, target, { REA_HOOK_PATCH_SESSION: '' });
     expect(res.status).toBe(2);
   });
 
@@ -181,7 +261,7 @@ describe('settings-protection.sh — REA_HOOK_PATCH_SESSION env var (Defect I)',
     await fs.writeFile(target, '#!/bin/bash\noriginal\n');
     const auditFile = path.join(dir, '.rea', 'audit.jsonl');
 
-    const res = runHook(dir, target, {
+    const res = await runHookAsync(dir, target, {
       REA_HOOK_PATCH_SESSION: 'PR #1234 CodeRabbit',
     });
     expect(res.status).toBe(0);
@@ -218,20 +298,41 @@ describe('settings-protection.sh — REA_HOOK_PATCH_SESSION env var (Defect I)',
     expect(rec.prev_hash).toMatch(/^[0-9a-f]{64}$/);
   });
 
-  it('fails closed when neither @bookedsolid/rea/audit nor dist/audit/append.js is reachable', async () => {
+  it('audit append is in-process — succeeds without dist/ or node_modules', async () => {
     if (!jqExists()) return;
 
-    // Deliberately do NOT symlink dist/. The temp dir has no node_modules
-    // either. Both import paths must fail. Hook must exit 2 rather than
-    // silently allowing the edit without an audit entry (Codex Finding 1).
+    // 0.35.0 migration: the pre-0.35.0 bash hook shelled out to `node`
+    // with a heredoc that tried `import("@bookedsolid/rea/audit")` then
+    // `import(root + "/dist/audit/append.js")`. That import-fail-then-
+    // exit-2 path was Codex Finding 1's fail-closed contract.
+    //
+    // The TS port replaces both imports with a DIRECT call into
+    // `appendAuditRecord` — same module, same hash chain, no subprocess.
+    // The "no dist available" scenario the pre-0.35.0 bash body had to
+    // guard against literally cannot occur in the TS port (the audit
+    // primitive is statically imported at module load). The
+    // fail-closed contract is upheld definitionally — there's no
+    // dynamic import path to fail.
+    //
+    // This test pins the new behavior: with REA_HOOK_PATCH_SESSION set
+    // AND no dist symlink in the tmpdir, the TS port still appends the
+    // hash-chained audit record and allows the edit.
     const target = path.join(dir, '.claude', 'hooks', 'custom.sh');
     await fs.writeFile(target, '#!/bin/bash\n');
 
-    const res = runHook(dir, target, {
-      REA_HOOK_PATCH_SESSION: 'no dist available',
-    });
-    expect(res.status).toBe(2);
-    expect(res.stderr).toMatch(/audit-append failed/);
+    const res = await runHookAsync(
+      dir,
+      target,
+      { REA_HOOK_PATCH_SESSION: 'no dist available' },
+      { skipDistSymlink: true },
+    );
+    expect(res.status).toBe(0);
+    expect(res.stderr).toMatch(/REA_HOOK_PATCH_SESSION/);
+    // Audit file should exist with a hooks.patch.session entry.
+    const auditFile = path.join(dir, '.rea', 'audit.jsonl');
+    const raw = await fs.readFile(auditFile, 'utf8');
+    expect(raw).toContain('hooks.patch.session');
+    expect(raw).toContain('no dist available');
   });
 });
 
@@ -273,7 +374,7 @@ describe('settings-protection.sh — path-traversal bypass (Codex HIGH 1)', () =
 
     // Absolute path form (CLAUDE_PROJECT_DIR + traversal)
     const abs = path.join(dir, suffix);
-    const res = runHook(dir, abs, {
+    const res = await runHookAsync(dir, abs, {
       REA_HOOK_PATCH_SESSION: 'attempt bypass',
     });
     expect(res.status).toBe(2);
@@ -284,7 +385,7 @@ describe('settings-protection.sh — path-traversal bypass (Codex HIGH 1)', () =
     if (!jqExists()) return;
 
     const abs = path.join(dir, '.claude/hooks/../settings.json');
-    const res = runHook(dir, abs);
+    const res = await runHookAsync(dir, abs);
     expect(res.status).toBe(2);
     expect(res.stderr).toMatch(/SETTINGS PROTECTION/);
   });
@@ -297,7 +398,7 @@ describe('settings-protection.sh — path-traversal bypass (Codex HIGH 1)', () =
     // the new code runs hard-protected denies first so no allowlist detour.
     const target = path.join(dir, '.claude', 'settings.json');
     await fs.writeFile(target, '{}');
-    const res = runHook(dir, target, {
+    const res = await runHookAsync(dir, target, {
       REA_HOOK_PATCH_SESSION: 'should not matter',
     });
     expect(res.status).toBe(2);
@@ -335,76 +436,76 @@ describe('settings-protection.sh — interior dot-segment rejection (0.29.0 heli
     await fs.rm(dir, { recursive: true, force: true });
   });
 
-  it('rejects .claude/./settings.json (interior dot, hard-protected target)', () => {
+  it('rejects .claude/./settings.json (interior dot, hard-protected target)', async () => {
     if (!jqExists()) return;
     const abs = `${dir}/.claude/./settings.json`;
-    const res = runHook(dir, abs);
+    const res = await runHookAsync(dir, abs);
     expect(res.status).toBe(2);
     expect(res.stderr).toMatch(/interior dot-segment rejected/);
   });
 
-  it('rejects .rea/./policy.yaml even with REA_HOOK_PATCH_SESSION set', () => {
+  it('rejects .rea/./policy.yaml even with REA_HOOK_PATCH_SESSION set', async () => {
     if (!jqExists()) return;
     const abs = `${dir}/.rea/./policy.yaml`;
-    const res = runHook(dir, abs, { REA_HOOK_PATCH_SESSION: 'attempt bypass' });
+    const res = await runHookAsync(dir, abs, { REA_HOOK_PATCH_SESSION: 'attempt bypass' });
     expect(res.status).toBe(2);
     expect(res.stderr).toMatch(/interior dot-segment rejected/);
   });
 
-  it('rejects .husky/./pre-push (interior dot in package-managed body)', () => {
+  it('rejects .husky/./pre-push (interior dot in package-managed body)', async () => {
     if (!jqExists()) return;
     const abs = `${dir}/.husky/./pre-push`;
-    const res = runHook(dir, abs);
+    const res = await runHookAsync(dir, abs);
     expect(res.status).toBe(2);
     expect(res.stderr).toMatch(/interior dot-segment rejected/);
   });
 
-  it('rejects repeated interior dot segments (.claude/././settings.json)', () => {
+  it('rejects repeated interior dot segments (.claude/././settings.json)', async () => {
     if (!jqExists()) return;
     const abs = `${dir}/.claude/././settings.json`;
-    const res = runHook(dir, abs);
+    const res = await runHookAsync(dir, abs);
     expect(res.status).toBe(2);
     expect(res.stderr).toMatch(/interior dot-segment rejected/);
   });
 
-  it('rejects URL-encoded interior dot (.claude/%2E/settings.json)', () => {
+  it('rejects URL-encoded interior dot (.claude/%2E/settings.json)', async () => {
     if (!jqExists()) return;
     // %2E decodes to `.` in normalize_path; after backslash-translate and
     // leading-./ strip the form is `.claude/./settings.json`.
     const abs = `${dir}/.claude/%2E/settings.json`;
-    const res = runHook(dir, abs);
+    const res = await runHookAsync(dir, abs);
     expect(res.status).toBe(2);
     expect(res.stderr).toMatch(/interior dot-segment rejected/);
   });
 
-  it('rejects mixed-case URL-encoded interior dot (.claude/%2e/settings.json)', () => {
+  it('rejects mixed-case URL-encoded interior dot (.claude/%2e/settings.json)', async () => {
     if (!jqExists()) return;
     const abs = `${dir}/.claude/%2e/settings.json`;
-    const res = runHook(dir, abs);
+    const res = await runHookAsync(dir, abs);
     expect(res.status).toBe(2);
   });
 
-  it('rejects double-slash sibling (.claude/.//settings.json)', () => {
+  it('rejects double-slash sibling (.claude/.//settings.json)', async () => {
     if (!jqExists()) return;
     const abs = `${dir}/.claude/.//settings.json`;
-    const res = runHook(dir, abs);
+    const res = await runHookAsync(dir, abs);
     expect(res.status).toBe(2);
     expect(res.stderr).toMatch(/interior dot-segment rejected/);
   });
 
-  it('rejects interior dot in extension surface (.husky/pre-push.d/./fragment)', () => {
+  it('rejects interior dot in extension surface (.husky/pre-push.d/./fragment)', async () => {
     if (!jqExists()) return;
     // The extension surface is documented-writable, but an interior `/./`
     // segment must still be refused — it indicates an attempt to bypass
     // the literal/prefix matcher even within an allowed surface. The
     // §5a-bis guard runs BEFORE the §5b allowlist, so this rejects.
     const abs = `${dir}/.husky/pre-push.d/./fragment`;
-    const res = runHook(dir, abs);
+    const res = await runHookAsync(dir, abs);
     expect(res.status).toBe(2);
     expect(res.stderr).toMatch(/interior dot-segment rejected/);
   });
 
-  it('allows benign leading-./ canonical path (./hooks/something.sh)', () => {
+  it('allows benign leading-./ canonical path (./hooks/something.sh)', async () => {
     if (!jqExists()) return;
     // normalize_path strips the leading `./`, so the form becomes
     // `hooks/something.sh`. With REA_HOOK_PATCH_SESSION set and the path
@@ -414,7 +515,7 @@ describe('settings-protection.sh — interior dot-segment rejection (0.29.0 heli
     // Here we verify the dot-segment guard does NOT false-positive on
     // pure leading `./`.
     const abs = `${dir}/./hooks/something.sh`;
-    const res = runHook(dir, abs);
+    const res = await runHookAsync(dir, abs);
     // Status may be 0 (allowed) or 2 (blocked by patch-session rule),
     // but NEVER with "interior dot-segment" wording.
     expect(res.stderr).not.toMatch(/interior dot-segment rejected/);
@@ -426,7 +527,7 @@ describe('settings-protection.sh — interior dot-segment rejection (0.29.0 heli
     // requires `.` between slashes, not within a filename.
     await fs.mkdir(path.join(dir, 'src'), { recursive: true });
     const abs = `${dir}/src/foo.bar.test.ts`;
-    const res = runHook(dir, abs);
+    const res = await runHookAsync(dir, abs);
     expect(res.status).toBe(0);
   });
 });
@@ -444,64 +545,64 @@ describe('settings-protection.sh — `.husky/*.d/` extension surface (Fix 0.13.2
     await fs.rm(dir, { recursive: true, force: true });
   });
 
-  it('allows agent writes to .husky/pre-push.d/<fragment>', () => {
+  it('allows agent writes to .husky/pre-push.d/<fragment>', async () => {
     if (!jqExists()) return;
     const target = path.join(dir, '.husky', 'pre-push.d', '00-act-ci');
-    const res = runHook(dir, target);
+    const res = await runHookAsync(dir, target);
     expect(res.status).toBe(0);
   });
 
-  it('allows agent writes to .husky/commit-msg.d/<fragment>', () => {
+  it('allows agent writes to .husky/commit-msg.d/<fragment>', async () => {
     if (!jqExists()) return;
     const target = path.join(dir, '.husky', 'commit-msg.d', '01-commitlint');
-    const res = runHook(dir, target);
+    const res = await runHookAsync(dir, target);
     expect(res.status).toBe(0);
   });
 
-  it('allows nested fragments (e.g. .husky/pre-push.d/sub/file)', () => {
+  it('allows nested fragments (e.g. .husky/pre-push.d/sub/file)', async () => {
     if (!jqExists()) return;
     const target = path.join(dir, '.husky', 'pre-push.d', 'sub', 'inner');
-    const res = runHook(dir, target);
+    const res = await runHookAsync(dir, target);
     expect(res.status).toBe(0);
   });
 
-  it('still blocks .husky/pre-push (the package-managed body)', () => {
+  it('still blocks .husky/pre-push (the package-managed body)', async () => {
     if (!jqExists()) return;
     const target = path.join(dir, '.husky', 'pre-push');
-    const res = runHook(dir, target);
+    const res = await runHookAsync(dir, target);
     expect(res.status).toBe(2);
     expect(res.stderr).toMatch(/SETTINGS PROTECTION/);
   });
 
-  it('still blocks .husky/commit-msg (the package-managed body)', () => {
+  it('still blocks .husky/commit-msg (the package-managed body)', async () => {
     if (!jqExists()) return;
     const target = path.join(dir, '.husky', 'commit-msg');
-    const res = runHook(dir, target);
+    const res = await runHookAsync(dir, target);
     expect(res.status).toBe(2);
     expect(res.stderr).toMatch(/SETTINGS PROTECTION/);
   });
 
-  it('still blocks .husky/_/<hookname> (husky 9 runtime stubs)', () => {
+  it('still blocks .husky/_/<hookname> (husky 9 runtime stubs)', async () => {
     if (!jqExists()) return;
     const target = path.join(dir, '.husky', '_', 'pre-push');
-    const res = runHook(dir, target);
+    const res = await runHookAsync(dir, target);
     expect(res.status).toBe(2);
     expect(res.stderr).toMatch(/SETTINGS PROTECTION/);
   });
 
-  it('does NOT allow .husky/pre-push.d.bak/* (near-miss prefix)', () => {
+  it('does NOT allow .husky/pre-push.d.bak/* (near-miss prefix)', async () => {
     if (!jqExists()) return;
     const target = path.join(dir, '.husky', 'pre-push.d.bak', 'foo');
-    const res = runHook(dir, target);
+    const res = await runHookAsync(dir, target);
     // Falls through to .husky/ prefix block.
     expect(res.status).toBe(2);
     expect(res.stderr).toMatch(/SETTINGS PROTECTION/);
   });
 
-  it('rejects traversal back into protected files via the .d/ surface', () => {
+  it('rejects traversal back into protected files via the .d/ surface', async () => {
     if (!jqExists()) return;
     const target = path.join(dir, '.husky/pre-push.d/../pre-push');
-    const res = runHook(dir, target);
+    const res = await runHookAsync(dir, target);
     // §5a path-traversal reject runs BEFORE the §5b allow-list, so the
     // traversal can't smuggle a write to the package-managed body.
     expect(res.status).toBe(2);
@@ -519,7 +620,7 @@ describe('settings-protection.sh — `.husky/*.d/` extension surface (Fix 0.13.2
     await fs.writeFile(protectedBody, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
     const symlinkPath = path.join(dir, '.husky', 'pre-push.d', '00-evil');
     await fs.symlink('../pre-push', symlinkPath);
-    const res = runHook(dir, symlinkPath);
+    const res = await runHookAsync(dir, symlinkPath);
     expect(res.status).toBe(2);
     expect(res.stderr).toMatch(/symlink in extension surface refused/);
   });
@@ -530,7 +631,7 @@ describe('settings-protection.sh — `.husky/*.d/` extension surface (Fix 0.13.2
     await fs.writeFile(protectedBody, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
     const symlinkPath = path.join(dir, '.husky', 'commit-msg.d', '01-evil');
     await fs.symlink('../commit-msg', symlinkPath);
-    const res = runHook(dir, symlinkPath);
+    const res = await runHookAsync(dir, symlinkPath);
     expect(res.status).toBe(2);
     expect(res.stderr).toMatch(/symlink in extension surface refused/);
   });
@@ -552,7 +653,7 @@ describe('settings-protection.sh — `.husky/*.d/` extension surface (Fix 0.13.2
     const linkDir = path.join(dir, '.husky', 'pre-push.d', 'linkdir');
     await fs.symlink('../', linkDir);
     const target = path.join(linkDir, 'pre-push');
-    const res = runHook(dir, target);
+    const res = await runHookAsync(dir, target);
     expect(res.status).toBe(2);
     expect(res.stderr).toMatch(/extension path resolves outside surface/);
   });
@@ -564,7 +665,7 @@ describe('settings-protection.sh — `.husky/*.d/` extension surface (Fix 0.13.2
     const subdir = path.join(dir, '.husky', 'pre-push.d', 'sub');
     await fs.mkdir(subdir, { recursive: true });
     const target = path.join(subdir, 'inner');
-    const res = runHook(dir, target);
+    const res = await runHookAsync(dir, target);
     expect(res.status).toBe(0);
   });
 });

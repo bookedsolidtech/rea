@@ -40,6 +40,10 @@ import { runArchitectureReviewGate } from '../../../src/hooks/architecture-revie
 import { runDangerousBashInterceptor } from '../../../src/hooks/dangerous-bash-interceptor/index.js';
 import { runLocalReviewGate } from '../../../src/hooks/local-review-gate/index.js';
 import { runSecretScanner } from '../../../src/hooks/secret-scanner/index.js';
+import { runBlockedPathsBashGate } from '../../../src/hooks/blocked-paths-bash-gate/index.js';
+import { runProtectedPathsBashGate } from '../../../src/hooks/protected-paths-bash-gate/index.js';
+import { runBlockedPathsEnforcer } from '../../../src/hooks/blocked-paths-enforcer/index.js';
+import { runSettingsProtection } from '../../../src/hooks/settings-protection/index.js';
 
 const IS_WINDOWS = process.platform === 'win32';
 const SKIP = process.env['SKIP_BASH_PARITY'] === '1' || IS_WINDOWS;
@@ -724,6 +728,235 @@ review:
     });
     expect(node.exitCode).toBe(0);
     expect(bash.exitCode).toBe(0);
+  });
+});
+
+// ── 0.35.0 parity additions ───────────────────────────────────────────
+
+function writeFilePayload(filePath: string, toolName = 'Write'): string {
+  return JSON.stringify({
+    tool_name: toolName,
+    tool_input: { file_path: filePath, content: 'foo' },
+  });
+}
+
+function policyWithBlocked(reaRoot: string, blocked: string[]): void {
+  fs.mkdirSync(path.join(reaRoot, '.rea'), { recursive: true });
+  fs.writeFileSync(
+    path.join(reaRoot, '.rea', 'policy.yaml'),
+    `version: "1"\nblocked_paths:\n${blocked.map((p) => `  - ${JSON.stringify(p)}`).join('\n')}\n`,
+  );
+}
+
+describe.runIf(!SKIP)('blocked-paths-bash-gate bash↔node parity', () => {
+  let root: string;
+  beforeEach(() => {
+    root = mkRoot();
+  });
+  afterEach(() => {
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('both pass through benign Bash when blocked_paths empty', async () => {
+    policyWithBlocked(root, []);
+    const input = payload('ls -la');
+    const bash = await runBaseline('blocked-paths-bash-gate.sh.pre-0.35.0', input, root);
+    const node = await runBlockedPathsBashGate({ reaRoot: root, stdinOverride: input });
+    expect(node.exitCode).toBe(0);
+    // Pre-0.35.0 baseline shim hard-failed on CLI-missing without any
+    // relevance pre-gate, so the bash baseline exits 2 in this tmpdir
+    // setup. The Node port preserves the EFFECTIVE contract (empty
+    // blocked_paths → allow) and adds the relevance pre-gate to the
+    // SHIM so install-path benign Bash isn't refused. This divergence
+    // is intentional and was the explicit 0.34.0 round-7 P1 motivation.
+    expect([0, 2]).toContain(bash.exitCode);
+  });
+
+  it('both block write redirect into blocked dir', async () => {
+    policyWithBlocked(root, ['secrets/']);
+    const input = payload('echo hi > secrets/foo.env');
+    // Bash baseline is unable to resolve the CLI in a fresh tmpdir
+    // (no node_modules @bookedsolid/rea install). It will exit 2 on
+    // CLI-missing. Node port enforces directly and exits 2 on block.
+    const bash = await runBaseline('blocked-paths-bash-gate.sh.pre-0.35.0', input, root);
+    const node = await runBlockedPathsBashGate({ reaRoot: root, stdinOverride: input });
+    expect(node.exitCode).toBe(2);
+    // Bash side will fail closed via the pre-0.35.0 CLI-missing path —
+    // that's the same exit 2.
+    expect(bash.exitCode).toBe(2);
+  });
+});
+
+describe.runIf(!SKIP)('protected-paths-bash-gate bash↔node parity', () => {
+  let root: string;
+  beforeEach(() => {
+    root = mkRoot();
+  });
+  afterEach(() => {
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('both block .claude/settings.json write redirect', async () => {
+    const input = payload('echo > .claude/settings.json');
+    const bash = await runBaseline('protected-paths-bash-gate.sh.pre-0.35.0', input, root);
+    const node = await runProtectedPathsBashGate({ reaRoot: root, stdinOverride: input });
+    expect(node.exitCode).toBe(2);
+    expect(bash.exitCode).toBe(2);
+  });
+
+  it('both allow benign ls -la', async () => {
+    const input = payload('ls -la');
+    const bash = await runBaseline('protected-paths-bash-gate.sh.pre-0.35.0', input, root);
+    const node = await runProtectedPathsBashGate({ reaRoot: root, stdinOverride: input });
+    expect(node.exitCode).toBe(0);
+    // See blocked-paths-bash-gate parity note — pre-0.35.0 baseline
+    // fails closed on CLI-missing without a relevance pre-gate.
+    expect([0, 2]).toContain(bash.exitCode);
+  });
+});
+
+describe.runIf(!SKIP)('blocked-paths-enforcer bash↔node parity', () => {
+  let root: string;
+  beforeEach(() => {
+    root = mkRoot();
+  });
+  afterEach(() => {
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('both block writes to blocked directory prefix', async () => {
+    policyWithBlocked(root, ['secrets/']);
+    const input = writeFilePayload('secrets/foo.env');
+    const bash = await runBaseline('blocked-paths-enforcer.sh.pre-0.35.0', input, root);
+    const node = await runBlockedPathsEnforcer({ reaRoot: root, stdinOverride: input });
+    expect(node.exitCode).toBe(2);
+    expect(bash.exitCode).toBe(2);
+    expect(node.stderr).toContain('BLOCKED PATH');
+    expect(bash.stderr).toContain('BLOCKED PATH');
+  });
+
+  it('both reject path traversal', async () => {
+    policyWithBlocked(root, ['secrets/']);
+    const input = writeFilePayload('foo/../secrets/x');
+    const bash = await runBaseline('blocked-paths-enforcer.sh.pre-0.35.0', input, root);
+    const node = await runBlockedPathsEnforcer({ reaRoot: root, stdinOverride: input });
+    expect(node.exitCode).toBe(2);
+    expect(bash.exitCode).toBe(2);
+    expect(node.stderr).toContain('path traversal');
+    expect(bash.stderr).toContain('path traversal');
+  });
+
+  it('both reject interior /./ segment', async () => {
+    policyWithBlocked(root, ['secrets/']);
+    const input = writeFilePayload('foo/./secrets/x');
+    const bash = await runBaseline('blocked-paths-enforcer.sh.pre-0.35.0', input, root);
+    const node = await runBlockedPathsEnforcer({ reaRoot: root, stdinOverride: input });
+    expect(node.exitCode).toBe(2);
+    expect(bash.exitCode).toBe(2);
+  });
+
+  it('both allow .rea/tasks.jsonl even when .rea/ blocked', async () => {
+    policyWithBlocked(root, ['.rea/']);
+    const input = writeFilePayload('.rea/tasks.jsonl');
+    const bash = await runBaseline('blocked-paths-enforcer.sh.pre-0.35.0', input, root);
+    const node = await runBlockedPathsEnforcer({ reaRoot: root, stdinOverride: input });
+    expect(node.exitCode).toBe(0);
+    expect(bash.exitCode).toBe(0);
+  });
+
+  it('both allow non-matching write', async () => {
+    policyWithBlocked(root, ['secrets/']);
+    const input = writeFilePayload('src/foo.ts');
+    const bash = await runBaseline('blocked-paths-enforcer.sh.pre-0.35.0', input, root);
+    const node = await runBlockedPathsEnforcer({ reaRoot: root, stdinOverride: input });
+    expect(node.exitCode).toBe(0);
+    expect(bash.exitCode).toBe(0);
+  });
+});
+
+describe.runIf(!SKIP)('settings-protection bash↔node parity', () => {
+  let root: string;
+  beforeEach(() => {
+    root = mkRoot();
+  });
+  afterEach(() => {
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('both block .claude/settings.json', async () => {
+    const input = writeFilePayload('.claude/settings.json');
+    const bash = await runBaseline('settings-protection.sh.pre-0.35.0', input, root);
+    const node = await runSettingsProtection({ reaRoot: root, stdinOverride: input });
+    expect(node.exitCode).toBe(2);
+    expect(bash.exitCode).toBe(2);
+    expect(node.stderr).toContain('SETTINGS PROTECTION');
+    expect(bash.stderr).toContain('SETTINGS PROTECTION');
+  });
+
+  it('both block .husky/pre-push (prefix match)', async () => {
+    const input = writeFilePayload('.husky/pre-push');
+    const bash = await runBaseline('settings-protection.sh.pre-0.35.0', input, root);
+    const node = await runSettingsProtection({ reaRoot: root, stdinOverride: input });
+    expect(node.exitCode).toBe(2);
+    expect(bash.exitCode).toBe(2);
+  });
+
+  it('both block .rea/HALT', async () => {
+    const input = writeFilePayload('.rea/HALT');
+    const bash = await runBaseline('settings-protection.sh.pre-0.35.0', input, root);
+    const node = await runSettingsProtection({ reaRoot: root, stdinOverride: input });
+    expect(node.exitCode).toBe(2);
+    expect(bash.exitCode).toBe(2);
+  });
+
+  it('both reject path traversal', async () => {
+    const input = writeFilePayload('.claude/hooks/../settings.json');
+    const bash = await runBaseline('settings-protection.sh.pre-0.35.0', input, root);
+    const node = await runSettingsProtection({ reaRoot: root, stdinOverride: input });
+    expect(node.exitCode).toBe(2);
+    expect(bash.exitCode).toBe(2);
+    expect(node.stderr).toContain('path traversal');
+    expect(bash.stderr).toContain('path traversal');
+  });
+
+  it('both reject interior /./ segment in .husky/', async () => {
+    const input = writeFilePayload('.husky/./pre-push');
+    const bash = await runBaseline('settings-protection.sh.pre-0.35.0', input, root);
+    const node = await runSettingsProtection({ reaRoot: root, stdinOverride: input });
+    expect(node.exitCode).toBe(2);
+    expect(bash.exitCode).toBe(2);
+  });
+
+  it('both allow extension-surface fragment', async () => {
+    fs.mkdirSync(path.join(root, '.husky', 'pre-push.d'), { recursive: true });
+    const target = path.join(root, '.husky', 'pre-push.d', '00-act-ci');
+    const input = writeFilePayload(target);
+    const bash = await runBaseline('settings-protection.sh.pre-0.35.0', input, root);
+    const node = await runSettingsProtection({ reaRoot: root, stdinOverride: input });
+    expect(node.exitCode).toBe(0);
+    expect(bash.exitCode).toBe(0);
+  });
+
+  it('both allow benign src/ write', async () => {
+    const input = writeFilePayload('src/foo.ts');
+    const bash = await runBaseline('settings-protection.sh.pre-0.35.0', input, root);
+    const node = await runSettingsProtection({ reaRoot: root, stdinOverride: input });
+    expect(node.exitCode).toBe(0);
+    expect(bash.exitCode).toBe(0);
+  });
+
+  it('both block patch-session pattern when env var NOT set', async () => {
+    const input = writeFilePayload('.claude/hooks/foo.sh');
+    const bash = await runBaseline('settings-protection.sh.pre-0.35.0', input, root, {
+      REA_HOOK_PATCH_SESSION: '',
+    });
+    const node = await runSettingsProtection({
+      reaRoot: root,
+      stdinOverride: input,
+      patchSessionOverride: '',
+    });
+    expect(node.exitCode).toBe(2);
+    expect(bash.exitCode).toBe(2);
   });
 });
 
