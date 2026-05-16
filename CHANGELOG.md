@@ -1,5 +1,168 @@
 # @bookedsolid/rea
 
+## 0.36.0
+
+### Minor Changes
+
+- c44bd43: 0.36.0 — marathon follow-up hardening. Five charter items closing
+  deferred 0.31.0 charter follow-throughs, the static-analysis lint
+  that would have caught 0.34.0 round-4 + round-6 at build time, and
+  the two P2 findings from 0.34.0 codex round-7 that did not block
+  0.34.0 publish but were carried into this minor.
+
+  # Surface
+
+  **Item 1 — `delegation-advisory.sh` promoted to `EXPECTED_HOOKS`
+  (charter follow-through from 0.31.0).** 4 release cycles of
+  upgrade-lag propagation (0.32 / 0.33 / 0.34 / 0.35) have elapsed
+  since 0.31.0 introduced the PostToolUse delegation-nudge hook.
+  Consumers who have run `rea upgrade` in that window already carry
+  the hook. 0.36.0 closes the staged-rollout window by:
+  - Adding `delegation-advisory.sh` to `EXPECTED_HOOKS` in
+    `src/cli/doctor.ts` (15 → 16 entries).
+  - Promoting `checkDelegationAdvisoryHookRegistered` from `warn` →
+    `fail`. Same ratchet `checkDelegationHookRegistered` went through
+    0.29.0 → 0.30.0.
+  - Updating the doctor.test.ts canonical-hook list to include the
+    hook and the count assertion to `16 hooks present`.
+  - The Class G byte-fidelity test (`__tests__/integration/package-byte-fidelity.test.ts`)
+    reads from `EXPECTED_HOOKS` so it auto-tracks the promotion.
+
+  **Item 2 — dogfood `policy.delegation_advisory.enabled: true`.**
+  The deferred 0.31.0 round-4 P3 finding: rea's own `.rea/policy.yaml`
+  didn't enable the delegation-advisory it ships. Staged as
+  `templates/policy.dogfood-delegation-advisory.patch` for `git apply`
+  bootstrap (`.rea/policy.yaml` is hard-protected by
+  `.claude/hooks/settings-protection.sh` and cannot be edited
+  in-session). Uses the schema-default threshold (25) and the schema-
+  default 5-entry exempt list to avoid accidentally narrowing the set
+  vs the default.
+
+  **Item 3 — `scripts/lint-awk-shim-quotes.mjs` (static-analysis lint
+  for 0.34.0 round-4 + round-6 regression class).** Both 0.34.0
+  bugs were a bash hook embedding an `awk '<body>'` block whose body
+  contained a comment line with a BARE `'` (e.g. `# can't`). Bash
+  terminated the single-quoted argument at the quote, the rest of the
+  awk body was reparsed as bash, and the hook crashed at parse time.
+  The 0.34.0 round-6 instance locked the entire repo (every Bash
+  refused at hook parse time because every hook sourced
+  `_lib/cmd-segments.sh`, which crashed at parse) — repair required
+  out-of-session `git apply`. The new lint:
+  - Scans `hooks/*.sh`, `hooks/_lib/*.sh`, `.claude/hooks/*.sh`,
+    `.claude/hooks/_lib/*.sh`, `.husky/*` (extensionless husky hooks
+    via shebang detection), and `templates/*.{sh,patch}` (defense-in-
+    depth coverage of the dogfood mirror + husky surface + patch
+    fragments).
+  - Discriminates the high-confidence bug shape via apostrophe-in-word
+    regex (`\b[A-Za-z]+'[A-Za-z]`) — same shape that ships naturally
+    in English prose (`can't`, `isn't`, `doesn't`) and exact shape
+    that broke both 0.34.0 marathon rounds. Scoping to this shape
+    avoids false-positives on legitimate bash continuation
+    (`}'`, `' "$arg"`, `END { print x }'`, `' | tr ...`) that
+    earlier structural attempts produced.
+  - Scans both opener line body content (when body starts on opener)
+    AND all subsequent body lines (comments + code uniformly — bash
+    doesn't know awk grammar).
+  - Strips bash quote-escape sequences (`'\''`, `'"'"'`, `''`) and
+    double-quoted spans (`"..."`) before scanning to avoid false
+    positives on documented idioms.
+  - Wired into `pnpm lint` as `pnpm run lint:awk-quotes`, run after
+    `lint:regex` and before `eslint .`. A regression that introduces
+    an apostrophe-in-word inside an awk body now fails the build
+    BEFORE the broken hook reaches a consumer.
+  - Tests at `__tests__/scripts/lint-awk-shim-quotes.test.ts`: real
+    corpus passes, synthetic broken-quote fixtures fail with the
+    expected error shape across all opener variants (bare,
+    `awk -v ...`, `awk -v key="can't" '`, `awk 'BEGIN { ... }`
+    inline body, prose-mentioning-awk-shell-comment false-positive
+    pin, canonical `'\''` escape false-positive pin).
+
+  **Item 4 — tighten `src/hooks/_lib/segments.ts` `-c` detection
+  (0.34.0 codex round-7 P2 #1).** Pre-fix
+  `extractNestedShellPayload` treated any flag containing the letter
+  `c` as a `-c` introducer. This false-positived on benign flags
+  like `--rcfile`, `--noprofile` (with `c` in the name), causing the
+  walker to commit to a -c unwrap, advance past the flag, then hand
+  a non-shell payload to downstream advisory matchers. Fix:
+  introduce `isCDashIntroducer` that mirrors bash exactly — any
+  SHORT-flag bundle (single leading `-`, then letters) containing
+  `c` is an introducer; long flags (`--rcfile`, `--noprofile`,
+  `--init-file`) never qualify regardless of `c`-presence; separated
+  `--c` long-flag form recognized for WRAP-regex parity. Pre-fix
+  test coverage included canonical baselines, the false-positive
+  case, pre-flag handling, and the codex round-1 P1 closure for
+  combined-flag permutations (`-lci`, `-cil`, `-ilc`).
+
+  **Item 5 — `src/hooks/secret-scanner/index.ts` Supabase regex
+  parity (0.34.0 codex round-7 P2 #2).** Pre-fix the
+  `SUPABASE_SERVICE_ROLE_KEY` HIGH pattern had `["']?` (quote
+  optional), upgrading unquoted `.env` assignments from MEDIUM
+  advisory to HIGH blocking vs the pre-0.34.0 bash baseline. Fix:
+  drop the `?` so the quote is required (HIGH), add a new MEDIUM
+  `Supabase service role key (JWT, unquoted non-.env shape)` rule
+  that fires on unquoted non-line-start assignments
+  (`export FOO=...`, Dockerfile `ENV FOO=...`, k8s manifests,
+  inline `; FOO=...`), and rely on the existing broader `.env
+credential assignment` MEDIUM for plain `^FOO=...` lines. Result:
+  each Supabase secret produces exactly one finding regardless of
+  shape; HIGH owns quoted forms; the two MEDIUM rules between them
+  cover every unquoted shape without double-firing. Sibling fix to
+  the SUPABASE_ANON_KEY MEDIUM pattern (same quote-optionality
+  regression). Test coverage: 8 new tests in a dedicated `Supabase
+parity` describe block covering quoted (HIGH), unquoted `.env`-line
+  (MEDIUM via .env-credential pattern), unquoted with `export`/`ENV`/
+  inline (MEDIUM via unquoted-non-.env pattern), yaml-colon form (no
+  match, parity with bash), and the no-double-fire negative
+  lookahead.
+
+  # Process
+
+  Single squashed commit on `feat/0.36.0-marathon-followup-hardening`.
+  All 4 gates green: `pnpm lint`, `pnpm type-check`, `pnpm test`
+  (14,299 passing, 0 failing), `pnpm build`.
+
+  5 codex rounds — local pre-push iteration to CONCERNS-only verdict:
+  - Round 1: BLOCKING (1 P1, 1 P2). `-c` allowlist regressed valid
+    combined-flag shapes; broadened to bash-parity. Lint missed
+    `awk -v` openers; broadened opener regex.
+  - Round 2: BLOCKING (1 P1, 2 P2). Secret-scanner gap on `export`
+    SUPABASE assignments; added MEDIUM unquoted-anywhere pattern.
+    Lint only scanned comment lines; broadened to all body lines.
+    Lint opener regex rejected `awk -v msg="can't" '`; broadened.
+  - Round 3: CONCERNS (2 P2, 1 P3). Lint flipped state on prose
+    `# Example: awk '`; added shell-comment skip. Lint missed
+    `awk 'BEGIN { ... }` opener with body on same line; switched
+    to odd-quote-count detection. Plain `.env` Supabase lines
+    double-fired; narrowed unquoted MEDIUM.
+  - Round 4: BLOCKING (1 P1, 2 P2). Opener-line body content
+    unchecked. `END { print x }'` valid close misclassified.
+    Round-3 Supabase narrowing missed Dockerfile `ENV FOO=…`.
+    All fixed by refactoring lint discriminator to
+    apostrophe-in-word (high-confidence-only) shape; Supabase
+    pattern re-broadened to "any non-line-start position".
+  - Round 5: CONCERNS (2 P2 — acceptable to push). Lint coverage
+    extended to `.husky/` and `templates/` (P2 #1, fixed). Dogfood
+    policy patch not applied (P2 #2, expected — see deferrals).
+
+  Marathon discipline: DCO `-s` sign-off, no AI attribution, full
+  surface enumeration here, audit-trail comments in every code
+  change referencing the 0.34.0 / 0.31.0 origin findings.
+
+  # Deferrals
+
+  **`.rea/policy.yaml` dogfood patch application (charter item 2 /
+  codex round-5 P2 #2)** — deferred to Jake's out-of-band `git apply`
+  after this commit merges. `.rea/policy.yaml` is hard-protected by
+  `.claude/hooks/settings-protection.sh` and cannot be edited from
+  within an agent session (the same bootstrap pattern the 0.32 → 0.35
+  dogfood mirrors used). The canonical content is staged as
+  `templates/policy.dogfood-delegation-advisory.patch`; post-merge:
+  (1) merge this PR, (2) Jake runs `git apply
+templates/policy.dogfood-delegation-advisory.patch`, then commits
+  the policy change. The codex round-5 P2 #2 finding flagged the
+  patch as "unused" — correct in isolation, expected by design per
+  the charter's protected-file note.
+
 ## 0.35.0
 
 ### Minor Changes
@@ -2969,13 +3132,13 @@ codex-review --also-set-cache`) on every push, produced a 1,250-line bash
 
   This release replaces the entire stack with a stateless gate:
 
-                                                                                git push
-                                                                                  → .husky/pre-push → rea hook push-gate
-                                                                                  → codex exec review --base <ref> --json
-                                                                                  → parse verdict from streamed findings
-                                                                                  → block on [P1] (blocking) or [P2] when concerns_blocks=true
-                                                                                  → write .rea/last-review.json + audit record
-                                                                                  → exit 0 / 1 (HALT) / 2 (blocked)
+                                                                                  git push
+                                                                                    → .husky/pre-push → rea hook push-gate
+                                                                                    → codex exec review --base <ref> --json
+                                                                                    → parse verdict from streamed findings
+                                                                                    → block on [P1] (blocking) or [P2] when concerns_blocks=true
+                                                                                    → write .rea/last-review.json + audit record
+                                                                                    → exit 0 / 1 (HALT) / 2 (blocked)
 
   Codex is run fresh on every push. No cache. No SHA matching. No receipt
   consultation. When the gate blocks, Claude reads stderr + the
