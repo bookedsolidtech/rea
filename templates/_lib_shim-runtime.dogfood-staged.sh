@@ -317,40 +317,58 @@ shim_run() {
   #    (instead of double-emitting sandbox + cli-missing).
   local sandbox_result=""
   local sandbox_failed=0
+  local node_missing=0
   if [ "${#REA_ARGV[@]}" -gt 0 ]; then
     if ! command -v node >/dev/null 2>&1; then
-      if [ "$SHIM_FAIL_OPEN" -eq 1 ]; then
-        exit 0
-      fi
-      # Blocking-tier: node missing means we cannot sandbox-validate the
-      # CLI — refuse with the dedicated banner.
-      shim_emit_node_missing_banner
-      exit 2
-    fi
-    sandbox_result=$(shim_sandbox_check "$RESOLVED_CLI_PATH" "$proj" "$SHIM_ENFORCE_CLI_SHAPE")
-    if [ "$sandbox_result" != "ok" ]; then
-      sandbox_failed=1
-      if [ "$SHIM_FAIL_OPEN" -eq 1 ]; then
-        shim_emit_sandbox_skip_banner "$sandbox_result"
-        exit 0
-      fi
-      # Blocking-tier: clear REA_ARGV so Tier-1 policy reads (in
-      # shim_policy_short_circuit) degrade to Tier 2 / Tier 3 instead
-      # of invoking the untrusted CLI.
+      # 0.38.1 round-2 P2 fix: pre-fix this branch exited 0/2 IMMEDIATELY
+      # without ever calling shim_policy_short_circuit, so a blocking-
+      # tier shim whose policy said "disabled" still refused when node
+      # was absent (which contradicts the pre-port body's no-op-on-
+      # disabled posture). Clear REA_ARGV here so Tier 1 (rea CLI)
+      # can't fire — the policy reader degrades to Tier 2 (python3) /
+      # Tier 3 (awk), neither of which needs node. Track node-missing
+      # separately so the CLI-required branch below can emit the right
+      # banner if the policy did NOT short-circuit us out.
+      node_missing=1
       REA_ARGV=()
+    else
+      sandbox_result=$(shim_sandbox_check "$RESOLVED_CLI_PATH" "$proj" "$SHIM_ENFORCE_CLI_SHAPE")
+      if [ "$sandbox_result" != "ok" ]; then
+        sandbox_failed=1
+        if [ "$SHIM_FAIL_OPEN" -eq 1 ]; then
+          shim_emit_sandbox_skip_banner "$sandbox_result"
+          exit 0
+        fi
+        # Blocking-tier: clear REA_ARGV so Tier-1 policy reads (in
+        # shim_policy_short_circuit) degrade to Tier 2 / Tier 3 instead
+        # of invoking the untrusted CLI.
+        REA_ARGV=()
+      fi
     fi
   fi
 
-  # 6. Policy short-circuit. Runs BEFORE the CLI-missing branch so a
-  #    shim whose policy says "disabled" exits 0 cleanly even when the
-  #    CLI is unbuilt (matches the pre-port body's no-op-on-disabled
-  #    posture). The policy reader's 4-tier ladder produces correct
-  #    answers even when REA_ARGV is empty (falls back to Tier 2
-  #    python3 / Tier 3 awk).
+  # 6. Policy short-circuit. Runs BEFORE the CLI-missing / node-missing
+  #    banners so a shim whose policy says "disabled" exits 0 cleanly
+  #    even when the CLI is unbuilt OR node is absent (matches the
+  #    pre-port body's no-op-on-disabled posture). The policy reader's
+  #    4-tier ladder produces correct answers when REA_ARGV is empty:
+  #    falls back to Tier 2 python3 if available, or Tier 3 awk
+  #    (block-form only) otherwise.
   if declare -F shim_policy_short_circuit >/dev/null 2>&1; then
     if shim_policy_short_circuit; then
       exit 0
     fi
+  fi
+
+  # 6b. node-missing fail branch — only fires if shim_policy_short_circuit
+  #     did NOT exit us out above. Emits the dedicated node-missing
+  #     banner for blocking-tier; advisory-tier exits 0 silently.
+  if [ "$node_missing" -eq 1 ]; then
+    if [ "$SHIM_FAIL_OPEN" -eq 1 ]; then
+      exit 0
+    fi
+    shim_emit_node_missing_banner
+    exit 2
   fi
 
   # 7. CLI-required branch. If REA_ARGV is empty either (a) the CLI
