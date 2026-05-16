@@ -17,10 +17,16 @@ import {
   checkCodexBinaryOnPath,
   checkDelegationRoundTrip,
   checkFingerprintStore,
+  checkPolicyReaderJq,
+  checkPolicyReaderTier1,
+  checkPolicyReaderTier2,
+  checkPolicyReaderTier3,
+  checkPolicyReaderTierSummary,
   checkPrepareCommitMsgHook,
   checksFromProbeState,
   collectChecks,
   type CheckResult,
+  type PolicyReaderProbes,
 } from './doctor.js';
 
 const execFileAsync = promisify(execFile);
@@ -1549,5 +1555,481 @@ describe('rea doctor — checkDelegationRoundTrip drives the shell hook (0.31.0)
     // chain integrity verified.
     expect(result.status).toBe('pass');
     expect(result.detail).toMatch(/delegation-capture\.sh shell hook/);
+  });
+});
+
+/**
+ * 0.39.0 — policy-reader tier visibility. Operators currently have no
+ * way to see which tier of the 4-tier `hooks/_lib/policy-reader.sh`
+ * ladder their shims will hit when the rea CLI is unreachable. These
+ * tests exercise the new per-tier checks (and the summary roll-up)
+ * across every combination of tier availability, using probe-function
+ * injection so we don't have to manipulate PATH or stage real
+ * binaries.
+ */
+describe('rea doctor — policy-reader tier checks (0.39.0)', () => {
+  const cleanup: string[] = [];
+
+  afterEach(async () => {
+    await Promise.all(cleanup.splice(0).map((d) => fs.rm(d, { recursive: true, force: true })));
+  });
+
+  // Probe factories — each returns a `PolicyReaderProbes` shape that
+  // simulates a specific environment. Keeps test bodies one-liners.
+  // 0.39.0 codex round-1 P2: `cliInvokable` is the CLI-invocation
+  // probe that mirrors `_pr_load_full_json` in policy-reader.sh —
+  // dist-present + invokable BOTH need to be true for Tier 1 to count.
+  const probes = {
+    /** Every tier reachable (the happy path on a typical dev machine). */
+    all: (): PolicyReaderProbes => ({
+      cliDistExists: () => true,
+      cliInvokable: () => true,
+      python3OnPath: () => '/usr/bin/python3',
+      python3PyYamlReachable: () => true,
+      awkOnPath: () => '/usr/bin/awk',
+      jqOnPath: () => '/usr/bin/jq',
+    }),
+    /** Tier 1 missing but Tier 2 + 3 + jq reachable. */
+    noTier1: (): PolicyReaderProbes => ({
+      cliDistExists: () => false,
+      cliInvokable: () => false,
+      python3OnPath: () => '/usr/bin/python3',
+      python3PyYamlReachable: () => true,
+      awkOnPath: () => '/usr/bin/awk',
+      jqOnPath: () => '/usr/bin/jq',
+    }),
+    /** Tier 1 dist exists but CLI is broken (stale build) — codex round-1 P2 shape. */
+    tier1Broken: (): PolicyReaderProbes => ({
+      cliDistExists: () => true,
+      cliInvokable: () => false,
+      python3OnPath: () => '/usr/bin/python3',
+      python3PyYamlReachable: () => true,
+      awkOnPath: () => '/usr/bin/awk',
+      jqOnPath: () => '/usr/bin/jq',
+    }),
+    /** Tier 1 + Tier 2 missing — only awk reachable (the silent-noop risk shape). */
+    onlyTier3: (): PolicyReaderProbes => ({
+      cliDistExists: () => false,
+      cliInvokable: () => false,
+      python3OnPath: () => null,
+      python3PyYamlReachable: () => false,
+      awkOnPath: () => '/usr/bin/awk',
+      jqOnPath: () => null,
+    }),
+    /** python3 present but PyYAML missing — Tier 2 degraded to Tier 3 floor. */
+    python3NoPyYaml: (): PolicyReaderProbes => ({
+      cliDistExists: () => false,
+      cliInvokable: () => false,
+      python3OnPath: () => '/usr/bin/python3',
+      python3PyYamlReachable: () => false,
+      awkOnPath: () => '/usr/bin/awk',
+      jqOnPath: () => '/usr/bin/jq',
+    }),
+    /** No tiers reachable (catastrophic — practically impossible without losing awk). */
+    none: (): PolicyReaderProbes => ({
+      cliDistExists: () => false,
+      cliInvokable: () => false,
+      python3OnPath: () => null,
+      python3PyYamlReachable: () => false,
+      awkOnPath: () => null,
+      jqOnPath: () => null,
+    }),
+    /** jq absent but every tier reachable — exercises the jq-warn case. */
+    noJq: (): PolicyReaderProbes => ({
+      cliDistExists: () => true,
+      cliInvokable: () => true,
+      python3OnPath: () => '/usr/bin/python3',
+      python3PyYamlReachable: () => true,
+      awkOnPath: () => '/usr/bin/awk',
+      jqOnPath: () => null,
+    }),
+    /**
+     * Codex round-1 P2 shape: Tier 1 reachable but neither jq nor
+     * python3 on PATH. flow-form SCALARS work via the CLI's JSON
+     * output, but `policy_reader_get_list` cannot iterate the
+     * resulting JSON arrays — flow-form `blocked_paths: [.env, ...]`
+     * silently no-ops via Tier 3 awk fallthrough.
+     */
+    tier1NoListWalker: (): PolicyReaderProbes => ({
+      cliDistExists: () => true,
+      cliInvokable: () => true,
+      python3OnPath: () => null,
+      python3PyYamlReachable: () => false,
+      awkOnPath: () => '/usr/bin/awk',
+      jqOnPath: () => null,
+    }),
+  };
+
+  describe('checkPolicyReaderTier1 — rea CLI dist reachable + invokable', () => {
+    it('passes when the CLI dist exists AND responds to `hook policy-get version --json`', async () => {
+      const dir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-pr-tier1-')));
+      cleanup.push(dir);
+      const result = checkPolicyReaderTier1(dir, probes.all());
+      expect(result.status).toBe('pass');
+      expect(result.detail).toMatch(/responds to .hook policy-get/);
+      expect(result.detail).toMatch(/canonical loader fully wired/);
+    });
+
+    it('warns when the CLI dist is absent (not installed) — Tier 2/3 still work', async () => {
+      const dir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-pr-tier1-')));
+      cleanup.push(dir);
+      const result = checkPolicyReaderTier1(dir, probes.noTier1());
+      expect(result.status).toBe('warn');
+      expect(result.detail).toMatch(/rea CLI dist not found/);
+      expect(result.detail).toMatch(/node_modules\/@bookedsolid\/rea\/dist\/cli\/index\.js/);
+      expect(result.detail).toMatch(/<baseDir>\/dist\/cli\/index\.js/);
+      expect(result.detail).toMatch(/pnpm i @bookedsolid\/rea/);
+      expect(result.detail).toMatch(/pnpm build/);
+    });
+
+    it('codex round-1 P2: warns when dist is present but CLI invocation fails (stale build)', async () => {
+      const dir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-pr-tier1-')));
+      cleanup.push(dir);
+      const result = checkPolicyReaderTier1(dir, probes.tier1Broken());
+      expect(result.status).toBe('warn');
+      expect(result.detail).toMatch(/dist exists but .* failed/);
+      expect(result.detail).toMatch(/stale or broken/);
+      expect(result.detail).toMatch(/skip Tier 1 and fall through/);
+      expect(result.detail).toMatch(/pnpm build|rea upgrade/);
+    });
+
+    it('default probe: warns when neither layout is present', async () => {
+      const dir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-pr-tier1-')));
+      cleanup.push(dir);
+      const result = checkPolicyReaderTier1(dir);
+      expect(result.status).toBe('warn');
+      expect(result.detail).toMatch(/rea CLI dist not found/);
+    });
+
+    it('default probe: warns when the dogfood dist/cli/index.js is present but unrunnable', async () => {
+      // Codex round-1 P2 default-probe coverage. Stage a file at the
+      // canonical dogfood path that throws on import (bash script
+      // pretending to be node) — the default `cliInvokable` probe
+      // should see exit non-zero and report `warn` (stale/broken),
+      // NOT `pass` from the file-existence probe alone.
+      const dir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-pr-tier1-')));
+      cleanup.push(dir);
+      await fs.mkdir(path.join(dir, 'dist', 'cli'), { recursive: true });
+      // A node script that throws immediately — `node <path> hook
+      // policy-get version --json` will exit non-zero.
+      await fs.writeFile(
+        path.join(dir, 'dist', 'cli', 'index.js'),
+        'throw new Error("simulated broken dist");\n',
+      );
+      const result = checkPolicyReaderTier1(dir);
+      expect(result.status).toBe('warn');
+      // We assert on the "stale or broken" branch specifically — the
+      // file-existence probe found the dist but the invocation failed.
+      expect(result.detail).toMatch(/stale or broken/);
+    });
+
+    it('codex round-2 P1: refuses a dist/cli/index.js that lacks a @bookedsolid/rea package.json ancestor', async () => {
+      // Stage a CLI body at the canonical dogfood path BUT without
+      // any ancestor package.json whose `name === "@bookedsolid/rea"`.
+      // The shim ladder's sandbox check (hooks/_lib/shim-runtime.sh
+      // ::shim_sandbox_check) refuses this layout — the doctor probe
+      // MUST refuse identically so it cannot be tricked into
+      // executing a forged dist by reporting `pass`.
+      //
+      // The forged dist below would print `{"version":"1"}` to stdout
+      // if executed — that is the EXACT shape that satisfies the
+      // invokable predicate (exit 0 + non-empty stdout). If the
+      // sandbox check is missing or bypassed, this test will report
+      // `pass` instead of `warn`, catching any regression that
+      // removes the sandbox gate or weakens it to a no-op.
+      const dir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-pr-sbox-')));
+      cleanup.push(dir);
+      await fs.mkdir(path.join(dir, 'dist', 'cli'), { recursive: true });
+      await fs.writeFile(
+        path.join(dir, 'dist', 'cli', 'index.js'),
+        // A node script that PRETENDS to be a healthy rea CLI — exits
+        // 0 with the JSON payload that defaultCliInvokable's content
+        // probe would otherwise accept. Sandbox refusal MUST short-
+        // circuit before this code runs.
+        'process.stdout.write(\'{"version":"1"}\'); process.exit(0);\n',
+      );
+      // DELIBERATELY no package.json at any ancestor — this is the
+      // "forged dist in a non-rea repo" attack shape.
+      const result = checkPolicyReaderTier1(dir);
+      expect(result.status).toBe('warn');
+      expect(result.detail).toMatch(/stale or broken/);
+    });
+
+    it('codex round-2 P1: refuses a dist/cli/index.js reached via a symlink that escapes the project realpath', async () => {
+      // Plant a real CLI body in an out-of-tree directory and link
+      // it into the in-tree `dist/cli/index.js` location. The
+      // symlink resolves to a path OUTSIDE realpath(baseDir), so the
+      // sandbox check's prefix-containment branch MUST reject it.
+      //
+      // Same defensive shape as the previous test: the out-of-tree
+      // CLI prints the JSON payload that satisfies the content
+      // probe, so a missing sandbox check would mis-report `pass`.
+      const outside = await fs.realpath(
+        await fs.mkdtemp(path.join(os.tmpdir(), 'rea-pr-sbox-out-')),
+      );
+      cleanup.push(outside);
+      const dir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-pr-sbox-in-')));
+      cleanup.push(dir);
+
+      // Stage the forged CLI OUTSIDE the project. Give the out-of-
+      // tree directory its own @bookedsolid/rea package.json so the
+      // ancestor walk would have succeeded if the prefix check were
+      // missing — this test then isolates the symlink-out failure
+      // path specifically.
+      await fs.writeFile(
+        path.join(outside, 'package.json'),
+        JSON.stringify({ name: '@bookedsolid/rea', version: '0.0.0-forged' }),
+      );
+      await fs.mkdir(path.join(outside, 'dist', 'cli'), { recursive: true });
+      const forgedCli = path.join(outside, 'dist', 'cli', 'index.js');
+      await fs.writeFile(
+        forgedCli,
+        'process.stdout.write(\'{"version":"1"}\'); process.exit(0);\n',
+      );
+
+      // Inside the project: create the dist/cli directory and
+      // symlink index.js to the out-of-tree forged CLI. resolveCliDistPath
+      // will find the symlink via existsSync; realpathSync will then
+      // resolve it to the out-of-tree real path, which the sandbox
+      // prefix check rejects.
+      await fs.mkdir(path.join(dir, 'dist', 'cli'), { recursive: true });
+      await fs.symlink(forgedCli, path.join(dir, 'dist', 'cli', 'index.js'));
+
+      const result = checkPolicyReaderTier1(dir);
+      expect(result.status).toBe('warn');
+      expect(result.detail).toMatch(/stale or broken/);
+    });
+
+    it('codex round-2 P1: accepts a dist/cli/index.js whose ancestor package.json names @bookedsolid/rea', async () => {
+      // Positive control for the sandbox check: when the layout
+      // mirrors a real install (CLI inside realpath(baseDir), an
+      // ancestor package.json names @bookedsolid/rea), the probe
+      // should run the CLI and — assuming it responds with non-
+      // empty JSON — report `pass`. This protects against an
+      // over-aggressive sandbox check that would refuse legitimate
+      // layouts and break the happy-path Tier 1 check on every
+      // consumer machine.
+      const dir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-pr-sbox-ok-')));
+      cleanup.push(dir);
+      // Mirror a consumer install:
+      //   <dir>/node_modules/@bookedsolid/rea/package.json (name=@bookedsolid/rea)
+      //   <dir>/node_modules/@bookedsolid/rea/dist/cli/index.js (healthy CLI)
+      const pkgRoot = path.join(dir, 'node_modules', '@bookedsolid', 'rea');
+      await fs.mkdir(path.join(pkgRoot, 'dist', 'cli'), { recursive: true });
+      await fs.writeFile(
+        path.join(pkgRoot, 'package.json'),
+        JSON.stringify({ name: '@bookedsolid/rea', version: '0.0.0-test' }),
+      );
+      await fs.writeFile(
+        path.join(pkgRoot, 'dist', 'cli', 'index.js'),
+        'process.stdout.write(\'{"version":"1"}\'); process.exit(0);\n',
+      );
+      const result = checkPolicyReaderTier1(dir);
+      expect(result.status).toBe('pass');
+    });
+  });
+
+  describe('checkPolicyReaderTier2 — python3 + PyYAML', () => {
+    it('passes when python3 and PyYAML are both reachable', () => {
+      const result = checkPolicyReaderTier2(probes.all());
+      expect(result.status).toBe('pass');
+      expect(result.detail).toMatch(/flow-form policy parses correctly/);
+    });
+
+    it('warns when python3 is absent', () => {
+      const result = checkPolicyReaderTier2({
+        ...probes.all(),
+        python3OnPath: () => null,
+      });
+      expect(result.status).toBe('warn');
+      expect(result.detail).toMatch(/python3 not on PATH/);
+      expect(result.detail).toMatch(/silently no-op/);
+    });
+
+    it('warns when python3 is present but PyYAML import fails', () => {
+      const result = checkPolicyReaderTier2(probes.python3NoPyYaml());
+      expect(result.status).toBe('warn');
+      expect(result.detail).toMatch(/import yaml.*failed/);
+      expect(result.detail).toMatch(/pip3 install pyyaml/);
+    });
+  });
+
+  describe('checkPolicyReaderTier3 — awk', () => {
+    it('passes when awk is on PATH', () => {
+      const result = checkPolicyReaderTier3(probes.all());
+      expect(result.status).toBe('pass');
+      expect(result.detail).toMatch(/awk at \/usr\/bin\/awk/);
+    });
+
+    it('fails (hard) when awk is absent — zero fallback tiers', () => {
+      const result = checkPolicyReaderTier3(probes.none());
+      expect(result.status).toBe('fail');
+      expect(result.detail).toMatch(/awk not on PATH/);
+      expect(result.detail).toMatch(/no fallback tier/);
+    });
+  });
+
+  describe('checkPolicyReaderJq — JSON accelerator', () => {
+    it('passes when jq is on PATH', () => {
+      const result = checkPolicyReaderJq(probes.all());
+      expect(result.status).toBe('pass');
+      expect(result.detail).toMatch(/jq at \/usr\/bin\/jq/);
+    });
+
+    it('warns when jq is absent — python3 fallback still works', () => {
+      const result = checkPolicyReaderJq(probes.noJq());
+      expect(result.status).toBe('warn');
+      expect(result.detail).toMatch(/jq not on PATH/);
+      expect(result.detail).toMatch(/python3 JSON walker/);
+    });
+  });
+
+  describe('checkPolicyReaderTierSummary — effective floor', () => {
+    it('passes when Tier 1 is reachable (Tier 1 + 2 + 3)', async () => {
+      const dir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-pr-sum-')));
+      cleanup.push(dir);
+      const result = checkPolicyReaderTierSummary(dir, probes.all());
+      expect(result.status).toBe('pass');
+      expect(result.detail).toMatch(/Tier 1 \(CLI\)/);
+      expect(result.detail).toMatch(/Tier 2 \(python3\+PyYAML\)/);
+      expect(result.detail).toMatch(/Tier 3 \(awk\)/);
+      expect(result.detail).toMatch(/flow-form policy parses correctly/);
+    });
+
+    it('passes when Tier 1 is absent but Tier 2 is reachable', async () => {
+      const dir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-pr-sum-')));
+      cleanup.push(dir);
+      const result = checkPolicyReaderTierSummary(dir, probes.noTier1());
+      expect(result.status).toBe('pass');
+      expect(result.detail).not.toMatch(/Tier 1 \(CLI\)/);
+      expect(result.detail).toMatch(/Tier 2 \(python3\+PyYAML\)/);
+      expect(result.detail).toMatch(/Tier 3 \(awk\)/);
+    });
+
+    it('warns when only Tier 3 (awk) is reachable — flow-form silent no-op', async () => {
+      const dir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-pr-sum-')));
+      cleanup.push(dir);
+      const result = checkPolicyReaderTierSummary(dir, probes.onlyTier3());
+      expect(result.status).toBe('warn');
+      expect(result.detail).toMatch(/only Tier 3/);
+      expect(result.detail).toMatch(/silently\s+no-ops/);
+      expect(result.detail).toMatch(/Restore Tier 1.*or Tier 2/);
+    });
+
+    it('warns when python3 is present but PyYAML is missing — still only Tier 3 effective', async () => {
+      const dir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-pr-sum-')));
+      cleanup.push(dir);
+      const result = checkPolicyReaderTierSummary(dir, probes.python3NoPyYaml());
+      expect(result.status).toBe('warn');
+      expect(result.detail).toMatch(/only Tier 3/);
+    });
+
+    it('fails when no tiers are reachable — every shim policy lookup fails closed', async () => {
+      const dir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-pr-sum-')));
+      cleanup.push(dir);
+      const result = checkPolicyReaderTierSummary(dir, probes.none());
+      expect(result.status).toBe('fail');
+      expect(result.detail).toMatch(/no policy-reader tier reachable/);
+      expect(result.detail).toMatch(/fails closed/);
+    });
+
+    it('codex round-1 P2: warns when Tier 1 reachable but no list walker (no jq, no python3)', async () => {
+      // Tier 1 is reachable so flow-form SCALARS work. But
+      // `policy_reader_get_list` needs jq OR python3 to iterate JSON
+      // arrays — without either, flow-form `blocked_paths: [.env, ...]`
+      // silently falls through to Tier 3 awk which only handles block
+      // form. Pre-fix the summary returned `pass`; now it returns
+      // `warn` with a precise remediation.
+      const dir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-pr-sum-')));
+      cleanup.push(dir);
+      const result = checkPolicyReaderTierSummary(dir, probes.tier1NoListWalker());
+      expect(result.status).toBe('warn');
+      expect(result.detail).toMatch(/Tier 1 \(CLI\)/);
+      expect(result.detail).toMatch(/flow-form scalars parse via Tier 1/);
+      expect(result.detail).toMatch(/neither jq nor python3 is on PATH/);
+      expect(result.detail).toMatch(/policy_reader_get_list/);
+      expect(result.detail).toMatch(/blocked_paths: \[\.env, \.\.\.\]/);
+      expect(result.detail).toMatch(/brew install jq|apt-get install jq/);
+    });
+
+    it('codex round-1 P2: treats Tier 1 dist-present-but-broken as Tier 1 unreachable', async () => {
+      // Mirror Tier 1's own probe: a dist that fails the CLI
+      // invocation probe is "Tier 1 unreachable" for the summary, even
+      // though `cliDistExists` returns true. With Tier 2 + Tier 3
+      // reachable in this stub, the verdict should still pass because
+      // Tier 2 is the effective floor — but the reachable list must
+      // NOT claim Tier 1.
+      const dir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-pr-sum-')));
+      cleanup.push(dir);
+      const result = checkPolicyReaderTierSummary(dir, probes.tier1Broken());
+      expect(result.status).toBe('pass');
+      expect(result.detail).not.toMatch(/Tier 1 \(CLI\)/);
+      expect(result.detail).toMatch(/Tier 2 \(python3\+PyYAML\)/);
+    });
+  });
+
+  describe('collectChecks wiring — tier checks appear when policy.yaml exists', () => {
+    it('includes all five tier checks in the standard collectChecks output', async () => {
+      const repo = await makeScratchRepo({ codexRequired: false });
+      cleanup.push(repo.dir);
+      const checks = collectChecks(repo.dir);
+      expect(findCheck(checks, 'policy-reader Tier 1 (rea CLI)')).toBeDefined();
+      expect(findCheck(checks, 'policy-reader Tier 2 (python3 + PyYAML)')).toBeDefined();
+      expect(findCheck(checks, 'policy-reader Tier 3 (awk)')).toBeDefined();
+      expect(findCheck(checks, 'policy-reader jq (JSON accelerator)')).toBeDefined();
+      expect(findCheck(checks, 'policy-reader effective floor')).toBeDefined();
+    });
+
+    it('omits tier checks when policy.yaml is absent (policy-parse fail dominates)', async () => {
+      // Bare scratch directory — no .rea/policy.yaml. checkPolicyParses
+      // already reports a fail; tier checks add no value in that state
+      // (and would render confusing pass-rows next to the missing policy).
+      const dir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-no-policy-')));
+      cleanup.push(dir);
+      await fs.mkdir(path.join(dir, '.rea'), { recursive: true });
+      // No policy.yaml written.
+      const checks = collectChecks(dir);
+      expect(findCheck(checks, 'policy-reader Tier 1 (rea CLI)')).toBeUndefined();
+      expect(findCheck(checks, 'policy-reader effective floor')).toBeUndefined();
+    });
+
+    it('codex round-3 P2: omits tier checks when policy.yaml is present but malformed', async () => {
+      // Stage a policy.yaml that exists but does NOT parse (invalid
+      // YAML / zod-rejected shape). Pre-fix `collectChecks` ran the
+      // tier probes anyway because the gate only tested file
+      // existence — operators saw a policy-parse FAIL row PLUS
+      // unrelated tier WARN rows about the CLI being "stale or
+      // broken" / the ladder being "degraded", which misattributed a
+      // config bug to a runtime/install problem.
+      //
+      // Post-fix the gate checks `checkPolicyParses(...).status ===
+      // "pass"`, so a malformed policy emits exactly ONE failure
+      // (the parse error) and skips every tier probe. This test
+      // pins that behavior so any future regression that loosens
+      // the gate back to `existsSync` will fail loudly.
+      const dir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-bad-policy-')));
+      cleanup.push(dir);
+      await fs.mkdir(path.join(dir, '.rea'), { recursive: true });
+      // Intentionally invalid YAML — unterminated string in a way
+      // that even the most permissive parser will reject. This must
+      // fail `loadPolicy` regardless of any schema-shape leniency.
+      await fs.writeFile(path.join(dir, '.rea', 'policy.yaml'), 'version: "1\nthis-is-not: valid\n');
+      const checks = collectChecks(dir);
+
+      // Sanity: the parse failure IS surfaced.
+      const parsesRow = findCheck(checks, 'policy.yaml parses');
+      expect(parsesRow).toBeDefined();
+      expect(parsesRow?.status).toBe('fail');
+
+      // The five tier rows MUST be absent — they would misattribute
+      // a config-file bug to a runtime/install problem and crowd
+      // out the parse-failure row that the operator actually needs
+      // to fix.
+      expect(findCheck(checks, 'policy-reader Tier 1 (rea CLI)')).toBeUndefined();
+      expect(findCheck(checks, 'policy-reader Tier 2 (python3 + PyYAML)')).toBeUndefined();
+      expect(findCheck(checks, 'policy-reader Tier 3 (awk)')).toBeUndefined();
+      expect(findCheck(checks, 'policy-reader jq (JSON accelerator)')).toBeUndefined();
+      expect(findCheck(checks, 'policy-reader effective floor')).toBeUndefined();
+    });
   });
 });
