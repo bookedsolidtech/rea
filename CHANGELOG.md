@@ -1,5 +1,90 @@
 # @bookedsolid/rea
 
+## 0.42.0
+
+### Minor Changes
+
+- 8d0d858: Deferred P2 sweep + MIGRATING.md cumulative refresh (0.32→0.41).
+
+  After 0.41.0's consumer-UX bundle, three P2 deferrals from 0.40.0 +
+  0.41.0 had accumulated. 0.42.0 closes the loop and refreshes
+  MIGRATING.md to cover the 9-release drift that piled up during the
+  hook-port marathon (0.32→0.41).
+
+  ## 1. Tier-3 list-walker uses Tier 2's full reachability (0.40.0 round-2 P2)
+
+  `checkPolicyReaderTier3` in `src/cli/doctor.ts` used bare
+  `python3OnPath` as the python3-as-list-walker signal — a python3
+  binary on PATH whose stdlib / sandbox / postinstall is broken is
+  indistinguishable from a healthy interpreter on the PATH check.
+  0.42.0 hardens the predicate to require Tier 2's full reachability
+  (`python3 + PyYAML`) rather than `python3OnPath`. The cheapest
+  end-to-end health check we already perform is `import yaml`; reusing
+  it as the python3 sentinel means the `warn` branch only fires when
+  the interpreter is provably healthy.
+
+  Concrete behavior change — pre-0.42.0 returned `warn`, post-0.42.0
+  returns `fail`:
+  - Tier 1 reachable + python3 present + PyYAML **absent** + jq absent
+    - awk absent → `fail` (with a python3-state-specific remediation
+      message naming PyYAML)
+
+  `jq` remains a sufficient list walker on its own (single binary,
+  strong file-existence signal). The `fail` detail explicitly
+  enumerates `awk OR jq OR python3+PyYAML` as the remediations.
+
+  ## 2. `rea upgrade --check` runs settings-schema validation (0.41.0 round-3 P2 #1)
+
+  `runUpgrade()` calls `validateSettings(merged, { strict: false })`
+  on the merged settings and throws when validation fails — refusing
+  the write. Pre-0.42.0 `rea upgrade --check` never invoked that
+  check, so the preview could promise a write the real upgrade would
+  refuse.
+
+  Added `settings_validation: { parsed, errors }` to the
+  `UpgradeCheckPlan` JSON shape (schema_version unchanged — additive).
+  The human-readable rendering surfaces a `WARNING: rea upgrade would
+REFUSE` block when validation fails, with the zod-issue strings
+  listed inline. The synthetic settings file row's `note` also gains a
+  `WOULD REFUSE: schema validation failed — …` annotation so operators
+  see the refusal at the per-file level, not just the footer.
+
+  ## 3. `rea audit summary --since` walks all rotated files (0.41.0 round-3 P2 #2)
+
+  `resolveSummaryFileWalk` in `src/cli/audit-summary.ts` pruned rotated
+  files under `--since` by their filename stamp. Rotation filenames are
+  NOT authoritative for "earliest record contained" — they mark the
+  ROTATION INSTANT, which can be days after the file's earliest
+  contents when the rotation size cap is reached late. A rotated file
+  from 7 days ago can contain records from 14 days ago when the
+  previous rotation cycle was long; pruning by filename silently
+  dropped in-window records.
+
+  Post-0.42.0 the walker reads every rotated file under `--since` and
+  lets the per-record `timestamp >=  windowStart` filter inside
+  `computeAuditSummary` decide. Correctness over micro-optimization —
+  the summary scan already reads every byte for the in-window filter,
+  so the marginal cost is the rotated-file enumeration itself.
+
+  ## 4. MIGRATING.md cumulative update (0.32→0.41)
+
+  MIGRATING.md was last touched in 0.30.0. Added per-release sections
+  without rewriting the existing chronology:
+  - **0.32.0+ Node-binary shim playbook** — hooks moved from bash to
+    TS bodies invoked via shell shims; consumer impact (`pnpm install`
+    after upgrade) + new `dist/cli/index.js` dependency.
+  - **0.37.0+ 4-tier policy reader** — graceful-degradation chain
+    (CLI → python3+PyYAML → awk → fail-closed); consumer impact +
+    PyYAML install guidance + list-walker requirements (jq OR
+    python3+PyYAML, post-0.42.0).
+  - **0.38.0+ shim runtime extraction** — cosmetic refactor; no
+    consumer action.
+  - **0.39.0+ doctor health surfaces** — `rea doctor` lines explained
+    - 0.42.0's tightened Tier 3 verdict.
+  - **0.41.0+ upgrade preview + audit summary** — `rea upgrade
+--check` + `rea audit summary` documented end-to-end, including
+    0.42.0's `settings_validation` field + late-rotation walk fix.
+
 ## 0.41.0
 
 ### Minor Changes
@@ -3505,13 +3590,13 @@ codex-review --also-set-cache`) on every push, produced a 1,250-line bash
 
   This release replaces the entire stack with a stateless gate:
 
-                                                                                              git push
-                                                                                                → .husky/pre-push → rea hook push-gate
-                                                                                                → codex exec review --base <ref> --json
-                                                                                                → parse verdict from streamed findings
-                                                                                                → block on [P1] (blocking) or [P2] when concerns_blocks=true
-                                                                                                → write .rea/last-review.json + audit record
-                                                                                                → exit 0 / 1 (HALT) / 2 (blocked)
+                                                                                                git push
+                                                                                                  → .husky/pre-push → rea hook push-gate
+                                                                                                  → codex exec review --base <ref> --json
+                                                                                                  → parse verdict from streamed findings
+                                                                                                  → block on [P1] (blocking) or [P2] when concerns_blocks=true
+                                                                                                  → write .rea/last-review.json + audit record
+                                                                                                  → exit 0 / 1 (HALT) / 2 (blocked)
 
   Codex is run fresh on every push. No cache. No SHA matching. No receipt
   consultation. When the gate blocks, Claude reads stderr + the
