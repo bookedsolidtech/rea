@@ -14,6 +14,7 @@ import {
   readSettings,
   writeSettingsAtomic,
 } from './install/settings-merge.js';
+import { EXPECTED_HOOKS } from './doctor.js';
 import { installCommitMsgHook } from './install/commit-msg.js';
 import { installPrepareCommitMsgHook } from './install/prepare-commit-msg.js';
 import { installPrePushFallback } from './install/pre-push.js';
@@ -1003,12 +1004,55 @@ function readExistingManifestInstalledAt(manifestPath: string): string | undefin
 }
 
 /**
+ * 0.44.0 charter item 1: derive the canonical hook filename set the
+ * installer will lay down. Union of:
+ *
+ *   - `EXPECTED_HOOKS` (the doctor's required-on-disk list — source of
+ *     truth for "what `.claude/hooks/` must contain after install").
+ *   - The `command` paths of every entry in `defaultDesiredHooks()`
+ *     (the source of truth for "what `.claude/settings.json` registers
+ *     with Claude Code"). Each command path ends in
+ *     `.claude/hooks/<name>.sh`; we extract `<name>.sh` so the result
+ *     joins cleanly with `EXPECTED_HOOKS`.
+ *
+ * Pre-0.44.0 `buildInstallSummary` hard-coded a hook count / list. If
+ * a new hook was added to `EXPECTED_HOOKS` (e.g. `delegation-advisory`
+ * was promoted in 0.36.0) or registered in `defaultDesiredHooks()`
+ * without anyone touching the summary, the operator's confirm screen
+ * silently lied about what was about to be installed. This helper
+ * means the summary now tracks the real installer surface — adding
+ * a hook to either canonical source automatically updates the screen.
+ *
+ * Sorted + deduped so the screen is stable across orderings.
+ */
+export function canonicalInstalledHooks(): string[] {
+  const fromExpected = new Set<string>(EXPECTED_HOOKS);
+  for (const group of defaultDesiredHooks()) {
+    for (const h of group.hooks) {
+      const cmd = h.command;
+      // Commands have shape `"$CLAUDE_PROJECT_DIR"/.claude/hooks/<name>.sh`.
+      // Take the basename (everything after the last `/`). Robust against
+      // future path changes — only the filename matters here.
+      const slashIdx = cmd.lastIndexOf('/');
+      const basename = slashIdx >= 0 ? cmd.slice(slashIdx + 1) : cmd;
+      if (basename.endsWith('.sh')) fromExpected.add(basename);
+    }
+  }
+  return Array.from(fromExpected).sort();
+}
+
+/**
  * 0.43.0 UX polish: build the human-readable install summary shown
  * BEFORE any files are written. Lists, in order: the policy file
  * being written, the chosen profile + autonomy, hook + agent counts
  * planned, the git/husky hooks planned (paths reflect what the
  * installer will ACTUALLY do given the target tree's shape), and
  * whether re-run preservation is active.
+ *
+ * 0.44.0 charter item 1: hook count + listing is derived from the
+ * canonical hook resolvers via {@link canonicalInstalledHooks}, NOT
+ * hard-coded. Adding a hook to `EXPECTED_HOOKS` or
+ * `defaultDesiredHooks()` automatically reflects in this screen.
  *
  * Rendered via clack's `note` primitive so it sits in a bordered block
  * adjacent to the final `confirm` gate. The string is also returned
@@ -1037,7 +1081,16 @@ export function buildInstallSummary(
   lines.push(`  .rea/registry.yaml       — empty MCP-server registry`);
   lines.push(`  .rea/install-manifest.json — hash record for drift detection`);
   lines.push(`  .claude/agents/          — curated specialist agents`);
-  lines.push(`  .claude/hooks/           — hook scripts (executable)`);
+  // 0.44.0 charter item 1: hook count derived from the canonical
+  // resolvers (EXPECTED_HOOKS + defaultDesiredHooks). Pre-fix this
+  // line read `.claude/hooks/           — hook scripts (executable)`
+  // with no count, so adding a new hook silently changed the install
+  // surface without surfacing in the operator's confirm screen.
+  const hookNames = canonicalInstalledHooks();
+  lines.push(`  .claude/hooks/           — ${hookNames.length} hook scripts (executable):`);
+  for (const name of hookNames) {
+    lines.push(`      ${name}`);
+  }
   lines.push(`  .claude/commands/        — slash commands`);
   lines.push(`  .claude/settings.json    — hook registration entries`);
   // 0.43.0 codex round-1 P3: the installer writes to `.git/hooks/*`
@@ -1114,10 +1167,77 @@ export function detectTargetState(targetDir: string): TargetState {
 }
 
 /**
+ * 0.44.0 charter item 2: detect filesystems where Unix mode bits are
+ * unreliable (Windows-class FSes, WSL/native crossings, some network
+ * mounts). On these, `stat.mode` for a freshly-installed `.sh` either
+ * reads back without the `0o111` exec bit set, or is zeroed entirely.
+ *
+ * Pre-fix `postInstallVerify` hard-failed the install when zero `.sh`
+ * files had the exec bit — every Windows install thus produced a
+ * false-positive "0 executable .sh files" warning even on a perfectly
+ * healthy install. We now treat exec-bit checks as advisory on these
+ * filesystems and still verify the more meaningful invariant: the
+ * files exist and have non-empty bytes.
+ *
+ * Detection strategy — two layers, either sufficient:
+ *
+ *   1. Platform — `process.platform === 'win32'` always skips the
+ *      exec-bit check (native Windows has no POSIX mode bit; node's
+ *      `stat.mode` is a translation that may or may not preserve the
+ *      0o111 bit depending on the source).
+ *   2. Sample — even on Linux/macOS, when crossing into a Windows-
+ *      backed filesystem (WSL bind-mount onto `/mnt/c/`, an SMB
+ *      share, etc.), `stat.mode` returns a value whose `0o777`
+ *      portion is zero. We detect this by sampling the FIRST `.sh`
+ *      file in the hooks directory and checking whether ANY of the
+ *      `0o777` bits are set; if none are, treat as mode-less.
+ *
+ * Returns true when the exec-bit check should be SKIPPED.
+ *
+ * Exported for testability — callers can stub the filesystem and
+ * exercise both shapes (mode-aware vs mode-less) without spinning
+ * up an actual Windows VM.
+ */
+export function isModeLessFilesystem(hooksDir: string): boolean {
+  if (process.platform === 'win32') return true;
+  // Sample any single .sh file to probe whether the FS preserves
+  // exec bits at all. We don't need every file — just one signal.
+  try {
+    const entries = fs.readdirSync(hooksDir);
+    const firstSh = entries.find((e) => e.endsWith('.sh'));
+    if (firstSh === undefined) {
+      // No .sh files at all — let the caller's existence check fire.
+      // Treat as mode-aware (skip = false) so we don't hide the
+      // genuinely-missing-files case behind the WSL advisory.
+      return false;
+    }
+    const stat = fs.statSync(path.join(hooksDir, firstSh));
+    // If ALL 0o777 bits are clear, the FS is not preserving Unix
+    // mode bits. Genuine Unix installs always have at least the
+    // owner-read bit (0o400) set, so an entirely-zero perms triple
+    // means we're on a mode-less mount.
+    if ((stat.mode & 0o777) === 0) return true;
+    return false;
+  } catch {
+    // Stat failed — let the caller's enumeration handle the error.
+    // Returning false here means "don't skip" so a genuine ENOENT
+    // surfaces through the normal exec-bit branch.
+    return false;
+  }
+}
+
+/**
  * 0.43.0 UX polish: post-install sanity check. Runs synchronously
  * after the file-write phase to catch installs that completed
  * "successfully" but are missing a critical artifact (write
  * permissions issue, partial copy, etc.).
+ *
+ * 0.44.0 charter item 2: exec-bit check is skipped on mode-less
+ * filesystems (Windows / WSL-crossing / SMB mounts). When skipped, we
+ * still verify the files exist + are non-empty — that's the invariant
+ * a partial-copy or zero-byte write would actually violate. The skip
+ * is annotated in the returned advisory so the operator knows why a
+ * check they expected to run didn't.
  *
  * Strictly read-only — no probes that touch python3 / jq / codex.
  * Pattern modelled on the synthetic round-trip checks established by
@@ -1126,7 +1246,9 @@ export function detectTargetState(targetDir: string): TargetState {
  * that bites first-time consumers hardest. For deep diagnostics
  * point the operator at `rea doctor`.
  *
- * Returns the list of issues found (empty = healthy). The caller
+ * Returns the list of issues found (empty = healthy). Advisory
+ * (skipped-check) lines are prefixed with `advisory:` so the caller
+ * can distinguish them from real issues if desired. The caller
  * surfaces them via clack's `log.warn` and points the operator at
  * `rea doctor` for follow-up.
  */
@@ -1152,15 +1274,19 @@ export function postInstallVerify(targetDir: string): string[] {
     }
   }
 
-  // 2. .claude/hooks directory present with executable scripts.
+  // 2. .claude/hooks directory present with non-empty scripts (and,
+  //    on mode-aware filesystems, executable).
   const hooksDir = path.join(targetDir, '.claude', 'hooks');
   if (!fs.existsSync(hooksDir)) {
     issues.push(`.claude/hooks/ directory missing after install (expected at ${hooksDir})`);
   } else {
+    const modeLess = isModeLessFilesystem(hooksDir);
     let executableCount = 0;
+    let shCount = 0;
     try {
       for (const entry of fs.readdirSync(hooksDir)) {
         if (!entry.endsWith('.sh')) continue;
+        shCount += 1;
         const stat = fs.statSync(path.join(hooksDir, entry));
         if ((stat.mode & 0o111) !== 0) executableCount += 1;
       }
@@ -1169,7 +1295,61 @@ export function postInstallVerify(targetDir: string): string[] {
         `failed to enumerate .claude/hooks/: ${e instanceof Error ? e.message : String(e)}`,
       );
     }
-    if (executableCount === 0) {
+    if (modeLess) {
+      // 0.44.0 charter item 2: emit a one-liner advisory so the
+      // operator understands why the exec-bit check didn't run. Still
+      // verify the files exist + have content — that's the partial-
+      // copy failure shape we genuinely want to catch on these FSes.
+      //
+      // 0.44.0 codex round-1 P2 fix: validate the FULL canonical hook
+      // set, not just `shCount > 0 && nonEmptyCount > 0`. Pre-fix a
+      // partial copy that left ONE non-empty .sh and dropped the rest
+      // would still report "install looks healthy" because the
+      // substitute invariant only required at least one survivor.
+      // Now we per-file check every entry in canonicalInstalledHooks()
+      // for existence + non-empty bytes — equivalent rigor to the
+      // mode-aware path's per-file exec-bit check.
+      issues.push(
+        'advisory: skipping exec-bit check on this filesystem ' +
+          '(Windows/WSL/SMB-class; mode bits not reliable). ' +
+          'Verifying per-file presence and non-empty content instead.',
+      );
+      const expected = canonicalInstalledHooks();
+      const missing: string[] = [];
+      const empty: string[] = [];
+      for (const name of expected) {
+        const hookPath = path.join(hooksDir, name);
+        if (!fs.existsSync(hookPath)) {
+          missing.push(name);
+          continue;
+        }
+        try {
+          const stat = fs.statSync(hookPath);
+          if (stat.size === 0) empty.push(name);
+        } catch {
+          // Treat unstattable as missing — the partial-copy failure
+          // shape we are trying to detect.
+          missing.push(name);
+        }
+      }
+      if (missing.length > 0) {
+        issues.push(
+          `.claude/hooks/ is missing ${missing.length} expected hook file(s): ${missing.join(', ')}`,
+        );
+      }
+      if (empty.length > 0) {
+        issues.push(
+          `.claude/hooks/ has ${empty.length} empty hook file(s): ${empty.join(', ')}`,
+        );
+      }
+      // Fallback for the no-canonical-list-known case (defensive — the
+      // helper always returns >=1 in practice, but if a future
+      // refactor empties the resolvers we still want to catch a
+      // completely-empty hooks dir).
+      if (expected.length === 0 && shCount === 0) {
+        issues.push('.claude/hooks/ contains zero .sh files — run `rea doctor`');
+      }
+    } else if (executableCount === 0) {
       issues.push('.claude/hooks/ contains zero executable .sh files — run `rea doctor`');
     }
   }
@@ -1523,11 +1703,27 @@ export async function runInit(options: InitOptions): Promise<void> {
   // operator at `rea doctor` for the deep dive. Modelled on the
   // 0.29.0/0.31.0 synthetic round-trip pattern.
   const verifyIssues = postInstallVerify(targetDir);
-  if (verifyIssues.length > 0) {
+  // 0.44.0 charter item 2: split advisory (`advisory:`-prefixed) from
+  // real issues. Advisories explain skipped checks (Windows/WSL exec-
+  // bit skip) and don't merit the loud "verification flagged" header
+  // when no real issue is present.
+  const realIssues = verifyIssues.filter((i) => !i.startsWith('advisory:'));
+  const advisories = verifyIssues.filter((i) => i.startsWith('advisory:'));
+  if (realIssues.length > 0) {
     console.log('');
     warn('post-install verification flagged the following:');
-    for (const issue of verifyIssues) warn(`  • ${issue}`);
+    for (const issue of realIssues) warn(`  • ${issue}`);
+    for (const adv of advisories) warn(`  • ${adv}`);
     warn('Run `rea doctor` for a full diagnostic.');
+  } else if (advisories.length > 0) {
+    if (interactive) {
+      p.log.success('Post-install check: install looks healthy.');
+      for (const adv of advisories) p.log.info(adv);
+    } else {
+      console.log('');
+      console.log('Post-install check: install looks healthy.');
+      for (const adv of advisories) console.log(`  ${adv}`);
+    }
   } else if (interactive) {
     // Quiet success — confirm we checked, but don't shout about it.
     p.log.success('Post-install check: install looks healthy.');
