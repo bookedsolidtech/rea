@@ -1,5 +1,40 @@
 # @bookedsolid/rea
 
+## 0.40.0
+
+### Minor Changes
+
+- 3a7a085: Delegation-telemetry race fix + doctor polish.
+
+  Three small fixes deferred from prior releases:
+  1. **Race fix — `sessionHasRealDelegation` poll-and-backoff.** The
+     delegation-capture hook fire-and-forgets `rea hook delegation-signal
+--detach &` for sub-50ms PreToolUse latency. Pre-fix, a write-class
+     tool call landing in the narrow window before the audit append
+     committed could read a stale chain, fire the advisory spuriously,
+     AND write the `.fired` sentinel — silencing every future nudge in
+     the session even though delegation DID happen. Post-fix the
+     predicate polls with a 50ms / 150ms / 300ms backoff schedule (total
+     ~500ms worst case) before declaring "no delegation". The first read
+     is immediate, so a session that delegated before threshold crossing
+     pays zero extra latency; only the rare race shape pays the full
+     budget, and only ONCE per session. (Pre-existing 0.29.0 tradeoff
+     documented as 0.31.0 round-4 P2.)
+  2. **Tier 3 awk verdict downgrade.** `checkPolicyReaderTier3`
+     previously hard-failed when awk was absent. Post-fix it downgrades
+     to `warn` when Tier 1 (rea CLI) OR Tier 2 (python3+PyYAML) are
+     reachable — the operator's effective floor is fine in that shape
+     even without awk. Hard `fail` is reserved for the catastrophic
+     shape where awk is gone AND no other tier covers. Mirrors the
+     summary check's posture. (Deferred 0.39.0 round-4 P2.)
+  3. **python3 probe `cwd` threading.** `defaultPython3PyYamlReachable`
+     now spawns python3 with `cwd: baseDir` so the sys.path scrub
+     (which strips CWD + realpath(CWD) to defend against a malicious
+     repo-local `./yaml.py`) operates on the consumer's project, not
+     doctor's own cwd. Closes the multi-repo scenario where `rea doctor
+--base-dir <consumer>` invoked from `/tmp/foo` would scrub against
+     the wrong directory. (Deferred 0.39.0 round-4 P3.)
+
 ## 0.39.0
 
 ### Minor Changes
@@ -3344,13 +3379,13 @@ codex-review --also-set-cache`) on every push, produced a 1,250-line bash
 
   This release replaces the entire stack with a stateless gate:
 
-                                                                                          git push
-                                                                                            → .husky/pre-push → rea hook push-gate
-                                                                                            → codex exec review --base <ref> --json
-                                                                                            → parse verdict from streamed findings
-                                                                                            → block on [P1] (blocking) or [P2] when concerns_blocks=true
-                                                                                            → write .rea/last-review.json + audit record
-                                                                                            → exit 0 / 1 (HALT) / 2 (blocked)
+                                                                                            git push
+                                                                                              → .husky/pre-push → rea hook push-gate
+                                                                                              → codex exec review --base <ref> --json
+                                                                                              → parse verdict from streamed findings
+                                                                                              → block on [P1] (blocking) or [P2] when concerns_blocks=true
+                                                                                              → write .rea/last-review.json + audit record
+                                                                                              → exit 0 / 1 (HALT) / 2 (blocked)
 
   Codex is run fresh on every push. No cache. No SHA matching. No receipt
   consultation. When the gate blocks, Claude reads stderr + the
