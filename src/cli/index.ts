@@ -18,6 +18,7 @@ import { runUpgradeCheck } from './upgrade-check.js';
 import { registerAuditSummaryCommand } from './audit-summary.js';
 import { registerAuditByToolCommand } from './audit-by-tool.js';
 import { registerAuditTimelineCommand } from './audit-timeline.js';
+import { registerAuditTopBlocksCommand } from './audit-top-blocks.js';
 import { registerVerifyClaimCommand } from './verify-claim.js';
 import { err, getPkgVersion } from './utils.js';
 
@@ -206,6 +207,11 @@ async function main(): Promise<void> {
   // [--since=DUR] [--json]`. Time-bucketed event counts with inline
   // histogram. Useful for spotting activity spikes + cadence patterns.
   registerAuditTimelineCommand(audit);
+
+  // 0.47.0 charter item 3 — `rea audit top-blocks [--limit=N]
+  // [--since=DUR] [--json]`. Most-recent refusal events (denied/error).
+  // The "why was that refused?" debugging lens.
+  registerAuditTopBlocksCommand(audit);
 
   // Register `rea hook push-gate` — the stateless pre-push Codex gate
   // called by `.husky/pre-push` and `.git/hooks/pre-push`.

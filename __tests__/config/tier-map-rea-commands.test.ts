@@ -47,6 +47,17 @@ describe('reaCommandTier — fully-trusted invocations (absolute path only)', ()
     // command is usable from a documented read-only / L0 posture.
     ['/usr/local/bin/rea audit specialists', Tier.Read],
     ['/usr/local/bin/rea audit specialists --json', Tier.Read],
+    // 0.47.0 codex round-11 P2 — close the misclassification gap for
+    // the 0.41.0+ audit reader trio. Every reader walks audit.jsonl +
+    // rotated segments and emits aggregations to stdout; none mutate.
+    ['/usr/local/bin/rea audit summary', Tier.Read],
+    ['/usr/local/bin/rea audit summary --since 7d --json', Tier.Read],
+    ['/usr/local/bin/rea audit by-tool', Tier.Read],
+    ['/usr/local/bin/rea audit by-tool --top 50 --json', Tier.Read],
+    ['/usr/local/bin/rea audit timeline', Tier.Read],
+    ['/usr/local/bin/rea audit timeline --bucket 1h --since 24h --json', Tier.Read],
+    ['/usr/local/bin/rea audit top-blocks', Tier.Read],
+    ['/usr/local/bin/rea audit top-blocks --limit 5 --since 1h --json', Tier.Read],
   ])('%s → Read', (cmd, expected) => {
     expect(reaCommandTier(cmd)).toBe(expected);
   });
