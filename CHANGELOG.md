@@ -1,5 +1,33 @@
 # @bookedsolid/rea
 
+## 0.44.0
+
+### Minor Changes
+
+- 109460f: 0.44.0 — `rea init` polish completion + hook playbook reference doc.
+  - `buildInstallSummary` now derives its hook listing from the
+    canonical resolvers (`EXPECTED_HOOKS` + `defaultDesiredHooks`) via
+    the new `canonicalInstalledHooks()` helper. Adding a hook to either
+    source automatically reflects in the operator's pre-confirm screen
+    — pre-fix the summary hard-coded the listing and could silently
+    drift. (0.43.0 round-2 P2 closure.)
+  - `postInstallVerify` is now Windows/WSL-aware. On filesystems where
+    Unix mode bits aren't reliable (native Windows, WSL crossings, SMB
+    mounts), the exec-bit check is skipped with a one-liner advisory.
+    In its place we now verify the FULL canonical hook set per-file —
+    every entry in `canonicalInstalledHooks()` must be present + non-
+    empty (0.44.0 codex round-1 P2 caught the loophole where the
+    substitute invariant accepted "at least one survivor", which would
+    have hidden a partial-copy failure that left one hook surviving).
+    New `isModeLessFilesystem()` helper detects the FS class.
+    (0.43.0 round-2 P3 closure.)
+  - New `docs/hook-playbook.md` — comprehensive contributor reference
+    extracting the 0.32.0–0.42.0 marathon lessons (shim_run API,
+    fail-open vs blocking tier, relevance pre-gate patterns, policy
+    short-circuit, sandbox expectations, parity baselines, dogfood
+    bootstrap, the awk-comment-quote class). Linked from
+    CONTRIBUTING.md.
+
 ## 0.43.0
 
 ### Minor Changes
@@ -3644,13 +3672,13 @@ codex-review --also-set-cache`) on every push, produced a 1,250-line bash
 
   This release replaces the entire stack with a stateless gate:
 
-                                                                                                  git push
-                                                                                                    → .husky/pre-push → rea hook push-gate
-                                                                                                    → codex exec review --base <ref> --json
-                                                                                                    → parse verdict from streamed findings
-                                                                                                    → block on [P1] (blocking) or [P2] when concerns_blocks=true
-                                                                                                    → write .rea/last-review.json + audit record
-                                                                                                    → exit 0 / 1 (HALT) / 2 (blocked)
+                                                                                                    git push
+                                                                                                      → .husky/pre-push → rea hook push-gate
+                                                                                                      → codex exec review --base <ref> --json
+                                                                                                      → parse verdict from streamed findings
+                                                                                                      → block on [P1] (blocking) or [P2] when concerns_blocks=true
+                                                                                                      → write .rea/last-review.json + audit record
+                                                                                                      → exit 0 / 1 (HALT) / 2 (blocked)
 
   Codex is run fresh on every push. No cache. No SHA matching. No receipt
   consultation. When the gate blocks, Claude reads stderr + the
