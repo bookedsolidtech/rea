@@ -1831,13 +1831,13 @@ describe('rea doctor — policy-reader tier checks (0.39.0)', () => {
 
   describe('checkPolicyReaderTier2 — python3 + PyYAML', () => {
     it('passes when python3 and PyYAML are both reachable', () => {
-      const result = checkPolicyReaderTier2(probes.all());
+      const result = checkPolicyReaderTier2('/baseDir-irrelevant-for-stub', probes.all());
       expect(result.status).toBe('pass');
       expect(result.detail).toMatch(/flow-form policy parses correctly/);
     });
 
     it('warns when python3 is absent', () => {
-      const result = checkPolicyReaderTier2({
+      const result = checkPolicyReaderTier2('/baseDir-irrelevant-for-stub', {
         ...probes.all(),
         python3OnPath: () => null,
       });
@@ -1847,25 +1847,146 @@ describe('rea doctor — policy-reader tier checks (0.39.0)', () => {
     });
 
     it('warns when python3 is present but PyYAML import fails', () => {
-      const result = checkPolicyReaderTier2(probes.python3NoPyYaml());
+      const result = checkPolicyReaderTier2(
+        '/baseDir-irrelevant-for-stub',
+        probes.python3NoPyYaml(),
+      );
       expect(result.status).toBe('warn');
       expect(result.detail).toMatch(/import yaml.*failed/);
       expect(result.detail).toMatch(/pip3 install pyyaml/);
+    });
+
+    // 0.40.0 charter item 3 — probes receive the consumer's baseDir
+    // so they can thread it as cwd to the spawned python3.
+    it('0.40.0: threads baseDir into the python3PyYamlReachable probe', () => {
+      const observed: string[] = [];
+      const result = checkPolicyReaderTier2('/explicit/consumer/dir', {
+        ...probes.all(),
+        python3PyYamlReachable: (baseDir) => {
+          observed.push(baseDir);
+          return true;
+        },
+      });
+      expect(result.status).toBe('pass');
+      expect(observed).toEqual(['/explicit/consumer/dir']);
     });
   });
 
   describe('checkPolicyReaderTier3 — awk', () => {
     it('passes when awk is on PATH', () => {
-      const result = checkPolicyReaderTier3(probes.all());
+      const result = checkPolicyReaderTier3('/baseDir-irrelevant-for-stub', probes.all());
       expect(result.status).toBe('pass');
       expect(result.detail).toMatch(/awk at \/usr\/bin\/awk/);
     });
 
-    it('fails (hard) when awk is absent — zero fallback tiers', () => {
-      const result = checkPolicyReaderTier3(probes.none());
+    it('fails (hard) when awk is absent AND no other tier reachable', () => {
+      // 0.40.0 — verdict is `fail` ONLY in the catastrophic shape
+      // where awk is gone AND neither Tier 1 nor Tier 2 covers.
+      const result = checkPolicyReaderTier3('/baseDir-irrelevant-for-stub', probes.none());
       expect(result.status).toBe('fail');
       expect(result.detail).toMatch(/awk not on PATH/);
       expect(result.detail).toMatch(/no fallback tier/);
+    });
+
+    // 0.40.0 charter item 2 — conditional downgrade, refined by
+    // codex round 1 P2. Tier 1 reachable + jq present (list walker
+    // available even without python3) is the warn shape.
+    it('0.40.0: warns (not fails) when awk absent but Tier 1 reachable AND jq present', () => {
+      const result = checkPolicyReaderTier3('/baseDir-irrelevant-for-stub', {
+        cliDistExists: () => true,
+        cliInvokable: () => true,
+        python3OnPath: () => null,
+        python3PyYamlReachable: () => false,
+        awkOnPath: () => null,
+        jqOnPath: () => '/usr/bin/jq',
+      });
+      expect(result.status).toBe('warn');
+      expect(result.detail).toMatch(/Tier 3 \(block-form fallback\) unreachable/);
+      expect(result.detail).toMatch(/Tier 1 \(rea CLI\)/);
+      expect(result.detail).toMatch(/still cover/);
+      expect(result.detail).toMatch(/mawk.*gawk.*nawk/);
+    });
+
+    // 0.40.0 codex round 1 P2: Tier 1 reachable but NO list walker
+    // (no jq AND no python3) AND awk absent is the concrete shape
+    // where list-valued policy reads silently fail-closed even
+    // though scalar reads work. Doctor must NOT exit 0 on this
+    // install — keep the `fail` verdict, with a list-walker-specific
+    // remediation message.
+    it('codex round 1 P2: fails when Tier 1 reachable but no list walker AND awk absent', () => {
+      const result = checkPolicyReaderTier3('/baseDir-irrelevant-for-stub', {
+        cliDistExists: () => true,
+        cliInvokable: () => true,
+        python3OnPath: () => null,
+        python3PyYamlReachable: () => false,
+        awkOnPath: () => null,
+        jqOnPath: () => null,
+      });
+      expect(result.status).toBe('fail');
+      expect(result.detail).toMatch(/neither jq nor python3 is on PATH/);
+      expect(result.detail).toMatch(/policy_reader_get_list/);
+      expect(result.detail).toMatch(/blocked_paths/);
+      expect(result.detail).toMatch(/silently stop enforcing/);
+      expect(result.detail).toMatch(/Install awk OR jq OR python3/);
+    });
+
+    it('0.40.0: warns (not fails) when awk absent but Tier 2 is reachable', () => {
+      const result = checkPolicyReaderTier3('/baseDir-irrelevant-for-stub', {
+        cliDistExists: () => false,
+        cliInvokable: () => false,
+        python3OnPath: () => '/usr/bin/python3',
+        python3PyYamlReachable: () => true,
+        awkOnPath: () => null,
+        jqOnPath: () => null,
+      });
+      expect(result.status).toBe('warn');
+      expect(result.detail).toMatch(/Tier 2 \(python3\+PyYAML\)/);
+      expect(result.detail).not.toMatch(/Tier 1/);
+    });
+
+    it('0.40.0: warns (not fails) when awk absent but BOTH Tier 1 and Tier 2 reachable', () => {
+      const result = checkPolicyReaderTier3('/baseDir-irrelevant-for-stub', {
+        cliDistExists: () => true,
+        cliInvokable: () => true,
+        python3OnPath: () => '/usr/bin/python3',
+        python3PyYamlReachable: () => true,
+        awkOnPath: () => null,
+        jqOnPath: () => null,
+      });
+      expect(result.status).toBe('warn');
+      expect(result.detail).toMatch(/Tier 1 \(rea CLI\) and Tier 2 \(python3\+PyYAML\)/);
+    });
+
+    it('0.40.0: treats Tier 1 dist-present-but-broken as Tier 1 unreachable for the verdict', () => {
+      // Mirror the summary check's posture: a stale dist that
+      // fails the invokable probe is NOT a usable Tier 1, so if
+      // Tier 2 is also unreachable the verdict must be `fail`
+      // (not `warn`), even though `cliDistExists` returns true.
+      const result = checkPolicyReaderTier3('/baseDir-irrelevant-for-stub', {
+        cliDistExists: () => true,
+        cliInvokable: () => false,
+        python3OnPath: () => null,
+        python3PyYamlReachable: () => false,
+        awkOnPath: () => null,
+        jqOnPath: () => null,
+      });
+      expect(result.status).toBe('fail');
+      expect(result.detail).toMatch(/no fallback tier/);
+    });
+
+    it('0.40.0: passes pass-through when awk reachable regardless of other tiers', () => {
+      // Sanity: even with every other tier missing, awk-present
+      // is still `pass` — the conditional downgrade only matters
+      // when awk is absent.
+      const result = checkPolicyReaderTier3('/baseDir-irrelevant-for-stub', {
+        cliDistExists: () => false,
+        cliInvokable: () => false,
+        python3OnPath: () => null,
+        python3PyYamlReachable: () => false,
+        awkOnPath: () => '/usr/bin/awk',
+        jqOnPath: () => null,
+      });
+      expect(result.status).toBe('pass');
     });
   });
 
