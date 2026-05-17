@@ -389,6 +389,145 @@ per finding and produces more consistent verdicts — fewer
 same-code-different-verdict round-trips. Trade-off is push-gate
 latency.
 
+## Node-binary hook scanner (added in 0.32.0)
+
+Pre-0.32.0 every `.claude/hooks/*.sh` carried the full gate body in
+bash. Adversarial review consistently caught bash-only edge cases that
+were structurally unfixable in shell — multi-line awk encodings,
+ANSI-C escapes, deep nested-shell decoding. 0.32.0 pivoted the entire
+hook surface to a Node-binary scanner: hooks became thin shims (~20-80
+LOC each) that delegate the actual gate work to `rea hook <name>` —
+which runs the canonical scanner inside `dist/cli/index.js`.
+
+**Consumer impact:**
+
+- Run `pnpm install` (or `npm install`) after upgrading to 0.32.0+ so
+  `dist/cli/index.js` is built and the shims have something to call.
+- `.claude/hooks/*.sh` files on disk are noticeably smaller after
+  `rea upgrade`; this is the canonical post-0.32.0 shape, not a
+  truncation. `rea doctor` will tell you if a shim is the wrong
+  vintage.
+- The audit trail is unchanged: hooks still emit `rea.bash_scan`-class
+  records to `.rea/audit.jsonl` with the same field shape.
+- Performance is materially better — single Node startup per scan
+  instead of an awk/sed pipeline per pattern.
+
+If `rea doctor` reports `policy-reader Tier 1 (rea CLI)` as `warn:
+dist not found`, you skipped the build step. Run `pnpm install`.
+
+## Graceful-degradation policy reader (added in 0.37.0)
+
+The shimmed hooks need to read `.rea/policy.yaml` from a bash context
+that may or may not have python3, jq, or rea's CLI on PATH. 0.37.0
+formalized a 4-tier reader ladder:
+
+1. **Tier 1** — `rea hook policy-get` (requires `dist/cli/index.js`)
+2. **Tier 2** — `python3 + stdlib yaml` (PyYAML) — handles flow-form
+3. **Tier 3** — POSIX `awk` block-form parser (the always-available floor)
+4. **Fail-closed** — every tier unreachable: shim refuses the action
+
+Tier 1 → 2 → 3 fallthrough is silent at hook-runtime; that's
+intentional (graceful degradation), but means an unreachable Tier 1 +
+unreachable Tier 2 can silently downgrade flow-form policy lookups to
+block-form-only. `rea doctor` (0.39.0+) surfaces all three tier
+reachabilities so you can spot the gap.
+
+**Consumer impact:**
+
+- If you use FLOW-form YAML for any policy block (e.g.
+  `blocked_paths: [.env, ".env.*"]`), make sure either the rea CLI
+  dist is present OR `python3 + PyYAML` is installed. With ONLY awk
+  reachable, flow-form lookups silently no-op on every shim
+  fallthrough path and your declared policy isn't enforced.
+- Install PyYAML on CI runners: `pip3 install pyyaml`. On consumer
+  developer machines, it's almost always already present (macOS ships
+  it; major Linux distros bundle it with python3).
+- For list-valued policy keys (`blocked_paths`, `protected_writes`),
+  the loader iterates the resulting JSON via jq OR python3. Have at
+  least one on PATH or `rea doctor` (0.42.0+) will report `fail` on
+  the `policy-reader Tier 3 (awk)` row with a list-walker-specific
+  remediation message.
+
+## Shim runtime extraction (added in 0.38.0)
+
+Cosmetic-only refactor: every `.claude/hooks/*.sh` shim now sources
+`hooks/_lib/shim-runtime.sh` for shared boilerplate (env loading,
+tier classification, audit-event emission). **No consumer action
+required** — the change is byte-equivalent at the gate surface. New
+shims you author can adopt the same runtime by sourcing the shared
+helper; documented in the shim authoring guide.
+
+## Doctor health surfaces for the policy reader (added in 0.39.0)
+
+`rea doctor` gained explicit reachability checks for the 4-tier
+ladder, the dist invokability probe, and a sandbox-containment check
+on the resolved `dist/cli/index.js` path. Output lines you'll see:
+
+- `policy-reader Tier 1 (rea CLI)` — pass/warn based on dist
+  presence + actual invocation
+- `policy-reader Tier 2 (python3 + PyYAML)` — pass/warn based on
+  python3 + import yaml succeeding
+- `policy-reader Tier 3 (awk)` — pass when awk present; warn or
+  fail conditional on whether other tiers cover the gap (0.40.0
+  refined the verdict logic; 0.42.0 hardened the list-walker
+  predicate)
+- `policy-reader effective floor` — summary verdict across all three
+- `policy-reader jq (JSON accelerator)` — info-level, calls out
+  Tier 1/2 perf when jq is absent
+
+**Consumer action:** run `rea doctor` after each upgrade. The lines
+above accurately reflect what your shims will do at runtime — a
+`warn` is not a hard failure but signals a posture worth knowing
+about (e.g. flow-form policy silently no-ops). A `fail` on any tier
+row IS a hard failure that the doctor exits non-zero on.
+
+## Upgrade preview + audit summary (added in 0.41.0)
+
+Two new consumer-facing commands rolled out:
+
+### `rea upgrade --check`
+
+Dry-run preview of what `rea upgrade` would write, file-by-file, with
+unified diffs. JSON output via `--json`. Always exits 0 — this is a
+preview, not a gate. Use it before any non-trivial rea upgrade to
+sanity-check the diff:
+
+```bash
+rea upgrade --check                       # human-readable table + diffs
+rea upgrade --check --json                # machine-readable for CI
+rea upgrade --check --no-diff             # counts + paths only
+```
+
+0.42.0 added the same settings-schema validation that `rea upgrade`
+itself runs — if the merged settings would fail schema parse (typo'd
+hook event, malformed hook command, …), the preview surfaces the
+`WOULD REFUSE` message rather than promising a write the real
+upgrade would refuse. The `settings_validation` field in the JSON
+output carries the structured outcome.
+
+### `rea audit summary`
+
+High-level rollup of the audit log: counts by `tool_name`, `tier`,
+`status`, `session`, the time window covered, and a sample-verified
+chain-integrity check. `--since <duration>` (e.g. `24h`, `7d`, `2w`)
+narrows to a recent window:
+
+```bash
+rea audit summary                         # all time
+rea audit summary --since 24h             # last 24 hours
+rea audit summary --since 7d --json       # last week, JSON
+```
+
+0.42.0 hardened the rotated-file walk: pre-0.42.0 `--since` pruned
+rotated audit segments by filename stamp, which is wall-clock at the
+rotation INSTANT — not the earliest record contained. A rotated file
+from N days ago can contain records from N+M days ago when the
+rotation cycle was long, so pruning by filename silently dropped
+in-window records. Post-0.42.0 the walker reads every rotated file
+under `--since` and lets the per-record timestamp filter drop the
+out-of-window entries. Correctness over micro-optimization;
+`rea audit summary` performance is unchanged in practice.
+
 ## Policy knobs worth setting
 
 For consumers with a long-running migration branch (>30 commits since

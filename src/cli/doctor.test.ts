@@ -1907,12 +1907,13 @@ describe('rea doctor — policy-reader tier checks (0.39.0)', () => {
       expect(result.detail).toMatch(/mawk.*gawk.*nawk/);
     });
 
-    // 0.40.0 codex round 1 P2: Tier 1 reachable but NO list walker
-    // (no jq AND no python3) AND awk absent is the concrete shape
-    // where list-valued policy reads silently fail-closed even
-    // though scalar reads work. Doctor must NOT exit 0 on this
-    // install — keep the `fail` verdict, with a list-walker-specific
-    // remediation message.
+    // 0.40.0 codex round 1 P2 (text-updated 0.42.0 round 2 correction):
+    // Tier 1 reachable but NO list walker (no jq AND no python3) AND
+    // awk absent is the concrete shape where list-valued policy reads
+    // silently fail-closed even though scalar reads work. Doctor must
+    // NOT exit 0 on this install — keep the `fail` verdict, with a
+    // list-walker-specific remediation message. PyYAML reference
+    // dropped per the corrected listWalker = jq || python3 semantic.
     it('codex round 1 P2: fails when Tier 1 reachable but no list walker AND awk absent', () => {
       const result = checkPolicyReaderTier3('/baseDir-irrelevant-for-stub', {
         cliDistExists: () => true,
@@ -1923,11 +1924,149 @@ describe('rea doctor — policy-reader tier checks (0.39.0)', () => {
         jqOnPath: () => null,
       });
       expect(result.status).toBe('fail');
-      expect(result.detail).toMatch(/neither jq nor python3 is on PATH/);
+      expect(result.detail).toMatch(/python3 is not on PATH/);
       expect(result.detail).toMatch(/policy_reader_get_list/);
       expect(result.detail).toMatch(/blocked_paths/);
       expect(result.detail).toMatch(/silently stop enforcing/);
       expect(result.detail).toMatch(/Install awk OR jq OR python3/);
+    });
+
+    // 0.42.0 codex round 2 P2 (CORRECTED 2026-05-16): the
+    // pre-correction version of this test pinned the WRONG semantic.
+    // `policy_reader_get_list` walks the already-parsed JSON array via
+    // jq OR python3; the python3 branch imports `json` from STDLIB
+    // ONLY — PyYAML is NOT required for list iteration (it's only
+    // needed for Tier 2's YAML PARSING step). Gating the doctor on
+    // PyYAML produces a false-fail regression for slim CI runners +
+    // Windows machines where python3 is on PATH but pip extensions
+    // aren't installed. Concrete shape: Tier 1 reachable + python3
+    // present + PyYAML ABSENT + jq absent + awk absent → MUST be
+    // `warn` (Tier 1 reachable + python3 walks the list correctly).
+    it('codex round 2 P2 corrected: warns (not fails) when Tier 1 reachable + python3 present (no PyYAML, no jq, no awk)', () => {
+      const result = checkPolicyReaderTier3('/baseDir-irrelevant-for-stub', {
+        cliDistExists: () => true,
+        cliInvokable: () => true,
+        python3OnPath: () => '/usr/bin/python3',
+        python3PyYamlReachable: () => false,
+        awkOnPath: () => null,
+        jqOnPath: () => null,
+      });
+      expect(result.status).toBe('warn');
+      expect(result.detail).toMatch(/Tier 3 \(block-form fallback\) unreachable/);
+      expect(result.detail).toMatch(/Tier 1 \(rea CLI\)/);
+      expect(result.detail).toMatch(/still cover/);
+      expect(result.detail).toMatch(/mawk.*gawk.*nawk/);
+    });
+
+    // 0.42.0 codex round 2 P2 — positive control. Tier 1 reachable +
+    // python3 present + PyYAML PRESENT + jq absent + awk absent must
+    // remain `warn` (Tier 2 itself is reachable, which subsumes the
+    // list-walker requirement).
+    it('codex round 2 P2: warns (not fails) when Tier 2 reachable even if jq + awk are absent', () => {
+      const result = checkPolicyReaderTier3('/baseDir-irrelevant-for-stub', {
+        cliDistExists: () => true,
+        cliInvokable: () => true,
+        python3OnPath: () => '/usr/bin/python3',
+        python3PyYamlReachable: () => true,
+        awkOnPath: () => null,
+        jqOnPath: () => null,
+      });
+      expect(result.status).toBe('warn');
+      expect(result.detail).toMatch(/Tier 1 \(rea CLI\) and Tier 2 \(python3\+PyYAML\)/);
+    });
+
+    // 0.42.0 codex round 2 P2 — positive control. jq remains a
+    // sufficient list walker on its own; Tier 1 + jq (no python3) is
+    // still `warn` because the JSON output from the CLI can be walked
+    // by jq alone.
+    it('codex round 2 P2: warns when Tier 1 reachable + jq present (no python3, no PyYAML, no awk)', () => {
+      const result = checkPolicyReaderTier3('/baseDir-irrelevant-for-stub', {
+        cliDistExists: () => true,
+        cliInvokable: () => true,
+        python3OnPath: () => null,
+        python3PyYamlReachable: () => false,
+        awkOnPath: () => null,
+        jqOnPath: () => '/usr/bin/jq',
+      });
+      expect(result.status).toBe('warn');
+      expect(result.detail).toMatch(/Tier 1 \(rea CLI\)/);
+      expect(result.detail).not.toMatch(/Tier 2 \(python3\+PyYAML\)/);
+    });
+
+    // 0.42.0 codex round 5 P2 (2026-05-16): the python3 leg of the
+    // list-walker predicate uses an EXECUTION probe, not just
+    // python3OnPath. When `python3OnPath` returns a path BUT
+    // `python3ListWalkerReachable` returns false (broken pyenv/asdf
+    // shim, dangling symlink, sandboxed interpreter that fails to
+    // start), the doctor must NOT downgrade to `warn` — the shim's
+    // list walker would actually fail and the operator needs to
+    // know.
+    it('codex round 5 P2: fails when python3 resolves on PATH but execution probe fails (broken shim) + no jq + no awk', () => {
+      const result = checkPolicyReaderTier3('/baseDir-irrelevant-for-stub', {
+        cliDistExists: () => true,
+        cliInvokable: () => true,
+        python3OnPath: () => '/usr/local/bin/python3-broken-shim',
+        python3PyYamlReachable: () => false,
+        // The new execution probe says "no" — interpreter cannot start.
+        python3ListWalkerReachable: () => false,
+        awkOnPath: () => null,
+        jqOnPath: () => null,
+      });
+      expect(result.status).toBe('fail');
+      expect(result.detail).toMatch(/policy_reader_get_list/);
+      expect(result.detail).toMatch(/silently stop enforcing/);
+      // Codex round 6 P3 (2026-05-16): the diagnostic message must
+      // distinguish "python3 absent" from "python3 present but
+      // broken" so the operator chases the right remediation. The
+      // resolved path appears verbatim so the operator can grep for
+      // it on the filesystem.
+      expect(result.detail).toMatch(
+        /python3 at \/usr\/local\/bin\/python3-broken-shim cannot execute/,
+      );
+      expect(result.detail).toMatch(/broken pyenv\/asdf shim/);
+      expect(result.detail).toMatch(/repair the python3 interpreter/);
+      // Must NOT report "python3 is not on PATH" — it is on PATH.
+      expect(result.detail).not.toMatch(/python3 is not on PATH/);
+    });
+
+    // Positive control for round 5 P2: python3 resolves AND the
+    // execution probe succeeds — still `warn` (list walker reachable).
+    it('codex round 5 P2: warns when python3 resolves AND execution probe succeeds (no jq, no awk)', () => {
+      const result = checkPolicyReaderTier3('/baseDir-irrelevant-for-stub', {
+        cliDistExists: () => true,
+        cliInvokable: () => true,
+        python3OnPath: () => '/usr/bin/python3',
+        python3PyYamlReachable: () => false,
+        python3ListWalkerReachable: () => true,
+        awkOnPath: () => null,
+        jqOnPath: () => null,
+      });
+      expect(result.status).toBe('warn');
+      expect(result.detail).toMatch(/Tier 3 \(block-form fallback\) unreachable/);
+    });
+
+    // 0.42.0 codex round 2 P2 corrected — explicit fail case. With
+    // listWalker = jq OR python3, the only "fail when Tier 1 reachable"
+    // shape is: no jq AND no python3 AND no awk. The diagnostic
+    // message should name all three (no PyYAML reference — PyYAML is
+    // irrelevant to list iteration).
+    it('codex round 2 P2 corrected: fails when Tier 1 reachable + NO jq + NO python3 + NO awk', () => {
+      const result = checkPolicyReaderTier3('/baseDir-irrelevant-for-stub', {
+        cliDistExists: () => true,
+        cliInvokable: () => true,
+        python3OnPath: () => null,
+        python3PyYamlReachable: () => false,
+        awkOnPath: () => null,
+        jqOnPath: () => null,
+      });
+      expect(result.status).toBe('fail');
+      expect(result.detail).toMatch(/awk not on PATH AND jq is not on PATH AND python3 is not on PATH/);
+      expect(result.detail).toMatch(/policy_reader_get_list/);
+      expect(result.detail).toMatch(/blocked_paths/);
+      expect(result.detail).toMatch(/silently stop enforcing/);
+      expect(result.detail).toMatch(/Install awk OR jq OR python3/);
+      // Must NOT mention PyYAML — irrelevant to list iteration.
+      expect(result.detail).not.toMatch(/PyYAML/);
     });
 
     it('0.40.0: warns (not fails) when awk absent but Tier 2 is reachable', () => {

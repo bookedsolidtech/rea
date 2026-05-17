@@ -15,7 +15,7 @@
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   computeAuditSummary,
   parseDurationSeconds,
@@ -367,6 +367,229 @@ describe('computeAuditSummary — rotated audit walks (codex round-1 P2)', () =>
     expect(result.total_events).toBe(1);
     expect(result.by_tool_name.Fresh).toBe(1);
     expect(result.by_tool_name.Stale).toBeUndefined();
+  });
+
+  // 0.42.0 charter item 3 — rotated filenames are NOT authoritative
+  // for "earliest record contained". The filename stamp marks the
+  // ROTATION INSTANT; a rotation that landed late (because the size
+  // cap was reached only after a long quiet period) can contain
+  // records that pre-date its filename by days. Pre-0.42.0 the
+  // walker pruned rotated files by their filename stamp, dropping
+  // in-window records from any rotation that occurred long after
+  // its earliest contents.
+  //
+  // Concrete shape exercised below:
+  //   - Rotated filename: audit-20260510-000000.jsonl (stamped 6
+  //     days BEFORE the 5d window start of 2026-05-11)
+  //   - First record inside: timestamp 2026-05-12 (INSIDE the 5d
+  //     window — should be counted)
+  //   - Second record inside: timestamp 2026-05-05 (OUTSIDE — should
+  //     be filtered out by the per-record check)
+  //   - Pre-0.42.0: the filename stamp 2026-05-10 < cutoff
+  //     2026-05-11, so the file was pruned from the walk and BOTH
+  //     records were silently dropped, even though the first was
+  //     in-window. Post-0.42.0: the file is walked, the per-record
+  //     filter keeps the in-window record and drops the
+  //     out-of-window one.
+  it('walks rotated files even when their filename stamp pre-dates the window (late-rotation correctness)', async () => {
+    const dir = await setupRepo();
+    cleanup.push(dir);
+    const now = new Date('2026-05-16T00:00:00.000Z');
+    const rotatedPath = path.join(dir, '.rea', 'audit-20260510-000000.jsonl');
+    const inWindowRecord = {
+      timestamp: '2026-05-12T10:00:00.000Z', // 4d before now → inside 5d window
+      session_id: 's1',
+      tool_name: 'LateRotated',
+      server_name: 'test',
+      tier: 'read',
+      status: 'allowed',
+      autonomy_level: 'L1',
+      duration_ms: 0,
+      emission_source: 'other',
+      prev_hash: '0'.repeat(64),
+      hash: 'a'.repeat(64),
+    };
+    const outOfWindowRecord = {
+      timestamp: '2026-05-05T10:00:00.000Z', // 11d before now → outside 5d window
+      session_id: 's1',
+      tool_name: 'StaleEntry',
+      server_name: 'test',
+      tier: 'read',
+      status: 'allowed',
+      autonomy_level: 'L1',
+      duration_ms: 0,
+      emission_source: 'other',
+      prev_hash: '0'.repeat(64),
+      hash: 'b'.repeat(64),
+    };
+    await fs.writeFile(
+      rotatedPath,
+      `${JSON.stringify(inWindowRecord)}\n${JSON.stringify(outOfWindowRecord)}\n`,
+      'utf8',
+    );
+    const result = await computeAuditSummary({ baseDir: dir, since: '5d', now });
+    expect(result.total_events).toBe(1);
+    expect(result.by_tool_name.LateRotated).toBe(1);
+    expect(result.by_tool_name.StaleEntry).toBeUndefined();
+    // The rotated file MUST appear in files_scanned even though its
+    // filename stamp pre-dates the window — that's the whole fix.
+    expect(result.files_scanned).toContain(rotatedPath);
+  });
+
+  it('walks ALL rotated files under --since regardless of filename stamp position', async () => {
+    // Multiple rotated segments + a window narrow enough that the
+    // pre-0.42.0 logic would have pruned all but one. Confirms the
+    // walker now includes every segment so the per-record filter
+    // gets to see them.
+    const dir = await setupRepo();
+    cleanup.push(dir);
+    const now = new Date('2026-05-16T12:00:00.000Z');
+    const oldStamps = ['20260101-000000', '20260201-000000', '20260301-000000'];
+    for (const stamp of oldStamps) {
+      const recordTimestamp = `2026-${stamp.slice(4, 6)}-01T00:00:01.000Z`;
+      const r = {
+        timestamp: recordTimestamp,
+        session_id: 's',
+        tool_name: `Old-${stamp}`,
+        server_name: 'test',
+        tier: 'read',
+        status: 'allowed',
+        autonomy_level: 'L1',
+        duration_ms: 0,
+        emission_source: 'other',
+        prev_hash: '0'.repeat(64),
+        hash: 'c'.repeat(64),
+      };
+      await fs.writeFile(
+        path.join(dir, '.rea', `audit-${stamp}.jsonl`),
+        `${JSON.stringify(r)}\n`,
+        'utf8',
+      );
+    }
+    // 1h window — none of the rotated records are in-window. Still,
+    // every rotated file MUST appear in files_scanned so the operator
+    // sees the walker is honest about what it scanned.
+    const result = await computeAuditSummary({ baseDir: dir, since: '1h', now });
+    expect(result.total_events).toBe(0);
+    expect(result.files_scanned.length).toBeGreaterThanOrEqual(oldStamps.length);
+    for (const stamp of oldStamps) {
+      expect(result.files_scanned).toContain(path.join(dir, '.rea', `audit-${stamp}.jsonl`));
+    }
+  });
+
+  // Codex round 4 + 5 + 6 P2 (2026-05-16) — convergent fix.
+  //
+  // Round 4 flagged that requiring every rotated segment to be
+  // readable broke `--since 1h` whenever an old backup-restored
+  // archive sat in `.rea/`. Round 5 narrowed the soft-skip to a
+  // permission-only allow-list (so EIO/EMFILE wouldn't get swallowed).
+  // Round 6 caught the deeper unsoundness: because
+  // `resolveSummaryFileWalk` enqueues every rotated segment under
+  // `--since` (filename-stamp pruning was correctly removed in 0.41.0
+  // round-3), we cannot prove an unreadable file is out-of-scope
+  // without reading it. A soft-skip therefore silently undercounts
+  // in-window records and reports `chain_integrity: ok` on an
+  // incomplete scan — exactly the failure mode round 5 already
+  // identified for EIO, just generalized.
+  //
+  // The settled behavior: ANY non-ENOENT read error throws with a
+  // precise, actionable remediation message (chmod / move / delete).
+  // `unreadable_segments` stays in the public schema but is always
+  // empty in 0.42.0 — reserved for a future release that ships
+  // per-segment time-range metadata strong enough to prove a
+  // skipped file truly cannot contribute in-window records.
+  it('codex round 6 P2: throws with an actionable message on EACCES rather than soft-skipping', async () => {
+    if (process.getuid?.() === 0) {
+      // Root bypasses file mode bits — chmod 000 doesn't restrict.
+      return;
+    }
+    const dir = await setupRepo();
+    cleanup.push(dir);
+    const rotated = path.join(dir, '.rea', 'audit-20260101-000000.jsonl');
+    const record = {
+      timestamp: '2026-01-01T00:00:01.000Z',
+      session_id: 's1',
+      tool_name: 'Stale',
+      server_name: 'test',
+      tier: 'read',
+      status: 'allowed',
+      autonomy_level: 'L1',
+      duration_ms: 0,
+      emission_source: 'other',
+      prev_hash: '0'.repeat(64),
+      hash: 'a'.repeat(64),
+    };
+    await fs.writeFile(rotated, `${JSON.stringify(record)}\n`, 'utf8');
+    await fs.chmod(rotated, 0o000);
+    try {
+      await emit(dir, { toolName: 'CurrentTool', sessionId: 'sCurrent' });
+      await expect(
+        computeAuditSummary({ baseDir: dir, since: '1h' }),
+      ).rejects.toThrow(/cannot read.*EACCES/);
+      // Sanity: also rejects with the actionable remediation text so
+      // operators see the chmod / move / delete options.
+      await expect(
+        computeAuditSummary({ baseDir: dir, since: '1h' }),
+      ).rejects.toThrow(/Fix permissions/);
+    } finally {
+      await fs.chmod(rotated, 0o600).catch(() => undefined);
+    }
+  });
+
+  // Codex round 5 P2 stays valid under round 6's settled behavior:
+  // EIO / EMFILE on any segment throws. (Effectively the same code
+  // path as the EACCES test above now, but pinning it separately
+  // documents the corruption / resource-exhaustion shape.)
+  it('codex round 5 P2: throws on EIO / EMFILE on a rotated segment', async () => {
+    const dir = await setupRepo();
+    cleanup.push(dir);
+    const rotated = path.join(dir, '.rea', 'audit-20260101-000000.jsonl');
+    await fs.writeFile(rotated, '');
+    await emit(dir, { toolName: 'CurrentTool', sessionId: 's1' });
+
+    for (const errno of ['EIO', 'EMFILE'] as const) {
+      const readSpy = vi
+        .spyOn(fs, 'readFile')
+        .mockImplementation(async (filePath: unknown, ...rest: unknown[]) => {
+          if (typeof filePath === 'string' && filePath === rotated) {
+            const e = new Error(`mocked ${errno}`) as NodeJS.ErrnoException;
+            e.code = errno;
+            throw e;
+          }
+          readSpy.mockRestore();
+          try {
+            return await fs.readFile(
+              filePath as Parameters<typeof fs.readFile>[0],
+              ...(rest as []),
+            );
+          } finally {
+            // intentional no-op; spy is restored above
+          }
+        });
+      try {
+        await expect(computeAuditSummary({ baseDir: dir })).rejects.toThrow();
+      } finally {
+        readSpy.mockRestore();
+      }
+    }
+  });
+
+  // Negative control: an IO error on the CURRENT audit.jsonl is
+  // still fatal — that file is authoritative for active sessions.
+  it('codex round 4 P2: IO error on the current audit.jsonl still throws', async () => {
+    if (process.getuid?.() === 0) {
+      return;
+    }
+    const dir = await setupRepo();
+    cleanup.push(dir);
+    const current = path.join(dir, '.rea', 'audit.jsonl');
+    await fs.writeFile(current, '');
+    await fs.chmod(current, 0o000);
+    try {
+      await expect(computeAuditSummary({ baseDir: dir })).rejects.toThrow();
+    } finally {
+      await fs.chmod(current, 0o600).catch(() => undefined);
+    }
   });
 });
 
