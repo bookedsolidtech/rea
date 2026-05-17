@@ -134,6 +134,29 @@ export interface EnsureGitignoreResult {
   addedEntries: string[];
   /** Non-fatal operator-facing messages (e.g. symlink refused, duplicate blocks). */
   warnings: string[];
+  /**
+   * 0.41.0 — when computed under `dryRun: true`, the full would-be
+   * on-disk content. Omitted in real-write mode (the file IS the
+   * authoritative copy). Callers like `rea upgrade --check` use this
+   * to render a unified diff against the current on-disk content.
+   */
+  previewContent?: string;
+  /**
+   * 0.41.0 — current on-disk content at planning time. `null` when
+   * the file does not exist. Omitted in real-write mode.
+   */
+  previousContent?: string | null;
+}
+
+export interface EnsureGitignoreOptions {
+  /**
+   * When `true`, compute the action + would-be content without
+   * writing. Returns `previewContent` and `previousContent`. Default
+   * `false` (write-on).
+   */
+  dryRun?: boolean;
+  /** Override the canonical entry list. Tests use this. */
+  entries?: readonly string[];
 }
 
 function buildManagedBlock(entries: readonly string[], eol: string): string {
@@ -298,8 +321,16 @@ async function writeAtomic(absPath: string, content: string): Promise<void> {
  */
 export async function ensureReaGitignore(
   targetDir: string,
-  entries: readonly string[] = REA_GITIGNORE_ENTRIES,
+  optionsOrEntries: EnsureGitignoreOptions | readonly string[] = {},
 ): Promise<EnsureGitignoreResult> {
+  // Back-compat: pre-0.41.0 callers passed `entries` as the second
+  // positional argument. Detect the legacy shape and forward to the
+  // options form so we don't break existing call sites.
+  const options: EnsureGitignoreOptions = Array.isArray(optionsOrEntries)
+    ? { entries: optionsOrEntries }
+    : (optionsOrEntries as EnsureGitignoreOptions);
+  const entries = options.entries ?? REA_GITIGNORE_ENTRIES;
+  const dryRun = options.dryRun === true;
   const absPath = path.resolve(targetDir, GITIGNORE);
   const warnings: string[] = [];
 
@@ -308,7 +339,13 @@ export async function ensureReaGitignore(
     existing = await readGitignoreIfFile(absPath);
   } catch (err) {
     warnings.push((err as Error).message);
-    return { path: absPath, action: 'unchanged', addedEntries: [], warnings };
+    return {
+      path: absPath,
+      action: 'unchanged',
+      addedEntries: [],
+      warnings,
+      ...(dryRun ? { previousContent: null, previewContent: '' } : {}),
+    };
   }
 
   // Detect EOL so a CRLF repo stays CRLF and doesn't get torn. Codex F3.
@@ -316,12 +353,13 @@ export async function ensureReaGitignore(
 
   if (existing === null) {
     const content = buildManagedBlock(entries, '\n') + '\n';
-    await writeAtomic(absPath, content);
+    if (!dryRun) await writeAtomic(absPath, content);
     return {
       path: absPath,
       action: 'created',
       addedEntries: [...entries],
       warnings,
+      ...(dryRun ? { previousContent: null, previewContent: content } : {}),
     };
   }
 
@@ -335,7 +373,13 @@ export async function ensureReaGitignore(
       `${absPath} contains multiple '# === rea managed' blocks — refusing to modify. ` +
         `Consolidate the managed blocks manually and rerun.`,
     );
-    return { path: absPath, action: 'unchanged', addedEntries: [], warnings };
+    return {
+      path: absPath,
+      action: 'unchanged',
+      addedEntries: [],
+      warnings,
+      ...(dryRun ? { previousContent: existing, previewContent: existing } : {}),
+    };
   }
 
   if (block === null) {
@@ -350,12 +394,13 @@ export async function ensureReaGitignore(
     const separator = bodyLines.length === 0 ? [] : [''];
     const newLines = [...bodyLines, ...separator, buildManagedBlock(entries, eol)];
     const content = newLines.join(eol) + eol;
-    await writeAtomic(absPath, content);
+    if (!dryRun) await writeAtomic(absPath, content);
     return {
       path: absPath,
       action: 'updated',
       addedEntries: [...entries],
       warnings,
+      ...(dryRun ? { previousContent: existing, previewContent: content } : {}),
     };
   }
 
@@ -369,6 +414,7 @@ export async function ensureReaGitignore(
       action: 'unchanged',
       addedEntries: [],
       warnings,
+      ...(dryRun ? { previousContent: existing, previewContent: existing } : {}),
     };
   }
 
@@ -379,11 +425,12 @@ export async function ensureReaGitignore(
   ];
   let content = newLines.join(eol);
   if (hadTrailingNewline && !content.endsWith(eol)) content += eol;
-  await writeAtomic(absPath, content);
+  if (!dryRun) await writeAtomic(absPath, content);
   return {
     path: absPath,
     action: 'updated',
     addedEntries: added,
     warnings,
+    ...(dryRun ? { previousContent: existing, previewContent: content } : {}),
   };
 }

@@ -14,6 +14,8 @@ import { runServe } from './serve.js';
 import { runStatus } from './status.js';
 import { runTofuAccept, runTofuList } from './tofu.js';
 import { runUpgrade } from './upgrade.js';
+import { runUpgradeCheck } from './upgrade-check.js';
+import { registerAuditSummaryCommand } from './audit-summary.js';
 import { registerVerifyClaimCommand } from './verify-claim.js';
 import { err, getPkgVersion } from './utils.js';
 
@@ -75,13 +77,49 @@ async function main(): Promise<void> {
     .option('--dry-run', 'show what would change; write nothing')
     .option('-y, --yes', 'non-interactive — keep drifted files, skip removed-upstream')
     .option('--force', 'non-interactive — overwrite drift, delete removed-upstream')
-    .action(async (opts: { dryRun?: boolean; yes?: boolean; force?: boolean }) => {
-      await runUpgrade({
-        dryRun: opts.dryRun,
-        yes: opts.yes,
-        force: opts.force,
-      });
-    });
+    // 0.41.0 — `--check` is a non-interactive, structured preview that
+    // emits unified diffs per modified file and exits 0 regardless of
+    // what would change. Distinct from `--dry-run`, which rehearses the
+    // FULL interactive flow with writes suppressed. Use `--check` in CI
+    // to surface the changes a `rea upgrade` PR would produce; use
+    // `--dry-run` locally to walk through the same prompts you'd see
+    // during a real upgrade.
+    .option('--check', '0.41.0 — preview-only mode: classify files, emit unified diffs, exit 0')
+    .option('--json', '(with --check) emit a single JSON document instead of the text summary')
+    .option('--no-diff', '(with --check) omit unified-diff bodies (counts + paths only)')
+    .action(
+      async (opts: {
+        dryRun?: boolean;
+        yes?: boolean;
+        force?: boolean;
+        check?: boolean;
+        json?: boolean;
+        diff?: boolean;
+      }) => {
+        if (opts.check === true) {
+          await runUpgradeCheck({
+            json: opts.json === true,
+            noDiff: opts.diff === false,
+          });
+          return;
+        }
+        // Codex round-2 P1: `--json` / `--no-diff` are preview-only.
+        // Before this PR they were unknown flags and commander rejected
+        // them; now they exist on the command. Refuse them without
+        // `--check` rather than silently performing a real upgrade —
+        // a CI typo (`rea upgrade --json` without `--check`) must not
+        // rewrite `.claude/` / `.husky/` / managed fragments.
+        if (opts.json === true || opts.diff === false) {
+          err('`--json` / `--no-diff` are preview-only flags; pass `--check` to use them.');
+          process.exit(2);
+        }
+        await runUpgrade({
+          dryRun: opts.dryRun,
+          yes: opts.yes,
+          force: opts.force,
+        });
+      },
+    );
 
   program
     .command('serve')
@@ -151,6 +189,11 @@ async function main(): Promise<void> {
   // records. Read-only; honors $CLAUDE_SESSION_ID for current-session
   // filtering. v1 omits --since / --session (deferred to 0.29.1).
   registerAuditSpecialistsSubcommand(audit);
+
+  // 0.41.0 — `rea audit summary [--since=DUR] [--json]` high-level
+  // overview reader. Counts events by tool_name, tier, session,
+  // status; samples chain integrity. Tier-Read; never mutates.
+  registerAuditSummaryCommand(audit);
 
   // Register `rea hook push-gate` — the stateless pre-push Codex gate
   // called by `.husky/pre-push` and `.git/hooks/pre-push`.
