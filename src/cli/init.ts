@@ -33,7 +33,16 @@ import {
   ReagentDroppedFieldsError,
   translateReagentPolicy,
 } from './install/reagent.js';
-import { POLICY_FILE, REA_DIR, REGISTRY_FILE, err, getPkgVersion, log, warn } from './utils.js';
+import {
+  PKG_ROOT,
+  POLICY_FILE,
+  REA_DIR,
+  REGISTRY_FILE,
+  err,
+  getPkgVersion,
+  log,
+  warn,
+} from './utils.js';
 
 export interface InitOptions {
   yes?: boolean | undefined;
@@ -1004,29 +1013,52 @@ function readExistingManifestInstalledAt(manifestPath: string): string | undefin
 }
 
 /**
- * 0.44.0 charter item 1: derive the canonical hook filename set the
- * installer will lay down. Union of:
+ * 0.45.0 charter item 2 — derive the canonical hook filename set
+ * PRIMARILY from the packaged `hooks/` filesystem tree (the literal
+ * shipped artifact), with the two source-code registries
+ * (`EXPECTED_HOOKS` and `defaultDesiredHooks()`) layered on top as
+ * defensive fallbacks.
  *
- *   - `EXPECTED_HOOKS` (the doctor's required-on-disk list — source of
- *     truth for "what `.claude/hooks/` must contain after install").
- *   - The `command` paths of every entry in `defaultDesiredHooks()`
- *     (the source of truth for "what `.claude/settings.json` registers
- *     with Claude Code"). Each command path ends in
- *     `.claude/hooks/<name>.sh`; we extract `<name>.sh` so the result
- *     joins cleanly with `EXPECTED_HOOKS`.
+ * # Why filesystem-first
  *
- * Pre-0.44.0 `buildInstallSummary` hard-coded a hook count / list. If
- * a new hook was added to `EXPECTED_HOOKS` (e.g. `delegation-advisory`
- * was promoted in 0.36.0) or registered in `defaultDesiredHooks()`
- * without anyone touching the summary, the operator's confirm screen
- * silently lied about what was about to be installed. This helper
- * means the summary now tracks the real installer surface — adding
- * a hook to either canonical source automatically updates the screen.
+ * 0.44.0 introduced this helper as the UNION of two source-code
+ * lists. Round-2 noticed a drift hazard: if either source-code list
+ * gets out of sync with the actual `hooks/` filesystem reality
+ * (e.g. a hook is added to `hooks/` but not to `EXPECTED_HOOKS`),
+ * the install-summary lies about what's about to land on disk.
+ * The filesystem is the source of truth — what the installer
+ * actually copies into `.claude/hooks/` is the contents of
+ * `hooks/`. Pinning the canonical set to the FS catches drift at
+ * runtime; the cross-check test in `init.test.ts` catches it at
+ * build time.
+ *
+ * # Strategy
+ *
+ *   1. Try to read `PKG_ROOT/hooks/*.sh` (filtered to exclude `_lib/`).
+ *      This is the authoritative list — it's literally what the
+ *      installer will copy into `.claude/hooks/`.
+ *   2. Union with `EXPECTED_HOOKS` (doctor's required list) — covers
+ *      the future case where the FS read fails (e.g. an unusual
+ *      install layout) but the source-code registry is intact.
+ *   3. Union with `defaultDesiredHooks()` basenames — covers the
+ *      symmetric case where a hook is registered in settings.json
+ *      but somehow absent from `EXPECTED_HOOKS`.
+ *
+ * Steps 2 and 3 are belt-and-suspenders. The cross-check test
+ * asserts all three sources agree; a drift between the FS and either
+ * source-code list fails the test loudly. In production the FS read
+ * (step 1) is the only one that contributes anything that wouldn't
+ * already be covered by steps 2+3 IF the test stays green.
  *
  * Sorted + deduped so the screen is stable across orderings.
+ *
+ * Exported for testability — the cross-check test imports it
+ * directly to compare against `canonicalHooksFromFilesystem()` and
+ * the two source-code registries.
  */
 export function canonicalInstalledHooks(): string[] {
-  const fromExpected = new Set<string>(EXPECTED_HOOKS);
+  const merged = new Set<string>(canonicalHooksFromFilesystem());
+  for (const name of EXPECTED_HOOKS) merged.add(name);
   for (const group of defaultDesiredHooks()) {
     for (const h of group.hooks) {
       const cmd = h.command;
@@ -1035,10 +1067,52 @@ export function canonicalInstalledHooks(): string[] {
       // future path changes — only the filename matters here.
       const slashIdx = cmd.lastIndexOf('/');
       const basename = slashIdx >= 0 ? cmd.slice(slashIdx + 1) : cmd;
-      if (basename.endsWith('.sh')) fromExpected.add(basename);
+      if (basename.endsWith('.sh')) merged.add(basename);
     }
   }
-  return Array.from(fromExpected).sort();
+  return Array.from(merged).sort();
+}
+
+/**
+ * 0.45.0 charter item 2 — read the canonical hook filename set
+ * directly from the packaged `hooks/` filesystem tree. Returns
+ * basenames (e.g. `dangerous-bash-interceptor.sh`) sorted ascending.
+ * Excludes anything under `_lib/` (shared helpers, not installed
+ * shims).
+ *
+ * Returns `[]` if the directory can't be read — caller is expected
+ * to union with `EXPECTED_HOOKS` / `defaultDesiredHooks()` so a
+ * missing FS doesn't produce a zero-length canonical list.
+ *
+ * Exported so the cross-check test can compare it against the two
+ * source-code registries and fail loudly on drift.
+ */
+export function canonicalHooksFromFilesystem(): string[] {
+  const dir = path.join(PKG_ROOT, 'hooks');
+  try {
+    return fs
+      .readdirSync(dir)
+      .filter((name) => name.endsWith('.sh'))
+      .filter((name) => {
+        try {
+          // Exclude subdirectories like `_lib/`; only top-level `.sh`
+          // files are shipped shims. `readdirSync` returns names from
+          // the directory itself, but a future `_lib/foo.sh` reachable
+          // via the root listing should still be excluded — hence the
+          // explicit isFile() check.
+          return fs.statSync(path.join(dir, name)).isFile();
+        } catch {
+          return false;
+        }
+      })
+      .sort();
+  } catch {
+    // PKG_ROOT/hooks/ unreadable — fall through to the caller's
+    // source-code union. This is a defensive branch; in practice the
+    // packaged tarball always ships hooks/, and source builds always
+    // have a hooks/ checked into the repo.
+    return [];
+  }
 }
 
 /**
@@ -1179,24 +1253,50 @@ export function detectTargetState(targetDir: string): TargetState {
  * filesystems and still verify the more meaningful invariant: the
  * files exist and have non-empty bytes.
  *
- * Detection strategy — two layers, either sufficient:
+ * Detection strategy — three layers, ordered cheapest-first.
  *
  *   1. Platform — `process.platform === 'win32'` always skips the
  *      exec-bit check (native Windows has no POSIX mode bit; node's
  *      `stat.mode` is a translation that may or may not preserve the
  *      0o111 bit depending on the source).
- *   2. Sample — even on Linux/macOS, when crossing into a Windows-
- *      backed filesystem (WSL bind-mount onto `/mnt/c/`, an SMB
- *      share, etc.), `stat.mode` returns a value whose `0o777`
- *      portion is zero. We detect this by sampling the FIRST `.sh`
- *      file in the hooks directory and checking whether ANY of the
- *      `0o777` bits are set; if none are, treat as mode-less.
+ *   2. Unambiguous shapes via sample — sample the FIRST `.sh` file:
+ *
+ *      - All 0o777 bits clear (`0o000`) — historical mode-less shape.
+ *        On a genuine Unix install no shipped hook is ever 0o000,
+ *        and a chmod-stripped install (the only innocuous source of
+ *        0o000) would already be unusable so a false skip there is
+ *        harmless (the substitute presence + non-empty check still
+ *        fires).
+ *      - All 0o777 bits set (`0o777`) — "no info, everything exec";
+ *        some SMB / NTFS-via-FUSE mounts surface this so file IO
+ *        works regardless of source mode.
+ *
+ *   3. Active mode-bit probe (0.45.0 codex round-1 P1 fix) — for
+ *      ambiguous shapes like `0o644` / `0o666` where the sample
+ *      COULD be "mode-less mount surfacing as 0o644" OR "chmod-
+ *      stripped genuine Unix install", do an active probe:
+ *
+ *        a. Write a temporary file with mode `0o755`.
+ *        b. Stat it back; if the kernel returned a value missing
+ *           the exec bits we just set, the FS truly ignores mode
+ *           bits — mode-less.
+ *        c. If the kernel returned `0o755` (preserved the mode),
+ *           the FS DOES respect mode bits — the sampled hook's
+ *           lack of exec bits is a real install failure, NOT a
+ *           mode-less mount. Return false so the caller emits the
+ *           genuine "zero executable .sh files" error.
+ *        d. If the probe itself fails (EROFS, EPERM, ENOSPC,
+ *           anything), fall through to false — let the caller
+ *           surface the real installation failure rather than
+ *           hide it behind an advisory.
+ *
+ *      Pre-fix the `0o644` branch suppressed the exec-bit check
+ *      unconditionally, masking genuinely broken Unix installs.
  *
  * Returns true when the exec-bit check should be SKIPPED.
  *
  * Exported for testability — callers can stub the filesystem and
- * exercise both shapes (mode-aware vs mode-less) without spinning
- * up an actual Windows VM.
+ * exercise all three shapes without spinning up an actual Windows VM.
  */
 export function isModeLessFilesystem(hooksDir: string): boolean {
   if (process.platform === 'win32') return true;
@@ -1212,17 +1312,77 @@ export function isModeLessFilesystem(hooksDir: string): boolean {
       return false;
     }
     const stat = fs.statSync(path.join(hooksDir, firstSh));
-    // If ALL 0o777 bits are clear, the FS is not preserving Unix
-    // mode bits. Genuine Unix installs always have at least the
-    // owner-read bit (0o400) set, so an entirely-zero perms triple
-    // means we're on a mode-less mount.
-    if ((stat.mode & 0o777) === 0) return true;
+    const perm = stat.mode & 0o777;
+    // (a) All 0o777 bits clear — historical mode-less detection.
+    if (perm === 0) return true;
+    // (b) All 0o777 bits set — some SMB / FUSE mounts surface this.
+    if (perm === 0o777) return true;
+    // (c) 0.45.0 codex round-1 P1 fix: when 0o111 bits are clear
+    //     (e.g. 0o644 / 0o666), we MUST disambiguate "mode-less
+    //     mount that surfaces as 0o644" from "chmod-stripped Unix
+    //     install" via an active write-then-stat probe. The pre-fix
+    //     unconditional skip masked genuinely-broken Unix installs.
+    if ((perm & 0o111) === 0) {
+      return filesystemIgnoresModeBits(hooksDir);
+    }
     return false;
   } catch {
     // Stat failed — let the caller's enumeration handle the error.
     // Returning false here means "don't skip" so a genuine ENOENT
     // surfaces through the normal exec-bit branch.
     return false;
+  }
+}
+
+/**
+ * 0.45.0 codex round-1 P1 fix: active probe to disambiguate a
+ * mode-less filesystem from a chmod-stripped genuine Unix install.
+ *
+ * Writes a temporary file with mode `0o755` and stats it back. If
+ * the kernel returns a value that LACKS the exec bits we just set,
+ * the filesystem is ignoring mode bits — it's truly mode-less.
+ * Otherwise (kernel preserves the mode, OR the probe fails for any
+ * reason), return false so the caller surfaces the real install
+ * failure instead of hiding it behind an advisory.
+ *
+ * Probe file is written into `hooksDir` to match the exact mount
+ * the caller is checking — sampling a different directory could
+ * cross a mount boundary and lie about the target FS. The file is
+ * always unlinked, even on probe failure.
+ *
+ * Exported for testability.
+ */
+export function filesystemIgnoresModeBits(hooksDir: string): boolean {
+  const probePath = path.join(hooksDir, `.rea-modeless-probe-${process.pid}-${Date.now()}`);
+  try {
+    // 0.45.0 codex round-2 P2: write WITHOUT the mode option, then
+    // explicitly chmod to 0o755. `writeFileSync({ mode })` is filtered
+    // through the process umask, so a caller running under e.g.
+    // `umask 0111` would have their probe land as 0o644 even on a
+    // real Unix FS — falsely flagging mode-less and re-introducing
+    // the bug the round-1 fix was trying to close. Explicit chmod
+    // bypasses umask and always lands exactly the bits we asked for
+    // (when the FS honors them, which is the property we're probing).
+    fs.writeFileSync(probePath, '');
+    fs.chmodSync(probePath, 0o755);
+    const stat = fs.statSync(probePath);
+    const perm = stat.mode & 0o777;
+    // If the kernel preserved any of our exec bits, the FS honors
+    // mode bits — NOT mode-less.
+    if ((perm & 0o111) !== 0) return false;
+    // Kernel stripped every exec bit we wrote — mode-less.
+    return true;
+  } catch {
+    // Probe write/stat failed (read-only mount, EPERM, ENOSPC).
+    // Conservative: return false so the caller emits the real error
+    // rather than swallow it behind an advisory.
+    return false;
+  } finally {
+    try {
+      fs.unlinkSync(probePath);
+    } catch {
+      // best-effort cleanup
+    }
   }
 }
 

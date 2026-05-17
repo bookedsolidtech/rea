@@ -21,8 +21,10 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { AutonomyLevel } from '../policy/types.js';
 import {
   buildInstallSummary,
+  canonicalHooksFromFilesystem,
   canonicalInstalledHooks,
   detectTargetState,
+  filesystemIgnoresModeBits,
   isModeLessFilesystem,
   postInstallVerify,
   runInit,
@@ -920,6 +922,97 @@ describe('0.44.0 charter item 1 — canonicalInstalledHooks derives from real re
   });
 });
 
+// ──────────────────────────────────────────────────────────────────────
+// 0.45.0 charter item 2 — canonicalInstalledHooks derives from the
+// packaged hooks/ filesystem PRIMARILY, with the two source-code
+// registries (EXPECTED_HOOKS + defaultDesiredHooks) as defensive
+// fallbacks. The cross-check test asserts all three sources agree —
+// drift between the FS and either source-code list fails the test
+// loudly with a precise discrepancy report.
+// ──────────────────────────────────────────────────────────────────────
+
+describe('0.45.0 charter item 2 — three-way cross-check of canonical hook sources', () => {
+  it('canonicalHooksFromFilesystem returns a non-empty sorted list when hooks/ exists', () => {
+    const fromFs = canonicalHooksFromFilesystem();
+    // In the repo and in the packaged tarball, hooks/ ships with
+    // every shipped shim. A zero-length result means the FS read
+    // failed silently — which the union below covers, but the
+    // baseline should be non-empty in a healthy build.
+    expect(fromFs.length).toBeGreaterThan(0);
+    const sorted = [...fromFs].sort();
+    expect(fromFs).toEqual(sorted);
+    for (const name of fromFs) {
+      expect(name.endsWith('.sh')).toBe(true);
+    }
+  });
+
+  it('filesystem set equals EXPECTED_HOOKS exactly (drift detector)', () => {
+    const fromFs = new Set(canonicalHooksFromFilesystem());
+    const fromExpected = new Set(EXPECTED_HOOKS);
+    const onlyFs = [...fromFs].filter((n) => !fromExpected.has(n));
+    const onlyExpected = [...fromExpected].filter((n) => !fromFs.has(n));
+    if (onlyFs.length > 0 || onlyExpected.length > 0) {
+      throw new Error(
+        `EXPECTED_HOOKS drifted from hooks/ filesystem:\n` +
+          `  only in hooks/ FS: ${onlyFs.join(', ') || '(none)'}\n` +
+          `  only in EXPECTED_HOOKS: ${onlyExpected.join(', ') || '(none)'}\n` +
+          `Add the missing hooks to the source-code registry or remove ` +
+          `them from hooks/ — they MUST agree.`,
+      );
+    }
+    expect(fromFs).toEqual(fromExpected);
+  });
+
+  it('filesystem set equals defaultDesiredHooks basenames exactly (drift detector)', () => {
+    const fromFs = new Set(canonicalHooksFromFilesystem());
+    const fromDesired = new Set<string>();
+    for (const group of defaultDesiredHooks()) {
+      for (const h of group.hooks) {
+        const slashIdx = h.command.lastIndexOf('/');
+        const basename = slashIdx >= 0 ? h.command.slice(slashIdx + 1) : h.command;
+        if (basename.endsWith('.sh')) fromDesired.add(basename);
+      }
+    }
+    const onlyFs = [...fromFs].filter((n) => !fromDesired.has(n));
+    const onlyDesired = [...fromDesired].filter((n) => !fromFs.has(n));
+    if (onlyFs.length > 0 || onlyDesired.length > 0) {
+      throw new Error(
+        `defaultDesiredHooks drifted from hooks/ filesystem:\n` +
+          `  only in hooks/ FS: ${onlyFs.join(', ') || '(none)'}\n` +
+          `  only in defaultDesiredHooks: ${onlyDesired.join(', ') || '(none)'}\n` +
+          `Register the missing hooks in settings-merge.ts or drop them ` +
+          `from hooks/ — they MUST agree.`,
+      );
+    }
+    expect(fromFs).toEqual(fromDesired);
+  });
+
+  it('all three sources produce identical sets (the canonical invariant)', () => {
+    const fromFs = new Set(canonicalHooksFromFilesystem());
+    const fromExpected = new Set(EXPECTED_HOOKS);
+    const fromDesired = new Set<string>();
+    for (const group of defaultDesiredHooks()) {
+      for (const h of group.hooks) {
+        const slashIdx = h.command.lastIndexOf('/');
+        const basename = slashIdx >= 0 ? h.command.slice(slashIdx + 1) : h.command;
+        if (basename.endsWith('.sh')) fromDesired.add(basename);
+      }
+    }
+    expect(fromFs).toEqual(fromExpected);
+    expect(fromFs).toEqual(fromDesired);
+    expect(fromExpected).toEqual(fromDesired);
+  });
+
+  it('canonicalInstalledHooks reflects the filesystem when no drift exists', () => {
+    // When the three sources agree, the union (canonicalInstalledHooks)
+    // equals any one of them. This pins the invariant that the
+    // fallback union doesn't introduce extra entries.
+    const fromFs = new Set(canonicalHooksFromFilesystem());
+    const merged = new Set(canonicalInstalledHooks());
+    expect(merged).toEqual(fromFs);
+  });
+});
+
 describe('0.44.0 charter item 1 — buildInstallSummary reflects the canonical hook count + names', () => {
   it('renders the hook count from canonicalInstalledHooks', () => {
     const summary = buildInstallSummary('/p', fakeConfig(), false, FAKE_BOTH);
@@ -1022,6 +1115,158 @@ describe('0.44.0 charter item 2 — isModeLessFilesystem detection', () => {
     // isModeLessFilesystem to swallow the error and return false so
     // the caller's enumeration sees the real failure.
     expect(isModeLessFilesystem('/this/path/does/not/exist/anywhere')).toBe(false);
+  });
+});
+
+// ──────────────────────────────────────────────────────────────────────
+// 0.45.0 charter item 3 + codex round-1 P1 — broaden mode-less
+// detection but DON'T mask broken Unix installs. Pre-0.45.0 only
+// `0o000` triggered. Post-charter `0o777` and `0o644`/`0o666` also
+// trigger — but the `0o644`/`0o666` branch MUST disambiguate "real
+// mode-less mount" from "chmod-stripped Unix install" via an active
+// write-then-stat probe (codex round-1 P1). Otherwise a broken copy
+// regresses from a detected install failure to a false green.
+// ──────────────────────────────────────────────────────────────────────
+
+describe('0.45.0 charter item 3 + codex round-1 P1 — isModeLessFilesystem with active probe', () => {
+  let prevCwd: string;
+  const cleanup: string[] = [];
+
+  beforeEach(() => {
+    prevCwd = process.cwd();
+  });
+
+  afterEach(async () => {
+    process.chdir(prevCwd);
+    await Promise.all(cleanup.splice(0).map((d) => fs.rm(d, { recursive: true, force: true })));
+  });
+
+  it('returns TRUE for 0o000 (case a — unambiguous mode-less shape, no probe needed)', async () => {
+    if (process.platform === 'win32') return;
+    const dir = await makeScratch();
+    cleanup.push(dir);
+    const hooksDir = path.join(dir, '.claude', 'hooks');
+    await fs.mkdir(hooksDir, { recursive: true });
+    const hookPath = path.join(hooksDir, 'sample.sh');
+    await fs.writeFile(hookPath, '#!/bin/bash\nexit 0\n');
+    try {
+      await fs.chmod(hookPath, 0o000);
+    } catch {
+      return;
+    }
+    const stat = await fs.stat(hookPath);
+    if ((stat.mode & 0o777) !== 0) return; // kernel didn't honor
+    expect(isModeLessFilesystem(hooksDir)).toBe(true);
+    await fs.chmod(hookPath, 0o644).catch(() => {});
+  });
+
+  it('returns TRUE for 0o777 (case b — everything-exec, no mode info)', async () => {
+    if (process.platform === 'win32') return;
+    const dir = await makeScratch();
+    cleanup.push(dir);
+    const hooksDir = path.join(dir, '.claude', 'hooks');
+    await fs.mkdir(hooksDir, { recursive: true });
+    const hookPath = path.join(hooksDir, 'sample.sh');
+    await fs.writeFile(hookPath, '#!/bin/bash\nexit 0\n', { mode: 0o777 });
+    const stat = await fs.stat(hookPath);
+    if ((stat.mode & 0o777) !== 0o777) return; // umask masked some bits
+    expect(isModeLessFilesystem(hooksDir)).toBe(true);
+  });
+
+  it('returns FALSE for 0o755 (positive control — genuine Unix exec)', async () => {
+    if (process.platform === 'win32') return;
+    const dir = await makeScratch();
+    cleanup.push(dir);
+    const hooksDir = path.join(dir, '.claude', 'hooks');
+    await fs.mkdir(hooksDir, { recursive: true });
+    const hookPath = path.join(hooksDir, 'sample.sh');
+    await fs.writeFile(hookPath, '#!/bin/bash\nexit 0\n', { mode: 0o755 });
+    const stat = await fs.stat(hookPath);
+    if ((stat.mode & 0o777) !== 0o755) return; // umask normalization
+    expect(isModeLessFilesystem(hooksDir)).toBe(false);
+  });
+
+  it('returns FALSE for 0o644 on a real Unix FS (codex round-1 P1 — probe disambiguates)', async () => {
+    // Pre-fix the 0o644 branch unconditionally returned TRUE,
+    // masking a chmod-stripped install. Post-fix the active probe
+    // catches "real Unix FS preserves mode bits", so 0o644 on a
+    // genuine FS returns FALSE — caller surfaces the real "zero
+    // executable .sh files" error instead of an advisory.
+    if (process.platform === 'win32') return;
+    const dir = await makeScratch();
+    cleanup.push(dir);
+    const hooksDir = path.join(dir, '.claude', 'hooks');
+    await fs.mkdir(hooksDir, { recursive: true });
+    const hookPath = path.join(hooksDir, 'sample.sh');
+    await fs.writeFile(hookPath, '#!/bin/bash\nexit 0\n', { mode: 0o644 });
+    const stat = await fs.stat(hookPath);
+    if ((stat.mode & 0o111) !== 0) return; // kernel added exec, skip
+    // The active probe on a real Unix FS will succeed and return
+    // false (mode bits preserved). isModeLessFilesystem therefore
+    // returns false even though the sampled hook has no exec bits.
+    expect(isModeLessFilesystem(hooksDir)).toBe(false);
+  });
+});
+
+describe('0.45.0 codex round-1 P1 — filesystemIgnoresModeBits active probe', () => {
+  let prevCwd: string;
+  const cleanup: string[] = [];
+
+  beforeEach(() => {
+    prevCwd = process.cwd();
+  });
+
+  afterEach(async () => {
+    process.chdir(prevCwd);
+    await Promise.all(cleanup.splice(0).map((d) => fs.rm(d, { recursive: true, force: true })));
+  });
+
+  it('returns FALSE on a real Unix FS that preserves mode bits', async () => {
+    if (process.platform === 'win32') return;
+    const dir = await makeScratch();
+    cleanup.push(dir);
+    const hooksDir = path.join(dir, '.claude', 'hooks');
+    await fs.mkdir(hooksDir, { recursive: true });
+    expect(filesystemIgnoresModeBits(hooksDir)).toBe(false);
+  });
+
+  it('cleans up the probe file even on success', async () => {
+    if (process.platform === 'win32') return;
+    const dir = await makeScratch();
+    cleanup.push(dir);
+    const hooksDir = path.join(dir, '.claude', 'hooks');
+    await fs.mkdir(hooksDir, { recursive: true });
+    filesystemIgnoresModeBits(hooksDir);
+    const entries = await fs.readdir(hooksDir);
+    const probeLeftBehind = entries.filter((e) => e.includes('rea-modeless-probe'));
+    expect(probeLeftBehind).toEqual([]);
+  });
+
+  it('returns FALSE conservatively when the probe write fails', () => {
+    // Non-existent directory — writeFileSync inside will throw, the
+    // helper should return false so the caller surfaces the real
+    // failure rather than emit an advisory.
+    expect(filesystemIgnoresModeBits('/this/does/not/exist/anywhere/rea-test')).toBe(false);
+  });
+
+  it('returns FALSE under restrictive umask (codex round-2 P2 — chmod bypasses umask)', async () => {
+    // Pre-fix the probe used writeFileSync({ mode: 0o755 }) which is
+    // filtered through process umask. Under `umask 0111` a real
+    // Unix FS would stat the probe back as 0o644 and the helper
+    // would falsely return true. Post-fix the explicit chmod after
+    // create lands exactly the bits we asked for so umask doesn't
+    // produce false positives.
+    if (process.platform === 'win32') return;
+    const dir = await makeScratch();
+    cleanup.push(dir);
+    const hooksDir = path.join(dir, '.claude', 'hooks');
+    await fs.mkdir(hooksDir, { recursive: true });
+    const originalUmask = process.umask(0o111); // strip exec bits
+    try {
+      expect(filesystemIgnoresModeBits(hooksDir)).toBe(false);
+    } finally {
+      process.umask(originalUmask);
+    }
   });
 });
 

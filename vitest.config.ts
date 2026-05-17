@@ -5,6 +5,18 @@ export default defineConfig({
     environment: 'node',
     globals: false,
     include: ['src/**/*.test.ts', '__tests__/**/*.test.ts'],
+    // 0.45.0 codex round-1 P2 #1: the hook hot-path profiling test
+    // spawns ~64 hook subprocesses (16 shims × 4 iterations) and
+    // asserts wall-clock p95 ceilings that are sensitive to system
+    // load. Excluded from the default test run so a noisy CI runner
+    // doesn't fail `pnpm test` spuriously. Run it explicitly via
+    // `pnpm test:perf` (which sets REA_INCLUDE_PERF=1 to override
+    // the exclude) or as part of `pnpm perf:hooks` which also
+    // refreshes the baseline JSON.
+    exclude:
+      process.env.REA_INCLUDE_PERF === '1'
+        ? ['**/node_modules/**', '**/dist/**']
+        : ['**/node_modules/**', '**/dist/**', '__tests__/scripts/profile-hooks.test.ts'],
     // Codex round 2 R2-15: bash-tier corpus expanded with 186+ new
     // fixtures, each spawning a bash hook (avg 400-600ms). The default
     // 5s test/teardown timeouts plus default RPC budget can cause
