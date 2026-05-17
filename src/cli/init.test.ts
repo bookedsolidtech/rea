@@ -18,7 +18,15 @@ import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { runInit } from './init.js';
+import { AutonomyLevel } from '../policy/types.js';
+import {
+  buildInstallSummary,
+  detectTargetState,
+  postInstallVerify,
+  runInit,
+  type ResolvedConfig,
+  type TargetState,
+} from './init.js';
 import { FALLBACK_MARKER } from './install/pre-push.js';
 
 const execFileAsync = promisify(execFile);
@@ -509,5 +517,345 @@ describe('rea init — G11.4 codex flags', () => {
     const userIdx = gi.indexOf('node_modules');
     const markerIdx = gi.indexOf('# === rea managed');
     expect(userIdx).toBeLessThan(markerIdx);
+  });
+});
+
+// ──────────────────────────────────────────────────────────────────────
+// 0.43.0 — rea init clack UX polish
+//
+// The interactive wizard itself is driven by `@clack/prompts` and is
+// hard to drive headlessly without stubbing the full prompt module.
+// Instead we test the BEHAVIOR seams the wizard delegates to:
+//   1. `buildInstallSummary` — pure function; assert content shape.
+//   2. `postInstallVerify` — pure function; assert detection of common
+//      partial-install shapes (missing policy, missing hooks, etc).
+//   3. `--yes` path of `runInit` — must still skip the new
+//      install-summary confirm gate (the gate is interactive-only).
+// ──────────────────────────────────────────────────────────────────────
+
+function fakeConfig(overrides: Partial<ResolvedConfig> = {}): ResolvedConfig {
+  return {
+    profile: 'minimal',
+    autonomyLevel: AutonomyLevel.L1,
+    maxAutonomyLevel: AutonomyLevel.L2,
+    blockAiAttribution: true,
+    blockedPaths: ['.env', '.env.*'],
+    notificationChannel: '',
+    codexRequired: false,
+    fromReagent: false,
+    reagentPolicyPath: null,
+    reagentNotices: [],
+    ...overrides,
+  };
+}
+
+const FAKE_BOTH: TargetState = { gitRepoPresent: true, huskyDirPresent: true };
+const FAKE_GIT_ONLY: TargetState = { gitRepoPresent: true, huskyDirPresent: false };
+const FAKE_HUSKY_ONLY: TargetState = { gitRepoPresent: false, huskyDirPresent: true };
+const FAKE_NEITHER: TargetState = { gitRepoPresent: false, huskyDirPresent: false };
+
+describe('0.43.0 — buildInstallSummary', () => {
+  it('lists the policy file, the chosen profile, and the autonomy levels', () => {
+    const summary = buildInstallSummary(
+      '/scratch/proj',
+      fakeConfig({
+        profile: 'bst-internal',
+        autonomyLevel: AutonomyLevel.L2,
+        maxAutonomyLevel: AutonomyLevel.L3,
+        codexRequired: true,
+      }),
+      false,
+      FAKE_BOTH,
+    );
+    expect(summary).toContain('profile=bst-internal');
+    expect(summary).toContain('autonomy=L2 (max=L3)');
+    expect(summary).toContain('codex-review=on');
+    expect(summary).toContain('attribution-block=on');
+    expect(summary).toContain('/scratch/proj');
+  });
+
+  it('includes every artifact the install will touch', () => {
+    const summary = buildInstallSummary('/p', fakeConfig(), false, FAKE_BOTH);
+    // Spot-check: the operator should see every directory and every
+    // hook surface explicitly before confirming.
+    expect(summary).toContain('.rea/policy.yaml');
+    expect(summary).toContain('.rea/registry.yaml');
+    expect(summary).toContain('.rea/install-manifest.json');
+    expect(summary).toContain('.claude/agents/');
+    expect(summary).toContain('.claude/hooks/');
+    expect(summary).toContain('.claude/commands/');
+    expect(summary).toContain('.claude/settings.json');
+    expect(summary).toContain('.husky/commit-msg');
+    expect(summary).toContain('.husky/pre-push');
+    expect(summary).toContain('.git/hooks/commit-msg');
+    expect(summary).toContain('.git/hooks/pre-push');
+    expect(summary).toContain('CLAUDE.md');
+    expect(summary).toContain('.gitignore');
+  });
+
+  it('labels re-run mode and lists which fields are preserved', () => {
+    const summary = buildInstallSummary('/p', fakeConfig(), true, FAKE_BOTH);
+    expect(summary).toMatch(/Mode: Re-run/);
+    expect(summary).toContain('autonomy_level');
+    expect(summary).toContain('blocked_paths');
+    expect(summary).toContain('review.codex_required');
+    expect(summary).toContain('attribution.co_author');
+  });
+
+  it('omits the preserved-fields section on a fresh install', () => {
+    const summary = buildInstallSummary('/p', fakeConfig(), false, FAKE_BOTH);
+    expect(summary).toMatch(/Mode: Fresh install/);
+    expect(summary).not.toMatch(/Re-run preserves/);
+  });
+
+  // 0.43.0 codex round-1 P3: the summary's hook listing must reflect
+  // what the installer will ACTUALLY do given the target tree's
+  // shape. Pre-fix the summary hard-coded `.husky/*` only, hiding
+  // the `.git/hooks/*` writes from the most common install shape.
+  it('codex round-1 P3: lists .git/hooks/* and skips .husky/* when only git is present', () => {
+    const summary = buildInstallSummary('/p', fakeConfig(), false, FAKE_GIT_ONLY);
+    expect(summary).toContain('.git/hooks/commit-msg');
+    expect(summary).toContain('.git/hooks/prepare-commit-msg');
+    expect(summary).toContain('.git/hooks/pre-push');
+    // Husky mirrors must NOT be advertised when the tree lacks .husky/.
+    expect(summary).not.toContain('.husky/commit-msg');
+    expect(summary).toContain('no .husky/ directory detected');
+  });
+
+  it('codex round-1 P3: lists .husky/* and explains git skip when no git repo is present', () => {
+    const summary = buildInstallSummary('/p', fakeConfig(), false, FAKE_HUSKY_ONLY);
+    expect(summary).toContain('.husky/commit-msg');
+    expect(summary).toContain('.husky/pre-push');
+    expect(summary).not.toContain('.git/hooks/commit-msg');
+    expect(summary).toContain('no .git/ directory detected');
+  });
+
+  it('codex round-1 P3: notes that BOTH git and husky writes will be skipped on a bare tree', () => {
+    const summary = buildInstallSummary('/p', fakeConfig(), false, FAKE_NEITHER);
+    expect(summary).toContain('no .git/ directory detected');
+    expect(summary).toContain('no .husky/ directory detected');
+    expect(summary).not.toContain('.git/hooks/commit-msg');
+    expect(summary).not.toContain('.husky/commit-msg');
+  });
+});
+
+describe('0.43.0 — detectTargetState', () => {
+  let prevCwd: string;
+  const cleanup: string[] = [];
+
+  beforeEach(() => {
+    prevCwd = process.cwd();
+  });
+
+  afterEach(async () => {
+    process.chdir(prevCwd);
+    await Promise.all(cleanup.splice(0).map((d) => fs.rm(d, { recursive: true, force: true })));
+  });
+
+  it('reports both git and husky absent on a bare tree', async () => {
+    const dir = await makeScratch();
+    cleanup.push(dir);
+    expect(detectTargetState(dir)).toEqual({ gitRepoPresent: false, huskyDirPresent: false });
+  });
+
+  it('reports gitRepoPresent: true after `git init`', async () => {
+    const dir = await makeScratch();
+    cleanup.push(dir);
+    await execFileAsync('git', ['-C', dir, 'init', '--quiet']);
+    const state = detectTargetState(dir);
+    expect(state.gitRepoPresent).toBe(true);
+    expect(state.huskyDirPresent).toBe(false);
+  });
+
+  it('reports huskyDirPresent: true when .husky/ exists', async () => {
+    const dir = await makeScratch();
+    cleanup.push(dir);
+    await fs.mkdir(path.join(dir, '.husky'));
+    const state = detectTargetState(dir);
+    expect(state.gitRepoPresent).toBe(false);
+    expect(state.huskyDirPresent).toBe(true);
+  });
+});
+
+describe('0.43.0 — postInstallVerify', () => {
+  let prevCwd: string;
+  const cleanup: string[] = [];
+
+  beforeEach(() => {
+    prevCwd = process.cwd();
+  });
+
+  afterEach(async () => {
+    process.chdir(prevCwd);
+    await Promise.all(cleanup.splice(0).map((d) => fs.rm(d, { recursive: true, force: true })));
+  });
+
+  it('returns zero issues on a healthy install (full `rea init --yes` end-to-end)', async () => {
+    const dir = await makeScratch();
+    cleanup.push(dir);
+    process.chdir(dir);
+
+    await runInit({ yes: true, profile: 'minimal', codex: false });
+
+    const issues = postInstallVerify(dir);
+    expect(issues).toEqual([]);
+  });
+
+  it('reports a missing policy.yaml as an issue', async () => {
+    const dir = await makeScratch();
+    cleanup.push(dir);
+
+    // Bare directory with no install at all.
+    const issues = postInstallVerify(dir);
+    expect(issues.length).toBeGreaterThan(0);
+    expect(issues.some((i) => i.includes('policy.yaml missing'))).toBe(true);
+  });
+
+  it('reports a malformed policy.yaml as an issue with a parse error', async () => {
+    const dir = await makeScratch();
+    cleanup.push(dir);
+    await fs.mkdir(path.join(dir, '.rea'), { recursive: true });
+    // Write deliberately invalid YAML.
+    await fs.writeFile(
+      path.join(dir, '.rea', 'policy.yaml'),
+      'this: is: not: valid: yaml:\n  - [unclosed\n',
+      'utf8',
+    );
+
+    const issues = postInstallVerify(dir);
+    expect(issues.some((i) => i.includes('policy.yaml failed to parse'))).toBe(true);
+  });
+
+  it('reports a missing .claude/hooks directory as an issue', async () => {
+    const dir = await makeScratch();
+    cleanup.push(dir);
+    process.chdir(dir);
+
+    await runInit({ yes: true, profile: 'minimal', codex: false });
+
+    // Remove the hooks directory after install to simulate corruption.
+    await fs.rm(path.join(dir, '.claude', 'hooks'), { recursive: true, force: true });
+
+    const issues = postInstallVerify(dir);
+    expect(issues.some((i) => i.includes('hooks/ directory missing'))).toBe(true);
+  });
+
+  it('reports a missing install-manifest.json as an issue (drift detection broken)', async () => {
+    const dir = await makeScratch();
+    cleanup.push(dir);
+    process.chdir(dir);
+
+    await runInit({ yes: true, profile: 'minimal', codex: false });
+    await fs.rm(path.join(dir, '.rea', 'install-manifest.json'), { force: true });
+
+    const issues = postInstallVerify(dir);
+    expect(issues.some((i) => i.includes('install-manifest.json missing'))).toBe(true);
+  });
+});
+
+describe('0.43.0 codex round-1 P2 — `--yes` re-run honors the preservation contract advertised by the summary', () => {
+  // The install-summary screen advertises these fields as preserved
+  // across a re-run. The `--yes` path already implemented this; the
+  // wizard now matches it (round-1 P2 fix). Tests below pin the
+  // `--yes` shape — the wizard interactive prompts are hard to
+  // drive headlessly, but they delegate to the same writer paths.
+  let prevCwd: string;
+  const cleanup: string[] = [];
+
+  beforeEach(() => {
+    prevCwd = process.cwd();
+  });
+
+  afterEach(async () => {
+    process.chdir(prevCwd);
+    await Promise.all(cleanup.splice(0).map((d) => fs.rm(d, { recursive: true, force: true })));
+  });
+
+  it('re-run preserves manually-edited notification_channel', async () => {
+    const dir = await makeScratch();
+    cleanup.push(dir);
+    process.chdir(dir);
+
+    await runInit({ yes: true, profile: 'minimal', codex: false });
+    let raw = await fs.readFile(path.join(dir, '.rea', 'policy.yaml'), 'utf8');
+    // Operator sets a custom notification target.
+    raw = raw.replace(
+      /^notification_channel:.*$/m,
+      'notification_channel: "#ops-rea"',
+    );
+    await fs.writeFile(path.join(dir, '.rea', 'policy.yaml'), raw, 'utf8');
+
+    await new Promise((r) => setTimeout(r, 20));
+    await runInit({ yes: true, profile: 'minimal', codex: false });
+    const second = await fs.readFile(path.join(dir, '.rea', 'policy.yaml'), 'utf8');
+    expect(second).toMatch(/notification_channel:\s*"#ops-rea"/);
+  });
+
+  it('re-run preserves manually-edited review.codex_required when --codex flag absent', async () => {
+    const dir = await makeScratch();
+    cleanup.push(dir);
+    process.chdir(dir);
+
+    // First init: explicit codex: false.
+    await runInit({ yes: true, profile: 'minimal', codex: false });
+    let raw = await fs.readFile(path.join(dir, '.rea', 'policy.yaml'), 'utf8');
+    expect(raw).toMatch(/codex_required:\s*false/);
+
+    // Operator manually flips to true.
+    raw = raw.replace(/codex_required:\s*false/, 'codex_required: true');
+    await fs.writeFile(path.join(dir, '.rea', 'policy.yaml'), raw, 'utf8');
+
+    // Re-run WITHOUT --codex / --no-codex — must preserve the
+    // operator's manual flip. (--force resets, so we use --yes only.)
+    await new Promise((r) => setTimeout(r, 20));
+    await runInit({ yes: true, profile: 'minimal' });
+    const second = await fs.readFile(path.join(dir, '.rea', 'policy.yaml'), 'utf8');
+    expect(second).toMatch(/codex_required:\s*true/);
+  });
+});
+
+describe('0.43.0 — runInit --yes path still bypasses the new confirm gate', () => {
+  // The new install-summary confirm gate is interactive-only. The
+  // non-interactive `--yes` path is the production CI path and must
+  // NEVER block waiting for a confirm — that would deadlock every
+  // automated install.
+  let prevCwd: string;
+  const cleanup: string[] = [];
+
+  beforeEach(() => {
+    prevCwd = process.cwd();
+  });
+
+  afterEach(async () => {
+    process.chdir(prevCwd);
+    await Promise.all(cleanup.splice(0).map((d) => fs.rm(d, { recursive: true, force: true })));
+  });
+
+  it('completes a full init without blocking on a confirm prompt', async () => {
+    const dir = await makeScratch();
+    cleanup.push(dir);
+    process.chdir(dir);
+
+    // If the confirm gate were not bypassed under `--yes`, this would
+    // hang indefinitely waiting for stdin. The fact that it returns
+    // proves the bypass.
+    await runInit({ yes: true, profile: 'minimal', codex: false });
+
+    // Sanity: install really did happen.
+    expect(await fs.stat(path.join(dir, '.rea', 'policy.yaml'))).toBeDefined();
+    expect(await fs.stat(path.join(dir, '.claude', 'settings.json'))).toBeDefined();
+  });
+
+  it('completes a re-run init under --force without blocking on confirms', async () => {
+    const dir = await makeScratch();
+    cleanup.push(dir);
+    process.chdir(dir);
+
+    await runInit({ yes: true, profile: 'minimal', codex: false });
+    // Second run under --force exercises the re-run path. Must also
+    // bypass the confirm gate.
+    await runInit({ yes: true, profile: 'minimal', codex: false, force: true });
+
+    expect(await fs.stat(path.join(dir, '.rea', 'policy.yaml'))).toBeDefined();
   });
 });
