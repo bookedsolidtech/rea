@@ -115,42 +115,89 @@ const DEFAULT_ITERATIONS = 10;
 const DEFAULT_WARMUP = 2;
 
 /**
- * Per-hook stdin payload generator. Each shim sees a Claude Code
- * PreToolUse/PostToolUse event JSON; the shape varies slightly per
- * hook (Bash vs Edit vs Write). We use intentionally innocuous
- * payloads so the shim runs through its full hot path without
- * blocking — that's the realistic latency we want to measure.
+ * 0.46.0 charter item 3 — per-hook payload variants.
  *
- * Returns the JSON string to pipe into the shim's stdin.
+ * Pre-0.46.0 the harness used generic Bash/Write/Edit payloads for
+ * EVERY shim. That undercounted latency for several gates:
+ *
+ *   - `attribution-advisory.sh`, `security-disclosure-gate.sh`,
+ *     `env-file-protection.sh`, `dependency-audit-gate.sh`,
+ *     `changeset-security-gate.sh`, `local-review-gate.sh` all have
+ *     `shim_is_relevant` short-circuits that exit at the relevance
+ *     pre-gate when the payload's substring marker isn't present.
+ *     The generic `ls -la` Bash payload hit those short-circuits and
+ *     the measured latency reflected the short-circuit path, not the
+ *     real hot path the shim runs when a relevant command actually
+ *     comes through.
+ *   - `secret-scanner.sh` short-circuits on empty content; the generic
+ *     write payload had content, so this one was already measuring
+ *     the real path. Still — pinning a MATCH variant makes the
+ *     contract explicit.
+ *
+ * The fix profiles every shim under TWO payloads:
+ *
+ *   - `match`     — crafted to PASS `shim_is_relevant` so the shim
+ *                   runs its full hot path (sandbox check + version
+ *                   probe + Node CLI forward + actual body work).
+ *                   This is the latency the operator pays when a
+ *                   relevant command lands.
+ *   - `no_match`  — crafted to FAIL `shim_is_relevant` so the shim
+ *                   short-circuits at the pre-gate. This is the
+ *                   latency the operator pays on EVERY irrelevant
+ *                   command — and since most commands are
+ *                   irrelevant to most shims, this is the dominant
+ *                   cumulative cost.
+ *
+ * Both are reported in the baseline. Shims without a relevance
+ * short-circuit (the always-on tier: dangerous-bash-interceptor,
+ * blocked-paths-*, settings-protection, delegation-capture,
+ * delegation-advisory, architecture-review-gate, pr-issue-link-gate)
+ * use the same payload for `match` and `no_match` — both variants
+ * exercise the same path. The `no_match` field stays so the JSON
+ * shape is uniform across shims, and the renderer flags
+ * `same_as_match: true` for those rows.
+ *
+ * MATCH payloads are crafted to be RELEVANT but NOT REFUSED — they
+ * pass the substring pre-gate but the full CLI body exits 0. The
+ * goal is to measure latency, not to exercise the refusal path. Two
+ * subtleties to keep in mind:
+ *
+ *   - `attribution-advisory`: `git commit` is relevant; we use
+ *     `git commit -m "feat: noop"` which carries no AI attribution
+ *     markers (`Co-Authored-By:` with an AI name, "Generated with
+ *     [Tool]" footers) so the CLI exits 0 after the body work.
+ *   - `dangerous-bash-interceptor`: every match-payload candidate
+ *     (`git status`, `npm ls`, etc) carries refusal risk via the
+ *     overlap with the CLI's bypass-corpus. We use `git status` —
+ *     a known-safe in-the-clear command that does not refuse — and
+ *     accept that the shim has no `shim_is_relevant` gate anyway
+ *     (CLI-missing path uses `shim_cli_missing_relevant` which is
+ *     a DIFFERENT branch and only fires when dist/cli is missing).
+ *     Under the normal CLI-reachable steady state, both `match` and
+ *     `no_match` payloads exercise the same full-CLI path here.
+ *
+ * Returns a `{ match: string, no_match: string }` object — both
+ * fields are non-null JSON event strings.
  */
-export function payloadForHook(name) {
-  // PreToolUse Bash event (Bash-tier hooks): a simple `ls` payload —
-  // not destructive, not policy-relevant, not a git push. The shim
-  // should run to completion without refusal.
-  const bashEvent = JSON.stringify({
+export function payloadVariantsForHook(name) {
+  // Reusable generic events.
+  const benignBashEvent = JSON.stringify({
     tool_name: 'Bash',
     tool_input: { command: 'ls -la', description: 'list current directory' },
     hook_event_name: 'PreToolUse',
   });
-
-  // PreToolUse Write event (Write-tier hooks): writing a benign .ts
-  // file with no secrets, no protected-path target.
-  const writeEvent = JSON.stringify({
+  const benignWriteEvent = JSON.stringify({
     tool_name: 'Write',
     tool_input: { file_path: '/tmp/rea-profile-scratch.ts', content: 'export const x = 1;\n' },
     hook_event_name: 'PreToolUse',
   });
-
-  // PostToolUse Edit event (architecture-review-gate fires PostToolUse).
-  const postEditEvent = JSON.stringify({
+  const benignPostEditEvent = JSON.stringify({
     tool_name: 'Edit',
     tool_input: { file_path: '/tmp/scratch.ts', old_string: 'a', new_string: 'b' },
     tool_response: { success: true },
     hook_event_name: 'PostToolUse',
   });
-
-  // PreToolUse Agent event (delegation-capture matches Agent|Skill).
-  const agentEvent = JSON.stringify({
+  const benignAgentEvent = JSON.stringify({
     tool_name: 'Agent',
     tool_input: { subagent_type: 'general-purpose', prompt: 'noop' },
     hook_event_name: 'PreToolUse',
@@ -158,57 +205,234 @@ export function payloadForHook(name) {
 
   switch (name) {
     case 'architecture-review-gate.sh':
-      return postEditEvent;
+      // PostToolUse on every Edit — no relevance pre-gate at the shim
+      // tier; the CLI body decides. Both variants exercise the same
+      // path.
+      return { match: benignPostEditEvent, no_match: benignPostEditEvent };
+
     case 'attribution-advisory.sh':
-      // Triggers on Bash `git commit` / `gh pr create`. We use a
-      // non-attribution payload so it runs through and exits clean.
-      return JSON.stringify({
-        tool_name: 'Bash',
-        tool_input: { command: 'git status', description: 'check status' },
-        hook_event_name: 'PreToolUse',
-      });
+      // Pre-gate: substring match for `git commit` OR `gh pr (create|edit)`.
+      // MATCH: `git commit -m "feat: noop"` (no AI attribution markers
+      // so the CLI body exits 0 after running its full check).
+      // NO_MATCH: `git status` (no commit/pr-create substring).
+      return {
+        match: JSON.stringify({
+          tool_name: 'Bash',
+          tool_input: {
+            command: 'git commit -m "feat: noop"',
+            description: 'noop commit',
+          },
+          hook_event_name: 'PreToolUse',
+        }),
+        no_match: JSON.stringify({
+          tool_name: 'Bash',
+          tool_input: { command: 'git status', description: 'check status' },
+          hook_event_name: 'PreToolUse',
+        }),
+      };
+
     case 'blocked-paths-bash-gate.sh':
-      return bashEvent;
+      // Shim has only `shim_cli_missing_relevant` (CLI-missing only).
+      // Under normal CLI-reachable steady state, both variants run
+      // the full CLI body. Same payload for both.
+      return { match: benignBashEvent, no_match: benignBashEvent };
+
     case 'blocked-paths-enforcer.sh':
-      return writeEvent;
+      // Same as above — CLI-missing-only relevance gate. Both variants
+      // hit the full CLI body when CLI is reachable.
+      return { match: benignWriteEvent, no_match: benignWriteEvent };
+
     case 'changeset-security-gate.sh':
-      return writeEvent;
+      // Pre-gate: file_path / notebook_path contains `.changeset/`.
+      // MATCH: a benign changeset frontmatter (no GHSA reference so
+      // the CLI body's disclosure scan exits 0).
+      // NO_MATCH: a Write to /tmp/foo.ts (no `.changeset/` substring).
+      return {
+        match: JSON.stringify({
+          tool_name: 'Write',
+          tool_input: {
+            file_path: '/tmp/changeset-profile/.changeset/perf-noop.md',
+            content: '---\n"@scope/pkg": patch\n---\n\nperf noop\n',
+          },
+          hook_event_name: 'PreToolUse',
+        }),
+        no_match: benignWriteEvent,
+      };
+
     case 'dangerous-bash-interceptor.sh':
-      return bashEvent;
-    case 'delegation-advisory.sh':
-      // Fires PostToolUse on Bash|Edit|Write|MultiEdit|NotebookEdit.
-      return JSON.stringify({
+      // No `shim_is_relevant` — every Bash event goes through the
+      // full CLI body. `git status` is the safest candidate: no rule
+      // head H1-H17 + M1 fires on it. Both variants are the same.
+      return { match: benignBashEvent, no_match: benignBashEvent };
+
+    case 'delegation-advisory.sh': {
+      // PostToolUse on Bash|Edit|Write|MultiEdit|NotebookEdit. No
+      // relevance pre-gate; CLI body decides. Both same.
+      const delegationAdvisoryEvent = JSON.stringify({
         tool_name: 'Write',
         tool_input: { file_path: '/tmp/scratch.ts', content: 'x' },
         tool_response: { success: true },
         hook_event_name: 'PostToolUse',
       });
+      return { match: delegationAdvisoryEvent, no_match: delegationAdvisoryEvent };
+    }
+
     case 'delegation-capture.sh':
-      return agentEvent;
+      // PreToolUse on Agent|Skill matcher — every Agent/Skill event
+      // goes through the CLI body. Both variants are the same.
+      return { match: benignAgentEvent, no_match: benignAgentEvent };
+
     case 'dependency-audit-gate.sh':
-      // Fires on Bash. Payload is benign — not an install command.
-      return bashEvent;
+      // Pre-gate: substring match for `(npm|pnpm|yarn) (install|i|add) `.
+      // MATCH: `pnpm add ./local-pkg` — passes the segment-anchored
+      // install matcher (full hot path through splitSegments + the
+      // env-prefix strip + the per-segment scan), but the
+      // package-name extractor in `src/hooks/dependency-audit-gate/
+      // index.ts` skips `./` / `/` / `../` tokens as path installs.
+      // After the scan, `packages.length === 0` → the hook returns
+      // exit 0 WITHOUT a `npm view` network call. Codex round-1 P2
+      // (0.46.0): the earlier `pnpm add lodash` payload triggered
+      // the real registry probe and `runProfile()` exited 2 on any
+      // offline / firewalled / npm-outage machine, making the harness
+      // unusable without external network access. The path-install
+      // variant keeps the hot path measured without the network
+      // dependency.
+      // NO_MATCH: `ls -la` (no install verb → segment matcher misses).
+      return {
+        match: JSON.stringify({
+          tool_name: 'Bash',
+          tool_input: {
+            command: 'pnpm add ./local-pkg',
+            description: 'install a local path package',
+          },
+          hook_event_name: 'PreToolUse',
+        }),
+        no_match: benignBashEvent,
+      };
+
     case 'env-file-protection.sh':
-      return bashEvent;
+      // Pre-gate: `.env` substring in tool_input.command.
+      // MATCH: `cat .env.example` — relevant (`.env` substring) but
+      // benign (`.env.example` is excluded by the CLI body's
+      // co-occurrence + suffix logic).
+      // NO_MATCH: `ls -la` (no `.env`).
+      return {
+        match: JSON.stringify({
+          tool_name: 'Bash',
+          tool_input: {
+            command: 'cat .env.example',
+            description: 'check example env',
+          },
+          hook_event_name: 'PreToolUse',
+        }),
+        no_match: benignBashEvent,
+      };
+
     case 'local-review-gate.sh':
-      // Fires on Bash. Use a non-push command so the gate runs through
-      // its policy-read path without triggering the actual
-      // local-review refusal.
-      return bashEvent;
+      // Pre-gate is policy-driven on `review.local_review.refuse_at`.
+      // Default `refuse_at: push` triggers on `git push`. But the
+      // body fails CLOSED when the policy is enforced — we'd refuse
+      // the synthetic payload and exit non-zero, which breaks the
+      // round-1 P2 #2 "every shim exits 0" contract.
+      //
+      // The safe match variant uses `REA_SKIP_LOCAL_REVIEW=1` env
+      // inheritance — but the harness explicitly sets env via
+      // `runOnce`, and we don't want to globally bypass the gate
+      // (that would invalidate the no-match variant too).
+      //
+      // Settled approach: NO_MATCH uses `git status` (no `git push`
+      // trigger → short-circuit at step 5 / 6). MATCH uses the
+      // explicit early-bypass envelope to drive the forward path
+      // without refusal — the shim's step 2b checks
+      // REA_SKIP_LOCAL_REVIEW from the environment, NOT from the
+      // payload, so we cannot drive it via JSON. Instead we use a
+      // `git status` payload for BOTH variants and document that
+      // local-review-gate is in the "no shim_is_relevant gate" tier:
+      // the policy-driven scan still fires, but a non-`git push`
+      // command exits before the heavy forward path. The body's
+      // genuine hot path under a `git push` is impossible to
+      // measure in a non-refusing way without ambient env bypass.
+      //
+      // Net: same payload for both variants. The baseline doc notes
+      // this limitation explicitly.
+      return { match: benignBashEvent, no_match: benignBashEvent };
+
     case 'pr-issue-link-gate.sh':
-      // Fires on `gh pr create`. Benign Bash payload.
-      return bashEvent;
+      // No `shim_is_relevant`. Advisory-tier; CLI body decides.
+      // Both variants are the same (`same_as_match: true` in the
+      // baseline) — the CLI body's `gh pr create` matcher fires only
+      // on that exact prefix, but the shim-tier latency is identical
+      // either way.
+      return { match: benignBashEvent, no_match: benignBashEvent };
+
     case 'protected-paths-bash-gate.sh':
-      return bashEvent;
+      // CLI-missing-only relevance gate. Under normal CLI-reachable
+      // steady state both variants run the full CLI body.
+      return { match: benignBashEvent, no_match: benignBashEvent };
+
     case 'secret-scanner.sh':
-      return writeEvent;
+      // Pre-gate short-circuits on empty content or `.env.example` /
+      // `.env.sample` suffix.
+      // MATCH: a benign `.ts` Write with non-credential content — the
+      // CLI body runs the full 17-pattern catalog and exits 0.
+      // NO_MATCH: a Write to `/tmp/foo.env.example` — pre-gate
+      // suffix short-circuit fires.
+      return {
+        match: benignWriteEvent,
+        no_match: JSON.stringify({
+          tool_name: 'Write',
+          tool_input: {
+            file_path: '/tmp/scratch.env.example',
+            content: 'EXAMPLE_VAR=changeme\n',
+          },
+          hook_event_name: 'PreToolUse',
+        }),
+      };
+
     case 'security-disclosure-gate.sh':
-      return bashEvent;
+      // Pre-gate: substring match for `gh issue create`.
+      // MATCH: `gh issue create --title "feat: noop"` — relevant,
+      // but no security keywords so the CLI body exits 0.
+      // NO_MATCH: `gh issue list` (no `create`).
+      return {
+        match: JSON.stringify({
+          tool_name: 'Bash',
+          tool_input: {
+            command: 'gh issue create --title "docs: noop"',
+            description: 'create a docs issue',
+          },
+          hook_event_name: 'PreToolUse',
+        }),
+        no_match: JSON.stringify({
+          tool_name: 'Bash',
+          tool_input: { command: 'gh issue list', description: 'list issues' },
+          hook_event_name: 'PreToolUse',
+        }),
+      };
+
     case 'settings-protection.sh':
-      return writeEvent;
+      // CLI-missing-only relevance gate. Under normal CLI-reachable
+      // steady state both variants run the full CLI body.
+      return { match: benignWriteEvent, no_match: benignWriteEvent };
+
     default:
-      return bashEvent;
+      // Conservative fallback: a benign Bash payload for both.
+      return { match: benignBashEvent, no_match: benignBashEvent };
   }
+}
+
+/**
+ * Per-hook stdin payload generator — BACKWARDS-COMPATIBLE wrapper.
+ * Pre-0.46.0 callers used `payloadForHook(name)`. The harness now
+ * profiles each shim under two variants (`match` + `no_match`); this
+ * wrapper returns the `match` variant for legacy callers (e.g. the
+ * existing regression test). Kept exported so external scripts / tests
+ * that imported `payloadForHook` continue to work without churn.
+ *
+ * New callers should use `payloadVariantsForHook(name)` directly.
+ */
+export function payloadForHook(name) {
+  return payloadVariantsForHook(name).match;
 }
 
 /**
@@ -256,6 +480,44 @@ function percentile(sorted, p) {
 }
 
 /**
+ * Run a measurement sweep for a single payload variant and return
+ * the per-variant record. Helper for `profileHook` which runs both
+ * `match` and `no_match` variants per shim (0.46.0 charter item 3).
+ */
+function measureVariant(hookPath, payload, iterations, warmup) {
+  for (let i = 0; i < warmup; i += 1) {
+    runOnce(hookPath, payload);
+  }
+  const samples = [];
+  const exitCodes = [];
+  for (let i = 0; i < iterations; i += 1) {
+    const r = runOnce(hookPath, payload);
+    samples.push(r.ms);
+    exitCodes.push(r.status);
+  }
+  const sorted = [...samples].sort((a, b) => a - b);
+  const median = percentile(sorted, 50);
+  const p95 = percentile(sorted, 95);
+  const max = sorted[sorted.length - 1];
+  const nonZero = exitCodes.filter((c) => c !== 0);
+  const error =
+    nonZero.length > 0
+      ? `${nonZero.length}/${exitCodes.length} samples exited non-zero ` +
+        `(codes: ${exitCodes.join(',')}). Synthetic payload likely hit an ` +
+        `error path; latency is NOT representative of the hot path. ` +
+        `Tune the payload in payloadVariantsForHook() so this shim exits 0.`
+      : null;
+  return {
+    median_ms: round(median),
+    p95_ms: round(p95),
+    max_ms: round(max),
+    samples_ms: samples.map(round),
+    exit_codes: exitCodes,
+    error,
+  };
+}
+
+/**
  * Profile a single hook. Returns the measurement record.
  *
  * 0.45.0 codex round-1 P2 #2: every shim is expected to exit 0 under
@@ -267,52 +529,46 @@ function percentile(sorted, p) {
  * surfacing any non-zero exit, and `runProfile` propagates it to the
  * report so callers can fail loudly rather than silently shipping a
  * "healthy" baseline that timed nothing but error paths.
+ *
+ * 0.46.0 charter item 3: every shim is profiled TWICE — once with a
+ * `match` payload (passes the shim_is_relevant pre-gate, exercises the
+ * full hot path) and once with a `no_match` payload (fails the
+ * pre-gate, exercises the short-circuit). Shims without a relevance
+ * pre-gate run the same payload for both variants and `same_as_match`
+ * is set to `true` so the renderer can collapse the row.
+ *
+ * The top-level record fields (`median_ms`, `p95_ms`, `max_ms`,
+ * `samples_ms`, `exit_codes`, `error`) reflect the MATCH variant —
+ * that's the hot path the ceiling enforcement budgets, and keeping
+ * those fields at the top level preserves the pre-0.46.0 baseline
+ * JSON shape for any external consumer. The `no_match` variant lives
+ * under `no_match: { median_ms, p95_ms, max_ms, samples_ms,
+ * exit_codes, error }` (set to `null` when same_as_match is true,
+ * since the numbers would be redundant).
  */
 export function profileHook(name, opts = {}) {
   const iterations = opts.iterations ?? DEFAULT_ITERATIONS;
   const warmup = opts.warmup ?? DEFAULT_WARMUP;
   const hooksDir = opts.hooksDir ?? HOOKS_DIR;
   const hookPath = path.join(hooksDir, name);
-  const payload = payloadForHook(name);
+  const variants = payloadVariantsForHook(name);
+  const sameAsMatch = variants.match === variants.no_match;
 
-  for (let i = 0; i < warmup; i += 1) {
-    runOnce(hookPath, payload);
-  }
-
-  const samples = [];
-  const exitCodes = [];
-  for (let i = 0; i < iterations; i += 1) {
-    const r = runOnce(hookPath, payload);
-    samples.push(r.ms);
-    exitCodes.push(r.status);
-  }
-
-  const sorted = [...samples].sort((a, b) => a - b);
-  const median = percentile(sorted, 50);
-  const p95 = percentile(sorted, 95);
-  const max = sorted[sorted.length - 1];
-
-  // 0.45.0 codex round-1 P2 #2: surface non-zero exits. -1 marks a
-  // timeout (runOnce normalizes spawnSync's null status). Any
-  // non-zero value means the shim ran a refusal / error path, not
-  // the steady-state hot path the measurement assumes.
-  const nonZero = exitCodes.filter((c) => c !== 0);
-  const error =
-    nonZero.length > 0
-      ? `${nonZero.length}/${exitCodes.length} samples exited non-zero ` +
-        `(codes: ${exitCodes.join(',')}). Synthetic payload likely hit an ` +
-        `error path; latency is NOT representative of the hot path. ` +
-        `Tune the payload in payloadForHook() so this shim exits 0.`
-      : null;
+  const matchMeas = measureVariant(hookPath, variants.match, iterations, warmup);
+  const noMatchMeas = sameAsMatch
+    ? null
+    : measureVariant(hookPath, variants.no_match, iterations, warmup);
 
   return {
     name,
-    median_ms: round(median),
-    p95_ms: round(p95),
-    max_ms: round(max),
-    samples_ms: samples.map(round),
-    exit_codes: exitCodes,
-    error,
+    // MATCH variant — the hot path. Top-level fields preserve
+    // backwards compatibility with the pre-0.46.0 record shape.
+    ...matchMeas,
+    // 0.46.0 — per-variant breakout. `no_match: null` means the shim
+    // has no shim_is_relevant pre-gate, so both variants would
+    // measure the same path.
+    same_as_match: sameAsMatch,
+    no_match: noMatchMeas,
   };
 }
 
@@ -400,12 +656,19 @@ async function main() {
 
   const json = JSON.stringify(report, null, 2) + '\n';
 
-  // Human-readable summary on stderr (top 5 by p95).
-  process.stderr.write('\n[profile-hooks] p95 leaders:\n');
+  // Human-readable summary on stderr (top 5 by MATCH p95).
+  // 0.46.0 charter item 3: surface the relevance-MATCH p95 (hot path)
+  // alongside the no-match p95 (short-circuit) so the operator sees
+  // both at a glance. Shims without a relevance pre-gate render the
+  // no_match column as `—`.
+  process.stderr.write('\n[profile-hooks] p95 leaders (MATCH = hot path, NO_MATCH = short-circuit):\n');
   for (const r of report.hooks.slice(0, 5)) {
+    const matchP95 = String(r.p95_ms).padStart(7);
+    const noMatchP95 = r.no_match !== null ? `${String(r.no_match.p95_ms).padStart(7)}ms` : '      —';
     process.stderr.write(
       `  ${r.name.padEnd(32)}  ` +
-        `p95=${String(r.p95_ms).padStart(7)}ms  ` +
+        `match.p95=${matchP95}ms  ` +
+        `no_match.p95=${noMatchP95}  ` +
         `median=${String(r.median_ms).padStart(7)}ms  ` +
         `max=${String(r.max_ms).padStart(7)}ms\n`,
     );
@@ -419,13 +682,23 @@ async function main() {
   // run BEFORE the baseline write — a failed measurement run must
   // NOT clobber the checked-in last-known-good baseline. The dry-run
   // branch still emits JSON for inspection regardless.
-  const errored = report.hooks.filter((h) => h.error !== null);
+  //
+  // 0.46.0 charter item 3: check BOTH match and no_match variants.
+  // Either error path means the synthetic payload is wrong.
+  const errored = report.hooks.filter(
+    (h) => h.error !== null || (h.no_match !== null && h.no_match.error !== null),
+  );
   if (errored.length > 0) {
     process.stderr.write(
       `\n[profile-hooks] ${errored.length} shim(s) ran a non-zero error path:\n`,
     );
     for (const h of errored) {
-      process.stderr.write(`  ${h.name}: ${h.error}\n`);
+      if (h.error !== null) {
+        process.stderr.write(`  ${h.name} [match]: ${h.error}\n`);
+      }
+      if (h.no_match !== null && h.no_match.error !== null) {
+        process.stderr.write(`  ${h.name} [no_match]: ${h.no_match.error}\n`);
+      }
     }
     process.stderr.write(
       `[profile-hooks] NOT writing ${BASELINE_PATH} — last-known-good baseline preserved.\n`,
@@ -434,15 +707,31 @@ async function main() {
     process.exit(2);
   }
 
-  const overBudget = report.hooks.filter((h) => h.p95_ms > ceilingForShim(h.name));
+  // 0.46.0 charter item 3: enforce the ceiling on both variants. The
+  // no_match short-circuit should be much faster than the match hot
+  // path; if it exceeds the same ceiling that's a sign of regression
+  // in the pre-gate path itself (e.g. an inadvertent CLI spawn before
+  // shim_is_relevant fires).
+  const overBudget = report.hooks.filter(
+    (h) =>
+      h.p95_ms > ceilingForShim(h.name) ||
+      (h.no_match !== null && h.no_match.p95_ms > ceilingForShim(h.name)),
+  );
   if (overBudget.length > 0) {
     process.stderr.write(
       `\n[profile-hooks] ${overBudget.length} shim(s) exceeded the p95 ceiling:\n`,
     );
     for (const h of overBudget) {
-      process.stderr.write(
-        `  ${h.name}  p95=${h.p95_ms}ms (ceiling=${ceilingForShim(h.name)}ms)\n`,
-      );
+      if (h.p95_ms > ceilingForShim(h.name)) {
+        process.stderr.write(
+          `  ${h.name} [match]  p95=${h.p95_ms}ms (ceiling=${ceilingForShim(h.name)}ms)\n`,
+        );
+      }
+      if (h.no_match !== null && h.no_match.p95_ms > ceilingForShim(h.name)) {
+        process.stderr.write(
+          `  ${h.name} [no_match]  p95=${h.no_match.p95_ms}ms (ceiling=${ceilingForShim(h.name)}ms)\n`,
+        );
+      }
     }
     process.stderr.write(
       `[profile-hooks] NOT writing ${BASELINE_PATH} — last-known-good baseline preserved.\n`,

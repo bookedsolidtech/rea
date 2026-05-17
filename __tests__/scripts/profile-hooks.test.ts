@@ -38,6 +38,7 @@ import {
   runProfile,
   listShims,
   payloadForHook,
+  payloadVariantsForHook,
   ceilingForShim,
 } from '../../scripts/profile-hooks.mjs';
 
@@ -79,6 +80,59 @@ describe('0.45.0 charter item 1 — profile-hooks harness', () => {
       expect(parsed).toHaveProperty('hook_event_name');
     }
   });
+
+  // 0.46.0 charter item 3 — per-hook MATCH + NO_MATCH variants.
+  // Every shipped shim must have BOTH variants defined; both must be
+  // valid Claude Code event JSON. Shims without a `shim_is_relevant`
+  // pre-gate set match === no_match so the profiler can flag them as
+  // `same_as_match: true` rather than running redundant measurements.
+  describe('0.46.0 charter item 3 — payloadVariantsForHook', () => {
+    it('returns { match, no_match } for every shipped shim, both JSON-parsable', () => {
+      for (const name of listShims() as string[]) {
+        const variants = payloadVariantsForHook(name) as { match: string; no_match: string };
+        expect(variants).toHaveProperty('match');
+        expect(variants).toHaveProperty('no_match');
+        expect(typeof variants.match).toBe('string');
+        expect(typeof variants.no_match).toBe('string');
+        expect(() => JSON.parse(variants.match)).not.toThrow();
+        expect(() => JSON.parse(variants.no_match)).not.toThrow();
+        for (const v of [variants.match, variants.no_match]) {
+          const parsed = JSON.parse(v) as Record<string, unknown>;
+          expect(parsed).toHaveProperty('tool_name');
+          expect(parsed).toHaveProperty('hook_event_name');
+        }
+      }
+    });
+
+    it('payloadForHook stays backwards-compatible with the MATCH variant', () => {
+      for (const name of listShims() as string[]) {
+        const variants = payloadVariantsForHook(name) as { match: string; no_match: string };
+        expect(payloadForHook(name)).toBe(variants.match);
+      }
+    });
+
+    // 0.46.0 charter item 3 — distinct payloads for shims with a
+    // `shim_is_relevant` pre-gate. Pre-fix, the harness reused the
+    // generic Bash/Write payloads and these shims silently measured
+    // the short-circuit path instead of the hot path. This test pins
+    // that the new mapping uses DIFFERENT payloads for the shims
+    // documented in the charter.
+    const SHIMS_WITH_RELEVANCE_GATE = [
+      'attribution-advisory.sh',
+      'changeset-security-gate.sh',
+      'dependency-audit-gate.sh',
+      'env-file-protection.sh',
+      'secret-scanner.sh',
+      'security-disclosure-gate.sh',
+    ];
+
+    for (const name of SHIMS_WITH_RELEVANCE_GATE) {
+      it(`${name} has distinct MATCH and NO_MATCH variants`, () => {
+        const variants = payloadVariantsForHook(name) as { match: string; no_match: string };
+        expect(variants.match).not.toBe(variants.no_match);
+      });
+    }
+  });
 });
 
 describe('0.45.0 charter item 1 — profile-hooks per-shim p95 ceiling', () => {
@@ -95,12 +149,29 @@ describe('0.45.0 charter item 1 — profile-hooks per-shim p95 ceiling', () => {
     () => {
       // Tiny sweep is enough to surface a bad payload — any shim that
       // hits an error path will exit non-zero on every iteration.
+      // 0.46.0 charter item 3 — check both match and no_match variants.
       const report = runProfile({ iterations: 2, warmup: 1 }) as {
-        hooks: Array<{ name: string; error: string | null; exit_codes: number[] }>;
+        hooks: Array<{
+          name: string;
+          error: string | null;
+          exit_codes: number[];
+          no_match: { error: string | null; exit_codes: number[] } | null;
+        }>;
       };
-      const errored = report.hooks.filter((h) => h.error !== null);
+      const errored = report.hooks.filter(
+        (h) => h.error !== null || (h.no_match !== null && h.no_match.error !== null),
+      );
       if (errored.length > 0) {
-        const summary = errored.map((h) => `  ${h.name}: ${h.error}`).join('\n');
+        const summary = errored
+          .flatMap((h) => {
+            const lines: string[] = [];
+            if (h.error !== null) lines.push(`  ${h.name} [match]: ${h.error}`);
+            if (h.no_match !== null && h.no_match.error !== null) {
+              lines.push(`  ${h.name} [no_match]: ${h.no_match.error}`);
+            }
+            return lines;
+          })
+          .join('\n');
         throw new Error(`Shims ran error paths during profiling:\n${summary}`);
       }
       expect(errored).toEqual([]);
@@ -112,18 +183,36 @@ describe('0.45.0 charter item 1 — profile-hooks per-shim p95 ceiling', () => {
     'no shipped shim exceeds its per-shim p95 ceiling',
     () => {
       const report = runProfile({ iterations: 3, warmup: 1 }) as {
-        hooks: Array<{ name: string; p95_ms: number; max_ms: number; median_ms: number }>;
+        hooks: Array<{
+          name: string;
+          p95_ms: number;
+          max_ms: number;
+          median_ms: number;
+          no_match: { p95_ms: number } | null;
+        }>;
       };
+      // 0.46.0 charter item 3 — enforce ceiling on both variants. The
+      // no_match short-circuit must also stay under the ceiling; a
+      // regression in the pre-gate path itself would slip through if
+      // we only checked the match path.
       const overBudget = report.hooks.filter(
-        (h) => h.p95_ms > (ceilingForShim(h.name) as number),
+        (h) =>
+          h.p95_ms > (ceilingForShim(h.name) as number) ||
+          (h.no_match !== null && h.no_match.p95_ms > (ceilingForShim(h.name) as number)),
       );
       if (overBudget.length > 0) {
         const summary = overBudget
-          .map(
-            (h) =>
-              `  ${h.name}: p95=${h.p95_ms}ms ` +
-              `(ceiling=${ceilingForShim(h.name) as number}ms)`,
-          )
+          .flatMap((h) => {
+            const lines: string[] = [];
+            const c = ceilingForShim(h.name) as number;
+            if (h.p95_ms > c) {
+              lines.push(`  ${h.name} [match]: p95=${h.p95_ms}ms (ceiling=${c}ms)`);
+            }
+            if (h.no_match !== null && h.no_match.p95_ms > c) {
+              lines.push(`  ${h.name} [no_match]: p95=${h.no_match.p95_ms}ms (ceiling=${c}ms)`);
+            }
+            return lines;
+          })
           .join('\n');
         throw new Error(
           `Shims exceeded p95 ceiling:\n${summary}\n` +
