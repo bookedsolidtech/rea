@@ -88,6 +88,12 @@ Changes to these paths require extra review:
 
 Tag `@himerus` and clearly explain the threat model impact. If the change alters a security boundary, update `THREAT_MODEL.md` in the same PR.
 
+## Adding or modifying a hook
+
+PreToolUse / PostToolUse hooks (the shell scripts under `hooks/`) have a specific four-file shape — executor + shim + dogfood mirror + parity baseline — and a set of conventions hardened across the 0.32.0–0.42.0 marathon (relevance pre-gate, sandbox check, 4-tier policy reader, `shim_run` API).
+
+**Read [`docs/hook-playbook.md`](./docs/hook-playbook.md) first.** It documents the patterns, the fail-open vs blocking-tier decision, the relevance-keyword catalog rules, the dogfood-mirror bootstrap trick, and the awk-comment-quote class. Following it (plus skimming one existing hook) should get you to a correctly-shaped contribution without re-deriving the lessons.
+
 ## Reporting security issues
 
 **Do not open a public issue.** See [SECURITY.md](./SECURITY.md) for private disclosure channels.

@@ -21,12 +21,16 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { AutonomyLevel } from '../policy/types.js';
 import {
   buildInstallSummary,
+  canonicalInstalledHooks,
   detectTargetState,
+  isModeLessFilesystem,
   postInstallVerify,
   runInit,
   type ResolvedConfig,
   type TargetState,
 } from './init.js';
+import { EXPECTED_HOOKS } from './doctor.js';
+import { defaultDesiredHooks } from './install/settings-merge.js';
 import { FALLBACK_MARKER } from './install/pre-push.js';
 
 const execFileAsync = promisify(execFile);
@@ -857,5 +861,427 @@ describe('0.43.0 — runInit --yes path still bypasses the new confirm gate', ()
     await runInit({ yes: true, profile: 'minimal', codex: false, force: true });
 
     expect(await fs.stat(path.join(dir, '.rea', 'policy.yaml'))).toBeDefined();
+  });
+});
+
+// ──────────────────────────────────────────────────────────────────────
+// 0.44.0 charter item 1 — install summary derives its hook listing
+// from the canonical resolvers (EXPECTED_HOOKS + defaultDesiredHooks),
+// not a hard-coded list. Adding a hook to either source must reflect
+// automatically.
+// ──────────────────────────────────────────────────────────────────────
+
+describe('0.44.0 charter item 1 — canonicalInstalledHooks derives from real resolvers', () => {
+  it('includes every entry in EXPECTED_HOOKS', () => {
+    const hooks = canonicalInstalledHooks();
+    for (const expected of EXPECTED_HOOKS) {
+      expect(hooks).toContain(expected);
+    }
+  });
+
+  it('includes every hook command basename registered by defaultDesiredHooks', () => {
+    const hooks = canonicalInstalledHooks();
+    for (const group of defaultDesiredHooks()) {
+      for (const h of group.hooks) {
+        const cmd = h.command;
+        const slashIdx = cmd.lastIndexOf('/');
+        const basename = slashIdx >= 0 ? cmd.slice(slashIdx + 1) : cmd;
+        if (basename.endsWith('.sh')) expect(hooks).toContain(basename);
+      }
+    }
+  });
+
+  it('is the UNION of both sources (every desired-hooks basename + every EXPECTED_HOOKS entry)', () => {
+    const hooks = canonicalInstalledHooks();
+    const expected = new Set<string>(EXPECTED_HOOKS);
+    for (const group of defaultDesiredHooks()) {
+      for (const h of group.hooks) {
+        const slashIdx = h.command.lastIndexOf('/');
+        const basename = slashIdx >= 0 ? h.command.slice(slashIdx + 1) : h.command;
+        if (basename.endsWith('.sh')) expected.add(basename);
+      }
+    }
+    expect(new Set(hooks)).toEqual(expected);
+  });
+
+  it('returns sorted output (stable ordering for the summary)', () => {
+    const hooks = canonicalInstalledHooks();
+    const sorted = [...hooks].sort();
+    expect(hooks).toEqual(sorted);
+  });
+
+  it('returns no duplicates even when both sources contain the same name', () => {
+    const hooks = canonicalInstalledHooks();
+    const seen = new Set<string>();
+    for (const h of hooks) {
+      expect(seen.has(h)).toBe(false);
+      seen.add(h);
+    }
+  });
+});
+
+describe('0.44.0 charter item 1 — buildInstallSummary reflects the canonical hook count + names', () => {
+  it('renders the hook count from canonicalInstalledHooks', () => {
+    const summary = buildInstallSummary('/p', fakeConfig(), false, FAKE_BOTH);
+    const expected = canonicalInstalledHooks();
+    // The summary line for the hooks directory should report the
+    // exact count, not a hard-coded one. Allowing the count to drift
+    // is exactly the bug this fix targets.
+    expect(summary).toContain(`${expected.length} hook scripts`);
+  });
+
+  it('lists every hook basename returned by canonicalInstalledHooks', () => {
+    const summary = buildInstallSummary('/p', fakeConfig(), false, FAKE_BOTH);
+    for (const name of canonicalInstalledHooks()) {
+      expect(summary).toContain(name);
+    }
+  });
+
+  it('does NOT contain hard-coded hook names not in the canonical list', () => {
+    // Regression guard: if a future edit reintroduces a hard-coded
+    // entry that ALSO drops the canonical derivation, this catches it
+    // by ensuring the summary's hook section length matches what we
+    // computed. We do this by counting lines that start with the
+    // hook-indent (6 spaces + name + ".sh").
+    const summary = buildInstallSummary('/p', fakeConfig(), false, FAKE_BOTH);
+    const expected = canonicalInstalledHooks();
+    const hookLines = summary
+      .split('\n')
+      .filter((l) => /^ {6}[A-Za-z0-9._-]+\.sh$/.test(l));
+    expect(hookLines.length).toBe(expected.length);
+  });
+});
+
+// ──────────────────────────────────────────────────────────────────────
+// 0.44.0 charter item 2 — exec-bit health check is Windows/WSL aware.
+// On mode-less filesystems we skip the 0o111 check and verify file
+// presence + non-empty content instead, with a one-liner advisory
+// explaining the skip.
+// ──────────────────────────────────────────────────────────────────────
+
+describe('0.44.0 charter item 2 — isModeLessFilesystem detection', () => {
+  let prevCwd: string;
+  const cleanup: string[] = [];
+
+  beforeEach(() => {
+    prevCwd = process.cwd();
+  });
+
+  afterEach(async () => {
+    process.chdir(prevCwd);
+    await Promise.all(cleanup.splice(0).map((d) => fs.rm(d, { recursive: true, force: true })));
+  });
+
+  it('returns false on a normal Unix-mode directory with a real .sh present', async () => {
+    if (process.platform === 'win32') return; // not applicable
+    const dir = await makeScratch();
+    cleanup.push(dir);
+    const hooksDir = path.join(dir, '.claude', 'hooks');
+    await fs.mkdir(hooksDir, { recursive: true });
+    const hookPath = path.join(hooksDir, 'sample.sh');
+    await fs.writeFile(hookPath, '#!/bin/bash\nexit 0\n', { mode: 0o755 });
+    expect(isModeLessFilesystem(hooksDir)).toBe(false);
+  });
+
+  it('returns true when ALL 0o777 bits are clear (simulated mode-less FS)', async () => {
+    if (process.platform === 'win32') return;
+    const dir = await makeScratch();
+    cleanup.push(dir);
+    const hooksDir = path.join(dir, '.claude', 'hooks');
+    await fs.mkdir(hooksDir, { recursive: true });
+    const hookPath = path.join(hooksDir, 'sample.sh');
+    await fs.writeFile(hookPath, '#!/bin/bash\nexit 0\n');
+    // Some POSIX systems refuse a chmod to 0; do a best-effort and
+    // skip the assertion when the kernel won't honor it. (Linux
+    // typically refuses chmod 000 from a non-root process; macOS
+    // allows it.)
+    try {
+      await fs.chmod(hookPath, 0o000);
+    } catch {
+      return;
+    }
+    const stat = await fs.stat(hookPath);
+    if ((stat.mode & 0o777) !== 0) return; // kernel didn't honor
+    expect(isModeLessFilesystem(hooksDir)).toBe(true);
+    // Restore so cleanup can remove the file.
+    await fs.chmod(hookPath, 0o644).catch(() => {});
+  });
+
+  it('returns false when the hooks dir contains no .sh files (lets the existence check fire)', async () => {
+    if (process.platform === 'win32') return;
+    const dir = await makeScratch();
+    cleanup.push(dir);
+    const hooksDir = path.join(dir, '.claude', 'hooks');
+    await fs.mkdir(hooksDir, { recursive: true });
+    // Empty directory — no .sh files to sample.
+    expect(isModeLessFilesystem(hooksDir)).toBe(false);
+  });
+
+  it('returns false when readdir throws (lets the caller surface the real error)', () => {
+    // Non-existent path — readdir will throw ENOENT. We expect
+    // isModeLessFilesystem to swallow the error and return false so
+    // the caller's enumeration sees the real failure.
+    expect(isModeLessFilesystem('/this/path/does/not/exist/anywhere')).toBe(false);
+  });
+});
+
+describe('0.44.0 charter item 2 — postInstallVerify mode-less FS skip', () => {
+  let prevCwd: string;
+  const cleanup: string[] = [];
+
+  beforeEach(() => {
+    prevCwd = process.cwd();
+  });
+
+  afterEach(async () => {
+    process.chdir(prevCwd);
+    await Promise.all(cleanup.splice(0).map((d) => fs.rm(d, { recursive: true, force: true })));
+  });
+
+  it('runs the full exec-bit check on a mode-aware FS (no advisory line)', async () => {
+    if (process.platform === 'win32') return;
+    const dir = await makeScratch();
+    cleanup.push(dir);
+    process.chdir(dir);
+
+    await runInit({ yes: true, profile: 'minimal', codex: false });
+
+    const issues = postInstallVerify(dir);
+    // Healthy install on mode-aware FS — no issues AT ALL, including
+    // no advisory lines.
+    expect(issues).toEqual([]);
+  });
+
+  it('emits an advisory + skips exec-bit check when 0o777 bits are clear', async () => {
+    if (process.platform === 'win32') return;
+    const dir = await makeScratch();
+    cleanup.push(dir);
+    process.chdir(dir);
+
+    await runInit({ yes: true, profile: 'minimal', codex: false });
+
+    // Simulate mode-less FS by chmod-ing every .sh file under
+    // .claude/hooks to 0o000. The exec-bit check would normally
+    // fail (zero executable .sh files), but the mode-less detector
+    // should catch the FS shape and skip the check.
+    const hooksDir = path.join(dir, '.claude', 'hooks');
+    const entries = await fs.readdir(hooksDir);
+    let restoreNeeded = false;
+    for (const entry of entries) {
+      if (!entry.endsWith('.sh')) continue;
+      try {
+        await fs.chmod(path.join(hooksDir, entry), 0o000);
+        restoreNeeded = true;
+      } catch {
+        // best-effort
+      }
+    }
+    // Verify the kernel honored the chmod (otherwise the simulation
+    // can't run). Use the first .sh as a probe.
+    const firstSh = entries.find((e) => e.endsWith('.sh'));
+    if (firstSh === undefined) return;
+    const probeStat = await fs.stat(path.join(hooksDir, firstSh));
+    if ((probeStat.mode & 0o777) !== 0) return; // kernel didn't honor
+
+    const issues = postInstallVerify(dir);
+
+    // Expect: at least one advisory line, no "zero executable" error.
+    expect(issues.some((i) => i.startsWith('advisory:'))).toBe(true);
+    expect(issues.some((i) => i.includes('zero executable'))).toBe(false);
+
+    // Restore mode so cleanup can remove files (some filesystems
+    // refuse rm on 0o000 directories).
+    if (restoreNeeded) {
+      for (const entry of entries) {
+        if (!entry.endsWith('.sh')) continue;
+        await fs.chmod(path.join(hooksDir, entry), 0o644).catch(() => {});
+      }
+    }
+  });
+
+  it('still flags an empty .sh file when exec-bit check is skipped (verifies the substitute invariant)', async () => {
+    if (process.platform === 'win32') return;
+    const dir = await makeScratch();
+    cleanup.push(dir);
+    process.chdir(dir);
+
+    await runInit({ yes: true, profile: 'minimal', codex: false });
+
+    // Truncate every .sh to zero bytes AND clear mode bits — the
+    // mode-less branch should still catch the partial-copy failure
+    // because the substitute invariant ("non-empty content") is what
+    // we run instead of the exec-bit check.
+    const hooksDir = path.join(dir, '.claude', 'hooks');
+    const entries = await fs.readdir(hooksDir);
+    let restoreNeeded = false;
+    for (const entry of entries) {
+      if (!entry.endsWith('.sh')) continue;
+      const p = path.join(hooksDir, entry);
+      await fs.writeFile(p, '');
+      try {
+        await fs.chmod(p, 0o000);
+        restoreNeeded = true;
+      } catch {
+        // best-effort
+      }
+    }
+    const firstSh = entries.find((e) => e.endsWith('.sh'));
+    if (firstSh === undefined) return;
+    const probeStat = await fs.stat(path.join(hooksDir, firstSh));
+    if ((probeStat.mode & 0o777) !== 0) return; // kernel didn't honor
+
+    const issues = postInstallVerify(dir);
+
+    // 0.44.0 codex round-1 P2: the substitute invariant now lists the
+    // EMPTY files explicitly (per-file rigor), not a count-only check.
+    expect(issues.some((i) => i.includes('empty hook file'))).toBe(true);
+    expect(issues.some((i) => i.startsWith('advisory:'))).toBe(true);
+
+    if (restoreNeeded) {
+      for (const entry of entries) {
+        if (!entry.endsWith('.sh')) continue;
+        await fs.chmod(path.join(hooksDir, entry), 0o644).catch(() => {});
+      }
+    }
+  });
+
+  // 0.44.0 codex round-1 P2 fix: on mode-less filesystems, the
+  // substitute invariant MUST validate the full canonical hook set,
+  // not just "at least one survivor". Pre-fix a partial copy that
+  // left one non-empty .sh and dropped the rest would falsely report
+  // "install looks healthy".
+  it('codex round-1 P2: flags a partial copy on mode-less FS (some hooks missing, one survives)', async () => {
+    if (process.platform === 'win32') return;
+    const dir = await makeScratch();
+    cleanup.push(dir);
+    process.chdir(dir);
+
+    await runInit({ yes: true, profile: 'minimal', codex: false });
+
+    const hooksDir = path.join(dir, '.claude', 'hooks');
+    const entries = await fs.readdir(hooksDir);
+    // Delete every .sh EXCEPT the first one — simulate the partial-
+    // copy failure shape. The pre-fix substitute invariant (shCount > 0
+    // && nonEmptyCount > 0) would pass on this; the post-fix per-file
+    // check must flag the missing files by name.
+    const firstSh = entries.find((e) => e.endsWith('.sh'));
+    if (firstSh === undefined) return;
+    let restoreCandidates: string[] = [];
+    for (const entry of entries) {
+      if (!entry.endsWith('.sh')) continue;
+      if (entry === firstSh) continue;
+      await fs.rm(path.join(hooksDir, entry), { force: true });
+      restoreCandidates.push(entry);
+    }
+    // Now clear mode bits on the surviving file to trigger the
+    // mode-less branch.
+    let restoreNeeded = false;
+    try {
+      await fs.chmod(path.join(hooksDir, firstSh), 0o000);
+      restoreNeeded = true;
+    } catch {
+      return;
+    }
+    const probeStat = await fs.stat(path.join(hooksDir, firstSh));
+    if ((probeStat.mode & 0o777) !== 0) return;
+
+    const issues = postInstallVerify(dir);
+
+    // Must flag missing files, listing at least one of the canonical
+    // hook names we deleted.
+    expect(issues.some((i) => i.includes('missing') && i.includes('expected hook file'))).toBe(
+      true,
+    );
+    // Should still emit the advisory line so the operator knows we
+    // skipped the exec-bit check.
+    expect(issues.some((i) => i.startsWith('advisory:'))).toBe(true);
+
+    if (restoreNeeded) {
+      await fs.chmod(path.join(hooksDir, firstSh), 0o644).catch(() => {});
+    }
+    // restoreCandidates not used for assertions — listed only to make
+    // the failure-shape simulation traceable.
+    void restoreCandidates;
+  });
+
+  it('codex round-1 P2: returns no issues on mode-less FS when ALL canonical hooks are present + non-empty', async () => {
+    if (process.platform === 'win32') return;
+    const dir = await makeScratch();
+    cleanup.push(dir);
+    process.chdir(dir);
+
+    await runInit({ yes: true, profile: 'minimal', codex: false });
+
+    // Trigger the mode-less branch on a HEALTHY install (every
+    // canonical hook present + non-empty, just mode bits cleared).
+    // The advisory line should fire, but no missing/empty errors.
+    const hooksDir = path.join(dir, '.claude', 'hooks');
+    const entries = await fs.readdir(hooksDir);
+    let restoreNeeded = false;
+    for (const entry of entries) {
+      if (!entry.endsWith('.sh')) continue;
+      try {
+        await fs.chmod(path.join(hooksDir, entry), 0o000);
+        restoreNeeded = true;
+      } catch {
+        // best-effort
+      }
+    }
+    const firstSh = entries.find((e) => e.endsWith('.sh'));
+    if (firstSh === undefined) return;
+    const probeStat = await fs.stat(path.join(hooksDir, firstSh));
+    if ((probeStat.mode & 0o777) !== 0) return;
+
+    const issues = postInstallVerify(dir);
+
+    expect(issues.some((i) => i.startsWith('advisory:'))).toBe(true);
+    expect(issues.some((i) => i.includes('expected hook file'))).toBe(false);
+    expect(issues.some((i) => i.includes('empty hook file'))).toBe(false);
+
+    if (restoreNeeded) {
+      for (const entry of entries) {
+        if (!entry.endsWith('.sh')) continue;
+        await fs.chmod(path.join(hooksDir, entry), 0o644).catch(() => {});
+      }
+    }
+  });
+
+  it('advisory line names the FS class so operators can diagnose the skip', async () => {
+    if (process.platform === 'win32') return;
+    const dir = await makeScratch();
+    cleanup.push(dir);
+    process.chdir(dir);
+
+    await runInit({ yes: true, profile: 'minimal', codex: false });
+
+    const hooksDir = path.join(dir, '.claude', 'hooks');
+    const entries = await fs.readdir(hooksDir);
+    let restoreNeeded = false;
+    for (const entry of entries) {
+      if (!entry.endsWith('.sh')) continue;
+      try {
+        await fs.chmod(path.join(hooksDir, entry), 0o000);
+        restoreNeeded = true;
+      } catch {
+        // best-effort
+      }
+    }
+    const firstSh = entries.find((e) => e.endsWith('.sh'));
+    if (firstSh === undefined) return;
+    const probeStat = await fs.stat(path.join(hooksDir, firstSh));
+    if ((probeStat.mode & 0o777) !== 0) return;
+
+    const issues = postInstallVerify(dir);
+    const advisory = issues.find((i) => i.startsWith('advisory:'));
+    expect(advisory).toBeDefined();
+    // Operator-readable: explain WHY the check was skipped.
+    expect(advisory).toMatch(/Windows|WSL|SMB|mode bits/);
+
+    if (restoreNeeded) {
+      for (const entry of entries) {
+        if (!entry.endsWith('.sh')) continue;
+        await fs.chmod(path.join(hooksDir, entry), 0o644).catch(() => {});
+      }
+    }
   });
 });
