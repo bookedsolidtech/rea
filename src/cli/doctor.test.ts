@@ -2226,6 +2226,59 @@ describe('rea doctor — policy-reader tier checks (0.39.0)', () => {
       expect(result.detail).not.toMatch(/Tier 1 \(CLI\)/);
       expect(result.detail).toMatch(/Tier 2 \(python3\+PyYAML\)/);
     });
+
+    // 0.43.0 codex round-7 P3 (2026-05-17): mirror the round-6 P3 fix
+    // from `checkPolicyReaderTier3` into the summary check's
+    // `flow-form-lists-degraded` branch. Pre-fix the summary always
+    // said "neither jq nor python3 is on PATH" even when python3
+    // WAS on PATH but the execution probe failed (broken pyenv/asdf
+    // shim, sandboxed interpreter). The diagnostic now distinguishes
+    // "python3 absent" from "python3 present but broken", surfaces
+    // the resolved path so the operator can grep for it, and
+    // suggests the right remediation (repair vs install).
+    it('codex round-7 P3: distinguishes broken-shim from python3-absent in summary diagnostic', async () => {
+      const dir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-pr-sum-')));
+      cleanup.push(dir);
+      // Tier 1 reachable; python3 IS on PATH but the execution probe
+      // fails (broken shim shape). No jq, no awk.
+      const result = checkPolicyReaderTierSummary(dir, {
+        cliDistExists: () => true,
+        cliInvokable: () => true,
+        python3OnPath: () => '/usr/local/bin/python3-broken-shim',
+        python3PyYamlReachable: () => false,
+        python3ListWalkerReachable: () => false,
+        awkOnPath: () => null,
+        jqOnPath: () => null,
+      });
+      expect(result.status).toBe('warn');
+      // The resolved python3 path must appear verbatim so the
+      // operator can locate and repair (or remove) the broken shim.
+      expect(result.detail).toMatch(
+        /python3 at \/usr\/local\/bin\/python3-broken-shim cannot execute/,
+      );
+      expect(result.detail).toMatch(/broken pyenv\/asdf shim/);
+      expect(result.detail).toMatch(/repair the python3 interpreter/);
+      // Must NOT report "neither jq nor python3 is on PATH" — python3
+      // IS on PATH; the round-6 → round-7 P3 fix is specifically
+      // about not steering the operator toward `apt-get install
+      // python3` when the binary is already there.
+      expect(result.detail).not.toMatch(/neither jq nor python3 is on PATH/);
+    });
+
+    // Round-7 P3 positive control: when python3 is genuinely absent
+    // (path probe returns null), the legacy "neither jq nor python3"
+    // wording is correct and must stay.
+    it('codex round-7 P3: keeps the "absent" diagnostic when python3 is genuinely off PATH', async () => {
+      const dir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-pr-sum-')));
+      cleanup.push(dir);
+      const result = checkPolicyReaderTierSummary(dir, probes.tier1NoListWalker());
+      expect(result.status).toBe('warn');
+      expect(result.detail).toMatch(/neither jq nor python3 is on PATH/);
+      // Must NOT mention the broken-shim remediation in this shape —
+      // the operator's problem is genuinely "install python3 or jq".
+      expect(result.detail).not.toMatch(/broken pyenv\/asdf shim/);
+      expect(result.detail).not.toMatch(/repair the python3 interpreter/);
+    });
   });
 
   describe('collectChecks wiring — tier checks appear when policy.yaml exists', () => {

@@ -1777,18 +1777,43 @@ export function checkPolicyReaderTierSummary(
 
   if (tier1 || tier2) {
     if (!listWalker) {
-      // Tier 1 + no python3/jq. flow-form scalars work; flow-form
-      // arrays silently no-op via Tier 3 fallthrough. (Tier 2 path
-      // is unreachable here because Tier 2 requires python3.)
+      // Tier 1 + no working list walker. flow-form scalars work;
+      // flow-form arrays silently no-op via Tier 3 fallthrough.
+      // (Tier 2 path is unreachable here because Tier 2 requires
+      // python3 itself reachable.)
+      //
+      // 0.43.0 round-7 P3 (2026-05-17): mirror the round-6 P3 fix
+      // from `checkPolicyReaderTier3`. Pre-fix this branch always
+      // said "neither jq nor python3 is on PATH" — but the
+      // `listWalker` predicate is `jq OR python3ListWalkerReachable`,
+      // so it also fires when python3 IS on PATH but the EXECUTION
+      // probe fails (broken pyenv/asdf shim, dangling symlink,
+      // sandboxed interpreter that fails to start). That
+      // misdiagnosis sent operators chasing the wrong remediation
+      // ("install python3" when python3 was already installed but
+      // broken). Distinguish the two shapes so the operator sees
+      // the actual problem, and surface the resolved path so they
+      // can `ls -l` it on the filesystem.
+      const pythonOnPath = py;
+      const pythonState =
+        pythonOnPath === null
+          ? 'neither jq nor python3 is on PATH'
+          : `jq is not on PATH AND python3 at ${pythonOnPath} cannot execute \`import json\` ` +
+            '(broken pyenv/asdf shim, sandboxed interpreter, or permission-denied binary — ' +
+            'fix the interpreter or remove the shim)';
+      const remediation =
+        pythonOnPath === null
+          ? 'Install jq (`brew install jq` / `apt-get install jq`) or python3 to close the gap.'
+          : `Install jq (\`brew install jq\` / \`apt-get install jq\`) or repair the python3 ` +
+            `interpreter at ${pythonOnPath} to close the gap.`;
       return {
         label,
         status: 'warn',
         detail:
           `${reachable.join(', ')} reachable — flow-form scalars parse via Tier 1 CLI, ` +
-          'BUT neither jq nor python3 is on PATH so `policy_reader_get_list` cannot iterate ' +
+          `BUT ${pythonState} so \`policy_reader_get_list\` cannot iterate ` +
           'the resulting JSON arrays. Flow-form list policy (e.g. `blocked_paths: [.env, ...]`) ' +
-          'silently falls through to Tier 3 awk and misses inline arrays. Install jq ' +
-          '(`brew install jq` / `apt-get install jq`) or python3 to close the gap.',
+          `silently falls through to Tier 3 awk and misses inline arrays. ${remediation}`,
       };
     }
     return {

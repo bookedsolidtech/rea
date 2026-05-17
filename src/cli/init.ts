@@ -90,7 +90,7 @@ const AUTONOMY_LEVELS: AutonomyLevel[] = [
   AutonomyLevel.L3,
 ];
 
-interface ResolvedConfig {
+export interface ResolvedConfig {
   profile: ProfileName;
   autonomyLevel: AutonomyLevel;
   maxAutonomyLevel: AutonomyLevel;
@@ -190,6 +190,30 @@ async function runWizard(
   const projectName = detectProjectName(targetDir);
   p.intro(`rea init — ${projectName}`);
 
+  // 0.43.0 UX polish: surface re-run vs fresh-install mode at the top
+  // of the wizard so the operator sees up-front that an existing policy
+  // is being preserved (not overwritten with defaults). Pre-fix the only
+  // signal was an oblique prompt label change ("current: L2") several
+  // questions in — easy to miss when running the wizard interactively.
+  if (existingPolicy !== undefined) {
+    p.note(
+      [
+        `Existing install detected at ${path.join(REA_DIR, POLICY_FILE)}.`,
+        'Re-run mode: your current settings will be preserved as defaults below.',
+        'Pass --force to reset everything to profile defaults.',
+      ].join('\n'),
+      'Re-running init',
+    );
+  } else {
+    p.note(
+      [
+        `Setting up rea governance for ${projectName}.`,
+        'You can change every answer later by editing .rea/policy.yaml.',
+      ].join('\n'),
+      'Fresh install',
+    );
+  }
+
   let fromReagent = options.fromReagent === true;
   if (!fromReagent && reagentPolicyPath !== null) {
     const migrate = await p.confirm({
@@ -211,18 +235,34 @@ async function runWizard(
     p.log.info(`Profile: ${profileName} (from --profile)`);
   } else {
     const picked = await p.select<ProfileName>({
-      message: 'Pick a profile',
+      message: 'Pick a profile preset',
       initialValue: 'minimal',
       options: [
-        { value: 'minimal', label: 'minimal', hint: 'bare policy, no extras (default)' },
+        {
+          value: 'minimal',
+          label: 'minimal',
+          hint: 'bare policy, no extras — safe starting point',
+        },
         {
           value: 'client-engagement',
           label: 'client-engagement',
-          hint: 'zero-trust client project',
+          hint: 'zero-trust client project — strict by default',
         },
-        { value: 'bst-internal', label: 'bst-internal', hint: 'internal BST projects' },
-        { value: 'lit-wc', label: 'lit-wc', hint: 'Lit / web component libraries' },
-        { value: 'open-source', label: 'open-source', hint: 'public OSS repos' },
+        {
+          value: 'bst-internal',
+          label: 'bst-internal',
+          hint: 'BookedSolid internal projects (Codex review on)',
+        },
+        {
+          value: 'lit-wc',
+          label: 'lit-wc',
+          hint: 'Lit / web-component libraries',
+        },
+        {
+          value: 'open-source',
+          label: 'open-source',
+          hint: 'public OSS repos (Codex review on)',
+        },
       ],
     });
     if (p.isCancel(picked)) cancel('Init cancelled.');
@@ -233,17 +273,35 @@ async function runWizard(
   // so re-running `rea init` doesn't reset an operator's manual edit.
   const autonomyDefault =
     existingPolicy?.autonomyLevel ?? layeredBase.autonomy_level ?? AutonomyLevel.L1;
+  const autonomyMessage =
+    existingPolicy?.autonomyLevel !== undefined
+      ? `Starting autonomy level (current: ${existingPolicy.autonomyLevel}). Controls how much the ` +
+        `agent can do without asking you first.`
+      : 'Starting autonomy level — how much can the agent do without asking you first?';
   const autonomyPick = await p.select<AutonomyLevel>({
-    message:
-      existingPolicy?.autonomyLevel !== undefined
-        ? `Starting autonomy_level (current: ${existingPolicy.autonomyLevel})`
-        : 'Starting autonomy_level',
+    message: autonomyMessage,
     initialValue: autonomyDefault,
     options: [
-      { value: AutonomyLevel.L0, label: 'L0', hint: 'read-only; every write needs approval' },
-      { value: AutonomyLevel.L1, label: 'L1', hint: 'default — writes allowed, destructive gated' },
-      { value: AutonomyLevel.L2, label: 'L2', hint: 'wider latitude; destructive ops allowed' },
-      { value: AutonomyLevel.L3, label: 'L3', hint: 'full autonomy (rare — supervised only)' },
+      {
+        value: AutonomyLevel.L0,
+        label: 'L0  — read-only',
+        hint: 'every write needs your approval; safest, slowest',
+      },
+      {
+        value: AutonomyLevel.L1,
+        label: 'L1  — supervised writes',
+        hint: 'default — writes allowed, destructive ops gated',
+      },
+      {
+        value: AutonomyLevel.L2,
+        label: 'L2  — wide latitude',
+        hint: 'destructive ops allowed; suitable for experienced operators',
+      },
+      {
+        value: AutonomyLevel.L3,
+        label: 'L3  — full autonomy',
+        hint: 'rare — supervised long-running agents only',
+      },
     ],
   });
   if (p.isCancel(autonomyPick)) cancel('Init cancelled.');
@@ -268,7 +326,9 @@ async function runWizard(
     },
   );
   const maxPick = await p.select<AutonomyLevel>({
-    message: 'max_autonomy_level (ceiling — cannot be exceeded at runtime)',
+    message:
+      'Ceiling autonomy level — the agent can never exceed this even if asked. ' +
+      'Promoting past the ceiling requires editing policy.yaml by hand.',
     initialValue: defaultMax,
     options: maxOptions as Parameters<typeof p.select<AutonomyLevel>>[0]['options'],
   });
@@ -276,33 +336,59 @@ async function runWizard(
   const maxAutonomyLevel = maxPick;
 
   const attribPick = await p.confirm({
-    message: 'Enforce block_ai_attribution (reject AI-authored commit trailers)?',
+    message:
+      'Block AI-attribution in commits? (rejects "Co-Authored-By: Claude" and similar ' +
+      'trailers — keeps your git history human-attributed)',
     initialValue: layeredBase.block_ai_attribution ?? true,
   });
   if (p.isCancel(attribPick)) cancel('Init cancelled.');
   const blockAiAttribution = attribPick === true;
 
-  // G11.4: "Use Codex adversarial review?" — the default follows the
-  // chosen profile (any `*-no-codex` profile defaults to No). An explicit
-  // flag on the command line overrides that default for the initial value.
+  // G11.4: "Use Codex adversarial review?" — initial-value precedence:
+  //   1. explicit --codex / --no-codex flag wins
+  //   2. otherwise existing on-disk value (preserves operator edit on re-run)
+  //   3. otherwise profile default (`*-no-codex` profiles default to No)
+  //
+  // 0.43.0 codex round-1 P2: prior to this commit step 2 was skipped on
+  // the interactive path — the initial value collapsed to the profile
+  // default even on a re-run where the operator had already toggled
+  // codex off. The summary screen advertised codex_required as
+  // preserved while the prompt default silently reverted it. The
+  // `--yes` path already had the correct precedence (see the
+  // non-interactive branch in `runInit`); this brings the wizard in
+  // line.
   const codexInitial =
-    options.codex !== undefined ? options.codex : profileDefaultCodexRequired(profileName);
+    options.codex !== undefined
+      ? options.codex
+      : (existingPolicy?.codexRequired ?? profileDefaultCodexRequired(profileName));
   const codexPick = await p.confirm({
-    message: 'Use Codex adversarial review? (requires an OpenAI account — can be added later)',
+    message:
+      'Enable Codex adversarial review? (runs a GPT-5.4 second-opinion review on every push; ' +
+      'requires the Codex CLI + an OpenAI account — can be installed later via /codex:setup)',
     initialValue: codexInitial,
   });
   if (p.isCancel(codexPick)) cancel('Init cancelled.');
   const codexRequired = codexPick === true;
-
-  p.outro('Config collected — installing files.');
 
   return {
     profile: profileName,
     autonomyLevel,
     maxAutonomyLevel,
     blockAiAttribution,
-    blockedPaths: layeredBase.blocked_paths ?? ['.env', '.env.*'],
-    notificationChannel: layeredBase.notification_channel ?? '',
+    // 0.43.0 codex round-1 P2: preserve the wizard-untouched fields
+    // (`blocked_paths` + `notification_channel`) the same way the
+    // `--yes` path already does. Pre-fix the wizard return rebuilt
+    // these from `layeredBase` on every interactive re-run, silently
+    // dropping operator edits even though the new install-summary
+    // confirm gate advertised them as preserved. The wizard does NOT
+    // prompt for either field (they are policy-file edits, not
+    // first-question UX), so falling back to the layered profile
+    // default is the correct seed shape on a fresh install; a re-run
+    // simply forwards whatever the operator committed to disk.
+    blockedPaths:
+      existingPolicy?.blockedPaths ?? layeredBase.blocked_paths ?? ['.env', '.env.*'],
+    notificationChannel:
+      existingPolicy?.notificationChannel ?? layeredBase.notification_channel ?? '',
     codexRequired,
     // Round-27 F6: the wizard does NOT prompt for the 0.26.0 knobs (they
     // are advanced config — most teams accept defaults). But when the
@@ -916,6 +1002,196 @@ function readExistingManifestInstalledAt(manifestPath: string): string | undefin
   return undefined;
 }
 
+/**
+ * 0.43.0 UX polish: build the human-readable install summary shown
+ * BEFORE any files are written. Lists, in order: the policy file
+ * being written, the chosen profile + autonomy, hook + agent counts
+ * planned, the git/husky hooks planned (paths reflect what the
+ * installer will ACTUALLY do given the target tree's shape), and
+ * whether re-run preservation is active.
+ *
+ * Rendered via clack's `note` primitive so it sits in a bordered block
+ * adjacent to the final `confirm` gate. The string is also returned
+ * verbatim so the test suite can assert content without mocking clack.
+ *
+ * `targetState` is computed by {@link detectTargetState} — kept as a
+ * separate argument so tests can drive both shapes (husky-present and
+ * husky-absent) without touching the filesystem.
+ */
+export function buildInstallSummary(
+  targetDir: string,
+  config: ResolvedConfig,
+  reRunMode: boolean,
+  targetState: TargetState,
+): string {
+  const lines: string[] = [];
+  const mode = reRunMode ? 'Re-run (preserving your existing edits)' : 'Fresh install';
+  lines.push(`Mode: ${mode}`);
+  lines.push(`Target: ${targetDir}`);
+  lines.push('');
+  lines.push('Will write:');
+  lines.push(`  .rea/policy.yaml         — profile=${config.profile}`);
+  lines.push(`                             autonomy=${config.autonomyLevel} (max=${config.maxAutonomyLevel})`);
+  lines.push(`                             attribution-block=${config.blockAiAttribution ? 'on' : 'off'}`);
+  lines.push(`                             codex-review=${config.codexRequired ? 'on' : 'off'}`);
+  lines.push(`  .rea/registry.yaml       — empty MCP-server registry`);
+  lines.push(`  .rea/install-manifest.json — hash record for drift detection`);
+  lines.push(`  .claude/agents/          — curated specialist agents`);
+  lines.push(`  .claude/hooks/           — hook scripts (executable)`);
+  lines.push(`  .claude/commands/        — slash commands`);
+  lines.push(`  .claude/settings.json    — hook registration entries`);
+  // 0.43.0 codex round-1 P3: the installer writes to `.git/hooks/*`
+  // ALWAYS when a git repo is present, AND to `.husky/*` ONLY when
+  // `.husky/` already exists. Pre-fix the summary hard-coded `.husky/*`
+  // and silently omitted the `.git/hooks/*` writes from the "no
+  // .husky/" install shape — the most common one. The operator then
+  // confirmed without being told their `.git/hooks/` would be
+  // modified. We list both surfaces conditionally based on the
+  // detected target state so the screen is faithful to what actually
+  // happens.
+  if (targetState.gitRepoPresent) {
+    lines.push(`  .git/hooks/commit-msg    — commit-message attribution gate`);
+    lines.push(`  .git/hooks/prepare-commit-msg — attribution augmenter (no-op until enabled)`);
+    lines.push(`  .git/hooks/pre-push      — local-review gate (fallback if no active hook present)`);
+  } else {
+    lines.push(`  (no .git/ directory detected — git hook copies will be skipped)`);
+  }
+  if (targetState.huskyDirPresent) {
+    lines.push(`  .husky/commit-msg        — commit-message attribution gate (husky mirror)`);
+    lines.push(`  .husky/prepare-commit-msg — attribution augmenter (husky mirror)`);
+    lines.push(`  .husky/pre-push          — local-review gate (husky mirror)`);
+  } else {
+    lines.push(`  (no .husky/ directory detected — husky mirrors will be skipped)`);
+  }
+  lines.push(`  CLAUDE.md fragment       — managed governance block`);
+  lines.push(`  .gitignore               — managed entries for .rea runtime artifacts`);
+  if (reRunMode) {
+    lines.push('');
+    // 0.43.0 codex round-1 P2: list only the fields the wizard
+    // ACTUALLY preserves. `blocked_paths`, `notification_channel`,
+    // and `review.codex_required` are now preserved by the wizard
+    // path (matching the `--yes` path's documented contract); the
+    // wizard does NOT prompt for the 0.26.0 local_review or
+    // commit_hygiene knobs, but those values forward verbatim from
+    // the existing policy when set.
+    lines.push('Re-run preserves your manually-edited:');
+    lines.push('  • autonomy_level / max_autonomy_level / block_ai_attribution');
+    lines.push('  • blocked_paths / notification_channel');
+    lines.push('  • review.codex_required + local_review.* + commit_hygiene.*');
+    lines.push('  • attribution.co_author.* + installed_at timestamp');
+  }
+  return lines.join('\n');
+}
+
+/**
+ * 0.43.0 codex round-1 P3: shape of the target tree the installer
+ * will see. `buildInstallSummary` and the post-install verifier both
+ * need to know whether `.git/` and `.husky/` are present so the
+ * summary doesn't lie about which hook files will be written.
+ */
+export interface TargetState {
+  gitRepoPresent: boolean;
+  huskyDirPresent: boolean;
+}
+
+/**
+ * 0.43.0 codex round-1 P3: detect which hook surfaces the installer
+ * will actually touch. Returns a snapshot so the install-summary
+ * confirm screen can show the right paths.
+ *
+ * Intentionally simple — the installers themselves (commit-msg,
+ * prepare-commit-msg, pre-push) each re-check at write time, so this
+ * detection is purely presentational. If something races between the
+ * snapshot and the writes (a `pnpm install` adding `.husky/` in the
+ * window between confirm and spinner), the installer's own checks win
+ * and the summary was only slightly stale.
+ */
+export function detectTargetState(targetDir: string): TargetState {
+  return {
+    gitRepoPresent: fs.existsSync(path.join(targetDir, '.git')),
+    huskyDirPresent: fs.existsSync(path.join(targetDir, '.husky')),
+  };
+}
+
+/**
+ * 0.43.0 UX polish: post-install sanity check. Runs synchronously
+ * after the file-write phase to catch installs that completed
+ * "successfully" but are missing a critical artifact (write
+ * permissions issue, partial copy, etc.).
+ *
+ * Strictly read-only — no probes that touch python3 / jq / codex.
+ * Pattern modelled on the synthetic round-trip checks established by
+ * `checkDelegationRoundTrip` in 0.29.0/0.31.0: cheap, in-process,
+ * sufficient to catch the "looks-installed-but-isn't" failure shape
+ * that bites first-time consumers hardest. For deep diagnostics
+ * point the operator at `rea doctor`.
+ *
+ * Returns the list of issues found (empty = healthy). The caller
+ * surfaces them via clack's `log.warn` and points the operator at
+ * `rea doctor` for follow-up.
+ */
+export function postInstallVerify(targetDir: string): string[] {
+  const issues: string[] = [];
+
+  // 1. policy file exists + parses as YAML object.
+  const policyPath = path.join(targetDir, REA_DIR, POLICY_FILE);
+  if (!fs.existsSync(policyPath)) {
+    issues.push(`.rea/policy.yaml missing after install (expected at ${policyPath})`);
+  } else {
+    try {
+      const raw = fs.readFileSync(policyPath, 'utf8');
+      const parsed: unknown = parseYaml(raw);
+      if (parsed === null || typeof parsed !== 'object') {
+        issues.push('.rea/policy.yaml parsed to a non-object — run `rea doctor` for details');
+      }
+    } catch (e) {
+      issues.push(
+        `.rea/policy.yaml failed to parse: ${e instanceof Error ? e.message : String(e)} — ` +
+          'run `rea doctor` for details',
+      );
+    }
+  }
+
+  // 2. .claude/hooks directory present with executable scripts.
+  const hooksDir = path.join(targetDir, '.claude', 'hooks');
+  if (!fs.existsSync(hooksDir)) {
+    issues.push(`.claude/hooks/ directory missing after install (expected at ${hooksDir})`);
+  } else {
+    let executableCount = 0;
+    try {
+      for (const entry of fs.readdirSync(hooksDir)) {
+        if (!entry.endsWith('.sh')) continue;
+        const stat = fs.statSync(path.join(hooksDir, entry));
+        if ((stat.mode & 0o111) !== 0) executableCount += 1;
+      }
+    } catch (e) {
+      issues.push(
+        `failed to enumerate .claude/hooks/: ${e instanceof Error ? e.message : String(e)}`,
+      );
+    }
+    if (executableCount === 0) {
+      issues.push('.claude/hooks/ contains zero executable .sh files — run `rea doctor`');
+    }
+  }
+
+  // 3. settings.json present.
+  const settingsPath = path.join(targetDir, '.claude', 'settings.json');
+  if (!fs.existsSync(settingsPath)) {
+    issues.push(`.claude/settings.json missing after install (expected at ${settingsPath})`);
+  }
+
+  // 4. install manifest present.
+  const manifestPath = path.join(targetDir, REA_DIR, 'install-manifest.json');
+  if (!fs.existsSync(manifestPath)) {
+    issues.push(
+      `.rea/install-manifest.json missing after install (expected at ${manifestPath}) — ` +
+        'drift detection will not work until `rea init` is re-run',
+    );
+  }
+
+  return issues;
+}
+
 export async function runInit(options: InitOptions): Promise<void> {
   const targetDir = process.cwd();
   const reagentPolicyPath = detectReagentPolicy(targetDir);
@@ -1054,52 +1330,112 @@ export async function runInit(options: InitOptions): Promise<void> {
     config.reagentNotices = reagentNotices;
   }
 
+  // 0.43.0 UX polish: install summary + final confirm gate. The
+  // operator sees exactly what's about to happen BEFORE any
+  // filesystem writes. Skipped on `--yes` / `--force` (non-interactive
+  // paths assume consent). The confirm step is the last chance to
+  // bail without leaving partial state on disk.
+  const reRunMode = existingPolicy !== undefined;
+  const interactive = options.yes !== true;
+  if (interactive) {
+    const targetState = detectTargetState(targetDir);
+    const summary = buildInstallSummary(targetDir, config, reRunMode, targetState);
+    p.note(summary, reRunMode ? 'Ready to refresh' : 'Ready to install');
+    const proceed = await p.confirm({
+      message: reRunMode ? 'Proceed with the refresh?' : 'Proceed with the install?',
+      initialValue: true,
+    });
+    if (p.isCancel(proceed) || proceed !== true) {
+      cancel('Init cancelled — no files written.');
+    }
+  }
+
   if (!fs.existsSync(reaDir)) fs.mkdirSync(reaDir, { recursive: true });
 
-  const written: string[] = [];
-  written.push(writePolicyYaml(targetDir, config, layeredBase));
-  written.push(writeRegistryYaml(targetDir));
+  // 0.43.0 UX polish: wrap the file-write phase in a clack spinner so
+  // operators on slow disks see progress instead of staring at a
+  // motionless prompt. Skipped under `--yes` (non-interactive paths
+  // log line-by-line). All operations remain identical — the spinner
+  // is purely presentational.
+  const spinner = interactive ? p.spinner() : null;
+  if (spinner !== null) spinner.start('Writing rea install');
 
-  // Artifact copies + settings merge + commit-msg + CLAUDE.md fragment.
-  const copyOptions = {
-    force: options.force === true,
-    yes: options.yes === true || options.force === true,
-  };
-  const copyResult = await copyArtifacts(targetDir, copyOptions);
+  let written: string[];
+  let copyResult: Awaited<ReturnType<typeof copyArtifacts>>;
+  let mergeResult: ReturnType<typeof mergeSettings>;
+  let commitMsgResult: Awaited<ReturnType<typeof installCommitMsgHook>>;
+  let prepareCommitMsgResult: Awaited<ReturnType<typeof installPrepareCommitMsgHook>>;
+  let prePushResult: Awaited<ReturnType<typeof installPrePushFallback>>;
+  let mdResult: Awaited<ReturnType<typeof writeClaudeMdFragment>>;
+  let gitignoreResult: Awaited<ReturnType<typeof ensureReaGitignore>>;
+  let manifestPath: string;
+  let fragmentInput: Parameters<typeof buildFragment>[0];
 
-  const { settings, settingsPath } = readSettings(targetDir);
-  const desired = defaultDesiredHooks();
-  const mergeResult = mergeSettings(settings, desired);
-  await writeSettingsAtomic(settingsPath, mergeResult.merged);
+  try {
+    written = [];
+    written.push(writePolicyYaml(targetDir, config, layeredBase));
+    written.push(writeRegistryYaml(targetDir));
 
-  const commitMsgResult = await installCommitMsgHook(targetDir);
-  // 0.30.0 attribution augmenter — install the prepare-commit-msg
-  // hook unconditionally. The hook is a no-op when
-  // policy.attribution.co_author.enabled !== true, so it is safe to
-  // ship under every profile; consumers opt in by editing their
-  // .rea/policy.yaml.
-  const prepareCommitMsgResult = await installPrepareCommitMsgHook(targetDir);
-  const prePushResult = await installPrePushFallback({ targetDir });
+    // Artifact copies + settings merge + commit-msg + CLAUDE.md fragment.
+    const copyOptions = {
+      force: options.force === true,
+      yes: options.yes === true || options.force === true,
+    };
+    copyResult = await copyArtifacts(targetDir, copyOptions);
 
-  const fragmentInput = {
-    policyPath: `.${path.sep}rea${path.sep}policy.yaml`.replace(/\\/g, '/'),
-    profile: config.profile,
-    autonomyLevel: config.autonomyLevel,
-    maxAutonomyLevel: config.maxAutonomyLevel,
-    blockedPathsCount: config.blockedPaths.length,
-    blockAiAttribution: config.blockAiAttribution,
-  };
-  const mdResult = await writeClaudeMdFragment(targetDir, fragmentInput);
+    const { settings, settingsPath } = readSettings(targetDir);
+    const desired = defaultDesiredHooks();
+    mergeResult = mergeSettings(settings, desired);
+    await writeSettingsAtomic(settingsPath, mergeResult.merged);
 
-  // BUG-010 — scaffold `.gitignore` entries for every runtime artifact
-  // `rea serve` / `rea cache` / `/freeze` can write under `.rea/`. Idempotent
-  // append (and `rea upgrade` backfills older installs that never got this).
-  const gitignoreResult = await ensureReaGitignore(targetDir);
+    commitMsgResult = await installCommitMsgHook(targetDir);
+    // 0.30.0 attribution augmenter — install the prepare-commit-msg
+    // hook unconditionally. The hook is a no-op when
+    // policy.attribution.co_author.enabled !== true, so it is safe to
+    // ship under every profile; consumers opt in by editing their
+    // .rea/policy.yaml.
+    prepareCommitMsgResult = await installPrepareCommitMsgHook(targetDir);
+    prePushResult = await installPrePushFallback({ targetDir });
 
-  // G12 — record the install manifest. SHAs are of the files actually on disk
-  // after the copy pass, so drift detection compares against real state (not
-  // canonical, which may differ if the consumer's copy was aborted mid-run).
-  const manifestPath = await writeInstallManifest(targetDir, config.profile, fragmentInput);
+    fragmentInput = {
+      policyPath: `.${path.sep}rea${path.sep}policy.yaml`.replace(/\\/g, '/'),
+      profile: config.profile,
+      autonomyLevel: config.autonomyLevel,
+      maxAutonomyLevel: config.maxAutonomyLevel,
+      blockedPathsCount: config.blockedPaths.length,
+      blockAiAttribution: config.blockAiAttribution,
+    };
+    mdResult = await writeClaudeMdFragment(targetDir, fragmentInput);
+
+    // BUG-010 — scaffold `.gitignore` entries for every runtime artifact
+    // `rea serve` / `rea cache` / `/freeze` can write under `.rea/`. Idempotent
+    // append (and `rea upgrade` backfills older installs that never got this).
+    gitignoreResult = await ensureReaGitignore(targetDir);
+
+    // G12 — record the install manifest. SHAs are of the files actually on disk
+    // after the copy pass, so drift detection compares against real state (not
+    // canonical, which may differ if the consumer's copy was aborted mid-run).
+    manifestPath = await writeInstallManifest(targetDir, config.profile, fragmentInput);
+  } catch (e) {
+    // 0.43.0 UX polish: surface install failures via the spinner's
+    // error state when interactive, then re-throw with a clack-rendered
+    // "what failed → suggested fix" envelope so the operator isn't
+    // left staring at a raw stack trace.
+    if (spinner !== null) spinner.stop('Install failed');
+    const message = e instanceof Error ? e.message : String(e);
+    // Pattern: <what failed>: <why> → <suggested fix>. Many of the
+    // underlying installers throw with the why already in `message`;
+    // we always append the actionable next step so the operator
+    // knows where to look.
+    p.log.error(
+      `Install aborted: ${message}\n` +
+        `  Suggested fix: re-run with --force to reset, or run \`rea doctor\` to ` +
+        `diagnose the partial state, or escalate via \`rea freeze\` if a hook is ` +
+        `actively blocking the operator's work.`,
+    );
+    throw e;
+  }
+  if (spinner !== null) spinner.stop('Install written');
 
   console.log('');
   log('init complete');
@@ -1180,17 +1516,57 @@ export async function runInit(options: InitOptions): Promise<void> {
     console.log('  Set review.codex_required: true in .rea/policy.yaml to re-enable.');
   }
 
-  console.log('');
-  console.log('Next steps:');
-  console.log('  1. Review .rea/policy.yaml and commit it.');
-  console.log('  2. Run `rea doctor` to validate the install.');
-  console.log('  3. Run `rea check` to see current status.');
-  if (config.fromReagent) {
+  // 0.43.0 UX polish: inline post-install verification. NOT a full
+  // `rea doctor` (that takes seconds and spawns subprocesses) — just
+  // a synchronous in-process sanity check that the install is sane.
+  // If anything looks off we surface a loud warning and direct the
+  // operator at `rea doctor` for the deep dive. Modelled on the
+  // 0.29.0/0.31.0 synthetic round-trip pattern.
+  const verifyIssues = postInstallVerify(targetDir);
+  if (verifyIssues.length > 0) {
     console.log('');
-    console.log('Reagent migration:');
-    console.log(`  Source: ${config.reagentPolicyPath ?? '(none)'}`);
-    console.log('  Copied fields were applied per the translator rules.');
-    console.log('  Once satisfied, you can remove the .reagent/ directory.');
+    warn('post-install verification flagged the following:');
+    for (const issue of verifyIssues) warn(`  • ${issue}`);
+    warn('Run `rea doctor` for a full diagnostic.');
+  } else if (interactive) {
+    // Quiet success — confirm we checked, but don't shout about it.
+    p.log.success('Post-install check: install looks healthy.');
   }
-  console.log('');
+
+  if (interactive) {
+    // 0.43.0 UX polish: clack outro with structured next-steps.
+    // Replaces the bare `console.log('Next steps:')` block with a
+    // bordered note so the call-to-action is unmissable on a busy
+    // terminal scrollback. The non-interactive path keeps the plain
+    // console.log block (CI logs don't render clack borders).
+    const nextSteps: string[] = [];
+    nextSteps.push('1. Review .rea/policy.yaml and commit it.');
+    nextSteps.push('2. Run `rea doctor` to validate the install end-to-end.');
+    nextSteps.push('3. Run `rea check` to see current status (autonomy, HALT, recent audit).');
+    if (config.fromReagent) {
+      nextSteps.push('');
+      nextSteps.push('Reagent migration:');
+      nextSteps.push(`  Source: ${config.reagentPolicyPath ?? '(none)'}`);
+      nextSteps.push('  Copied fields were applied per the translator rules.');
+      nextSteps.push('  Once satisfied, you can remove the .reagent/ directory.');
+    }
+    nextSteps.push('');
+    nextSteps.push('Docs: https://github.com/bookedsolidtech/rea#readme');
+    p.note(nextSteps.join('\n'), 'Next steps');
+    p.outro(reRunMode ? 'rea refresh complete.' : 'rea install complete.');
+  } else {
+    console.log('');
+    console.log('Next steps:');
+    console.log('  1. Review .rea/policy.yaml and commit it.');
+    console.log('  2. Run `rea doctor` to validate the install.');
+    console.log('  3. Run `rea check` to see current status.');
+    if (config.fromReagent) {
+      console.log('');
+      console.log('Reagent migration:');
+      console.log(`  Source: ${config.reagentPolicyPath ?? '(none)'}`);
+      console.log('  Copied fields were applied per the translator rules.');
+      console.log('  Once satisfied, you can remove the .reagent/ directory.');
+    }
+    console.log('');
+  }
 }
