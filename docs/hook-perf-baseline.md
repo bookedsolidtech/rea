@@ -23,21 +23,83 @@ the gate is actually built to refuse.
 
 ## Methodology
 
-- 10 measured iterations + 2 discarded warmups per shim
+- 10 measured iterations + 2 discarded warmups per shim **per variant**
+- **Two payload variants per shim** (0.46.0 charter item 3):
+  - **MATCH** — payload crafted to PASS `shim_is_relevant` so the
+    shim runs its FULL hot path (sandbox check + version probe +
+    Node CLI forward + actual body work). The latency the operator
+    pays when a relevant command lands.
+  - **NO_MATCH** — payload crafted to FAIL `shim_is_relevant` so
+    the shim short-circuits at the pre-gate. The latency the
+    operator pays on every irrelevant command — which is the
+    cumulative cost dominant on most sessions, since most commands
+    are irrelevant to most shims.
+- Shims without a `shim_is_relevant` pre-gate (always-on tier:
+  `dangerous-bash-interceptor`, `blocked-paths-*`, `settings-protection`,
+  `delegation-capture`, `delegation-advisory`, `architecture-review-gate`,
+  `pr-issue-link-gate`, `local-review-gate`) use the same payload for
+  both variants and the JSON record carries `same_as_match: true`.
+  These shims have only `shim_cli_missing_relevant` (a different
+  branch fired only when dist/cli is missing), so under normal
+  CLI-reachable steady state both variants exercise the same path.
 - Payload tuned per shim to traverse the full HALT → stdin → resolve →
   sandbox → policy short-circuit / version-probe / forward path without
   triggering a refusal
-- Reports median, p95, max
-- Sorted by p95 descending
+- Reports median, p95, max for the MATCH variant at the top level
+  (backwards compatible with pre-0.46.0 baseline JSON shape) and a
+  nested `no_match: { median_ms, p95_ms, max_ms, samples_ms,
+  exit_codes, error }` for the short-circuit variant (`null` when
+  `same_as_match: true`)
+- Sorted by MATCH p95 descending
 - Run on the rea repo itself (the operator's dogfood)
-- **Every shim must exit 0 under its synthetic payload** (codex
-  round-1 P2 #2). A non-zero exit means the payload hit an error
-  path, not the hot path, and the latency number is meaningless —
-  the profiler refuses to write the baseline and the regression test
-  fails. To add a new shim, tune its entry in `payloadForHook()`
-  until every iteration exits 0.
+- **Every shim must exit 0 under BOTH synthetic payloads** (codex
+  round-1 P2 #2 + 0.46.0 charter item 3). A non-zero exit means the
+  payload hit an error path, not the hot path, and the latency number
+  is meaningless — the profiler refuses to write the baseline and the
+  regression test fails. To add a new shim, tune its entries in
+  `payloadVariantsForHook()` until every iteration of both variants
+  exits 0.
 
-## Findings (0.45.0, macOS Darwin, Node 22+, rea repo dogfood)
+## Why two variants matter
+
+Pre-0.46.0 the harness used generic Bash/Write payloads for every
+shim. That was fine for the always-on tier (dangerous-bash,
+blocked-paths-*, etc) which have no relevance pre-gate — but for
+shims like `attribution-advisory`, `security-disclosure-gate`,
+`env-file-protection`, `dependency-audit-gate`,
+`changeset-security-gate`, and `secret-scanner`, the generic payload
+HIT the short-circuit and the measured latency was the irrelevant-call
+cost (~15-55ms) instead of the real hot-path cost (~500-800ms when a
+relevant command lands).
+
+Operators reading the pre-0.46.0 baseline could reasonably conclude
+those shims were already cheap — when in fact they were cheap only
+under the synthetic payload's irrelevant shape. The 0.46.0 baseline
+fixes the attribution by reporting both costs separately, so:
+
+- The MATCH row shows what the operator pays when running `git commit`
+  / `gh issue create` / `pnpm add foo` / etc.
+- The NO_MATCH row shows what the operator pays on `ls`, `cat`,
+  `git status` — the irrelevant-call short-circuit cost that fires
+  on most commands.
+
+The ceiling enforcement (regression test + harness exit-2) applies
+to BOTH variants under the same threshold, so a regression in the
+pre-gate path itself (e.g. an inadvertent Node spawn before
+`shim_is_relevant` fires) gets caught by the no_match column.
+
+## Findings
+
+The 0.45.0 baseline below reflected the SHORT-CIRCUIT path for the
+six shims with a `shim_is_relevant` pre-gate. Under the 0.46.0
+methodology those shims now report a separate MATCH (hot-path) and
+NO_MATCH (short-circuit) measurement. Refresh
+`hook-perf-baseline.json` via `pnpm perf:hooks` after the 0.46.0
+landing to see the now-accurate hot-path numbers for the
+relevance-gated shims; the always-on tier numbers stay representative
+of both variants.
+
+### 0.45.0 baseline (pre-fix — relevance-gated shims undercounted)
 
 | Shim | p95 (ms) | Median (ms) | Ceiling (ms) | Notes |
 |---|--:|--:|--:|---|
@@ -52,11 +114,42 @@ the gate is actually built to refuse.
 | `pr-issue-link-gate.sh` | ~485 | ~465 | 2000 | Advisory tier |
 | `delegation-advisory.sh` | ~350 | ~260 | 2000 | Advisory tier |
 | `delegation-capture.sh` | ~100 | ~70 | 2000 | `SHIM_SKIP_VERSION_PROBE=1` (one of two Node spawns skipped) |
-| `dependency-audit-gate.sh` | ~55 | ~30 | 2000 | Short-circuits via `shim_is_relevant` keyword scan |
-| `env-file-protection.sh` | ~25 | ~20 | 2000 | Short-circuits via `shim_is_relevant` |
-| `changeset-security-gate.sh` | ~22 | ~18 | 2000 | Short-circuits via `shim_is_relevant` |
-| `attribution-advisory.sh` | ~15 | ~15 | 2000 | Short-circuits via `shim_policy_short_circuit` |
-| `security-disclosure-gate.sh` | ~15 | ~14 | 2000 | Short-circuits via `shim_policy_short_circuit` |
+| `dependency-audit-gate.sh` | ~55 | ~30 | 2000 | **UNDERCOUNT** — short-circuit only; hot-path will be ~600ms under MATCH payload |
+| `env-file-protection.sh` | ~25 | ~20 | 2000 | **UNDERCOUNT** — short-circuit only |
+| `changeset-security-gate.sh` | ~22 | ~18 | 2000 | **UNDERCOUNT** — short-circuit only |
+| `attribution-advisory.sh` | ~15 | ~15 | 2000 | **UNDERCOUNT** — short-circuit only; hot-path will be ~600ms under MATCH payload |
+| `security-disclosure-gate.sh` | ~15 | ~14 | 2000 | **UNDERCOUNT** — short-circuit only |
+
+### 0.46.0 expected pattern (after MATCH payloads added)
+
+The relevance-gated shims should land at two distinct latencies:
+
+- **NO_MATCH** (irrelevant-command short-circuit): ~15-55ms as
+  pre-0.46.0 baseline. This is what fires on `ls`, `git status`,
+  `cat foo.ts`, etc — the dominant cumulative cost across a
+  session because most commands are irrelevant to most shims.
+- **MATCH** (relevant-command hot path): ~500-800ms — same
+  cost-shape as the always-on blocking shims (sandbox check +
+  version probe + Node CLI forward). This is what fires on `git
+  commit`, `gh issue create`, `pnpm add foo`, writes to
+  `.changeset/`, etc.
+
+Concretely we expect the MATCH columns to fall in:
+
+| Shim | Expected MATCH p95 (ms) | Expected NO_MATCH p95 (ms) | Reason for split |
+|---|--:|--:|---|
+| `attribution-advisory.sh` | ~500-800 | ~15 | Pre-gate substring match (`git commit` / `gh pr create`) |
+| `security-disclosure-gate.sh` | ~500-800 | ~15 | Pre-gate substring match (`gh issue create`) |
+| `dependency-audit-gate.sh` | ~500-800 | ~30 | Pre-gate substring match (`pnpm add` / `npm i`) |
+| `env-file-protection.sh` | ~500-800 | ~20 | Pre-gate substring match (`.env`) |
+| `changeset-security-gate.sh` | ~500-800 | ~18 | Pre-gate file_path match (`.changeset/`) |
+| `secret-scanner.sh` | ~500-800 | ~25 | Pre-gate suffix short-circuit (`.env.example` / empty content) |
+
+Any shim whose **MATCH** p95 exceeds the per-shim ceiling needs the
+hot path investigated (or the ceiling raised with a documented
+reason); any shim whose **NO_MATCH** p95 exceeds the ceiling means
+the pre-gate path itself regressed (probable cause: an inadvertent
+Node spawn before `shim_is_relevant` runs).
 
 (See `hook-perf-baseline.json` for the exact per-machine numbers — they vary by hardware and system load.)
 

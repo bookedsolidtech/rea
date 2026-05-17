@@ -16,6 +16,8 @@ import { runTofuAccept, runTofuList } from './tofu.js';
 import { runUpgrade } from './upgrade.js';
 import { runUpgradeCheck } from './upgrade-check.js';
 import { registerAuditSummaryCommand } from './audit-summary.js';
+import { registerAuditByToolCommand } from './audit-by-tool.js';
+import { registerAuditTimelineCommand } from './audit-timeline.js';
 import { registerVerifyClaimCommand } from './verify-claim.js';
 import { err, getPkgVersion } from './utils.js';
 
@@ -194,6 +196,16 @@ async function main(): Promise<void> {
   // overview reader. Counts events by tool_name, tier, session,
   // status; samples chain integrity. Tier-Read; never mutates.
   registerAuditSummaryCommand(audit);
+
+  // 0.46.0 charter item 1 — `rea audit by-tool [--top=N] [--since=DUR]
+  // [--json]`. Higher-fidelity tool_name distribution than `summary`
+  // (which caps at 12 + `(other)`). Reads the same rotated-file walk.
+  registerAuditByToolCommand(audit);
+
+  // 0.46.0 charter item 2 — `rea audit timeline [--bucket=HOUR|DAY]
+  // [--since=DUR] [--json]`. Time-bucketed event counts with inline
+  // histogram. Useful for spotting activity spikes + cadence patterns.
+  registerAuditTimelineCommand(audit);
 
   // Register `rea hook push-gate` — the stateless pre-push Codex gate
   // called by `.husky/pre-push` and `.git/hooks/pre-push`.
