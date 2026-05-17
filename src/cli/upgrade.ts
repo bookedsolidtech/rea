@@ -551,10 +551,55 @@ export async function runUpgrade(options: UpgradeOptions = {}): Promise<void> {
     );
   }
 
+  // 0.42.0 codex round 2 P2 (2026-05-16): pre-flight the merged
+  // settings validation BEFORE any file writes happen. Pre-correction,
+  // `upgradeSettings` ran AFTER the canonical-file write loop and only
+  // then validated the merged result; throwing here meant canonical
+  // hook + agent files had already been written to disk, breaking
+  // `rea upgrade --check`'s implicit "preview = real" contract (the
+  // check footer correctly claimed validation would refuse, but did
+  // not warn that hook files would still be written first).
+  //
+  // Codex round 2 P2 (2026-05-16, follow-up): this MUST run before
+  // `migrateReviewPolicyFor0110` as well — the 0.11.0 policy migration
+  // rewrites `.rea/policy.yaml` and creates a `policy.yaml.bak-*`
+  // sibling. If the pre-flight runs after that migration, the
+  // "no files have been written" claim in the refusal message
+  // becomes false for pre-0.11 consumers with malformed settings.
+  // Ordering: pre-flight FIRST, then migration, then canonical
+  // enumeration + write loop.
+  //
+  // The pre-flight reuses the same helpers as `upgradeSettings` —
+  // `readSettings` / `pruneHookCommands` / `mergeSettings` /
+  // `validateSettings` are all pure functions over existing on-disk
+  // state and `defaultDesiredHooks()`, so running them twice is
+  // cheap (microseconds — single JSON parse + small object merge)
+  // and the second run inside `upgradeSettings` re-derives the same
+  // result before writing. Atomicity guarantee: if validation fails,
+  // `runUpgrade` aborts here with ZERO mutations to disk.
+  {
+    const desired = defaultDesiredHooks();
+    const { settings: existingSettings } = readSettings(resolvedRoot);
+    const pruned = pruneHookCommands(existingSettings, STALE_HOOK_COMMAND_TOKENS);
+    const mergeResult = mergeSettings(pruned.merged, desired);
+    const validation = validateSettings(mergeResult.merged);
+    if (!validation.parsed) {
+      throw new Error(
+        `rea upgrade: refusing to start because the merged .claude/settings.json would ` +
+          `fail schema validation. This is a safety guardrail — no files have been written ` +
+          `(including no .rea/policy.yaml 0.11.0 migration). Your existing install is ` +
+          `unchanged. zod errors: ${validation.errors.join('; ')}`,
+      );
+    }
+  }
+
   // 0.11.0 migration — strip removed review.* fields and backfill the new
   // concerns_blocks default. Runs before canonical file reconciliation so a
   // policy that fails strict schema load (which happens on upgrade from
   // 0.10.x the moment we re-read `.rea/policy.yaml`) is cleaned up first.
+  // 0.42.0 round 2 P2 follow-up: ordered AFTER the pre-flight validation
+  // above so a settings-validation refusal does not leave a half-migrated
+  // .rea/policy.yaml + backup behind.
   await migrateReviewPolicyFor0110(resolvedRoot, { dryRun });
 
   const canonicalFiles = await enumerateCanonicalFiles();

@@ -96,6 +96,21 @@ export interface AuditSummaryResult {
   window_end: string | null;
   /** Absolute paths of audit files walked. */
   files_scanned: string[];
+  /**
+   * 0.42.0 codex round 4 P2 + round 6 P2 (2026-05-16) — reserved for
+   * future use; ALWAYS EMPTY in 0.42.0. The original intent (round 4)
+   * was to soft-skip rotated segments that the operator could not
+   * read (e.g. EACCES/EPERM after a backup restore). Round 6 showed
+   * the soft-skip was unsound: without per-segment time-range
+   * metadata we cannot prove a skipped file is out-of-scope for the
+   * `--since` window, so a silent skip risks an undercount + a
+   * misleading `chain_integrity: ok`. The current implementation
+   * therefore throws on any non-ENOENT read error; this field is
+   * kept in the public schema so a future release that ships
+   * per-segment time-range metadata can populate it without breaking
+   * JSON consumers.
+   */
+  unreadable_segments: string[];
   total_events: number;
   by_tool_name: Record<string, number>;
   by_tier: Record<string, number>;
@@ -168,13 +183,25 @@ export function parseDurationSeconds(raw: string): number {
  *     PLUS the current `audit.jsonl`. Round-1 P2: the prior shape
  *     dropped rotated history silently while the header still
  *     advertised "all time", undercounting long-lived repos.
- *   - `windowStart` set: walk every rotated file whose basename
- *     timestamp >= the cutoff, PLUS one rotated file immediately
- *     before the cutoff (the in-flight file at cutoff time may
- *     contain in-window records).
+ *   - `windowStart` set: walk EVERY rotated file. The per-record
+ *     timestamp filter inside `computeAuditSummary` then drops
+ *     out-of-window records during the scan. 0.41.0 round-3 P2 +
+ *     0.42.0 charter item 3: rotated filenames are NOT authoritative
+ *     for "earliest contained record" — they are wall-clock at the
+ *     ROTATION INSTANT, which can be days after the file's earliest
+ *     contents when the rotation size cap is reached late. Pruning
+ *     by filename therefore drops in-window records from
+ *     conservatively-rotated logs (a rotated file from 7 days ago can
+ *     still contain records from 14 days ago because the previous
+ *     rotation event was 14 days ago). The cost of walking every
+ *     rotated segment under `--since` is bounded by the rotation cap
+ *     × number of segments — comfortably manageable in the
+ *     summary-rollup setting where we already read every byte for
+ *     the in-window scan; the win is correctness.
  *
- * Sort order is timestamp-ascending; the current `audit.jsonl` is
- * always appended last (it is the newest segment of the chain).
+ * Sort order is timestamp-ascending (by FILENAME stamp); the current
+ * `audit.jsonl` is always appended last (it is the newest segment
+ * of the chain).
  */
 async function resolveSummaryFileWalk(
   baseDir: string,
@@ -185,33 +212,23 @@ async function resolveSummaryFileWalk(
   const files: string[] = [];
 
   const rotated = await listRotatedAuditFiles(reaDir);
-  if (windowStart === null) {
-    // Walk every rotated segment. The "all time" header would be a
-    // lie otherwise.
-    for (const name of rotated) files.push(path.join(reaDir, name));
-  } else {
-    // Rotated filenames are `audit-YYYYMMDD-HHMMSS(-N).jsonl` in UTC.
-    // We treat each filename as "rotated at this instant" and include
-    // every file rotated >= windowStart, plus one file immediately
-    // before windowStart (the in-flight file at cutoff time may
-    // contain in-window records).
-    const stampToDate = (name: string): Date | null => {
-      const m = /^audit-(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})/.exec(name);
-      if (m === null) return null;
-      const iso = `${m[1]!}-${m[2]!}-${m[3]!}T${m[4]!}:${m[5]!}:${m[6]!}Z`;
-      const d = new Date(iso);
-      return Number.isNaN(d.getTime()) ? null : d;
-    };
-    const cutoffIdx = rotated.findIndex((n) => {
-      const d = stampToDate(n);
-      return d !== null && d >= windowStart;
-    });
-    const startIdx =
-      cutoffIdx === -1 ? Math.max(0, rotated.length - 1) : Math.max(0, cutoffIdx - 1);
-    for (const name of rotated.slice(startIdx)) {
-      files.push(path.join(reaDir, name));
-    }
-  }
+  // Both `windowStart === null` and `windowStart` set: walk every
+  // rotated segment. Pre-0.42.0 the `windowStart` branch attempted to
+  // prune rotated files by their filename stamp ("rotated at >=
+  // windowStart minus one buffer file"). That was wrong: the filename
+  // stamp marks the ROTATION event, not the earliest record contained
+  // in the file. A rotated file's records can pre-date its filename
+  // stamp by days when the previous rotation cycle was long. Walking
+  // every rotated file and letting the per-record `timestamp >=
+  // windowStart` filter inside `computeAuditSummary` decide is the
+  // only correct approach: we never falsely drop an in-window record
+  // because of where it happens to live on disk. Reference:
+  // 0.41.0 round-3 P2 + 0.42.0 charter item 3.
+  //
+  // `windowStart === null` (no --since) already walks every rotated
+  // segment — same code path.
+  void windowStart; // intentionally unused — full-walk is correct in both modes
+  for (const name of rotated) files.push(path.join(reaDir, name));
   try {
     const stat = await fs.stat(currentAudit);
     if (stat.isFile()) files.push(currentAudit);
@@ -319,15 +336,53 @@ export async function computeAuditSummary(
   let latest: string | null = null;
   // We only feed in-window records to the chain-sample check.
   const inWindowRecords: AuditRecord[] = [];
+  // 0.42.0 codex round 4 P2 + round 6 P2 (2026-05-16): reserved for
+  // future per-segment time-range metadata that would let us prove a
+  // skipped file is out of scope. Always empty under 0.42.0 — see
+  // the AuditSummaryResult.unreadable_segments docstring.
+  const unreadableSegments: string[] = [];
+  // We rebuild the actually-read file list as we go so the summary
+  // never claims to have scanned a file that was silently skipped.
+  // (Currently identical to `files` minus ENOENT entries since every
+  // other read error throws — kept as a separate accumulator so the
+  // shape stays correct when the future `unreadable_segments`
+  // soft-skip path lands.)
+  const actuallyScanned: string[] = [];
 
   for (const filePath of files) {
     let raw: string;
     try {
       raw = await fs.readFile(filePath, 'utf8');
     } catch (e) {
-      if ((e as NodeJS.ErrnoException).code === 'ENOENT') continue;
-      throw e;
+      const errno = (e as NodeJS.ErrnoException).code;
+      if (errno === 'ENOENT') continue;
+      // 0.42.0 codex round 4 P2 + round 5 P2 + round 6 P2 (2026-05-16):
+      // earlier rounds attempted to soft-skip unreadable rotations to
+      // accommodate backup-restore artifacts. Round 6 caught that the
+      // soft-skip is unsound: `resolveSummaryFileWalk` now enqueues
+      // every rotated segment under `--since` (filename-stamp pruning
+      // was correctly removed because the stamp marks the rotation
+      // event, not the earliest record contained), so we CANNOT prove
+      // an unreadable file is out of scope without reading it. A
+      // silent skip would mean `rea audit summary` could exit 0 with
+      // an undercount AND `chain_integrity: ok` while real in-window
+      // records went uncounted.
+      //
+      // Throwing with a precise, actionable error is the right call:
+      // the operator can chmod the file, move it out of .rea/, or
+      // delete it. `unreadable_segments` in the result is reserved
+      // for the never-reached future case where we can prove a file
+      // is genuinely out of scope (we'd need rotation start/end
+      // metadata for that — out of scope here).
+      throw new Error(
+        `rea audit summary: cannot read ${filePath} (${errno ?? 'unknown errno'}). ` +
+          `An unreadable audit segment may contain in-window records, so the summary ` +
+          `would be silently incomplete. Fix permissions (e.g. \`chmod u+r ${filePath}\`), ` +
+          `or move the file out of \`.rea/\` if you no longer need it. The current ` +
+          `audit.jsonl is always required.`,
+      );
     }
+    actuallyScanned.push(filePath);
     for (const line of raw.split('\n')) {
       if (line.length === 0) continue;
       let parsed: AuditRecord;
@@ -380,7 +435,12 @@ export async function computeAuditSummary(
     window_seconds: windowSeconds,
     window_start: windowStart !== null ? windowStart.toISOString() : null,
     window_end: windowEnd !== null ? windowEnd.toISOString() : null,
-    files_scanned: files,
+    // 0.42.0 codex round 4 P2: report only the files actually read.
+    // Unreadable rotations are reported separately under
+    // `unreadable_segments` so consumers can tell the difference
+    // between "scanned and empty" and "skipped because permissions".
+    files_scanned: actuallyScanned,
+    unreadable_segments: unreadableSegments,
     total_events: totalEvents,
     by_tool_name: byToolName,
     by_tier: byTier,
@@ -461,6 +521,15 @@ export function renderAuditSummary(result: AuditSummaryResult): string {
       lines.push('(no audit files found — has `rea serve` ever run?)');
       lines.push('');
     }
+    // 0.42.0 codex round 4 P2: even in the zero-events early-return,
+    // surface unreadable segments so the operator sees the gap.
+    if (result.unreadable_segments.length > 0) {
+      lines.push(
+        `unreadable rotated segments: ${String(result.unreadable_segments.length)} ` +
+          `(see stderr for paths; fix permissions and re-run to include them)`,
+      );
+      lines.push('');
+    }
     return lines.join('\n');
   }
   const total = result.total_events;
@@ -496,6 +565,15 @@ export function renderAuditSummary(result: AuditSummaryResult): string {
         : 'unsampled (no records in window)';
   lines.push(`chain integrity: ${chainLabel}`);
   lines.push(`files scanned:   ${String(result.files_scanned.length)}`);
+  // 0.42.0 codex round 4 P2 (2026-05-16): surface unreadable rotated
+  // segments so an operator scanning the rendered summary doesn't
+  // miss a skipped archive that the JSON consumers can see.
+  if (result.unreadable_segments.length > 0) {
+    lines.push(
+      `unreadable rotated segments: ${String(result.unreadable_segments.length)} ` +
+        `(see stderr for paths; fix permissions and re-run to include them)`,
+    );
+  }
   lines.push('');
   return lines.join('\n');
 }

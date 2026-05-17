@@ -495,6 +495,213 @@ describe('CLI flag wiring (codex round-2 P1)', () => {
   });
 });
 
+describe('computeUpgradeCheck — settings_validation (0.42.0 charter item 2)', () => {
+  const cleanup: string[] = [];
+
+  afterEach(async () => {
+    await Promise.all(cleanup.splice(0).map((d) => fs.rm(d, { recursive: true, force: true })));
+  });
+
+  it('reports settings_validation.parsed=true on a clean merge', async () => {
+    const { dir, pkgDir } = await setupScratch();
+    cleanup.push(dir);
+    const { src } = await writeCanonicalSource(pkgDir, 'one.sh', 'x\n');
+    const plan = await computeUpgradeCheck({
+      baseDir: dir,
+      canonicalFiles: [makeCanonical(src, 'one.sh')],
+    });
+    expect(plan.settings_validation).not.toBeNull();
+    expect(plan.settings_validation!.parsed).toBe(true);
+    expect(plan.settings_validation!.errors).toEqual([]);
+  });
+
+  it('reports settings_validation.parsed=false when the consumer file injects an invalid hooks shape', async () => {
+    // Pre-stage a .claude/settings.json that already carries an
+    // invalid `hooks` shape (a hook event with a typo'd key). The
+    // canonical merge does not remove consumer-authored entries — it
+    // only ADDS our defaults — so the typo survives the merge, and
+    // `validateSettings` rejects the result. This is the SAME shape
+    // `runUpgrade` would refuse to write (Class M guardrail), and
+    // `rea upgrade --check` should now surface that refusal in the
+    // preview.
+    const { dir, pkgDir } = await setupScratch();
+    cleanup.push(dir);
+    const { src } = await writeCanonicalSource(pkgDir, 'one.sh', 'x\n');
+    await fs.mkdir(path.join(dir, '.claude'), { recursive: true });
+    // `PreToolUze` is a deliberate typo — the schema's hook-event
+    // object is `.strict()` and rejects unknown event names. This is
+    // a real bug class: a typo silently disables an entire registered
+    // hook event because the harness skips events it doesn't
+    // recognize.
+    await fs.writeFile(
+      path.join(dir, '.claude', 'settings.json'),
+      JSON.stringify(
+        {
+          hooks: {
+            PreToolUze: [
+              { matcher: 'Bash', hooks: [{ type: 'command', command: 'echo typo' }] },
+            ],
+          },
+        },
+        null,
+        2,
+      ),
+      'utf8',
+    );
+    const plan = await computeUpgradeCheck({
+      baseDir: dir,
+      canonicalFiles: [makeCanonical(src, 'one.sh')],
+    });
+    expect(plan.settings_validation).not.toBeNull();
+    expect(plan.settings_validation!.parsed).toBe(false);
+    expect(plan.settings_validation!.errors.length).toBeGreaterThan(0);
+    // The settings file row in the plan should also carry the WOULD
+    // REFUSE annotation so operators see the refusal alongside the
+    // file detail (not just in the footer).
+    const settingsRow = plan.files.find((f) => f.synthetic === 'settings');
+    expect(settingsRow).toBeDefined();
+    expect(settingsRow!.note).toMatch(/WOULD REFUSE/);
+    expect(settingsRow!.note).toMatch(/schema validation failed/);
+  });
+
+  it('rendered output surfaces the validation refusal alongside the footer', async () => {
+    const { dir, pkgDir } = await setupScratch();
+    cleanup.push(dir);
+    const { src } = await writeCanonicalSource(pkgDir, 'one.sh', 'x\n');
+    await fs.mkdir(path.join(dir, '.claude'), { recursive: true });
+    await fs.writeFile(
+      path.join(dir, '.claude', 'settings.json'),
+      JSON.stringify(
+        {
+          hooks: {
+            // Hook command missing the required `type: 'command'` field —
+            // zod rejects on `HookCommandSchema`.
+            PreToolUse: [
+              { matcher: 'Bash', hooks: [{ command: 'echo missing-type' }] },
+            ],
+          },
+        },
+        null,
+        2,
+      ),
+      'utf8',
+    );
+    const plan = await computeUpgradeCheck({
+      baseDir: dir,
+      canonicalFiles: [makeCanonical(src, 'one.sh')],
+    });
+    expect(plan.settings_validation!.parsed).toBe(false);
+    const rendered = renderUpgradeCheck(plan);
+    expect(rendered).toContain('WARNING: `rea upgrade` would REFUSE');
+    // 0.42.0 codex round 2 P2 correction (2026-05-16): pre-flight
+    // validation moved BEFORE any file writes, so the footer now
+    // truthfully states no files will be written when validation
+    // refuses (previously the wording said "no changes" but the
+    // refusal happened after the file-write loop, breaking the
+    // implicit "preview = real" contract).
+    expect(rendered).toContain('No files will be written');
+    expect(rendered).toContain('pre-flight check runs before any canonical');
+    // Codex round 2 follow-up P2 (2026-05-16): pre-flight also gates
+    // the 0.11.0 .rea/policy.yaml migration; footer must say so.
+    expect(rendered).toContain('AND before the 0.11.0 .rea/policy.yaml migration');
+    // Codex round 3 P2 (2026-05-16): JSON plan exposes would_apply=false
+    // so CI consumers don't have to grep the rendered text.
+    expect(plan.would_apply).toBe(false);
+    // Banner above the counts table makes the refusal unambiguous
+    // without scrolling to the footer.
+    expect(rendered).toContain('BLOCKED — `rea upgrade` would refuse to apply this plan');
+    expect(rendered).toContain('the real upgrade writes nothing until the refusal clears');
+    // Summary line wording flips so the counts table doesn't read as
+    // a promise of action.
+    expect(rendered).toContain('change(s) blocked by refusal');
+    expect(rendered).not.toContain('planned change(s)');
+    // Each per-file row carries the BLOCKED suffix.
+    expect(rendered).toMatch(/— created \(BLOCKED — refusal active\)/);
+    // The standard "no changes were written" footer line should NOT
+    // appear when validation refused — operators get the refusal
+    // notice instead.
+    expect(rendered).not.toContain('Run `rea upgrade` (without --check) to apply.');
+  });
+
+  it('rendered "no changes" path still surfaces validation refusal when nothing would change file-wise', async () => {
+    // Synthesize a scenario where the canonical merge produces no
+    // file changes BUT the on-disk file already contains an invalid
+    // shape (validation refuses). The header would normally say
+    // "in sync" — make sure the refusal is still visible.
+    const { dir, pkgDir } = await setupScratch();
+    cleanup.push(dir);
+    const content = 'fixed\n';
+    const { src } = await writeCanonicalSource(pkgDir, 'one.sh', content);
+    await fs.writeFile(path.join(dir, 'one.sh'), content, 'utf8');
+    // Plant the canonical-merged shape THEN add a typo'd entry. The
+    // merge will be no-op (rea's defaults already present), but
+    // validation still rejects the file.
+    const { defaultDesiredHooks, mergeSettings } = await import(
+      '../../src/cli/install/settings-merge.js'
+    );
+    const baseline = mergeSettings({}, defaultDesiredHooks()).merged as Record<
+      string,
+      unknown
+    >;
+    const baselineHooks = baseline.hooks as Record<string, unknown>;
+    baselineHooks.PreToolUze = [
+      { matcher: 'Bash', hooks: [{ type: 'command', command: 'echo typo' }] },
+    ];
+    await fs.mkdir(path.join(dir, '.claude'), { recursive: true });
+    await fs.writeFile(
+      path.join(dir, '.claude', 'settings.json'),
+      `${JSON.stringify(baseline, null, 2)}\n`,
+      'utf8',
+    );
+    // .gitignore + CLAUDE.md still match (skip — even if they didn't,
+    // the rendered output would still show the validation refusal).
+    const { ensureReaGitignore } = await import('../../src/cli/install/gitignore.js');
+    await ensureReaGitignore(dir);
+    const { buildFragment } = await import('../../src/cli/install/claude-md.js');
+    const { loadPolicy } = await import('../../src/policy/loader.js');
+    const policy = loadPolicy(dir);
+    const fragment = buildFragment({
+      policyPath: '.rea/policy.yaml',
+      profile: policy.profile,
+      autonomyLevel: policy.autonomy_level,
+      maxAutonomyLevel: policy.max_autonomy_level,
+      blockedPathsCount: policy.blocked_paths.length,
+      blockAiAttribution: policy.block_ai_attribution,
+    });
+    await fs.writeFile(path.join(dir, 'CLAUDE.md'), `# CLAUDE.md\n\n${fragment}\n`, 'utf8');
+    const plan = await computeUpgradeCheck({
+      baseDir: dir,
+      canonicalFiles: [makeCanonical(src, 'one.sh')],
+    });
+    expect(plan.settings_validation!.parsed).toBe(false);
+    // Codex round 3 P2 positive control: would_apply is false when
+    // validation fails even though file-level changes are zero.
+    expect(plan.would_apply).toBe(false);
+    const rendered = renderUpgradeCheck(plan);
+    expect(rendered).toContain('WARNING: `rea upgrade` would REFUSE');
+  });
+
+  // Codex round 3 P2 positive control (2026-05-16): when validation
+  // passes, would_apply is true AND none of the BLOCKED labels appear.
+  it('renders without BLOCKED labels and sets would_apply=true when validation passes', async () => {
+    const { dir, pkgDir } = await setupScratch();
+    cleanup.push(dir);
+    const { src } = await writeCanonicalSource(pkgDir, 'new.sh', 'fresh\n');
+    // No on-disk hook → action=created. No settings shape that would
+    // fail validation → settings_validation.parsed=true.
+    const plan = await computeUpgradeCheck({
+      baseDir: dir,
+      canonicalFiles: [makeCanonical(src, 'new.sh')],
+    });
+    expect(plan.settings_validation!.parsed).toBe(true);
+    expect(plan.would_apply).toBe(true);
+    const rendered = renderUpgradeCheck(plan);
+    expect(rendered).not.toContain('BLOCKED');
+    expect(rendered).not.toContain('change(s) blocked by refusal');
+    expect(rendered).toContain('planned change(s)');
+  });
+});
+
 describe('renderUpgradeCheck', () => {
   const cleanup: string[] = [];
 

@@ -78,6 +78,7 @@ import { type ManifestEntry } from './install/manifest-schema.js';
 import { sha256OfBuffer, sha256OfFile } from './install/sha.js';
 import { diffUnified, DIFF_TOO_LARGE_NOTICE } from './install/unified-diff.js';
 import { loadPolicy } from '../policy/loader.js';
+import { validateSettings } from '../config/settings-schema.js';
 import { err, getPkgVersion, log } from './utils.js';
 
 /** Hard cap on the diff input size. Mirrors `DIFF_SIZE_CAP_BYTES` in
@@ -132,6 +133,25 @@ export interface UpgradeCheckFile {
   note?: string;
 }
 
+/**
+ * 0.42.0 charter item 2 — surface the same settings-schema validation
+ * the real upgrade flow runs. `runUpgrade` calls `validateSettings`
+ * on the merged result and refuses the write (throws) when it fails;
+ * pre-0.42.0 `rea upgrade --check` never invoked that check, so a
+ * preview could promise a write that the real upgrade would refuse.
+ *
+ *   - `parsed: true` — schema validation succeeded; `errors` is empty.
+ *     The real upgrade WOULD write the merged settings on demand.
+ *   - `parsed: false` — schema validation failed. `errors` carries the
+ *     same zod-issue strings `runUpgrade` would surface in its throw
+ *     message. The real upgrade would refuse and leave settings.json
+ *     untouched.
+ */
+export interface UpgradeCheckSettingsValidation {
+  parsed: boolean;
+  errors: string[];
+}
+
 export interface UpgradeCheckPlan {
   schema_version: typeof UPGRADE_CHECK_SCHEMA_VERSION;
   rea_version: string;
@@ -147,6 +167,26 @@ export interface UpgradeCheckPlan {
     removed_upstream: number;
   };
   files: UpgradeCheckFile[];
+  /** 0.42.0 — schema-validation outcome on the merged settings.json
+   *  the real `rea upgrade` would write. `null` when the synthetic
+   *  settings classification did not produce a merged result (should
+   *  not happen in practice; defensive). */
+  settings_validation: UpgradeCheckSettingsValidation | null;
+  /**
+   * 0.42.0 codex round 3 P2 (2026-05-16) — top-level "preview = real"
+   * verdict. `true` when `rea upgrade` would actually start mutating
+   * the install; `false` when the new pre-flight (settings-validation)
+   * gate would refuse the upgrade before any file is written.
+   *
+   * Why this matters: `counts` + `files` still describe what WOULD be
+   * written if validation passed (operators want the diff so they can
+   * fix the underlying invalid setting and see the upgrade preview in
+   * one shot). But CI and automation consuming the JSON need a single
+   * unambiguous signal that the real upgrade will write nothing in
+   * the current state. Use `would_apply` as that signal; treat
+   * `files[]` + `counts` as conditional on `would_apply === true`.
+   */
+  would_apply: boolean;
 }
 
 export interface ComputeUpgradeCheckOptions {
@@ -384,11 +424,16 @@ async function classifyClaudeMd(
  * upgrade flow, we prune known-stale hook tokens BEFORE merging the
  * default-desired hook set — the order matters so the merge sees a
  * clean baseline.
+ *
+ * 0.42.0 — also returns the merged object so the caller can run the
+ * same `validateSettings` check the real `runUpgrade` runs. We hand
+ * back the merged shape directly (not the file rendering) so the
+ * caller can decide whether to thread it into the schema check.
  */
 async function classifySettings(
   resolvedRoot: string,
   includeDiffs: boolean,
-): Promise<UpgradeCheckFile> {
+): Promise<{ file: UpgradeCheckFile; merged: Record<string, unknown> }> {
   const desired = defaultDesiredHooks();
   // `canonicalSettingsSubsetHash` is the MANIFEST-tracked SHA of the
   // rea-owned subset (used by drift detection). It does NOT equal the
@@ -452,7 +497,7 @@ async function classifySettings(
       Object.assign(file, safeDiff(oldText, newText, file.path));
     }
   }
-  return file;
+  return { file, merged: mergeResult.merged };
 }
 
 /**
@@ -612,12 +657,36 @@ export async function computeUpgradeCheck(
   }
 
   // Synthetic entries.
-  const settingsFile = await classifySettings(resolvedRoot, includeDiffs);
-  files.push(settingsFile);
+  const settingsClassification = await classifySettings(resolvedRoot, includeDiffs);
+  files.push(settingsClassification.file);
   const claudeMd = await classifyClaudeMd(resolvedRoot, includeDiffs);
   if (claudeMd !== null) files.push(claudeMd);
   const gitignoreFile = await classifyGitignore(resolvedRoot, includeDiffs);
   if (gitignoreFile !== null) files.push(gitignoreFile);
+
+  // 0.42.0 charter item 2 — schema-validate the merged settings the
+  // real `runUpgrade` would write. `runUpgrade` calls `validateSettings`
+  // (non-strict, matching the upgrade flow's posture) and throws when
+  // the merged result fails — refusing the write. Pre-0.42.0 the
+  // preview never ran this check, so the planner could promise a write
+  // that the real upgrade would refuse. Reproduce the exact validation
+  // shape here so the JSON `settings_validation` field is byte-for-byte
+  // what `runUpgrade` would see.
+  const validation = validateSettings(settingsClassification.merged, { strict: false });
+  const settingsValidation: UpgradeCheckSettingsValidation = {
+    parsed: validation.parsed,
+    errors: validation.errors,
+  };
+  // If validation failed, annotate the settings file row so the
+  // human-readable rendering surfaces the refusal alongside the count
+  // table (operators reading the table without scrolling to the
+  // footer still see the warning). Note appends rather than overwrites
+  // so the existing merge / prune annotations remain visible.
+  if (!validation.parsed) {
+    const refusalNote = `WOULD REFUSE: schema validation failed — ${validation.errors.join('; ')}`;
+    const f = settingsClassification.file;
+    f.note = f.note !== undefined ? `${f.note}; ${refusalNote}` : refusalNote;
+  }
 
   // Stable sort: action priority (modified → created → removed_upstream
   // → unchanged) then path. Operators reviewing the table want to see
@@ -644,6 +713,13 @@ export async function computeUpgradeCheck(
     bootstrap: isBootstrap,
     counts,
     files,
+    settings_validation: settingsValidation,
+    // Codex round 3 P2 (2026-05-16): mirror runUpgrade's pre-flight
+    // gate. `would_apply` is true when the real upgrade would actually
+    // start mutating disk — currently the only gate is settings-schema
+    // validation, but more pre-flight checks may land in future
+    // releases (in which case they get ANDed in here).
+    would_apply: settingsValidation.parsed,
   };
 }
 
@@ -660,9 +736,23 @@ export function renderUpgradeCheck(plan: UpgradeCheckPlan): string {
     lines.push(`  bootstrap mode: no install-manifest found yet`);
   }
   lines.push('');
+  // Codex round 3 P2 (2026-05-16): when a pre-flight gate would
+  // refuse the upgrade, the counts/files below describe what WOULD
+  // happen if the gate passed — but `rea upgrade` will actually
+  // write nothing in the current state. Lead with that banner so
+  // operators don't read the summary table as a promise of action.
+  if (!plan.would_apply) {
+    lines.push(
+      'BLOCKED — `rea upgrade` would refuse to apply this plan in its current state. ' +
+        'The summary below describes the would-be plan IF the refusal were fixed first; ' +
+        'the real upgrade writes nothing until the refusal clears.',
+    );
+    lines.push('');
+  }
   const totalChanges =
     plan.counts.created + plan.counts.modified + plan.counts.removed_upstream;
-  lines.push(`Summary — ${String(totalChanges)} planned change(s):`);
+  const summaryLabel = plan.would_apply ? 'planned change(s)' : 'change(s) blocked by refusal';
+  lines.push(`Summary — ${String(totalChanges)} ${summaryLabel}:`);
   lines.push(`  created:          ${String(plan.counts.created)}`);
   lines.push(`  modified:         ${String(plan.counts.modified)}`);
   lines.push(`  removed-upstream: ${String(plan.counts.removed_upstream)}`);
@@ -671,6 +761,19 @@ export function renderUpgradeCheck(plan: UpgradeCheckPlan): string {
   if (totalChanges === 0) {
     lines.push('No changes — your install is already in sync with this rea version.');
     lines.push('');
+    // 0.42.0 — even with zero planned changes, surface a validation
+    // failure here so an operator doesn't see "in sync" and miss the
+    // settings refusal.
+    if (plan.settings_validation !== null && !plan.settings_validation.parsed) {
+      lines.push(
+        'WARNING: `rea upgrade` would REFUSE to run — the merged ' +
+          '.claude/settings.json would fail schema validation:',
+      );
+      for (const e of plan.settings_validation.errors) {
+        lines.push(`  - ${e}`);
+      }
+      lines.push('');
+    }
     return lines.join('\n');
   }
 
@@ -679,8 +782,13 @@ export function renderUpgradeCheck(plan: UpgradeCheckPlan): string {
     if (file.action === 'unchanged') continue;
     const marker =
       file.action === 'created' ? '+' : file.action === 'removed_upstream' ? '-' : '~';
-    const label =
+    const baseLabel =
       file.action === 'removed_upstream' ? 'removed-upstream' : file.action;
+    // Codex round 3 P2 (2026-05-16): when a refusal is active, every
+    // would-be-mutated file row gets a BLOCKED suffix so a quick scroll
+    // through the per-file detail cannot miss the fact that no write
+    // will happen until the refusal clears.
+    const label = plan.would_apply ? baseLabel : `${baseLabel} (BLOCKED — refusal active)`;
     const syntheticTag = file.synthetic !== undefined ? ` [${file.synthetic}]` : '';
     lines.push(`${marker} ${file.path}${syntheticTag} — ${label}`);
     if (file.note !== undefined) lines.push(`    note: ${file.note}`);
@@ -704,8 +812,35 @@ export function renderUpgradeCheck(plan: UpgradeCheckPlan): string {
     }
     lines.push('');
   }
-  lines.push('No changes were written. Run `rea upgrade` (without --check) to apply.');
-  lines.push('');
+  // 0.42.0 — surface settings-schema validation outcome alongside the
+  // footer. When the merged settings would fail validation, `rea
+  // upgrade` would refuse to start at all (codex round 2 P2 moved the
+  // validation to a pre-flight check BEFORE any file writes); we
+  // report that here so consumers can fix policy + settings before
+  // invoking the real upgrade.
+  if (plan.settings_validation !== null && !plan.settings_validation.parsed) {
+    lines.push('');
+    lines.push(
+      'WARNING: `rea upgrade` would REFUSE to run — the merged ' +
+        '.claude/settings.json would fail schema validation:',
+    );
+    for (const e of plan.settings_validation.errors) {
+      lines.push(`  - ${e}`);
+    }
+    lines.push(
+      'No files will be written by `rea upgrade` while this is true — the ' +
+        'pre-flight check runs before any canonical hook or agent file is ' +
+        'installed AND before the 0.11.0 .rea/policy.yaml migration, so your ' +
+        'existing install stays untouched. Fix the settings entries flagged ' +
+        'above and re-run `rea upgrade --check`.',
+    );
+    lines.push('');
+  } else {
+    lines.push(
+      'No changes were written. Run `rea upgrade` (without --check) to apply.',
+    );
+    lines.push('');
+  }
   return lines.join('\n');
 }
 

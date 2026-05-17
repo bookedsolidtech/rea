@@ -1097,6 +1097,26 @@ export interface PolicyReaderProbes {
    * ignore the argument; the default production probe uses it.
    */
   python3PyYamlReachable?: (baseDir: string) => boolean;
+  /**
+   * 0.42.0 codex round 5 P2 (2026-05-16) — execution probe for the
+   * python3 list-walker branch in `policy_reader_get_list`. That
+   * branch needs to spawn `python3 -c "..."` with `import json` from
+   * stdlib; PyYAML is irrelevant. The check is execution-based (not
+   * PATH-only) because a `python3` symlink can resolve on PATH but
+   * fail to start in the current sandbox (dangling pyenv/asdf stub,
+   * permission-denied interpreter, missing dynamic libs). A PATH-only
+   * check would let the doctor declare `warn` on a box where the
+   * shim will actually fall through to Tier 3 — masking a real
+   * enforcement gap for list-valued policy keys.
+   *
+   * The probe runs `python3 -c "import json; print('ok')"` with the
+   * same env scrub as the PyYAML probe (PYTHONPATH/PYTHONHOME/
+   * PYTHONSTARTUP unset, PYTHONSAFEPATH=1, sys.path scrubbed) so a
+   * malicious repo cannot plant a `./json.py` that shadows stdlib
+   * and falsely report `true` while the real loader (which scrubs)
+   * fails.
+   */
+  python3ListWalkerReachable?: (baseDir: string) => boolean;
   awkOnPath?: () => string | null;
   jqOnPath?: () => string | null;
 }
@@ -1335,18 +1355,73 @@ function defaultPython3PyYamlReachable(baseDir: string): boolean {
   }
 }
 
+/**
+ * 0.42.0 codex round 5 P2 (2026-05-16) — execution probe for the
+ * python3 list-walker. Mirrors `defaultPython3PyYamlReachable` exactly
+ * but swaps the `import yaml` for `import json` (the actual stdlib
+ * module the shim's list-walker branch imports). Spawning the
+ * interpreter end-to-end catches the broken-symlink / unreachable-
+ * shim case that a bare PATH check misses.
+ */
+function defaultPython3ListWalkerReachable(baseDir: string): boolean {
+  try {
+    const probeEnv: NodeJS.ProcessEnv = { ...process.env, PYTHONSAFEPATH: '1' };
+    delete probeEnv['PYTHONPATH'];
+    delete probeEnv['PYTHONHOME'];
+    delete probeEnv['PYTHONSTARTUP'];
+    // Same sys.path scrub as the production loader, applied before
+    // `import json`. `json` is stdlib so a malicious `./json.py`
+    // attack would matter the same way `./yaml.py` does.
+    const probeBody = [
+      'import sys',
+      'import os',
+      '_cwd = os.getcwd()',
+      '_cwd_real = os.path.realpath(_cwd)',
+      'sys.path[:] = [p for p in sys.path if p not in ("", ".", _cwd, _cwd_real)]',
+      'import json',
+      'sys.stdout.write("ok")',
+    ].join('\n');
+    const res = spawnSync('python3', ['-c', probeBody], {
+      cwd: baseDir,
+      env: probeEnv,
+      timeout: 5_000,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    if (res.status !== 0) return false;
+    return (res.stdout?.toString().trim() ?? '') === 'ok';
+  } catch {
+    return false;
+  }
+}
+
 const DEFAULT_PROBES: Required<PolicyReaderProbes> = {
   cliDistExists: defaultCliDistExists,
   cliInvokable: defaultCliInvokable,
   python3OnPath: () => resolveBinaryOnPath('python3'),
   python3PyYamlReachable: defaultPython3PyYamlReachable,
+  python3ListWalkerReachable: defaultPython3ListWalkerReachable,
   awkOnPath: () => resolveBinaryOnPath('awk'),
   jqOnPath: () => resolveBinaryOnPath('jq'),
 };
 
 function resolveProbes(probes: PolicyReaderProbes | undefined): Required<PolicyReaderProbes> {
   if (probes === undefined) return DEFAULT_PROBES;
-  return { ...DEFAULT_PROBES, ...probes };
+  // 0.42.0 codex round 5 P2 (2026-05-16): when a caller (typically
+  // a unit test) stubs `python3OnPath` but does NOT stub the new
+  // `python3ListWalkerReachable` execution probe, derive a faithful
+  // fallback from `python3OnPath` instead of falling through to the
+  // real `defaultPython3ListWalkerReachable` (which would spawn a
+  // python3 subprocess and break test determinism). The convention
+  // matches `python3PyYamlReachable` in the existing test suite:
+  // stubs that say "python3 is present" want both downstream probes
+  // to report reachable, and stubs that say "python3 is absent" want
+  // both downstream probes to report unreachable.
+  const overrides: PolicyReaderProbes = { ...probes };
+  if (overrides.python3ListWalkerReachable === undefined && overrides.python3OnPath !== undefined) {
+    const stubbedPython3OnPath = overrides.python3OnPath;
+    overrides.python3ListWalkerReachable = () => stubbedPython3OnPath() !== null;
+  }
+  return { ...DEFAULT_PROBES, ...overrides };
 }
 
 /**
@@ -1459,12 +1534,12 @@ export function checkPolicyReaderTier2(
  * Practically always present (POSIX requirement).
  *
  * 0.40.0 charter item 2 — conditional verdict, refined by codex
- * round 1 P2:
+ * round 1 P2 (0.40.0) and round 2 P2 (0.42.0):
  *   - awk present                                            → `pass`
  *   - awk absent AND Tier 2 reachable                        → `warn`
  *     (Tier 2 implies python3, which is a list-walker)
  *   - awk absent AND Tier 1 reachable AND a list walker
- *     (jq OR python3) is on PATH                             → `warn`
+ *     (jq OR full Tier-2 reachable) is usable                → `warn`
  *   - awk absent AND Tier 1 reachable BUT no list walker     → `fail`
  *     (codex round 1 P2 — list-valued policy reads silently
  *     fail-closed even though scalar reads work, so the
@@ -1483,9 +1558,29 @@ export function checkPolicyReaderTier2(
  * functional box that has python3 + jq + the rea CLI all wired but
  * happens to lack awk.
  *
+ * List-iteration semantic (clarifying note for codex round 2 P2,
+ * 2026-05-16): `policy_reader_get_list` in
+ * `hooks/_lib/policy-reader.sh` walks the cached subtree JSON via
+ * `jq` OR `python3` (stdlib-only — `json` module, no PyYAML import).
+ * PyYAML is only needed for Tier 2 itself (YAML PARSING into JSON),
+ * NOT for iterating the already-parsed JSON arrays at list-read time.
+ *
+ * Codex round 5 P2 (2026-05-16): the "list walker" predicate uses
+ * `python3ListWalkerReachable` — an EXECUTION probe that actually
+ * spawns `python3 -c "import json"` — instead of `python3OnPath`. A
+ * PATH-only check passes for broken pyenv/asdf shims, dangling
+ * symlinks, and sandboxed environments where the interpreter cannot
+ * start; in those cases the shim's list-walker branch would actually
+ * fail and `blocked_paths`/`protected_writes` enforcement would
+ * silently break while doctor reported `warn`. The execution probe
+ * mirrors `defaultPython3PyYamlReachable` exactly but swaps the
+ * `import yaml` for `import json` so it's not gated on PyYAML
+ * availability (which is irrelevant to list iteration).
+ *
  * Takes `baseDir` so it can evaluate Tier 1's two-stage check (dist
- * present + CLI invokable) and Tier 2's reachability. Probes are
- * threaded through identically.
+ * present + CLI invokable), Tier 2's reachability, and the
+ * list-walker execution probe. All probes are threaded through
+ * identically.
  */
 export function checkPolicyReaderTier3(
   baseDir: string,
@@ -1508,22 +1603,25 @@ export function checkPolicyReaderTier3(
   // ladder would actually do at runtime.
   const tier1 = p.cliDistExists(baseDir) && p.cliInvokable(baseDir);
   const tier2 = p.python3OnPath() !== null && p.python3PyYamlReachable(baseDir);
-  // Codex round 1 P2 (2026-05-16): the downgrade-to-warn branch needs
-  // a list walker too. `policy_reader_get_list` (the helper that reads
-  // list-valued keys like `blocked_paths`) iterates the parsed JSON
-  // array via jq OR python3, falling back to Tier 3 awk for inline
-  // arrays. With awk gone AND no jq AND no python3, list-valued
-  // policy reads silently fail-closed even when Tier 1 is reachable —
-  // `blocked-paths-bash-gate.sh` etc. would see an EMPTY blocked-paths
-  // set and stop enforcing entries the operator declared. Pre-fix
-  // this concrete shape (cliInvokable + no python3 + no jq + no awk)
-  // returned `warn` and the doctor exited 0 on a broken install.
-  // Post-fix the downgrade requires a list walker; otherwise we stay
-  // on `fail`. Tier 2 implies python3 on PATH (the interpreter that
-  // ran PyYAML), so Tier 2 always brings list-walker support — no
-  // additional check needed for the Tier-2 branch.
-  const py = p.python3OnPath();
-  const listWalker = p.jqOnPath() !== null || py !== null;
+  // Codex round 1 P2 (0.40.0) + round 2 P2 corrected (0.42.0,
+  // 2026-05-16) + round 5 P2 (0.42.0, 2026-05-16): the
+  // downgrade-to-warn branch needs a list walker too.
+  // `policy_reader_get_list` iterates the parsed JSON array via jq
+  // OR python3. The python3 branch uses `json` from stdlib only —
+  // PyYAML is NOT required (it's only needed for Tier 2's YAML
+  // parsing step, which has already run by the time list iteration
+  // executes).
+  //
+  // Round 5 P2 hardening: the python3 leg of this predicate uses an
+  // EXECUTION probe (`python3ListWalkerReachable`), not just a PATH
+  // check. A `python3` symlink can resolve on PATH while the
+  // interpreter itself fails to start (dangling pyenv/asdf shim,
+  // sandboxed runner without dynamic libs, permission denied on the
+  // resolved binary). PATH-only would let doctor declare `warn` on
+  // a box where the shim's list walker would actually fail —
+  // silently breaking `blocked_paths` / `protected_writes`
+  // enforcement while doctor exits 0.
+  const listWalker = p.jqOnPath() !== null || p.python3ListWalkerReachable(baseDir);
   if (tier2 || (tier1 && listWalker)) {
     const reachable: string[] = [];
     if (tier1) reachable.push('Tier 1 (rea CLI)');
@@ -1540,22 +1638,46 @@ export function checkPolicyReaderTier3(
         'to restore the last-resort fallback.',
     };
   }
-  // Codex round 1 P2: separate "no list walker" diagnosis from the
-  // catastrophic "no tier at all" case. Tier 1 reachable but no jq
-  // AND no python3 AND no awk means list-valued policy reads
-  // fail-closed silently — distinct from the truly-empty
-  // no-CLI-no-python-no-awk shape, and worth a precise remediation.
+  // Codex round 1 P2 (0.40.0) + round 2 P2 (0.42.0): separate "no list
+  // walker" diagnosis from the catastrophic "no tier at all" case.
+  // Tier 1 reachable but no jq AND no python3 AND no awk means
+  // list-valued policy reads fail-closed silently — distinct from the
+  // truly-empty no-CLI-no-python-no-awk shape, and worth a precise
+  // remediation. The python3-as-list-walker signal is plain
+  // `python3OnPath` (the `json` module is stdlib — PyYAML is NOT
+  // required for list iteration).
   if (tier1) {
+    // 0.42.0 codex round 6 P3 (2026-05-16): distinguish "python3 not
+    // on PATH" from "python3 on PATH but execution fails". Pre-fix
+    // this branch always reported "python3 is not on PATH" even when
+    // a python3 binary was resolvable but a broken pyenv/asdf shim
+    // or sandboxed interpreter failed the execution probe — that
+    // sent operators toward the wrong remediation. Round 5 added
+    // the execution probe specifically to surface this case; the
+    // diagnostic needs to follow.
+    const pythonOnPath = p.python3OnPath();
+    const pythonState =
+      pythonOnPath === null
+        ? 'python3 is not on PATH'
+        : `python3 at ${pythonOnPath} cannot execute \`import json\` (broken pyenv/asdf shim, ` +
+          'sandboxed interpreter, or permission-denied binary — fix the interpreter or ' +
+          'remove the shim)';
+    const remediation =
+      pythonOnPath === null
+        ? 'Install awk OR jq OR python3 to restore list-iteration.'
+        : `Install awk OR jq, or repair the python3 interpreter at ${pythonOnPath}, ` +
+          'to restore list-iteration.';
     return {
       label,
       status: 'fail',
       detail:
-        'awk not on PATH AND neither jq nor python3 is on PATH — Tier 1 (rea CLI) parses ' +
-        'flow-form scalars, but `policy_reader_get_list` cannot iterate list-valued keys ' +
-        '(e.g. `blocked_paths: [.env, ...]`) without jq, python3, OR awk to walk the ' +
-        'resulting JSON arrays. Affected hooks (`blocked-paths-bash-gate.sh`, ' +
-        '`blocked-paths-enforcer.sh`, …) see an EMPTY list and silently stop enforcing. ' +
-        'Install awk OR jq OR python3 to restore list-iteration.',
+        `awk not on PATH AND jq is not on PATH AND ${pythonState} — ` +
+        'Tier 1 (rea CLI) parses flow-form scalars, but `policy_reader_get_list` ' +
+        'cannot iterate list-valued keys (e.g. `blocked_paths: [.env, ...]`) ' +
+        'without jq OR python3 OR awk to walk the resulting JSON arrays. ' +
+        'Affected hooks (`blocked-paths-bash-gate.sh`, ' +
+        `\`blocked-paths-enforcer.sh\`, …) see an EMPTY list and silently stop ` +
+        `enforcing. ${remediation}`,
     };
   }
   return {
@@ -1639,11 +1761,14 @@ export function checkPolicyReaderTierSummary(
   const tier2 = py !== null && p.python3PyYamlReachable(baseDir);
   const tier3 = p.awkOnPath() !== null;
   const jq = p.jqOnPath();
-  // List iteration after Tier 1/2 needs jq OR python3 to walk the
-  // JSON. Tier 2 implies python3 on PATH (the interpreter that ran
-  // the loader); so the only "lists broken" shape is Tier 1 reachable
-  // but neither jq nor python3 on PATH.
-  const listWalker = jq !== null || py !== null;
+  // 0.42.0 codex round 5 P2 (2026-05-16): list iteration after Tier
+  // 1/2 needs jq OR a python3 that can ACTUALLY execute (not just
+  // resolve on PATH). The execution probe catches the broken-shim
+  // case where `python3` resolves but the interpreter cannot start —
+  // PATH-only would falsely declare the list walker "usable" on a
+  // box where the shim's python3 branch will fall through to Tier 3
+  // and silently miss flow-form arrays.
+  const listWalker = jq !== null || p.python3ListWalkerReachable(baseDir);
 
   const reachable: string[] = [];
   if (tier1) reachable.push('Tier 1 (CLI)');
