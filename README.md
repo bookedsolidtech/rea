@@ -9,8 +9,13 @@
 [![DCO](https://img.shields.io/badge/DCO-required-green)](https://developercertificate.org/)
 [![Node](https://img.shields.io/badge/node-%3E%3D22-brightgreen)](https://nodejs.org/)
 
-> Status: `0.11.0` — published to npm with SLSA v1 provenance. See
-> [CHANGELOG.md](./CHANGELOG.md) for the per-release history.
+> Status: `0.41.0` — published to npm with SLSA v1 provenance. See
+> [CHANGELOG.md](./CHANGELOG.md) for the per-release history. The
+> hook-port marathon (0.32→0.35) replaced every shell hook body with
+> a Node-binary shim; the bash files in `.claude/hooks/` are now
+> ~30-line stubs that fork `rea hook scan-bash` / `scan-write` for
+> the real work. See [Architecture](#architecture) for the runtime
+> picture.
 
 REA is a single npm package that gates and audits agentic tool calls made by
 Claude Code — shell commands, filesystem writes, and MCP tool invocations —
@@ -38,6 +43,7 @@ the [migration section](#migration-from-010x) below.
 - [Quickstart](#quickstart)
 - [What REA is](#what-rea-is)
 - [What REA is NOT](#what-rea-is-not)
+- [Architecture](#architecture)
 - [The pre-push Codex gate](#the-pre-push-codex-gate)
 - [MCP gateway](#mcp-gateway)
 - [Policy file](#policy-file)
@@ -141,31 +147,39 @@ does not prevent the kill-switch from firing.
 
 ### 3. A hook layer
 
-Eleven shell scripts ship in `hooks/` and are copied into `.claude/hooks/`
-by `rea init`. All eleven are wired into the default `.claude/settings.json`
-and fire on Claude Code's `PreToolUse` / `PostToolUse` events (secret
-scanning, dangerous-command interception, blocked-path enforcement,
-settings protection, attribution rejection, env-file protection,
-disclosure-policy routing, dependency audit, changeset security,
-PR-issue-link advisory, architecture advisory). Each hook uses
-`set -euo pipefail` (or `set -uo pipefail` for stdin-JSON consumers) and
-runs a HALT check near the top. See [Hooks shipped](#hooks-shipped) for
-the full inventory.
+Fourteen hook scripts ship in `hooks/` and are copied into
+`.claude/hooks/` by `rea init`. All fourteen are wired into the default
+`.claude/settings.json` and fire on Claude Code's `PreToolUse` /
+`PostToolUse` events (secret scanning, dangerous-command interception,
+blocked-path enforcement, settings protection, attribution rejection,
+env-file protection, disclosure-policy routing, dependency audit,
+changeset security, PR-issue-link advisory, architecture advisory,
+local-review enforcement, protected-paths + blocked-paths bash-tier
+parity). Each hook performs a HALT check near the top. See
+[Hooks shipped](#hooks-shipped) for the full inventory.
 
-**Bash-tier scanner (parser-backed since 0.23.0).** Two hooks —
-`protected-paths-bash-gate.sh` and `blocked-paths-bash-gate.sh` — are
-shims that forward stdin to `rea hook scan-bash`, a CLI subcommand
-that parses the Bash command via `mvdan-sh@0.10.1`, walks the AST,
-and emits a verdict JSON. Pre-0.23.0 these were 500-line bash regex
-pipelines; the rewrite closes 24 known-bypass classes
-(helix-021..023 + discord-ops Round 13 + codex round 1) by replacing
-re-tokenization heuristics with structural matches against the parsed
-argv tree. The other nine hooks remain regex-based bash. The shim
-re-verifies the verdict JSON shape on return so a tampered
-`REA_NODE_CLI` env var cannot bypass. See
+**Node-binary scanners (since 0.32.0).** The hook-port marathon
+(0.32.0 → 0.35.0) replaced every shell hook body with a Node-binary
+shim. The bash files in `.claude/hooks/` are now ~30-line stubs that
+fork `rea hook scan-bash` / `rea hook scan-write` (the AST-walker and
+write-tier scanner respectively) and re-verify the verdict JSON shape
+on return — a tampered `REA_NODE_CLI` env var cannot bypass. The
+parser-tier walker (`mvdan-sh@0.10.1`) handles Bash AST grammar
+exhaustively; the write-tier scanner handles `Write`/`Edit`/
+`MultiEdit`/`NotebookEdit` payloads against the same policy. See
 [`docs/architecture/bash-scanner.md`](docs/architecture/bash-scanner.md)
-for the AST-walker design and [`docs/migration/0.23.0.md`](docs/migration/0.23.0.md)
-for consumer migration notes.
+and [`docs/migration/0.23.0.md`](docs/migration/0.23.0.md) for the
+walker design and consumer migration notes.
+
+**Four-tier policy reader.** The shim infrastructure honors a
+four-tier ladder when loading policy (`hooks/_lib/policy-reader.sh`):
+Tier 1 is `rea hook policy-get` (the dist CLI), Tier 2 is
+`python3 + PyYAML`, Tier 3 is `awk` (block-form only), and an
+optional `jq` accelerator for JSON walks. `rea doctor` probes every
+tier and surfaces which one(s) are reachable in the operator's
+environment — pre-0.39.0 a stale dist + missing PyYAML would
+silently no-op flow-form policy when `awk` was the only working
+tier. See `Self-validation` below.
 
 The hook layer runs independently of the MCP gateway — bypassing one does
 not disable the other. That redundancy is intentional.
@@ -217,6 +231,71 @@ to build a separate package that composes with REA.
   in audit records; it does not store, rotate, or provision them.
 
 The non-goals are the product.
+
+---
+
+## Architecture
+
+REA ships as a single npm package that delivers five runtime surfaces:
+
+1. **Node-binary CLI** (`dist/cli/index.js`) — the `rea` command, with
+   subcommands for install (`init`/`upgrade`), runtime
+   (`serve`/`check`/`status`/`doctor`), kill-switch (`freeze`/
+   `unfreeze`), audit (`rotate`/`verify`/`summary`/`specialists`),
+   review (`review`/`preflight`/`hook push-gate`), and hook
+   evaluation (`hook scan-bash`/`scan-write`/`policy-get`).
+2. **Shell hook shims** (`hooks/*.sh` → `.claude/hooks/*.sh`) — ~30
+   lines apiece. Each shim performs a HALT check, then forks the
+   corresponding `rea hook scan-*` Node CLI for the real verdict.
+   Pre-0.32.0 these were 500+ line bash regex pipelines; the rewrite
+   closed 24 known bypass classes and removed the bash hot-path
+   entirely. The shims still ship as bash so Claude Code's hook
+   matcher (which spawns sh) works without a Node prerequisite at
+   hook-fire time — the Node CLI is invoked from inside.
+3. **Husky hooks** (`.husky/commit-msg`, `.husky/pre-push`,
+   `.husky/prepare-commit-msg`) — written by `rea init`. Pre-push
+   runs `rea hook push-gate` (stateless Codex review). Commit-msg
+   blocks AI attribution and DCO violations. Prepare-commit-msg
+   optionally appends a `Co-Authored-By:` trailer when configured.
+   Extension surfaces in `.husky/{commit-msg,pre-push}.d/*` are
+   sourced after rea's body for layering commitlint, lint-staged,
+   etc.
+4. **MCP gateway** (`rea serve`) — a stdio MCP server started by
+   Claude Code via `.mcp.json`. Proxies downstream MCPs declared in
+   `.rea/registry.yaml` through a fixed middleware chain (audit,
+   kill-switch, tier, policy, blocked-paths, rate-limit, breaker,
+   injection, redact, size-cap). See [MCP gateway](#mcp-gateway).
+5. **Four-tier policy reader** (`hooks/_lib/policy-reader.sh`) — the
+   shared helper that bash shims use to read `.rea/policy.yaml`.
+   Tier 1 calls `rea hook policy-get` (full YAML semantics). Tier 2
+   falls back to `python3 + PyYAML` when the CLI is unreachable.
+   Tier 3 falls back to `awk` for the block-form subset. `jq` is an
+   optional JSON accelerator. Each tier downgrades silently to the
+   next; `rea doctor` probes the ladder explicitly so operators see
+   exactly which tier(s) work in their environment.
+
+### Self-validation
+
+`rea doctor` validates every install surface in one shot:
+
+- `.rea/policy.yaml` parses against the strict zod schema
+- `.rea/` directory layout (HALT, registry, fingerprints, audit log)
+- `.claude/settings.json` schema + every shipped hook registered
+- `.husky/commit-msg`, `.husky/pre-push`, `.husky/prepare-commit-msg`
+  exist + have the expected marker, with husky-9 stub indirection
+  followed transparently
+- `codex` binary on `PATH` when `policy.review.codex_required: true`
+- Per-tier policy reader probe (`rea hook policy-get` → `python3 +
+  PyYAML` → `awk` → optional `jq`) so silent flow-form no-ops are
+  caught at install time, not at first hook fire
+- Optional `--smoke` drives the real delegation-capture hook
+  end-to-end (writes a probe audit record + verifies chain integrity)
+- Optional `--drift` reports per-file SHA drift vs. the install
+  manifest without mutating
+- `--strict` promotes settings-schema warnings to hard fail (for CI)
+
+This repo dogfoods every check — see `.rea/` and `.claude/` in the
+checkout for the canonical `bst-internal` profile layout.
 
 ---
 
@@ -864,11 +943,26 @@ Sync `.claude/`, `.husky/`, and managed fragments with this rea version.
 Prompts on drift; silently refreshes unmodified files.
 
 ```bash
-rea upgrade --dry-run   # show what would change; write nothing
-rea upgrade             # interactive
-rea upgrade -y          # non-interactive, keep drifted files
-rea upgrade --force     # non-interactive, overwrite drift
+rea upgrade --dry-run            # rehearse the interactive flow; write nothing
+rea upgrade --check              # structured preview + unified diffs (0.41.0)
+rea upgrade --check --json       # machine-readable preview document
+rea upgrade --check --no-diff    # paths + counts only (large repos)
+rea upgrade                      # interactive
+rea upgrade -y                   # non-interactive, keep drifted files
+rea upgrade --force              # non-interactive, overwrite drift
 ```
+
+`--check` and `--dry-run` are distinct:
+
+- `--dry-run` rehearses the full interactive flow with writes
+  suppressed (prompts still fire, output streams in classification
+  order). Useful locally to walk through the same prompts you'd see
+  during a real upgrade.
+- `--check` is the structured, non-interactive preview: emits a
+  summary table + unified diffs per modified file, exits 0
+  regardless of what would change. The shape mirrors
+  `terraform plan` / `npm install --dry-run` — wire it into CI to
+  surface the changes an upgrade PR would produce.
 
 ### `rea serve`
 
@@ -908,26 +1002,49 @@ rea status --json   # pipe to jq
 
 ### `rea doctor`
 
-Validate the install — policy parses, `.rea/` layout, hooks, Codex plugin
-presence, TOFU fingerprint store.
+Validate the install — policy parses, `.rea/` layout, hooks, Codex
+plugin presence, TOFU fingerprint store, husky stub indirection,
+and the four-tier policy reader ladder (`rea hook policy-get` → 
+`python3 + PyYAML` → `awk` → optional `jq`).
 
 ```bash
 rea doctor
 rea doctor --metrics   # also print 7-day Codex telemetry summary
 rea doctor --drift     # report drift vs. install manifest (read-only)
+rea doctor --smoke     # exercise delegation-capture hook end-to-end
+rea doctor --strict    # 0.30.0 — promote settings-schema warnings to fail
 ```
 
-In non-git directories the commit-msg and pre-push checks are skipped
-cleanly. Audit hash-chain integrity is verified by `rea audit verify`,
-not by `rea doctor`.
+In non-git directories the commit-msg and pre-push checks are
+skipped cleanly. Audit hash-chain integrity is verified by `rea
+audit verify`, not by `rea doctor`. Each policy-reader tier is
+probed independently so silent flow-form no-ops (e.g. stale dist +
+missing PyYAML, with awk handling block-form only) surface at
+install time instead of at first hook fire.
 
-### `rea audit rotate` / `rea audit verify`
+### `rea audit rotate` / `rea audit verify` / `rea audit summary` / `rea audit specialists`
 
 ```bash
 rea audit rotate                      # force rotation now
 rea audit verify                      # re-hash the chain; exit 1 on first tamper
 rea audit verify --since <file>       # walk forward from a rotated file
+
+rea audit summary                     # 0.41.0 — counts by tool/tier/session/status
+rea audit summary --since 24h         # filter to last 24h (units: s/m/h/d/w)
+rea audit summary --since 7d --json   # machine-readable rollup for jq
+
+rea audit specialists                 # delegation-telemetry roll-up
+rea audit specialists --session all   # show every session (default: $CLAUDE_SESSION_ID)
+rea audit specialists --since <file>  # extend the walk through rotated files
 ```
+
+`rea audit summary` is the high-level overview reader: total events,
+counts grouped by `tool_name` / tier / status / session, the time
+window covered, and a sample-verified chain-integrity check. Note
+that `--since` for `summary` is a duration (`24h`, `7d`) — distinct
+from `--since <rotated-file>` on `verify` / `specialists` which
+anchors on a rotated-audit basename. Use `rea audit verify` for the
+rigorous per-record re-hash; `summary` only samples.
 
 ### `rea tofu list` / `rea tofu accept`
 
