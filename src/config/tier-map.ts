@@ -319,6 +319,34 @@ export function reaCommandTier(command: string): Tier | null {
         // can summarize delegation patterns without tripping the
         // Write-tier default. Codex round 3 P2 (2026-05-12).
         if (sub2 === 'specialists') return Tier.Read;
+        // 0.47.0 codex round-11 P2: the audit-reader trio
+        // (`summary`, `by-tool`, `timeline`, `top-blocks`) all share
+        // the read-only contract — they walk audit.jsonl + rotated
+        // segments and emit aggregations to stdout. The pre-0.47.0
+        // tier-map only downgraded `verify` + `specialists`, leaving
+        // 0.41.0+ readers misclassified as Write under TRUSTED
+        // invocations — which made them unavailable in L0 sessions
+        // run from `/usr/local/bin/rea` or
+        // `/proj/node_modules/.bin/rea` despite being purely
+        // observational. Close the gap for all four readers here.
+        //
+        // 0.47.0 codex round-12 P2 (DELIBERATE NON-FIX): the weak-
+        // trust branch below intentionally returns null for Read-tier
+        // subcommands, including these audit readers. That keeps a
+        // bare `rea audit summary` (PATH-lookup or relative path) at
+        // generic Bash Write, where an attacker who shadowed `rea` on
+        // PATH cannot trick the gateway into downgrading their
+        // payload via a fake subcommand. Consumers needing Read
+        // semantics under L0 use the trusted invocation shapes
+        // (`/usr/local/bin/rea …`, `npx rea …`,
+        // `./node_modules/.bin/rea …`) — same contract as `verify`
+        // and `specialists` since 0.10.x / 0.29.0. The UX gap is
+        // documented in `docs/cli/trust-model.md` (see also the
+        // weak-trust branch comment below).
+        if (sub2 === 'summary') return Tier.Read;
+        if (sub2 === 'by-tool') return Tier.Read;
+        if (sub2 === 'timeline') return Tier.Read;
+        if (sub2 === 'top-blocks') return Tier.Read;
         if (sub2 === 'rotate') return Tier.Write;
         return Tier.Write;
       }

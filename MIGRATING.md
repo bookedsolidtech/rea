@@ -528,6 +528,95 @@ under `--since` and lets the per-record timestamp filter drop the
 out-of-window entries. Correctness over micro-optimization;
 `rea audit summary` performance is unchanged in practice.
 
+## Audit observability completion (added in 0.47.0)
+
+0.46.0 shipped `rea audit by-tool` and `rea audit timeline`. 0.47.0
+rounds out the observability surface with two timeline ergonomics fixes
+and a new refusal-debugging reader:
+
+### `rea audit timeline` — helpful MAX_BUCKETS errors + auto-clamp
+
+Pre-0.47.0, `rea audit timeline --bucket=15m --since=21d` (= 2016
+buckets, just past the 2000-bucket ceiling) rejected with a generic
+"use a larger --bucket or narrower --since" message. The 0.47.0 error
+now carries concrete remediation:
+
+```text
+rea audit timeline: --bucket=15m × --since=21d = 2016 buckets exceeds
+MAX_BUCKETS=2000. Try --bucket=1h (504 buckets) or --since=20d 20h
+(1999 buckets).
+```
+
+For the related "I omitted `--since` and the audit log spans a year"
+case, the timeline now AUTO-CLAMPS to the widest window that fits at
+the requested cadence rather than throwing. The clamp is surfaced
+inline in human output:
+
+```text
+rea audit timeline (clamped to ~1999h of newest activity, hourly)
+────────────────────────────────────────
+note: --since not specified; auto-clamped to newest 2000 buckets
+      (~1999h span at --bucket=1h). Pass --since=DUR to anchor at
+      now, or rerun with a WIDER --bucket (current 1h) to fit the
+      full log.
+…
+```
+
+JSON consumers see the clamp as a new `clamped_since` field — `null`
+in the common case, a duration string (e.g. `"1999h"`) when the
+clamp fired. The field is informational, not reproducible: `--since`
+always anchors at `now`, so a clamp anchored at an older record
+cannot be round-tripped through `--since=<clamped_since>`. Use the
+field to detect that clamping occurred and to size the rendered
+window in dashboards. For a fully reproducible view, pass `--since`
+or `--bucket` explicitly. Schema version is unchanged (still v1) —
+the field is purely additive. `window.start/end/seconds` is also
+nulled out on sparse-log clamps where the kept buckets don't form a
+contiguous time lattice, so `total_events / window.seconds` never
+derives a misleading rate.
+
+### `rea audit top-blocks` — debugging "why was that refused?"
+
+A new subcommand surfaces the most recent refusal events (any record
+whose `status` is `denied` or `error`) from the audit log:
+
+```bash
+rea audit top-blocks                          # last 20 refusals, all time
+rea audit top-blocks --since=24h              # last 24h
+rea audit top-blocks --since=7d --limit=50    # last week, top 50
+rea audit top-blocks --json                   # dashboard shape
+```
+
+Each row carries the short hash (first 8 chars), full timestamp, tool
+name, and the refusal reason (sourced from the record's `error` field;
+truncated to ~80 chars in human output, full text in JSON). Sorted
+newest-first so the most recent refusals are at the top.
+
+Use this when an agent reports "the hook blocked my push" or "the
+write was refused" and you need the exact reason without grepping
+`.rea/audit.jsonl` by hand.
+
+JSON shape (stable, v1):
+
+```json
+{
+  "schema_version": 1,
+  "since": "24h",
+  "limit": 20,
+  "window": { "seconds": 86400, "start": "...", "end": "..." },
+  "total_matched": 4,
+  "events": [
+    { "hash": "...", "timestamp": "...", "tool": "Bash",
+      "status": "denied", "reason": "...", "session_id": "..." }
+  ],
+  "files_scanned": ["/abs/path/.rea/audit.jsonl"]
+}
+```
+
+`total_matched` is the pre-limit count, so dashboards can show
+"20 of 47 refusals in window". Walk scope mirrors the sibling audit
+readers — current `.rea/audit.jsonl` PLUS every rotated segment.
+
 ## Policy knobs worth setting
 
 For consumers with a long-running migration branch (>30 commits since

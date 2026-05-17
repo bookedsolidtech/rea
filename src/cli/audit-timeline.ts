@@ -136,6 +136,16 @@ export interface AuditTimelineResult {
   /** Index of the bucket with the highest count. `-1` when no events. */
   peak_index: number;
   files_scanned: string[];
+  /**
+   * 0.47.0 charter item 2: when `--since` was NOT specified and the
+   * audit log spans more than `MAX_BUCKETS` buckets at the requested
+   * cadence, the timeline auto-clamps the window to the widest duration
+   * that fits. This field carries the duration string that was actually
+   * applied (e.g. `"7d"`) — `null` when no clamping fired (the common
+   * case). Dashboard consumers use this to flag "the window you saw is
+   * not the whole log" in their UI.
+   */
+  clamped_since: string | null;
 }
 
 export interface ComputeAuditTimelineOptions {
@@ -215,6 +225,116 @@ function alignToBucket(epochMs: number, bucketSeconds: number): number {
 }
 
 /**
+ * Format a duration in seconds as the coarsest single-unit compact
+ * string that round-trips through `parseDurationSeconds`. Mirrors the
+ * shape `--since` accepts (`s`/`m`/`h`/`d`/`w`).
+ *
+ * 0.47.0 charter item 1: powers the helpful-error suggestion + the
+ * auto-clamp `clamped_since` field. The largest-unit pass keeps the
+ * suggestion readable — `"21d"` not `"1814400s"`.
+ */
+export function formatDurationCompact(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds <= 0) return '0s';
+  const units: Array<[string, number]> = [
+    ['w', 60 * 60 * 24 * 7],
+    ['d', 60 * 60 * 24],
+    ['h', 60 * 60],
+    ['m', 60],
+    ['s', 1],
+  ];
+  for (const [unit, factor] of units) {
+    if (seconds % factor === 0) {
+      return `${String(seconds / factor)}${unit}`;
+    }
+  }
+  return `${String(seconds)}s`;
+}
+
+/**
+ * 0.47.0 charter item 1: build a helpful error message for the
+ * MAX_BUCKETS guard. Computes a concrete "use --bucket=X" and
+ * "use --since=Y" suggestion based on the actual inputs, so the
+ * operator sees the next step inline instead of having to do the
+ * division themselves.
+ *
+ * Strategy:
+ *   - "Try a wider bucket" — smallest unit from {1h, 4h, 1d, 1w} that
+ *     brings projected ≤ MAX_BUCKETS. Falls back to a concrete second
+ *     count if no unit fits (extreme `--since`).
+ *   - "Try a narrower since" — largest multiple of the requested bucket
+ *     that fits under MAX_BUCKETS, rendered compactly.
+ *
+ * The error text always includes the substrings `bucket=`, `since=`,
+ * and `Try` so test assertions can pin the shape.
+ */
+function bucketOverflowMessage(
+  windowSeconds: number,
+  bucketSeconds: number,
+  rawBucket: string,
+  rawSince: string,
+  sinceImplicit: boolean,
+): string {
+  const projected = Math.ceil(windowSeconds / bucketSeconds);
+  // Candidate wider buckets, in ascending size — pick the first that fits.
+  const allCandidates: Array<[string, number]> = [
+    ['1h', 60 * 60],
+    ['4h', 4 * 60 * 60],
+    ['1d', 60 * 60 * 24],
+    ['1w', 60 * 60 * 24 * 7],
+  ];
+  const widerCandidates = allCandidates.filter((entry) => entry[1] > bucketSeconds);
+  let bucketSuggestion: string | null = null;
+  let bucketSuggestionCount: number | null = null;
+  for (const [label, secs] of widerCandidates) {
+    // Account for alignment slack: a window of N seconds at bucket
+    // size S emits up to `ceil(N/S) + 1` buckets after alignment
+    // (lower-edge + upper-edge alignment can each contribute one
+    // extra bucket vs the naive division). Codex round-4 P2 (0.47.0):
+    // suggesting a bucket where `ceil(N/S) === MAX_BUCKETS` would
+    // still re-throw at the post-alignment guard. Use the +1
+    // worst-case so the operator's retry actually succeeds.
+    const cnt = Math.ceil(windowSeconds / secs) + 1;
+    if (cnt <= MAX_BUCKETS) {
+      bucketSuggestion = label;
+      bucketSuggestionCount = cnt;
+      break;
+    }
+  }
+  // Largest --since that fits at the requested bucket size, rendered
+  // compactly. Subtract one bucket so the suggested value survives the
+  // post-alignment guard regardless of where `now` falls on the
+  // bucket lattice — codex round-1 P2 (0.47.0): a window of exactly
+  // `MAX_BUCKETS * bucketSeconds` aligns to MAX_BUCKETS+1 buckets in
+  // the common case (`now` not already on a boundary), so the
+  // operator pasting our suggestion would hit the same error they
+  // just got. `(MAX_BUCKETS - 1) * bucketSeconds` leaves alignment
+  // slack on either edge.
+  const fittingSinceSeconds = (MAX_BUCKETS - 1) * bucketSeconds;
+  const sinceSuggestion = formatDurationCompact(fittingSinceSeconds);
+  const sinceSuggestionCount = Math.floor(fittingSinceSeconds / bucketSeconds);
+
+  const parts: string[] = [];
+  const reason = sinceImplicit
+    ? `--since not specified; defaulting to full audit log (${rawSince}) at --bucket=${rawBucket} = ${String(projected)} buckets exceeds MAX_BUCKETS=${String(MAX_BUCKETS)}.`
+    : `--bucket=${rawBucket} × --since=${rawSince} = ${String(projected)} buckets exceeds MAX_BUCKETS=${String(MAX_BUCKETS)}.`;
+  parts.push(reason);
+  const suggestions: string[] = [];
+  if (bucketSuggestion !== null && bucketSuggestionCount !== null) {
+    suggestions.push(`--bucket=${bucketSuggestion} (${String(bucketSuggestionCount)} buckets)`);
+  }
+  suggestions.push(`--since=${sinceSuggestion} (${String(sinceSuggestionCount)} buckets)`);
+  parts.push(`Try ${suggestions.join(' or ')}.`);
+  return parts.join(' ');
+}
+
+// 0.47.0 round-3 (codex P1+P2): the pre-scan `measureLogBounds`
+// helper was removed. The all-time auto-clamp now runs as a
+// post-scan recovery against observed bucket keys (the only data
+// that can't be fooled by caller-supplied timestamps or empty
+// current-file edge cases). See the "post-scan auto-clamp" branch
+// inside `computeAuditTimeline`.
+
+/**
  * Compute the bucketed timeline. Pure (read-only). Throws
  * `AuditTimelineOptionError` on bad `--since` / `--bucket`; throws on
  * unreadable rotated segments (mirror of audit-summary's stance).
@@ -235,6 +355,7 @@ export async function computeAuditTimeline(
   let windowSeconds: number | null = null;
   let windowStart: Date | null = null;
   let windowEnd: Date | null = null;
+  let clampedSince: string | null = null;
   if (options.since !== undefined && options.since.length > 0) {
     try {
       windowSeconds = parseDurationSeconds(options.since);
@@ -248,19 +369,32 @@ export async function computeAuditTimeline(
     windowStart = new Date(now.getTime() - windowSeconds * 1000);
 
     // Guard against runaway bucket counts under a wide --since with a
-    // tiny --bucket. A simple ceiling is cheaper than rendering 100k
-    // empty rows and gives the operator a clear remediation path.
+    // tiny --bucket. 0.47.0 charter item 1: deliver a concrete-suggestion
+    // error rather than the prior "use a larger --bucket or narrower
+    // --since" generic line — the operator should see the next step
+    // inline.
     const projected = Math.ceil(windowSeconds / bucketSeconds);
     if (projected > MAX_BUCKETS) {
       throw new AuditTimelineOptionError(
-        `--bucket=${bucketRaw} with --since=${options.since} would emit ` +
-          `${String(projected)} buckets (max ${String(MAX_BUCKETS)}). ` +
-          `Use a larger --bucket or narrower --since.`,
+        bucketOverflowMessage(windowSeconds, bucketSeconds, bucketRaw, options.since, false),
       );
     }
   }
 
   const files = await resolveTimelineFileWalk(baseDir);
+
+  // 0.47.0 charter item 2: auto-clamp on long-history repos is
+  // implemented as a POST-SCAN recovery, not a pre-scan guess. Codex
+  // round-3 P1: a pre-scan clamp based on `latestMs - earliestMs`
+  // span is wrong for the no-`--since` path, which normally emits
+  // ONLY event-bearing buckets. A sparse long-lived repo (two
+  // records a year apart at `--bucket=1h`) has a 365d span but a
+  // 2-bucket result — pre-clamping would incorrectly drop one of
+  // those events. We must let the scan see what bucket count the
+  // actual records produce, then clamp only if that exceeds
+  // MAX_BUCKETS. The clamp anchor uses the busiest in-data range
+  // (max observed timestamp + alignment buffer), so we never have
+  // to guess from disk metadata. See the post-scan branch below.
   // Bucket key is the aligned epoch-ms boundary; value is the count.
   const buckets = new Map<number, number>();
   let totalEvents = 0;
@@ -327,9 +461,30 @@ export async function computeAuditTimeline(
     // the renderer.
     const emit = Math.floor((endKey - startKey) / stepMs) + 1;
     if (emit > MAX_BUCKETS) {
+      // Post-alignment overflow is a near-miss vs the pre-scan
+      // projection check (alignment can add at most one bucket on
+      // either edge). Codex round-6 P3 (0.47.0): the helpful-error
+      // builder previously recomputed the projected count from
+      // `windowSeconds` and could end up saying "= 2000 buckets
+      // exceeds MAX_BUCKETS=2000" when the actual post-alignment
+      // count was 2001. Inflate `windowSeconds` by enough to make
+      // the projection match the actual aligned emit count — that
+      // way the operator sees a consistent number, and the
+      // remediation suggestions inherit the same +1 bias.
+      const effectiveSince =
+        clampedSince ?? (options.since ?? formatDurationCompact(windowSeconds ?? 0));
+      const reportedSeconds = Math.max(
+        windowSeconds ?? 0,
+        (emit - 1) * bucketSeconds + 1,
+      );
       throw new AuditTimelineOptionError(
-        `--bucket / --since would emit ${String(emit)} buckets after alignment ` +
-          `(max ${String(MAX_BUCKETS)}). Use a larger --bucket or narrower --since.`,
+        bucketOverflowMessage(
+          reportedSeconds,
+          bucketSeconds,
+          bucketRaw,
+          effectiveSince,
+          options.since === undefined || options.since.length === 0,
+        ),
       );
     }
     for (let k = startKey; k <= endKey; k += stepMs) {
@@ -341,22 +496,110 @@ export async function computeAuditTimeline(
     }
   } else if (buckets.size > 0) {
     const keys = Array.from(buckets.keys()).sort((a, b) => a - b);
-    if (keys.length > MAX_BUCKETS) {
-      // Without --since the operator hasn't asked for a fixed shape,
-      // but a runaway result still needs a guard. Refuse rather than
-      // truncate silently.
-      throw new AuditTimelineOptionError(
-        `Without --since, the audit log spans ${String(keys.length)} ${bucketRaw} buckets ` +
-          `(max ${String(MAX_BUCKETS)}). Pass --since to scope, or use a larger --bucket.`,
-      );
-    }
     const stepMs = bucketSeconds * 1000;
-    for (const k of keys) {
-      result.push({
-        start: new Date(k).toISOString(),
-        end: new Date(k + stepMs).toISOString(),
-        count: buckets.get(k) ?? 0,
-      });
+    if (keys.length > MAX_BUCKETS) {
+      // 0.47.0 charter item 2 (post-scan auto-clamp): the actual
+      // observed bucket count exceeds MAX_BUCKETS. The no-`--since`
+      // path emits only event-bearing buckets (not a zero-filled
+      // lattice), so clamping by a contiguous time window would
+      // discard most of the newest activity on SPARSE logs (codex
+      // round-5 P1: e.g. one record/day across 2001 days at
+      // --bucket=1h, a time-window clamp keeps ~83 buckets — the
+      // newest-2000-keys clamp keeps all 2000 newest event-bearing
+      // buckets). The right shape: slice the keys array to the newest
+      // MAX_BUCKETS entries directly.
+      //
+      // Codex round-3 P1: clamp on OBSERVED data, not guessed span.
+      // Codex round-3 P2: observed-max timestamp sidesteps both the
+      // empty-current-file case and the out-of-order-timestamp case.
+      // Codex round-4 P2: full MAX_BUCKETS budget (the +1 alignment
+      // slack doesn't apply when cherry-picking from observed keys).
+      const fittingBuckets = MAX_BUCKETS;
+      const kept = keys.slice(keys.length - fittingBuckets);
+      const startKey = kept[0]!;
+      const anchorKey = kept[kept.length - 1]!;
+      // Determine whether the kept buckets form a CONTIGUOUS lattice
+      // (every bucket between startKey and anchorKey is present) or a
+      // SPARSE one (gaps inside). The no-`--since` path emits only
+      // event-bearing buckets, so a sparse clamp is the common case.
+      // Codex round-6 P2 (0.47.0): if we filled `window.start/end/
+      // seconds` with the bucket span of a sparse clamp, the JSON
+      // would lie to dashboard consumers — `total_events / window.
+      // seconds` would derive a wildly-wrong rate, and the operator
+      // could NOT reproduce the view by re-running with
+      // `--since=<clamped_since>` (it would either error or include
+      // far more buckets). Treat the two shapes distinctly:
+      //   - contiguous: report the time-window shape (operator can
+      //     paste `--since=<clamped_since>` to reproduce).
+      //   - sparse: leave `window` null (no reproducible duration
+      //     exists), but still report `clamped_since` so callers
+      //     know the kept-bucket count was budgeted.
+      const expectedContiguousCount =
+        Math.floor((anchorKey - startKey) / stepMs) + 1;
+      const isContiguous = expectedContiguousCount === kept.length;
+      // 0.47.0 charter item 2: `clamped_since` is ALWAYS a duration
+      // string (per the charter `clamped_since: "<DUR>"` contract).
+      // It carries the approximate time span the rendered window
+      // covers — informative, not necessarily paste-back-safe.
+      //
+      // Codex round-8 P2 (0.47.0): on stale logs (latest record
+      // hours/days ago) `--since=<DUR>` would NOT reproduce the
+      // returned data because `--since` always anchors on `now`,
+      // not on the audit's latest record. The reproducibility
+      // promise we entertained briefly across rounds 7-8 is
+      // inherently unsound — `--since` semantics fix one side of
+      // the window (now), so any clamp anchored at an older
+      // timestamp can't round-trip through it. The `note:` line in
+      // human output now describes the field as APPROXIMATE
+      // rather than pasteable.
+      //
+      // Codex round-8 P2 (0.47.0): the sparse-clamp branch
+      // previously emitted `"newest 2000 buckets"` for clarity, but
+      // that broke the documented `<DUR>` shape — dashboards trying
+      // to parse it as a duration would fail only on sparse logs.
+      // Both branches now emit a duration string; the human note
+      // adds the "sparse" qualifier so operators understand what
+      // they're looking at.
+      const spanSeconds = Math.max(
+        bucketSeconds,
+        Math.ceil((anchorKey - startKey) / 1000) + bucketSeconds,
+      );
+      clampedSince = formatDurationCompact(spanSeconds);
+      // For contiguous clamps, also fill window.* so consumers can
+      // compute rates against a real duration. For sparse clamps,
+      // window.* stays null — `total_events / window.seconds` would
+      // be meaningless when the kept buckets don't form a contiguous
+      // lattice.
+      if (isContiguous) {
+        windowSeconds = spanSeconds;
+        windowEnd = new Date(anchorKey + stepMs);
+        windowStart = new Date(startKey);
+      }
+      // Track the contiguous-vs-sparse shape so the renderer can
+      // surface the right note.
+      void expectedContiguousCount; // used above via isContiguous
+      // Emit each kept bucket. total_events under the post-scan clamp
+      // path counts only what the rendered buckets contain — older
+      // sliced-out buckets contribute nothing to the report.
+      let inWindow = 0;
+      for (const k of kept) {
+        const cnt = buckets.get(k) ?? 0;
+        result.push({
+          start: new Date(k).toISOString(),
+          end: new Date(k + stepMs).toISOString(),
+          count: cnt,
+        });
+        inWindow += cnt;
+      }
+      totalEvents = inWindow;
+    } else {
+      for (const k of keys) {
+        result.push({
+          start: new Date(k).toISOString(),
+          end: new Date(k + stepMs).toISOString(),
+          count: buckets.get(k) ?? 0,
+        });
+      }
     }
   }
 
@@ -386,6 +629,7 @@ export async function computeAuditTimeline(
     total_events: totalEvents,
     peak_index: peakIndex,
     files_scanned: filesScanned,
+    clamped_since: clampedSince,
   };
 }
 
@@ -438,10 +682,40 @@ function formatWindowLabel(seconds: number | null): string {
  */
 export function renderAuditTimeline(result: AuditTimelineResult): string {
   const lines: string[] = [];
-  const windowLabel = formatWindowLabel(result.window.seconds);
+  // Codex round-9 P2 (0.47.0): when auto-clamp fires, the regular
+  // `last <DUR>` header (derived from `window.seconds`) is wrong —
+  // contiguous stale logs would print "last 1d" even though the
+  // newest event was days ago, and sparse clamps would fall back
+  // to "all time". Use a clamp-aware header that describes the
+  // returned shape instead.
   const cadenceLabel = bucketLabel(result.bucket.seconds, result.bucket.raw);
+  let windowLabel: string;
+  if (result.clamped_since !== null) {
+    windowLabel = `clamped to ~${result.clamped_since} of newest activity`;
+  } else {
+    windowLabel = formatWindowLabel(result.window.seconds);
+  }
   lines.push(`rea audit timeline (${windowLabel}, ${cadenceLabel})`);
   lines.push('─'.repeat(40));
+  // 0.47.0 charter item 2: surface the auto-clamp inline. Operators
+  // scanning the rendered output should immediately see that the
+  // window they got isn't the full audit log. Codex round-8 P2
+  // (0.47.0): `clamped_since` is informational, not reproducible —
+  // `--since=DUR` anchors at `now`, so a clamp anchored at an older
+  // record can't round-trip. Codex round-9 P3 (0.47.0): only a
+  // WIDER `--bucket` actually changes the result — pinning the same
+  // bucket would just re-trigger the clamp. The remediation
+  // suggestion names "wider" explicitly to avoid sending operators
+  // down a no-op retry path.
+  if (result.clamped_since !== null) {
+    lines.push(
+      `note: --since not specified; auto-clamped to newest ${String(MAX_BUCKETS)} buckets ` +
+        `(~${result.clamped_since} span at --bucket=${result.bucket.raw}). ` +
+        `Pass --since=DUR to anchor at now, or rerun with a WIDER --bucket ` +
+        `(current ${result.bucket.raw}) to fit the full log.`,
+    );
+    lines.push('');
+  }
   // Codex round-1 P2 (0.46.0): the zero-events case has two distinct
   // shapes and the renderer must NOT collapse them.
   //
