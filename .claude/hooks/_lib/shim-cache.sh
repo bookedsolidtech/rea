@@ -250,10 +250,24 @@ shim_cache_disabled() {
     # but valid YAML). Pre-fix the bash matcher pinned column 0.
     # We strip leading whitespace from the line for matching
     # purposes; for the block-form sub-block scan we ALSO track the
-    # opener's indentation depth so we don't mistake a deeper-
-    # indented sibling block's `enabled: false` for ours. The
-    # block-form-end heuristic is now "first non-empty line at or
-    # below the opener's indent level".
+    # opener indent depth so we do not mistake a deeper-indented
+    # sibling block enabled: false for ours. The block-form-end
+    # heuristic is now first non-empty line at or below the opener
+    # indent level.
+    #
+    # 0.48.1 R10 P3: pure-comment lines (matching ^[[:space:]]*#) MUST
+    # NOT close the block. Pre-fix a top-level comment like
+    # shim_cache:\n# note\n  enabled: false closed the block on the
+    # comment line (non-empty, indent 0 <= opener_indent 0) and the
+    # subsequent enabled: false was treated as a top-level key with
+    # no parent block, so the disable was silently ignored.
+    #
+    # 0.48.1 multi-line flow-form: shim_cache: {\n  enabled: false\n}
+    # is valid YAML the TS loader accepts. We add a flow-block state
+    # that opens on shim_cache: { (with the { unmatched on the same
+    # line), accumulates body until }, and matches enabled: false in
+    # the assembled buffer. The single-line flow-form rule above
+    # still wins for shim_cache: { enabled: false } on one line.
     result=$(awk '
       {
         lc = tolower($0)
@@ -262,9 +276,82 @@ shim_cache_disabled() {
         indent_of_line = match(lc, /[^[:space:]]/) - 1
         if (indent_of_line < 0) indent_of_line = 0
       }
-      # Flow-form: leading whitespace allowed before the key.
-      lc ~ /^[[:space:]]*shim_cache:[[:space:]]*\{[^}]*enabled[[:space:]]*:[[:space:]]*false[^}]*\}([[:space:]]*(#.*)?)?$/ {
-        print "off"; exit
+      # Pure-comment line: skip without affecting state. Must come
+      # before BOTH the flow-block accumulator AND the block-end
+      # heuristic so a comment inside either context is transparent.
+      lc ~ /^[[:space:]]*#/ {
+        next
+      }
+      # 0.48.1 round-2 P2: removed the narrow single-line flow regex
+      # that matched shim_cache: { enabled: false } with [^}]* — it
+      # had no concept of quoted scalars or trailing comments and
+      # mis-fired on shim_cache: { note: "enabled: false", enabled:
+      # true }. The single-line case now flows through the brace-
+      # depth path below (which strips quotes + trailing comments
+      # per line); the only behavior change is that the inline form
+      # gets the same sanitization the multi-line form already does.
+      # Flow-form multi-line opener: shim_cache: { with the first {
+      # unmatched on the same line. Start accumulating until the
+      # matching close brace.
+      #
+      # 0.48.1 round-1 P2-B: track BRACE DEPTH across the buffer
+      # instead of closing on the first }. Valid YAML such as
+      # shim_cache: { meta: { foo: bar }, enabled: false } has
+      # nested {} pairs; a quoted scalar like note: "}" embeds a
+      # brace inside a string. We strip "..." and *...* (single-quote
+      # placeholder is \047 to keep this awk single-quoted body
+      # apostrophe-clean) before counting so quoted braces do not
+      # affect depth. Approximate but matches every shape the TS
+      # loader accepts; on a malformed policy the worst case is
+      # cache-stays-on (the safe default).
+      in_flow == 0 && lc ~ /^[[:space:]]*shim_cache:[[:space:]]*\{/ {
+        # Build a sanitized line: strip quoted scalars first so
+        # quoted braces / quoted comments / quoted enabled: false
+        # tokens cannot pollute brace-depth or value detection;
+        # then strip trailing #-comments so they cannot either.
+        # 0.48.1 round-2 P2 fix.
+        line_stripped = lc
+        gsub(/"[^"]*"/, "", line_stripped)
+        gsub(/\047[^\047]*\047/, "", line_stripped)
+        gsub(/[[:space:]]*#.*$/, "", line_stripped)
+        opens = gsub(/\{/, "{", line_stripped)
+        closes = gsub(/\}/, "}", line_stripped)
+        flow_depth = opens - closes
+        if (flow_depth <= 0) {
+          # Already balanced on this line — single-line flow form,
+          # potentially with nested braces (e.g. { meta: { foo: bar
+          # }, enabled: false }). The narrow single-line rule above
+          # cannot match nested-brace shapes (its [^}]* fails on the
+          # inner closing brace), so we check the SANITIZED line
+          # (quotes + comments stripped) here. Anchoring on a token
+          # boundary defends against accidental substring noise
+          # like enabled-false-something.
+          if (line_stripped ~ /enabled[[:space:]]*:[[:space:]]*false([^[:alnum:]_]|$)/) {
+            print "off"; exit
+          }
+          next
+        }
+        in_flow = 1
+        flow_buf = line_stripped
+        next
+      }
+      # Flow-form continuation: accumulate sanitized + maintain depth.
+      in_flow == 1 {
+        line_stripped = lc
+        gsub(/"[^"]*"/, "", line_stripped)
+        gsub(/\047[^\047]*\047/, "", line_stripped)
+        gsub(/[[:space:]]*#.*$/, "", line_stripped)
+        flow_buf = flow_buf " " line_stripped
+        opens = gsub(/\{/, "{", line_stripped)
+        closes = gsub(/\}/, "}", line_stripped)
+        flow_depth += opens - closes
+        if (flow_depth <= 0) {
+          in_flow = 0
+          if (flow_buf ~ /enabled[[:space:]]*:[[:space:]]*false([^[:alnum:]_]|$)/) {
+            print "off"; exit
+          }
+        }
+        next
       }
       # Block-form opener: leading whitespace allowed.
       lc ~ /^[[:space:]]*shim_cache:[[:space:]]*(#.*)?$/ {
@@ -273,7 +360,8 @@ shim_cache_disabled() {
         next
       }
       # End the block when we see a non-empty line at or below the
-      # opener indent (a sibling YAML key at the same level).
+      # opener indent (a sibling YAML key at the same level). Comment
+      # lines were already filtered above so they cannot close the block.
       in_block && lc !~ /^[[:space:]]*$/ && indent_of_line <= opener_indent {
         in_block = 0
       }

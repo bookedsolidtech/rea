@@ -1088,3 +1088,172 @@ process.stdin.on('end', () => {
     expect(secondEntries.length).toBeGreaterThanOrEqual(firstEntries.length);
   });
 });
+
+describe('hooks/_lib/shim-runtime.sh — 0.48.1 SHIM_SKIP_VERSION_PROBE cache-write soundness', () => {
+  // 0.48.1 Item 1 (SOUNDNESS): when SHIM_SKIP_VERSION_PROBE=1 is set
+  // (delegation-capture's no-probe shape), the cache MUST NOT write an
+  // entry. Pre-fix the write proceeded and recorded sandbox_ok+shape_ok
+  // from defaulted-true logic, even though the probe never ran. A
+  // subsequent cache HIT would read that entry and trust a probe-skip
+  // result that was never produced — silently extending the bypass to
+  // shims that DO need probes.
+  let projectDir: string;
+  let cacheTmpdir: string;
+  beforeEach(() => {
+    projectDir = makeProjectDir();
+    cacheTmpdir = fs.mkdtempSync(path.join(os.tmpdir(), 'rea-shim-cache-skip-probe-'));
+  });
+  afterEach(() => {
+    fs.rmSync(projectDir, { recursive: true, force: true });
+    fs.rmSync(cacheTmpdir, { recursive: true, force: true });
+  });
+
+  it('probe RUNS: cache write proceeds (baseline)', () => {
+    if (!bashExists()) return;
+    const r = runShim({
+      shimBody: STD_BODY,
+      payload: '{}',
+      projectDir,
+      installFakeCli: 'good-probe',
+      installPkgJson: true,
+      env: { TMPDIR: cacheTmpdir, REA_SHIM_CACHE: '1' },
+    });
+    expect(r.status).toBe(0);
+    const euid = String(process.getuid?.() ?? 0);
+    const dir = path.join(cacheTmpdir, `rea-shim-cache.${euid}`);
+    expect(fs.existsSync(dir)).toBe(true);
+    const entries = fs.readdirSync(dir).filter((e) => e.endsWith('.json'));
+    expect(entries.length).toBeGreaterThan(0);
+  });
+
+  it('SHIM_SKIP_VERSION_PROBE=1: cache write is SKIPPED', () => {
+    if (!bashExists()) return;
+    const body = `
+SHIM_SKIP_VERSION_PROBE=1
+${STD_BODY}
+`;
+    const r = runShim({
+      shimBody: body,
+      payload: '{}',
+      projectDir,
+      installFakeCli: 'good-probe',
+      installPkgJson: true,
+      env: { TMPDIR: cacheTmpdir, REA_SHIM_CACHE: '1' },
+    });
+    expect(r.status).toBe(0);
+    // The cache directory may or may not exist (cache layer creates it
+    // only when it would write an entry). Either way, no entry files.
+    const euid = String(process.getuid?.() ?? 0);
+    const dir = path.join(cacheTmpdir, `rea-shim-cache.${euid}`);
+    if (fs.existsSync(dir)) {
+      const entries = fs.readdirSync(dir).filter((e) => e.endsWith('.json'));
+      expect(entries.length).toBe(0);
+    }
+  });
+
+  it('SHIM_SKIP_VERSION_PROBE on first fire: second fire WITHOUT skip runs full probe (no cache hit)', () => {
+    if (!bashExists()) return;
+    // Run #1 — probe bypassed, must not write cache.
+    const bodySkip = `
+SHIM_SKIP_VERSION_PROBE=1
+${STD_BODY}
+`;
+    const r1 = runShim({
+      shimBody: bodySkip,
+      payload: '{}',
+      projectDir,
+      installFakeCli: 'good-probe',
+      installPkgJson: true,
+      env: { TMPDIR: cacheTmpdir, REA_SHIM_CACHE: '1' },
+    });
+    expect(r1.status).toBe(0);
+    const euid = String(process.getuid?.() ?? 0);
+    const dir = path.join(cacheTmpdir, `rea-shim-cache.${euid}`);
+    const afterRun1 = fs.existsSync(dir)
+      ? fs.readdirSync(dir).filter((e) => e.endsWith('.json'))
+      : [];
+    expect(afterRun1.length).toBe(0);
+
+    // Run #2 — probe NOT bypassed. If run #1 had wrongly written an
+    // entry, run #2 would hit the cache, skip the probe, and NOT add
+    // a new entry. The correct behavior is that run #2 writes one.
+    const r2 = runShim({
+      shimBody: STD_BODY,
+      payload: '{}',
+      projectDir,
+      env: { TMPDIR: cacheTmpdir, REA_SHIM_CACHE: '1' },
+    });
+    expect(r2.status).toBe(0);
+    const afterRun2 = fs.readdirSync(dir).filter((e) => e.endsWith('.json'));
+    expect(afterRun2.length).toBe(1);
+  });
+});
+
+describe('hooks/_lib/shim-runtime.sh — 0.48.1 sandbox-before-cache-prep ordering', () => {
+  // 0.48.1 Item 4 (codex 0.48.0 round-10 P2): the dist-tree hash walk
+  // (a `find` over $RESOLVED_CLI_PATH's grandparent) must NOT run
+  // before the sandbox check. Pre-fix a hostile workspace whose
+  // node_modules/@bookedsolid/rea (or dist) symlinked outside
+  // CLAUDE_PROJECT_DIR caused the find walk to recurse the external
+  // tree before sandbox refused at `bad:cli-escapes-project`.
+  let projectDir: string;
+  let cacheTmpdir: string;
+  let externalTree: string;
+  beforeEach(() => {
+    projectDir = makeProjectDir();
+    cacheTmpdir = fs.mkdtempSync(path.join(os.tmpdir(), 'rea-shim-cache-symlink-'));
+    externalTree = fs.mkdtempSync(path.join(os.tmpdir(), 'rea-external-tree-'));
+  });
+  afterEach(() => {
+    fs.rmSync(projectDir, { recursive: true, force: true });
+    fs.rmSync(cacheTmpdir, { recursive: true, force: true });
+    fs.rmSync(externalTree, { recursive: true, force: true });
+  });
+
+  it('symlinked-out CLI tree: refuses with sandbox banner WITHOUT walking external tree', () => {
+    if (!bashExists()) return;
+    // Build an OUTSIDE-PROJECT dist tree. dist/cli/index.js is a real
+    // file with valid CLI shape; we then symlink projectDir/dist to
+    // externalTree/dist. Sandbox check resolves the realpath of
+    // RESOLVED_CLI_PATH (the index.js) and refuses with
+    // bad:cli-escapes-project because the realpath is outside
+    // CLAUDE_PROJECT_DIR.
+    const externalDistCli = path.join(externalTree, 'dist', 'cli');
+    fs.mkdirSync(externalDistCli, { recursive: true });
+    fs.writeFileSync(path.join(externalDistCli, 'index.js'), '// fake CLI\n');
+    fs.chmodSync(path.join(externalDistCli, 'index.js'), 0o755);
+    // Plant a sentinel sibling .js file in the external tree. If the
+    // dist-tree hash walk runs against the symlinked target, this
+    // file's stat will be captured. We cannot directly observe `find`
+    // execution, but we CAN assert the shim refuses with the sandbox
+    // banner and does NOT emit any output indicating cache prep ran.
+    fs.writeFileSync(path.join(externalDistCli, 'sentinel.js'), '// SENTINEL\n');
+
+    // Symlink projectDir/dist → externalTree/dist.
+    fs.symlinkSync(path.join(externalTree, 'dist'), path.join(projectDir, 'dist'));
+    // Install a package.json so the sandbox check's package walk
+    // gets past the "no rea pkg.json" branch on its way to the
+    // realpath/escapes check.
+    installPkgJson(projectDir);
+
+    const r = runShim({
+      shimBody: STD_BODY,
+      payload: '{}',
+      projectDir,
+      env: { TMPDIR: cacheTmpdir, REA_SHIM_CACHE: '1' },
+    });
+    // Blocking-tier shim with no fail-open: exits 2 with the
+    // sandbox-failure banner (and the CLI-missing banner since
+    // REA_ARGV got cleared by sandbox failure).
+    expect(r.status).toBe(2);
+    expect(r.stderr).toMatch(/sandbox check|cli is not built/i);
+    // Cache directory must NOT have been created — cache prep is
+    // gated on sandbox_failed -eq 0 (0.48.1 fix).
+    const euid = String(process.getuid?.() ?? 0);
+    const dir = path.join(cacheTmpdir, `rea-shim-cache.${euid}`);
+    if (fs.existsSync(dir)) {
+      const entries = fs.readdirSync(dir).filter((e) => e.endsWith('.json'));
+      expect(entries.length).toBe(0);
+    }
+  });
+});

@@ -325,6 +325,249 @@ describe('shim-cache.sh — shim_cache_disabled (policy.shim_cache.enabled)', ()
     expect(r.status).toBe(0);
     expect(r.stdout.trim()).toBe('OFF');
   });
+
+  // 0.48.1 Item 2: multi-line flow-form. The TS loader parses
+  //   shim_cache: {
+  //     enabled: false
+  //   }
+  // as flow-form YAML; the bash helper must match the same shape.
+  it('returns 0 (disabled) for multi-line flow-form (opener on its own line)', () => {
+    if (!bashExists()) return;
+    const projDir = path.join(tmp, 'proj');
+    fs.mkdirSync(path.join(projDir, '.rea'), { recursive: true });
+    fs.writeFileSync(
+      path.join(projDir, '.rea', 'policy.yaml'),
+      'version: "1"\nshim_cache: {\n  enabled: false\n}\n',
+    );
+    const r = runBash(
+      `REA_ROOT="${projDir}"
+       source "${SHIM_CACHE_LIB}"
+       if shim_cache_disabled; then echo OFF; else echo ON; fi`,
+      { tmpdir: tmp, env: { REA_ROOT: projDir } },
+    );
+    expect(r.status).toBe(0);
+    expect(r.stdout.trim()).toBe('OFF');
+  });
+
+  it('returns 0 (disabled) for multi-line flow-form with trailing comment on close brace', () => {
+    if (!bashExists()) return;
+    const projDir = path.join(tmp, 'proj');
+    fs.mkdirSync(path.join(projDir, '.rea'), { recursive: true });
+    fs.writeFileSync(
+      path.join(projDir, '.rea', 'policy.yaml'),
+      'version: "1"\nshim_cache: {\n  enabled: false\n} # closed for measurement\n',
+    );
+    const r = runBash(
+      `REA_ROOT="${projDir}"
+       source "${SHIM_CACHE_LIB}"
+       if shim_cache_disabled; then echo OFF; else echo ON; fi`,
+      { tmpdir: tmp, env: { REA_ROOT: projDir } },
+    );
+    expect(r.status).toBe(0);
+    expect(r.stdout.trim()).toBe('OFF');
+  });
+
+  it('returns 1 (enabled) for multi-line flow-form with enabled: true', () => {
+    if (!bashExists()) return;
+    const projDir = path.join(tmp, 'proj');
+    fs.mkdirSync(path.join(projDir, '.rea'), { recursive: true });
+    fs.writeFileSync(
+      path.join(projDir, '.rea', 'policy.yaml'),
+      'version: "1"\nshim_cache: {\n  enabled: true\n}\n',
+    );
+    const r = runBash(
+      `REA_ROOT="${projDir}"
+       source "${SHIM_CACHE_LIB}"
+       if shim_cache_disabled; then echo OFF; else echo ON; fi`,
+      { tmpdir: tmp, env: { REA_ROOT: projDir } },
+    );
+    expect(r.status).toBe(0);
+    expect(r.stdout.trim()).toBe('ON');
+  });
+
+  // 0.48.1 Item 3 (codex 0.48.0 last-review.json P3): pure-comment
+  // lines (matching ^[[:space:]]*#) inside the shim_cache: block must
+  // NOT close the block. Pre-fix the block-end heuristic (non-empty
+  // line at or below opener indent) treated a top-level # comment as
+  // a sibling-key line and dropped out of in_block before reaching
+  // the indented enabled: false.
+  it('returns 0 (disabled) when a top-level comment lives INSIDE the shim_cache: block', () => {
+    if (!bashExists()) return;
+    const projDir = path.join(tmp, 'proj');
+    fs.mkdirSync(path.join(projDir, '.rea'), { recursive: true });
+    fs.writeFileSync(
+      path.join(projDir, '.rea', 'policy.yaml'),
+      'version: "1"\nshim_cache:\n# this is a top-level YAML comment inside the block\n  enabled: false\n',
+    );
+    const r = runBash(
+      `REA_ROOT="${projDir}"
+       source "${SHIM_CACHE_LIB}"
+       if shim_cache_disabled; then echo OFF; else echo ON; fi`,
+      { tmpdir: tmp, env: { REA_ROOT: projDir } },
+    );
+    expect(r.status).toBe(0);
+    expect(r.stdout.trim()).toBe('OFF');
+  });
+
+  it('returns 0 (disabled) when MULTIPLE comments interleave inside the shim_cache: block', () => {
+    if (!bashExists()) return;
+    const projDir = path.join(tmp, 'proj');
+    fs.mkdirSync(path.join(projDir, '.rea'), { recursive: true });
+    fs.writeFileSync(
+      path.join(projDir, '.rea', 'policy.yaml'),
+      'version: "1"\nshim_cache:\n# top-level comment\n  # indented comment\n  enabled: false\n',
+    );
+    const r = runBash(
+      `REA_ROOT="${projDir}"
+       source "${SHIM_CACHE_LIB}"
+       if shim_cache_disabled; then echo OFF; else echo ON; fi`,
+      { tmpdir: tmp, env: { REA_ROOT: projDir } },
+    );
+    expect(r.status).toBe(0);
+    expect(r.stdout.trim()).toBe('OFF');
+  });
+
+  it('returns 1 (enabled) when a top-level sibling YAML key still closes the block', () => {
+    // Negative control: the comment-line exemption must NOT make
+    // genuine sibling keys (autonomy_level: L1) transparent. A
+    // real top-level key after `shim_cache:` should still close the
+    // block; otherwise an `enabled: false` belonging to a different
+    // top-level section would be wrongly attributed to shim_cache.
+    if (!bashExists()) return;
+    const projDir = path.join(tmp, 'proj');
+    fs.mkdirSync(path.join(projDir, '.rea'), { recursive: true });
+    fs.writeFileSync(
+      path.join(projDir, '.rea', 'policy.yaml'),
+      'version: "1"\nshim_cache:\nautonomy_level: L1\nother_section:\n  enabled: false\n',
+    );
+    const r = runBash(
+      `REA_ROOT="${projDir}"
+       source "${SHIM_CACHE_LIB}"
+       if shim_cache_disabled; then echo OFF; else echo ON; fi`,
+      { tmpdir: tmp, env: { REA_ROOT: projDir } },
+    );
+    expect(r.status).toBe(0);
+    expect(r.stdout.trim()).toBe('ON');
+  });
+
+  // 0.48.1 round-1 P2-B (codex): the multi-line flow parser must
+  // track BRACE DEPTH instead of closing on the first }. Pre-fix
+  // valid YAML such as `shim_cache: { meta: { foo: bar }, enabled:
+  // false }` exited the flow-form accumulator on the inner closing
+  // brace before reaching `enabled: false`, leaving the cache wrongly
+  // enabled. Quoted scalars containing braces (e.g. `note: "}"`)
+  // would also short-circuit.
+  it('returns 0 (disabled) for single-line flow-form with NESTED braces around enabled: false', () => {
+    if (!bashExists()) return;
+    const projDir = path.join(tmp, 'proj');
+    fs.mkdirSync(path.join(projDir, '.rea'), { recursive: true });
+    fs.writeFileSync(
+      path.join(projDir, '.rea', 'policy.yaml'),
+      'version: "1"\nshim_cache: { meta: { foo: bar }, enabled: false }\n',
+    );
+    const r = runBash(
+      `REA_ROOT="${projDir}"
+       source "${SHIM_CACHE_LIB}"
+       if shim_cache_disabled; then echo OFF; else echo ON; fi`,
+      { tmpdir: tmp, env: { REA_ROOT: projDir } },
+    );
+    expect(r.status).toBe(0);
+    expect(r.stdout.trim()).toBe('OFF');
+  });
+
+  it('returns 0 (disabled) for multi-line flow-form with nested braces in continuation', () => {
+    if (!bashExists()) return;
+    const projDir = path.join(tmp, 'proj');
+    fs.mkdirSync(path.join(projDir, '.rea'), { recursive: true });
+    fs.writeFileSync(
+      path.join(projDir, '.rea', 'policy.yaml'),
+      'version: "1"\nshim_cache: {\n  meta: { foo: bar },\n  enabled: false\n}\n',
+    );
+    const r = runBash(
+      `REA_ROOT="${projDir}"
+       source "${SHIM_CACHE_LIB}"
+       if shim_cache_disabled; then echo OFF; else echo ON; fi`,
+      { tmpdir: tmp, env: { REA_ROOT: projDir } },
+    );
+    expect(r.status).toBe(0);
+    expect(r.stdout.trim()).toBe('OFF');
+  });
+
+  // 0.48.1 round-2 P2 (codex): the buffer-level enabled: false
+  // detector must ignore trailing YAML comments AND quoted scalars
+  // that happen to contain the literal text. Pre-round-2 these
+  // false-positives flipped a true policy to disabled.
+  it('returns 1 (enabled) when a TRAILING comment after enabled: true mentions enabled: false', () => {
+    if (!bashExists()) return;
+    const projDir = path.join(tmp, 'proj');
+    fs.mkdirSync(path.join(projDir, '.rea'), { recursive: true });
+    fs.writeFileSync(
+      path.join(projDir, '.rea', 'policy.yaml'),
+      'version: "1"\nshim_cache: { enabled: true } # previously enabled: false\n',
+    );
+    const r = runBash(
+      `REA_ROOT="${projDir}"
+       source "${SHIM_CACHE_LIB}"
+       if shim_cache_disabled; then echo OFF; else echo ON; fi`,
+      { tmpdir: tmp, env: { REA_ROOT: projDir } },
+    );
+    expect(r.status).toBe(0);
+    expect(r.stdout.trim()).toBe('ON');
+  });
+
+  it('returns 1 (enabled) when a multi-line flow trailing comment mentions enabled: false', () => {
+    if (!bashExists()) return;
+    const projDir = path.join(tmp, 'proj');
+    fs.mkdirSync(path.join(projDir, '.rea'), { recursive: true });
+    fs.writeFileSync(
+      path.join(projDir, '.rea', 'policy.yaml'),
+      'version: "1"\nshim_cache: {\n  enabled: true # was enabled: false during incident\n}\n',
+    );
+    const r = runBash(
+      `REA_ROOT="${projDir}"
+       source "${SHIM_CACHE_LIB}"
+       if shim_cache_disabled; then echo OFF; else echo ON; fi`,
+      { tmpdir: tmp, env: { REA_ROOT: projDir } },
+    );
+    expect(r.status).toBe(0);
+    expect(r.stdout.trim()).toBe('ON');
+  });
+
+  it('returns 1 (enabled) when a quoted scalar value mentions enabled: false', () => {
+    if (!bashExists()) return;
+    const projDir = path.join(tmp, 'proj');
+    fs.mkdirSync(path.join(projDir, '.rea'), { recursive: true });
+    fs.writeFileSync(
+      path.join(projDir, '.rea', 'policy.yaml'),
+      'version: "1"\nshim_cache: { note: "enabled: false", enabled: true }\n',
+    );
+    const r = runBash(
+      `REA_ROOT="${projDir}"
+       source "${SHIM_CACHE_LIB}"
+       if shim_cache_disabled; then echo OFF; else echo ON; fi`,
+      { tmpdir: tmp, env: { REA_ROOT: projDir } },
+    );
+    expect(r.status).toBe(0);
+    expect(r.stdout.trim()).toBe('ON');
+  });
+
+  it('returns 0 (disabled) for multi-line flow-form where a quoted string contains } before enabled: false', () => {
+    if (!bashExists()) return;
+    const projDir = path.join(tmp, 'proj');
+    fs.mkdirSync(path.join(projDir, '.rea'), { recursive: true });
+    fs.writeFileSync(
+      path.join(projDir, '.rea', 'policy.yaml'),
+      'version: "1"\nshim_cache: {\n  note: "}",\n  enabled: false\n}\n',
+    );
+    const r = runBash(
+      `REA_ROOT="${projDir}"
+       source "${SHIM_CACHE_LIB}"
+       if shim_cache_disabled; then echo OFF; else echo ON; fi`,
+      { tmpdir: tmp, env: { REA_ROOT: projDir } },
+    );
+    expect(r.status).toBe(0);
+    expect(r.stdout.trim()).toBe('OFF');
+  });
 });
 
 describe('shim-cache.sh — nanosecond-precision mtime in cache key', () => {
