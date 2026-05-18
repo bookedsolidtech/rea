@@ -312,16 +312,66 @@ shim_run() {
   # 4. Resolve CLI.
   shim_resolve_cli
 
+  # 4a. Sandbox check (0.48.1 — moved earlier from step 5). Runs BEFORE
+  #     the cache-key-prep block so the dist-tree `find` walk (added in
+  #     0.48.0) never recurses an out-of-project symlink target. Pre-
+  #     0.48.1 ordering was: cache prep → cache lookup → sandbox check;
+  #     codex 0.48.0 round-10 P2 caught that a hostile workspace whose
+  #     `node_modules/@bookedsolid/rea` (or `dist`) symlinks outside
+  #     CLAUDE_PROJECT_DIR caused the find walk to traverse the external
+  #     tree before step 5 refused at `bad:cli-escapes-project`. Moving
+  #     sandbox earlier preserves the cheap-refusal posture the
+  #     pre-0.48.0 hot path had.
+  #
+  #     Tradeoff vs 0.48.0: a warm cache hit no longer skips sandbox
+  #     (pre-fix the `_shim_cache_hit` guard at this site bypassed it).
+  #     Sandbox is a single `node -e` (~30ms warm) so the lost
+  #     optimization is acceptable; the cache's primary win is skipping
+  #     the version probe at step 8 (which is a full CLI spawn,
+  #     materially more expensive).
+  local sandbox_result=""
+  local sandbox_failed=0
+  local node_missing=0
+  if [ "${#REA_ARGV[@]}" -gt 0 ]; then
+    if ! command -v node >/dev/null 2>&1; then
+      # 0.38.1 round-2 P2 fix: pre-fix this branch exited 0/2 IMMEDIATELY
+      # without ever calling shim_policy_short_circuit, so a blocking-
+      # tier shim whose policy said "disabled" still refused when node
+      # was absent (which contradicts the pre-port body's no-op-on-
+      # disabled posture). Clear REA_ARGV here so Tier 1 (rea CLI)
+      # cannot fire — the policy reader degrades to Tier 2 (python3) /
+      # Tier 3 (awk), neither of which needs node. Track node-missing
+      # separately so the CLI-required branch below can emit the right
+      # banner if the policy did NOT short-circuit us out.
+      node_missing=1
+      REA_ARGV=()
+    else
+      sandbox_result=$(shim_sandbox_check "$RESOLVED_CLI_PATH" "$proj" "$SHIM_ENFORCE_CLI_SHAPE")
+      if [ "$sandbox_result" != "ok" ]; then
+        sandbox_failed=1
+        if [ "$SHIM_FAIL_OPEN" -eq 1 ]; then
+          shim_emit_sandbox_skip_banner "$sandbox_result"
+          exit 0
+        fi
+        # Blocking-tier: clear REA_ARGV so Tier-1 policy reads (in
+        # shim_policy_short_circuit) degrade to Tier 2 / Tier 3 instead
+        # of invoking the untrusted CLI.
+        REA_ARGV=()
+      fi
+    fi
+  fi
+
   # 4b. Per-session cache lookup (0.48.0). When the cache is enabled
   #     AND the resolved CLI matches a recent same-session entry, the
-  #     sandbox check (step 5) AND version probe (step 8) can both be
-  #     skipped — those answers do not change for a stable CLI inside a
-  #     stable session. Cache MISS / disabled / corrupt → fall through
-  #     to the existing uncached hot path. NEVER fail closed on a cache
-  #     error (see hooks/_lib/shim-cache.sh header for the security
-  #     contract). The cache check runs AFTER `shim_is_relevant` (per
-  #     design memo concern #3) so we never pay a stat-per-fire cost
-  #     for irrelevant payloads.
+  #     version probe (step 8) can be skipped — that answer does not
+  #     change for a stable CLI inside a stable session. Cache MISS /
+  #     disabled / corrupt → fall through to the existing uncached hot
+  #     path. NEVER fail closed on a cache error (see
+  #     hooks/_lib/shim-cache.sh header for the security contract). The
+  #     cache check runs AFTER `shim_is_relevant` (per design memo
+  #     concern #3) so we never pay a stat-per-fire cost for irrelevant
+  #     payloads. 0.48.1: also runs AFTER step 4a sandbox check so the
+  #     dist-tree hash walk never traverses a symlinked-out CLI tree.
   local _shim_cache_hit=0
   local _shim_cache_key=""
   local _shim_cache_cli_real=""
@@ -333,7 +383,19 @@ shim_run() {
   local _shim_cache_dist_mtime=""
   local _shim_cache_node_real=""
   local _shim_cache_node_mtime=""
-  if [ "${#REA_ARGV[@]}" -gt 0 ] && ! shim_cache_disabled; then
+  # 0.48.1: gated on `sandbox_failed -eq 0` so a sandbox refusal
+  # short-circuits BEFORE the dist-tree hash walk runs (was running
+  # against a possibly-symlinked-out target pre-0.48.1).
+  #
+  # 0.48.1 round-1 P2-A: also gated on SHIM_SKIP_VERSION_PROBE -eq 0.
+  # Skip-probe shims (delegation-advisory, delegation-capture) cannot
+  # write a cache entry (the step-8b write block also gates on
+  # SHIM_SKIP_VERSION_PROBE -eq 0 — 0.48.1 SOUNDNESS fix), so any
+  # cache-key prep + lookup is pure overhead with zero possible hit.
+  # Pre-fix the highest-frequency hooks paid dist-tree find/stat/hash
+  # + several `node -e` calls on EVERY write-class fire for nothing.
+  if [ "${#REA_ARGV[@]}" -gt 0 ] && [ "$sandbox_failed" -eq 0 ] \
+     && [ "$SHIM_SKIP_VERSION_PROBE" -eq 0 ] && ! shim_cache_disabled; then
     local _stat_out=""
     local _proj_real=""
     local _euid=""
@@ -547,49 +609,12 @@ shim_run() {
     fi
   fi
 
-  # 5. Sandbox check (when CLI was resolved). On failure clear REA_ARGV
-  #    + stash the reason so the eventual CLI-required branch can emit
-  #    the correct banner. Running the sandbox check BEFORE the policy
-  #    short-circuit prevents an unsandboxed CLI from being invoked by
-  #    Tier-1 of the policy reader (0.37.0 codex round-2 P1: applies to
-  #    shims like attribution-advisory whose policy_short_circuit may
-  #    use `policy_reader_get`).
-  #
-  #    Advisory-tier: a sandbox failure exits 0 with the skip banner —
-  #    nothing to enforce for nudges. Blocking-tier: deferred to the
-  #    CLI-required branch below so we emit ONE banner per refusal
-  #    (instead of double-emitting sandbox + cli-missing).
-  local sandbox_result=""
-  local sandbox_failed=0
-  local node_missing=0
-  if [ "${#REA_ARGV[@]}" -gt 0 ] && [ "$_shim_cache_hit" -eq 0 ]; then
-    if ! command -v node >/dev/null 2>&1; then
-      # 0.38.1 round-2 P2 fix: pre-fix this branch exited 0/2 IMMEDIATELY
-      # without ever calling shim_policy_short_circuit, so a blocking-
-      # tier shim whose policy said "disabled" still refused when node
-      # was absent (which contradicts the pre-port body's no-op-on-
-      # disabled posture). Clear REA_ARGV here so Tier 1 (rea CLI)
-      # can't fire — the policy reader degrades to Tier 2 (python3) /
-      # Tier 3 (awk), neither of which needs node. Track node-missing
-      # separately so the CLI-required branch below can emit the right
-      # banner if the policy did NOT short-circuit us out.
-      node_missing=1
-      REA_ARGV=()
-    else
-      sandbox_result=$(shim_sandbox_check "$RESOLVED_CLI_PATH" "$proj" "$SHIM_ENFORCE_CLI_SHAPE")
-      if [ "$sandbox_result" != "ok" ]; then
-        sandbox_failed=1
-        if [ "$SHIM_FAIL_OPEN" -eq 1 ]; then
-          shim_emit_sandbox_skip_banner "$sandbox_result"
-          exit 0
-        fi
-        # Blocking-tier: clear REA_ARGV so Tier-1 policy reads (in
-        # shim_policy_short_circuit) degrade to Tier 2 / Tier 3 instead
-        # of invoking the untrusted CLI.
-        REA_ARGV=()
-      fi
-    fi
-  fi
+  # 5. (0.48.1: sandbox check moved to step 4a — before cache prep — so
+  #    a hostile workspace cannot make the dist-tree hash walk traverse
+  #    a symlinked-out target. The original step-5 block lived between
+  #    cache prep and policy short-circuit; that location was sound for
+  #    correctness but the cache code regressed the cheap-refusal
+  #    posture against symlink workspaces. See step 4a comment.)
 
   # 6. Policy short-circuit. Runs BEFORE the CLI-missing / node-missing
   #    banners so a shim whose policy says "disabled" exits 0 cleanly
@@ -667,7 +692,17 @@ shim_run() {
   #     entry; rewriting it would be wasted work AND would refresh
   #     `cached_at_unix` past the TTL ceiling, defeating the staleness
   #     bound).
-  if [ "$_shim_cache_hit" -eq 0 ] && [ -n "$_shim_cache_key" ]; then
+  #
+  #     0.48.1 SOUNDNESS: also skipped when SHIM_SKIP_VERSION_PROBE=1
+  #     (delegation-capture path). Pre-fix the cache write proceeded
+  #     after a skipped probe, recording `shape_ok: true` from
+  #     defaulted-true logic without the probe having actually run.
+  #     On the next fire a cache hit would read that entry and trust
+  #     a version-probe answer that was never produced. The cache MUST
+  #     only persist real probe results; if the probe was bypassed,
+  #     the next fire pays the cost of running it for real.
+  if [ "$_shim_cache_hit" -eq 0 ] && [ -n "$_shim_cache_key" ] \
+     && [ "$SHIM_SKIP_VERSION_PROBE" -eq 0 ]; then
     local _write_payload=""
     _write_payload=$(node -e '
       const args = process.argv.slice(1);
