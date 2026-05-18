@@ -550,4 +550,57 @@ export interface Policy {
    * blocks. See `DelegationAdvisoryPolicy` for the full contract.
    */
   delegation_advisory?: DelegationAdvisoryPolicy;
+  /**
+   * Per-session shim cache (0.48.0+).
+   *
+   * The `hooks/_lib/shim-cache.sh` helper, sourced by every Node-binary
+   * shim via `hooks/_lib/shim-runtime.sh`, records the answers to the
+   * sandbox check + version probe under a per-user, per-session,
+   * per-CLI key. Subsequent shim fires within the same Claude Code
+   * session against the same CLI (mtime + size unchanged) skip
+   * straight to the forward step.
+   *
+   * The cache is an OPTIMIZATION, not a security boundary. Cache miss
+   * / disabled / corruption all fall through to the existing uncached
+   * hot path — never fail closed.
+   *
+   * `enabled` default: `true`. Set `false` to disable the cache layer
+   * at the policy tier (equivalent effect to setting the
+   * `REA_SHIM_CACHE=0` env var on every invocation). Operators who
+   * want to measure unconditional steady-state latency should use the
+   * env-var form so the cache stays off only for the measurement
+   * window. See `docs/shim-session-cache-design.md` for the security
+   * contract and `docs/hook-perf-baseline.md` for the perf
+   * methodology note.
+   */
+  shim_cache?: ShimCachePolicy;
+}
+
+/**
+ * Per-session shim cache policy (0.48.0+).
+ *
+ * The cache short-circuits the sandbox check + version probe in
+ * `hooks/_lib/shim-runtime.sh` on session-warm fires of the same
+ * shim. The on-disk entry shape is bound to `schema_version: "v1"`
+ * — a schema bump (future cache field additions) invalidates every
+ * existing entry. TTL is hard-capped at 3600s (1h) inside the
+ * runtime; this block does not expose a TTL knob in 0.48.0 because
+ * the optimization is steady-state-bound and a longer TTL would
+ * extend staleness without measurable benefit.
+ */
+export interface ShimCachePolicy {
+  /**
+   * Master switch. `true` (default) enables the cache. `false`
+   * disables both reads and writes — the runtime falls through to
+   * the existing uncached hot path on every fire. `REA_SHIM_CACHE=0`
+   * in env overrides this to `false` for the current invocation
+   * regardless of policy.
+   *
+   * NOTE 0.48.0: the bash-tier `shim_cache_disabled` helper consults
+   * this field via a narrow YAML grep BEFORE the canonical 4-tier
+   * policy reader is available (cache runs in the shim's pre-CLI
+   * section). The TS loader's schema validation runs at full CLI
+   * load time and catches typos / wrong types.
+   */
+  enabled?: boolean;
 }

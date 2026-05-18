@@ -60,6 +60,43 @@ the gate is actually built to refuse.
   `payloadVariantsForHook()` until every iteration of both variants
   exits 0.
 
+## Per-session shim cache and the baseline (0.48.0+)
+
+The `hooks/_lib/shim-cache.sh` helper (0.48.0) records the answers to
+the sandbox check + version probe under a per-user, per-session,
+per-CLI key. On a HIT, `shim-runtime.sh` skips both steps 5 and 8 and
+goes straight to the forward step. Steady-state same-session same-CLI
+fires therefore pay roughly the cache-key + cache-read latency
+(~5-10ms) instead of the full sandbox + probe cost (~80-150ms on
+macOS, varies on Linux).
+
+The baseline harness sets **`REA_SHIM_CACHE=0` in the environment of
+every profiled invocation** (see `scripts/profile-hooks.mjs` `runOnce`)
+for one reason: a warmed cache would silently improve the steady-state
+numbers from one `pnpm perf:hooks` run to the next, **masking
+regressions in the underlying resolve / sandbox / probe layers** the
+baseline exists to catch. The baseline measures the COLD path. The
+cache's benefit is a separate concern.
+
+To observe the cache effect manually (NOT for baseline regression
+purposes):
+
+```bash
+# Cold-path baseline (what the regression test enforces).
+REA_SHIM_CACHE=0 pnpm perf:hooks --iterations=10 --warmup=2
+
+# Warm-path observation (informational, not enforced).
+REA_SHIM_CACHE=1 pnpm perf:hooks --iterations=10 --warmup=2
+# The first ~2-3 iterations populate the cache; subsequent iterations
+# of the same shim hit the cache and drop ~80-150ms each.
+```
+
+Per design memo concern #6, **never let the baseline run with the
+cache enabled.** A green baseline under a warmed cache could be
+hiding a 100ms regression in `shim_resolve_cli` or
+`shim_sandbox_check` that would land on the operator the moment
+their session token rotates or their TMPDIR clears.
+
 ## Why two variants matter
 
 Pre-0.46.0 the harness used generic Bash/Write payloads for every

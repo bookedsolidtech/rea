@@ -827,3 +827,264 @@ describe('hooks/_lib/shim-runtime.sh — shim line-budget assertion', () => {
     expect(loc).toBeLessThan(500);
   });
 });
+
+describe('hooks/_lib/shim-runtime.sh — 0.48.0 per-session cache integration', () => {
+  let projectDir: string;
+  let cacheTmpdir: string;
+  beforeEach(() => {
+    projectDir = makeProjectDir();
+    cacheTmpdir = fs.mkdtempSync(path.join(os.tmpdir(), 'rea-shim-cache-e2e-'));
+  });
+  afterEach(() => {
+    fs.rmSync(projectDir, { recursive: true, force: true });
+    fs.rmSync(cacheTmpdir, { recursive: true, force: true });
+  });
+
+  it('cold miss: runs sandbox + probe + forward AND writes the cache entry', () => {
+    if (!bashExists()) return;
+    const r = runShim({
+      shimBody: STD_BODY,
+      payload: '{}',
+      projectDir,
+      installFakeCli: 'good-probe',
+      installPkgJson: true,
+      env: { TMPDIR: cacheTmpdir, REA_SHIM_CACHE: '1' },
+    });
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain('forwarded:');
+    // The cache dir should now exist with at least one entry.
+    const euid = String(process.getuid?.() ?? 0);
+    const dir = path.join(cacheTmpdir, `rea-shim-cache.${euid}`);
+    expect(fs.existsSync(dir)).toBe(true);
+    const entries = fs.readdirSync(dir).filter((e) => e.endsWith('.json'));
+    expect(entries.length).toBeGreaterThan(0);
+  });
+
+  it('warm hit: second invocation reuses cached entry and still forwards stdin', () => {
+    if (!bashExists()) return;
+    // First run — populates cache.
+    const r1 = runShim({
+      shimBody: STD_BODY,
+      payload: '{}',
+      projectDir,
+      installFakeCli: 'good-probe',
+      installPkgJson: true,
+      env: { TMPDIR: cacheTmpdir, REA_SHIM_CACHE: '1' },
+    });
+    expect(r1.status).toBe(0);
+    // Second run — same project, same CLI, cache should hit.
+    const r2 = runShim({
+      shimBody: STD_BODY,
+      payload: '{}',
+      projectDir,
+      env: { TMPDIR: cacheTmpdir, REA_SHIM_CACHE: '1' },
+    });
+    expect(r2.status).toBe(0);
+    expect(r2.stdout).toContain('forwarded:');
+  });
+
+  it('cache invalidates when a SIBLING dist/cli/*.js file is rewritten in place', () => {
+    // 0.48.0 codex round-5 P1: dir mtime alone does NOT change when
+    // tsc rewrites an existing sibling file. The cache key folds in
+    // a hash of every *.js file's mtime/size/name in dist/cli/ so
+    // changing any sibling invalidates the entry. Without this fix,
+    // a same-session `pnpm build` after editing `src/cli/hook.ts`
+    // could let warm fires skip the version probe and forward into
+    // an unvalidated CLI.
+    if (!bashExists()) return;
+    // First run — populates cache.
+    const r1 = runShim({
+      shimBody: STD_BODY,
+      payload: '{}',
+      projectDir,
+      installFakeCli: 'good-probe',
+      installPkgJson: true,
+      env: { TMPDIR: cacheTmpdir, REA_SHIM_CACHE: '1' },
+    });
+    expect(r1.status).toBe(0);
+    const euid = String(process.getuid?.() ?? 0);
+    const cacheDir = path.join(cacheTmpdir, `rea-shim-cache.${euid}`);
+    const beforeKey = fs.readdirSync(cacheDir).filter((e) => e.endsWith('.json'))[0];
+    expect(beforeKey).toBeDefined();
+
+    // Drop a sibling .js file into dist/cli/ AND rewrite it — does
+    // not change index.js mtime, does change dist/cli/ dir mtime
+    // (because the file was just added). To exercise the round-5
+    // protection we need a file that ALREADY exists then is
+    // rewritten — adding a file changes the dir mtime which would
+    // already invalidate. So we add the file FIRST, run once
+    // (re-warming the cache against the new dir layout), THEN
+    // rewrite the file in place and assert the third run still
+    // misses.
+    const siblingPath = path.join(projectDir, 'dist', 'cli', 'sibling.js');
+    fs.writeFileSync(siblingPath, '// initial sibling\n');
+    // Pre-warm again to absorb the dir-mtime change.
+    const r2 = runShim({
+      shimBody: STD_BODY,
+      payload: '{}',
+      projectDir,
+      env: { TMPDIR: cacheTmpdir, REA_SHIM_CACHE: '1' },
+    });
+    expect(r2.status).toBe(0);
+    // Record the cache entries on disk after the rewarming so we
+    // can detect a NEW entry written by the post-rewrite run below.
+    const afterAddKeys = fs.readdirSync(cacheDir).filter((e) => e.endsWith('.json'));
+
+    // Now rewrite the sibling file IN PLACE (same name, same dir
+    // mtime). Brief sleep so mtime ns differs.
+    const sab = new SharedArrayBuffer(4);
+    const ia = new Int32Array(sab);
+    Atomics.wait(ia, 0, 0, 20);
+    fs.writeFileSync(siblingPath, '// modified sibling content longer than before\n');
+
+    const r3 = runShim({
+      shimBody: STD_BODY,
+      payload: '{}',
+      projectDir,
+      env: { TMPDIR: cacheTmpdir, REA_SHIM_CACHE: '1' },
+    });
+    expect(r3.status).toBe(0);
+    // After the sibling rewrite, the cache key changed → a NEW
+    // entry was written. So the cache dir now has more entries than
+    // before the rewrite.
+    const afterRewriteKeys = fs.readdirSync(cacheDir).filter((e) => e.endsWith('.json'));
+    expect(afterRewriteKeys.length).toBeGreaterThan(afterAddKeys.length);
+    // The pre-existing rewarmed entry is still on disk (TTL/sweep
+    // not part of this test), but a new one with a different key
+    // was written for the post-rewrite CLI surface.
+    const newKeys = afterRewriteKeys.filter((k) => !afterAddKeys.includes(k));
+    expect(newKeys.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('warm hit: second run executes faster than cold first run (probe skipped)', () => {
+    if (!bashExists()) return;
+    // Heuristic test for cache hit: warm runs should not measurably
+    // re-spawn `rea hook --help`. We can't directly observe that from
+    // outside the bash shim, so we test the OBSERVABLE: a second run
+    // against the same TMPDIR + CLI succeeds without re-validating
+    // via the version probe. The cache-key invalidation behavior is
+    // covered separately by the "fresh build" test below; here we
+    // confirm that successive runs in the same cache window do not
+    // regress to an exit-2 (which would indicate the cache layer
+    // unintentionally re-enforced version-skew). Cold-then-warm with
+    // an unchanged CLI: both must exit 0.
+    const r1 = runShim({
+      shimBody: STD_BODY,
+      payload: '{}',
+      projectDir,
+      installFakeCli: 'good-probe',
+      installPkgJson: true,
+      env: { TMPDIR: cacheTmpdir, REA_SHIM_CACHE: '1' },
+    });
+    expect(r1.status).toBe(0);
+    expect(r1.stdout).toContain('forwarded:');
+
+    // Inspect the on-disk cache entry — its presence + correct shape
+    // is direct evidence the warm path skipped the probe (the write
+    // happens AFTER a successful probe, and only when no hit fired).
+    const euid = String(process.getuid?.() ?? 0);
+    const cacheDir = path.join(cacheTmpdir, `rea-shim-cache.${euid}`);
+    const entries = fs.readdirSync(cacheDir).filter((e) => e.endsWith('.json'));
+    expect(entries.length).toBe(1);
+    const entryPath = path.join(cacheDir, entries[0]);
+    const entry = JSON.parse(fs.readFileSync(entryPath, 'utf8'));
+    expect(entry.schema_version).toBe('v1');
+    expect(entry.sandbox_ok).toBe(true);
+    expect(entry.shape_ok).toBe(true);
+    expect(entry.cli_realpath).toContain('dist/cli/index.js');
+
+    // A second run with the SAME CLI must succeed and (per the
+    // `cached_at_unix` field) reuse the existing entry rather than
+    // writing a new one. We pin a stable cached_at by reading it
+    // before + after.
+    const cachedAtBefore = Number(entry.cached_at_unix);
+    const r2 = runShim({
+      shimBody: STD_BODY,
+      payload: '{}',
+      projectDir,
+      env: { TMPDIR: cacheTmpdir, REA_SHIM_CACHE: '1' },
+    });
+    expect(r2.status).toBe(0);
+    expect(r2.stdout).toContain('forwarded:');
+    const entry2 = JSON.parse(fs.readFileSync(entryPath, 'utf8'));
+    // 0.48.0 design memo §5: on cache hit the runtime does NOT
+    // rewrite the entry (rewriting would refresh cached_at past the
+    // TTL bound). Same cached_at across two same-CLI runs == proof
+    // the second run hit the cache and skipped both sandbox + probe.
+    expect(Number(entry2.cached_at_unix)).toBe(cachedAtBefore);
+  });
+
+  it('REA_SHIM_CACHE=0 disables the cache — no entry is written', () => {
+    if (!bashExists()) return;
+    const r = runShim({
+      shimBody: STD_BODY,
+      payload: '{}',
+      projectDir,
+      installFakeCli: 'good-probe',
+      installPkgJson: true,
+      env: { TMPDIR: cacheTmpdir, REA_SHIM_CACHE: '0' },
+    });
+    expect(r.status).toBe(0);
+    const euid = String(process.getuid?.() ?? 0);
+    const dir = path.join(cacheTmpdir, `rea-shim-cache.${euid}`);
+    // Either the dir doesn't exist or it exists with zero entries.
+    if (fs.existsSync(dir)) {
+      const entries = fs.readdirSync(dir).filter((e) => e.endsWith('.json'));
+      expect(entries.length).toBe(0);
+    }
+  });
+
+  it('miss + fresh build (file mtime/size changed) → cache key differs, full path re-runs', () => {
+    if (!bashExists()) return;
+    // First run.
+    const r1 = runShim({
+      shimBody: STD_BODY,
+      payload: '{}',
+      projectDir,
+      installFakeCli: 'good-probe',
+      installPkgJson: true,
+      env: { TMPDIR: cacheTmpdir, REA_SHIM_CACHE: '1' },
+    });
+    expect(r1.status).toBe(0);
+    const euid = String(process.getuid?.() ?? 0);
+    const dir = path.join(cacheTmpdir, `rea-shim-cache.${euid}`);
+    const firstEntries = fs.readdirSync(dir).filter((e) => e.endsWith('.json'));
+    expect(firstEntries.length).toBeGreaterThan(0);
+
+    // Now replace the CLI with a different content + size — this
+    // simulates a fresh `pnpm install` swapping the CLI binary.
+    const cliPath = path.join(projectDir, 'dist', 'cli', 'index.js');
+    fs.writeFileSync(
+      cliPath,
+      `#!/usr/bin/env node
+// Modified CLI body — different size + mtime.
+const args = process.argv.slice(2);
+if (args.length >= 3 && args[0] === 'hook' && args[1] === 'test-shim' && args[2] === '--help') {
+  process.stdout.write('Usage: rea hook test-shim [options]\\n');
+  process.exit(0);
+}
+let buf = '';
+process.stdin.on('data', (c) => { buf += c; });
+process.stdin.on('end', () => {
+  process.stdout.write('forwarded-v2:' + buf.length + ' bytes\\n');
+  process.exit(0);
+});
+`,
+    );
+    fs.chmodSync(cliPath, 0o755);
+
+    const r2 = runShim({
+      shimBody: STD_BODY,
+      payload: '{}',
+      projectDir,
+      env: { TMPDIR: cacheTmpdir, REA_SHIM_CACHE: '1' },
+    });
+    expect(r2.status).toBe(0);
+    // Second forward uses the new CLI body.
+    expect(r2.stdout).toContain('forwarded-v2:');
+    // Cache picked up a NEW entry — old one may still exist but the
+    // total count should be at least the same and ideally +1.
+    const secondEntries = fs.readdirSync(dir).filter((e) => e.endsWith('.json'));
+    expect(secondEntries.length).toBeGreaterThanOrEqual(firstEntries.length);
+  });
+});

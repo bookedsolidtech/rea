@@ -1277,3 +1277,143 @@ The bash gate explicitly does NOT defend against:
   to an attacker binary on PATH, the gate is defeated. Production
   deployments pin PATH via the harness; `rea doctor` verifies PATH
   integrity at install time but does not enforce it at runtime.
+
+---
+
+## 9. Per-session shim cache (0.48.0+)
+
+The `hooks/_lib/shim-cache.sh` helper sits between the relevance
+pre-gate and the sandbox check inside `hooks/_lib/shim-runtime.sh`.
+On a cache HIT it short-circuits steps 5 (sandbox check) and 8
+(version probe) — those answers were validated when the entry was
+written, the cache key invalidates if any field changes, and the
+entry has a 3600-second TTL. On a cache MISS, corrupt file, or any
+error condition, the runtime falls through to the existing uncached
+hot path. The cache is an **optimization, not a security boundary**.
+
+### 9.1 Cache key construction
+
+The cache key is `sha256(NUL-joined-tuple)[0:32]` of:
+
+  1. `schema_version` (`"v1"`)
+  2. `session_token` (claude-ancestor PID+start-time hash, or
+     tty/login-shell/boot-id fallback, or "cache disabled" if
+     neither is derivable)
+  3. `project_root_realpath` (post-symlink-resolution)
+  4. `cli_realpath` (post-symlink-resolution)
+  5. `cli_mtime` (nanosecond precision uniformly across macOS and
+     Linux — see §9.4 for the portability rationale; closes the
+     same-second-same-size rebuild class flagged by codex round-2)
+  6. `cli_size_bytes` (defeats `touch -r` mtime-preserving swap)
+  7. `euid` (refuses cross-user reuse)
+  8. `SHIM_ENFORCE_CLI_SHAPE` (whether the `dist/cli/index.js`
+     shape was required for this fire)
+  9. `SHIM_NAME` (0.48.0 codex round-1 P1 — hook-scoped key prevents
+     a cache-warm shim letting a sibling skip its own probe)
+ 10. `pkg_mtime` + `pkg_size` of the ancestor `package.json` the
+     sandbox check found (codex round-3 P2 — same-session edit /
+     rename of that file invalidates the entry)
+ 11. `dist_mtime` of `dist/cli/` directory (codex round-3 P1 — a
+     same-session rebuild that adds/removes ANY file in that
+     directory invalidates the entry, the dominant signal for the
+     rea-dev workflow where `tsc` rewrites many siblings of
+     `index.js`)
+ 12. `node_realpath` + `node_mtime` (codex round-4 P1 — a
+     same-session `nvm use` / `volta pin` / PATH-prepended wrapper
+     that swaps the node interpreter invalidates the entry; warm
+     hits otherwise would skip both node-availability AND the
+     version probe and forward through a different interpreter
+     whose JS engine version may not match what the probe
+     validated)
+
+### 9.2 Storage discipline
+
+  - Per-user directory at `$TMPDIR/rea-shim-cache.<euid>/`, created
+    mode `0700` via `umask 077`. Reads refuse if mode is wider or
+    owner != euid.
+  - Per-entry file at `<dir>/<key>.json`, written mode `0600` via
+    atomic `mv` from `.tmp.$$`. Reads refuse if mode is wider or
+    owner != euid.
+  - JSON entry shape includes `schema_version`, `cli_realpath`,
+    `cli_mtime`, `cli_size_bytes`, `pkg_mtime`, `pkg_size_bytes`,
+    `dist_mtime`, `node_realpath`, `node_mtime`, `sandbox_ok`,
+    `shape_ok`, `cached_at_unix`, `ttl_seconds`. Any unknown / missing
+    required
+    field → ignore entry. Schema version bump → all v(n-1) entries
+    become unreadable cache-misses (no migration).
+
+### 9.3 Attack enumeration
+
+| # | Attack | Defense |
+|---|--------|---------|
+| 1 | Symlink swap of cached CLI between cache-write and cache-read | `cli_realpath` recomputed at every read and compared to entry; any drift → miss |
+| 2 | Two concurrent projects sharing `$TMPDIR` | `project_root_realpath` in key + per-user `0700` dir; cross-project read produces different key |
+| 3 | Cache file race on parallel hook fires | One file per key; identical inputs produce identical content; atomic `mv` from `.tmp.$$` ensures no partial reads |
+| 4 | Cross-user TOCTOU (other local user plants entry) | `0700` dir + `0600` file + owner check refuse foreign-owned reads |
+| 5 | mtime-preserving binary swap (attacker `touch -r`s after replacing CLI) | `cli_size_bytes` in key; size change forces miss even with preserved mtime |
+| 6 | Cached `sandbox_ok=true` after consumer moves project | `project_root_realpath` in key; CLAUDE_PROJECT_DIR drift → different key |
+| 7 | Schema rollback (older shim reads newer entry) | `schema_version` in key; cross-version reads miss cleanly |
+| 8 | Stale cache during a 0.x → 0.y upgrade mid-session | `cli_version` field + `cli_mtime` (ns precision) + `cli_size_bytes` — three independent invalidators |
+| 8b | Rebuild within the same wall-clock second + same byte length | `cli_mtime` recorded at nanosecond precision (codex round-2 P2) — APFS / ext4 / xfs all store ns mtime; a same-second rebuild moves the ns suffix so the key differs |
+| 9 | Long-lived session accumulating staleness past acceptable bound | Hard 3600s TTL enforced inside `shim-runtime.sh` even if mtime+size match |
+| 10 | Session-token spoofing on stripped containers (no `/proc`, no `ps -o lstart=`) | Final fallback is **cache disabled** (return 1), NOT "use PPID alone" — the contract is never silently weakened |
+| 11 | Same-session rebuild of CLI's hook surface that does not touch `dist/cli/index.js` itself (codex round-3 P1) | `dist_mtime` of the parent dir in the key — any add/remove in `dist/cli/` shifts the dir mtime and invalidates every entry under that CLI |
+| 12 | Same-session edit of the ancestor `package.json` that the sandbox check trusted (codex round-3 P2) | `pkg_mtime` + `pkg_size_bytes` in the key — any change forces a fresh sandbox + probe pass |
+| 13 | Same-session `node` interpreter swap (nvm use / volta pin / PATH-prepended wrapper) (codex round-4 P1 + round-7 P2) | `node_realpath` is derived from `process.execPath` (node's own path to itself), NOT from resolving the PATH-visible `node`. Stable version-manager shims like `~/.volta/bin/node` resolve to themselves; only `execPath` reveals which concrete Node binary the shim launched (e.g. `~/.volta/tools/image/node/22.x.x/bin/node`). Swapping versions changes execPath → different key |
+| 14 | Same-session rebuild that rewrites any module in `dist/**/*.js` without changing dist/cli/ — including transitively imported files like `dist/hooks/**`, `dist/policy/**`, `dist/audit/**` (codex round-5 P1 + round-9 P1) | `dist_mtime` is a sha256 of every `*.js` file's `ns-mtime / size / name` across the WHOLE dist tree (not just dist/cli/), built via `find -exec stat +` for ~15ms total cost. Any in-place rewrite of any imported module invalidates the entry. Falls back to single-dir mtime if `find`/`stat`/`shasum`/`sha256sum` are all unavailable. Hasher detection: `shasum -a 256` on macOS, `sha256sum` on GNU coreutils Linux (codex round-6 P2) |
+| 15 | Cache silently disabled on non-interactive subprocess launches (CI, vitest spawn, editor wrappers) where no claude/claude-code ancestor exists AND stdin is piped (codex round-6 P1) | Intermediate fallback: `(PPID basename + PPID start_time + boot_id)`. NOT "PPID alone" — start-time defeats PID reuse across reboots, boot-id confines to the current boot. Scopes the cache to "this specific parent process invocation, on this boot". A different parent / a reboot → different token |
+| 16 | Cache silently disabled on sandboxed macOS / locked-down CI where `/proc` is absent AND `ps`/`sysctl` are denied (codex round-8 P1) | Final fallback before disabled: `(euid + REA_ROOT)`. Coarser session scope than the process-anchored paths above, but cache poisoning still prevented by the per-user 0700 dir + 0600 file (foreign-owned reads refused) and cross-install reuse still prevented by REA_ROOT in the token PLUS every other key field (project, CLI mtime, dist hash, node execPath). The trade-off honors the spirit of design memo concern #2 (NEVER PPID alone) while letting the cache function in environments where the design's primary anchors are unavailable. Truly hostile environments (no euid AND no REA_ROOT) still fall through to "cache disabled" |
+
+### 9.4 Portability — mtime precision
+
+macOS supports fractional-second mtime via `stat -f %Fm`; GNU
+coreutils supports the same via `stat -c %.Y`. Both produce the
+same `1779052861.082677123` string shape — string-equal across
+platforms for the same physical mtime. **Both are used** at
+nanosecond precision (codex round-2 P2 closure). The design memo
+concern #1 was conditional ("if you can't get ns on one platform,
+downgrade both") — since both CAN, we use ns and close the
+same-second-same-size rebuild collision class.
+
+`cli_size_bytes` remains in the key as defense-in-depth for
+filesystems that truncate nanosecond mtime to seconds (some
+FAT/NTFS mounts). On those filesystems the same-second-same-size
+rebuild would still hit the cache for up to 3600s — the TTL is the
+backstop, plus `pnpm install` typically changes the file size.
+The realistic exposure is "consumer runs `npm run build` twice
+within the same wall-clock second on a FAT volume" which is a
+corner case for a dev tool.
+
+### 9.5 Disable switches
+
+  - `REA_SHIM_CACHE=0` in env disables both reads and writes. Used
+    by `pnpm perf:hooks` so steady-state measurements reflect the
+    uncached hot path (a warmed cache would silently mask
+    regressions in the underlying resolve / sandbox / probe layers).
+  - `policy.shim_cache.enabled: false` disables the cache via the
+    policy file. The bash-tier helper consults this via a narrow
+    inline YAML grep (the cache runs BEFORE the canonical 4-tier
+    policy reader is available). The zod schema in
+    `src/policy/loader.ts` validates the field at CLI load time so
+    typos / wrong types are caught at the load boundary.
+
+### 9.6 Out of scope
+
+The cache explicitly does NOT defend against:
+
+  - **A poisoned cache entry that happens to collide with a
+    legitimate key.** The 32-hex-char (128-bit) key space and the
+    fail-safe validate-on-read pass (mtime/size/realpath rechecked
+    against disk, JSON shape verified, TTL enforced) make this
+    economically infeasible without already having euid + tmpdir
+    write access — which is a higher privilege than the gate
+    protects against to begin with.
+  - **An attacker with the same euid who has already compromised
+    the shim runtime.** At that point the cache layer is moot —
+    every code path is attacker-controlled.
+  - **A long-running session where the operator wants to force a
+    cache rebuild without the TTL expiring.** Set `REA_SHIM_CACHE=0`
+    in the env, or `rm -rf $TMPDIR/rea-shim-cache.$(id -u)/`. There
+    is intentionally no `rea cache clear` CLI surface in 0.48.0 —
+    the disable switch + on-reboot tmpfs wipe handle the realistic
+    cases.

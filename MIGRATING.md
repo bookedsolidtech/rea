@@ -662,3 +662,91 @@ verdict that triggered it is.
   document the ambivalence.
 - **My pre-commit hook breaks on push** → not rea (rea ships no
   pre-commit). Fix in your repo.
+
+## Shim session-cache (added in 0.48.0)
+
+Every Node-binary shim (`.claude/hooks/*.sh`) does three steps that
+do not change across same-session same-CLI fires:
+
+1. Resolve the rea CLI through the fixed 2-tier sandboxed order
+   (`node_modules/@bookedsolid/rea/dist/cli/index.js`, then
+   `./dist/cli/index.js`).
+2. Sandbox-check the resolved CLI (realpath inside project + ancestor
+   `package.json` with `name: @bookedsolid/rea` + optional
+   `dist/cli/index.js` shape enforcement).
+3. Version-probe via `rea hook <NAME> --help` to confirm the
+   subcommand exists in the resolved CLI.
+
+The 0.48.0 per-session cache (`hooks/_lib/shim-cache.sh`) records
+the answers under a key composed of `(session_token, project_realpath,
+cli_realpath, cli_mtime, cli_size_bytes, euid, enforce_cli_shape,
+shim_name, pkg_mtime, pkg_size_bytes, dist_dir_mtime, node_realpath,
+node_mtime)`. Subsequent
+fires that match the same key skip both the sandbox check (step 5
+in `shim_run`) and the version probe (step 8). Cache hit latency is
+roughly the cache-read cost (~5-10ms) instead of the full hot path
+(~80-150ms on macOS).
+
+### Disable switches
+
+- `REA_SHIM_CACHE=0` in env disables both reads and writes for the
+  current process. `pnpm perf:hooks` sets this automatically so
+  baseline measurements reflect the uncached path.
+- `policy.shim_cache.enabled: false` disables the cache via
+  `.rea/policy.yaml`:
+  ```yaml
+  shim_cache:
+    enabled: false
+  ```
+  Default is `enabled: true`. The block is optional — a vanilla
+  install with no `shim_cache:` block gets the cache on.
+
+### Where the cache lives
+
+`$TMPDIR/rea-shim-cache.<euid>/<key>.json` — per-user `0700`
+directory, per-entry `0600` file. Entries are atomically written
+via `mv` from `.tmp.$$` (no half-written reads). On reboot the
+tmpfs is wiped — there is no cross-session persistence by design.
+
+### Invalidation
+
+Cache entries are invalidated automatically when any of the key
+fields change. The most common triggers:
+
+- `pnpm install` / `npm install` updates the CLI mtime + size →
+  cache key differs → next fire takes the full path and writes a
+  fresh entry.
+- Hard 3600s (1h) TTL ceiling enforced inside `shim_run` even when
+  mtime + size match — bounds staleness on long-lived sessions.
+- Schema version bump (future `v2`) → every `v1` entry becomes a
+  cache-miss (no migration).
+- Cross-user read attempts refused via owner check.
+
+### Forcing a cache rebuild
+
+Use the env var or wipe the directory:
+
+```bash
+# One invocation, uncached
+REA_SHIM_CACHE=0 git commit -m "..."
+
+# Wipe the entire cache for the current user
+rm -rf "$TMPDIR/rea-shim-cache.$(id -u)"
+```
+
+There is intentionally no `rea cache clear` CLI in 0.48.0 — the
+env-var and rm patterns handle the realistic cases without adding
+surface area.
+
+### Why this matters
+
+Before 0.48.0 every shim fire paid the full sandbox + probe cost on
+every Bash/Edit/Write/MultiEdit/NotebookEdit tool call. With 8+
+hooks firing per Bash event, the cumulative latency was felt by the
+operator on every single command. The cache brings warm-session
+hot-path latency down to roughly the cache-read overhead, which is
+the dominant cost ceiling that motivated 0.45.0's profiling work.
+
+See `docs/shim-session-cache-design.md` for the security contract
+and `docs/hook-perf-baseline.md` §"Per-session shim cache and the
+baseline" for the perf methodology note.
