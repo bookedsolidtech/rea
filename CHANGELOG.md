@@ -1,5 +1,11 @@
 # @bookedsolid/rea
 
+## 0.48.1
+
+### Patch Changes
+
+- e0d6147: Close four 0.48.0 shim-cache deferrals: skip cache write when `SHIM_SKIP_VERSION_PROBE=1` so cache state never reflects a probe that never ran; extend the `shim_cache_disabled` awk parser to handle multi-line flow-form `shim_cache: { \n enabled: false \n }`; teach the same parser to skip pure-comment lines so top-level YAML comments inside the `shim_cache:` block no longer prematurely close it; move `shim_sandbox_check` ahead of cache prep so the dist-tree hash walk never traverses a symlinked-out CLI target before sandbox refuses.
+
 ## 0.48.0
 
 ### Minor Changes
@@ -3814,13 +3820,13 @@ codex-review --also-set-cache`) on every push, produced a 1,250-line bash
 
   This release replaces the entire stack with a stateless gate:
 
-                                                                                                            git push
-                                                                                                              → .husky/pre-push → rea hook push-gate
-                                                                                                              → codex exec review --base <ref> --json
-                                                                                                              → parse verdict from streamed findings
-                                                                                                              → block on [P1] (blocking) or [P2] when concerns_blocks=true
-                                                                                                              → write .rea/last-review.json + audit record
-                                                                                                              → exit 0 / 1 (HALT) / 2 (blocked)
+                                                                                                              git push
+                                                                                                                → .husky/pre-push → rea hook push-gate
+                                                                                                                → codex exec review --base <ref> --json
+                                                                                                                → parse verdict from streamed findings
+                                                                                                                → block on [P1] (blocking) or [P2] when concerns_blocks=true
+                                                                                                                → write .rea/last-review.json + audit record
+                                                                                                                → exit 0 / 1 (HALT) / 2 (blocked)
 
   Codex is run fresh on every push. No cache. No SHA matching. No receipt
   consultation. When the gate blocks, Claude reads stderr + the
