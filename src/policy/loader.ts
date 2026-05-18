@@ -348,6 +348,33 @@ const DelegationAdvisoryPolicySchema = z
   })
   .strict();
 
+/**
+ * 0.48.0 — per-session shim cache policy. The
+ * `hooks/_lib/shim-cache.sh` helper, sourced by every Node-binary
+ * shim via `hooks/_lib/shim-runtime.sh`, caches the (sandbox-ok,
+ * shape-ok) tuple for a given (session, project, CLI realpath,
+ * mtime, size, euid, enforce_shape) key, with a 3600s TTL ceiling.
+ * The cache is an OPTIMIZATION — every cache-miss path falls through
+ * to the existing uncached hot path. See
+ * `docs/shim-session-cache-design.md` for the full contract.
+ *
+ * Strict mode rejects unknown keys so a typo (`enabld`, `enable`)
+ * fails loudly at policy load. The block is optional — vanilla
+ * installs with no `shim_cache:` block get the default behavior
+ * (cache enabled). To disable: `shim_cache: { enabled: false }`.
+ *
+ * The bash-tier helper does a narrow YAML grep for the field
+ * BEFORE the canonical 4-tier policy reader is available (cache
+ * runs in the shim's pre-CLI section). This zod schema validates
+ * the field at CLI load time so wrong types / typos are caught at
+ * the load boundary.
+ */
+const ShimCachePolicySchema = z
+  .object({
+    enabled: z.boolean().default(true),
+  })
+  .strict();
+
 const PolicySchema = z
   .object({
     version: z.string(),
@@ -407,6 +434,16 @@ const PolicySchema = z
     // when unset/false). When the block IS present the inner schema
     // supplies defaults for any omitted field.
     delegation_advisory: DelegationAdvisoryPolicySchema.optional(),
+    // 0.48.0 per-session shim cache — drives `hooks/_lib/shim-cache.sh`
+    // which short-circuits the sandbox check + version probe in
+    // `hooks/_lib/shim-runtime.sh` on session-warm fires of the same
+    // shim. Optional — vanilla installs get the default behavior
+    // (cache enabled). The bash-tier `shim_cache_disabled` helper
+    // honors `enabled: false` via a narrow inline YAML grep before
+    // the canonical policy reader is reachable. `REA_SHIM_CACHE=0`
+    // in env overrides this to `false` for the current invocation
+    // regardless of policy.
+    shim_cache: ShimCachePolicySchema.optional(),
   })
   .strict();
 

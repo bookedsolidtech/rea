@@ -137,6 +137,15 @@
 
 set -uo pipefail
 
+# Source the per-session cache helper (0.48.0). This must be sourced
+# at the top of shim-runtime.sh because `shim_run` needs all of the
+# `shim_cache_*` functions available. The helper itself fails safe —
+# no operations fire unless `shim_run` calls them.
+# shellcheck source=shim-cache.sh
+_SHIM_RUNTIME_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=shim-cache.sh
+. "$_SHIM_RUNTIME_DIR/shim-cache.sh"
+
 # -----------------------------------------------------------------------------
 # Defaults — applied by `shim_run` when the shim hasn't set them. We use
 # the `:=` operator to assign-if-unset so callers can override.
@@ -303,6 +312,241 @@ shim_run() {
   # 4. Resolve CLI.
   shim_resolve_cli
 
+  # 4b. Per-session cache lookup (0.48.0). When the cache is enabled
+  #     AND the resolved CLI matches a recent same-session entry, the
+  #     sandbox check (step 5) AND version probe (step 8) can both be
+  #     skipped — those answers do not change for a stable CLI inside a
+  #     stable session. Cache MISS / disabled / corrupt → fall through
+  #     to the existing uncached hot path. NEVER fail closed on a cache
+  #     error (see hooks/_lib/shim-cache.sh header for the security
+  #     contract). The cache check runs AFTER `shim_is_relevant` (per
+  #     design memo concern #3) so we never pay a stat-per-fire cost
+  #     for irrelevant payloads.
+  local _shim_cache_hit=0
+  local _shim_cache_key=""
+  local _shim_cache_cli_real=""
+  local _shim_cache_cli_mtime=""
+  local _shim_cache_cli_size=""
+  local _shim_cache_pkg_real=""
+  local _shim_cache_pkg_mtime=""
+  local _shim_cache_pkg_size=""
+  local _shim_cache_dist_mtime=""
+  local _shim_cache_node_real=""
+  local _shim_cache_node_mtime=""
+  if [ "${#REA_ARGV[@]}" -gt 0 ] && ! shim_cache_disabled; then
+    local _stat_out=""
+    local _proj_real=""
+    local _euid=""
+    local _session_tok=""
+    _stat_out=$(shim_cache_mtime_size "$RESOLVED_CLI_PATH" 2>/dev/null || true)
+    # 0.48.0 codex round-4 P1 + round-7 P2: capture the ACTUAL node
+    # interpreter realpath + mtime via `process.execPath` (node's own
+    # path to itself). Pre-round-7 we resolved `command -v node` via
+    # `fs.realpathSync` — but version managers like Volta and asdf
+    # use STABLE shim scripts (e.g. ~/.volta/bin/node) that resolve
+    # to themselves; only the spawned node's `process.execPath`
+    # reveals which concrete Node binary the shim ultimately
+    # launched (e.g. /Users/foo/.volta/tools/image/node/22.x.x/bin/
+    # node). Using execPath catches `volta pin`/`nvm use` interpreter
+    # swaps correctly. The mtime field is captured at second
+    # precision (consistent with the other mtime fields) — switching
+    # Node versions changes the realpath so the mtime alone is not
+    # load-bearing.
+    _shim_cache_node_real=$(node -e 'process.stdout.write(require("fs").realpathSync(process.execPath))' 2>/dev/null || true)
+    if [ -n "$_shim_cache_node_real" ]; then
+      local _node_stat=""
+      _node_stat=$(shim_cache_mtime_size "$_shim_cache_node_real" 2>/dev/null || true)
+      if [ -n "$_node_stat" ]; then
+        _shim_cache_node_mtime="${_node_stat%% *}"
+      fi
+    fi
+    _shim_cache_cli_real=$(node -e 'try { process.stdout.write(require("fs").realpathSync(process.argv[1])); } catch (e) { process.exit(1); }' -- "$RESOLVED_CLI_PATH" 2>/dev/null || true)
+    _proj_real=$(node -e 'try { process.stdout.write(require("fs").realpathSync(process.argv[1])); } catch (e) { process.exit(1); }' -- "$proj" 2>/dev/null || true)
+    _euid=$(id -u 2>/dev/null || true)
+    _session_tok=$(shim_cache_session_token 2>/dev/null || true)
+    # 0.48.0 codex round-3 P2: ALSO capture the ancestor package.json
+    # path + mtime/size. The sandbox check walks upward to find a
+    # package.json whose `name` is `@bookedsolid/rea`; without it in
+    # the key, a same-session edit to that package.json (renaming, or
+    # removing the `name` field) would still see warm cache hits even
+    # though the uncached sandbox check would reject the new state.
+    # Codex round-3 P1: ALSO capture the dist/cli/ DIR mtime so a
+    # rebuild that adds/removes files (most fresh tsc runs after a
+    # source-tree change) invalidates the key even if dist/cli/
+    # index.js content happens to round to the same ns.
+    _shim_cache_pkg_real=$(node -e '
+      try {
+        const fs = require("fs");
+        const path = require("path");
+        const real = fs.realpathSync(process.argv[1]);
+        let cur = path.dirname(path.dirname(path.dirname(real)));
+        for (let i = 0; i < 20 && cur && cur !== path.dirname(cur); i++) {
+          const pj = path.join(cur, "package.json");
+          if (fs.existsSync(pj)) {
+            try {
+              const data = JSON.parse(fs.readFileSync(pj, "utf8"));
+              if (data && data.name === "@bookedsolid/rea") {
+                process.stdout.write(pj);
+                process.exit(0);
+              }
+            } catch (e) {}
+          }
+          cur = path.dirname(cur);
+        }
+        process.exit(1);
+      } catch (e) { process.exit(1); }
+    ' -- "$RESOLVED_CLI_PATH" 2>/dev/null || true)
+    if [ -n "$_shim_cache_pkg_real" ]; then
+      local _pkg_stat=""
+      _pkg_stat=$(shim_cache_mtime_size "$_shim_cache_pkg_real" 2>/dev/null || true)
+      if [ -n "$_pkg_stat" ]; then
+        _shim_cache_pkg_mtime="${_pkg_stat%% *}"
+        _shim_cache_pkg_size="${_pkg_stat##* }"
+      fi
+    fi
+    # 0.48.0 codex round-5/7/9 — the cache key incorporates a hash of
+    # every `*.js` file's mtime across the FULL dist tree, not just
+    # dist/cli/. Pre-round-9 the hash covered only dist/cli/*.js, but
+    # `rea hook` actually executes a much larger module graph:
+    # dist/cli/hook.js imports ../hooks/**, ../policy/loader.js,
+    # ../audit/**, etc. A same-session rebuild that rewrote one of
+    # those imported files in place without touching a top-level
+    # dist/cli/*.js file would leave the hash unchanged, the warm
+    # cache would survive, and shim_run would skip the version probe
+    # against a changed CLI runtime. Hashing dist/**/*.js closes the
+    # gap. Cost: ~15ms on the rea dist (141 files) via `find -exec
+    # stat +` batched into a single subprocess call.
+    local _dist_root=""
+    # dist root is two parents above dist/cli/index.js
+    _dist_root=$(dirname "$(dirname "$RESOLVED_CLI_PATH")" 2>/dev/null || true)
+    if [ -n "$_dist_root" ] && [ -d "$_dist_root" ]; then
+      # 0.48.0 codex round-6 P2: pick a hasher that exists. macOS
+      # ships `shasum` (perl); GNU coreutils provides `sha256sum`.
+      local _hasher=""
+      if command -v shasum >/dev/null 2>&1; then
+        _hasher="shasum -a 256"
+      elif command -v sha256sum >/dev/null 2>&1; then
+        _hasher="sha256sum"
+      fi
+      if [ -n "$_hasher" ]; then
+        # 0.48.0 codex round-7 P2: ns-precision mtime so a
+        # same-second rewrite is caught. Try macOS `-f` form first;
+        # fall through to GNU `-c` on failure. `find -exec stat +`
+        # batches all paths into ONE stat call (~15ms total instead
+        # of the per-file 365ms loop).
+        local _stat_macos=""
+        local _stat_gnu=""
+        _stat_macos=$(find "$_dist_root" -name '*.js' -type f -exec stat -f "%Fm %z %N" {} + 2>/dev/null || true)
+        if [ -n "$_stat_macos" ]; then
+          _shim_cache_dist_mtime=$(printf '%s' "$_stat_macos" | sort | $_hasher 2>/dev/null | awk '{print $1}' | cut -c1-32)
+        else
+          _stat_gnu=$(find "$_dist_root" -name '*.js' -type f -exec stat -c "%.Y %s %n" {} + 2>/dev/null || true)
+          if [ -n "$_stat_gnu" ]; then
+            _shim_cache_dist_mtime=$(printf '%s' "$_stat_gnu" | sort | $_hasher 2>/dev/null | awk '{print $1}' | cut -c1-32)
+          fi
+        fi
+      fi
+      # Last-ditch fallback: just the dist/cli/ dir mtime (round-3
+      # behavior). Keeps the cache functional even when find / stat /
+      # shasum / sha256sum are all unavailable (truly stripped
+      # container) — though that's already the case where the cache
+      # layer should fall back to disabled via the session token.
+      if [ -z "$_shim_cache_dist_mtime" ]; then
+        local _cli_dir=""
+        _cli_dir=$(dirname "$RESOLVED_CLI_PATH" 2>/dev/null || true)
+        if [ -n "$_cli_dir" ] && [ -d "$_cli_dir" ]; then
+          local _dir_stat=""
+          _dir_stat=$(shim_cache_mtime_size "$_cli_dir" 2>/dev/null || true)
+          if [ -n "$_dir_stat" ]; then
+            _shim_cache_dist_mtime="${_dir_stat%% *}"
+          fi
+        fi
+      fi
+    fi
+    if [ -n "$_stat_out" ] && [ -n "$_shim_cache_cli_real" ] && [ -n "$_proj_real" ] \
+       && [ -n "$_euid" ] && [ -n "$_session_tok" ] \
+       && [ -n "$_shim_cache_pkg_real" ] && [ -n "$_shim_cache_pkg_mtime" ] \
+       && [ -n "$_shim_cache_dist_mtime" ] \
+       && [ -n "$_shim_cache_node_real" ] && [ -n "$_shim_cache_node_mtime" ]; then
+      _shim_cache_cli_mtime="${_stat_out%% *}"
+      _shim_cache_cli_size="${_stat_out##* }"
+      # 0.48.0 codex round-1 P1: the key MUST include SHIM_NAME because
+      # step 8's version probe is `rea hook $SHIM_NAME --help` — it's
+      # hook-specific. Without SHIM_NAME in the key, a cache-warm shim
+      # could let a sibling shim with the SAME (session, project, CLI,
+      # mtime, size, euid, shape) skip its OWN version-skew check and
+      # forward straight to a CLI that does not implement that hook
+      # (realistic on a 0.32 CLI + newer secret-scanner shim mismatch).
+      #
+      # 0.48.0 codex round-3 P1+P2: 3 new key fields cover (a) ancestor
+      # package.json mtime/size — invalidates if the rea package.json
+      # is renamed or its `name` field is edited; (b) dist/cli/ dir
+      # mtime — invalidates when any file in that directory is
+      # added/removed (most fresh `tsc` rebuilds do both); (c) the
+      # package.json realpath is implicitly part of the key via these
+      # mtime/size fields plus the project realpath above.
+      _shim_cache_key=$(shim_cache_key "v1" "$_session_tok" "$_proj_real" "$_shim_cache_cli_real" \
+                                       "$_shim_cache_cli_mtime" "$_shim_cache_cli_size" "$_euid" \
+                                       "$SHIM_ENFORCE_CLI_SHAPE" "$SHIM_NAME" \
+                                       "$_shim_cache_pkg_mtime" "$_shim_cache_pkg_size" \
+                                       "$_shim_cache_dist_mtime" \
+                                       "$_shim_cache_node_real" "$_shim_cache_node_mtime" \
+                                       2>/dev/null || true)
+      if [ -n "$_shim_cache_key" ]; then
+        local _cache_json=""
+        _cache_json=$(shim_cache_read "$_shim_cache_key" 2>/dev/null || true)
+        if [ -n "$_cache_json" ]; then
+          # Parse + validate the entry. Failure → treat as miss.
+          local _cache_validate=""
+          _cache_validate=$(node -e '
+            try {
+              const e = JSON.parse(process.argv[1]);
+              const now = Math.floor(Date.now() / 1000);
+              const ttl = Number(e.ttl_seconds);
+              const cachedAt = Number(e.cached_at_unix);
+              const cliMtime = String(e.cli_mtime);
+              const cliSize = String(e.cli_size_bytes);
+              const cliReal = String(e.cli_realpath);
+              const pkgMtime = String(e.pkg_mtime);
+              const pkgSize = String(e.pkg_size_bytes);
+              const distMtime = String(e.dist_mtime);
+              const sandboxOk = e.sandbox_ok === true;
+              const shapeOk = e.shape_ok === true;
+              if (e.schema_version !== "v1") process.exit(1);
+              if (!Number.isFinite(ttl) || ttl <= 0 || ttl > 3600) process.exit(1);
+              if (!Number.isFinite(cachedAt)) process.exit(1);
+              if ((cachedAt + ttl) < now) process.exit(1);
+              if (cliMtime !== process.argv[2]) process.exit(1);
+              if (cliSize !== process.argv[3]) process.exit(1);
+              if (cliReal !== process.argv[4]) process.exit(1);
+              // 0.48.0 codex round-3 P1+P2: re-check the package.json
+              // mtime/size and the dist/cli/ dir mtime in addition to
+              // the CLI itself. Defense-in-depth against an entry
+              // whose key happened to collide but whose disk state
+              // has drifted.
+              if (pkgMtime !== process.argv[5]) process.exit(1);
+              if (pkgSize !== process.argv[6]) process.exit(1);
+              if (distMtime !== process.argv[7]) process.exit(1);
+              // 0.48.0 codex round-4 P1: re-check the resolved node
+              // binary realpath + mtime. A same-session interpreter
+              // swap (nvm use, volta pin) would otherwise let the
+              // warm entry silently forward through a different node.
+              const nodeReal = String(e.node_realpath);
+              const nodeMtime = String(e.node_mtime);
+              if (nodeReal !== process.argv[8]) process.exit(1);
+              if (nodeMtime !== process.argv[9]) process.exit(1);
+              if (!sandboxOk || !shapeOk) process.exit(1);
+              process.stdout.write("ok");
+            } catch (e) { process.exit(1); }
+          ' -- "$_cache_json" "$_shim_cache_cli_mtime" "$_shim_cache_cli_size" "$_shim_cache_cli_real" "$_shim_cache_pkg_mtime" "$_shim_cache_pkg_size" "$_shim_cache_dist_mtime" "$_shim_cache_node_real" "$_shim_cache_node_mtime" 2>/dev/null || true)
+          if [ "$_cache_validate" = "ok" ]; then
+            _shim_cache_hit=1
+          fi
+        fi
+      fi
+    fi
+  fi
+
   # 5. Sandbox check (when CLI was resolved). On failure clear REA_ARGV
   #    + stash the reason so the eventual CLI-required branch can emit
   #    the correct banner. Running the sandbox check BEFORE the policy
@@ -318,7 +562,7 @@ shim_run() {
   local sandbox_result=""
   local sandbox_failed=0
   local node_missing=0
-  if [ "${#REA_ARGV[@]}" -gt 0 ]; then
+  if [ "${#REA_ARGV[@]}" -gt 0 ] && [ "$_shim_cache_hit" -eq 0 ]; then
     if ! command -v node >/dev/null 2>&1; then
       # 0.38.1 round-2 P2 fix: pre-fix this branch exited 0/2 IMMEDIATELY
       # without ever calling shim_policy_short_circuit, so a blocking-
@@ -399,8 +643,10 @@ shim_run() {
   # 8. Version probe (skipped when SHIM_SKIP_VERSION_PROBE=1, used by
   #    delegation-capture whose pre-port body had no probe — a stale
   #    CLI drops the signal silently rather than spamming the operator
-  #    on every Agent/Skill dispatch).
-  if [ "$SHIM_SKIP_VERSION_PROBE" -eq 0 ]; then
+  #    on every Agent/Skill dispatch). Also skipped on cache hit — the
+  #    probe answer was recorded when the entry was written and the
+  #    cache key invalidates if mtime / size / realpath changes.
+  if [ "$SHIM_SKIP_VERSION_PROBE" -eq 0 ] && [ "$_shim_cache_hit" -eq 0 ]; then
     local probe_out probe_status
     probe_out=$("${REA_ARGV[@]}" hook "$SHIM_NAME" --help 2>&1)
     probe_status=$?
@@ -411,6 +657,50 @@ shim_run() {
       fi
       shim_emit_version_skew_banner_blocking
       exit 2
+    fi
+  fi
+
+  # 8b. Cache write (0.48.0). At this point sandbox + probe both
+  #     succeeded — record the answers for the next fire in this
+  #     session. Cache write failure NEVER blocks the gate; we ignore
+  #     the return value. Skipped on a cache hit (we just used the
+  #     entry; rewriting it would be wasted work AND would refresh
+  #     `cached_at_unix` past the TTL ceiling, defeating the staleness
+  #     bound).
+  if [ "$_shim_cache_hit" -eq 0 ] && [ -n "$_shim_cache_key" ]; then
+    local _write_payload=""
+    _write_payload=$(node -e '
+      const args = process.argv.slice(1);
+      const now = Math.floor(Date.now() / 1000);
+      const entry = {
+        schema_version: "v1",
+        cli_realpath: args[0],
+        cli_mtime: args[1],
+        cli_size_bytes: args[2],
+        // 0.48.0 codex round-3 P1+P2: record the ancestor package.json
+        // mtime/size + dist/cli/ dir mtime so the read-side validator
+        // can re-check them on every hit. The cache key includes
+        // these too, so a drifted state produces a different key —
+        // but persisting them in the entry lets the validator catch
+        // a key collision as a stale-entry miss instead of trusting
+        // it.
+        pkg_mtime: args[3],
+        pkg_size_bytes: args[4],
+        dist_mtime: args[5],
+        // 0.48.0 codex round-4 P1: record the resolved node binary
+        // realpath + mtime so the read-side validator can re-check
+        // them and refuse a hit when the interpreter swapped.
+        node_realpath: args[6],
+        node_mtime: args[7],
+        sandbox_ok: true,
+        shape_ok: true,
+        cached_at_unix: now,
+        ttl_seconds: 3600,
+      };
+      process.stdout.write(JSON.stringify(entry));
+    ' -- "$_shim_cache_cli_real" "$_shim_cache_cli_mtime" "$_shim_cache_cli_size" "$_shim_cache_pkg_mtime" "$_shim_cache_pkg_size" "$_shim_cache_dist_mtime" "$_shim_cache_node_real" "$_shim_cache_node_mtime" 2>/dev/null || true)
+    if [ -n "$_write_payload" ]; then
+      shim_cache_write "$_shim_cache_key" "$_write_payload" >/dev/null 2>&1 || true
     fi
   fi
 

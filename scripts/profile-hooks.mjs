@@ -461,7 +461,16 @@ function runOnce(hookPath, payload) {
     input: payload,
     encoding: 'utf8',
     timeout: 30000,
-    env: { ...process.env, CLAUDE_PROJECT_DIR: REPO_ROOT },
+    // 0.48.0 charter — REA_SHIM_CACHE=0 forces the per-session shim
+    // cache OFF for every profiled invocation. Without this, the
+    // cache would warm on the warmup runs and steady-state numbers
+    // would silently improve from one profile invocation to the next
+    // — masking regressions in the underlying resolve / sandbox /
+    // probe layers (concern #6 of the design memo). The
+    // measurement-time baseline is the COLD path; the cache's
+    // benefit is reported separately in
+    // `docs/hook-perf-baseline.md`.
+    env: { ...process.env, CLAUDE_PROJECT_DIR: REPO_ROOT, REA_SHIM_CACHE: '0' },
   });
   const elapsed = performance.now() - start;
   // spawnSync returns res.status null on timeout/signal — surface
