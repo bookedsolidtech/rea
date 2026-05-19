@@ -45,21 +45,24 @@ shim_cli_missing_relevant() {
   if [ -z "$cli_missing_cmd" ]; then
     return 1
   fi
+
+  # R5-P1 (codex round 5): substring scan is DETERMINATIVE for
+  # refusal. Allowlist opens an audited-allow gate but never closes
+  # one.
+  local matched_protected=0
   case "$cli_missing_cmd" in
-    *".claude/"*) return 0 ;;
-    *".husky/"*) return 0 ;;
-    *".rea/policy.yaml"*) return 0 ;;
-    *".rea/HALT"*) return 0 ;;
-    *".rea/last-review"*) return 0 ;;
-    *".claude\\"*|*".husky\\"*|*".rea\\"*) return 0 ;;
+    *".claude/"*) matched_protected=1 ;;
+    *".husky/"*) matched_protected=1 ;;
+    *".rea/policy.yaml"*) matched_protected=1 ;;
+    *".rea/HALT"*) matched_protected=1 ;;
+    *".rea/last-review"*) matched_protected=1 ;;
+    *".claude\\"*|*".husky\\"*|*".rea\\"*) matched_protected=1 ;;
   esac
   # 0.37.0: route protected_writes reads through the unified
   # policy-reader (Tier 1 CLI → Tier 2 python3 → Tier 3 awk
-  # block-form). Pre-0.37.0 the inline awk parser missed flow-form
-  # arrays (`protected_writes: [path/a, path/b]`) on CLI-missing
-  # installs.
+  # block-form).
   local policy_file="${REA_ROOT}/.rea/policy.yaml"
-  if [ -f "$policy_file" ]; then
+  if [ "$matched_protected" -eq 0 ] && [ -f "$policy_file" ]; then
     # shellcheck source=_lib/policy-reader.sh
     source "$(dirname "$0")/_lib/policy-reader.sh"
     local entry base
@@ -71,11 +74,26 @@ shim_cli_missing_relevant() {
       esac
       [ -z "$base" ] && continue
       case "$cli_missing_cmd" in
-        *"$base"*) return 0 ;;
+        *"$base"*) matched_protected=1; break ;;
       esac
     done < <(policy_reader_get_list protected_writes 2>/dev/null)
   fi
-  return 1
+
+  # shellcheck source=_lib/bootstrap-allowlist.sh
+  source "$(dirname "$0")/_lib/bootstrap-allowlist.sh"
+
+  # R7-P1 (codex round 7): 3-state PM-route return. See the
+  # blocked-paths shim for the contract.
+  _bootstrap_shim_pm_route "protected-paths-bash-gate" "$cli_missing_cmd" "$REA_ROOT"
+  case "$?" in
+    0) exit 0 ;;
+    2) return 0 ;;
+  esac
+
+  if [ "$matched_protected" -eq 0 ]; then
+    return 1
+  fi
+  return 0
 }
 
 # shellcheck source=_lib/shim-runtime.sh

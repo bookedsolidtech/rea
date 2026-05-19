@@ -14,6 +14,21 @@ blocked_paths:
   - .github/workflows/release.yml
   - SECURITY.md
   - THREAT_MODEL.md
+  # 0.49.0 — gates Write/Edit/MultiEdit/NotebookEdit tool calls
+  # targeting `package.json`. The bootstrap allowlist passes a
+  # CLI-missing PM payload through ONLY when `package.json` already
+  # declares `@bookedsolid/rea`, so blocking AGENT edits to the
+  # manifest narrows the Edit/Write-tier forge surface (an attacker
+  # can no longer add the declaration via Edit then invoke the
+  # allowed PM command). PM-induced writes to the manifest are
+  # explicitly out of scope (see THREAT_MODEL.md §5.23 "Out of
+  # scope"): a path-based blocklist cannot distinguish agent edits
+  # from PM-tool writes. The static manifest-write detector that
+  # would close that gap was deliberately removed in R17;
+  # defending against agent-initiated PM mutations needs a
+  # different abstraction (process-tree-aware policy / per-tool
+  # capability tokens) — not shipped in 0.49.0.
+  - package.json
 notification_channel: ''
 # G9: Booked-internal consumers retain the stricter 0.2.x posture — a single
 # literal injection match at write/destructive tier denies (does not merely
@@ -80,3 +95,16 @@ attribution:
 delegation_advisory:
   enabled: true
   threshold: 25
+# 0.49.0 bootstrap allowlist (P3-1) — explicit declaration for parity
+# with the dogfood `.rea/policy.yaml`. The other five shipped profiles
+# (open-source*, client-engagement, lit-wc, minimal) inherit the zod
+# schema default (`enabled: true`), so they need no entry here. The
+# bst-internal profile pins it so the operator-visible policy file
+# clearly states the position rather than relying on schema defaults.
+# The allowlist passes a single-segment pnpm install / npm ci / yarn /
+# corepack invocation through when (a) the rea CLI is unreachable, (b)
+# the consumer's package.json declares `@bookedsolid/rea`, and (c)
+# every other precondition (single-segment payload, exact argv shape,
+# audit emission OK) holds. See hooks/_lib/bootstrap-allowlist.sh.
+bootstrap_allowlist:
+  enabled: true

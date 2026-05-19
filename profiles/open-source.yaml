@@ -15,6 +15,17 @@ blocked_paths:
   - SECURITY.md
   - .github/workflows/release.yml
   - .github/workflows/publish.yml
+  # 0.49.0 — gates Write/Edit tool calls targeting `package.json`.
+  # The always-on `bootstrap_allowlist` (schema default) trusts a
+  # CLI-missing PM payload only when `package.json` declares
+  # `@bookedsolid/rea`. Without an Edit/Write-tier gate on the
+  # manifest, an agent could ADD that declaration first and then
+  # invoke the allowed PM command, defeating the precondition.
+  # PM-induced writes are explicitly out of scope (THREAT_MODEL.md
+  # §5.23 "Out of scope"). Operators who need agent freedom to edit
+  # package.json should remove this entry in `.rea/policy.yaml`
+  # AND set `bootstrap_allowlist.enabled: false` in tandem.
+  - package.json
 notification_channel: ''
 # 0.30.0 attribution augmenter — opt-in.
 # Husky prepare-commit-msg hook appends a Co-Authored-By trailer to

@@ -15,6 +15,15 @@ blocked_paths:
   - THREAT_MODEL.md
   - secrets/
   - credentials/
+  # 0.49.0 — gates Write/Edit tool calls targeting `package.json`.
+  # Pairs with the always-on `bootstrap_allowlist` (schema default):
+  # the allowlist trusts a CLI-missing PM command only when
+  # `package.json` declares `@bookedsolid/rea`, so blocking AGENT
+  # edits to the manifest narrows the Edit/Write-tier forge surface.
+  # PM-induced writes are explicitly out of scope (see
+  # THREAT_MODEL.md §5.23 "Out of scope") — a path-based blocklist
+  # cannot distinguish agent edits from PM-tool writes.
+  - package.json
 notification_channel: ''
 context_protection:
   delegate_to_subagent:

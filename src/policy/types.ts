@@ -574,6 +574,45 @@ export interface Policy {
    * methodology note.
    */
   shim_cache?: ShimCachePolicy;
+  /**
+   * Bootstrap allowlist (0.49.0+).
+   *
+   * Drives the narrow CLI-missing pass-through in
+   * `hooks/_lib/bootstrap-allowlist.sh`. When the bash-tier
+   * `blocked-paths-bash-gate.sh` / `protected-paths-bash-gate.sh`
+   * shims would refuse a Bash payload because the rea CLI is
+   * unreachable, the allowlist consults this block + the
+   * consumer's `package.json` to decide whether the payload is a
+   * legitimate recovery command (pnpm install / npm ci / yarn /
+   * corepack enable / etc.) that should pass through.
+   *
+   * Always-on by default. Set `enabled: false` to disable.
+   * Opt-out is the only knob — the allowlist itself does not
+   * accept env-var participation in the decision (security
+   * architect locked).
+   */
+  bootstrap_allowlist?: BootstrapAllowlistPolicy;
+}
+
+/**
+ * Bootstrap allowlist policy (0.49.0+).
+ *
+ * See `hooks/_lib/bootstrap-allowlist.sh` for the full contract and
+ * `THREAT_MODEL.md §5.X` for the threat-model analysis. The single
+ * knob is `enabled` — there is no list of allowed shapes in policy;
+ * the shape set is hardcoded in the helper because the threat model
+ * depends on it being fixed (a consumer-mutable shape list would let
+ * an attacker who can edit `policy.yaml` widen the pass-through).
+ *
+ * `policy.yaml` is itself a `blocked_paths` entry in the
+ * `bst-internal` profile (so a consumer who is dogfooding rea's
+ * own profile cannot turn the allowlist off via a Bash payload
+ * without first earning a separate Write-tier audit event), but
+ * the field is intentionally simple so external profiles can drop
+ * it back to consumer-editable.
+ */
+export interface BootstrapAllowlistPolicy {
+  enabled?: boolean;
 }
 
 /**

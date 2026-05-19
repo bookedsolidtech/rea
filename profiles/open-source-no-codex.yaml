@@ -30,6 +30,10 @@ blocked_paths:
   - SECURITY.md
   - .github/workflows/release.yml
   - .github/workflows/publish.yml
+  # 0.49.0 — gates Write/Edit tool calls targeting `package.json`.
+  # See `open-source.yaml` for the rationale; this variant inherits
+  # the same posture sans Codex review.
+  - package.json
 notification_channel: ''
 # 0.30.0 attribution augmenter — opt-in.
 # Husky prepare-commit-msg hook appends a Co-Authored-By trailer to

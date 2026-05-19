@@ -375,6 +375,33 @@ const ShimCachePolicySchema = z
   })
   .strict();
 
+/**
+ * 0.49.0 — bootstrap allowlist policy. Drives the narrow CLI-missing
+ * pass-through in `hooks/_lib/bootstrap-allowlist.sh` that the
+ * `blocked-paths-bash-gate.sh` and `protected-paths-bash-gate.sh`
+ * shims consult when the rea CLI is unreachable. See the helper
+ * header for the full security contract.
+ *
+ * The block is optional — vanilla installs with no
+ * `bootstrap_allowlist:` block get the default behavior (enabled).
+ * To disable: `bootstrap_allowlist: { enabled: false }`.
+ *
+ * Strict mode rejects unknown keys so a typo (`enabld`, `enable`)
+ * fails loudly at policy load.
+ *
+ * The bash-tier helper does a narrow YAML grep for the field via
+ * inline node (engines.node >=22 guarantees availability) BEFORE the
+ * canonical 4-tier policy reader is available (the allowlist runs
+ * precisely BECAUSE the CLI is missing). This zod schema validates
+ * the field at CLI load time so wrong types / typos are caught at the
+ * load boundary.
+ */
+const BootstrapAllowlistPolicySchema = z
+  .object({
+    enabled: z.boolean().default(true),
+  })
+  .strict();
+
 const PolicySchema = z
   .object({
     version: z.string(),
@@ -444,6 +471,16 @@ const PolicySchema = z
     // in env overrides this to `false` for the current invocation
     // regardless of policy.
     shim_cache: ShimCachePolicySchema.optional(),
+    // 0.49.0 — bootstrap allowlist. Narrow CLI-missing pass-through
+    // for the `pnpm install` / `npm ci` / `yarn` / `corepack enable`
+    // class of recovery commands. ALWAYS-ON by default; opt-out via
+    // `bootstrap_allowlist: { enabled: false }`. The bash-tier
+    // gate consults the field via inline node BEFORE the canonical
+    // 4-tier policy reader is reachable, since the whole reason it
+    // runs is that the CLI is unbuilt. See
+    // `hooks/_lib/bootstrap-allowlist.sh` and
+    // `THREAT_MODEL.md §5.X`.
+    bootstrap_allowlist: BootstrapAllowlistPolicySchema.optional(),
   })
   .strict();
 

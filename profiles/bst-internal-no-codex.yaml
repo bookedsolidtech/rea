@@ -31,6 +31,10 @@ blocked_paths:
   - .github/workflows/release.yml
   - SECURITY.md
   - THREAT_MODEL.md
+  # 0.49.0 — gates Write/Edit tool calls targeting `package.json`.
+  # See `bst-internal.yaml` for the rationale and explicit
+  # out-of-scope statement on PM-induced writes.
+  - package.json
 notification_channel: ''
 # G9: Booked-internal consumers retain the stricter 0.2.x posture — a single
 # literal injection match at write/destructive tier denies (does not merely

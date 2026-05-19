@@ -66,6 +66,7 @@ import {
 import { validateSettings } from '../config/settings-schema.js';
 import { ensureReaGitignore } from './install/gitignore.js';
 import { installPrepareCommitMsgHook } from './install/prepare-commit-msg.js';
+import { checkUpgradeBlockingPin, selfPinRea } from './install/self-pin.js';
 import { manifestExists, readManifest, writeManifestAtomic } from './install/manifest-io.js';
 import { type InstallManifest, type ManifestEntry } from './install/manifest-schema.js';
 import { sha256OfBuffer, sha256OfFile } from './install/sha.js';
@@ -593,6 +594,66 @@ export async function runUpgrade(options: UpgradeOptions = {}): Promise<void> {
     }
   }
 
+  // R9-P1 (codex round 9 / 0.49.0): blocking-pin pre-flight.
+  //
+  // When package.json pins @bookedsolid/rea to a version that does
+  // NOT admit the installed CLI version (workspace:*, file:.., git
+  // URLs, dist-tags, exact older pins, cross-major caret), writing
+  // 0.49 hooks + policy artifacts on top creates a hook/CLI skew:
+  // the bash gates resolve the older CLI from node_modules and that
+  // CLI's strict policy loader rejects the new `bootstrap_allowlist:`
+  // top-level key, breaking every Bash payload until the operator
+  // reconciles the pin.
+  //
+  // The check is READ-ONLY (single package.json read) and runs
+  // BEFORE every artifact-writing step:
+  //   - migrateReviewPolicyFor0110 (rewrites .rea/policy.yaml)
+  //   - the canonical file-write loop (hooks, agents, commands)
+  //   - the dedicated selfPinRea call further below
+  //   - .gitignore + prepare-commit-msg + manifest writes
+  //
+  // In dry-run we DESCRIBE the abort condition without exiting
+  // non-zero — operators using `rea upgrade --check` get to see the
+  // would-block diagnostic, then the dry-run completes normally.
+  // In live mode we abort with exit 1 and the operator-facing
+  // reconciliation steps.
+  {
+    const pinCheck = await checkUpgradeBlockingPin({
+      cwd: resolvedRoot,
+      cliVersion: getPkgVersion(),
+      mode: 'upgrade',
+    });
+    if (pinCheck.kind === 'block' || pinCheck.kind === 'block-symlink') {
+      // R10-P2 (codex round 10): block-symlink is the new variant —
+      // package.json is a symlink and writing through it would
+      // mutate a file outside the requested project tree. Handle
+      // it identically to the R9-P1 block case (throw with the
+      // operator-actionable reason; dry-run describes without
+      // throwing).
+      const dryRunHeadline =
+        pinCheck.kind === 'block'
+          ? `dry-run: rea upgrade WOULD refuse — pin ${JSON.stringify(pinCheck.existingRange)} ` +
+            `in ${path.relative(resolvedRoot, pinCheck.packageJsonPath)} does not admit ` +
+            `CLI ${pinCheck.newCliVersion}.`
+          : `dry-run: rea upgrade WOULD refuse — ${path.relative(resolvedRoot, pinCheck.packageJsonPath)} ` +
+            `is a symlink and rea must not mutate files outside the requested project tree.`;
+      if (dryRun) {
+        console.log('');
+        warn(dryRunHeadline);
+        for (const line of pinCheck.reason.split('\n')) {
+          console.log(`    ${line}`);
+        }
+        console.log('');
+      } else {
+        // R9-P1: throw (don't process.exit) so the CLI wrapper can
+        // surface the message via its standard error path AND tests
+        // can assert on the thrown reason. Matches the settings
+        // pre-flight (line ~588) which also throws.
+        throw new Error(pinCheck.reason);
+      }
+    }
+  }
+
   // 0.11.0 migration — strip removed review.* fields and backfill the new
   // concerns_blocks default. Runs before canonical file reconciliation so a
   // policy that fails strict schema load (which happens on upgrade from
@@ -781,6 +842,82 @@ export async function runUpgrade(options: UpgradeOptions = {}): Promise<void> {
       console.log(`  ${marker} ${target} (attribution augmenter)`);
     }
     for (const w of pcmResult.warnings) warn(w);
+  }
+
+  // 0.49.0 — self-heal legacy installs that pre-date `rea init`'s
+  // self-pin step. Bricks-on-fresh-clone is a 0.48.x-and-earlier
+  // problem; `rea upgrade` rolls forward to a healthy state by
+  // re-running the same self-pin module.
+  //
+  // P1-1 (codex round 2): `mode: 'upgrade'` opts the upgrade path
+  // into auto-bumping a managed-caret pin when the existing range
+  // does not admit the new CLI minor. `^0.49.0` does NOT admit
+  // `0.50.0` (npm pre-1.0 caret = tilde semantics) — without auto-
+  // bump, `rea upgrade 0.50.0` would copy newer hooks against the
+  // older CLI pin and recreate the hook/CLI skew this feature
+  // exists to prevent. Auto-bump fires ONLY when the existing
+  // range is a strict managed-caret shape (something we wrote);
+  // workspace:*, file:.., git URLs, tags, exact pins, tildes, and
+  // cross-major bumps all hands-off and warn+skip. See
+  // src/cli/install/self-pin.ts::shouldBumpManagedCaret for the
+  // gate.
+  //
+  // R3-P2 (codex round 3): dry-run must surface the SAME action the
+  // live run would take — operators ran `rea upgrade --dry-run`,
+  // saw zero pin-related output, and were surprised when the live
+  // run mutated `package.json`. We now invoke `selfPinRea` in BOTH
+  // dry-run and live mode; the helper's `dryRun: true` opt computes
+  // the action discriminant without writing. Dry-run console output
+  // uses "would" verbs so the planned vs done distinction is
+  // unambiguous.
+  {
+    const selfPinResult = await selfPinRea({
+      cwd: resolvedRoot,
+      cliVersion: getPkgVersion(),
+      mode: 'upgrade',
+      dryRun,
+    });
+    const rel =
+      selfPinResult.packageJsonPath !== null
+        ? path.relative(resolvedRoot, selfPinResult.packageJsonPath)
+        : null;
+    if (selfPinResult.action === 'wrote' && rel !== null) {
+      console.log(
+        dryRun
+          ? `  ~ ${rel} (would self-pin: write devDependencies["@bookedsolid/rea"] = ${selfPinResult.pinnedRange})`
+          : `  ~ ${rel} (self-pin: @bookedsolid/rea@${selfPinResult.pinnedRange})`,
+      );
+    } else if (selfPinResult.action === 'bumped' && rel !== null) {
+      // P1-1: surface the bump explicitly so the upgrade log shows
+      // exactly what changed about the pin (vs the silent same-bytes
+      // case which uses the dot marker).
+      console.log(
+        dryRun
+          ? `  ~ ${rel} (would self-pin: bump @bookedsolid/rea from ${selfPinResult.existingRange ?? '?'} to ${selfPinResult.pinnedRange})`
+          : `  ✓ ${rel} (self-pin: bumped @bookedsolid/rea from ${selfPinResult.existingRange ?? '?'} to ${selfPinResult.pinnedRange})`,
+      );
+    } else if (selfPinResult.action === 'skipped-same' && rel !== null) {
+      console.log(`  · ${rel} (self-pin: already declared)`);
+    } else if (selfPinResult.action === 'skipped-different') {
+      // Same warn-and-skip path for both dry-run and live — the
+      // operator-owned-pin posture doesn't change between modes.
+      // The message itself describes the existing pin and the
+      // hands-off rationale.
+      warn(selfPinResult.message);
+    } else if (selfPinResult.action === 'skipped-no-package-json') {
+      warn(
+        'self-pin skipped — no package.json found upward from target; bash gates may refuse without it',
+      );
+    } else if (selfPinResult.action === 'skipped-malformed-package-json') {
+      warn(selfPinResult.message);
+    } else if (selfPinResult.action === 'skipped-symlink-package-json') {
+      // R10-P2 (codex round 10): dry-run path only. Live mode throws
+      // at the symlink check; reaching this branch means the
+      // pre-flight already described the block-symlink condition to
+      // the operator earlier in this `rea upgrade --dry-run`
+      // invocation. No additional output needed beyond the
+      // already-printed pre-flight diagnostic.
+    }
   }
 
   // BUG-010 — ensure `.gitignore` carries every runtime artifact entry. This

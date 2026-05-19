@@ -495,6 +495,76 @@ Ref: `hooks/settings-protection.sh:86-336`, `.claude/hooks/settings-protection.s
 
 ---
 
+### 5.23 Bootstrap Allowlist (0.49.0)
+
+**Threat:** Pre-0.49.0, `rea init` wrote `.claude/hooks/blocked-paths-bash-gate.sh` and `.claude/hooks/protected-paths-bash-gate.sh` shims that depend on the `@bookedsolid/rea` CLI being resolvable from `node_modules/`. The init flow did NOT add the dep to the consumer's `package.json`. Any fresh clone of a consumer repo + `pnpm install` produced a brick state where the shims found no CLI and refused 100% of `Bash` calls — including the very `pnpm add -D @bookedsolid/rea` that would recover the install. Hot consumer paths (helixir, BST clients) routinely tripped this whenever a fresh checkout landed.
+
+Two paired fixes ship in 0.49.0. The structural fix is `rea init` self-pin (`src/cli/install/self-pin.ts`, §5.23.1 below). The bootstrap allowlist is the safety net that recovers consumers who upgraded to a hooks-shipping `rea init` but were NEVER on the self-pinned init flow.
+
+**Scope:** The bootstrap allowlist is a narrow CLI-missing recovery surface. It permits a small set of legitimate-shape PM invocations (bare `pnpm install` / `npm ci` / `yarn install`; `pnpm add -D @bookedsolid/rea` and its npm/yarn equivalents in BARE form) to flow when the CLI is unreachable AND `package.json` already declares `@bookedsolid/rea`. The precondition exists to differentiate consumers who have already opted into `@bookedsolid/rea` (post-`rea init`) from arbitrary repos. It is NOT a defense against agent-initiated package.json mutations — a path-based blocklist on `package.json` cannot distinguish agent writes from PM-tool writes, so that surface is explicitly out of scope here.
+
+**Mitigations:**
+
+- `hooks/_lib/bootstrap-allowlist.sh` exposes `bootstrap_allowlist_check`. The blocked-paths and protected-paths Bash gates consult it ONLY when (a) the CLI is unreachable AND (b) the substring scan said "this payload looks like it would write a protected/blocked path." When the allowlist returns "allow", the shim exits 0 BEFORE the CLI-missing banner fires.
+- Allowlist is ALWAYS-ON by default (`policy.bootstrap_allowlist.enabled: true`). No env-var ever participates in the decision — `REA_BOOTSTRAP_ALLOW=1`, `REA_FORCE_BOOTSTRAP=*`, etc. are inert. Operators who want to opt out set `policy.bootstrap_allowlist.enabled: false`.
+- Precondition: `<project>/package.json` exists, parses as a strict JSON object, and declares `@bookedsolid/rea` under `dependencies` OR `devDependencies` (NOT `optionalDependencies`, NOT `peerDependencies`, NOT `pnpm.overrides`). Without this declaration, the allowlist refuses every payload. The precondition is "consumer has run `rea init`, so a self-pin already exists" — not a defense against an attacker forging the declaration.
+- The argv shape allowlist is FIXED in the helper, not consumer-mutable from policy. Recognised shapes are precisely:
+  - pnpm: `pnpm install`, `pnpm i`, with optional `--frozen-lockfile` / `--no-frozen-lockfile`; `pnpm add -D @bookedsolid/rea` (bare); `pnpm add --save-dev @bookedsolid/rea` (bare).
+  - npm: `npm install`, `npm i`, `npm ci`; `npm install -D @bookedsolid/rea` (bare); `npm install --save-dev @bookedsolid/rea` (bare).
+  - yarn: `yarn`, `yarn install`; `yarn add -D @bookedsolid/rea` (bare); `yarn add --dev @bookedsolid/rea` (bare).
+  - corepack: `corepack enable`, `corepack enable {pnpm,yarn,npm}`, `corepack prepare {pnpm,yarn,npm}@<ver> --activate`.
+
+  Bun, `pnpm fetch`, `--global`/`-g`, any `--registry=` override, and any `--ignore-scripts` flag are deliberately OUT of the allowlist for 0.49.0 — adding any of them would broaden the contract beyond "recover the brick state."
+
+  **R6-P2 (codex round 6):** `@bookedsolid/rea` is accepted ONLY in its bare form. Version-pinned shapes `@bookedsolid/rea@<anything>` are REFUSED — this includes dist-tags (`@latest`, `@next`), exact versions (`@0.48.0`), and semver ranges (`@^0.50.0`). Version selection is `rea init` (caret pin at install time) and `rea upgrade` (managed-caret bump, audited via the TS path) territory; the Bash-tier bootstrap path must not allow a CLI-missing session to retarget the trusted gate binary by pinning a chosen version. `corepack prepare pnpm@<ver> --activate` retains the version slot because that selects the package-manager binary (out-of-scope for rea's gate trust), but the rea package spec itself is locked to bare.
+- Multi-segment payloads refuse: the gate's `cmd-segments.sh` segmentation runs ahead of the allowlist, and the helper itself re-counts segments as defense in depth. Any `&&`, `;`, `||`, `|`, newline, or backgrounding refuses.
+- argv[0] basename match is exact-string with no slashes — `./pnpm install`, `/usr/local/bin/pnpm install`, `pnpm/x install` all refuse. The character class for argv[0] is `[A-Za-z0-9._-]`.
+- The package-spec match for `@bookedsolid/rea` is the BARE form only (R6-P2). All versioned forms `@bookedsolid/rea@<ver>` refuse — dist-tags, exact versions, semver ranges, shell metacharacters, command substitutions, and empty `@`-suffixes all hit the refuse branch uniformly.
+- Quoted argv forms (`pnpm "install"`, `'pnpm' install`) refuse-fallthrough. This is a defense feature — a quoted token does NOT match the bare-string shape lists, so any attacker laundering through quotes hits the refuse branch.
+- IFS leakage is defeated by `local IFS=$' \t\n'` declared inside `bootstrap_allowlist_check`. A hostile parent shell that sets `IFS=:` (or worse) cannot reshape the splitter.
+- The `$proj` directory is realpath-resolved via `cd "$CLAUDE_PROJECT_DIR" && pwd -P` before the allowlist sees it. A hostile workspace whose `CLAUDE_PROJECT_DIR` symlinks outside the actual project does not get the allowlist sandbox: the hashing + audit-emit still references the resolved path, NOT the symlink.
+- Every `allow` verdict emits a `rea.bash.bootstrap_allow` audit record through the hash-chained log. Audit fields are fixed-shape: `shim`, `pm`, `argv_shape`, `argv_segments_sha256`, `package_json_sha256`, `package_json_declares_rea`, `declared_version_range` (truncated to 16 chars), `cli_resolution: "missing"`, `policy_enabled`. If `node` is unavailable, or the audit append fails (read-only `.rea/`, hasher missing, disk full), the allowlist REFUSES rather than allowing silently — every allow MUST be auditable.
+- **R19-P1 (codex round 19):** `package.json` is in `blocked_paths` on the `bst-internal` and `bst-internal-no-codex` profiles (and the dogfood `.rea/policy.yaml`). This narrows the Edit/Write-tier forge surface specifically — an L1 Bash session cannot first `Edit` `package.json` to ADD a `@bookedsolid/rea` declaration and then route an otherwise-disallowed PM command through the allowlist's "consumer already declares `@bookedsolid/rea`" precondition. The blocklist gates Write/Edit/MultiEdit/NotebookEdit tool calls via the existing path-based machinery (`settings-protection.sh`, `blocked-paths-enforcer.sh`); it does NOT gate PM-induced writes to the manifest (those are explicitly out of scope, below). External profiles inherit `enabled: true` from the schema default but do NOT add `package.json` to their blocked_paths list (consumers may need to edit package.json freely; the `bst-internal` posture is the strict one).
+
+**Trust boundary:** The bootstrap allowlist is reachable only when the CLI is unreachable. The CLI-present path through both gates flows through the full Node-binary scanner (`src/hooks/bash-scanner/`). Once `pnpm install` completes and `node_modules/@bookedsolid/rea/dist/cli/index.js` resolves, every subsequent Bash call is scanned by the canonical scanner — the allowlist no longer participates.
+
+**Out of scope (explicit non-claim):**
+
+- The allowlist does NOT prevent an attacker who can already write Bash payloads from invoking PM commands that mutate `package.json`. A path-based blocklist on `package.json` (re-added by R19-P1 above) defends against AGENT writes only — it cannot distinguish PM-tool writes from agent writes because the PM is invoked by Bash and the manifest mutation happens inside the PM process, not in argv that a static analyzer can see reliably. Defending against agent-initiated PM mutations requires a different abstraction (process-tree-aware policy, per-tool capability tokens, or operator-confirmed PM invocations) — none of which ship in 0.49.0. The R6-onward "manifest-write static analyzer" surface that would have attempted to close this gap was deliberately removed in R17 (scope-cut) because a path-based blocklist is the wrong abstraction for PM-process introspection. The 0.49.0 contract is solely: "recover the brick state without requiring the operator to disable hooks, AND gate agent-initiated Edit/Write to the manifest."
+
+**Residual risks:**
+
+- **CLOSED in R6-P2:** Pre-R6 the allowlist accepted `@bookedsolid/rea@<version>` and let a CLI-missing session forge a downgrade attack against a known-vulnerable historical rea version. R6-P2 strips all version-pinned forms from the allowlist; only the bare `@bookedsolid/rea` spec is permitted. Version selection lives in `rea init` (caret pin at install) and `rea upgrade` (managed-caret bump under audit). A CLI-missing Bash session can no longer retarget the trusted gate binary.
+- An attacker who controls a npm registry mirror could publish a malicious `@bookedsolid/rea` once the allowlist runs the install. Mitigation: npm OIDC provenance is verified by `rea init` post-install (out of scope here). Operators on a hostile mirror are exposed regardless of the allowlist. R6-P2 reduces the attack surface because the version range is bounded by the consumer's existing self-pin — the mirror cannot choose which version to ship; the consumer's caret pin does.
+- The `corepack prepare pnpm@<ver> --activate` shape allows arbitrary `<ver>` strings (within the 64-char `[A-Za-z0-9._^~+\-]` charset). This selects the package-MANAGER binary, not rea itself; consumers on a hostile pnpm version have other problems.
+- The allowlist's policy-enabled probe relies on a narrow inline YAML regex (block-form scan, flow-form match). A malformed or pathologically-shaped `bootstrap_allowlist:` block reads as "unparseable" → schema default = enabled. This is intentional: a corrupted policy MUST NOT silently strip the bootstrap recovery path. The full zod schema validation at CLI load time catches typos / wrong types at the canonical boundary.
+
+Ref: `hooks/_lib/bootstrap-allowlist.sh`, `hooks/blocked-paths-bash-gate.sh`, `hooks/protected-paths-bash-gate.sh`, `src/policy/loader.ts` (`BootstrapAllowlistPolicySchema`), `__tests__/hooks/bootstrap-allowlist/`.
+
+#### 5.23.1 `rea init` self-pin (paired structural fix)
+
+**Threat:** Same brick state described in §5.23. The bootstrap allowlist recovers consumers who get stuck; self-pin prevents them from getting stuck in the first place.
+
+**Mitigations:**
+
+- `rea init` writes `@bookedsolid/rea` as a `^<cli-version>` caret pin in the consumer's `devDependencies`. Workspace-root semantics: the upward walk finds the FIRST `package.json` from the invocation dir and stops; sub-package installs land at the sub-package, not the workspace root.
+- Idempotent: a re-run produces byte-identical `package.json`. Indent, EOL (LF vs CRLF), and trailing-newline are sniffed from the existing file and preserved.
+- Existing different version → warn + skip. The operator's pin is not mutated (covers exact-version reproducibility pins, workspace-relative paths, older-or-newer pins that disagree with the running CLI).
+- Dogfood short-circuit: `pkg.name === '@bookedsolid/rea'` skips silently.
+- `rea doctor` runs `checkSelfPinDeclared` and emits a `fail` row when `.claude/hooks/` is installed but no pin is declared. The recovery instruction names `rea upgrade` (which re-runs the self-pin step). This is the brick-state detector.
+- `rea upgrade` re-runs `selfPinRea` so legacy installs that pre-date 0.49.0 self-heal on the next upgrade. Same warn-and-skip posture on existing different version.
+
+**Trust boundary:** Self-pin only writes the `package.json` entry. It does not invoke any package manager, does not run lifecycle scripts, does not modify the lockfile. The consumer's next `pnpm install` is what materializes the install — same trust posture as a manual `pnpm add -D @bookedsolid/rea` would have.
+
+**Residual risks:**
+
+- An operator who runs `rea init` in a repo whose `package.json` is owned by a parent workspace will get a pin in the parent (the closest package.json found by the upward walk). This matches the architect's locked decision. Operators with per-package install discipline should run `rea init` from each sub-package directory after seeding a sub-package package.json.
+- An operator who pinned a workspace-relative path (`workspace:^`, `file:../rea`) gets `skipped-different` on every re-run. This is the correct behavior — the operator owns the pin. The doctor's `pass` detection accepts any non-empty string in dependencies/devDependencies as a valid pin (including workspace specs).
+
+Ref: `src/cli/install/self-pin.ts`, `src/cli/init.ts`, `src/cli/upgrade.ts`, `src/cli/doctor.ts` (`checkSelfPinDeclaredCheck`), `__tests__/cli/self-pin.test.ts`.
+
+---
+
 ## 6. Residual Risks and Open Issues
 
 | Risk                                                          | Severity | Status / Tracking              |

@@ -535,3 +535,4 @@ describe('walker — empty / no-detection inputs', () => {
     expect(detect('git status').forms).toEqual([]);
   });
 });
+
