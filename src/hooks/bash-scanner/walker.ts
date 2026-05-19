@@ -3341,6 +3341,7 @@ function detectMkfifo(argv: WordValue[], out: DetectedWrite[]): void {
   }
 }
 
+
 /**
  * Codex round 12 F12-7 (P1): mknod dispatcher.
  *

@@ -14,6 +14,12 @@ blocked_paths:
   - .github/workflows/release.yml
   - .github/workflows/publish.yml
   - tokens/
+  # 0.49.0 — gates Write/Edit tool calls targeting `package.json`.
+  # Pairs with the always-on `bootstrap_allowlist` so the
+  # "consumer declares @bookedsolid/rea" precondition is meaningful.
+  # PM-induced writes are explicitly out of scope (THREAT_MODEL.md
+  # §5.23 "Out of scope").
+  - package.json
 notification_channel: ''
 # 0.30.0 attribution augmenter — opt-in.
 # Husky prepare-commit-msg hook appends a Co-Authored-By trailer to

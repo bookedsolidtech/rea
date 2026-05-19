@@ -7,6 +7,7 @@ import { AutonomyLevel } from '../policy/types.js';
 import { HARD_DEFAULTS, loadProfile, mergeProfiles, type Profile } from '../policy/profiles.js';
 import { copyArtifacts } from './install/copy.js';
 import { ensureReaGitignore } from './install/gitignore.js';
+import { checkUpgradeBlockingPin, selfPinRea } from './install/self-pin.js';
 import {
   canonicalSettingsSubsetHash,
   defaultDesiredHooks,
@@ -137,6 +138,18 @@ export interface ResolvedConfig {
     email?: string;
     skipMerge?: boolean;
   };
+  /**
+   * R12-P1 (codex round 12 / 0.49.0): bootstrap_allowlist.enabled.
+   * Preserved across re-init so an operator who opted out via
+   * `bootstrap_allowlist: { enabled: false }` doesn't get silently
+   * re-enabled by the next `rea init`. Seeded from the layered
+   * profile on first install (only `bst-internal` currently pins
+   * `enabled: true` explicitly; every other profile inherits the
+   * zod schema default which is also `true`). When `undefined`, the
+   * writer emits no block — consumers fall through to the schema
+   * default at policy load.
+   */
+  bootstrapAllowlistEnabled?: boolean;
   fromReagent: boolean;
   reagentPolicyPath: string | null;
   reagentNotices: string[];
@@ -428,6 +441,9 @@ async function runWizard(
     // `enabled: false`). Conditional spread so undefined → key omitted
     // (the field is exact-optional).
     ...attributionConfigSpread(layeredBase, existingPolicy),
+    // R12-P1 (codex round 12): preserve bootstrap_allowlist.enabled
+    // so an operator opt-out survives `rea init` re-runs.
+    ...bootstrapAllowlistConfigSpread(layeredBase, existingPolicy),
     fromReagent,
     reagentPolicyPath,
     reagentNotices: [],
@@ -475,6 +491,47 @@ function attributionConfigSpread(
       ...(fromProfile.skip_merge !== undefined ? { skipMerge: fromProfile.skip_merge } : {}),
     },
   };
+}
+
+/**
+ * R12-P1 (codex round 12 / 0.49.0): same shape-spread helper for
+ * `bootstrap_allowlist.enabled`. Precedence:
+ *
+ *   1. Existing on-disk policy `bootstrap_allowlist.enabled` (highest).
+ *   2. Layered profile's `bootstrap_allowlist.enabled` (e.g.
+ *      `bst-internal` pins `true` explicitly).
+ *   3. Omitted — the writer skips emission and consumers fall through
+ *      to the zod schema default at policy-load time.
+ *
+ * The omit-vs-emit distinction matters: external profiles
+ * (open-source, client-engagement, etc.) leave the block unset, and
+ * we want a clean policy.yaml that does NOT mention the field unless
+ * the operator or the profile explicitly pinned it. That preserves
+ * the existing emit-only-when-set posture for the other preserved
+ * keys (local_review, commit_hygiene).
+ *
+ * Pre-R12 the field was dropped entirely on re-init — an operator
+ * who opted out via `bootstrap_allowlist: { enabled: false }` got
+ * silently flipped back to `true` (schema default). This helper
+ * closes that drop class.
+ */
+function bootstrapAllowlistConfigSpread(
+  layered: Profile,
+  existing: ExistingPolicyValues | undefined,
+): { bootstrapAllowlistEnabled?: boolean } {
+  // Existing on-disk policy wins — preserves explicit opt-out.
+  if (existing?.bootstrapAllowlistEnabled !== undefined) {
+    return { bootstrapAllowlistEnabled: existing.bootstrapAllowlistEnabled };
+  }
+  // Profile-layer value next — `bst-internal` pins `true` explicitly
+  // so the on-disk policy shows the pinned posture rather than
+  // relying on the schema default.
+  const fromProfile = layered.bootstrap_allowlist?.enabled;
+  if (fromProfile !== undefined) {
+    return { bootstrapAllowlistEnabled: fromProfile };
+  }
+  // Neither set — omit from the emitted policy.yaml.
+  return {};
 }
 
 /**
@@ -560,6 +617,14 @@ interface ExistingPolicyValues {
     email?: string;
     skipMerge?: boolean;
   };
+  /**
+   * R12-P1 (codex round 12 / 0.49.0): bootstrap_allowlist.enabled
+   * preserved across `rea init` re-runs. Pre-fix an operator who
+   * opted out via `bootstrap_allowlist: { enabled: false }` got
+   * silently re-enabled on the next init — the same drop-class
+   * R28-F6 closed for local_review / commit_hygiene.
+   */
+  bootstrapAllowlistEnabled?: boolean;
 }
 
 /**
@@ -739,6 +804,21 @@ function readExistingPolicyForPreservation(targetDir: string): ExistingPolicyVal
     }
   }
 
+  // R12-P1 (codex round 12 / 0.49.0): preserve bootstrap_allowlist
+  // across re-init. Critical for the documented opt-out — an
+  // operator who set `bootstrap_allowlist: { enabled: false }` MUST
+  // NOT have it silently flipped back to `true` by the next init.
+  // Inline (`bootstrap_allowlist: { enabled: false }`) and block
+  // (`bootstrap_allowlist:\n  enabled: false`) forms fold to the
+  // same parsed object via yaml.parse.
+  const bootstrapAllowlist = policy['bootstrap_allowlist'];
+  if (bootstrapAllowlist !== null && typeof bootstrapAllowlist === 'object') {
+    const ba = bootstrapAllowlist as Record<string, unknown>;
+    if (typeof ba['enabled'] === 'boolean') {
+      out.bootstrapAllowlistEnabled = ba['enabled'];
+    }
+  }
+
   return out;
 }
 
@@ -909,6 +989,16 @@ function writePolicyYaml(targetDir: string, config: ResolvedConfig, layered: Pro
     if (config.commitHygieneRefuseAtCommits !== undefined) {
       lines.push(`  refuse_at_commits: ${config.commitHygieneRefuseAtCommits}`);
     }
+  }
+  // R12-P1 (codex round 12 / 0.49.0): emit bootstrap_allowlist when
+  // the layered profile or the existing on-disk policy declared it.
+  // When unset, omit the block — consumers fall through to the zod
+  // schema default (`enabled: true`). The block form (vs flow form)
+  // mirrors what `bst-internal.yaml` emits so dogfood byte-fidelity
+  // is preserved.
+  if (config.bootstrapAllowlistEnabled !== undefined) {
+    lines.push(`bootstrap_allowlist:`);
+    lines.push(`  enabled: ${config.bootstrapAllowlistEnabled ? 'true' : 'false'}`);
   }
   lines.push(``);
   fs.writeFileSync(policyPath, lines.join('\n'), 'utf8');
@@ -1652,6 +1742,9 @@ export async function runInit(options: InitOptions): Promise<void> {
       // seeded from the layered profile. Same precedence as the
       // wizard path above. Conditional spread for exact-optional.
       ...attributionConfigSpread(layeredBase, existingPolicy),
+      // R12-P1 (codex round 12): preserve bootstrap_allowlist.enabled
+      // so an operator opt-out survives `rea init` re-runs.
+      ...bootstrapAllowlistConfigSpread(layeredBase, existingPolicy),
       fromReagent,
       reagentPolicyPath,
       reagentNotices,
@@ -1690,6 +1783,41 @@ export async function runInit(options: InitOptions): Promise<void> {
     }
   }
 
+  // R11-P1 (codex round 11): blocking-pin pre-flight. Same security
+  // guarantee as `runUpgrade`'s pre-flight (R9-P1) but for the init
+  // surface. If `package.json` already pins `@bookedsolid/rea` to a
+  // version that does NOT admit the installed CLI version
+  // (workspace:*, file:.., git URLs, dist-tags, exact older pins,
+  // cross-major caret), writing 0.49 hooks + policy artifacts on
+  // top creates a hook/CLI skew: the bash gates resolve the older
+  // CLI from node_modules and that CLI's strict policy loader
+  // rejects the new `bootstrap_allowlist:` top-level key.
+  //
+  // Pre-R11 the pre-flight was upgrade-only. Operators running `rea
+  // init` to reinstall (a common pattern on consumer repos) hit
+  // the same trap. We run the same check here, BEFORE the first
+  // `.rea/` mkdir — so a refused init leaves the consumer's
+  // existing state untouched.
+  //
+  // Fresh-clone repos (no existing pin) return `kind: 'ok'` from
+  // the check, so this branch is a no-op for the canonical init
+  // path.
+  {
+    const initPinCheck = await checkUpgradeBlockingPin({
+      cwd: targetDir,
+      cliVersion: getPkgVersion(),
+      mode: 'init',
+    });
+    if (initPinCheck.kind === 'block' || initPinCheck.kind === 'block-symlink') {
+      // R10-P2: block-symlink is the symlinked-pkg.json variant.
+      // Both kinds share the `reason` field; throw with the
+      // operator-actionable explainer. The throw lands in
+      // `main().catch(...)` (src/cli/index.ts) which surfaces the
+      // multi-line message via the standard `err` path.
+      throw new Error(initPinCheck.reason);
+    }
+  }
+
   if (!fs.existsSync(reaDir)) fs.mkdirSync(reaDir, { recursive: true });
 
   // 0.43.0 UX polish: wrap the file-write phase in a clack spinner so
@@ -1708,6 +1836,7 @@ export async function runInit(options: InitOptions): Promise<void> {
   let prePushResult: Awaited<ReturnType<typeof installPrePushFallback>>;
   let mdResult: Awaited<ReturnType<typeof writeClaudeMdFragment>>;
   let gitignoreResult: Awaited<ReturnType<typeof ensureReaGitignore>>;
+  let selfPinResult: Awaited<ReturnType<typeof selfPinRea>>;
   let manifestPath: string;
   let fragmentInput: Parameters<typeof buildFragment>[0];
 
@@ -1751,6 +1880,33 @@ export async function runInit(options: InitOptions): Promise<void> {
     // `rea serve` / `rea cache` / `/freeze` can write under `.rea/`. Idempotent
     // append (and `rea upgrade` backfills older installs that never got this).
     gitignoreResult = await ensureReaGitignore(targetDir);
+
+    // 0.49.0 — self-pin `@bookedsolid/rea` as `^<cli-version>` in the
+    // consumer's package.json (devDependencies). Without this, the hook
+    // shims that init JUST wrote depend on a CLI that the next `pnpm
+    // install` does not actually install. The bash-gate bootstrap
+    // allowlist (Fix B) recovers the brick state when the dep IS
+    // declared but the CLI is not yet built; without the dep declared,
+    // the allowlist refuses (no precondition forge route — must be a
+    // legitimate top-level declaration). See `src/cli/install/self-pin.ts`
+    // for the full contract.
+    //
+    // R13-P1 (codex round 13): `mode: 'upgrade'` — managed-caret pins
+    // that don't admit the installed CLI MUST bump in place during
+    // `rea init` too. Pre-R13 init used the default `mode: 'init'`
+    // (warn-and-skip), but the R11-P1 preflight already filters out
+    // the non-managed-caret cases (workspace, file:, git, dist-tag,
+    // exact) — so anything reaching this line is either a fresh
+    // write OR a managed-caret bump. `mode: 'upgrade'` is the right
+    // semantics for both. Without this fix, `rea init` on a repo
+    // with `^0.49.0` + CLI 0.50.0 wrote new hooks/policy but left
+    // the pin behind — recreating the hook/CLI skew the preflight
+    // was supposed to prevent.
+    selfPinResult = await selfPinRea({
+      cwd: targetDir,
+      cliVersion: getPkgVersion(),
+      mode: 'upgrade',
+    });
 
     // G12 — record the install manifest. SHAs are of the files actually on disk
     // after the copy pass, so drift detection compares against real state (not
@@ -1826,6 +1982,40 @@ export async function runInit(options: InitOptions): Promise<void> {
     console.log(`  · ${path.relative(targetDir, gitignoreResult.path)} (managed block up to date)`);
   }
   for (const w of gitignoreResult.warnings) warn(w);
+  // 0.49.0 self-pin reporting. One line per outcome; warn-and-skip is
+  // surfaced loudly so the operator notices a mismatched pin.
+  //
+  // R18-P2 (codex round 18): R13-P1 switched `rea init` to
+  // `mode: 'upgrade'` so re-running init on a repo with a managed-
+  // caret pin from an older CLI auto-bumps to the new CLI's caret.
+  // The reporting ladder lacked a `'bumped'` arm — the file was
+  // mutated but the success summary printed no line about it,
+  // making the install output incomplete. Mirrors the `'bumped'`
+  // arm in `rea upgrade` (see src/cli/upgrade.ts) so the operator
+  // sees the pin delta explicitly in both surfaces.
+  if (selfPinResult.action === 'wrote' && selfPinResult.packageJsonPath !== null) {
+    console.log(
+      `  ~ ${path.relative(targetDir, selfPinResult.packageJsonPath)} (self-pin: @bookedsolid/rea@${selfPinResult.pinnedRange})`,
+    );
+  } else if (selfPinResult.action === 'bumped' && selfPinResult.packageJsonPath !== null) {
+    console.log(
+      `  ✓ ${path.relative(targetDir, selfPinResult.packageJsonPath)} (self-pin: bumped @bookedsolid/rea from ${selfPinResult.existingRange ?? '?'} to ${selfPinResult.pinnedRange})`,
+    );
+  } else if (selfPinResult.action === 'skipped-same' && selfPinResult.packageJsonPath !== null) {
+    console.log(
+      `  · ${path.relative(targetDir, selfPinResult.packageJsonPath)} (self-pin: already declared)`,
+    );
+  } else if (selfPinResult.action === 'skipped-different') {
+    warn(selfPinResult.message);
+  } else if (selfPinResult.action === 'skipped-dogfood') {
+    // Silent — dogfood install, expected.
+  } else if (selfPinResult.action === 'skipped-no-package-json') {
+    warn(
+      'self-pin skipped — no package.json found upward from target; bash gates will refuse on a fresh clone unless you add `@bookedsolid/rea` to a package.json',
+    );
+  } else if (selfPinResult.action === 'skipped-malformed-package-json') {
+    warn(selfPinResult.message);
+  }
   console.log(`  + ${path.relative(targetDir, manifestPath)}`);
 
   if (mergeResult.warnings.length > 0) {

@@ -173,4 +173,5 @@ describe('blocked-paths-bash-gate (Node-binary port)', () => {
       expect(r.exitCode).toBe(0);
     });
   });
+
 });

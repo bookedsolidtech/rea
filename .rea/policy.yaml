@@ -14,6 +14,18 @@ blocked_paths:
   - .env.*
   - .rea/HALT
   - .github/workflows/release.yml
+  # 0.49.0 — gates Write/Edit/MultiEdit/NotebookEdit tool calls
+  # targeting `package.json`. The bootstrap allowlist passes a
+  # CLI-missing PM payload through only when `package.json`
+  # declares `@bookedsolid/rea`, so blocking AGENT edits to the
+  # manifest narrows the Edit/Write-tier forge surface. PM-induced
+  # writes to the manifest are explicitly out of scope (see
+  # THREAT_MODEL.md §5.23 "Out of scope") — a path-based blocklist
+  # cannot distinguish agent edits from PM-tool writes. The static
+  # manifest-write detector that would close that gap was
+  # deliberately removed in R17 (scope-cut); defending against
+  # agent-initiated PM mutations needs a different abstraction.
+  - package.json
 notification_channel: ""
 context_protection:
   delegate_to_subagent:
@@ -52,3 +64,10 @@ delegation_advisory:
     - Plan
     - output-style-setup
     - statusline-setup
+# 0.49.0 bootstrap allowlist — explicit `enabled: true` so the dogfood
+# install advertises the default rather than relying on the schema
+# default. The bash-tier gate consults this field via inline node before
+# the canonical policy reader is reachable (the whole reason it runs is
+# CLI-missing).
+bootstrap_allowlist:
+  enabled: true

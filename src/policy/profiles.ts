@@ -120,6 +120,18 @@ export const ProfileSchema = z
       })
       .strict()
       .optional(),
+    // 0.49.0+ bootstrap allowlist (P3-1) — narrow CLI-missing pass-through
+    // in `hooks/_lib/bootstrap-allowlist.sh`. The `bst-internal` profile
+    // pins `enabled: true` for parity with `.rea/policy.yaml`; every other
+    // shipped profile inherits the schema default (also `true`). The
+    // profile-layer schema mirrors the policy-loader's
+    // `BootstrapAllowlistPolicySchema`; strict mode catches typos at init.
+    bootstrap_allowlist: z
+      .object({
+        enabled: z.boolean().optional(),
+      })
+      .strict()
+      .optional(),
   })
   .strict();
 

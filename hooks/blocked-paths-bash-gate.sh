@@ -41,21 +41,44 @@ shim_cli_missing_relevant() {
   if [ -z "$cli_missing_cmd" ]; then
     return 1
   fi
+
+  # R5-P1: substring scan DETERMINES refusal; allowlist OPENS gates
+  # only. R7-P1: PM-route can ALSO return 2 (audit-integrity fail)
+  # which MUST refuse via banner regardless of substring scan.
+  local matched_blocked=0
   local policy_file="${REA_ROOT}/.rea/policy.yaml"
-  if [ ! -f "$policy_file" ]; then
+  if [ -f "$policy_file" ]; then
+    # shellcheck source=_lib/policy-reader.sh
+    source "$(dirname "$0")/_lib/policy-reader.sh"
+    local entry
+    while IFS= read -r entry; do
+      [ -z "$entry" ] && continue
+      case "$cli_missing_cmd" in
+        *"$entry"*) matched_blocked=1; break ;;
+      esac
+    done < <(policy_reader_get_list blocked_paths 2>/dev/null)
+  fi
+
+  # shellcheck source=_lib/bootstrap-allowlist.sh
+  source "$(dirname "$0")/_lib/bootstrap-allowlist.sh"
+
+  # R7-P1 (codex round 7): 3-state PM-route return.
+  #   0 = auditable allow → exit 0 immediately.
+  #   2 = refuse-HARD (audit-integrity fail) → banner regardless
+  #       of substring scan (the helper printed an explainer to
+  #       stderr; we must NOT silently allow a payload whose audit
+  #       record could not be written).
+  #   * = refuse-fallthrough → defer to substring-scan verdict.
+  _bootstrap_shim_pm_route "blocked-paths-bash-gate" "$cli_missing_cmd" "$REA_ROOT"
+  case "$?" in
+    0) exit 0 ;;
+    2) return 0 ;;
+  esac
+
+  if [ "$matched_blocked" -eq 0 ]; then
     return 1
   fi
-  # 0.37.0: route blocked_paths reads through the unified policy-reader.
-  # shellcheck source=_lib/policy-reader.sh
-  source "$(dirname "$0")/_lib/policy-reader.sh"
-  local entry
-  while IFS= read -r entry; do
-    [ -z "$entry" ] && continue
-    case "$cli_missing_cmd" in
-      *"$entry"*) return 0 ;;
-    esac
-  done < <(policy_reader_get_list blocked_paths 2>/dev/null)
-  return 1
+  return 0
 }
 
 # shellcheck source=_lib/shim-runtime.sh

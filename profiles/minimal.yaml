@@ -8,6 +8,17 @@ block_ai_attribution: true
 blocked_paths:
   - .env
   - .env.*
+  # 0.49.0 — gates Write/Edit tool calls targeting `package.json`.
+  # The always-on `bootstrap_allowlist` (schema default) trusts a
+  # CLI-missing PM payload only when `package.json` declares
+  # `@bookedsolid/rea`; without an Edit/Write gate on the manifest,
+  # an agent could ADD that declaration first and then route an
+  # otherwise-disallowed PM command through the allowlist. PM-
+  # induced writes are explicitly out of scope (THREAT_MODEL.md
+  # §5.23 "Out of scope"). Operators who deliberately want agent
+  # freedom to edit `package.json` should remove this entry AND
+  # set `bootstrap_allowlist.enabled: false` in tandem.
+  - package.json
 notification_channel: ''
 # 0.30.0 attribution augmenter — opt-in.
 # When enabled: true, the husky prepare-commit-msg hook appends a

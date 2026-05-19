@@ -31,6 +31,7 @@ import {
   PREPARE_COMMIT_MSG_MARKER,
 } from './install/prepare-commit-msg.js';
 import { validateSettings } from '../config/settings-schema.js';
+import { checkSelfPinDeclaredSync, REA_PACKAGE_NAME, stripUtf8Bom } from './install/self-pin.js';
 import { POLICY_FILE, REA_DIR, REGISTRY_FILE, getPkgVersion, log, reaPath } from './utils.js';
 
 export interface CheckResult {
@@ -276,6 +277,247 @@ function checkHooksInstalled(baseDir: string): CheckResult {
     };
   }
   return { label: 'hooks installed + executable', status: 'fail', detail: issues.join('; ') };
+}
+
+/**
+ * 0.49.0 — fail when `.claude/hooks/` is present but no `@bookedsolid/rea`
+ * pin is declared in the consumer's `package.json`. This is the "brick
+ * state" detector — a fresh clone of a consumer repo whose hook shims
+ * exist but whose dependency declaration is missing is exactly the
+ * scenario the bash-gate bootstrap allowlist (paired Fix B) recovers
+ * from. Doctor surfaces it loudly so the operator runs `rea upgrade`
+ * (which re-runs the self-pin step) before assuming the shims have
+ * drifted.
+ *
+ * Statuses:
+ *   - `pass`  — hooks installed AND pin declared (in dependencies or
+ *               devDependencies).
+ *   - `pass`  — no `.claude/hooks/` directory (check is N/A; the
+ *               brick scenario does not exist).
+ *   - `pass`  — `pkg.name === '@bookedsolid/rea'` (dogfood — never
+ *               self-pins).
+ *   - `warn`  — hooks installed but NO `package.json` upward. The
+ *               bootstrap allowlist requires a pkg.json precondition,
+ *               so without one the gates cannot self-recover anyway.
+ *               We warn rather than fail to avoid spamming non-Node
+ *               consumers who landed `.claude/hooks/` through a
+ *               separate vendoring flow.
+ *   - `fail`  — hooks installed, package.json found, no rea pin.
+ *               This is the brick state.
+ *   - `fail`  — package.json exists but is malformed/non-object.
+ */
+/**
+ * R18-P1 (codex round 18) / R19-P2 (codex round 19): resolve the
+ * `@bookedsolid/rea` version that the consumer's HOOK SCRIPTS will
+ * actually invoke at runtime.
+ *
+ * Two layouts the shim chain accepts (mirrors `resolveCliDistPath`
+ * above):
+ *
+ *   1. `<baseDir>/node_modules/@bookedsolid/rea/package.json` — the
+ *      consumer install (`pnpm i @bookedsolid/rea`). The version is
+ *      that file's `version` field.
+ *
+ *   2. `<baseDir>/dist/cli/index.js` present AND `<baseDir>/package.json`
+ *      has `name === '@bookedsolid/rea'` — the rea-repo dogfood
+ *      after `pnpm build`. The dist is a build output of the same
+ *      package.json that declares the rea CLI, so its `version`
+ *      field is the CLI version the dogfood hooks will resolve.
+ *
+ * Pre-R18 doctor passed `getPkgVersion()` (the version of whatever
+ * `rea` binary launched `rea doctor`) into the pin-compat check.
+ * That caused false failures whenever an operator ran a newer
+ * GLOBAL CLI (e.g. `rea@0.50.0`) against a repo whose `package.json`
+ * intentionally pinned an older but compatible version. The repo's
+ * hooks resolve the LOCAL CLI; the global binary is irrelevant.
+ *
+ * R19-P2 narrows the fix: when neither layout resolves, return
+ * `null` — and the caller SKIPS the compat check entirely (no
+ * fallback to `getPkgVersion()`). Fresh clones (pre-`pnpm install`)
+ * and broken dist builds fall into this branch and now pass instead
+ * of false-failing.
+ *
+ * Returns `null` on any read/parse error or when no recognized
+ * layout matches. Best-effort, single read per call. Never throws.
+ */
+function resolveLocalCliVersion(baseDir: string): string | null {
+  // Layout 1: consumer install via node_modules.
+  const nmPkgPath = path.join(
+    baseDir,
+    'node_modules',
+    '@bookedsolid',
+    'rea',
+    'package.json',
+  );
+  const nmVersion = readPackageVersion(nmPkgPath);
+  if (nmVersion !== null) return nmVersion;
+
+  // Layout 2: rea-repo dogfood. The CLI is `<baseDir>/dist/cli/
+  // index.js`; the source of truth for its version is the SAME
+  // `<baseDir>/package.json` that declares it. Guard with name-
+  // match so we never mis-identify a consumer's package.json
+  // (which lacks the dist build) as a rea install.
+  const distCliPath = path.join(baseDir, 'dist', 'cli', 'index.js');
+  if (!fs.existsSync(distCliPath)) return null;
+  const dogfoodPkgPath = path.join(baseDir, 'package.json');
+  let raw: string;
+  try {
+    raw = fs.readFileSync(dogfoodPkgPath, 'utf8');
+  } catch {
+    return null;
+  }
+  raw = stripUtf8Bom(raw);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return null;
+  }
+  const pkg = parsed as Record<string, unknown>;
+  if (pkg['name'] !== REA_PACKAGE_NAME) return null;
+  const version = pkg['version'];
+  return typeof version === 'string' && version.length > 0 ? version : null;
+}
+
+/**
+ * Helper for `resolveLocalCliVersion` — read a package.json's
+ * `version` field with the same BOM tolerance + defensive parse
+ * posture as the rest of the self-pin surface. Returns `null` on
+ * any failure.
+ */
+function readPackageVersion(pkgPath: string): string | null {
+  let raw: string;
+  try {
+    raw = fs.readFileSync(pkgPath, 'utf8');
+  } catch {
+    return null;
+  }
+  raw = stripUtf8Bom(raw);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return null;
+  }
+  const version = (parsed as Record<string, unknown>)['version'];
+  return typeof version === 'string' && version.length > 0 ? version : null;
+}
+
+export function checkSelfPinDeclaredCheck(baseDir: string): CheckResult {
+  const label = `${REA_PACKAGE_NAME} declared in package.json`;
+  try {
+    // R11-P3 (codex round 11): pass the running CLI version so the
+    // check verifies the declared range admits it (not just that
+    // it's declared). Pre-R11 the check was presence-only — a stale
+    // pin like `"0.48.0"` reported pass even though the running
+    // CLI was 0.49.x. Doctor's job is to catch skew BEFORE it
+    // bricks the consumer.
+    //
+    // R18-P1 (codex round 18): prefer the LOCAL CLI's version
+    // (`<baseDir>/node_modules/@bookedsolid/rea`) over the global
+    // invoker's. The consumer's HOOKS resolve the local install at
+    // runtime, so that's the version the pin must admit.
+    //
+    // R19-P2 (codex round 19): when the local CLI is absent (no
+    // node_modules layout AND no dogfood dist build), SKIP the
+    // compat check entirely. Falling back to the invoker version
+    // (the R18-P1 implementation) still produced false-fails on
+    // fresh clones — an operator's newer global `rea@0.50.0`
+    // running doctor against a repo pinned `^0.49.0` before
+    // `pnpm install` saw fail-incompatible despite no real
+    // problem. With local CLI absent we cannot determine what
+    // version the hooks will run, so we report pass and let
+    // pnpm's own resolution-time errors surface any actual pin
+    // skew during install. The existing `fail-no-pin` /
+    // `fail-malformed` arms continue to catch the brick states.
+    const resolvedCliVersion = resolveLocalCliVersion(baseDir);
+    const result = checkSelfPinDeclaredSync(
+      baseDir,
+      resolvedCliVersion ?? undefined,
+    );
+    switch (result.kind) {
+      case 'pass':
+        return {
+          label,
+          status: 'pass',
+          detail: `declared in ${result.declaredIn} as ${result.declaredRange}`,
+        };
+      case 'pass-no-hooks':
+        return {
+          label,
+          status: 'pass',
+          detail: 'no .claude/hooks/ — check is N/A',
+        };
+      case 'pass-dogfood':
+        return {
+          label,
+          status: 'pass',
+          detail: 'dogfood install (pkg.name === @bookedsolid/rea)',
+        };
+      case 'pass-no-pkg':
+        return {
+          label,
+          status: 'warn',
+          detail:
+            'hook shims installed but no package.json found upward — bash gates will refuse on fresh clones (the bootstrap allowlist requires a package.json precondition)',
+        };
+      case 'fail':
+        return {
+          label,
+          status: 'fail',
+          detail:
+            `hook shims at ${path.relative(baseDir, result.hooksDir)} but ${REA_PACKAGE_NAME} is not declared in ${path.relative(baseDir, result.packageJsonPath)}. ` +
+            `Fresh clones will brick (bash gates refuse without a CLI). Run \`rea upgrade\` to self-heal.`,
+        };
+      case 'fail-malformed':
+        return {
+          label,
+          status: 'fail',
+          detail: `${path.relative(baseDir, result.packageJsonPath)} is missing or not a valid JSON object`,
+        };
+      // R10-P2 (codex round 10): symlinked package.json. Surface
+      // the write-path's refusal verbatim so the operator sees the
+      // same diagnostic at doctor time as they would at upgrade
+      // time (avoiding drift between the two surfaces).
+      case 'fail-symlink':
+        return {
+          label,
+          status: 'fail',
+          detail: result.reason,
+        };
+      // R11-P3 (codex round 11): declared range doesn't admit the
+      // running CLI. Surface the helper's full reason — it includes
+      // the recovery command and the explainer.
+      case 'fail-incompatible':
+        return {
+          label,
+          status: 'fail',
+          detail: result.reason,
+        };
+      // R11-P3: declared as workspace:* / file:.. / git URL / dist-
+      // tag. Can't statically determine whether the resolved version
+      // admits the running CLI; surface as fail so the operator
+      // audits the resolution path.
+      case 'fail-non-semver':
+        return {
+          label,
+          status: 'fail',
+          detail: result.reason,
+        };
+    }
+  } catch (e) {
+    return {
+      label,
+      status: 'fail',
+      detail: e instanceof Error ? e.message : String(e),
+    };
+  }
 }
 
 /**
@@ -2411,6 +2653,12 @@ export function collectChecks(
     checkRegistryParses(baseDir, registryPath),
     checkAgentsPresent(baseDir),
     checkHooksInstalled(baseDir),
+    // 0.49.0 brick-state detector. Hook shims installed without a
+    // self-pin in package.json is the exact scenario the bash-gate
+    // bootstrap allowlist (paired fix) recovers from. Doctor surfaces
+    // it as a hard FAIL so the operator runs `rea upgrade` (which
+    // re-runs self-pin) before assuming the gates are broken.
+    checkSelfPinDeclaredCheck(baseDir),
     checkSettingsJson(baseDir),
     // 0.30.0 Class M — strict zod schema check of the full
     // .claude/settings.json shape. Complements checkSettingsJson
