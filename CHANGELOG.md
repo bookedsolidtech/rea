@@ -1,5 +1,18 @@
 # @bookedsolid/rea
 
+## 0.49.1
+
+### Patch Changes
+
+- 70c2396: chore: migrate npm publishing to Trusted Publishing (OIDC)
+
+  Removes the long-lived `NPM_TOKEN` dependency from the release workflow.
+  Authentication now federates a short-lived OIDC token to npm via the
+  trusted-publisher entry, in response to the npm Mini Shai-Hulud token
+  rotation event. Bumps the pinned pnpm to 9.15.9 (the version with
+  confirmed OIDC trusted-publishing support). Sigstore provenance and all
+  BUG-013 tarball-integrity verification gates are preserved.
+
 ## 0.49.0
 
 ### Minor Changes
@@ -3860,13 +3873,13 @@ codex-review --also-set-cache`) on every push, produced a 1,250-line bash
 
   This release replaces the entire stack with a stateless gate:
 
-                                                                                                                git push
-                                                                                                                  → .husky/pre-push → rea hook push-gate
-                                                                                                                  → codex exec review --base <ref> --json
-                                                                                                                  → parse verdict from streamed findings
-                                                                                                                  → block on [P1] (blocking) or [P2] when concerns_blocks=true
-                                                                                                                  → write .rea/last-review.json + audit record
-                                                                                                                  → exit 0 / 1 (HALT) / 2 (blocked)
+                                                                                                                  git push
+                                                                                                                    → .husky/pre-push → rea hook push-gate
+                                                                                                                    → codex exec review --base <ref> --json
+                                                                                                                    → parse verdict from streamed findings
+                                                                                                                    → block on [P1] (blocking) or [P2] when concerns_blocks=true
+                                                                                                                    → write .rea/last-review.json + audit record
+                                                                                                                    → exit 0 / 1 (HALT) / 2 (blocked)
 
   Codex is run fresh on every push. No cache. No SHA matching. No receipt
   consultation. When the gate blocks, Claude reads stderr + the
