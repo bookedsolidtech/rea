@@ -135,12 +135,11 @@ jobs:
           # CHANGESET_TOKEN is an org PAT that can open PRs that bypass
           # branch protection (the default GITHUB_TOKEN cannot).
           GITHUB_TOKEN: ${{ secrets.CHANGESET_TOKEN }}
-          # NPM_TOKEN is an automation-scoped token for the @bookedsolid
-          # org. Trusted-publisher OIDC for brand-new packages requires
-          # pre-registration on npm; until that's in place we publish
-          # with a classic token. Provenance is still attached via
-          # id-token: write + NPM_CONFIG_PROVENANCE.
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          # Trusted Publishing (OIDC): no NPM_TOKEN. pnpm 9.15.9 federates a
+          # short-lived OIDC token to npm via the trusted-publisher entry
+          # configured on npmjs.com (org=bookedsolidtech, repo=rea,
+          # workflow=release.yml, environment=npm-publish). Provenance is
+          # attached via id-token: write + NPM_CONFIG_PROVENANCE.
           NPM_CONFIG_PROVENANCE: "true"
 
       # BUG-013 defense-in-depth: re-pack the just-published tarball from npm
