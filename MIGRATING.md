@@ -10,6 +10,43 @@ If you hit something this doc doesn't cover, file an issue at
 https://github.com/bookedsolidtech/rea/issues with the offending hook
 body and the prior tool name.
 
+## Coming from `@bookedsolid/reagent`?
+
+`@bookedsolid/rea` is the successor to the now-**deprecated**
+`@bookedsolid/reagent`. Same core idea (every AI tool call governed by
+your `policy.yaml`), rebuilt with a cleaner hook model and a
+codex-integrated push-gate. reagent receives no further releases.
+
+The package/CLI/config names changed:
+
+| | reagent (old) | rea (new) |
+|---|---|---|
+| npm package | `@bookedsolid/reagent` | `@bookedsolid/rea` |
+| CLI binary | `reagent` | `rea` |
+| Config dir | `.reagent/` | `.rea/` |
+| Policy file | `.reagent/policy.yaml` | `.rea/policy.yaml` |
+| Install | `reagent init` | `rea init` |
+
+Steps:
+
+1. `npm rm -D @bookedsolid/reagent` (or pnpm/yarn equivalent)
+2. `npm i -D @bookedsolid/rea`
+3. `npx rea init` — installs the current hook set and writes a fresh
+   `.rea/policy.yaml`
+4. Port your settings from `.reagent/policy.yaml` into the new
+   `.rea/policy.yaml` (review the generated file rather than copying
+   verbatim — autonomy levels, blocked paths, audit logging, and
+   `block_ai_attribution` carry over, but the shape evolved)
+5. `rea doctor` — confirm the install is green
+6. Delete the old `.reagent/` directory and any reagent-installed hooks
+   rea has replaced; update any `reagent` CLI calls in CI to `rea`
+
+The rest of this document covers the harder case: integrating rea with
+**other** prior tooling already in your repo (commitlint, lint-staged,
+gitleaks, branch-policy linters, husky layouts). If you're a fresh
+reagent → rea swap, the six steps above plus `rea doctor` are usually
+all you need.
+
 ## Prerequisite — husky must be installed and `core.hooksPath` configured
 
 The `.husky/{commit-msg,pre-push}.d/` extension surface is sourced from
