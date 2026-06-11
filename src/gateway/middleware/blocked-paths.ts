@@ -268,7 +268,7 @@ function looksLikePath(value: string): boolean {
  * the segment split on `/` kept `.rea%zz` and `foo`, neither of which equal
  * `.rea`. We now fail closed on malformed escapes before any pattern match.
  */
-function hasMalformedEscape(value: string): boolean {
+export function hasMalformedEscape(value: string): boolean {
   if (!value.includes('%')) return false;
   if (/%(?![0-9a-fA-F]{2})/.test(value)) return true;
   try {
@@ -293,7 +293,7 @@ function hasMalformedEscape(value: string): boolean {
  * on any URIError so malformed inputs (already caught by hasMalformedEscape)
  * do not crash here.
  */
-function hasDeepEncodedSeparator(value: string): boolean {
+export function hasDeepEncodedSeparator(value: string): boolean {
   if (!value.includes('%')) return false;
   let v = value;
   for (;;) {
@@ -319,7 +319,7 @@ function hasDeepEncodedSeparator(value: string): boolean {
  * Relative patterns (no leading `/`) match tail-aligned segments anywhere in
  * the value (`.env` matches `/project/.env` and `.env`).
  */
-function matchesBlockedPattern(value: string, pattern: string): boolean {
+export function matchesBlockedPattern(value: string, pattern: string): boolean {
   const nv = normalizePath(value);
   const np = normalizePath(pattern);
   if (np.length === 0) return false;
@@ -471,7 +471,7 @@ function globToRegex(glob: string): RegExp {
  *   other control chars that could smuggle segment prefixes past equality
  *   checks (e.g. `\x00.gitignore` → `.gitignore`).
  */
-function normalizePath(raw: string): string {
+export function normalizePath(raw: string): string {
   // Step 1: URI scheme dispatch.
   // Only `file:` URIs map to local filesystem paths. All other schemes
   // (http:, https:, ftp:, data:, etc.) reference remote or non-filesystem
