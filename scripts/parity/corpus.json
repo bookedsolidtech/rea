@@ -1,0 +1,65 @@
+{
+  "_comment": "Parity catch-rate corpus — codex vs gpt-oss-120b on OUR OWN code. Each entry reintroduces a REAL defect codex caught during the 16-round hardening of the openrouter provider, by a precise anchor→replacement edit in source. The harness reapplies each break, runs `rea review` (codex authoritative + gpt-oss shadow via `--provider both`), records whether EACH reviewer flags it, then restores via `git checkout`. `severity` is the class codex assigned. A team extends this file: add an entry with a stable `anchor` (must occur exactly once in `file`) and a `replacement` that reintroduces the bug. Stale anchors are reported, not silently skipped.",
+  "cases": [
+    {
+      "id": "verdict-laundering",
+      "round": 5,
+      "severity": "P1",
+      "class": "verdict integrity",
+      "file": "src/cli/review-openrouter.ts",
+      "anchor": "return VERDICT_RANK[modelVerdict] >= VERDICT_RANK[fromFindings] ? modelVerdict : fromFindings;",
+      "replacement": "return modelVerdict; // PARITY-BREAK(verdict-laundering): trust the model's self-verdict over its findings",
+      "description": "Adapter trusts the model's self-verdict, so {verdict:'pass', findings:[P1]} writes a passing coverage record. A reviewer should flag that the model's verdict is not reconciled against finding severities."
+    },
+    {
+      "id": "diff-fail-open",
+      "round": 8,
+      "severity": "P1",
+      "class": "false coverage",
+      "file": "src/cli/review-openrouter.ts",
+      "anchor": "  // Non-zero exit (bad ref, corruption) — NOT a legitimate empty diff.\n  if (r.status !== 0) {\n    throw new DiffAssemblyError('diff-error', `${what} exited ${String(r.status)}`);\n  }",
+      "replacement": "  // PARITY-BREAK(diff-fail-open): swallow git failure to empty string\n  if (r.status !== 0) {\n    return '';\n  }",
+      "description": "A failed `git diff` collapses to an empty string, so a partial/empty patch is reviewed and a PASS is recorded claiming HEAD was reviewed. A reviewer should flag the silent-empty-on-failure as false coverage."
+    },
+    {
+      "id": "evidentiary-root-bypass",
+      "round": 8,
+      "severity": "P1",
+      "class": "evidentiary exfiltration",
+      "file": "src/cli/review-pathguard.ts",
+      "anchor": "  const trailingDirStar = glob.endsWith('/**');\n  if (trailingDirStar) glob = glob.slice(0, -'/**'.length);",
+      "replacement": "  const trailingDirStar = false; // PARITY-BREAK(evidentiary-root-bypass): dir/** no longer matches the bare root\n  if (glob.endsWith('/**')) glob = glob.slice(0, -'/**'.length);",
+      "description": "`strawn-legal/**` stops matching the bare `strawn-legal` directory, so a symlink whose realpath is the evidentiary root slips the guard and sends protected content off-machine. A reviewer should flag the dir-root glob gap."
+    },
+    {
+      "id": "served-by-laundering",
+      "round": 11,
+      "severity": "P1",
+      "class": "backend-pin bypass",
+      "file": "src/cli/review-openrouter.ts",
+      "anchor": "  if (!SERVED_BY_RE.test(prov)) return undefined;\n  return prov;",
+      "replacement": "  const cleaned = sanitizeInput(prov); // PARITY-BREAK(served-by-laundering): sanitize-then-match\n  if (!SERVED_BY_RE.test(cleaned)) return undefined;\n  return cleaned;",
+      "description": "served_by is sanitized BEFORE the backend-pin check, so a forged control-char id launders into a clean value that passes the pin. A reviewer should flag that sanitization defeats pin verification."
+    },
+    {
+      "id": "ext-diff-exfil",
+      "round": 5,
+      "severity": "P1",
+      "class": "outbound exfiltration",
+      "file": "src/cli/review-openrouter.ts",
+      "anchor": "      NO_EXT_DIFF_FLAG,\n      NO_TEXTCONV_FLAG,\n      ...committedScopeArgs(baseRef, unborn),",
+      "replacement": "      // PARITY-BREAK(ext-diff-exfil): external/textconv drivers re-enabled\n      ...committedScopeArgs(baseRef, unborn),",
+      "description": "Dropping --no-ext-diff/--no-textconv lets a repo-configured GIT_EXTERNAL_DIFF/textconv driver emit arbitrary bytes that go off-machine past the path-guard. A reviewer should flag that the diff content is not the raw patch."
+    },
+    {
+      "id": "doctor-missing-key-warn",
+      "round": 11,
+      "severity": "P2",
+      "class": "observability",
+      "file": "src/cli/doctor.ts",
+      "anchor": "    if (policy.review?.provider !== 'openrouter') return false;",
+      "replacement": "    return false; // PARITY-BREAK(doctor-missing-key-warn): never treat a missing key as fatal",
+      "description": "doctor never reports a missing key as fatal even when openrouter is the active enforced lane (where `rea review` exits 2). A reviewer should flag the health check under-reporting a broken configuration."
+    }
+  ]
+}
