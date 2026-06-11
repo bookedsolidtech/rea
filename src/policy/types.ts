@@ -223,6 +223,143 @@ export interface ReviewPolicy {
    * block governs WHETHER the gate fires, not WHO runs the review.
    */
   local_review?: LocalReviewPolicy;
+  /**
+   * 0.50.x — review provider selector. `runReview` switches on this:
+   *
+   *   - `'codex'` / absent  → the turnkey `codex exec review` path (default).
+   *   - `'openrouter'`      → adversarial review via OpenRouter
+   *                            (`gpt-oss-120b`); the diff is sent
+   *                            off-machine subject to the outbound-safety
+   *                            chokepoint (path-guard + redaction +
+   *                            backend-pin).
+   *   - `'both'`            → parity-test mode (Phase 5A). Codex is
+   *                            AUTHORITATIVE (writes the canonical
+   *                            `rea.local_review` record + drives the exit
+   *                            code); OpenRouter runs in a never-throwing
+   *                            shadow wrapper that writes
+   *                            `rea.local_review.shadow` and emits a
+   *                            side-by-side parity report. The shadow record
+   *                            never counts as preflight coverage.
+   *
+   * Resolved at consumption (`provider ?? 'codex'`) — NO zod `.default`, so
+   * absence stays distinguishable from an explicit value.
+   */
+  provider?: 'codex' | 'openrouter' | 'both';
+  /**
+   * 0.50.x — per-provider configuration. Today only `openrouter` is wired.
+   */
+  providers?: ReviewProvidersPolicy;
+}
+
+/**
+ * 0.50.x — per-provider configuration block (`policy.review.providers`).
+ */
+export interface ReviewProvidersPolicy {
+  openrouter?: OpenRouterProviderPolicy;
+}
+
+/**
+ * 0.50.x — OpenRouter (`gpt-oss-120b`) provider configuration.
+ *
+ * All fields optional; the provider resolves defaults at consumption.
+ * Strict-validated (unknown keys rejected) by the policy loader so a
+ * typo fails loud rather than silently defaulting.
+ */
+export interface OpenRouterProviderPolicy {
+  /**
+   * OpenRouter model id. Default `'openai/gpt-oss-120b'` (paid lane). A
+   * `:free` suffix is REJECTED loudly at load — the `:free` endpoint
+   * trains on prompts and is not wired (config-vs-capability mismatch).
+   */
+  model?: string;
+  /**
+   * OpenRouter API base URL. HTTPS-pinned at the schema layer. Default
+   * `'https://openrouter.ai/api/v1'`. Overridden in tests/smoke to a
+   * localhost fixture responder.
+   */
+  base_url?: string;
+  /**
+   * Data policy for the outbound request. Only `'deny-training'` is
+   * accepted — the always-on default. Sent as `provider.data_collection:
+   * 'deny'` on every request.
+   *
+   * M4 (round-8) — accuracy correction: this is a ROUTING REQUEST enforced on
+   * OpenRouter's side, NOT a rea-verified guarantee. OpenRouter returns no
+   * per-response no-training acknowledgment, so rea cannot confirm a backend
+   * honored it. Only the served backend IDENTITY (`served_by`) is verified,
+   * and only against `backend_pin`. The audit record reflects this honestly:
+   * `data_policy_requested` (what was asked) + a derived `data_policy_enforced`
+   * (`'pin-verified'` only when `served_by ∈ backend_pin`, else
+   * `'routing-requested'`). See `LocalReviewMetadata` and THREAT_MODEL §5.24.
+   */
+  data_policy?: 'deny-training';
+  /**
+   * Pinned OpenRouter serving backends (e.g. `['fireworks']`). Sent as
+   * `provider.only` so OpenRouter routes ONLY to a known-good
+   * structured-output backend. The response's serving backend is verified
+   * to be a member; a mismatch discards the findings and falls back to
+   * codex (`refusal_class: 'backend-pin-violation'`).
+   */
+  backend_pin?: string[];
+  /** Hard cap on the outbound request in milliseconds. Default 120_000. */
+  timeout_ms?: number;
+  /**
+   * Per-path DOWNGRADE overrides (fail-closed). A review runs on the WHOLE
+   * diff, so an override cannot UPGRADE a subset of files to the external lane
+   * — it can only force a SAFER lane when a changed path matches: `'refuse'`
+   * blocks the external run entirely; `'codex'` forces the local lane. (Round-14:
+   * `'openrouter'` was removed — per-path upgrade is incoherent for a
+   * whole-diff review and was a silent no-op.) The NON-OVERRIDABLE evidentiary
+   * refuse-set (the `strawn-legal` tree and any `.secret.` file glob) and
+   * `blocked_paths` always win — a path_override can ADD refusals, never
+   * SUBTRACT a hard refusal.
+   */
+  path_overrides?: ReviewPathOverride[];
+  /**
+   * Byte cap on the assembled diff sent to OpenRouter. Over-cap falls back
+   * to codex (`refusal_class: 'diff-too-large'`) — NEVER truncate-and-send.
+   * Default ~1.5MB.
+   */
+  max_diff_bytes?: number;
+  /**
+   * 0.50.x — commit-aware review granularity.
+   *
+   * `gpt-oss-120b` has a ~131k-token context window; a diff larger than the
+   * per-request context budget (`OPENROUTER_CONTEXT_BUDGET_BYTES`, ~350KB) is
+   * rejected by the backend BEFORE inference (a fast 0-token failure). When the
+   * whole diff would not fit, this knob governs how the review is split:
+   *
+   *   - `'auto'` (default) — send the WHOLE diff in one request when it fits the
+   *     context budget; otherwise split PER COMMIT (each commit is a coherent
+   *     unit, preserving within-commit cross-file context) and merge.
+   *   - `'per-commit'` — always review per commit (one request per commit +
+   *     a trailing working-tree unit), then merge.
+   *   - `'whole'` — always send the whole diff in one request (pre-chunking
+   *     behavior); an over-budget diff fails closed to codex as before.
+   *
+   * The PATH-GUARD always runs ONCE on the whole changed-path set BEFORE any
+   * chunking — splitting only affects what is SENT, post-approval. This is
+   * distinct from `max_diff_bytes` (the absolute send cap, an over-cap → codex);
+   * `review_granularity` governs how an APPROVED diff is partitioned into
+   * per-request units, each still bounded by both the context budget and
+   * `max_diff_bytes`.
+   */
+  review_granularity?: 'auto' | 'per-commit' | 'whole';
+}
+
+/**
+ * 0.50.x — a single per-path provider override entry.
+ */
+export interface ReviewPathOverride {
+  /** Gitignore-style globs (repo-relative). At least one. */
+  paths: string[];
+  /**
+   * Safer lane to force when a matching path changes. Round-14: only DOWNGRADE
+   * targets — `'codex'` (force the local lane) or `'refuse'` (block the run).
+   * `'openrouter'` was removed: a review covers the whole diff, so per-path
+   * upgrade to the external lane is incoherent and was a no-op.
+   */
+  provider: 'codex' | 'refuse';
 }
 
 /**
