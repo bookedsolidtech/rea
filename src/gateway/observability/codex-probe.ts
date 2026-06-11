@@ -4,12 +4,9 @@
  * Passive, periodic reachability check for the Codex CLI, used by `rea serve`
  * at startup and by `rea doctor` to surface a one-line status about whether
  * Codex is actually usable right now. This is INTENTIONALLY separate from
- * the reviewer-selection path in `src/gateway/reviewers/select.ts`:
- *
- *   - The selector decides which reviewer to run for a specific push (it
- *     respects `REA_REVIEWER`, registry pin, policy, etc.).
- *   - The probe just reports "is the Codex CLI responding at all?" as a
- *     observability signal — never gates a review.
+ * the review-gating path: the probe just reports "is the Codex CLI
+ * responding at all?" as an observability signal — it never decides
+ * whether a review runs and never gates one.
  *
  * Startup must NEVER fail-closed on a probe failure. Codex going away is a
  * degraded state, not a fatal one; the push gate has its own audited escape
@@ -52,8 +49,8 @@ const CATALOG_TIMEOUT_MS_DEFAULT = 5_000;
 const DEFAULT_INTERVAL_MS = 10 * 60 * 1_000;
 
 /**
- * Narrow test seam mirroring the shape in `src/gateway/reviewers/codex.ts`.
- * Kept module-local; production callers never pass their own.
+ * Narrow test seam for injecting a fake `execFile`. Kept module-local;
+ * production callers never pass their own.
  */
 export type ExecFileFn = (
   file: string,
