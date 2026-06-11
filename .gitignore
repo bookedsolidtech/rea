@@ -35,9 +35,12 @@ coverage/
 .rea/fingerprints.json
 .rea/fingerprints.json.bak.*
 .rea/last-review.json
+.rea/review-parity.json
+.rea/parity-dataset/
 .rea/policy.yaml.bak-*
 .rea/.delegation-advisory/
 .claude/worktrees/
+.claude/scheduled_tasks.lock
 
 # Scratch space
 .scratch/
