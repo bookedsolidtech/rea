@@ -103,6 +103,14 @@ The default engineering process for non-trivial changes:
 
 This is NOT optional for changes to `/src/gateway/middleware/`, `/hooks/`, `/src/policy/`, or anything under `.github/workflows/`. CODEOWNERS enforces human review on those paths as well.
 
+## Commit Discipline & Per-Commit Review
+
+Work lands as **logical, manageable, connected commits — never one `git add -A` lump.** A single giant uncommitted change ("review the whole feature at once") is the anti-pattern: it can't be reviewed well by any model or human, and it overflows the cheap review lane outright (a >~400KB diff exceeds `gpt-oss-120b`'s context window and is rejected before inference).
+
+- **Split work into coherent units.** Each commit is a *connected* set of related changes — the change AND its test, the refactor AND its callers — sized to fit a focused review (a few hundred KB of diff at most). Stage deliberately with `git add <paths>`; do NOT `git add -A` across an entire feature.
+- **Review at the commit boundary.** Run `rea review` per logical commit so errors are caught in manageable units. This is the routine floor — `gpt-oss-120b` is cheap enough (~$0.0003–0.003/commit) to run on every commit, and a focused commit-sized review catches more than one skim of a giant diff, *regardless of model*.
+- **The deep, impartial whole-system audit is separate** — a clean-room codex pass run OUTSIDE rea (multi-agent, HITL, its own process). rea's codex lane is the per-commit parity *check* (proving gpt-oss is good enough), NOT that audit. Never conflate the two, and never let rea pretend to be the impartial deep audit.
+
 ---
 
 # CLAUDE.md — @bookedsolid/rea
