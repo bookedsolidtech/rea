@@ -9,6 +9,7 @@
  * CI without bash present in the matrix.
  */
 
+import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   runProtectedScan,
@@ -17,6 +18,16 @@ import {
 } from '../../../src/hooks/bash-scanner/index.js';
 
 const REA_ROOT = process.cwd();
+
+/**
+ * Synthetic passwd-derived home for the `~/.rea` global-root gate. A
+ * sibling of the project directory so the absolute `<home>/.rea` root is
+ * genuinely OUTSIDE REA_ROOT (the case that used to ALLOW). Its parent
+ * exists (no automount stat), its `.rea` subtree does NOT — and the
+ * scanner is pure static analysis, so no file under it is ever written
+ * (we never touch the real `~/.rea`).
+ */
+const PASSWD_HOME = path.resolve(REA_ROOT, '..', 'rea-fixture-home');
 
 interface Fixture {
   cmd: string;
@@ -344,6 +355,282 @@ describe('blocked_paths — Bash-tier coverage parity', () => {
     expect(v.verdict).toBe('allow');
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────
+//  safe-global-CLI: passwd-derived `~/.rea` global trust root
+//  (Phase 4-scanner). The passwd-home is injected via ctx.passwdHome —
+//  the same style REA_ROOT is injected — so no test ever resolves or
+//  writes the real `~/.rea`.
+// ─────────────────────────────────────────────────────────────────────
+
+/** Scan WITH the synthetic passwd-home injected (gate active). */
+function pg(cmd: string): Verdict {
+  return runProtectedScan(
+    {
+      reaRoot: REA_ROOT,
+      policy: { protected_paths_relax: [] },
+      passwdHome: PASSWD_HOME,
+      stderr: () => {},
+    },
+    cmd,
+  );
+}
+
+const GLOBAL_ROOT_REFUSE: Fixture[] = [
+  // Direct redirect create-path — the seed-the-fake-registry attack.
+  { cmd: 'printf x > ~/.rea/trusted-projects', expect: 'block', origin: 'GR: tilde redirect create' },
+  // cd into ~/.rea then a bare-relative write (cwd model flags the cd target).
+  { cmd: 'cd ~/.rea && tee trusted-projects', expect: 'block', origin: 'GR: cd + tee bare-relative' },
+  { cmd: 'cd ~/.rea && printf x > new', expect: 'block', origin: 'GR: cd + create bare-relative' },
+  // cwd-relative create one level into the cli tree.
+  { cmd: 'cd ~/.rea/cli && printf x > index.js', expect: 'block', origin: 'GR: cd into cli + create' },
+  // mv/cp/install destinations.
+  { cmd: 'mv /tmp/f ~/.rea/trusted-projects', expect: 'block', origin: 'GR: mv dest' },
+  { cmd: 'install -m 600 /tmp/f ~/.rea/x', expect: 'block', origin: 'GR: install dest' },
+  { cmd: 'cp f ~/.rea/cli/dist/cli/index.js', expect: 'block', origin: 'GR: cp into cli tree' },
+  // `..`-normalization back into ~/.rea.
+  { cmd: 'printf x > ~/sub/../.rea/x', expect: 'block', origin: 'GR: dot-dot re-entry (tilde)' },
+  // Case-insensitive (macOS APFS default).
+  { cmd: 'printf x > ~/.REA/x', expect: 'block', origin: 'GR: case-insensitive .REA' },
+  // ABSOLUTE forms — the real hole pre-fix (outside REA_ROOT → ALLOW).
+  {
+    cmd: `printf x > ${PASSWD_HOME}/.rea/trusted-projects`,
+    expect: 'block',
+    origin: 'GR: absolute redirect create',
+  },
+  {
+    cmd: `cd ${PASSWD_HOME}/.rea && printf x > new`,
+    expect: 'block',
+    origin: 'GR: absolute cd + create',
+  },
+  {
+    cmd: `mv /tmp/f ${PASSWD_HOME}/.rea/trusted-projects`,
+    expect: 'block',
+    origin: 'GR: absolute mv dest',
+  },
+  {
+    cmd: `install -m 600 /tmp/f ${PASSWD_HOME}/.rea/x`,
+    expect: 'block',
+    origin: 'GR: absolute install dest',
+  },
+  {
+    cmd: `cp f ${PASSWD_HOME}/.rea/cli/dist/cli/index.js`,
+    expect: 'block',
+    origin: 'GR: absolute cp into cli tree',
+  },
+  {
+    cmd: `printf x > ${PASSWD_HOME}/sub/../.rea/trusted-projects`,
+    expect: 'block',
+    origin: 'GR: absolute dot-dot re-entry',
+  },
+  { cmd: `tee ${PASSWD_HOME}/.rea/trusted-projects < /dev/null`, expect: 'block', origin: 'GR: absolute tee' },
+];
+
+const GLOBAL_ROOT_ALLOW: Fixture[] = [
+  // Boundary-anchor siblings — the `+ '/'` anchor keeps these OUT of ~/.rea.
+  { cmd: 'printf x > ~/.reafoo', expect: 'allow', origin: 'GR-ALLOW: tilde .reafoo sibling' },
+  { cmd: 'printf x > ~/.rea-backup/notes', expect: 'allow', origin: 'GR-ALLOW: tilde .rea-backup sibling' },
+  {
+    cmd: `printf x > ${PASSWD_HOME}/.reafoo`,
+    expect: 'allow',
+    origin: 'GR-ALLOW: absolute .reafoo sibling',
+  },
+  {
+    cmd: `printf x > ${PASSWD_HOME}/.rea-backup/x`,
+    expect: 'allow',
+    origin: 'GR-ALLOW: absolute .rea-backup sibling',
+  },
+  // Elsewhere under $HOME that is NOT ~/.rea.
+  { cmd: 'printf x > ~/notes.txt', expect: 'allow', origin: 'GR-ALLOW: home file, not .rea' },
+  { cmd: 'cd ~/.reafoo && printf x > new', expect: 'allow', origin: 'GR-ALLOW: cd into sibling' },
+  // Inside the project — unaffected by the global-root gate.
+  { cmd: 'printf x > project-file.txt', expect: 'allow', origin: 'GR-ALLOW: project-relative write' },
+  { cmd: 'echo x > dist/out.js', expect: 'allow', origin: 'GR-ALLOW: project build output' },
+];
+
+describe('safe-global-CLI — passwd `~/.rea` global trust root REFUSE', () => {
+  for (const f of GLOBAL_ROOT_REFUSE) {
+    it(`${f.origin}: ${f.cmd.slice(0, 80)}`, () => {
+      const v = pg(f.cmd);
+      if (v.verdict !== f.expect) {
+        throw new Error(
+          `expected ${f.expect}, got ${v.verdict}. reason: ${v.reason ?? '(none)'}\ncmd: ${f.cmd}`,
+        );
+      }
+      expect(v.verdict).toBe('block');
+    });
+  }
+});
+
+describe('safe-global-CLI — no false-positive outside `~/.rea`', () => {
+  for (const f of GLOBAL_ROOT_ALLOW) {
+    it(`${f.origin}: ${f.cmd.slice(0, 80)}`, () => {
+      const v = pg(f.cmd);
+      if (v.verdict !== f.expect) {
+        throw new Error(
+          `expected ${f.expect}, got ${v.verdict}. reason: ${v.reason ?? '(none)'}\ncmd: ${f.cmd}`,
+        );
+      }
+      expect(v.verdict).toBe('allow');
+    });
+  }
+});
+
+describe('safe-global-CLI — gate is opt-in (feature-absent parity when passwdHome unset)', () => {
+  // Without passwdHome the scanner behaves byte-identically to the
+  // pre-feature build: `~/` is fail-closed-dynamic (legacy F-24) and an
+  // absolute out-of-root `<home>/.rea` write is an outside-root ALLOW.
+  it('absolute out-of-root .rea write ALLOWS (legacy outside-root) when gate off', () => {
+    expect(p(`printf x > ${PASSWD_HOME}/.rea/trusted-projects`).verdict).toBe('allow');
+  });
+  it('tilde write stays fail-closed (legacy dynamic) when gate off', () => {
+    expect(p('printf x > ~/.reafoo').verdict).toBe('block');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────
+//  safe-global-CLI — sibling-class sweep over the `~/.rea` gate
+//  (adversarial-test, 0.50.0). The GLOBAL_ROOT_REFUSE set above pins the
+//  DIRECT surface forms (bare redirect, cd+relative, mv/cp/install dest).
+//  This sweep pins their laundered SIBLINGS — every structural way an
+//  agent can wrap or rewrite the same write so it still lands in
+//  `<home>/.rea`. Each was verified to `block` against the real passwd
+//  home before being pinned; a future scanner change that lets any of
+//  them ALLOW is a hard regression (the `~/.rea` guarantee re-opened via
+//  a laundered form the corpus already enumerated).
+//
+//  Structural signal being pinned: the walker unwraps nested shells,
+//  env-prefixes, `eval`, fd-numbered + append redirects, and the
+//  ln-source/dest alias forms for the PROJECT-relative protected set
+//  (helix-024 F3, etc.). This block proves that unwrapping is inherited
+//  by the passwd-derived `<home>/.rea` root — parity with the in-project
+//  tier, form-for-form.
+// ─────────────────────────────────────────────────────────────────────
+
+const GLOBAL_ROOT_REFUSE_LAUNDERED: Fixture[] = [
+  // Nested-shell wrap — inner payload re-parsed; tilde still resolves.
+  {
+    cmd: "bash -c 'printf x > ~/.rea/trusted-projects'",
+    expect: 'block',
+    origin: 'GR-sib: bash -c nested redirect',
+  },
+  { cmd: 'sh -c "printf x > ~/.rea/x"', expect: 'block', origin: 'GR-sib: sh -c nested redirect' },
+  {
+    cmd: "bash -c 'cd ~/.rea && printf x > new'",
+    expect: 'block',
+    origin: 'GR-sib: bash -c cd + relative write',
+  },
+  // env-prefix + eval — command-word laundering.
+  {
+    cmd: 'env X=1 tee ~/.rea/trusted-projects',
+    expect: 'block',
+    origin: 'GR-sib: env-prefix tee',
+  },
+  { cmd: 'eval "printf x > ~/.rea/x"', expect: 'block', origin: 'GR-sib: eval redirect' },
+  // fd-numbered + append + here redirects.
+  {
+    cmd: 'printf x 1> ~/.rea/trusted-projects',
+    expect: 'block',
+    origin: 'GR-sib: explicit fd 1> redirect',
+  },
+  { cmd: 'echo x 2> ~/.rea/err', expect: 'block', origin: 'GR-sib: stderr fd 2> redirect' },
+  {
+    cmd: 'printf x >> ~/.rea/trusted-projects',
+    expect: 'block',
+    origin: 'GR-sib: append >> redirect',
+  },
+  { cmd: 'tee -a ~/.rea/trusted-projects', expect: 'block', origin: 'GR-sib: tee -a append' },
+  // Utility writers whose destination is a flag/arg, not a redirect.
+  { cmd: 'dd of=~/.rea/trusted-projects', expect: 'block', origin: 'GR-sib: dd of= dest' },
+  { cmd: 'truncate -s0 ~/.rea/trusted-projects', expect: 'block', origin: 'GR-sib: truncate dest' },
+  // ln alias creation with a `~/.rea` SOURCE (helix-024 F3 sibling) — a
+  // later write through the alias would reach the protected file; the
+  // scanner refuses the link at creation because it is not inode-aware.
+  {
+    cmd: 'ln ~/.rea/trusted-projects ./alias',
+    expect: 'block',
+    origin: 'GR-sib: ln hardlink source is registry',
+  },
+  {
+    cmd: 'ln ~/.rea/cli/dist/cli/index.js ./x',
+    expect: 'block',
+    origin: 'GR-sib: ln hardlink source is global CLI',
+  },
+  {
+    cmd: 'ln -s ~/.rea/trusted-projects ./reg-link',
+    expect: 'block',
+    origin: 'GR-sib: ln -s symlink source is registry',
+  },
+  // ln DEST *under* the root — creating a link INSIDE ~/.rea.
+  { cmd: 'ln ./innocent.js ~/.rea/cli/x.js', expect: 'block', origin: 'GR-sib: ln dest under root' },
+  {
+    cmd: 'ln -s ./innocent.js ~/.rea/cli/x.js',
+    expect: 'block',
+    origin: 'GR-sib: ln -s dest under root',
+  },
+];
+
+const GLOBAL_ROOT_ALLOW_SIBLING: Fixture[] = [
+  // ln with a SIBLING source (`.reafoo`) must not be caught by the anchor.
+  { cmd: 'ln ~/.reafoo ./alias', expect: 'allow', origin: 'GR-sib-ALLOW: ln source is sibling' },
+  // Pure in-project hardlink — no ~/.rea component anywhere.
+  { cmd: 'cp -l ./a ./b', expect: 'allow', origin: 'GR-sib-ALLOW: in-project cp -l' },
+];
+
+describe('safe-global-CLI — sibling-class sweep: laundered `~/.rea` writes REFUSE', () => {
+  for (const f of GLOBAL_ROOT_REFUSE_LAUNDERED) {
+    it(`${f.origin}: ${f.cmd.slice(0, 80)}`, () => {
+      const v = pg(f.cmd);
+      if (v.verdict !== f.expect) {
+        throw new Error(
+          `expected ${f.expect}, got ${v.verdict}. reason: ${v.reason ?? '(none)'}\ncmd: ${f.cmd}`,
+        );
+      }
+      expect(v.verdict).toBe('block');
+    });
+  }
+});
+
+describe('safe-global-CLI — sibling-class sweep: no false-positive on siblings', () => {
+  for (const f of GLOBAL_ROOT_ALLOW_SIBLING) {
+    it(`${f.origin}: ${f.cmd.slice(0, 80)}`, () => {
+      const v = pg(f.cmd);
+      if (v.verdict !== f.expect) {
+        throw new Error(
+          `expected ${f.expect}, got ${v.verdict}. reason: ${v.reason ?? '(none)'}\ncmd: ${f.cmd}`,
+        );
+      }
+      expect(v.verdict).toBe('allow');
+    });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────
+//  KNOWN GAP (adversarial-test P2 — pre-existing, NOT new to this feature)
+//
+//  The ln-source-alias protection above (helix-024 F3) recognizes only
+//  the `ln` command. Its SIBLINGS that also create a hard link are NOT
+//  recognized by the walker, so an alias to a protected SOURCE is created
+//  silently, and a later write through the (path-invisible, non-inode-
+//  aware) alias reaches the protected file:
+//
+//     cp -l   ~/.rea/cli/.../loader.js  ./a.js   → ALLOW  (should block)
+//     cp --link ~/.rea/trusted-projects ./alias  → ALLOW  (should block)
+//     cp -al  ~/.rea/cli                ./dir    → ALLOW  (should block)
+//     link    ~/.rea/trusted-projects   ./alias  → ALLOW  (should block)
+//
+//  This is EQUALLY true for the in-project kill-switch paths
+//  (`cp -l .rea/policy.yaml ./a` / `link .rea/HALT ./a` also ALLOW), so
+//  the `~/.rea` root is exactly as strong as the in-project tier — it
+//  does NOT violate the "no weaker than the in-project tier" bar. The fix
+//  is a WALKER change (teach it that `cp -l|--link|-al|-r -l` and the
+//  `link` command are alias-creators whose SOURCE must be checked against
+//  the protected set, mirroring `ln`). Because the runtime nlink guard
+//  only covers index.js + package.json + the registry — NOT sibling dist
+//  modules like loader.js — a hardlink to a non-index dist file reaches
+//  an UNCHECKED file at exec time. Tracked as a follow-up; not pinned as
+//  a failing test so CI stays green. See the sweep report for the repro.
+// ─────────────────────────────────────────────────────────────────────
 
 // ─────────────────────────────────────────────────────────────────────
 //  Fuzz / property layer — generated fixtures

@@ -32,6 +32,20 @@ import {
 } from './install/prepare-commit-msg.js';
 import { validateSettings } from '../config/settings-schema.js';
 import { checkSelfPinDeclaredSync, REA_PACKAGE_NAME, stripUtf8Bom } from './install/self-pin.js';
+import {
+  checkGlobalCandidateSafety,
+  checkReaDirSafety,
+  checkRegistrySafety,
+  globalRoot,
+  isProjectTrusted,
+  passwdHome,
+  probeGlobalCliCapability,
+  reaDir as globalReaDir,
+  registryPath as globalRegistryPath,
+  resolveGlobalCli,
+  type GlobalCandidateFail,
+  type SafetyFail,
+} from './global-cli.js';
 import { POLICY_FILE, REA_DIR, REGISTRY_FILE, getPkgVersion, log, reaPath } from './utils.js';
 
 export interface CheckResult {
@@ -2615,6 +2629,456 @@ export async function checkDelegationRoundTrip(baseDir: string): Promise<CheckRe
   };
 }
 
+// ---------------------------------------------------------------------------
+// 0.50.0 Phase 3b — global rea CLI resolution section.
+//
+// The opt-in GLOBAL CLI tier (Phase 1b/2b) resolves a per-user `rea` from
+// `<passwd-home>/.rea/cli`, gated by a per-user trust registry
+// (`<passwd-home>/.rea/trusted-projects`) and an optional in-project
+// `runtime.allow_global_cli: false` veto. `rea doctor` surfaces which tier a
+// checkout would actually run through — and refuses (exit 1) when the global
+// root is present but unsafe.
+//
+// F1 SINGLE PREDICATE: this section consumes `global-cli.ts` (the TS mirror of
+// the bash shim's resolver) and NEVER reimplements resolution. `resolveGlobalCliTier`
+// is the one function; both the row renderer below AND the doctor↔shim parity
+// test read from it, so `rea doctor` can never claim a tier the shim wouldn't.
+// The reason codes map 1:1 onto the authoritative Phase-3b decision tree.
+// ---------------------------------------------------------------------------
+
+/**
+ * The tier a checkout resolves to under the global-CLI feature, plus the
+ * reason (which drives the doctor rows) and the resolved realpaths. Mirrors
+ * `shim_run`'s tier resolution in `hooks/_lib/shim-runtime.sh` (steps 4 /
+ * 4-global / 4-global-veto) exactly, so a parity test can bind the two.
+ */
+export interface GlobalCliTier {
+  /** The tier the bash shim would resolve to for this checkout. */
+  tier: 'in-project' | 'global';
+  reason:
+    | 'global-unavailable-platform' // no process.geteuid (Windows/Git Bash) — tier is POSIX-only
+    | 'global-root-absent' // <home>/.rea/cli missing — feature unused
+    | 'global-root-unsafe' // <home>/.rea failed the A5.3a safety gate — shim degrades to no-CLI
+    | 'global-registry-unsafe' // <home>/.rea/trusted-projects failed the A5.3b gate
+    | 'global-unresolvable' // root present but no dist/cli/index.js under it
+    | 'in-project-wins' // an in-project CLI resolved — global present but unused
+    | 'untrusted' // checkout not in the trust registry — shim fails closed to project
+    | 'global-candidate-unsafe' // candidate present but fails the A1–A4 sandbox
+    | 'global-cli-incapable' // candidate sandbox-clean but predates `hook policy-get`
+    | 'policy-veto' // runtime.allow_global_cli: false — the repo refuses the tier
+    | 'trusted'; // checkout trusted — the global CLI is the active tier
+  /** realpath of the CLI the shim would actually run, or null when no CLI resolves. */
+  cliRealpath: string | null;
+  /** realpath of the global candidate (existence probe) when the root resolved one. */
+  globalCliRealpath: string | null;
+  /** Populated for `global-root-unsafe` (the .rea dir) or `global-registry-unsafe` (the registry file). */
+  safety?: SafetyFail;
+  /** Populated only for `global-candidate-unsafe`. */
+  candidateSafety?: GlobalCandidateFail;
+}
+
+/** realpath a path, returning null on any failure (missing / ENOENT / loop). */
+function realpathOrNull(p: string | null): string | null {
+  if (p === null) return null;
+  try {
+    return fs.realpathSync(p);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Is the global tier vetoed by this repo's policy? Mirrors `shim_run`'s
+ * step 4-global-veto, which shells `rea hook policy-get runtime.allow_global_cli`:
+ *   - explicit `runtime.allow_global_cli: false`      → veto
+ *   - `true` / no `runtime:` block / EMPTY output      → allow
+ *   - a MISSING `.rea/policy.yaml`                      → allow (policy-get exits
+ *     0 with empty output for an absent file — the tier is ALLOWED)
+ *   - a PRESENT but malformed/unreadable policy         → veto (policy-get exits
+ *     non-zero → the shim's fail-closed branch refuses the tier)
+ *
+ * The missing-vs-malformed distinction is load-bearing: turning file-absent into
+ * a veto (the old behavior) misreported a trusted checkout with no policy.yaml as
+ * `policy-veto` while the shim actually runs the global CLI.
+ */
+function globalTierVetoed(baseDir: string): boolean {
+  const policyPath = reaPath(baseDir, POLICY_FILE);
+  // Absent policy ⇒ allow (parity with `policy-get` exit 0 + empty output).
+  if (!fs.existsSync(policyPath)) return false;
+  try {
+    return loadPolicy(baseDir).runtime?.allow_global_cli === false;
+  } catch {
+    // Present but malformed/unreadable ⇒ fail-closed veto (parity with the
+    // shim's non-zero `policy-get` branch).
+    return true;
+  }
+}
+
+/**
+ * THE single predicate (F1). Resolve which tier a checkout runs through and
+ * why, consuming `global-cli.ts`. Follows the authoritative Phase-3b decision
+ * tree top-to-bottom; each branch corresponds to a `shim_run` outcome so the
+ * parity test can assert byte-agreement on `tier` + `cliRealpath`.
+ *
+ * `home` defaults to the passwd-derived home (env-immune by design); tests
+ * inject a temp home to stay hermetic. `probeCapability` defaults to the shared
+ * `probeGlobalCliCapability` (spawns the real CLI); tests inject a fake to stay
+ * hermetic. NO CLI flag exposes either parameter.
+ */
+export function resolveGlobalCliTier(
+  baseDir: string,
+  home: string = passwdHome(),
+  probeCapability: (cliPath: string) => { ok: boolean } = probeGlobalCliCapability,
+): GlobalCliTier {
+  const inProjectReal = realpathOrNull(resolveCliDistPath(baseDir));
+
+  // In-project ALWAYS wins (shim step 4). The bash shim NEVER consults
+  // <home>/.rea when an in-project @bookedsolid/rea resolves — so we MUST
+  // short-circuit BEFORE any global-root safety / resolvability / candidate
+  // check. Otherwise a repo that vendors rea locally, whose user also has a
+  // stale or permission-damaged ~/.rea/cli, would get a FALSE [fail] from
+  // `rea doctor` even though the hooks happily run the in-project CLI. A
+  // broken or unused global tree must never produce a warn/fail here.
+  if (inProjectReal !== null) {
+    // Note the global root's mere existence (a benign [info]) but do NOT probe
+    // or sandbox it — it is unused, and the shim would never touch it.
+    const reason = fs.existsSync(globalRoot(home)) ? 'in-project-wins' : 'global-root-absent';
+    return { tier: 'in-project', reason, cliRealpath: inProjectReal, globalCliRealpath: null };
+  }
+
+  // Platform guard (before ANY global work). The global tier is POSIX-ONLY (v1):
+  // the bash `shim_global_entry_gate` calls `process.geteuid()`, which is
+  // undefined on Windows / Git Bash, so it falls back to `unavailable` and the
+  // tier NEVER resolves there. Mirror that gate EXACTLY (`geteuid` presence, not
+  // `platform === 'win32'`) so doctor never claims a global tier the hooks can't
+  // resolve. In-project resolution above is unaffected; this is NOT a fail —
+  // the feature simply isn't available on this platform.
+  if (typeof process.geteuid !== 'function') {
+    return {
+      tier: 'in-project',
+      reason: 'global-unavailable-platform',
+      cliRealpath: null,
+      globalCliRealpath: null,
+    };
+  }
+
+  // No in-project CLI — the global tier now governs.
+  // Global root absent → feature unused; the (empty) in-project resolver governs.
+  if (!fs.existsSync(globalRoot(home))) {
+    return {
+      tier: 'in-project',
+      reason: 'global-root-absent',
+      cliRealpath: null,
+      globalCliRealpath: null,
+    };
+  }
+
+  // <home>/.rea safety gate (shim A5.3a). Unsafe → shim degrades to no-CLI;
+  // doctor hard-fails.
+  const safety = checkReaDirSafety(home);
+  if (!safety.ok) {
+    return {
+      tier: 'in-project',
+      reason: 'global-root-unsafe',
+      cliRealpath: null,
+      globalCliRealpath: null,
+      safety,
+    };
+  }
+
+  // <home>/.rea/trusted-projects safety gate (shim A5.3b) — checked BEFORE
+  // membership, exactly as the shim's entry gate does. A symlinked / hardlinked
+  // / group-or-other-accessible (non-0600) registry makes the shim REFUSE the
+  // global CLI entirely (silent no-CLI fallback); doctor must NOT then report
+  // `trusted`/`global` — it would send the operator to the wrong remediation.
+  // An ABSENT registry is safe here (`ok:true, absent:true`) — it just means
+  // nothing is trusted yet, which the membership check below reports as
+  // `untrusted`.
+  const registrySafety = checkRegistrySafety(home);
+  if (!registrySafety.ok) {
+    return {
+      tier: 'in-project',
+      reason: 'global-registry-unsafe',
+      cliRealpath: null,
+      globalCliRealpath: null,
+      safety: registrySafety,
+    };
+  }
+
+  // Root present but no resolvable CLI under it (blessed-but-not-installed).
+  const globalCli = resolveGlobalCli(home);
+  if (globalCli === null) {
+    return {
+      tier: 'in-project',
+      reason: 'global-unresolvable',
+      cliRealpath: null,
+      globalCliRealpath: null,
+    };
+  }
+  const globalReal = realpathOrNull(globalCli);
+
+  // The remaining branches mirror the shim's GLOBAL path when the in-project
+  // resolver missed. The shim evaluates them in this order:
+  //   entry gate (registry membership) -> A1–A4 candidate sandbox -> veto.
+  // Reproduce that order so the tier verdict matches for every scenario.
+
+  // Trust-registry membership (shim A5.5) keyed on realpath(cwd). An untrusted
+  // checkout fails the entry gate BEFORE the candidate is ever sandboxed.
+  const cwdReal = realpathOrNull(baseDir);
+  if (cwdReal === null || !isProjectTrusted(cwdReal, home)) {
+    return {
+      tier: 'in-project',
+      reason: 'untrusted',
+      cliRealpath: null,
+      globalCliRealpath: globalReal,
+    };
+  }
+
+  // A1–A4 candidate sandbox (shim `shim_sandbox_check_global`). A
+  // blessed-but-hostile tree (symlinked index.js, foreign owner, wrong pkg
+  // name, …) makes the shim fall back to no-CLI — so doctor must NOT claim
+  // global. Reported as a fail row (a hostile global tree is worth surfacing).
+  const candSafety = checkGlobalCandidateSafety(globalCli, globalRoot(home), home);
+  if (!candSafety.ok) {
+    return {
+      tier: 'in-project',
+      reason: 'global-candidate-unsafe',
+      cliRealpath: null,
+      globalCliRealpath: globalReal,
+      candidateSafety: candSafety,
+    };
+  }
+
+  // Capability floor (shim step 4-global-veto read). The shim's veto step runs
+  // `<global CLI> hook policy-get runtime.allow_global_cli`; a CLI that predates
+  // that subcommand (older/manually-seeded ~/.rea/cli that still passes A1–A4)
+  // exits non-zero → the shim FAIL-CLOSES to no-CLI. Doctor must NOT then claim
+  // `global`. Probe `hook policy-get --help` on the sandbox-validated realpath;
+  // a failing probe reports NOT-global so operators get the right remediation
+  // (re-run `rea install --global`), not a false "global active".
+  if (!probeCapability(candSafety.realpath).ok) {
+    return {
+      tier: 'in-project',
+      reason: 'global-cli-incapable',
+      cliRealpath: null,
+      globalCliRealpath: globalReal,
+    };
+  }
+
+  // Project veto over the global tier (shim step 4-global-veto), read only
+  // AFTER the sandbox confirmed the candidate — exactly the shim's ordering.
+  if (globalTierVetoed(baseDir)) {
+    return {
+      tier: 'in-project',
+      reason: 'policy-veto',
+      cliRealpath: null,
+      globalCliRealpath: globalReal,
+    };
+  }
+
+  // Trusted + sandbox-clean + not vetoed → the global CLI is the active tier.
+  // Prefer the sandbox-validated realpath (identical to `globalReal` for a
+  // non-symlinked tree, but it is the exact path the shim would execute).
+  return {
+    tier: 'global',
+    reason: 'trusted',
+    cliRealpath: candSafety.realpath,
+    globalCliRealpath: globalReal,
+  };
+}
+
+/**
+ * Read the global CLI's declared version from the package.json that sits
+ * beside whichever install shape `resolveGlobalCli` matched. Best-effort;
+ * returns null when neither shape carries a readable version.
+ */
+function readGlobalCliVersion(home: string): string | null {
+  const root = globalRoot(home);
+  const candidates = [
+    path.join(root, 'node_modules', '@bookedsolid', 'rea', 'package.json'),
+    path.join(root, 'package.json'),
+  ];
+  for (const p of candidates) {
+    const v = readPackageVersion(p);
+    if (v !== null) return v;
+  }
+  return null;
+}
+
+/**
+ * Render the global rea CLI section as flat `CheckResult` rows. Off-by-default
+ * quiet: when the global root does NOT exist, emits exactly ONE `info` row.
+ * When it exists, walks the authoritative decision tree via
+ * `resolveGlobalCliTier` and always names the RESOLVED REALPATH (helix-013.1
+ * lesson). A `global-root-unsafe` / `global-unresolvable` verdict yields a
+ * `fail` row so `rea doctor` exits 1.
+ *
+ * The registry named in these rows is the per-user GLOBAL-CLI TRUST REGISTRY
+ * (`<home>/.rea/trusted-projects`), NOT `.rea/registry.yaml` (the MCP
+ * fingerprint store).
+ */
+export function checkGlobalCli(
+  baseDir: string,
+  homeArg?: string,
+  probeCapability: (cliPath: string) => { ok: boolean } = probeGlobalCliCapability,
+): CheckResult[] {
+  // P2-2: the passwd lookup throws on an arbitrary/unmapped UID (containers,
+  // CI, `nobody`). The feature is off-by-default quiet — a passwd failure must
+  // degrade to ONE info row, NEVER abort `rea doctor` before any row renders.
+  let home: string;
+  if (homeArg !== undefined) {
+    home = homeArg;
+  } else {
+    try {
+      home = passwdHome();
+    } catch {
+      return [
+        {
+          label: 'global rea CLI',
+          status: 'info',
+          detail: 'unavailable — could not resolve home directory from the password database',
+        },
+      ];
+    }
+  }
+
+  const dir = globalReaDir(home);
+  const reg = globalRegistryPath(home);
+  const root = globalRoot(home);
+
+  if (!fs.existsSync(root)) {
+    return [
+      {
+        label: 'global rea CLI',
+        status: 'info',
+        detail: 'not installed — in-project resolution active; see `rea install --global`',
+      },
+    ];
+  }
+
+  const tier = resolveGlobalCliTier(baseDir, home, probeCapability);
+
+  // POSIX-only tier on a platform without geteuid (Windows/Git Bash). A single
+  // benign info row — never a fail/warn (the feature is simply unavailable, and
+  // in-project resolution still governs).
+  if (tier.reason === 'global-unavailable-platform') {
+    return [
+      {
+        label: 'global rea CLI',
+        status: 'info',
+        detail: 'POSIX-only; not available on this platform',
+      },
+    ];
+  }
+
+  if (tier.reason === 'global-root-unsafe') {
+    const s = tier.safety as SafetyFail;
+    return [
+      {
+        label: 'global rea CLI root safety',
+        status: 'fail',
+        detail: `${s.reason} — fix: \`${s.remediation}\``,
+      },
+    ];
+  }
+
+  if (tier.reason === 'global-registry-unsafe') {
+    const s = tier.safety as SafetyFail;
+    return [
+      {
+        label: 'global-CLI trust registry safety',
+        status: 'fail',
+        detail: `${s.reason} — the shim refuses the global CLI while the trust registry is tampered; fix: \`${s.remediation}\``,
+      },
+    ];
+  }
+
+  if (tier.reason === 'global-unresolvable') {
+    return [
+      {
+        label: 'global rea CLI',
+        status: 'fail',
+        detail: `${root} present but no resolvable CLI (expected dist/cli/index.js) — re-run \`rea install --global\``,
+      },
+    ];
+  }
+
+  if (tier.reason === 'global-candidate-unsafe') {
+    const c = tier.candidateSafety as GlobalCandidateFail;
+    return [
+      {
+        label: 'global rea CLI candidate safety',
+        status: 'fail',
+        detail: `blessed global CLI tree fails the sandbox (${c.code}): ${c.reason} — the shim refuses it; re-run \`rea install --global\` to reinstall a clean tree`,
+      },
+    ];
+  }
+
+  if (tier.reason === 'global-cli-incapable') {
+    return [
+      {
+        label: 'global rea CLI capability',
+        status: 'fail',
+        detail: `resolved global CLI at ${tier.globalCliRealpath} does not implement \`rea hook policy-get\` (needs ~0.26.0+) — the shim falls back to no-CLI at the veto step; re-run \`rea install --global\` to reinstall a current CLI`,
+      },
+    ];
+  }
+
+  // In-project wins: an in-project CLI resolved, so the shim never consults the
+  // global tree. Emit exactly ONE benign info row — NEVER a warn/fail for the
+  // unused global tree (it may legitimately be broken/stale and it does not
+  // matter here). We deliberately do NOT read the global version or sandbox it.
+  if (tier.reason === 'in-project-wins') {
+    return [
+      {
+        label: 'global rea CLI',
+        status: 'info',
+        detail: `present at ${root} but unused — this checkout resolves the in-project CLI (${tier.cliRealpath})`,
+      },
+    ];
+  }
+
+  const version = readGlobalCliVersion(home);
+  const rows: CheckResult[] = [
+    {
+      label: 'global rea CLI installed',
+      status: 'pass',
+      detail: `${version !== null ? `v${version} ` : ''}at ${tier.globalCliRealpath}`,
+    },
+  ];
+
+  switch (tier.reason) {
+    case 'policy-veto':
+      rows.push({
+        label: 'global rea CLI active tier',
+        status: 'info',
+        detail:
+          'policy.runtime.allow_global_cli: false — global tier vetoed by this repo; in-project required',
+      });
+      break;
+    case 'trusted':
+      rows.push({
+        label: 'global rea CLI active tier',
+        status: 'pass',
+        detail: `global — this checkout is trusted (in the global-CLI trust registry ${reg}); hooks run ${tier.cliRealpath}`,
+      });
+      rows.push({
+        label: 'global rea CLI residual risk',
+        status: 'info',
+        detail: `integrity relies on filesystem ownership of ${dir}; prefer in-project install for shared or CI checkouts`,
+      });
+      break;
+    case 'untrusted':
+      rows.push({
+        label: 'global rea CLI active tier',
+        status: 'warn',
+        detail: `this checkout is NOT in the global-CLI trust registry ${reg} — hooks FAIL-CLOSED here until you trust it; run: rea trust`,
+      });
+      break;
+  }
+  return rows;
+}
+
 /**
  * Assemble the full checklist for a given baseDir. Exported so tests can
  * exercise the conditional branching without capturing stdout from
@@ -2634,7 +3098,7 @@ export function collectChecks(
   baseDir: string,
   codexProbeState?: CodexProbeState,
   prePushState?: PrePushDoctorState,
-  options: { strict?: boolean } = {},
+  options: { strict?: boolean; globalHome?: string } = {},
 ): CheckResult[] {
   const policyPath = reaPath(baseDir, POLICY_FILE);
   const registryPath = reaPath(baseDir, REGISTRY_FILE);
@@ -2742,6 +3206,14 @@ export function collectChecks(
       detail: 'disabled via policy.review.codex_required — skipping Codex-related checks',
     });
   }
+
+  // 0.50.0 Phase 3b — global rea CLI resolution section. Off-by-default quiet:
+  // one `info` row when the global root is absent (the common case). When the
+  // root exists, the section names the active tier + resolved realpath and
+  // hard-fails on an unsafe/unresolvable global root. `globalHome` is the
+  // injectable passwd-home seam for hermetic tests; production passes nothing
+  // and the check reads the env-immune passwd home.
+  checks.push(...checkGlobalCli(baseDir, options.globalHome));
 
   return checks;
 }

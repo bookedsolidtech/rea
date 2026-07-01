@@ -93,6 +93,30 @@ export interface ProtectedScanContext {
    * pollute stdout.
    */
   stderr?: (line: string) => void;
+  /**
+   * The passwd-derived absolute home directory
+   * (`os.userInfo().homedir` — libuv `getpwuid_r`, NOT `$HOME` /
+   * `$XDG_*`). When set, `<passwdHome>/.rea` becomes a FIRST-CLASS
+   * absolute protected root: any write whose resolved target (or
+   * resolved parent + basename, for create-paths) lands anywhere under
+   * it is REFUSED. This protects the safe-global-CLI trust root
+   * (`~/.rea/cli`, `~/.rea/trusted-projects`) the shim-runtime derives
+   * the same way (`shim_global_entry_gate` → `os.userInfo().homedir`).
+   *
+   * Passwd-derived ONLY — never `$HOME` / `$XDG_*`: an agent can set
+   * those in-process, so an env-derived root is exactly the redirect
+   * surface this gate closes. A trust root an agent can move is not a
+   * trust root (same rule as the shim).
+   *
+   * When UNDEFINED the global-root gate is disabled entirely (the
+   * scanner behaves byte-identically to the pre-feature build — the
+   * legacy `~/`-is-dynamic fail-closed posture is preserved). The two
+   * production callers (`rea hook scan-bash`, `protected-paths-bash-
+   * gate`) populate it from `os.userInfo().homedir`; a passwd lookup
+   * failure leaves it undefined (feature-absent parity, mirroring the
+   * shim's silent "unavailable").
+   */
+  passwdHome?: string;
 }
 
 interface EffectivePatterns {
@@ -303,8 +327,14 @@ function checkPathProtected(
 interface NormalizedTarget {
   /** The lowercase project-relative path, OR a sentinel string. */
   pathLc: string;
-  /** True if the path is a recognized sentinel (outside root, expansion). */
-  sentinel: 'outside_root' | 'expansion' | null;
+  /**
+   * True if the path is a recognized sentinel:
+   *   - `outside_root` — `..`-escape resolved outside REA_ROOT.
+   *   - `expansion` — unresolved $-substitution / command-substitution.
+   *   - `global_root` — resolved target (or symlink-resolved parent)
+   *     lands under the passwd-derived `<passwdHome>/.rea` root. Block.
+   */
+  sentinel: 'outside_root' | 'expansion' | 'global_root' | null;
   /** The original token, for error messages. */
   original: string;
   /** The fully-resolved (symlink-walked) project-relative path, when different. */
@@ -321,7 +351,12 @@ interface NormalizedTarget {
  * blocks on either match. Either may be a sentinel string for
  * outside-root / expansion-uncertainty.
  */
-function normalizeTarget(reaRoot: string, raw: string, form?: DetectedForm): NormalizedTarget {
+function normalizeTarget(
+  reaRoot: string,
+  raw: string,
+  form?: DetectedForm,
+  passwdHome?: string,
+): NormalizedTarget {
   // 1. Strip surrounding matching quotes (the parser already strips
   //    them for SglQuoted/DblQuoted, but a literal node can still hold
   //    `'.rea/HALT'` in pathological cases). Defensive.
@@ -387,11 +422,45 @@ function normalizeTarget(reaRoot: string, raw: string, form?: DetectedForm): Nor
     };
   }
 
-  // 2c. Codex round 1 F-24: `~/` or bare `~` expands to $HOME at
-  //     runtime, which may equal reaRoot (any project rooted at the
-  //     user's home dir). Treat as dynamic to be safe — refuse on
-  //     uncertainty rather than guess at HOME.
-  if (t === '~' || t.startsWith('~/') || t.startsWith('~')) {
+  // 2c. Tilde handling. `~` and `~/…` bash-expand to the home dir at
+  //     runtime. Two postures:
+  //
+  //     - passwdHome AVAILABLE (safe-global-CLI gate active): resolve
+  //       `~`/`~/…` against the PASSWD-derived home so the downstream
+  //       global-root + project-relative checks see a concrete absolute
+  //       path. This is what lets `~/.rea/x` REFUSE (lands under the
+  //       protected `<passwdHome>/.rea` root) while `~/.reafoo` /
+  //       `~/.rea-backup` ALLOW (siblings — boundary-anchored, NOT under
+  //       the root). We resolve against passwd-home, never `$HOME`: the
+  //       goal is to refuse writes that WOULD land in the passwd-derived
+  //       `~/.rea` (the common case where `$HOME` == passwd-home); if an
+  //       agent moved `$HOME`, its `~/.rea/x` cannot reach the real root
+  //       anyway, so approximating with passwd-home is the safe
+  //       direction.
+  //
+  //     - passwdHome UNDEFINED (feature-absent parity): keep the
+  //       original Codex round 1 F-24 fail-closed posture — `~` may
+  //       equal reaRoot (project rooted at home), so refuse on
+  //       uncertainty.
+  //
+  //     `~user`, `~+`, `~-` and other tilde-prefix forms are NEVER
+  //     statically resolvable (a foreign user's home / `$PWD` / `$OLDPWD`)
+  //     → always fail-closed, regardless of passwdHome.
+  if (t === '~' || t.startsWith('~/')) {
+    if (passwdHome !== undefined && passwdHome.startsWith('/')) {
+      // Drop the leading `~`, keep the `/tail` (empty for bare `~`).
+      t = t === '~' ? passwdHome : passwdHome + t.slice(1);
+      // Fall through to normalization with the resolved absolute path.
+    } else {
+      return {
+        pathLc: '__rea_unresolved_expansion__',
+        sentinel: 'expansion',
+        original: raw,
+        resolvedLc: null,
+      };
+    }
+  } else if (t.startsWith('~')) {
+    // ~user / ~+ / ~- — not statically resolvable → refuse on uncertainty.
     return {
       pathLc: '__rea_unresolved_expansion__',
       sentinel: 'expansion',
@@ -420,6 +489,33 @@ function normalizeTarget(reaRoot: string, raw: string, form?: DetectedForm): Nor
   }
   const hadDotDot = normalized.includes('..');
   const collapsed = collapseDotDot(abs);
+
+  // 4b. Passwd-derived `<passwdHome>/.rea` global-root gate. This runs
+  //     BEFORE the isInsideRoot early-returns because the absolute
+  //     `~/.rea` root is (in the common case) OUTSIDE the project root —
+  //     without this, an absolute write like
+  //     `/Users/me/.rea/trusted-projects` falls through to the
+  //     `__outside_root_allowed` branch and is ALLOWED. This is NOT a
+  //     naive `realpath(target)` prefix check: it reuses the same
+  //     lexical `collapsed` form (handles non-existent create-path
+  //     leaves + `..`-normalization with no FS access) plus the
+  //     symlink-walk-to-nearest-existing-ancestor resolver (handles a
+  //     symlinked parent / symlinked home) — the identical machinery the
+  //     project-relative path logic below uses. Bare cwd-relative writes
+  //     (`cd ~/.rea && > trusted-projects`) are covered upstream by the
+  //     walker's cwd model, which flags the `cd` target (a
+  //     `cwd_protected_unresolvable` detection carrying `~/.rea`) and
+  //     routes it through THIS function.
+  if (passwdHome !== undefined && passwdHome.startsWith('/')) {
+    if (targetHitsGlobalReaRoot(collapsed, passwdHome)) {
+      return {
+        pathLc: '__rea_global_root__',
+        sentinel: 'global_root',
+        original: raw,
+        resolvedLc: null,
+      };
+    }
+  }
 
   // 5. Outside-root sentinel — fires ONLY for paths that contained
   //    `..` segments and resolved outside REA_ROOT (helix-022 #1
@@ -542,6 +638,66 @@ function realpathSafe(p: string): string | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * Case-insensitive "is `p` inside directory `dir` (or equal to it)".
+ * Both are absolute lexical paths without trailing slashes. The `+ '/'`
+ * boundary anchor is load-bearing: it keeps `<home>/.rea-backup` and
+ * `<home>/.reafoo` OUT of the `<home>/.rea` root (siblings, not
+ * descendants). Case-insensitive to match the project-relative matcher
+ * (macOS APFS default is case-insensitive — helix-015 #2), so `~/.REA`
+ * is caught too.
+ */
+function isUnderDirCI(p: string, dir: string): boolean {
+  const pl = p.toLowerCase();
+  const dl = dir.toLowerCase();
+  return pl === dl || pl.startsWith(dl + '/');
+}
+
+/**
+ * True when the resolved write target lands under the passwd-derived
+ * `<passwdHome>/.rea` root. Checks TWO forms, mirroring the
+ * project-relative logic:
+ *
+ *   1. Lexical `collapsed` (from `collapseDotDot`, no FS access) against
+ *      the lexical `<passwdHome>/.rea`. This is what catches non-existent
+ *      create-path leaves (`> ~/.rea/new-registry`) and `..`-normalized
+ *      escapes — `realpath(target)` would ENOENT-fail on those, which is
+ *      exactly the naive-approach failure codex flagged (P1-4).
+ *
+ *   2. The symlink-resolved form (walk to the nearest existing ancestor,
+ *      realpath it, re-attach the unresolved tail) against
+ *      `realpath(<passwdHome>/.rea)`. This catches a symlinked parent
+ *      (an in-project symlink whose target is under `~/.rea`) or a
+ *      symlinked home dir (`/Users` ↔ firmlink, `/home` ↔ symlink).
+ *
+ * The `<passwdHome>/.rea` root need NOT exist on disk — the whole point
+ * is to refuse an agent CREATING it (seeding a fake `trusted-projects`
+ * registry), so form (1) fires regardless of existence.
+ */
+function targetHitsGlobalReaRoot(collapsed: string, passwdHome: string): boolean {
+  // Lexical global root, e.g. `/Users/me/.rea`. `path.join` normalizes a
+  // trailing slash on passwdHome; collapseDotDot strips any `..` in it.
+  const globalRoot = collapseDotDot(path.join(passwdHome, '.rea'));
+  // Form 1: lexical (create-path + `..`-safe, no FS).
+  if (isUnderDirCI(collapsed, globalRoot)) return true;
+  // Form 2: symlink-resolved parent. Best-effort — a dynamic sentinel
+  // (symlink cycle / depth cap) is left to the caller's step-6 handling.
+  let resolved: string | null | SymlinkDynamic = null;
+  try {
+    resolved = resolveSymlinksWalkUp(collapsed);
+  } catch {
+    resolved = null;
+  }
+  if (typeof resolved === 'string') {
+    const realGlobalRoot = realpathSafe(globalRoot) ?? globalRoot;
+    if (isUnderDirCI(resolved, realGlobalRoot)) return true;
+    // Defensive: when `<passwdHome>/.rea` does not exist, realpathSafe
+    // returns the lexical form — still compare against it directly.
+    if (isUnderDirCI(resolved, globalRoot)) return true;
+  }
+  return false;
 }
 
 /**
@@ -869,7 +1025,28 @@ export function scanForProtectedViolations(
     }
     if (d.path.length === 0) continue;
 
-    const norm = normalizeTarget(ctx.reaRoot, d.path, d.form);
+    const norm = normalizeTarget(ctx.reaRoot, d.path, d.form, ctx.passwdHome);
+    if (norm.sentinel === 'global_root') {
+      return blockVerdict({
+        reason: [
+          'PROTECTED PATH (bash): write to the per-user rea trust root (~/.rea) blocked.',
+          '',
+          `  Resolved under:  ${ctx.passwdHome ?? '~'}/.rea`,
+          `  Original token:  ${norm.original}`,
+          `  Detected as:     ${d.form}`,
+          '',
+          '  Rule: the passwd-derived ~/.rea tree (the safe-global-CLI trust root —',
+          "        ~/.rea/cli and ~/.rea/trusted-projects) is unreachable via agent",
+          '        writes, including create-paths, cwd-relative writes after `cd ~/.rea`,',
+          '        mv/cp/install destinations, and symlinked parents. A human must edit',
+          '        it directly. This root is derived from the password database, never',
+          '        $HOME/$XDG_* — an agent-movable root would defeat the protection.',
+        ].join('\n'),
+        hitPattern: '(~/.rea global trust root)',
+        detectedForm: d.form,
+        ...(d.position.line > 0 ? { sourcePosition: d.position } : {}),
+      });
+    }
     if (norm.sentinel === 'expansion') {
       return blockVerdict({
         reason: [

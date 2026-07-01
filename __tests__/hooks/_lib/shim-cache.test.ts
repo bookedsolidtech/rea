@@ -621,7 +621,8 @@ describe('shim-cache.sh — shim_cache_key determinism', () => {
     if (!bashExists()) return;
     const tmp = makeTmpdir();
     try {
-      const args = '"v1" "tok" "/proj" "/cli" "1000" "10" "501" "1" "test-shim" "100" "1000" "200" "/usr/bin/node" "12345"';
+      // 0.49.0 Phase 1b: 17-arg v2 form (trust_tier + registry mtime/size).
+      const args = '"v2" "tok" "/proj" "/cli" "1000" "10" "501" "1" "test-shim" "100" "1000" "200" "/usr/bin/node" "12345" "project" "" ""';
       const r = runBash(
         `source "${SHIM_CACHE_LIB}"
          k1=$(shim_cache_key ${args})
@@ -644,37 +645,46 @@ describe('shim-cache.sh — shim_cache_key determinism', () => {
     if (!bashExists()) return;
     const tmp = makeTmpdir();
     try {
+      // 0.49.0 Phase 1b: 17-arg v2 base; new variants for trust_tier,
+      // registry_mtime, registry_size (positions 15-17). Every field must
+      // still discriminate.
       const r = runBash(
         `source "${SHIM_CACHE_LIB}"
-         k_base=$(shim_cache_key "v1" "tok" "/proj" "/cli" "1000" "10" "501" "1" "test-shim" "100" "1000" "200" "/usr/bin/node" "12345")
+         k_base=$(shim_cache_key "v2" "tok" "/proj" "/cli" "1000" "10" "501" "1" "test-shim" "100" "1000" "200" "/usr/bin/node" "12345" "project" "" "")
          # change schema
-         k_schema=$(shim_cache_key "v2" "tok" "/proj" "/cli" "1000" "10" "501" "1" "test-shim" "100" "1000" "200" "/usr/bin/node" "12345")
+         k_schema=$(shim_cache_key "v1" "tok" "/proj" "/cli" "1000" "10" "501" "1" "test-shim" "100" "1000" "200" "/usr/bin/node" "12345" "project" "" "")
          # change session
-         k_session=$(shim_cache_key "v1" "tok2" "/proj" "/cli" "1000" "10" "501" "1" "test-shim" "100" "1000" "200" "/usr/bin/node" "12345")
+         k_session=$(shim_cache_key "v2" "tok2" "/proj" "/cli" "1000" "10" "501" "1" "test-shim" "100" "1000" "200" "/usr/bin/node" "12345" "project" "" "")
          # change project
-         k_proj=$(shim_cache_key "v1" "tok" "/proj2" "/cli" "1000" "10" "501" "1" "test-shim" "100" "1000" "200" "/usr/bin/node" "12345")
+         k_proj=$(shim_cache_key "v2" "tok" "/proj2" "/cli" "1000" "10" "501" "1" "test-shim" "100" "1000" "200" "/usr/bin/node" "12345" "project" "" "")
          # change cli
-         k_cli=$(shim_cache_key "v1" "tok" "/proj" "/cli2" "1000" "10" "501" "1" "test-shim" "100" "1000" "200" "/usr/bin/node" "12345")
+         k_cli=$(shim_cache_key "v2" "tok" "/proj" "/cli2" "1000" "10" "501" "1" "test-shim" "100" "1000" "200" "/usr/bin/node" "12345" "project" "" "")
          # change mtime
-         k_mtime=$(shim_cache_key "v1" "tok" "/proj" "/cli" "1001" "10" "501" "1" "test-shim" "100" "1000" "200" "/usr/bin/node" "12345")
+         k_mtime=$(shim_cache_key "v2" "tok" "/proj" "/cli" "1001" "10" "501" "1" "test-shim" "100" "1000" "200" "/usr/bin/node" "12345" "project" "" "")
          # change size
-         k_size=$(shim_cache_key "v1" "tok" "/proj" "/cli" "1000" "11" "501" "1" "test-shim" "100" "1000" "200" "/usr/bin/node" "12345")
+         k_size=$(shim_cache_key "v2" "tok" "/proj" "/cli" "1000" "11" "501" "1" "test-shim" "100" "1000" "200" "/usr/bin/node" "12345" "project" "" "")
          # change euid
-         k_euid=$(shim_cache_key "v1" "tok" "/proj" "/cli" "1000" "10" "502" "1" "test-shim" "100" "1000" "200" "/usr/bin/node" "12345")
+         k_euid=$(shim_cache_key "v2" "tok" "/proj" "/cli" "1000" "10" "502" "1" "test-shim" "100" "1000" "200" "/usr/bin/node" "12345" "project" "" "")
          # change enforce shape
-         k_shape=$(shim_cache_key "v1" "tok" "/proj" "/cli" "1000" "10" "501" "0" "test-shim" "100" "1000" "200" "/usr/bin/node" "12345")
+         k_shape=$(shim_cache_key "v2" "tok" "/proj" "/cli" "1000" "10" "501" "0" "test-shim" "100" "1000" "200" "/usr/bin/node" "12345" "project" "" "")
          # change shim name (0.48.0 codex round-1 P1: hook-specific scope)
-         k_name=$(shim_cache_key "v1" "tok" "/proj" "/cli" "1000" "10" "501" "1" "other-shim" "100" "1000" "200" "/usr/bin/node" "12345")
+         k_name=$(shim_cache_key "v2" "tok" "/proj" "/cli" "1000" "10" "501" "1" "other-shim" "100" "1000" "200" "/usr/bin/node" "12345" "project" "" "")
          # change pkg mtime (0.48.0 codex round-3 P2)
-         k_pkgm=$(shim_cache_key "v1" "tok" "/proj" "/cli" "1000" "10" "501" "1" "test-shim" "101" "1000" "200" "/usr/bin/node" "12345")
+         k_pkgm=$(shim_cache_key "v2" "tok" "/proj" "/cli" "1000" "10" "501" "1" "test-shim" "101" "1000" "200" "/usr/bin/node" "12345" "project" "" "")
          # change pkg size (0.48.0 codex round-3 P2)
-         k_pkgs=$(shim_cache_key "v1" "tok" "/proj" "/cli" "1000" "10" "501" "1" "test-shim" "100" "1001" "200" "/usr/bin/node" "12345")
+         k_pkgs=$(shim_cache_key "v2" "tok" "/proj" "/cli" "1000" "10" "501" "1" "test-shim" "100" "1001" "200" "/usr/bin/node" "12345" "project" "" "")
          # change dist dir mtime (0.48.0 codex round-3 P1)
-         k_distm=$(shim_cache_key "v1" "tok" "/proj" "/cli" "1000" "10" "501" "1" "test-shim" "100" "1000" "201" "/usr/bin/node" "12345")
+         k_distm=$(shim_cache_key "v2" "tok" "/proj" "/cli" "1000" "10" "501" "1" "test-shim" "100" "1000" "201" "/usr/bin/node" "12345" "project" "" "")
          # change node realpath (0.48.0 codex round-4 P1)
-         k_node=$(shim_cache_key "v1" "tok" "/proj" "/cli" "1000" "10" "501" "1" "test-shim" "100" "1000" "200" "/opt/homebrew/bin/node" "12345")
+         k_node=$(shim_cache_key "v2" "tok" "/proj" "/cli" "1000" "10" "501" "1" "test-shim" "100" "1000" "200" "/opt/homebrew/bin/node" "12345" "project" "" "")
          # change node mtime (interpreter rebuild at same path)
-         k_nodem=$(shim_cache_key "v1" "tok" "/proj" "/cli" "1000" "10" "501" "1" "test-shim" "100" "1000" "200" "/usr/bin/node" "12346")
+         k_nodem=$(shim_cache_key "v2" "tok" "/proj" "/cli" "1000" "10" "501" "1" "test-shim" "100" "1000" "200" "/usr/bin/node" "12346" "project" "" "")
+         # change trust_tier (0.49.0 Phase 1b: cross-tier non-collision)
+         k_tier=$(shim_cache_key "v2" "tok" "/proj" "/cli" "1000" "10" "501" "1" "test-shim" "100" "1000" "200" "/usr/bin/node" "12345" "global" "" "")
+         # change registry_mtime (0.49.0 Phase 1b: untrust mid-session)
+         k_regm=$(shim_cache_key "v2" "tok" "/proj" "/cli" "1000" "10" "501" "1" "test-shim" "100" "1000" "200" "/usr/bin/node" "12345" "project" "1700000000.1" "")
+         # change registry_size (0.49.0 Phase 1b: untrust shrinks the file)
+         k_regs=$(shim_cache_key "v2" "tok" "/proj" "/cli" "1000" "10" "501" "1" "test-shim" "100" "1000" "200" "/usr/bin/node" "12345" "project" "" "256")
          echo "$k_base"
          echo "$k_schema"
          echo "$k_session"
@@ -689,12 +699,15 @@ describe('shim-cache.sh — shim_cache_key determinism', () => {
          echo "$k_pkgs"
          echo "$k_distm"
          echo "$k_node"
-         echo "$k_nodem"`,
+         echo "$k_nodem"
+         echo "$k_tier"
+         echo "$k_regm"
+         echo "$k_regs"`,
         { tmpdir: tmp },
       );
       expect(r.status).toBe(0);
       const keys = r.stdout.trim().split('\n');
-      expect(keys).toHaveLength(15);
+      expect(keys).toHaveLength(18);
       const baseKey = keys[0];
       // Every variant key must differ from the base.
       for (let i = 1; i < keys.length; i += 1) {
@@ -709,7 +722,7 @@ describe('shim-cache.sh — shim_cache_key determinism', () => {
     }
   });
 
-  it('returns exit 1 when called with fewer than 14 args', () => {
+  it('returns exit 1 when called with fewer than 17 args', () => {
     if (!bashExists()) return;
     const tmp = makeTmpdir();
     try {
@@ -721,6 +734,27 @@ describe('shim-cache.sh — shim_cache_key determinism', () => {
       );
       // Helper itself exits 1, captured via $?
       expect(r.stdout).toContain('ret=1');
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it('returns exit 1 for the legacy 14-arg shape (0.49.0 Phase 1b hard cutover)', () => {
+    // The guard rose from 14 to 17. A call in the old 14-arg shape (no
+    // trust_tier / registry mtime/size) no longer produces a key — it is a
+    // clean miss, the cutover boundary. The on-disk schema check is the
+    // other half (v1 entries fail schema_version === "v2").
+    if (!bashExists()) return;
+    const tmp = makeTmpdir();
+    try {
+      const r = runBash(
+        `source "${SHIM_CACHE_LIB}"
+         out=$(shim_cache_key "v1" "tok" "/proj" "/cli" "1000" "10" "501" "1" "test-shim" "100" "1000" "200" "/usr/bin/node" "12345")
+         echo "ret=$? out=[$out]"`,
+        { tmpdir: tmp },
+      );
+      expect(r.stdout).toContain('ret=1');
+      expect(r.stdout).toContain('out=[]');
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
     }
@@ -741,7 +775,7 @@ describe('shim-cache.sh — miss → write → hit round-trip', () => {
     const json = '{"schema_version":"v1","sandbox_ok":true,"shape_ok":true,"cached_at_unix":9999999999,"ttl_seconds":3600,"cli_realpath":"/x","cli_mtime":"1","cli_size_bytes":"1"}';
     const r = runBash(
       `source "${SHIM_CACHE_LIB}"
-       KEY=$(shim_cache_key "v1" "tok" "/proj" "/cli" "1000" "10" "501" "1" "test-shim" "100" "1000" "200" "/usr/bin/node" "12345")
+       KEY=$(shim_cache_key "v2" "tok" "/proj" "/cli" "1000" "10" "501" "1" "test-shim" "100" "1000" "200" "/usr/bin/node" "12345" "project" "" "")
        # Initial miss
        out=$(shim_cache_read "$KEY" 2>/dev/null || echo MISS)
        echo "first=$out"
@@ -763,7 +797,7 @@ describe('shim-cache.sh — miss → write → hit round-trip', () => {
     if (!bashExists()) return;
     const r = runBash(
       `source "${SHIM_CACHE_LIB}"
-       KEY=$(shim_cache_key "v1" "tok" "/proj" "/cli" "1000" "10" "501" "1" "test-shim" "100" "1000" "200" "/usr/bin/node" "12345")
+       KEY=$(shim_cache_key "v2" "tok" "/proj" "/cli" "1000" "10" "501" "1" "test-shim" "100" "1000" "200" "/usr/bin/node" "12345" "project" "" "")
        shim_cache_write "$KEY" '{"x":1}' > /dev/null 2>&1
        echo "ret=$?"`,
       { tmpdir: tmp },
@@ -781,7 +815,7 @@ describe('shim-cache.sh — miss → write → hit round-trip', () => {
     if (!bashExists()) return;
     const r = runBash(
       `source "${SHIM_CACHE_LIB}"
-       KEY=$(shim_cache_key "v1" "tok" "/proj" "/cli" "1000" "10" "501" "1" "test-shim" "100" "1000" "200" "/usr/bin/node" "12345")
+       KEY=$(shim_cache_key "v2" "tok" "/proj" "/cli" "1000" "10" "501" "1" "test-shim" "100" "1000" "200" "/usr/bin/node" "12345" "project" "" "")
        shim_cache_write "$KEY" '{"x":1}'
        echo "$KEY"`,
       { tmpdir: tmp },
@@ -809,7 +843,7 @@ describe('shim-cache.sh — corrupt entry fail-safe', () => {
     if (!bashExists()) return;
     const r = runBash(
       `source "${SHIM_CACHE_LIB}"
-       KEY=$(shim_cache_key "v1" "tok" "/proj" "/cli" "1000" "10" "501" "1" "test-shim" "100" "1000" "200" "/usr/bin/node" "12345")
+       KEY=$(shim_cache_key "v2" "tok" "/proj" "/cli" "1000" "10" "501" "1" "test-shim" "100" "1000" "200" "/usr/bin/node" "12345" "project" "" "")
        shim_cache_write "$KEY" '{"x":1}' >/dev/null 2>&1
        echo "$KEY"`,
       { tmpdir: tmp },
@@ -879,7 +913,7 @@ describe('shim-cache.sh — atomic write', () => {
       // write.
       runBash(
         `source "${SHIM_CACHE_LIB}"
-         KEY=$(shim_cache_key "v1" "tok" "/proj" "/cli" "1000" "10" "501" "1" "test-shim" "100" "1000" "200" "/usr/bin/node" "12345")
+         KEY=$(shim_cache_key "v2" "tok" "/proj" "/cli" "1000" "10" "501" "1" "test-shim" "100" "1000" "200" "/usr/bin/node" "12345" "project" "" "")
          shim_cache_write "$KEY" '{"ok":1}'`,
         { tmpdir: tmp },
       );
@@ -963,7 +997,7 @@ describe('shim-cache.sh — TTL behavior is enforced by the shim-runtime caller'
       const stale = '{"cached_at_unix":1,"ttl_seconds":1,"x":1}';
       const r = runBash(
         `source "${SHIM_CACHE_LIB}"
-         KEY=$(shim_cache_key "v1" "tok" "/proj" "/cli" "1000" "10" "501" "1" "test-shim" "100" "1000" "200" "/usr/bin/node" "12345")
+         KEY=$(shim_cache_key "v2" "tok" "/proj" "/cli" "1000" "10" "501" "1" "test-shim" "100" "1000" "200" "/usr/bin/node" "12345" "project" "" "")
          shim_cache_write "$KEY" '${stale}'
          out=$(shim_cache_read "$KEY")
          echo "out=$out"`,
@@ -971,6 +1005,131 @@ describe('shim-cache.sh — TTL behavior is enforced by the shim-runtime caller'
       );
       expect(r.status).toBe(0);
       expect(r.stdout).toContain('out=' + stale);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('shim-cache.sh — cache-key v2 byte-exact compat (0.49.0 Phase 1b)', () => {
+  // The fixture pins shim_cache_key output for a frozen input set. The key
+  // is sha256(NUL-join(args))[:32], so the pins are platform-stable. A
+  // change here means the key construction changed and MUST be a deliberate
+  // regen of __tests__/hooks/_lib/fixtures/cache-keys.json (every on-disk
+  // v2 entry silently invalidates — fine under tmpfs + TTL, but the pin
+  // forces intent).
+  interface Row {
+    label: string;
+    expect: 'key' | 'no-key';
+    args: string[];
+    key: string;
+  }
+  const fixture = JSON.parse(
+    fs.readFileSync(
+      path.join(REPO_ROOT, '__tests__', 'hooks', '_lib', 'fixtures', 'cache-keys.json'),
+      'utf8',
+    ),
+  ) as { rows: Row[] };
+
+  for (const row of fixture.rows) {
+    it(`byte-exact: ${row.label}`, () => {
+      if (!bashExists()) return;
+      const tmp = makeTmpdir();
+      try {
+        const quoted = row.args.map((a) => `"${a}"`).join(' ');
+        const r = runBash(
+          `source "${SHIM_CACHE_LIB}"
+           out=$(shim_cache_key ${quoted})
+           echo "ret=$? key=$out"`,
+          { tmpdir: tmp },
+        );
+        expect(r.status).toBe(0);
+        if (row.expect === 'key') {
+          expect(r.stdout).toContain(`ret=0 key=${row.key}`);
+        } else {
+          // no-key: the guard rejected the arg count.
+          expect(r.stdout).toContain('ret=1 key=');
+          expect(r.stdout).not.toMatch(/key=[0-9a-f]{32}/);
+        }
+      } finally {
+        fs.rmSync(tmp, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+describe('shim-cache.sh — cache-key v2 tier invariants (0.49.0 Phase 1b)', () => {
+  // Design §8 case (a): a symlink that makes project-tier and global-tier
+  // `cli_realpath` identical must still yield DISTINCT keys, so project-tier
+  // can never read a global entry's sandbox_ok:true and skip its own
+  // containment check. trust_tier is the discriminator — here the first 14
+  // fields are IDENTICAL and only trust_tier + registry fields differ.
+  it('cross-tier non-collision: identical cli_realpath, different trust_tier → distinct keys', () => {
+    if (!bashExists()) return;
+    const tmp = makeTmpdir();
+    try {
+      const r = runBash(
+        `source "${SHIM_CACHE_LIB}"
+         proj=$(shim_cache_key "v2" "tok" "/same" "/same/cli" "1000" "10" "501" "1" "test-shim" "100" "1000" "200" "/usr/bin/node" "12345" "project" "" "")
+         glob=$(shim_cache_key "v2" "tok" "/same" "/same/cli" "1000" "10" "501" "1" "test-shim" "100" "1000" "200" "/usr/bin/node" "12345" "global" "1700000000.5" "256")
+         echo "$proj"
+         echo "$glob"`,
+        { tmpdir: tmp },
+      );
+      expect(r.status).toBe(0);
+      const [proj, glob] = r.stdout.trim().split('\n');
+      expect(proj).toMatch(/^[0-9a-f]{32}$/);
+      expect(glob).toMatch(/^[0-9a-f]{32}$/);
+      expect(proj).not.toBe(glob);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  // Design §8 case (b): untrust mid-session rewrites the registry via an
+  // atomic rename (new mtime) and removes a line (smaller size). A warm
+  // global entry keyed on the OLD registry mtime/size must become
+  // unreachable — two invalidators defeat a `touch -r` mtime-preserving
+  // swap.
+  it('untrust mid-session: registry mtime+size change → warm global key misses', () => {
+    if (!bashExists()) return;
+    const tmp = makeTmpdir();
+    try {
+      const r = runBash(
+        `source "${SHIM_CACHE_LIB}"
+         warm=$(shim_cache_key "v2" "tok" "/p" "/cli" "1000" "10" "501" "1" "test-shim" "100" "1000" "200" "/usr/bin/node" "12345" "global" "1700000000.111" "256")
+         after=$(shim_cache_key "v2" "tok" "/p" "/cli" "1000" "10" "501" "1" "test-shim" "100" "1000" "200" "/usr/bin/node" "12345" "global" "1700000999.999" "240")
+         echo "$warm"
+         echo "$after"`,
+        { tmpdir: tmp },
+      );
+      expect(r.status).toBe(0);
+      const [warm, after] = r.stdout.trim().split('\n');
+      expect(warm).toMatch(/^[0-9a-f]{32}$/);
+      expect(after).toMatch(/^[0-9a-f]{32}$/);
+      expect(warm).not.toBe(after);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  // A removed line shrinks the file even if an attacker pins the mtime with
+  // `touch -r`. Size alone must discriminate.
+  it('untrust mid-session: registry SIZE change alone (mtime pinned) → distinct keys', () => {
+    if (!bashExists()) return;
+    const tmp = makeTmpdir();
+    try {
+      const r = runBash(
+        `source "${SHIM_CACHE_LIB}"
+         a=$(shim_cache_key "v2" "tok" "/p" "/cli" "1000" "10" "501" "1" "test-shim" "100" "1000" "200" "/usr/bin/node" "12345" "global" "1700000000.5" "256")
+         b=$(shim_cache_key "v2" "tok" "/p" "/cli" "1000" "10" "501" "1" "test-shim" "100" "1000" "200" "/usr/bin/node" "12345" "global" "1700000000.5" "240")
+         echo "$a"
+         echo "$b"`,
+        { tmpdir: tmp },
+      );
+      expect(r.status).toBe(0);
+      const [a, b] = r.stdout.trim().split('\n');
+      expect(a).not.toBe(b);
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
     }

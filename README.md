@@ -51,6 +51,7 @@ the [migration section](#migration-from-010x) below.
 - [Slash commands](#slash-commands)
 - [Curated agents](#curated-agents)
 - [CLI reference](#cli-reference)
+- [Global install (govern a checkout without a shared dependency)](#global-install-govern-a-checkout-without-a-shared-dependency)
 - [Migration from 0.10.x](#migration-from-010x)
 - [Contributor quality gates](#contributor-quality-gates)
 - [Threat model and security](#threat-model-and-security)
@@ -1063,6 +1064,67 @@ manually to test.
 rea hook push-gate
 rea hook push-gate --base origin/main
 ```
+
+---
+
+## Global install (govern a checkout without a shared dependency)
+
+Opt-in, off by default (added in 0.50.0). It lets rea's hooks govern a
+checkout **without** adding `@bookedsolid/rea` to that checkout's shared
+`package.json` — useful for a shared repo where you want rea for yourself
+while other developers, and the shared manifest, stay rea-free.
+
+Install the CLI once, per-user and out of any project, then bless the
+checkouts you want governed:
+
+```bash
+# From OUTSIDE any git checkout (it refuses to install inside one):
+rea install --global                 # → <home>/.rea/cli (real npm install)
+rea install --global --trust .       # install and trust the cwd in one step
+
+# From a plain shell (NOT under a governed agent session):
+rea trust                            # bless the current checkout
+rea trust /path/to/repo              # bless another checkout
+rea trust --list                     # print the trust registry
+rea untrust                          # remove the current checkout
+```
+
+`rea install --global` and `rea trust` / `rea untrust` are **human
+actions**: the CLI refuses to mutate your per-user trust root when a
+governed agent session is detected (`CLAUDE_PROJECT_DIR` is set). The
+per-user root is derived from the password database, never from `$HOME`
+or `$XDG_*`.
+
+How resolution behaves:
+
+- **In-project resolution always wins.** If `node_modules/@bookedsolid/rea`
+  (or a `dist/cli/index.js`) resolves in the project, the global tier is
+  never consulted and behavior is byte-identical to a build without the
+  feature.
+- **Off / un-blessed is invisible.** A checkout that is not in the trust
+  registry resolves exactly as it would without the feature installed.
+- **The registry only ever enables — never disables — enforcement.** The
+  global tier supplies a CLI binary; the policy enforced is always the
+  checkout's own `.rea/policy.yaml`. A repo can further-restrict the tier
+  with `runtime.allow_global_cli: false`; nothing in the registry can
+  waive a gate.
+
+Check which tier a checkout actually runs through:
+
+```bash
+rea doctor    # shows: global rea CLI installed / active tier / trust anchor
+```
+
+`rea doctor` names the resolved realpath and reports the active tier
+(`in-project` when the global tier is present but unused, `global` +
+trusted, a `warn` when the checkout is not trusted, or the
+`runtime.allow_global_cli: false` veto). The trust registry
+(`<home>/.rea/trusted-projects`) is distinct from `.rea/registry.yaml`
+(the per-project MCP TOFU store).
+
+POSIX-only in v1 (the tier is disabled on Windows). `rea init` and
+`rea upgrade` never touch `<home>/.rea/` and never write
+`runtime.allow_global_cli` — the option is per-developer, per-machine.
 
 ---
 

@@ -28,6 +28,7 @@
 import type { Buffer } from 'node:buffer';
 import path from 'node:path';
 import fs from 'node:fs';
+import os from 'node:os';
 import { parse as parseYaml } from 'yaml';
 import { checkHalt, formatHaltBanner } from '../_lib/halt-check.js';
 import {
@@ -61,6 +62,22 @@ export interface ProtectedPathsBashGateResult {
 interface PermissivePolicy {
   protectedWrites?: string[];
   protectedRelax: string[];
+}
+
+/**
+ * Passwd-derived absolute home for the `~/.rea` global-root scanner gate.
+ * `os.userInfo().homedir` (libuv `getpwuid_r`), NEVER `$HOME` / `$XDG_*`.
+ * Undefined on passwd-lookup failure or a non-absolute home → gate
+ * disabled (feature-absent parity, mirroring `shim_global_entry_gate`).
+ */
+function passwdDerivedHome(): string | undefined {
+  try {
+    const home = os.userInfo().homedir;
+    if (typeof home === 'string' && home.startsWith('/')) return home;
+  } catch {
+    /* no passwd entry → gate disabled */
+  }
+  return undefined;
 }
 
 function loadPolicyPermissive(reaRoot: string): PermissivePolicy {
@@ -162,7 +179,11 @@ export async function runProtectedPathsBashGate(
     relax.push('.claude/hooks/');
   }
 
-  // 7. Scan.
+  // 7. Scan. Passwd-derived home enables the `~/.rea` global-root gate
+  //    (safe-global-CLI). Never `$HOME` / `$XDG_*` — an agent can move
+  //    those in-process; a passwd-lookup failure disables the gate
+  //    (feature-absent parity, mirroring the shim's silent "unavailable").
+  const passwdHome = passwdDerivedHome();
   const verdict = runProtectedScan(
     {
       reaRoot,
@@ -172,6 +193,7 @@ export async function runProtectedPathsBashGate(
           : {}),
         protected_paths_relax: relax,
       },
+      ...(passwdHome !== undefined ? { passwdHome } : {}),
       stderr: (line) => writeStderr(line),
     },
     cmd,

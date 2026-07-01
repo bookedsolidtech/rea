@@ -63,19 +63,65 @@ fi
 
 # 3. Resolve CLI early (used by policy reader Tier 1 + final forward).
 shim_resolve_cli
+TRUST_TIER="project"
+
+# 0.50.0 Phase 2b: when BOTH in-project tiers miss, consult the opt-in
+# global tier. shim_resolve_cli_global runs the registry opt-in gate + the
+# A1–A4 sandbox itself and, on success, sets REA_ARGV / RESOLVED_CLI_PATH /
+# TRUST_TIER=global (and _SHIM_GLOBAL_BAD_REASON on a blessed-but-hostile
+# tree). Without this, a BLESSED global-only repo (no in-project
+# @bookedsolid/rea) leaves REA_ARGV empty → section 7 refuses the push as
+# `cli-missing`, defeating the feature for the push/commit gate. An
+# un-blessed repo leaves REA_ARGV empty + emits nothing, so section 7 stays
+# byte-identical to feature-absent. A blessed-but-hostile global tree
+# (_SHIM_GLOBAL_BAD_REASON set) also leaves REA_ARGV empty → section 7
+# refuses (blocking gate: refusing is the correct fail-closed posture).
+if [ "${#REA_ARGV[@]}" -eq 0 ]; then
+  shim_resolve_cli_global
+fi
+
+# 0.50.0 Phase 2b: honor the in-project runtime.allow_global_cli veto for the
+# push/commit gate too — parity with shim_run's 14 shims via the SHARED
+# shim_global_tier_vetoed helper (single source of truth). Runs ONLY when the
+# global tier resolved (TRUST_TIER=global ⇒ REA_ARGV is the sandbox-validated
+# global CLI). On veto, clear REA_ARGV + revert TRUST_TIER so the gate falls
+# back to no-CLI → section 7 refuses the push cli-missing (correct fail-closed
+# posture for a blocking gate). Without this the gate would forward through
+# the global CLI regardless, leaving the repo-level veto ineffective for
+# push/commit enforcement while the shims honor it.
+if [ "${TRUST_TIER:-project}" = "global" ] && shim_global_tier_vetoed; then
+  REA_ARGV=()
+  TRUST_TIER="project"
+fi
 
 # Round-5 P1 fix: sandbox-check the CLI BEFORE any policy-get
 # invocation. Pre-fix `_lrg_read_policy()` could spawn the resolved CLI
 # for mode-off / refuse_at reads BEFORE the sandbox guard fired — a
 # symlinked or swapped dist/cli/index.js would execute during policy
 # lookup, defeating the realpath / package.json trust boundary.
+#
+# 0.50.0 Phase 2b: gate this IN-PROJECT sandbox on TRUST_TIER=project,
+# mirroring shim_run step 4a. The global tier already ran its own A1–A4
+# sandbox inside shim_resolve_cli_global (and REA_ARGV points at the
+# validated realpath, which legitimately lives OUTSIDE CLAUDE_PROJECT_DIR).
+# Re-running the in-project shim_sandbox_check on a global CLI would reject
+# it with bad:cli-escapes-project and wrongly refuse the push.
 SANDBOX_EARLY_FAILURE=""
-if [ "${#REA_ARGV[@]}" -gt 0 ] && command -v node >/dev/null 2>&1; then
+if [ "${#REA_ARGV[@]}" -gt 0 ] && [ "${TRUST_TIER:-project}" = "project" ] && command -v node >/dev/null 2>&1; then
   sandbox_check_early=$(shim_sandbox_check "$RESOLVED_CLI_PATH" "$proj" "$SHIM_ENFORCE_CLI_SHAPE")
-  if [ "$sandbox_check_early" != "ok" ]; then
-    SANDBOX_EARLY_FAILURE="$sandbox_check_early"
-    REA_ARGV=()
-  fi
+  # TOCTOU precursor: shim_sandbox_check now echoes `ok:<realpath>` on
+  # success (was bare `ok`). Branch on the `ok:` prefix. This hook is
+  # the documented shim_run exception, so it keeps executing the literal
+  # RESOLVED_CLI_PATH for its forward (realpath-exec is scoped to
+  # shim_run in this phase); only the success detection adapts to the
+  # new return shape. bash 3.2: `case` glob match, no `[[ =~ ]]`.
+  case "$sandbox_check_early" in
+    ok:*) ;;
+    *)
+      SANDBOX_EARLY_FAILURE="$sandbox_check_early"
+      REA_ARGV=()
+      ;;
+  esac
 fi
 
 # 0.37.0: route policy reads through the unified policy-reader. The

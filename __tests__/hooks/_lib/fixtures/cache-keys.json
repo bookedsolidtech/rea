@@ -1,0 +1,29 @@
+{
+  "description": "Byte-exact regression pins for hooks/_lib/shim-cache.sh shim_cache_key. 0.49.0 Phase 1b introduced cache-key schema v2 for the opt-in global-CLI resolver tier (3 new fields: trust_tier, registry_mtime, registry_size; enforce_cli_shape carries the EFFECTIVE value). The key is the first 32 hex chars of sha256(NUL-join(args)), so these values are deterministic across macOS and Linux. A change here means the cache-key construction changed (NUL-join order / field set) and MUST be a deliberate regen — every v2 entry on disk silently invalidates, which is fine (tmpfs + 3600s TTL) but the pin forces the change to be intentional. The v1 rows are negatives: a v1-shaped 14-arg call no longer produces a key (the guard rose from 14 to 17), and a 17-arg call with schema_version v1 produces a key that can never collide with a v2 lookup (schema is field 1, re-checked by the read-side validator).",
+  "rows": [
+    {
+      "label": "v2 project tier — registry fields empty",
+      "expect": "key",
+      "args": ["v2", "tok", "/proj", "/cli", "1000", "10", "501", "1", "test-shim", "100", "1000", "200", "/usr/bin/node", "12345", "project", "", ""],
+      "key": "1e18bc0ab0a2f403d3bf50cb1db92fee"
+    },
+    {
+      "label": "v2 global tier — registry mtime/size present, effective enforce_cli_shape=1",
+      "expect": "key",
+      "args": ["v2", "tok", "/proj", "/cli", "1000", "10", "501", "1", "test-shim", "100", "1000", "200", "/usr/bin/node", "12345", "global", "1700000000.123456789", "256"],
+      "key": "91e59fd487cddac1c35850fdc66ced14"
+    },
+    {
+      "label": "v1 negative (17-arg, schema_version v1) — distinct key, never matches a v2 lookup",
+      "expect": "key",
+      "args": ["v1", "tok", "/proj", "/cli", "1000", "10", "501", "1", "test-shim", "100", "1000", "200", "/usr/bin/node", "12345", "project", "", ""],
+      "key": "75dfc6bbcfca064d326b478dbf4bd290"
+    },
+    {
+      "label": "v1 negative (legacy 14-arg call shape) — the v2 guard rejects fewer than 17 args",
+      "expect": "no-key",
+      "args": ["v1", "tok", "/proj", "/cli", "1000", "10", "501", "1", "test-shim", "100", "1000", "200", "/usr/bin/node", "12345"],
+      "key": ""
+    }
+  ]
+}

@@ -402,6 +402,51 @@ const BootstrapAllowlistPolicySchema = z
   })
   .strict();
 
+/**
+ * 0.50.0 — runtime resolver policy. Currently the sole field is
+ * `allow_global_cli`, the OPTIONAL project-level veto over the global rea
+ * CLI resolver tier in `hooks/_lib/shim-runtime.sh`.
+ *
+ * The global tier is gated PRIMARILY by a per-user registry (A5 consent
+ * gate). This project-level knob is a SECONDARY veto layered on top —
+ * registry can only ENABLE the tier; policy can only further-RESTRICT it.
+ * The asymmetry is deliberate: a project can refuse the global CLI even
+ * when the machine's registry has blessed it, but a project can NEVER
+ * turn the tier ON when the registry has not.
+ *
+ * Tri-state (locked):
+ *   - absent   → permitted (registry alone governs — the veto is silent)
+ *   - `true`   → permitted (affirm; identical effect to absent, but
+ *                explicit — a project can pin "yes, the global tier is
+ *                fine here")
+ *   - `false`  → veto (the project refuses the global tier even when the
+ *                registry has blessed it)
+ *
+ * `.optional()` — NOT `.default()` — so absent stays distinguishable from
+ * an explicit `false`. The distinction is load-bearing: the shim's veto
+ * wiring (a later phase) must treat "field omitted" (registry governs)
+ * differently from "explicitly false" (project refuses), and a schema
+ * default would collapse the two.
+ *
+ * Deliberately OFF / absent by default — no profile and no shipped
+ * `.rea/policy.yaml` carries a `runtime:` block. The global CLI tier is a
+ * per-developer / per-machine opt-in via the per-user registry; the
+ * project-level veto exists only for repos that want to affirmatively
+ * refuse it, so its natural state is "not present."
+ *
+ * Strict mode rejects unknown keys so a typo (`allow_globcli`,
+ * `allow_global_clis`) fails loudly at policy load rather than silently
+ * omitting the veto. The `runtime` schema is REQUIRED even though it holds
+ * a single optional field: the top-level `PolicySchema` is `.strict()`, so
+ * without a `runtime` schema ANY `policy.yaml` carrying a `runtime:` block
+ * would fail to load entirely.
+ */
+const RuntimePolicySchema = z
+  .object({
+    allow_global_cli: z.boolean().optional(),
+  })
+  .strict();
+
 const PolicySchema = z
   .object({
     version: z.string(),
@@ -481,6 +526,14 @@ const PolicySchema = z
     // `hooks/_lib/bootstrap-allowlist.sh` and
     // `THREAT_MODEL.md §5.X`.
     bootstrap_allowlist: BootstrapAllowlistPolicySchema.optional(),
+    // 0.50.0 runtime resolver policy — currently only the optional
+    // `allow_global_cli` project-level veto over the global rea CLI
+    // resolver tier. `.optional()` so a vanilla install with no
+    // `runtime:` block leaves the tier governed by the per-user registry
+    // alone (absent → permitted). See `RuntimePolicySchema` for the full
+    // tri-state contract and the registry-primary / policy-secondary
+    // asymmetry.
+    runtime: RuntimePolicySchema.optional(),
   })
   .strict();
 

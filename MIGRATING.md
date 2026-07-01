@@ -787,3 +787,71 @@ the dominant cost ceiling that motivated 0.45.0's profiling work.
 See `docs/shim-session-cache-design.md` for the security contract
 and `docs/hook-perf-baseline.md` §"Per-session shim cache and the
 baseline" for the perf methodology note.
+
+## Governing a shared repo without touching shared files (added in 0.50.0)
+
+The driving case: you work in a shared repo. You want rea's hooks to
+govern **your** clone on **your** machine, without other developers
+using rea and without touching the shared `package.json` or lockfile.
+The 0.50.0 opt-in global rea CLI tier is built for exactly this — it is
+OFF by default and changes nothing until you install it and bless a
+checkout.
+
+The shape is a two-step, human-only setup:
+
+1. **Install the CLI once, per-user, from OUTSIDE the repo.** The
+   installer refuses to place the CLI inside a git checkout (it would
+   become a committable artifact):
+
+   ```bash
+   cd ~                      # anywhere outside the repo
+   rea install --global      # real `npm install --prefix ~/.rea/cli`
+   ```
+
+2. **Trust the checkout, in a plain shell.** `rea trust` /
+   `rea install --global` refuse to run under a governed agent session
+   (`CLAUDE_PROJECT_DIR` set) — establishing trust is a human action, not
+   something the agent can grant itself:
+
+   ```bash
+   cd /path/to/shared-repo
+   rea trust                 # or: rea install --global --trust . in step 1
+   ```
+
+Nothing about the shared repo changes: no dependency is added to
+`package.json`, no lockfile entry, no committed `.claude/`. Keep your
+personal `.claude/` gitignored as usual. The global tier supplies a CLI
+binary; the policy enforced is always the checkout's own
+`.rea/policy.yaml`, so blessing a repo means vouching for its policy —
+it can never waive a gate.
+
+### Verification
+
+Run `rea doctor` from inside the checkout and read three rows:
+
+```text
+[pass] global rea CLI installed        v0.50.0 at /Users/you/.rea/cli/node_modules/@bookedsolid/rea/dist/cli/index.js
+[pass] global rea CLI active tier      global — this checkout is trusted (in the global-CLI trust registry /Users/you/.rea/trusted-projects); hooks run <realpath>
+[info] global rea CLI residual risk    integrity relies on filesystem ownership of /Users/you/.rea; prefer in-project install for shared or CI checkouts
+```
+
+If the checkout is not trusted yet, the active-tier row is a `warn`
+telling you the hooks fail closed here until you `rea trust` it. If an
+in-project rea resolves, doctor reports the active tier as `in-project`
+(global present, unused) — the in-project tier always wins. `rea trust
+--list` prints the current registry; `rea untrust` removes a checkout.
+
+### Notes
+
+- **Human actions only.** `rea install --global`, `rea trust`, and
+  `rea untrust` refuse under a governed agent session. Run them from a
+  plain shell.
+- **POSIX-only in v1** — the tier is disabled on Windows.
+- **`rea init` / `rea upgrade` are unchanged** — they never touch
+  `~/.rea/`, never prompt about the global tier, and never write
+  `runtime.allow_global_cli`. A repo that wants to forbid the tier for
+  everyone can set `runtime.allow_global_cli: false` in its
+  `.rea/policy.yaml`.
+- The trust registry `~/.rea/trusted-projects` (per-user global-CLI
+  allow-list) is a different file from `.rea/registry.yaml` (the
+  per-project MCP-server TOFU fingerprint store).

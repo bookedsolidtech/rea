@@ -565,6 +565,68 @@ Ref: `src/cli/install/self-pin.ts`, `src/cli/init.ts`, `src/cli/upgrade.ts`, `sr
 
 ---
 
+### 5.24 Global rea CLI resolution tier (opt-in)
+
+**Threat class.** 0.50.0 adds an OPT-IN, off-by-default resolution tier. A developer runs `rea install --global` (a real `npm install --prefix <pw_dir>/.rea/cli @bookedsolid/rea`) and `rea trust <checkout>`, and the shim hooks then govern that checkout by resolving a per-user rea CLI from `<pw_dir>/.rea/cli` — **without** adding `@bookedsolid/rea` to the checkout's shared `package.json`. The driving case is a shared repo (well-lit) with a gitignored personal `.claude/`, where the shared manifest must stay rea-free and other developers stay rea-free. The moment a per-user CLI can serve *any* checkout, three surfaces open that the in-project tier does not have: cross-project ambient authority, cross-user plant, and env/symlink redirect of the root. This section states the trust-boundary delta, the closures, and — plainly — the residuals.
+
+The honest bar is **"no weaker than the in-project tier, plus close the three new surfaces a shared global location adds."** It is NOT "sound against a same-uid agent" — the in-project tier is not either (a same-uid process can overwrite `node_modules/@bookedsolid/rea/dist/cli/index.js` in place today; see §8.3). Everything below is measured against that bar.
+
+#### 5.24.1 Trust-boundary delta
+
+The load-bearing framing: **the global tier supplies a CLI *binary*, never a *policy*.** Enforcement always runs against the in-project `.rea/policy.yaml`. Blessing a checkout into the trust registry means "run the trusted per-user CLI against *this repo's own policy*" — it is an act of vouching for that repo's policy, not a grant of new authority. Concretely, the tier adds:
+
+- A per-user CLI tree at `<pw_dir>/.rea/cli/` (out of any project).
+- A per-user allow-list `<pw_dir>/.rea/trusted-projects` (mode `0600`, owner==euid). **Naming:** this is the GLOBAL-CLI trust registry; it is NOT `.rea/registry.yaml` (the per-project MCP-server TOFU fingerprint store of §5.20). The two are unrelated files with unrelated schemas.
+- An optional in-project veto key `runtime.allow_global_cli?: boolean` (§7 zod, `.strict()`, `.optional()` so absent ≠ explicit false).
+
+In-project resolution **always wins**: the shim probes `$proj/node_modules/@bookedsolid/rea/dist/cli/index.js` then `$proj/dist/cli/index.js` first, and the trust registry is NEVER consulted when either resolves. An un-blessed checkout is **byte-identical** to a rea build without the feature — any registry-unusable condition in the hot path degrades to a silent `unavailable` (no banner), so shared per-user state cannot perturb a CLI-less checkout (codex design-gate P1-3). Loud diagnosis lives only in `rea doctor` / `rea trust` / `rea install --global`.
+
+#### 5.24.2 The passwd-derived anchor
+
+The per-user root is `os.userInfo().homedir` — libuv `getpwuid_r(geteuid())→pw_dir`, which reads the password database, **not** the environment. `$HOME` and `$XDG_CONFIG_HOME` are never consulted on either the bash or the TypeScript side; `homedir !== $HOME` uses the passwd value and raises a `rea doctor` advisory. A throw (squashed/absent passwd entry, e.g. NFS root_squash) makes the tier **unavailable** — the code never falls back to `$HOME`. POSIX-only: the tier is disabled on Windows in v1 (no `getuid`; shipping a half-enforced ownership walk would be worse than not shipping).
+
+This is a deliberate divergence from the sibling openrouter-key-source design, stated verbatim so the reason is not lost:
+
+> openrouter-key-source derives its root from the env bag (`XDG_CONFIG_HOME`→`HOME`) because its actor is a careless operator needing overridability of a credential lookup; the global-CLI tier derives its root from the password database via `os.userInfo().homedir` because its actor is the agent itself, which can set `$HOME`/`$XDG_CONFIG_HOME` in-process — any env-derived root is agent-redirectable, exactly the N3 surface we close. A trust root an agent can move is not a trust root.
+
+#### 5.24.3 New-surface closures (N1 / N2 / N3)
+
+- **N1 — cross-project ambient authority.** One per-user CLI could otherwise serve *every* checkout on the machine, including a freshly-cloned hostile repo. Closure: a **default-deny registry**. The global tier fires only for a checkout whose `realpath(CLAUDE_PROJECT_DIR)` is an exact whole-line match (`grep -Fxq`) in `<pw_dir>/.rea/trusted-projects`. No entry → no global tier. The registry is a CONSENT gate, not a containment gate: `CLAUDE_PROJECT_DIR` is agent-controllable, but spoofing it to a *blessed* path only causes the **trusted** CLI to run against a repo the human already vouched for — never a bypass.
+- **N2 — cross-user plant.** Another local user (or a group/other-writable directory) could plant a CLI tree. Closure: a **per-component `lstat` walk** (A2) from the resolved candidate up to and including `<pw_dir>/.rea`, requiring for every component `uid === geteuid()`, no group/other write (`mode & 0o022 === 0`), and no device-number change vs `g_root` (`st_dev`, defeats a mount/bind/automount aliased subtree — codex P2-6). The candidate `index.js` and the ancestor `package.json` must each be `nlink === 1` (a pre-existing hardlink is a same-uid mutation primitive — codex P2-7). The registry file itself is held to the strict `0600` mask (`mode & 0o077 === 0`) plus `nlink === 1`.
+- **N3 — env/symlink redirect of the root.** An agent that can set `$HOME`/`$XDG_*` in-process could otherwise redirect the whole root. Closure is three-part: **passwd-derivation** (§5.24.2, the root is not env-derived), **realpath containment** (A1: `realpath(candidate)` must equal or sit under `realpath(g_root)`), and **reject-ANY-symlink** in the A2 walk — not only outward-pointing links. An inside-pointing symlink is still a same-uid repoint primitive, so every symlink component is fatal (codex `sec(f)`).
+
+#### 5.24.4 Accept predicate (A1–A5)
+
+Evaluated cheapest/most-decisive first. A5 is the silent consent gate; A1–A4 are fatal-to-tier checks that fire only for a blessed-but-hostile tree. Reasons are the shim's `bad:global-*` strings (`hooks/_lib/shim-runtime.sh`, `shim_sandbox_check_global`).
+
+| Step | Check | Outcome on failure |
+| --- | --- | --- |
+| **A5** | registry entry-gate: passwd-derive `pw_dir`; `<pw_dir>/.rea` dir-safe; registry file-safe (`0600`, owner, `nlink===1`); `realpath(proj)` is a `grep -Fxq` member | **silent `unavailable`** → today's no-CLI path (NO banner; parity with feature-absent) |
+| **A2** | per-component `lstat` walk (candidate → `<pw_dir>/.rea`): any symlink; foreign uid or group/other-write; `st_dev` change; candidate `nlink!==1` | `bad:global-symlink` / `bad:global-perm` / `bad:global-hardlink` (FATAL to tier) |
+| **A1** | `realpath(cand)` contained in `realpath(g_root)` | `bad:global-escapes-root` (FATAL); `realpath` throw → silent `unavailable` |
+| **A4** | `realpath` ends `…/dist/cli/index.js` (ALWAYS-on for global, independent of `SHIM_ENFORCE_CLI_SHAPE`) | `bad:global-shape` (FATAL) |
+| **A3** | ancestor `package.json#name === "@bookedsolid/rea"` (walk ≤20) and that `package.json` is `nlink===1` | `bad:global-no-rea-pkg` / `bad:global-hardlink` (FATAL) |
+
+**Fatal vs. short-circuit.** An A5 miss short-circuits **silently** — REA_ARGV stays empty and the existing relevance-gated no-CLI terminal runs (harmless payload → exit 0 silent; a relevant payload on a blocking shim → cli-missing banner + exit 2), byte-identical to feature-absent. An A1–A4 failure (blessed, but the global tree is hostile or malformed) is **fatal to the tier**: REA_ARGV is cleared, a single one-line `bad:global-*` advisory is emitted to stderr, and the no-CLI terminal runs. Advisory hooks are NOT escalated to a hard block on a global plant — A2 already proves only euid wrote the tree, so escalation would only add a same-uid DoS. **Registry problems are never surfaced as a `bad:global-registry-*` banner in the hot path** (codex P1-3); they collapse into the silent `unavailable` path so shared per-user state cannot perturb a CLI-less checkout.
+
+**The veto is POST-resolution, and the asymmetry is load-bearing.** The pre-CLI A5 gate reads registry membership ONLY — there is no inline `policy.yaml` read in the no-CLI window (codex P1-1/P1-2: a narrow YAML grep is a split-brain magnet, and `policy.yaml` is not scanner-protected when no CLI is resolved). The `runtime.allow_global_cli` veto instead runs *after* A1–A4 pass, read through the sandbox-validated CLI (`rea hook policy-get runtime.allow_global_cli`) at the same trust level `shim_policy_short_circuit` already relies on: `false`, or any `policy-get` error/unparseable policy → **refuse-forward** (clear REA_ARGV, revert `TRUST_TIER` to `project`, silent — a veto is a project choice, not a security signal). It is kept out of the cache key so a mid-session `allow_global_cli: false` is honored on the very next fire. This is safe because the **asymmetry holds: the registry (primary, protected, human-established) can only ever ENABLE the tier; a project's own policy can only ever further-RESTRICT it, never the reverse.** An agent that strips a `false` veto from an in-project `policy.yaml` only affects a repo *already* in the registry (the human already vouched); an agent that adds a veto only restricts. Policy mutation in the no-CLI window therefore cannot grant authority beyond the registry.
+
+#### 5.24.5 Registry asymmetry — ENABLE-only, never DISABLE
+
+Restated because it is the property the whole design turns on: **the trust registry can only ENABLE enforcement, never DISABLE a gate.** Adding a checkout means "govern this repo with the trusted CLI against its own policy." It cannot lower an autonomy level, remove a blocked path, or waive a hook — those live in the in-project `.rea/policy.yaml`, which the registry does not touch. The worst an attacker who forges registry membership (or spoofs `CLAUDE_PROJECT_DIR` to a blessed path) achieves is *"the trusted rea CLI runs against a policy the human already vouched for"* — strictly more governance, never less. Conversely, a checkout's own policy can veto the tier down to in-project-required, but can never use the registry to escape its own gates.
+
+#### 5.24.6 Residual risks
+
+Stated plainly; the tier does not claim to close these.
+
+- **(a) Same-uid in-place file swap — ACCEPTED.** A2 proves only euid wrote the global tree, but a same-uid process can still overwrite the resolved `dist/cli/index.js` *in place* after validation. This is the **same residual the in-project package tier carries** (§8.3 "`@bookedsolid/rea` package-tier supply-chain compromise"; §8.6 out-of-scope) — at that privilege level the attacker can forge any dependency the agent uses, so hook-tier defense is already past and the trust boundary is the `npm install` provenance check. The TOCTOU realpath-exec precursor (Phase 1a, retrofitted to the in-project tier too) shrinks the resolve→execute window to exactly this in-place-swap residual and no wider. The global tier is therefore **no weaker** than the in-project tier on this class.
+- **(b) `cp -l` / `cp --link` / `link` hardlink-alias creation — PRE-EXISTING walker gap, equal on both tiers.** The `nlink === 1` checks reject a *pre-existing* hardlinked registry / `index.js` / `package.json`. They do NOT stop an agent from *creating* a new hardlink alias to a protected file at Bash-write time (`cp -l …`, `link …`) — the bash-tier scanner (§8) does not yet resolve a create-a-hardlink-to-a-protected-target write. This is a pre-existing gap that applies **equally to the in-project kill-switch**: `cp -l .rea/policy.yaml ./alias` passes the scanner today, exactly as `cp -l <pw_dir>/.rea/trusted-projects ./alias` would. The global tier introduces **no new weakness** here relative to the in-project tier. Tracked as a walker follow-up (inode-aware hardlink-alias detection across both tiers).
+- **(c) POSIX ACL cross-user write — degraded-env class.** The A2 mode-bit checks (`mode & 0o022`, `mode & 0o077`) inspect the classic permission bits, not POSIX ACLs. An attacker who already holds a second uid on the box AND has pre-set an ACL granting that uid write to a component of `<pw_dir>/.rea/cli` could evade the mode-bit gate. This requires a second uid plus a pre-existing ACL — the same degraded-environment class as NFS `root_squash` uid-mismatch — and is documented, not defended, in v1. Operators on ACL-bearing filesystems should prefer the in-project install for shared checkouts.
+
+Ref: `hooks/_lib/shim-runtime.sh` (`shim_global_entry_gate`, `shim_sandbox_check_global`, `shim_resolve_cli_global`, 4-global-veto), `src/cli/global-cli.ts`, `src/cli/trust.ts`, `src/cli/install/global.ts`, `src/cli/doctor.ts` (`resolveGlobalCliTier`, `checkGlobalCli`), `src/policy/loader.ts` (`RuntimePolicySchema`), `__tests__/hooks/global-cli/`.
+
+---
+
 ## 6. Residual Risks and Open Issues
 
 | Risk                                                          | Severity | Status / Tracking              |
@@ -582,6 +644,9 @@ Ref: `src/cli/install/self-pin.ts`, `src/cli/init.ts`, `src/cli/upgrade.ts`, `sr
 | Escape-hatch abuse signal not surfaced in `rea doctor`        | Low      | Tracked (threshold: ≥3 / 7d)   |
 | Local user can escalate policy.yaml outside gateway           | Low      | By design (trusted actor)      |
 | Registry pin mismatch → hard fail (no rollback) on TOFU       | Low      | By design — operator clears `.rea/fingerprints.json` to re-pin |
+| Global-CLI tier: same-uid in-place swap of resolved `dist/cli/index.js` | Low | Accepted — same residual as the in-project package tier (§5.24.6a / §8.3); realpath-exec precursor shrinks the TOCTOU window |
+| Global-CLI tier: `cp -l` / `link` hardlink-alias to a protected target | Low | Pre-existing scanner gap, equal on the in-project kill-switch (§5.24.6b) — walker follow-up (inode-aware alias detection) |
+| Global-CLI tier: POSIX ACL cross-user write evades the mode-bit walk | Low | Degraded-env class (needs 2nd uid + pre-set ACL), alongside NFS root_squash (§5.24.6c) — prefer in-project install on ACL filesystems |
 
 ---
 

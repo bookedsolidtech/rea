@@ -20,6 +20,8 @@ import { registerAuditByToolCommand } from './audit-by-tool.js';
 import { registerAuditTimelineCommand } from './audit-timeline.js';
 import { registerAuditTopBlocksCommand } from './audit-top-blocks.js';
 import { registerVerifyClaimCommand } from './verify-claim.js';
+import { registerTrustCommands } from './trust.js';
+import { registerInstallCommand } from './install/global.js';
 import { err, getPkgVersion } from './utils.js';
 
 async function main(): Promise<void> {
@@ -230,6 +232,15 @@ async function main(): Promise<void> {
   // centerpiece of 0.28.0 (4th structural pivot — claims as
   // machine-verifiable artifacts).
   registerVerifyClaimCommand(program);
+
+  // Phase 3a — the opt-in global rea CLI tier's writer surface. `rea trust` /
+  // `rea untrust` / `rea trust --list` manage the per-user allow-list
+  // (<home>/.rea/trusted-projects); `rea install --global` drops a real
+  // per-user CLI at <home>/.rea/cli. Both derive the per-user root from the
+  // password database (never $HOME/$XDG_*) — an env-redirectable trust root
+  // would re-open the N3 surface the tier closes.
+  registerTrustCommands(program);
+  registerInstallCommand(program);
 
   const tofu = program
     .command('tofu')
