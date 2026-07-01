@@ -491,6 +491,38 @@ export interface GatewayPolicy {
   health?: GatewayHealthPolicy;
 }
 
+/**
+ * Runtime resolver policy (0.50.0+).
+ *
+ * Governs the global rea CLI resolver tier in
+ * `hooks/_lib/shim-runtime.sh`. The tier is enabled PRIMARILY by a
+ * per-user registry (an A5 consent gate). `allow_global_cli` is the
+ * OPTIONAL project-level SECONDARY veto: registry can only ENABLE the
+ * tier, this knob can only further-RESTRICT it. A project can refuse the
+ * global CLI even when the registry has blessed it, but a project can
+ * never turn the tier ON when the registry has not.
+ *
+ * See `RuntimePolicy.allow_global_cli` for the tri-state contract.
+ */
+export interface RuntimePolicy {
+  /**
+   * Project-level veto over the global rea CLI resolver tier. Tri-state
+   * (locked):
+   *   - `undefined` (omitted) → permitted; the per-user registry alone
+   *     governs the tier. This is the default state — no shipped profile
+   *     or `.rea/policy.yaml` carries a `runtime:` block.
+   *   - `true`  → permitted; explicit affirmation (same effect as absent,
+   *     but pins "the global tier is fine in this repo").
+   *   - `false` → veto; the project refuses the global tier even when the
+   *     registry has blessed the machine.
+   *
+   * Modeled as an optional boolean (not defaulted) so absent stays
+   * distinguishable from an explicit `false` — the shim's veto wiring
+   * treats "registry governs" and "project refuses" as different states.
+   */
+  allow_global_cli?: boolean;
+}
+
 export interface Policy {
   version: string;
   profile: string;
@@ -592,6 +624,15 @@ export interface Policy {
    * architect locked).
    */
   bootstrap_allowlist?: BootstrapAllowlistPolicy;
+  /**
+   * Runtime resolver policy (0.50.0+). Currently only the optional
+   * `allow_global_cli` project-level veto over the global rea CLI
+   * resolver tier in `hooks/_lib/shim-runtime.sh`. Absent → the tier is
+   * governed by the per-user registry alone; `false` → the project
+   * refuses the tier even when registry-blessed; `true` → explicit
+   * affirmation. See `RuntimePolicy` for the full contract.
+   */
+  runtime?: RuntimePolicy;
 }
 
 /**

@@ -132,6 +132,58 @@ header. Also disabled when `REA_SHIM_CACHE` is unset AND
 `policy.shim_cache.enabled` is `false` (additive future hook — out of
 scope for 0.48.0, mention only as a forward-compatibility note).
 
+## v2 — global-tier trust scoping (0.50.0)
+
+The opt-in global rea CLI tier (THREAT_MODEL §5.24) adds a second
+resolution tier, and the cache key must not let one tier read the
+other's warm entry. The schema bumps `v1` → `v2` as a **hard cutover
+with no migration**: per §4 a `schema_version` mismatch makes every
+`v1` entry an unreadable miss, so the first shim fire after the upgrade
+pays one cold hot-path pass and rewrites its entry as `v2`. Cold on
+first fire is the fail-safe outcome — a stale cross-schema hit would be
+the unsafe one.
+
+### New key + entry fields
+
+Three fields join the NUL-joined key tuple (§1) after `enforce_cli_shape`:
+
+```
+  trust_tier        \0  # "project" | "global"
+  registry_mtime    \0  # "" on project; ns-mtime of <pw_dir>/.rea/trusted-projects on global
+  registry_size     \0  # "" on project; size-bytes of the registry on global
+```
+
+`enforce_cli_shape` (the existing slot) is written with its **effective**
+value: `"1"` whenever the tier is `global` (A4 shape is enforced
+unconditionally during global resolution) OR `SHIM_ENFORCE_CLI_SHAPE=1`.
+The entry gains the same three fields; `sandbox_ok` / `shape_ok` record
+the **tier-appropriate** result. The capture-completeness gate requires
+`trust_tier`, and additionally requires `registry_mtime` + `registry_size`
+when `trust_tier === "global"`; a global-tier `stat` failure on the
+registry **skips the cache (clean miss)** — it never fail-closes.
+
+### Ordering invariant
+
+A5 (the live registry/policy gate in `shim_resolve_cli_global`) and the
+whole global resolution complete — so `TRUST_TIER` is final — **before**
+the cache block builds or reads any key. This is a hard design invariant
+(codex P3-9), not merely a test expectation: the `v2` fields are only
+sound if the live registry gate ran first. The `runtime.allow_global_cli`
+veto is deliberately **kept out of the key** (it runs post-resolution on
+every fire, warm hits included) so a mid-session veto is honored on the
+next fire rather than surviving inside a warm entry.
+
+### Two adversarial cases the fields defeat
+
+| # | Attack | Defense |
+|---|--------|---------|
+| a | **In-project ↔ global collision.** Normally the tiers differ by `cli_realpath` and miss each other. Corner case: `node_modules/@bookedsolid/rea` is symlinked to `<pw_dir>/.rea/cli`, so both tiers resolve the **same** `cli_realpath`. Without tier scoping, the project tier could read a global entry's `sandbox_ok:true` and skip its own containment check. | `trust_tier` in the key makes every entry tier-scoped — the collision produces two distinct keys, so neither tier can honor the other's `sandbox_ok`. Correctness does not depend on step-ordering. |
+| b | **Untrust mid-session.** A checkout is untrusted after a warm global entry was written; the warm entry must not keep the tier alive. | Primary defense is the every-fire membership grep — untrust → `grep -Fxq` fails → no global key is built → the warm entry is unreachable. `registry_mtime` + `registry_size` are defense-in-depth: the atomic rewrite bumps the mtime and a removed line shrinks the size, so the two independent invalidators defeat a `touch -r` mtime-preserving edit. |
+
+The `cache-keys.json` fixture gains `v2` project and global rows and
+keeps the `v1` rows as miss-producing negatives; the byte-exact
+key-compat test asserts both.
+
 ## Sign-off conditions
 
 - `THREAT_MODEL.md` gains a section "§N Per-session shim cache" naming

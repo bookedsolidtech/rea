@@ -187,8 +187,14 @@ shim_resolve_cli() {
 #   2. an ancestor package.json has `name`=`@bookedsolid/rea`
 #   3. (when SHIM_ENFORCE_CLI_SHAPE=1) realpath ends in dist/cli/index.js
 #
-# Echoes "ok" on success or "bad:<reason>" on failure. Caller compares
-# to "ok".
+# Echoes "ok:<realpath>" on success or "bad:<reason>" on failure.
+# Callers branch on the `ok:` prefix (bash 3.2: `case "$x" in ok:*)`)
+# and use the realpath tail for realpath-exec (shim_run step 4a). The
+# realpath is the same fs.realpathSync the sandbox already computed, so
+# executing it shrinks the TOCTOU window to the in-place-swap residual
+# the in-project tier already carries — it is NOT a same-inode
+# guarantee (a rename-swap of the realpath after validation remains
+# possible).
 #
 # Args:
 #   $1 — resolved CLI path
@@ -240,8 +246,308 @@ shim_sandbox_check() {
       cur = path.dirname(cur);
     }
     if (!found) { process.stdout.write("bad:no-rea-pkg-json"); process.exit(1); }
-    process.stdout.write("ok");
+    // TOCTOU precursor: emit the validated realpath so the caller can
+    // execute it instead of the literal (possibly-symlinked) cli path.
+    // `real` is the fs.realpathSync(cli) computed at the top of this
+    // program. The `bad:<reason>` outputs above are byte-unchanged.
+    process.stdout.write("ok:" + real);
   ' -- "$cli_path" "$proj_dir" "$enforce_shape" 2>/dev/null
+}
+
+# -----------------------------------------------------------------------------
+# Global tier — A5 entry gate (registry ∧ membership) + resolve. 0.49.0
+# Phase 1b. Derives the per-user trust root from the PASSWORD DATABASE
+# (os.userInfo().homedir → libuv getpwuid_r), NEVER from $HOME / $XDG_* —
+# an agent can set those in-process, so an env-derived root is the N3
+# redirect surface this tier closes. A trust root an agent can move is not
+# a trust root.
+#
+# Registry-ONLY (codex design-gate P1-1): NO policy read in this pre-CLI
+# window. policy.yaml is NOT scanner-protected while no CLI is resolved, so
+# the optional `allow_global_cli` veto lands POST-resolution in a later
+# phase (registry can only ENABLE; policy can only further-RESTRICT — the
+# asymmetry holds).
+#
+# Every A5 / registry-unusable / not-installed condition prints
+# "unavailable" (codex P1-3: SILENT in the hot path — an un-blessed
+# checkout MUST stay byte-identical to feature-absent; a loud
+# `bad:global-registry-*` banner would perturb every CLI-less checkout via
+# shared per-user state). Loud diagnosis lives only in `rea doctor`.
+#
+# Output:
+#   success → "<candidate_path>\n<g_root_path>" (literal probed paths)
+#   else    → "unavailable"
+#
+# Args: $1 — CLAUDE_PROJECT_DIR (agent-controllable; spoofing only causes
+#            the TRUSTED global CLI to run — A5 is a consent gate, not a
+#            containment gate).
+# -----------------------------------------------------------------------------
+shim_global_entry_gate() {
+  local proj_dir="$1"
+  node -e '
+    const fs = require("fs");
+    const path = require("path");
+    const os = require("os");
+    const projDir = process.argv[1];
+    function unavailable() { process.stdout.write("unavailable"); process.exit(0); }
+    // A5.1 — passwd-derived home. NEVER $HOME / $XDG_*.
+    let pwDir;
+    try { pwDir = os.userInfo().homedir; } catch (e) { unavailable(); }
+    if (!pwDir || typeof pwDir !== "string" || pwDir.charAt(0) !== "/") unavailable();
+    const euid = process.geteuid();
+    const reaDir = path.join(pwDir, ".rea");
+    const gRoot = path.join(reaDir, "cli");
+    const registry = path.join(reaDir, "trusted-projects");
+    // A5.3a — validate <pw_dir>/.rea (lstat; never lstat pwDir or above:
+    // firmlinks / BSD /home symlinks legitimately exist there).
+    let rs;
+    try { rs = fs.lstatSync(reaDir); } catch (e) { unavailable(); }
+    if (rs.isSymbolicLink() || !rs.isDirectory()) unavailable();
+    if (rs.uid !== euid) unavailable();
+    if ((rs.mode & 0o022) !== 0) unavailable();
+    // A5.3b — validate the registry file: regular, not a symlink, owner,
+    // strict 0600 mask (NOT the 0o022 dir mask), single link (codex P2-7:
+    // a hardlinked registry is a same-uid mutation primitive).
+    let regs;
+    try { regs = fs.lstatSync(registry); } catch (e) { unavailable(); }
+    if (regs.isSymbolicLink() || !regs.isFile()) unavailable();
+    if (regs.uid !== euid) unavailable();
+    if ((regs.mode & 0o077) !== 0) unavailable();
+    if (regs.nlink !== 1) unavailable();
+    // A5.4 — project realpath (same resolution the writer anchors trust on).
+    let projReal;
+    try { projReal = fs.realpathSync(projDir); } catch (e) { unavailable(); }
+    // A5.5 — membership: fixed-string, full-line match (grep -Fxq). No
+    // parser ever (membership is decided pre-CLI-resolution); comment/blank
+    // lines are inert because realpath queries start with "/".
+    let content;
+    try { content = fs.readFileSync(registry, "utf8"); } catch (e) { unavailable(); }
+    const lines = content.split("\n");
+    let member = false;
+    for (let i = 0; i < lines.length; i += 1) {
+      if (lines[i] === projReal) { member = true; break; }
+    }
+    if (!member) unavailable();
+    // Resolve — probe (1) node_modules shape then (2) bare-drop fallback.
+    const c1 = path.join(gRoot, "node_modules", "@bookedsolid", "rea", "dist", "cli", "index.js");
+    const c2 = path.join(gRoot, "dist", "cli", "index.js");
+    let cand = "";
+    if (fs.existsSync(c1)) cand = c1;
+    else if (fs.existsSync(c2)) cand = c2;
+    if (!cand) unavailable(); // blessed-but-not-installed
+    process.stdout.write(cand + "\n" + gRoot);
+  ' -- "$proj_dir" 2>/dev/null
+}
+
+# -----------------------------------------------------------------------------
+# Global tier — A1–A4 sandbox over a resolved candidate. 0.49.0 Phase 1b.
+# Echoes "ok:<realpath>" on success (consistent with shim_sandbox_check),
+# "bad:global-<reason>" on a fatal tier failure (blessed-but-hostile tree),
+# or "unavailable" when realpath throws (ENOENT / automount — NOT a
+# refusal). Evaluation order is cheapest/most-decisive first.
+#
+#   A2  per-component lstat walk from the candidate UP to AND INCLUDING
+#       <rea_dir> (= dirname(g_root)); STOP there (never lstat pw_dir or
+#       above). Rejects ANY symlink component (an inside-pointing symlink
+#       is still a same-uid repoint primitive), foreign owner, group/other
+#       write, OR a device-number change vs g_root (mount/bind/automount
+#       aliasing, codex P2-6). The candidate index.js must have nlink===1
+#       (codex P2-7).
+#   A1  realpath(candidate) contained in realpath(g_root).
+#   A4  realpath ends sep+"dist/cli/index.js" — ALWAYS-on for global,
+#       independent of SHIM_ENFORCE_CLI_SHAPE.
+#   A3  ancestor package.json#name==="@bookedsolid/rea" (walk ≤20); that
+#       package.json must also have nlink===1.
+#
+# Args:
+#   $1 — candidate CLI path (literal, as probed)
+#   $2 — g_root (<pw_dir>/.rea/cli)
+# -----------------------------------------------------------------------------
+shim_sandbox_check_global() {
+  local cand="$1"
+  local g_root="$2"
+  node -e '
+    const fs = require("fs");
+    const path = require("path");
+    const cand = process.argv[1];
+    const gRoot = process.argv[2];
+    function bad(r) { process.stdout.write("bad:global-" + r); process.exit(1); }
+    function unavailable() { process.stdout.write("unavailable"); process.exit(1); }
+    function ok(r) { process.stdout.write("ok:" + r); process.exit(0); }
+    const euid = process.geteuid();
+    const reaDir = path.dirname(gRoot); // walk stops here; never above
+    const sep = path.sep;
+    // Capture g_root device number for the mount/bind aliasing check.
+    let gRootDev;
+    try { gRootDev = fs.lstatSync(gRoot).dev; } catch (e) { unavailable(); }
+    // A2 — per-component lstat walk: candidate UP to AND INCLUDING reaDir.
+    let comp = cand;
+    let first = true;
+    let guard = 0;
+    for (;;) {
+      guard += 1;
+      if (guard > 128) bad("perm"); // pathological depth — fail to tier
+      let st;
+      try { st = fs.lstatSync(comp); } catch (e) { unavailable(); }
+      if (st.isSymbolicLink()) bad("symlink");
+      if (st.uid !== euid) bad("perm");
+      if ((st.mode & 0o022) !== 0) bad("perm");
+      if (st.dev !== gRootDev) bad("perm");
+      if (first) {
+        // The candidate (index.js) must be a single-link regular file.
+        if (st.nlink !== 1) bad("hardlink");
+        first = false;
+      }
+      if (comp === reaDir) break;
+      const parent = path.dirname(comp);
+      if (parent === comp) break; // reached fs root without reaDir
+      comp = parent;
+    }
+    // A1 — realpath containment.
+    let real, realRoot;
+    try { real = fs.realpathSync(cand); } catch (e) { unavailable(); }
+    try { realRoot = fs.realpathSync(gRoot); } catch (e) { unavailable(); }
+    const rootSep = realRoot.endsWith(sep) ? realRoot : realRoot + sep;
+    if (!(real === realRoot || real.startsWith(rootSep))) bad("escapes-root");
+    // A4 — dist/cli/index.js shape (ALWAYS-on for global).
+    const endWith = path.join("dist", "cli", "index.js");
+    if (!(real.endsWith(sep + endWith) || real === sep + endWith)) bad("shape");
+    // A3 — ancestor package.json with the rea name + nlink===1.
+    let cur = path.dirname(path.dirname(path.dirname(real)));
+    let pkg = "";
+    for (let i = 0; i < 20 && cur && cur !== path.dirname(cur); i += 1) {
+      const pj = path.join(cur, "package.json");
+      if (fs.existsSync(pj)) {
+        try {
+          const data = JSON.parse(fs.readFileSync(pj, "utf8"));
+          if (data && data.name === "@bookedsolid/rea") { pkg = pj; break; }
+        } catch (e) { /* keep walking */ }
+      }
+      cur = path.dirname(cur);
+    }
+    if (!pkg) bad("no-rea-pkg");
+    let ps;
+    try { ps = fs.lstatSync(pkg); } catch (e) { bad("no-rea-pkg"); }
+    if (ps.nlink !== 1) bad("hardlink");
+    ok(real);
+  ' -- "$cand" "$g_root" 2>/dev/null
+}
+
+# -----------------------------------------------------------------------------
+# Global tier resolver. Called by shim_run ONLY when the in-project tiers
+# missed (in-project ALWAYS wins; the registry is NEVER consulted when an
+# in-project CLI resolved). On success sets REA_ARGV + RESOLVED_CLI_PATH +
+# TRUST_TIER=global + _SHIM_GLOBAL_G_ROOT; on a fatal A1–A4 failure sets
+# _SHIM_GLOBAL_BAD_REASON; on a silent A5 / registry / resolve miss leaves
+# everything empty (byte-identical to feature-absent).
+# -----------------------------------------------------------------------------
+shim_resolve_cli_global() {
+  _SHIM_GLOBAL_BAD_REASON=""
+  _SHIM_GLOBAL_G_ROOT=""
+  # node is required for passwd derivation + lstat walk + realpath. No node
+  # → tier silently unavailable (same terminal as feature-absent).
+  command -v node >/dev/null 2>&1 || return 0
+  local gate=""
+  gate=$(shim_global_entry_gate "$proj" 2>/dev/null)
+  case "$gate" in
+    unavailable|"") return 0 ;; # silent A5 / registry / resolve miss
+  esac
+  # Success form is "<candidate>\n<g_root>". Parse the two lines (bash 3.2:
+  # ANSI-C $'\n' parameter-expansion trim — no `mapfile`).
+  local candidate="" g_root=""
+  candidate="${gate%%$'\n'*}"
+  g_root="${gate#*$'\n'}"
+  # Defensive: both must be non-empty absolute paths; else treat as silent.
+  case "$candidate" in /*) ;; *) return 0 ;; esac
+  case "$g_root" in /*) ;; *) return 0 ;; esac
+  local result=""
+  result=$(shim_sandbox_check_global "$candidate" "$g_root" 2>/dev/null)
+  case "$result" in
+    ok:*)
+      local real=""
+      real="${result#ok:}"
+      REA_ARGV=(node "$real")
+      RESOLVED_CLI_PATH="$real"
+      TRUST_TIER="global"
+      _SHIM_GLOBAL_G_ROOT="$g_root"
+      ;;
+    bad:*)
+      _SHIM_GLOBAL_BAD_REASON="$result"
+      ;;
+    *)
+      # "unavailable" (realpath threw) — silent, parity preserved.
+      ;;
+  esac
+}
+
+# -----------------------------------------------------------------------------
+# Global-tier veto decision (0.50.0 Phase 2b). The A5 registry gate can only
+# ENABLE the per-user global CLI; a project's OWN policy may further-RESTRICT
+# it via `runtime.allow_global_cli` — the enable/restrict asymmetry the design
+# turns on. This is the SINGLE source of truth for that decision, shared by
+# BOTH shim_run (step-4-global-veto) and local-review-gate.sh (push/commit
+# gate), so the 14 shims and the push gate cannot drift.
+#
+# Reads the veto THROUGH the sandbox-validated REA_ARGV CLI (the exact trust
+# level shim_policy_short_circuit relies on post-sandbox). MUST be called ONLY
+# when TRUST_TIER=global — that guarantees REA_ARGV is the non-empty validated
+# global CLI, so "${REA_ARGV[@]}" is safe under set -u.
+#
+# TWO-STEP + TYPE-STRICT + fail-closed on malformed config. `rea hook
+# policy-get` only PARSES YAML — it does NOT run the strict zod schema
+# loadPolicy() / `rea doctor` apply, so ANY shape the strict loader would
+# REJECT must never silently ENABLE the tier:
+#
+#   1. Read the PARENT `runtime` block (policy-get runtime --json). Verified
+#      shapes against the built CLI:
+#        runtime: {allow_global_cli: …} → {"allow_global_cli":…}  (valid object)
+#        runtime: []                    → []                       (malformed)
+#        runtime: "off"                 → "off"                    (malformed)
+#        runtime: 42                    → 42                        (malformed)
+#        runtime absent                 → null
+#        malformed YAML                 → null, exit 1
+#      Classify:
+#        non-zero exit                  → fail-closed VETO
+#        null                           → runtime absent → ALLOW
+#        starts with `{`                → valid object → step 2
+#        anything else ([, ", number …) → malformed runtime block → fail-closed VETO
+#   2. Read the LEAF `runtime.allow_global_cli --json` (TYPE-PRESERVING: JSON
+#      boolean `true` vs the string `"true"` vs `null`):
+#        non-zero exit                  → fail-closed VETO
+#        true                           → ALLOW
+#        null                           → allow_global_cli absent → ALLOW
+#        anything else (false, "true", "yes", garbage) → VETO
+#
+# Return: 0 = VETO (refuse the global tier), 1 = ALLOW (proceed).
+# -----------------------------------------------------------------------------
+shim_global_tier_vetoed() {
+  local _rt_out="" _rt_status=0
+  _rt_out=$("${REA_ARGV[@]}" hook policy-get runtime --json 2>/dev/null); _rt_status=$?
+  if [ "$_rt_status" -ne 0 ]; then
+    return 0  # policy-get errored / unparseable policy → fail-closed veto
+  fi
+  case "$_rt_out" in
+    null)
+      return 1  # runtime block absent → allow
+      ;;
+    '{'*)
+      : # valid object → fall through to the type-strict leaf read
+      ;;
+    *)
+      # runtime present with the WRONG TYPE ([], "off", 42, …) — a shape the
+      # strict loader REJECTS. Fail closed rather than ENABLE the tier.
+      return 0
+      ;;
+  esac
+  local _av_out="" _av_status=0
+  _av_out=$("${REA_ARGV[@]}" hook policy-get runtime.allow_global_cli --json 2>/dev/null); _av_status=$?
+  if [ "$_av_status" -ne 0 ]; then
+    return 0  # fail-closed veto
+  fi
+  case "$_av_out" in
+    true|null) return 1 ;;  # JSON boolean true, or null (allow_global_cli absent) → allow
+    *) return 0 ;;          # false | "true" | "yes" | any string / garbage → fail-closed veto
+  esac
 }
 
 # -----------------------------------------------------------------------------
@@ -266,6 +572,15 @@ shim_emit_sandbox_failure_banner() {
 shim_emit_sandbox_skip_banner() {
   local reason="$1"
   printf 'rea: %s skipped (sandbox check: %s)\n' "$SHIM_NAME" "$reason" >&2
+}
+
+# Global tier — one-line advisory when a BLESSED project resolves a global
+# CLI tree that fails A1–A4 (hostile/malformed). Never fired by an
+# un-blessed project (which degrades silently), so it cannot perturb the
+# feature-absent parity surface.
+shim_emit_global_tier_banner() {
+  local reason="$1"
+  printf 'rea: %s — global rea CLI tier rejected (%s); falling back to no-CLI.\n' "$SHIM_NAME" "$reason" >&2
 }
 
 shim_emit_version_skew_banner_blocking() {
@@ -309,8 +624,52 @@ shim_run() {
     fi
   fi
 
-  # 4. Resolve CLI.
+  # 4. Resolve CLI. In-project tiers ALWAYS win (byte-identical to today).
   shim_resolve_cli
+  local TRUST_TIER="project"
+
+  # 4-global (0.49.0 Phase 1b). ONLY when both in-project tiers missed do we
+  # consult the opt-in global tier. Registry membership is the SOLE gate
+  # (codex design-gate P1-1: NO policy read in this pre-CLI window). An
+  # un-blessed project leaves REA_ARGV empty + emits nothing, so the no-CLI
+  # terminal below is byte-identical to feature-absent. A5 + global
+  # resolution complete (and TRUST_TIER is final) BEFORE the cache block at
+  # step 4b builds its key — a HARD design invariant (codex P3-9): the
+  # cache's trust_tier + registry mtime/size fields are only sound if the
+  # live registry gate ran first.
+  if [ "${#REA_ARGV[@]}" -eq 0 ]; then
+    shim_resolve_cli_global
+  fi
+
+  # 4-global-veto (0.50.0 Phase 2b). OPTIONAL in-project veto over the global
+  # tier, via the SHARED shim_global_tier_vetoed helper (single source of
+  # truth for the decision — see its header for the two-step type-strict +
+  # fail-closed-on-malformed logic). Runs ONLY when the global tier actually
+  # resolved (TRUST_TIER=global ⇒ REA_ARGV is the sandbox-validated global
+  # CLI, so the helper's "${REA_ARGV[@]}" reads are safe under set -u).
+  #
+  # Placement is deliberate: this sits BEFORE the step-4b cache block and
+  # therefore fires on EVERY invocation, warm-cache fires included.
+  # `runtime.allow_global_cli` is intentionally kept OUT of the cache key
+  # (design memo) precisely so a mid-session edit adding
+  # `allow_global_cli: false` is honored on the very NEXT fire instead of
+  # surviving inside a warm entry. Gating this read behind the cache would
+  # reintroduce exactly the stale-consent hole the key-omission avoids. It
+  # also completes BEFORE the step-4b cache-key build, so TRUST_TIER is
+  # still final when that key is constructed (extends the step-4 invariant).
+  #
+  # On veto: behave EXACTLY like "project not in registry" / no-CLI — clear
+  # REA_ARGV, revert TRUST_TIER to project, and DO NOT set
+  # _SHIM_GLOBAL_BAD_REASON. A veto is a legitimate project CHOICE, not a
+  # security signal, so it stays SILENT — no bad:global-* advisory. The
+  # existing step-7 relevance-gated no-CLI terminal then makes a vetoed
+  # project byte-identical to an un-blessed / no-CLI project (harmless
+  # payload → exit 0 silent; relevant payload on a blocking shim →
+  # cli-missing banner + exit 2).
+  if [ "$TRUST_TIER" = "global" ] && shim_global_tier_vetoed; then
+    REA_ARGV=()
+    TRUST_TIER="project"
+  fi
 
   # 4a. Sandbox check (0.48.1 — moved earlier from step 5). Runs BEFORE
   #     the cache-key-prep block so the dist-tree `find` walk (added in
@@ -332,7 +691,16 @@ shim_run() {
   local sandbox_result=""
   local sandbox_failed=0
   local node_missing=0
-  if [ "${#REA_ARGV[@]}" -gt 0 ]; then
+  local real=""
+  # 0.49.0 Phase 1b: gated on TRUST_TIER=project. The global tier already
+  # ran its own A1–A4 sandbox (incl. the per-component lstat walk, st_dev,
+  # nlink, realpath containment, and the always-on dist/cli/index.js shape)
+  # inside shim_resolve_cli_global, and REA_ARGV already points at the
+  # validated realpath. Re-running the IN-PROJECT check here would reject a
+  # global CLI with bad:cli-escapes-project (it legitimately lives outside
+  # CLAUDE_PROJECT_DIR). node was already required for the global resolve,
+  # so the node-missing branch below is project-tier-only too.
+  if [ "${#REA_ARGV[@]}" -gt 0 ] && [ "$TRUST_TIER" = "project" ]; then
     if ! command -v node >/dev/null 2>&1; then
       # 0.38.1 round-2 P2 fix: pre-fix this branch exited 0/2 IMMEDIATELY
       # without ever calling shim_policy_short_circuit, so a blocking-
@@ -347,17 +715,33 @@ shim_run() {
       REA_ARGV=()
     else
       sandbox_result=$(shim_sandbox_check "$RESOLVED_CLI_PATH" "$proj" "$SHIM_ENFORCE_CLI_SHAPE")
-      if [ "$sandbox_result" != "ok" ]; then
-        sandbox_failed=1
-        if [ "$SHIM_FAIL_OPEN" -eq 1 ]; then
-          shim_emit_sandbox_skip_banner "$sandbox_result"
-          exit 0
-        fi
-        # Blocking-tier: clear REA_ARGV so Tier-1 policy reads (in
-        # shim_policy_short_circuit) degrade to Tier 2 / Tier 3 instead
-        # of invoking the untrusted CLI.
-        REA_ARGV=()
-      fi
+      # TOCTOU precursor: shim_sandbox_check now echoes `ok:<realpath>`
+      # on success. Execute the VALIDATED realpath instead of the
+      # literal RESOLVED_CLI_PATH so the version probe (step 8) and the
+      # forward (step 9) run the exact path the sandbox vetted. This
+      # shrinks the TOCTOU window to the same in-place-swap residual the
+      # in-project tier already has — it is NOT a same-inode guarantee
+      # (a rename-swap of the realpath after validation remains
+      # possible). bash 3.2: `case` glob match, no `[[ =~ ]]`.
+      case "$sandbox_result" in
+        ok:*)
+          real="${sandbox_result#ok:}"
+          REA_ARGV=(node "$real")
+          RESOLVED_CLI_PATH="$real"
+          ;;
+        *)
+          # bad:<reason> — sandbox refused.
+          sandbox_failed=1
+          if [ "$SHIM_FAIL_OPEN" -eq 1 ]; then
+            shim_emit_sandbox_skip_banner "$sandbox_result"
+            exit 0
+          fi
+          # Blocking-tier: clear REA_ARGV so Tier-1 policy reads (in
+          # shim_policy_short_circuit) degrade to Tier 2 / Tier 3 instead
+          # of invoking the untrusted CLI.
+          REA_ARGV=()
+          ;;
+      esac
     fi
   fi
 
@@ -383,6 +767,10 @@ shim_run() {
   local _shim_cache_dist_mtime=""
   local _shim_cache_node_real=""
   local _shim_cache_node_mtime=""
+  # 0.49.0 Phase 1b cache-key v2 fields.
+  local _registry_mtime=""
+  local _registry_size=""
+  local _effective_shape="$SHIM_ENFORCE_CLI_SHAPE"
   # 0.48.1: gated on `sandbox_failed -eq 0` so a sandbox refusal
   # short-circuits BEFORE the dist-tree hash walk runs (was running
   # against a possibly-symlinked-out target pre-0.48.1).
@@ -400,6 +788,12 @@ shim_run() {
     local _proj_real=""
     local _euid=""
     local _session_tok=""
+    # TOCTOU precursor cache-stability note: step 4a may have rewritten
+    # RESOLVED_CLI_PATH to its realpath. That does NOT drift the cache
+    # key value — `_shim_cache_cli_real` below runs realpathSync, so
+    # realpath-of-realpath is byte-identical to realpath-of-symlink, and
+    # `_stat_out` lstat reads the same underlying file (intermediate
+    # symlinks are kernel-resolved either way).
     _stat_out=$(shim_cache_mtime_size "$RESOLVED_CLI_PATH" 2>/dev/null || true)
     # 0.48.0 codex round-4 P1 + round-7 P2: capture the ACTUAL node
     # interpreter realpath + mtime via `process.execPath` (node's own
@@ -426,6 +820,27 @@ shim_run() {
     _proj_real=$(node -e 'try { process.stdout.write(require("fs").realpathSync(process.argv[1])); } catch (e) { process.exit(1); }' -- "$proj" 2>/dev/null || true)
     _euid=$(id -u 2>/dev/null || true)
     _session_tok=$(shim_cache_session_token 2>/dev/null || true)
+    # 0.49.0 Phase 1b — tier-aware key inputs. The global tier enforces the
+    # dist/cli/index.js shape unconditionally (A4), so the effective
+    # enforce_cli_shape key field is "1" there regardless of
+    # SHIM_ENFORCE_CLI_SHAPE. The registry mtime/size pin the trust source
+    # so an untrust mid-session (atomic rename → new mtime; removed line →
+    # smaller size — two invalidators defeat `touch -r`) misses a warm
+    # global entry. Stat failure → leave them empty → the completeness gate
+    # below produces a clean miss (fail-safe, NEVER fail-closed).
+    if [ "$TRUST_TIER" = "global" ]; then
+      _effective_shape="1"
+      if [ -n "${_SHIM_GLOBAL_G_ROOT:-}" ]; then
+        local _reg_path=""
+        _reg_path="$(dirname "$_SHIM_GLOBAL_G_ROOT")/trusted-projects"
+        local _reg_stat=""
+        _reg_stat=$(shim_cache_mtime_size "$_reg_path" 2>/dev/null || true)
+        if [ -n "$_reg_stat" ]; then
+          _registry_mtime="${_reg_stat%% *}"
+          _registry_size="${_reg_stat##* }"
+        fi
+      fi
+    fi
     # 0.48.0 codex round-3 P2: ALSO capture the ancestor package.json
     # path + mtime/size. The sandbox check walks upward to find a
     # package.json whose `name` is `@bookedsolid/rea`; without it in
@@ -529,7 +944,8 @@ shim_run() {
        && [ -n "$_euid" ] && [ -n "$_session_tok" ] \
        && [ -n "$_shim_cache_pkg_real" ] && [ -n "$_shim_cache_pkg_mtime" ] \
        && [ -n "$_shim_cache_dist_mtime" ] \
-       && [ -n "$_shim_cache_node_real" ] && [ -n "$_shim_cache_node_mtime" ]; then
+       && [ -n "$_shim_cache_node_real" ] && [ -n "$_shim_cache_node_mtime" ] \
+       && { [ "$TRUST_TIER" != "global" ] || { [ -n "$_registry_mtime" ] && [ -n "$_registry_size" ]; }; }; then
       _shim_cache_cli_mtime="${_stat_out%% *}"
       _shim_cache_cli_size="${_stat_out##* }"
       # 0.48.0 codex round-1 P1: the key MUST include SHIM_NAME because
@@ -547,12 +963,17 @@ shim_run() {
       # added/removed (most fresh `tsc` rebuilds do both); (c) the
       # package.json realpath is implicitly part of the key via these
       # mtime/size fields plus the project realpath above.
-      _shim_cache_key=$(shim_cache_key "v1" "$_session_tok" "$_proj_real" "$_shim_cache_cli_real" \
+      # 0.49.0 Phase 1b: schema "v1"→"v2"; enforce_cli_shape carries the
+      # EFFECTIVE value; trust_tier + registry mtime/size appended
+      # (positions 15-17). v1 entries become a clean miss at the read-side
+      # schema check (hard cutover).
+      _shim_cache_key=$(shim_cache_key "v2" "$_session_tok" "$_proj_real" "$_shim_cache_cli_real" \
                                        "$_shim_cache_cli_mtime" "$_shim_cache_cli_size" "$_euid" \
-                                       "$SHIM_ENFORCE_CLI_SHAPE" "$SHIM_NAME" \
+                                       "$_effective_shape" "$SHIM_NAME" \
                                        "$_shim_cache_pkg_mtime" "$_shim_cache_pkg_size" \
                                        "$_shim_cache_dist_mtime" \
                                        "$_shim_cache_node_real" "$_shim_cache_node_mtime" \
+                                       "$TRUST_TIER" "$_registry_mtime" "$_registry_size" \
                                        2>/dev/null || true)
       if [ -n "$_shim_cache_key" ]; then
         local _cache_json=""
@@ -572,9 +993,12 @@ shim_run() {
               const pkgMtime = String(e.pkg_mtime);
               const pkgSize = String(e.pkg_size_bytes);
               const distMtime = String(e.dist_mtime);
+              const trustTier = String(e.trust_tier);
+              const regMtime = String(e.registry_mtime);
+              const regSize = String(e.registry_size);
               const sandboxOk = e.sandbox_ok === true;
               const shapeOk = e.shape_ok === true;
-              if (e.schema_version !== "v1") process.exit(1);
+              if (e.schema_version !== "v2") process.exit(1);
               if (!Number.isFinite(ttl) || ttl <= 0 || ttl > 3600) process.exit(1);
               if (!Number.isFinite(cachedAt)) process.exit(1);
               if ((cachedAt + ttl) < now) process.exit(1);
@@ -597,10 +1021,18 @@ shim_run() {
               const nodeMtime = String(e.node_mtime);
               if (nodeReal !== process.argv[8]) process.exit(1);
               if (nodeMtime !== process.argv[9]) process.exit(1);
+              // 0.49.0 Phase 1b: re-check trust_tier + registry mtime/size.
+              // These are in the key too (a drifted state produces a
+              // different key), but persisting + re-validating them catches
+              // a key collision as a stale-entry miss instead of trusting
+              // it — and makes the cross-tier non-collision explicit.
+              if (trustTier !== process.argv[10]) process.exit(1);
+              if (regMtime !== process.argv[11]) process.exit(1);
+              if (regSize !== process.argv[12]) process.exit(1);
               if (!sandboxOk || !shapeOk) process.exit(1);
               process.stdout.write("ok");
             } catch (e) { process.exit(1); }
-          ' -- "$_cache_json" "$_shim_cache_cli_mtime" "$_shim_cache_cli_size" "$_shim_cache_cli_real" "$_shim_cache_pkg_mtime" "$_shim_cache_pkg_size" "$_shim_cache_dist_mtime" "$_shim_cache_node_real" "$_shim_cache_node_mtime" 2>/dev/null || true)
+          ' -- "$_cache_json" "$_shim_cache_cli_mtime" "$_shim_cache_cli_size" "$_shim_cache_cli_real" "$_shim_cache_pkg_mtime" "$_shim_cache_pkg_size" "$_shim_cache_dist_mtime" "$_shim_cache_node_real" "$_shim_cache_node_mtime" "$TRUST_TIER" "$_registry_mtime" "$_registry_size" 2>/dev/null || true)
           if [ "$_cache_validate" = "ok" ]; then
             _shim_cache_hit=1
           fi
@@ -648,20 +1080,46 @@ shim_run() {
       shim_emit_sandbox_failure_banner "$sandbox_result"
       exit 2
     fi
+    # 0.49.0 Phase 1b: a BLESSED project resolved a global CLI tree that
+    # failed A1–A4 (hostile/malformed). This MUST behave EXACTLY like "no
+    # CLI" for the relevance decision — otherwise a broken ~/.rea/cli would
+    # turn a harmless Bash/Write call into a repo-wide lockout for opted-in
+    # users on the relevance-gated blocking shims (dangerous-bash-
+    # interceptor, secret-scanner, settings-protection, blocked-paths-*,
+    # protected-paths-bash-gate). The relevance + tier exit logic below is
+    # SHARED between the plain CLI-missing and the bad-global-tree cases;
+    # the only difference is that a bad global tree emits its one-line
+    # advisory (which REPLACES the generic cli-missing banner) once we are
+    # past the not-relevant-allow exit. An irrelevant payload is therefore
+    # allowed SILENTLY, byte-identical to the pre-Phase-1b no-CLI path. Do
+    # NOT escalate advisory hooks to a hard block on a global plant (A2
+    # already proved only euid wrote the tree). Un-blessed projects never
+    # reach here (they degrade silently). The bad reason is unset when
+    # in-project resolved, so guard with :- for set -u.
     if declare -F shim_cli_missing_relevant >/dev/null 2>&1; then
       if ! shim_cli_missing_relevant; then
-        # CLI missing AND payload is not relevant per shim's keyword
-        # scan — the pre-port bash body would have allowed this.
+        # CLI missing — or a bad global tree, treated identically — AND the
+        # payload is not relevant per the shim's keyword scan. The pre-port
+        # bash body would have allowed this. Silent, no advisory.
         exit 0
       fi
     fi
-    # Either no callback defined OR the callback said "yes, relevant".
+    # Past here the payload IS relevant (or no callback is defined) → the
+    # gate would act. Surface the global-tier diagnostic ONCE if a bad
+    # global tree is the cause (it replaces the generic cli-missing banner).
+    if [ -n "${_SHIM_GLOBAL_BAD_REASON:-}" ]; then
+      shim_emit_global_tier_banner "$_SHIM_GLOBAL_BAD_REASON"
+    fi
     if [ "$SHIM_FAIL_OPEN" -eq 1 ]; then
-      # Advisory tier — drop the gate silently. No banner; advisory
-      # hooks are nudges, not security claims.
+      # Advisory tier — drop the gate. Any global-bad advisory was already
+      # emitted; advisory hooks are nudges, not security claims.
       exit 0
     fi
-    shim_emit_cli_missing_banner
+    # Relevant + blocking: refuse. The generic cli-missing banner only when
+    # a bad global tree did NOT already explain the refusal.
+    if [ -z "${_SHIM_GLOBAL_BAD_REASON:-}" ]; then
+      shim_emit_cli_missing_banner
+    fi
     exit 2
   fi
 
@@ -708,7 +1166,7 @@ shim_run() {
       const args = process.argv.slice(1);
       const now = Math.floor(Date.now() / 1000);
       const entry = {
-        schema_version: "v1",
+        schema_version: "v2",
         cli_realpath: args[0],
         cli_mtime: args[1],
         cli_size_bytes: args[2],
@@ -727,13 +1185,20 @@ shim_run() {
         // them and refuse a hit when the interpreter swapped.
         node_realpath: args[6],
         node_mtime: args[7],
+        // 0.49.0 Phase 1b: trust_tier + registry mtime/size (the read-side
+        // validator re-checks all three). registry_* are "" on the project
+        // tier; sandbox_ok/shape_ok are the tier-appropriate results — for
+        // global, A4 shape was enforced unconditionally during resolution.
+        trust_tier: args[8],
+        registry_mtime: args[9],
+        registry_size: args[10],
         sandbox_ok: true,
         shape_ok: true,
         cached_at_unix: now,
         ttl_seconds: 3600,
       };
       process.stdout.write(JSON.stringify(entry));
-    ' -- "$_shim_cache_cli_real" "$_shim_cache_cli_mtime" "$_shim_cache_cli_size" "$_shim_cache_pkg_mtime" "$_shim_cache_pkg_size" "$_shim_cache_dist_mtime" "$_shim_cache_node_real" "$_shim_cache_node_mtime" 2>/dev/null || true)
+    ' -- "$_shim_cache_cli_real" "$_shim_cache_cli_mtime" "$_shim_cache_cli_size" "$_shim_cache_pkg_mtime" "$_shim_cache_pkg_size" "$_shim_cache_dist_mtime" "$_shim_cache_node_real" "$_shim_cache_node_mtime" "$TRUST_TIER" "$_registry_mtime" "$_registry_size" 2>/dev/null || true)
     if [ -n "$_write_payload" ]; then
       shim_cache_write "$_shim_cache_key" "$_write_payload" >/dev/null 2>&1 || true
     fi
