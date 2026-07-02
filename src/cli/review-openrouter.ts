@@ -1548,7 +1548,7 @@ export async function executeOpenRouterReview(
   // P2-4 (round-6): the commit log (branch names + commit subjects, which can
   // carry PII like ticket URLs / customer names) is part of `userContent` and
   // therefore passes through the SAME redaction chokepoint below as the diff —
-  // it egresses, and that egress is disclosed in THREAT_MODEL §5.24.
+  // it egresses, and that egress is disclosed in THREAT_MODEL §5.25.
   let userContent = `Commits under review:\n${commitLog}\n\nDiff:\n${diffText}`;
   // codex round-16 P1: the WHOLE-diff `max_diff_bytes` cap and whole-diff
   // redaction apply ONLY when the whole `userContent` is what gets sent (the

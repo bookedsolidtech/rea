@@ -29,8 +29,10 @@
  */
 
 import { spawnSync } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 const REPO_ROOT = path.resolve(__dirname, '..', '..');
 const SHIM = path.join(REPO_ROOT, 'hooks', 'local-review-gate.sh');
@@ -294,5 +296,172 @@ describe('hooks/local-review-gate.sh — shim end-to-end', () => {
     } finally {
       spawnSync('rm', ['-rf', tmpdir]);
     }
+  });
+});
+
+// 0.50.0 Phase 2b — the global-CLI resolver tier wired into this shim. A
+// BLESSED global-only repo (no in-project @bookedsolid/rea) must resolve the
+// per-user global CLI instead of refusing the push as `cli-missing`. Same
+// guarded-skip-if-`~/.rea`-exists pattern the shim-runtime global e2e uses:
+// writes to the REAL passwd-derived ~/.rea and SKIPS when it already exists.
+describe('hooks/local-review-gate.sh — global tier (blessed global-only repo, real passwd home, guarded)', () => {
+  const REAL_HOME = os.userInfo().homedir;
+  const REAL_REA = path.join(REAL_HOME, '.rea');
+  let projectDir: string;
+  beforeEach(() => {
+    projectDir = fs.mkdtempSync(path.join(os.tmpdir(), 'rea-lrg-global-'));
+  });
+  afterEach(() => {
+    fs.rmSync(projectDir, { recursive: true, force: true });
+  });
+
+  function withFreshRea(body: (reaDir: string) => void): boolean {
+    if (fs.existsSync(REAL_REA)) {
+      return false; // documented residual: never clobber an existing ~/.rea
+    }
+    fs.mkdirSync(REAL_REA, { recursive: true });
+    fs.chmodSync(REAL_REA, 0o700);
+    try {
+      body(REAL_REA);
+      return true;
+    } finally {
+      fs.rmSync(REAL_REA, { recursive: true, force: true });
+    }
+  }
+
+  // Global CLI stub implementing the three subcommands this shim drives on
+  // the global tier: `hook local-review-gate --help` (version probe), `hook
+  // policy-get ...` (delegated to the real repo CLI so the policy reads hit
+  // the project policy.yaml), and the bare `hook local-review-gate` forward
+  // (emits a marker + exit 0 so a resolved tier is observable).
+  function installGlobalCli(reaDir: string): void {
+    const pkgRoot = path.join(reaDir, 'cli', 'node_modules', '@bookedsolid', 'rea');
+    const distCli = path.join(pkgRoot, 'dist', 'cli');
+    fs.mkdirSync(distCli, { recursive: true });
+    fs.writeFileSync(
+      path.join(pkgRoot, 'package.json'),
+      JSON.stringify({ name: '@bookedsolid/rea', version: '0.0.0-test' }),
+    );
+    const realCli = path.join(REPO_ROOT, 'dist', 'cli', 'index.js');
+    fs.writeFileSync(
+      path.join(distCli, 'index.js'),
+      `#!/usr/bin/env node
+const cp = require('child_process');
+const args = process.argv.slice(2);
+if (args.length >= 3 && args[0] === 'hook' && args[1] === 'local-review-gate' && args[2] === '--help') {
+  process.stdout.write('Usage: rea hook local-review-gate\\n');
+  process.exit(0);
+}
+if (args[0] === 'hook' && args[1] === 'policy-get') {
+  const r = cp.spawnSync(process.execPath, [${JSON.stringify(realCli)}, ...args], {
+    env: process.env, encoding: 'utf8',
+  });
+  if (r.stdout) process.stdout.write(r.stdout);
+  if (r.stderr) process.stderr.write(r.stderr);
+  process.exit(r.status == null ? 1 : r.status);
+}
+let buf = '';
+process.stdin.on('data', (c) => { buf += c; });
+process.stdin.on('end', () => {
+  process.stdout.write('LRG_GLOBAL_FORWARD:' + process.argv[1] + ':' + buf.length + '\\n');
+  process.exit(0);
+});
+`,
+    );
+    fs.chmodSync(path.join(distCli, 'index.js'), 0o755);
+  }
+
+  function blessRegistry(reaDir: string, entry: string): void {
+    const reg = path.join(reaDir, 'trusted-projects');
+    fs.writeFileSync(reg, entry + '\n');
+    fs.chmodSync(reg, 0o600);
+  }
+
+  function writePolicy(contents: string): void {
+    const reaProj = path.join(projectDir, '.rea');
+    fs.mkdirSync(reaProj, { recursive: true });
+    fs.writeFileSync(path.join(reaProj, 'policy.yaml'), contents);
+  }
+
+  function runShimIn(command: string): ShimResult {
+    const res = spawnSync('bash', [SHIM], {
+      cwd: projectDir,
+      env: {
+        PATH: process.env.PATH ?? '',
+        CLAUDE_PROJECT_DIR: projectDir,
+        HOME: process.env.HOME ?? '/tmp',
+        REA_SHIM_CACHE: '0',
+      },
+      input: JSON.stringify({ tool_name: 'Bash', tool_input: { command } }),
+      encoding: 'utf8',
+      timeout: 20_000,
+    });
+    return {
+      status: res.status ?? -1,
+      stdout: res.stdout ?? '',
+      stderr: res.stderr ?? '',
+    };
+  }
+
+  // Active gate: enforced + refuse_at push, NO in-project CLI in projectDir.
+  const ACTIVE_POLICY =
+    'profile: bst-internal\nreview:\n  local_review:\n    mode: enforced\n    refuse_at: push\n';
+
+  it('blessed global-only repo: `git push` is NOT cli-missing-blocked — tier resolves + forwards', () => {
+    if (!bashExists()) return;
+    const ran = withFreshRea((reaDir) => {
+      installGlobalCli(reaDir);
+      blessRegistry(reaDir, fs.realpathSync(projectDir));
+      writePolicy(ACTIVE_POLICY);
+      const r = runShimIn('git push origin main');
+      // Pre-fix: REA_ARGV empty → section 7 cli-missing banner + exit 2.
+      // Post-fix: the global tier resolves → the forward reaches the GLOBAL
+      // CLI (its realpath under <pw_dir>/.rea/cli), so the push is NOT blocked
+      // as cli-missing.
+      expect(r.stderr, `stderr: ${r.stderr}`).not.toContain('cannot run — the rea CLI is not built');
+      expect(r.stdout).toContain('LRG_GLOBAL_FORWARD:');
+      const line = r.stdout.split('\n').find((l) => l.startsWith('LRG_GLOBAL_FORWARD:')) ?? '';
+      expect(line).toContain(`.rea${path.sep}cli${path.sep}`); // ran the GLOBAL realpath
+      expect(r.status).toBe(0);
+    });
+    if (!ran) expect(fs.existsSync(REAL_REA)).toBe(true);
+  });
+
+  it('blessed global-only repo with allow_global_cli:false: `git push` is REFUSED — veto honored, NO forward', () => {
+    if (!bashExists()) return;
+    const ran = withFreshRea((reaDir) => {
+      installGlobalCli(reaDir);
+      blessRegistry(reaDir, fs.realpathSync(projectDir));
+      // Blessed in the registry (tier resolves) BUT the project vetoes the
+      // global CLI. The push gate must honor the veto: fall back to no-CLI →
+      // refuse cli-missing, NOT forward through the global CLI.
+      writePolicy(
+        'profile: bst-internal\nruntime:\n  allow_global_cli: false\n' +
+          'review:\n  local_review:\n    mode: enforced\n    refuse_at: push\n',
+      );
+      const r = runShimIn('git push origin main');
+      expect(r.status).toBe(2);
+      expect(r.stdout).not.toContain('LRG_GLOBAL_FORWARD:'); // veto → no forward through global CLI
+      expect(r.stderr).toContain('cannot run — the rea CLI is not built');
+      expect(r.stderr).not.toContain('global'); // veto is silent, not a bad:global advisory
+    });
+    if (!ran) expect(fs.existsSync(REAL_REA)).toBe(true);
+  });
+
+  it('un-blessed global-only repo: `git push` still refuses cli-missing (feature-absent parity, silent)', () => {
+    if (!bashExists()) return;
+    const ran = withFreshRea((reaDir) => {
+      installGlobalCli(reaDir);
+      // Registry is well-formed but lists a DIFFERENT path → not a member.
+      blessRegistry(reaDir, '/some/other/blessed/project');
+      writePolicy(ACTIVE_POLICY);
+      const r = runShimIn('git push origin main');
+      // Un-blessed → global tier silently unavailable → REA_ARGV stays empty
+      // → section 7 refuses, byte-identical to feature-absent (no advisory).
+      expect(r.status).toBe(2);
+      expect(r.stderr).toContain('cannot run — the rea CLI is not built');
+      expect(r.stderr).not.toContain('global');
+    });
+    if (!ran) expect(fs.existsSync(REAL_REA)).toBe(true);
   });
 });

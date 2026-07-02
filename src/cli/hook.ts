@@ -147,6 +147,25 @@ export async function runHookPushGate(options: HookPushGateOptions): Promise<voi
  * safety net for weird invocations (running the CLI from a script that
  * piped in nothing, a test that forgot to close the write end, etc.).
  */
+/**
+ * Passwd-derived absolute home directory for the `~/.rea` global-root
+ * scanner gate. Uses `os.userInfo().homedir` (libuv `getpwuid_r`), NEVER
+ * `$HOME` / `$XDG_*` — an agent can set those in-process, so an
+ * env-derived root is exactly the redirect surface this gate closes.
+ * Returns undefined on a passwd-lookup failure or a non-absolute home
+ * (feature-absent parity, mirroring the shim-runtime's silent
+ * "unavailable" — see `shim_global_entry_gate`).
+ */
+function passwdDerivedHome(): string | undefined {
+  try {
+    const home = os.userInfo().homedir;
+    if (typeof home === 'string' && home.startsWith('/')) return home;
+  } catch {
+    /* no passwd entry → gate disabled */
+  }
+  return undefined;
+}
+
 async function readStdinWithTimeout(timeoutMs: number): Promise<string> {
   return new Promise((resolve) => {
     const chunks: Buffer[] = [];
@@ -288,6 +307,12 @@ export async function runHookScanBash(options: HookScanBashOptions): Promise<voi
     // protected list is hardcoded; blocked_paths becomes an empty no-op.
   }
 
+  // Passwd-derived home for the `~/.rea` global-root gate (safe-global-
+  // CLI). Never `$HOME` / `$XDG_*` — an agent can move those in-process.
+  // A passwd-lookup failure leaves it undefined → gate disabled
+  // (feature-absent parity, mirroring the shim's silent "unavailable").
+  const passwdHome = passwdDerivedHome();
+
   let verdict: Verdict;
   try {
     if (options.mode === 'protected') {
@@ -298,6 +323,7 @@ export async function runHookScanBash(options: HookScanBashOptions): Promise<voi
             ...(protectedWrites !== undefined ? { protected_writes: protectedWrites } : {}),
             protected_paths_relax: protectedRelax,
           },
+          ...(passwdHome !== undefined ? { passwdHome } : {}),
           stderr: (line) => process.stderr.write(line),
         },
         cmd,

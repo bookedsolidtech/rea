@@ -324,4 +324,81 @@ describe('policy loader', () => {
       expect(second.injection?.suspicious_blocks_writes).toBe(true);
     });
   });
+
+  describe('runtime policy (0.50.0 safe-global-cli veto)', () => {
+    it('leaves runtime undefined when no runtime block is present (absent → permitted)', async () => {
+      await fs.writeFile(path.join(baseDir, '.rea', 'policy.yaml'), SAMPLE, 'utf8');
+      const p = loadPolicy(baseDir);
+      expect(p.runtime).toBeUndefined();
+    });
+
+    it('accepts runtime.allow_global_cli: true (explicit affirm — value round-trips)', async () => {
+      const yaml = SAMPLE + '\nruntime:\n  allow_global_cli: true\n';
+      await fs.writeFile(path.join(baseDir, '.rea', 'policy.yaml'), yaml, 'utf8');
+      const p = loadPolicy(baseDir);
+      expect(p.runtime).toBeDefined();
+      expect(p.runtime?.allow_global_cli).toBe(true);
+    });
+
+    it('accepts runtime.allow_global_cli: false (project veto — value round-trips)', async () => {
+      const yaml = SAMPLE + '\nruntime:\n  allow_global_cli: false\n';
+      await fs.writeFile(path.join(baseDir, '.rea', 'policy.yaml'), yaml, 'utf8');
+      const p = loadPolicy(baseDir);
+      expect(p.runtime).toBeDefined();
+      // false must survive as false — NOT collapsed to undefined. The shim
+      // veto wiring distinguishes explicit-false (project refuses) from
+      // absent (registry governs).
+      expect(p.runtime?.allow_global_cli).toBe(false);
+    });
+
+    it('preserves an empty runtime block (allow_global_cli omitted → undefined)', async () => {
+      const yaml = SAMPLE + '\nruntime: {}\n';
+      await fs.writeFile(path.join(baseDir, '.rea', 'policy.yaml'), yaml, 'utf8');
+      const p = loadPolicy(baseDir);
+      expect(p.runtime).toBeDefined();
+      expect(p.runtime?.allow_global_cli).toBeUndefined();
+    });
+
+    it('rejects a typo field inside runtime (strict — allow_globcli)', async () => {
+      const yaml = SAMPLE + '\nruntime:\n  allow_globcli: true\n';
+      await fs.writeFile(path.join(baseDir, '.rea', 'policy.yaml'), yaml, 'utf8');
+      expect(() => loadPolicy(baseDir)).toThrow(/Invalid policy schema/);
+    });
+
+    it('rejects a wrong-type allow_global_cli (string "yes")', async () => {
+      const yaml = SAMPLE + '\nruntime:\n  allow_global_cli: "yes"\n';
+      await fs.writeFile(path.join(baseDir, '.rea', 'policy.yaml'), yaml, 'utf8');
+      expect(() => loadPolicy(baseDir)).toThrow(/Invalid policy schema/);
+    });
+
+    it('loads a full .rea/policy.yaml-shaped fixture carrying runtime.allow_global_cli: false (strict-reject-of-unknown-field is solved)', async () => {
+      // The crux of Phase 2a: BEFORE the schema existed, ANY policy.yaml with
+      // a `runtime:` block failed to load entirely under the top-level
+      // `.strict()`. This fixture proves a realistic project policy that opts
+      // into the veto loads cleanly and round-trips the value.
+      const fixture = `version: "1"
+profile: "bst-internal"
+installed_by: "safe-global-cli-phase-2a"
+installed_at: "2026-06-30T00:00:00Z"
+autonomy_level: L1
+max_autonomy_level: L2
+promotion_requires_human_approval: true
+block_ai_attribution: true
+blocked_paths:
+  - ".env"
+  - ".env.*"
+  - ".rea/HALT"
+notification_channel: ""
+review:
+  codex_required: true
+runtime:
+  allow_global_cli: false
+`;
+      await fs.writeFile(path.join(baseDir, '.rea', 'policy.yaml'), fixture, 'utf8');
+      const p = loadPolicy(baseDir);
+      expect(p.profile).toBe('bst-internal');
+      expect(p.review?.codex_required).toBe(true);
+      expect(p.runtime?.allow_global_cli).toBe(false);
+    });
+  });
 });

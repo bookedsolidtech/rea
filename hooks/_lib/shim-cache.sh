@@ -32,7 +32,13 @@
 #
 # # Cache key fields (NUL-joined, sha256-hashed, first 32 hex chars)
 #
-#   schema_version       — "v1"
+#   schema_version       — "v2" (0.49.0 Phase 1b: bumped from "v1" for the
+#                          global-CLI resolver tier. v1 entries on disk are
+#                          a clean miss — the read-side validator in
+#                          shim-runtime.sh requires schema_version === "v2".
+#                          Hard cutover, no migration: the per-session cache
+#                          is tmpfs + 3600s TTL, so a schema bump is a free
+#                          drop-and-rebuild.)
 #   session_token        — see shim_cache_session_token
 #   project_root_realpath — realpath(CLAUDE_PROJECT_DIR)
 #   cli_realpath         — realpath(resolved CLI)
@@ -66,6 +72,21 @@
 #                          a swap that re-resolves to the SAME realpath
 #                          but with a different binary, e.g. an in-place
 #                          rebuild of node itself; rare but cheap)
+#   trust_tier           — "project" | "global" (0.49.0 Phase 1b). The
+#                          resolved tier. Makes the key tier-scoped so a
+#                          symlink that makes project-tier and global-tier
+#                          `cli_realpath` identical still yields DISTINCT
+#                          keys — project-tier can never read a global
+#                          entry's sandbox_ok:true and skip its own
+#                          containment check (design §8 case (a)).
+#   registry_mtime       — ns-mtime of <pw_dir>/.rea/trusted-projects on
+#                          the GLOBAL tier; "" on the project tier (design
+#                          §8 case (b): atomic-rename on trust/untrust
+#                          changes the mtime, defeating a warm global hit
+#                          after the project is untrusted mid-session).
+#   registry_size        — size-bytes of the registry on the GLOBAL tier;
+#                          "" on the project tier (a removed line shrinks
+#                          the file — two invalidators defeat `touch -r`).
 #
 # # Storage
 #
@@ -121,14 +142,19 @@
 #   shim_cache_session_token             — prints session token to stdout
 #                                          (empty + exit 1 means "cache
 #                                          disabled, no token derivable")
-#   shim_cache_key                       — args:
+#   shim_cache_key                       — args (17, in order):
 #                                            schema_version session_token
 #                                            project_realpath cli_realpath
 #                                            cli_mtime cli_size euid
 #                                            enforce_cli_shape shim_name
-#                                          (9 args; the helper accepts
-#                                          variadic but the caller in
-#                                          shim-runtime always passes 9)
+#                                            pkg_mtime pkg_size dist_mtime
+#                                            node_realpath node_mtime
+#                                            trust_tier registry_mtime
+#                                            registry_size
+#                                          (the helper accepts variadic but
+#                                          rejects fewer than 17 args; the
+#                                          caller in shim-runtime always
+#                                          passes 17 — 0.49.0 Phase 1b)
 #                                          prints the 32-char hex key
 #                                          (exit 1 on hash failure → caller
 #                                          treats as clean miss)
@@ -580,10 +606,11 @@ shim_cache_session_token() {
 #   shim_cache_key SCHEMA SESSION_TOKEN PROJECT_REALPATH CLI_REALPATH \
 #                  CLI_MTIME CLI_SIZE EUID ENFORCE_SHAPE SHIM_NAME \
 #                  PKG_MTIME PKG_SIZE DIST_DIR_MTIME \
-#                  NODE_REALPATH NODE_MTIME
+#                  NODE_REALPATH NODE_MTIME \
+#                  TRUST_TIER REGISTRY_MTIME REGISTRY_SIZE
 #
 # Echoes the 32-char hex key on success; empty + exit 1 on hash
-# failure. 0.48.0 evolution:
+# failure. Evolution:
 #   - codex round-1 P1: SHIM_NAME added so the cache is hook-scoped
 #     (the skipped probe `rea hook \$SHIM_NAME --help` is hook-specific)
 #   - codex round-3 P1+P2: PKG_MTIME / PKG_SIZE / DIST_DIR_MTIME added
@@ -595,9 +622,16 @@ shim_cache_session_token() {
 #     invalidates the entry (the warm hit would otherwise skip both
 #     node-availability AND the version probe, forwarding through a
 #     different interpreter).
+#   - 0.49.0 Phase 1b: TRUST_TIER + REGISTRY_MTIME + REGISTRY_SIZE added
+#     (positions 15-17) for the opt-in global-CLI resolver tier. The
+#     guard is raised from 14 to 17 args; the SCHEMA is bumped to "v2".
+#     ENFORCE_SHAPE (position 8) carries the EFFECTIVE value — "1" when
+#     the global tier is in effect (A4 shape is always-on there) OR
+#     SHIM_ENFORCE_CLI_SHAPE==1. REGISTRY_MTIME/SIZE are "" on the
+#     project tier.
 # -----------------------------------------------------------------------------
 shim_cache_key() {
-  if [ "$#" -lt 14 ]; then
+  if [ "$#" -lt 17 ]; then
     return 1
   fi
   _shim_cache_sha256_hex "$@"
