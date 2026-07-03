@@ -1468,6 +1468,157 @@ describe('rea doctor — checkPrepareCommitMsgHook hooks-dir resolution (0.30.1 
     );
     expect(() => checkPrepareCommitMsgHook(dir)).not.toThrow();
   });
+
+  // checkCommitMsgHook shares the same resolver. Pre-fix it hardcoded
+  // `.git/hooks/commit-msg`, so a repo wired through `core.hooksPath=.husky`
+  // (husky's classic install — git runs `.husky/commit-msg`, the attribution
+  // gate IS active) warned "missing" on every single doctor run. The rea
+  // dogfood repo itself hit this permanently. These pin the fix.
+  it('commit-msg check passes when the hook lives at core.hooksPath (husky layout)', async () => {
+    const dir = await initRepo();
+    const husky = path.join(dir, '.husky');
+    await fs.mkdir(husky, { recursive: true });
+    await fs.writeFile(path.join(husky, 'commit-msg'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    await execFileAsync('git', ['-C', dir, 'config', 'core.hooksPath', '.husky']);
+
+    const checks = collectChecks(dir);
+    const check = findCheck(checks, 'commit-msg hook installed');
+    expect(check?.status).toBe('pass');
+  });
+
+  it('commit-msg check still warns when core.hooksPath is set but the hook is absent there', async () => {
+    const dir = await initRepo();
+    const husky = path.join(dir, '.husky');
+    await fs.mkdir(husky, { recursive: true });
+    await execFileAsync('git', ['-C', dir, 'config', 'core.hooksPath', '.husky']);
+    // A commit-msg at the DEFAULT location is dead weight once hooksPath
+    // points elsewhere — git never runs it, so it must NOT satisfy the check.
+    await fs.mkdir(path.join(dir, '.git', 'hooks'), { recursive: true });
+    await fs.writeFile(path.join(dir, '.git', 'hooks', 'commit-msg'), '#!/bin/sh\nexit 0\n');
+
+    const checks = collectChecks(dir);
+    const check = findCheck(checks, 'commit-msg hook installed');
+    expect(check?.status).toBe('warn');
+    expect(check?.detail).toMatch(/missing/);
+  });
+
+  it('commit-msg check keeps resolving .git/hooks in a vanilla repo (no hooksPath)', async () => {
+    const dir = await initRepo();
+    await fs.mkdir(path.join(dir, '.git', 'hooks'), { recursive: true });
+    await fs.writeFile(path.join(dir, '.git', 'hooks', 'commit-msg'), '#!/bin/sh\nexit 0\n', {
+      mode: 0o755,
+    });
+
+    const checks = collectChecks(dir);
+    const check = findCheck(checks, 'commit-msg hook installed');
+    expect(check?.status).toBe('pass');
+  });
+
+  // Git silently SKIPS a hook without an exec bit, so a 0644 commit-msg
+  // means block_ai_attribution is disabled — doctor must fail, not pass
+  // (codex P2 on the second iteration of this fix).
+  it('commit-msg check fails when the active hook is not executable', async () => {
+    const dir = await initRepo();
+    const husky = path.join(dir, '.husky');
+    await fs.mkdir(husky, { recursive: true });
+    await fs.writeFile(path.join(husky, 'commit-msg'), '#!/bin/sh\nexit 0\n', { mode: 0o644 });
+    await execFileAsync('git', ['-C', dir, 'config', 'core.hooksPath', '.husky']);
+
+    const checks = collectChecks(dir);
+    const check = findCheck(checks, 'commit-msg hook installed');
+    expect(check?.status).toBe('fail');
+    expect(check?.detail).toMatch(/not executable/);
+  });
+
+  // Husky 9 layout: core.hooksPath=.husky/_ holds an auto-generated
+  // `. "${0%/*}/h"` stub that dispatches to the canonical `.husky/commit-msg`.
+  // The check must classify the CANONICAL body, not the stub — a non-empty
+  // stub with no canonical body is not an installed gate (codex P2 on the
+  // initial fix).
+  it('commit-msg check follows a husky 9 stub to the canonical body (pass)', async () => {
+    const dir = await initRepo();
+    const stubDir = path.join(dir, '.husky', '_');
+    await fs.mkdir(stubDir, { recursive: true });
+    await fs.writeFile(path.join(stubDir, 'commit-msg'), '#!/usr/bin/env sh\n. "${0%/*}/h"\n', {
+      mode: 0o755,
+    });
+    await fs.writeFile(path.join(stubDir, 'h'), '#!/usr/bin/env sh\n# husky runner\n');
+    await fs.writeFile(path.join(dir, '.husky', 'commit-msg'), '#!/bin/sh\nexit 0\n');
+    await execFileAsync('git', ['-C', dir, 'config', 'core.hooksPath', '.husky/_']);
+
+    const checks = collectChecks(dir);
+    const check = findCheck(checks, 'commit-msg hook installed');
+    expect(check?.status).toBe('pass');
+  });
+
+  it('commit-msg check warns when the husky 9 runner (h) is missing', async () => {
+    const dir = await initRepo();
+    const stubDir = path.join(dir, '.husky', '_');
+    await fs.mkdir(stubDir, { recursive: true });
+    await fs.writeFile(path.join(stubDir, 'commit-msg'), '#!/usr/bin/env sh\n. "${0%/*}/h"\n', {
+      mode: 0o755,
+    });
+    // Canonical body present, but NO `.husky/_/h` runner — the stub
+    // sources it first, so `git commit` fails before the body runs.
+    await fs.writeFile(path.join(dir, '.husky', 'commit-msg'), '#!/bin/sh\nexit 0\n');
+    await execFileAsync('git', ['-C', dir, 'config', 'core.hooksPath', '.husky/_']);
+
+    const checks = collectChecks(dir);
+    const check = findCheck(checks, 'commit-msg hook installed');
+    expect(check?.status).toBe('warn');
+    expect(check?.detail).toMatch(/missing or unreadable/);
+  });
+
+  it('commit-msg check warns when a husky 9 stub has no canonical body', async () => {
+    const dir = await initRepo();
+    const stubDir = path.join(dir, '.husky', '_');
+    await fs.mkdir(stubDir, { recursive: true });
+    await fs.writeFile(path.join(stubDir, 'commit-msg'), '#!/usr/bin/env sh\n. "${0%/*}/h"\n', {
+      mode: 0o755,
+    });
+    await fs.writeFile(path.join(stubDir, 'h'), '#!/usr/bin/env sh\n# husky runner\n');
+    // NO .husky/commit-msg canonical body.
+    await execFileAsync('git', ['-C', dir, 'config', 'core.hooksPath', '.husky/_']);
+
+    const checks = collectChecks(dir);
+    const check = findCheck(checks, 'commit-msg hook installed');
+    expect(check?.status).toBe('warn');
+    expect(check?.detail).toMatch(/no canonical body/);
+  });
+
+  it('commit-msg check fails when the husky 9 canonical body is a directory', async () => {
+    const dir = await initRepo();
+    const stubDir = path.join(dir, '.husky', '_');
+    await fs.mkdir(stubDir, { recursive: true });
+    await fs.writeFile(path.join(stubDir, 'commit-msg'), '#!/usr/bin/env sh\n. "${0%/*}/h"\n', {
+      mode: 0o755,
+    });
+    await fs.writeFile(path.join(stubDir, 'h'), '#!/usr/bin/env sh\n# husky runner\n');
+    // Bad-migration shape: a DIRECTORY where the canonical body should be.
+    await fs.mkdir(path.join(dir, '.husky', 'commit-msg'), { recursive: true });
+    await execFileAsync('git', ['-C', dir, 'config', 'core.hooksPath', '.husky/_']);
+
+    const checks = collectChecks(dir);
+    const check = findCheck(checks, 'commit-msg hook installed');
+    expect(check?.status).toBe('fail');
+  });
+
+  it('commit-msg check fails when the husky 9 canonical body is empty', async () => {
+    const dir = await initRepo();
+    const stubDir = path.join(dir, '.husky', '_');
+    await fs.mkdir(stubDir, { recursive: true });
+    await fs.writeFile(path.join(stubDir, 'commit-msg'), '#!/usr/bin/env sh\n. "${0%/*}/h"\n', {
+      mode: 0o755,
+    });
+    await fs.writeFile(path.join(stubDir, 'h'), '#!/usr/bin/env sh\n# husky runner\n');
+    await fs.writeFile(path.join(dir, '.husky', 'commit-msg'), '');
+    await execFileAsync('git', ['-C', dir, 'config', 'core.hooksPath', '.husky/_']);
+
+    const checks = collectChecks(dir);
+    const check = findCheck(checks, 'commit-msg hook installed');
+    expect(check?.status).toBe('fail');
+    expect(check?.detail).toMatch(/empty/);
+  });
 });
 
 /**
