@@ -477,11 +477,12 @@ export type BillingErrorResponse = 'halt' | 'warn' | 'off';
 
 export interface SpendGovernancePolicy {
   /**
-   * Master switch. When `false` — or when the whole `spend_governance`
-   * block is omitted — the `billing-cap-halt.sh` hook is a silent no-op.
-   * Default `false` at the schema layer (absent block = disabled, the
-   * safe upgrade posture); every shipped profile pins `true` because a
-   * billing→HALT reflex has no false-positive cost worth the risk.
+   * Master switch. OPT-OUT: the `billing-cap-halt.sh` reflex is a no-op
+   * ONLY when this is positively `false` (or `billing_error_response:
+   * off`). Default `true` at the schema layer, and an ABSENT block also
+   * resolves to enabled (`.default({})`) — the reflex is ON for any present
+   * rea policy unless it opts out, per the incident mandate. Every shipped
+   * profile still pins `true` explicitly.
    */
   enabled?: boolean;
   /**

@@ -366,17 +366,21 @@ const DelegationAdvisoryPolicySchema = z
  * or a premature future-field fails loudly at policy load, matching
  * every other block.
  *
- * Defaults live here at the schema layer: a block that is present but
- * omits fields gets `enabled: false` (the strict-upgrade-safe default —
- * an ABSENT block is likewise a no-op via `.optional()` at the top-level
- * schema) and `billing_error_response: 'halt'`. Every shipped profile
- * pins `enabled: true` because the billing→HALT reflex has no
- * false-positive cost worth the risk (unlike delegation_advisory, which
- * is opinion and ships bst-internal-only).
+ * OPT-OUT defaults (incident mandate "default ON, zero-exception", codex
+ * 0.51.0 round-5/6): a block that is present but omits `enabled` gets
+ * `enabled: true`, and an ABSENT block gets the whole default object
+ * (`.default({})` at the top-level schema) so `loadPolicy()` agrees with
+ * the runtime hook's opt-out reading — the reflex is ON for any present
+ * rea policy unless it positively sets `enabled: false` (or
+ * `billing_error_response: off`). This keeps the strict loader and the
+ * `billing-cap-halt` hook in lockstep; a split where one says on and the
+ * other off was the round-6 finding. `billing_error_response` defaults to
+ * the protective `'halt'`. Every shipped profile still pins the block
+ * explicitly for documentation, but absence no longer means disabled.
  */
 const SpendGovernancePolicySchema = z
   .object({
-    enabled: z.boolean().default(false),
+    enabled: z.boolean().default(true),
     billing_error_response: z.enum(['halt', 'warn', 'off']).default('halt'),
   })
   .strict();
@@ -540,14 +544,16 @@ const PolicySchema = z
     // supplies defaults for any omitted field.
     delegation_advisory: DelegationAdvisoryPolicySchema.optional(),
     // 0.51.0 spend-governance (E1 seed) — drives the `billing-cap-halt.sh`
-    // PostToolUse hook. `.optional()` so a vanilla / pre-0.51.0 install
-    // with no block sees the hook as a silent no-op (an absent block is
-    // disabled, the strict-upgrade-safe posture). When the block IS
-    // present the inner schema supplies `enabled: false` +
-    // `billing_error_response: 'halt'` for any omitted field. Every
-    // shipped profile pins `enabled: true`. See `SpendGovernancePolicySchema`
-    // and `THREAT_MODEL.md §5.25`.
-    spend_governance: SpendGovernancePolicySchema.optional(),
+    // PostToolUse hook. `.default({})` (NOT `.optional()`) so an ABSENT
+    // block resolves to the opt-out default (`enabled: true`,
+    // `billing_error_response: 'halt'`) — the reflex is ON for any present
+    // rea policy unless it positively opts out. This keeps `loadPolicy()`
+    // in lockstep with the runtime hook's opt-out reading (codex round-6:
+    // a split where the schema said off-by-default while the hook enforced
+    // on was the defect). When the block IS present the inner schema fills
+    // any omitted field. Every shipped profile still pins it explicitly.
+    // See `SpendGovernancePolicySchema` and `THREAT_MODEL.md §5.25`.
+    spend_governance: SpendGovernancePolicySchema.default({}),
     // 0.48.0 per-session shim cache — drives `hooks/_lib/shim-cache.sh`
     // which short-circuits the sandbox check + version probe in
     // `hooks/_lib/shim-runtime.sh` on session-warm fires of the same

@@ -151,14 +151,16 @@ export interface ResolvedConfig {
    */
   bootstrapAllowlistEnabled?: boolean;
   /**
-   * 0.51.0 spend-governance (E1 seed) — the billing→HALT reflex. Emitted
-   * into `.rea/policy.yaml` on EVERY install (schema default is OFF, so —
-   * unlike bootstrap_allowlist — the block MUST be written explicitly or
-   * the reflex ships disabled). Seeded from the layered profile, which
-   * pins `enabled: true` + `billing_error_response: halt` on every shipped
-   * profile; preserved across re-init so an operator override survives.
-   * When `undefined` (a custom profile that declares no spend_governance),
-   * the writer emits no block and the reflex stays off for that install.
+   * 0.51.0 spend-governance (E1 seed) — the billing→HALT reflex. OPT-OUT:
+   * an absent block already resolves to ON at load (schema `.default({})`),
+   * so emitting is documentation, not activation. Seeded from the layered
+   * profile (every shipped profile pins `enabled: true` +
+   * `billing_error_response: halt`) and preserved across re-init so an
+   * operator override — including a mode-only `billing_error_response: warn`
+   * — survives. When `undefined` (a custom profile that declares no
+   * spend_governance) the writer emits no block, but the reflex is still ON
+   * for that install via the opt-out default; opting out is an explicit
+   * `enabled: false`.
    */
   spendGovernanceEnabled?: boolean;
   spendGovernanceBillingErrorResponse?: 'halt' | 'warn' | 'off';
@@ -558,15 +560,14 @@ function bootstrapAllowlistConfigSpread(
  *   2. Layered profile — every SHIPPED profile pins `enabled: true` +
  *      `billing_error_response: halt`.
  *   3. Omitted — a custom profile declaring no spend_governance emits no
- *      block (the reflex stays off for that install).
+ *      block, but the reflex is still ON via the opt-out default.
  *
- * CRITICAL difference from bootstrap_allowlist: the zod schema default is
- * `enabled: false` (absent block = disabled), so omitting the block does
- * NOT fall through to an enabled default. For the reflex to actually ship
- * ON, the block MUST be emitted — which it is for every shipped profile,
- * because they all pin it and the writer emits whenever `enabled` resolves.
- * Fields are resolved independently so an operator who set only `warn`
- * still gets `enabled` from the profile (and vice-versa).
+ * OPT-OUT (codex round-6): the zod schema now `.default({})`s an absent
+ * block to `enabled: true`, so — like bootstrap_allowlist — omitting the
+ * block no longer disables the reflex. Emission is documentation, not
+ * activation. Fields resolve independently so an operator who set only
+ * `warn` still round-trips that mode (the writer emits a mode-only block),
+ * and one who set only `enabled` keeps it.
  */
 function spendGovernanceConfigSpread(
   layered: Profile,
@@ -1066,16 +1067,22 @@ function writePolicyYaml(targetDir: string, config: ResolvedConfig, layered: Pro
     lines.push(`bootstrap_allowlist:`);
     lines.push(`  enabled: ${config.bootstrapAllowlistEnabled ? 'true' : 'false'}`);
   }
-  // 0.51.0 spend-governance (E1 seed) — the billing→HALT reflex. Emitted
-  // whenever `enabled` resolves (every shipped profile pins it). Unlike
-  // bootstrap_allowlist, omitting the block does NOT enable it (schema
-  // default is OFF), so this MUST be written for the reflex to ship on.
-  // `billing_error_response` only emits when resolved (default `halt` is
-  // also the schema default, so an operator who left it unset still gets
-  // `halt` at load — but the shipped profiles pin it explicitly).
-  if (config.spendGovernanceEnabled !== undefined) {
+  // 0.51.0 spend-governance (E1 seed) — the billing→HALT reflex. Opt-out:
+  // an absent block already resolves to ON at load (schema `.default({})`),
+  // so emitting is for documentation, not activation. Emit whenever EITHER
+  // field resolves so a MODE-ONLY block (`spend_governance: {
+  // billing_error_response: warn }`, valid — `enabled` defaults true) round-
+  // trips through `rea init --force` instead of being silently dropped
+  // (codex round-6 P2). Each field emits only when present, so a mode-only
+  // block stays mode-only.
+  if (
+    config.spendGovernanceEnabled !== undefined ||
+    config.spendGovernanceBillingErrorResponse !== undefined
+  ) {
     lines.push(`spend_governance:`);
-    lines.push(`  enabled: ${config.spendGovernanceEnabled ? 'true' : 'false'}`);
+    if (config.spendGovernanceEnabled !== undefined) {
+      lines.push(`  enabled: ${config.spendGovernanceEnabled ? 'true' : 'false'}`);
+    }
     if (config.spendGovernanceBillingErrorResponse !== undefined) {
       lines.push(`  billing_error_response: ${config.spendGovernanceBillingErrorResponse}`);
     }
