@@ -50,6 +50,10 @@ SHIM_REFUSAL_NOUN="the billing-cap-halt reflex"
 
 # Shared coarse billing-keyword match. Superset of the CLI's BILLING_RE
 # (never narrower — an under-trigger would be a missed billing halt).
+# Used ONLY by the CLI-PRESENT relevance pre-gate (`shim_is_relevant`),
+# where an over-trigger just spawns the CLI (which then applies the precise
+# channel-restricted BILLING_RE and no-ops on benign input) — cheap, and
+# breadth is REQUIRED so the perf gate never drops a real signal.
 # Takes already-lower-cased text on $1. bash 3.2 `case` glob match.
 _billing_kw_match() {
   case "$1" in
@@ -60,6 +64,27 @@ _billing_kw_match() {
     *"payment required"*) return 0 ;;
     *"billing"*) return 0 ;;
     *"402 payment"*) return 0 ;;
+  esac
+  return 1
+}
+
+# STRICT billing match — only the unambiguous, multi-word billing-wall
+# phrases that essentially never appear in benign stderr. Used ONLY by the
+# CLI-MISSING fail-closed path, where an over-trigger causes a FALSE HALT
+# (exit 2) with no CLI to disambiguate (codex 0.51.0 round-2 P2). The broad
+# `_billing_kw_match` would fire on `insufficient permissions` or a failed
+# `cat billing-report.txt` during the "hooks upgraded before pnpm build"
+# window. This tighter set trades that false-block risk for a narrower
+# guarantee: during the TRANSIENT no-CLI window a rarer billing phrasing
+# may not fail-closed — it is caught the moment the CLI is built (the
+# authoritative BILLING_RE). Every phrase here is a strict subset of
+# BILLING_RE. Takes already-lower-cased text on $1.
+_billing_kw_strict() {
+  case "$1" in
+    *"spending cap"*) return 0 ;;
+    *"prepayment credit"*) return 0 ;;
+    *"credit balance is too low"*) return 0 ;;
+    *"insufficient_quota"*) return 0 ;;
   esac
   return 1
 }
@@ -88,7 +113,7 @@ shim_cli_missing_relevant() {
   if ! command -v node >/dev/null 2>&1; then
     local lower=""
     lower=$(printf '%s' "$INPUT" | tr '[:upper:]' '[:lower:]' 2>/dev/null || printf '%s' "$INPUT")
-    _billing_kw_match "$lower"
+    _billing_kw_strict "$lower"
     return $?
   fi
   local errout=""
@@ -113,7 +138,7 @@ shim_cli_missing_relevant() {
   ' 2>/dev/null) || return 0
   local lower=""
   lower=$(printf '%s' "$errout" | tr '[:upper:]' '[:lower:]' 2>/dev/null || printf '%s' "$errout")
-  _billing_kw_match "$lower"
+  _billing_kw_strict "$lower"
 }
 
 # shellcheck source=_lib/shim-runtime.sh

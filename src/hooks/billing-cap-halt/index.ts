@@ -157,9 +157,22 @@ interface RawSpendGovernance {
  * them locally.
  *
  * Returns `{ enabled: false }` (disabled) when:
- *   - the policy file is missing or unparseable,
+ *   - the policy file is missing/unreadable (genuine no-config — the
+ *     operator has no rea policy for this checkout),
  *   - `spend_governance` is absent or not an object,
  *   - `enabled` is anything other than the literal `true`.
+ *
+ * FAIL-SAFE toward PROTECTION when the policy file is PRESENT but its
+ * YAML does not parse (a syntax error, a mid-edit merge conflict, a typo
+ * ANYWHERE in the file): returns `{ enabled: true, mode: 'halt' }` rather
+ * than silently disabling the last-resort spend guard (codex 0.51.0
+ * round-2 P2). A broken policy is a degraded state; dropping the billing
+ * reflex during it — precisely when an operator is mid-edit — is the
+ * wrong direction for a safety control. The only cost is a freeze IF a
+ * genuine billing signal also appears while the policy is broken, which
+ * is rare and worth stopping. A missing file is distinct (no rea config
+ * at all → stays disabled). We cannot read `billing_error_response` from
+ * unparseable YAML, so we default to the protective `halt`.
  *
  * `billing_error_response` is validated against the enum; any other
  * value (including a typo the strict loader would reject) is treated as
@@ -170,18 +183,22 @@ function readSpendGovernance(reaRoot: string): {
   mode: BillingErrorResponse;
 } {
   const disabled = { enabled: false, mode: 'halt' as BillingErrorResponse };
+  const protect = { enabled: true, mode: 'halt' as BillingErrorResponse };
   const policyPath = path.join(reaRoot, '.rea', 'policy.yaml');
   let raw: string;
   try {
     raw = fs.readFileSync(policyPath, 'utf8');
   } catch {
+    // Missing / unreadable file → genuine no-config → disabled.
     return disabled;
   }
   let parsed: unknown;
   try {
     parsed = parseYaml(raw);
   } catch {
-    return disabled;
+    // Present but UNPARSEABLE (syntax error / merge conflict) → fail-safe
+    // toward protection rather than silently dropping the guard.
+    return protect;
   }
   if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
     return disabled;

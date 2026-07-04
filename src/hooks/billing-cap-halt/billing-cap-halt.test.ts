@@ -255,6 +255,41 @@ describe('runBillingCapHalt', () => {
   });
 });
 
+describe('policy degradation — malformed YAML fails toward protection (round-2 P2)', () => {
+  it('present-but-unparseable policy → PROTECT (billing signal still HALTs)', async () => {
+    const root = makeRoot();
+    // A real spend-governance install (feature on by default) whose YAML
+    // is broken by a syntax error in an UNRELATED section — the exact
+    // mid-edit / merge-conflict scenario. The guard must NOT silently
+    // vanish; it defaults to the protective halt.
+    fs.mkdirSync(path.join(root, '.rea'), { recursive: true });
+    fs.writeFileSync(
+      path.join(root, '.rea', 'policy.yaml'),
+      'version: "1"\nblocked_paths: [unclosed\n  : : bad indent :\n',
+    );
+    const res = await runBillingCapHalt({
+      reaRoot: root,
+      stdinOverride: payload('node tts.mjs', 'Error: spending cap exceeded'),
+    });
+    expect(res.action).toBe('halt');
+    expect(res.exitCode).toBe(2);
+    expect(fs.existsSync(haltPath(root))).toBe(true);
+    rm(root);
+  });
+
+  it('MISSING policy file → disabled (no HALT even on a billing signal)', async () => {
+    const root = makeRoot(); // no .rea/policy.yaml at all
+    const res = await runBillingCapHalt({
+      reaRoot: root,
+      stdinOverride: payload('node tts.mjs', 'spending cap exceeded'),
+    });
+    expect(res.action).toBe('noop');
+    expect(res.exitCode).toBe(0);
+    expect(fs.existsSync(haltPath(root))).toBe(false);
+    rm(root);
+  });
+});
+
 describe('BILLING_RE distinctness from rate-limit', () => {
   it('matches terminal billing phrases', () => {
     for (const s of [
