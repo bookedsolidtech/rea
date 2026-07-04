@@ -102,6 +102,42 @@ describe('runBillingCapHalt', () => {
     expect(r.stderr).toMatch(/BILLING HALT/);
   });
 
+  function lastAudit(r: string): Record<string, unknown> {
+    const p = path.join(r, '.rea', 'audit.jsonl');
+    const lines = fs.readFileSync(p, 'utf8').trim().split('\n');
+    return JSON.parse(lines[lines.length - 1]) as Record<string, unknown>;
+  }
+
+  it('halt appends a durable audit record (round-13 P2)', async () => {
+    writePolicy(root, 'halt');
+    await runBillingCapHalt({ reaRoot: root, stdinOverride: payload('node tts.mjs', BILLING) });
+    const rec = lastAudit(root);
+    expect(rec['tool_name']).toBe('rea.spend_governance.billing');
+    const md = rec['metadata'] as Record<string, unknown>;
+    expect(md['action']).toBe('halt');
+    expect(md['halt_written']).toBe(true);
+    expect(md['signature']).toBeTruthy();
+  });
+
+  it('warn appends a durable audit record with halt_written false (round-13 P2)', async () => {
+    writePolicy(root, 'warn');
+    await runBillingCapHalt({ reaRoot: root, stdinOverride: payload('node tts.mjs', BILLING) });
+    const rec = lastAudit(root);
+    expect(rec['tool_name']).toBe('rea.spend_governance.billing');
+    const md = rec['metadata'] as Record<string, unknown>;
+    expect(md['action']).toBe('warn');
+    expect(md['halt_written']).toBe(false);
+  });
+
+  it('no match → NO audit record appended', async () => {
+    writePolicy(root, 'halt');
+    await runBillingCapHalt({
+      reaRoot: root,
+      stdinOverride: payload('ls -la', 'total 0'),
+    });
+    expect(fs.existsSync(path.join(root, '.rea', 'audit.jsonl'))).toBe(false);
+  });
+
   it('billing signature + warn → exit 0 (advisory, non-blocking), NO HALT', async () => {
     writePolicy(root, 'warn');
     const r = await runBillingCapHalt({

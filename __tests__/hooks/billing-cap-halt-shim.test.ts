@@ -261,11 +261,11 @@ describe('billing-cap-halt CLI-missing opt-out (round-8 P2)', () => {
   });
 
   it.skipIf(!bashExists())(
-    'opt-out default (no block) → seed default warn → does NOT fail closed (round-12)',
+    'no block (no positive opt-out) → fail-closed refuse in the CLI-missing window (round-13 P1)',
     () => {
-      // A present policy with no spend_governance block is enabled at the
-      // SEED default `warn`. Only an EXPLICIT `halt` fails closed in the
-      // CLI-missing window; `warn` (the default) must not refuse.
+      // A present policy with no spend_governance block is NOT a positive
+      // opt-out. The shim can't deliver `warn` without the CLI, so it errs
+      // toward protection: a transient exit-2 refuse until the CLI is built.
       const withBlockAbsent = [
         'version: "1"',
         'profile: "test"',
@@ -277,7 +277,29 @@ describe('billing-cap-halt CLI-missing opt-out (round-8 P2)', () => {
         failedPayload('node tts.mjs', 'FATAL: spending cap exceeded'),
         withBlockAbsent,
       );
-      expect(r.status).toBe(0);
+      expect(r.status).toBe(2);
+    },
+  );
+
+  it.skipIf(!bashExists())(
+    'unreadable/flow-form mode (no positive opt-out) → still fails closed (round-13 P1)',
+    () => {
+      // Flow-form block the Tier-3 awk fallback can't parse: the mode is
+      // unreadable, but it is NOT a positive opt-out, so fail-closed is
+      // preserved rather than silently dropped.
+      const flowForm = [
+        'version: "1"',
+        'profile: "test"',
+        'installed_by: "t"',
+        'blocked_paths: []',
+        'spend_governance: { enabled: true, billing_error_response: halt }',
+        '',
+      ].join('\n');
+      const r = runShimInUnbuiltDir(
+        failedPayload('node tts.mjs', 'FATAL: spending cap exceeded'),
+        flowForm,
+      );
+      expect(r.status).toBe(2);
     },
   );
 

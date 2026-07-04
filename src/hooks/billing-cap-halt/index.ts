@@ -106,8 +106,46 @@ import {
   readStdinWithTimeout,
 } from '../_lib/payload.js';
 import { writeHaltFile, sanitizeHaltReason } from '../../cli/freeze.js';
+import { appendAuditRecord } from '../../audit/append.js';
+import { InvocationStatus, Tier } from '../../policy/types.js';
 
 export type BillingErrorResponse = 'halt' | 'warn' | 'off';
+
+/**
+ * Durable audit trail for a billing match (codex 0.51.0 round-13 P2). The
+ * banner is ephemeral and `.rea/HALT` is removed on `rea unfreeze`, so
+ * without this a `warn` match — or a freeze that was later cleared — leaves
+ * no record that the spend-governance reflex ever fired. Appends one
+ * hash-chained record to `.rea/audit.jsonl` (`rea.spend_governance.billing`)
+ * carrying ONLY the sanitized, bounded signature (never raw vendor output),
+ * the mode, and whether HALT was written. Best-effort: an audit failure must
+ * NOT break the reflex, so this swallows errors — the banner/HALT are the
+ * primary effect, the audit is secondary observability.
+ */
+async function recordBillingAudit(
+  reaRoot: string,
+  info: { action: 'warn' | 'halt'; matched: string; haltWritten: boolean; writeError?: string },
+): Promise<void> {
+  try {
+    await appendAuditRecord(reaRoot, {
+      tool_name: 'rea.spend_governance.billing',
+      server_name: 'billing-cap-halt',
+      // A freeze DENIES further work; a warn is an advisory that ALLOWS the
+      // call to proceed. Reflect that in the audit status.
+      status: info.action === 'halt' ? InvocationStatus.Denied : InvocationStatus.Allowed,
+      tier: Tier.Destructive,
+      metadata: {
+        kind: 'billing-cap-halt',
+        action: info.action,
+        signature: info.matched,
+        halt_written: info.haltWritten,
+        ...(info.writeError !== undefined ? { halt_write_error: info.writeError } : {}),
+      },
+    });
+  } catch {
+    /* observability is secondary — never let an audit failure break the gate */
+  }
+}
 
 export interface BillingCapHaltOptions {
   reaRoot?: string;
@@ -410,6 +448,7 @@ export async function runBillingCapHalt(
     // is the non-freezing mode, so it must NOT block the call — it just
     // surfaces the banner (like the other advisory PostToolUse hooks).
     writeStderr(buildBanner(matched, 'warn'));
+    await recordBillingAudit(reaRoot, { action: 'warn', matched, haltWritten: false });
     return { exitCode: 0, stderr, action: 'warn', matched, haltWritten: false };
   }
 
@@ -427,10 +466,13 @@ export async function runBillingCapHalt(
     // round-1 P1). Emit an explicit degraded-state banner instead, still
     // exit 2 so the reflex does not silently disappear and the agent is
     // told to stop.
-    writeStderr(buildWriteFailedBanner(matched, err instanceof Error ? err.message : String(err)));
+    const writeError = err instanceof Error ? err.message : String(err);
+    writeStderr(buildWriteFailedBanner(matched, writeError));
+    await recordBillingAudit(reaRoot, { action: 'halt', matched, haltWritten: false, writeError });
     return { exitCode: 2, stderr, action: 'halt', matched, haltWritten: false };
   }
   writeStderr(buildBanner(matched, 'halt'));
+  await recordBillingAudit(reaRoot, { action: 'halt', matched, haltWritten: true });
   return { exitCode: 2, stderr, action: 'halt', matched, haltWritten: true };
 }
 

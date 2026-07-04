@@ -180,18 +180,23 @@ shim_policy_short_circuit() {
   # shellcheck source=_lib/policy-reader.sh
   source "$(dirname "$0")/_lib/policy-reader.sh"
   local sg_enabled sg_mode
+  # Short-circuit ONLY on a POSITIVE opt-out that we can read cleanly:
+  # `enabled: false` or `billing_error_response: off`. Everything else —
+  # `halt`, `warn`, an absent mode, OR a mode we could not resolve (flow-
+  # form the Tier-3 awk fallback can't parse, or an unreadable policy) —
+  # proceeds to the fail-closed refuse (codex round-13 P1). The shim cannot
+  # DELIVER `warn` in the CLI-missing window (the advisory banner + audit
+  # need the CLI), so on any uncertainty about the mode it errs toward
+  # PROTECTION: a transient per-command exit-2 refuse (NOT a .rea/HALT
+  # freeze) until the CLI is built and the TS hook takes over. Silently
+  # disabling the refuse because a halt operator's mode line was unreadable
+  # is the exact degraded window this path exists to protect.
   sg_enabled=$(policy_reader_get spend_governance.enabled 2>/dev/null || true)
   if [ "$sg_enabled" = "false" ]; then
     return 0
   fi
-  # SEED default is `warn` (round-12 P1): only an EXPLICIT `halt` should
-  # fail closed (exit 2) in the CLI-missing window, since only `halt` blocks
-  # at all. `warn` (banner, exit 0), `off`, and the absent-default `warn`
-  # must NOT refuse the command. The shim can't emit the warn banner without
-  # the CLI, so the correct degraded behavior for every non-halt mode is to
-  # short-circuit (exit 0). Only `halt` proceeds to the fail-closed match.
   sg_mode=$(policy_reader_get spend_governance.billing_error_response 2>/dev/null || true)
-  if [ "$sg_mode" != "halt" ]; then
+  if [ "$sg_mode" = "off" ]; then
     return 0
   fi
   return 1
