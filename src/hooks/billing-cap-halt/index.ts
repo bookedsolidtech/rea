@@ -18,18 +18,24 @@
  * (`BILLING_RE ⇒ process.exit`, no retry) into a governance-layer
  * primitive: stop everything, no retry, zero exceptions.
  *
- * # What it scans — and what it does NOT (codex 0.51.0 round-1 P1/P2)
+ * # What it scans — and what it does NOT (codex 0.51.0 round-1 P1/P2, round-4 P1)
  *
- * A billing error is ERROR output from a FAILED metered call. So the gate
- * scans the `stderr` channel unconditionally, plus `stdout` ONLY when the
- * tool_response carries an explicit failure signal (`is_error`, a
- * non-zero exit field, `interrupted`). It NEVER scans the command text,
- * and NEVER scans a successful command's stdout. Without that
- * restriction, entirely benign work would freeze the session: `cat
- * THREAT_MODEL.md` or `rg "spending cap" .` legitimately print the
- * watched phrases to stdout, and the hook ships enabled on every profile
- * firing on every Bash call. Conservatism against false-positive freezes
- * is the governing constraint (a self-inflicted freeze is its own harm).
+ * A billing error is ERROR output from a FAILED metered call — an
+ * unhandled SDK/CLI failure surfaces on stderr with a non-zero exit. So
+ * the gate scans the `stderr` channel ONLY. It NEVER scans the command
+ * text, and NEVER scans stdout (not even on a non-zero exit). Without
+ * those restrictions, entirely benign work would freeze the session, and
+ * the hook ships enabled on every profile firing on every Bash call:
+ *   - `cat THREAT_MODEL.md` / `rg "spending cap" .` print the watched
+ *     phrases to stdout (round-1 P1/P2);
+ *   - `grep -R "spending cap" docs missing_dir` EXITS NON-ZERO (missing
+ *     path) yet prints real doc matches to stdout, with only "No such
+ *     file" on stderr (round-4 P1) — a stdout-on-failure scan froze on it.
+ * Conservatism against false-positive freezes is the governing constraint
+ * (a self-inflicted freeze is its own harm). The residual — a billing
+ * error printed ONLY to stdout of a failed command — is an accepted gap
+ * for this coarse backstop; PR2's metered-endpoint registry restores
+ * full-output scanning once a KNOWN metered host is in play.
  *
  * Billing-class is DELIBERATELY DISTINCT from a mere rate-limit. A `429`
  * / "rate limit" / "usage limit" / "exceeded quota" is retryable
@@ -316,13 +322,28 @@ export async function runBillingCapHalt(
     throw err;
   }
 
-  // 4. Scan the ERROR output for a billing-class signature. stderr is the
-  //    error channel and is always scanned; stdout is a benign channel
-  //    scanned ONLY when the command explicitly FAILED (a billing error
-  //    printed to stdout by a script that then exits non-zero). The
-  //    command text is NEVER scanned. This is the codex round-1 P1/P2
-  //    false-positive-freeze fix — see the file header.
-  const haystack = errored ? `${payloadStderr}\n${payloadStdout}` : payloadStderr;
+  // 4. Scan STDERR ONLY for a billing-class signature. A genuine billing
+  //    wall from a metered call is an ERROR: an unhandled SDK/CLI failure
+  //    surfaces on stderr with a non-zero exit. The command text and stdout
+  //    are NEVER scanned.
+  //
+  //    We deliberately do NOT fall back to scanning stdout on a non-zero
+  //    exit (codex round-4 P1): a command that fails for an UNRELATED
+  //    reason while printing benign matching text to stdout would
+  //    false-freeze. The canonical case is `grep -R "spending cap" docs
+  //    missing_dir` — grep exits non-zero because one path is missing, but
+  //    prints real doc matches to stdout; its stderr is only "No such
+  //    file", which does not match. stderr-only makes that a clean no-op.
+  //
+  //    The residual gap — a script that prints a billing error ONLY to
+  //    stdout and then exits non-zero — is accepted for this coarse
+  //    backstop; full-output scanning returns with PR2's metered-endpoint
+  //    registry, where a KNOWN metered host justifies searching everything.
+  //    `payloadStdout` / `errored` stay parsed (the parser is shared and
+  //    PR2-ready) but are not consulted here.
+  void payloadStdout;
+  void errored;
+  const haystack = payloadStderr;
   const m = BILLING_RE.exec(haystack);
   if (m === null) {
     return { exitCode: 0, stderr, action: 'noop', matched: null, haltWritten: false };

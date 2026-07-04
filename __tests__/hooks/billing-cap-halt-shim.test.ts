@@ -149,6 +149,23 @@ describe('hooks/billing-cap-halt.sh — CLI-missing strict fail-closed (round-2 
       expect(r.status).toBe(0);
     },
   );
+
+  it.skipIf(!bashExists())(
+    'does NOT fail closed when a FAILED command prints billing text to STDOUT with benign stderr (round-4 P1 grep case)',
+    () => {
+      const payload = JSON.stringify({
+        tool_name: 'Bash',
+        tool_input: { command: 'grep -R "spending cap" docs missing_dir' },
+        tool_response: {
+          stdout: 'docs/THREAT_MODEL.md: the spending cap wall',
+          stderr: 'grep: missing_dir: No such file or directory',
+          exit_code: 2,
+        },
+      });
+      const r = runShimInUnbuiltDir(payload);
+      expect(r.status).toBe(0);
+    },
+  );
 });
 
 describe('billing-cap-halt matcher parity — shim strict set ⇔ CLI BILLING_RE (round-3 P1)', () => {

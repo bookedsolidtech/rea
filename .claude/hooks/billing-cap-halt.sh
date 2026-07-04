@@ -118,15 +118,16 @@ shim_is_relevant() {
 }
 
 # CLI-MISSING fail-closed decision — must be CHANNEL-ACCURATE so a benign
-# command whose TEXT or SUCCESSFUL stdout merely mentions a billing phrase
-# (`rg "billing" .`, `cat THREAT_MODEL.md`) does NOT get a false refusal
-# when the rea CLI happens to be unbuilt (codex 0.51.0 round-1 P2). We use
-# node (available in this runtime) ONLY to EXTRACT the same channels the TS
-# hook scans — stderr always, stdout only on explicit failure — then apply
-# the shared coarse keyword set. No BILLING_RE is duplicated into bash; the
-# CLI stays the authoritative matcher when present. If node is unavailable
-# we cannot split channels, so we fall back to the coarse whole-payload
-# scan (fail-closed in a doubly-degraded no-node-no-CLI environment).
+# command whose TEXT or STDOUT merely mentions a billing phrase (`rg
+# "billing" .`, `cat THREAT_MODEL.md`, or `grep -R "spending cap" docs
+# missing_dir`) does NOT get a false refusal when the rea CLI is unbuilt
+# (codex 0.51.0 round-1 P2 / round-4 P1). We use node (available in this
+# runtime) ONLY to EXTRACT the same channel the TS hook scans — STDERR
+# ONLY — then apply the shared strict phrase set. No BILLING_RE is
+# duplicated into bash; the CLI stays the authoritative matcher when
+# present. If node is unavailable we cannot isolate the channel, so we fall
+# back to the coarse whole-payload scan against the STRICT set (fail-closed
+# in a doubly-degraded no-node-no-CLI environment).
 shim_cli_missing_relevant() {
   if ! command -v node >/dev/null 2>&1; then
     local lower=""
@@ -141,17 +142,14 @@ shim_cli_missing_relevant() {
       let p; try { p = JSON.parse(d); } catch { process.exit(0); }
       if (!p || typeof p !== "object" || Array.isArray(p)) process.exit(0);
       const tr = p.tool_response;
-      let stderr = "", stdout = "", errored = false;
-      if (typeof tr === "string") { stdout = tr; }
-      else if (tr && typeof tr === "object" && !Array.isArray(tr)) {
+      // STDERR ONLY — the sole channel the TS hook scans (round-4 P1). A
+      // bare-string tool_response is stdout-equivalent, so it contributes
+      // nothing to the error channel.
+      let stderr = "";
+      if (tr && typeof tr === "object" && !Array.isArray(tr)) {
         if (typeof tr.stderr === "string") stderr = tr.stderr;
-        for (const k of ["stdout","output","content"]) if (typeof tr[k] === "string") stdout += "\n" + tr[k];
-        if (tr.is_error === true || tr.isError === true) errored = true;
-        if (tr.error === true || (typeof tr.error === "string" && tr.error.length)) errored = true;
-        if (tr.interrupted === true) errored = true;
-        for (const k of ["exit_code","exitCode","code","returncode","status"]) if (typeof tr[k] === "number" && tr[k] !== 0) errored = true;
       }
-      process.stdout.write(errored ? (stderr + "\n" + stdout) : stderr);
+      process.stdout.write(stderr);
     });
   ' 2>/dev/null) || return 0
   local lower=""

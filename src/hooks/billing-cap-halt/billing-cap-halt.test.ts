@@ -209,11 +209,45 @@ describe('runBillingCapHalt', () => {
     expect(fs.existsSync(haltPath(root))).toBe(false);
   });
 
-  it('DOES scan stdout when the command errored (billing on stdout + is_error → halt)', async () => {
+  it('does NOT scan stdout even when the command errored (round-4 P1: stderr-only)', async () => {
+    // A failed command that prints a benign match to STDOUT must not
+    // freeze — only stderr is scanned. Pre-fix an `is_error` stdout scan
+    // froze on this.
     writePolicy(root, 'halt');
     const r = await runBillingCapHalt({
       reaRoot: root,
       stdinOverride: stdoutPayload('node tts.mjs', 'FATAL: spending cap exceeded', true),
+    });
+    expect(r.exitCode).toBe(0);
+    expect(r.action).toBe('noop');
+    expect(fs.existsSync(haltPath(root))).toBe(false);
+  });
+
+  it('grep -R that fails on a missing path but matches docs on stdout → no freeze (round-4 P1)', async () => {
+    // The canonical false-positive: grep exits non-zero because one path
+    // is missing (stderr: "No such file"), but prints real doc matches to
+    // stdout. stderr does not match BILLING_RE, so no HALT.
+    writePolicy(root, 'halt');
+    const grepPayload = JSON.stringify({
+      tool_name: 'Bash',
+      tool_input: { command: 'grep -R "spending cap" docs missing_dir' },
+      tool_response: {
+        stdout: 'docs/THREAT_MODEL.md: ... the spending cap wall ...',
+        stderr: 'grep: missing_dir: No such file or directory',
+        exit_code: 2,
+      },
+    });
+    const r = await runBillingCapHalt({ reaRoot: root, stdinOverride: grepPayload });
+    expect(r.exitCode).toBe(0);
+    expect(r.action).toBe('noop');
+    expect(fs.existsSync(haltPath(root))).toBe(false);
+  });
+
+  it('billing error on STDERR of a failed command → halt (the real wall still fires)', async () => {
+    writePolicy(root, 'halt');
+    const r = await runBillingCapHalt({
+      reaRoot: root,
+      stdinOverride: payload('node tts.mjs', 'FATAL: spending cap exceeded'),
     });
     expect(r.exitCode).toBe(2);
     expect(r.action).toBe('halt');

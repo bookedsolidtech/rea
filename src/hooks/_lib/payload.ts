@@ -290,19 +290,20 @@ export interface PostToolUsePayload {
   /**
    * The benign channel — `tool_response.stdout` (plus the `output` /
    * `content` fallback keys some harnesses use, and a bare-string
-   * `tool_response`). A successful command's normal output. Scanned by
-   * the gate ONLY when `errored` is true. `''` when absent.
+   * `tool_response`). A successful command's normal output. Parsed but
+   * NOT scanned by the billing gate (round-4 P1: a command that fails for
+   * an unrelated reason while printing benign matches to stdout — e.g.
+   * `grep -R "spending cap" docs missing_dir` — must not freeze). Retained
+   * for PR2, where a registered metered host justifies scanning it. `''`
+   * when absent.
    */
   stdout: string;
   /**
    * True when `tool_response` carries an explicit FAILURE signal — an
    * `is_error`/`isError`/`error` flag, a non-zero numeric exit field
    * (`exit_code`/`exitCode`/`code`/`returncode`/`status`), or
-   * `interrupted: true`. Used by the gate to decide whether the benign
-   * `stdout` channel is worth scanning (a billing error printed to
-   * stdout by a script that then exits non-zero). Absent/unknown shapes
-   * → `false` (bias toward NOT scanning stdout, i.e. no false-positive
-   * freeze).
+   * `interrupted: true`. Parsed for PR2; the billing gate is stderr-only
+   * and does not consult it. Absent/unknown shapes → `false`.
    */
   errored: boolean;
 }
