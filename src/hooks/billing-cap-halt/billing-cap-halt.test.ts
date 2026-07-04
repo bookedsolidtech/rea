@@ -382,6 +382,22 @@ describe('policy degradation — malformed YAML fails toward protection (round-2
     expect(fs.existsSync(haltPath(root))).toBe(false);
     rm(root);
   });
+
+  it('present-but-UNREADABLE policy (non-ENOENT) → PROTECT (round-9 P2)', async () => {
+    // A read failure other than "missing" — here a directory at the policy
+    // path (EISDIR) — is a degraded PRESENT policy, not no-config, so the
+    // guard fails toward protection rather than silently disabling.
+    const root = makeRoot();
+    fs.mkdirSync(path.join(root, '.rea', 'policy.yaml'), { recursive: true });
+    const res = await runBillingCapHalt({
+      reaRoot: root,
+      stdinOverride: payload('node tts.mjs', 'spending cap exceeded'),
+    });
+    expect(res.action).toBe('halt');
+    expect(res.exitCode).toBe(2);
+    expect(fs.existsSync(haltPath(root))).toBe(true);
+    rm(root);
+  });
 });
 
 describe('BILLING_RE distinctness from rate-limit', () => {

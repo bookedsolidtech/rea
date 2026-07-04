@@ -212,9 +212,17 @@ function readSpendGovernance(reaRoot: string): {
   let raw: string;
   try {
     raw = fs.readFileSync(policyPath, 'utf8');
-  } catch {
-    // Missing / unreadable file → genuine no-config → disabled.
-    return disabled;
+  } catch (err) {
+    // A MISSING file (ENOENT) is genuine no-config → disabled. Any OTHER
+    // read failure — EACCES (permissions regression), EIO (transient), a
+    // directory at the path (EISDIR) — is a PRESENT-but-degraded policy, so
+    // fail toward PROTECTION, consistent with the parse-error / malformed-
+    // block / CLI-missing posture (codex round-9 P2). A spend guard must not
+    // silently vanish just because the file could not be read.
+    if ((err as NodeJS.ErrnoException | null)?.code === 'ENOENT') {
+      return disabled;
+    }
+    return protect;
   }
   let parsed: unknown;
   try {
