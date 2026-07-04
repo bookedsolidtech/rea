@@ -94,7 +94,7 @@ _billing_kw_strict() {
   # `[^.]{0,40}` mirrors BILLING_RE's bounded gap (newline handling differs
   # slightly — a coarse backstop errs toward CATCHING the wall). MUST stay
   # in sync with BILLING_RE; the parity test enforces it.
-  local re='spending cap|prepayment credits (are )?depleted|billing (hard )?(cap|limit)[^.]{0,40}(exceeded|reached)|credit balance is too low|insufficient_quota'
+  local re='spending cap|prepayment credits (are )?depleted|credit balance is too low|insufficient_quota'
   [[ "$1" =~ $re ]]
 }
 

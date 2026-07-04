@@ -185,22 +185,24 @@ export interface BillingCapHaltResult {
  *   - `spending cap`                         — field-proven (Gemini, the
  *                                              incident's own `BILLING_RE`)
  *   - `prepayment credits (are) depleted`    — field-proven (Gemini)
- *   - `billing (hard) (cap|limit) … exceeded/reached`
- *                                            — "billing" + cap/limit +
- *                                              exceeded/reached is provider-
- *                                              billing-specific
  *   - `credit balance is too low`            — Anthropic billing
  *   - `insufficient_quota`                   — OpenAI billing error CODE
  *                                              (the machine code, not the
  *                                              ambiguous prose)
  *
- * Deliberately NOT included: `payment required`, `402`, `insufficient
- * funds/credits/balance` (ambiguous — round-7 P2); and the retryable
- * RATE_LIMIT_REGEX set (`429`, `rate limit`, `usage limit`, `exceeded
- * quota`, `too many requests`, `resource exhausted`, `deadline exceeded`).
+ * Deliberately NOT included: `payment required` / `402`, `insufficient
+ * funds/credits/balance` (round-7 P2), AND the generic `billing (cap|limit)
+ * … exceeded/reached` (round-14 P2) — the bare word "billing" appears in
+ * ordinary subscription/billing-domain app errors ("billing limit for this
+ * account exceeded"), so it is too broad for a hook with no endpoint
+ * scoping. PR2 restores broader matching scoped to a KNOWN metered host,
+ * where the ambiguity is resolved by the endpoint. Also excluded: the
+ * retryable RATE_LIMIT_REGEX set (`429`, `rate limit`, `usage limit`,
+ * `exceeded quota`, `too many requests`, `resource exhausted`, `deadline
+ * exceeded`).
  */
 export const BILLING_RE =
-  /spending cap|prepayment credits (?:are )?depleted|billing (?:hard )?(?:cap|limit)[^.\n]{0,40}(?:exceeded|reached)|credit balance is too low|insufficient_quota/i;
+  /spending cap|prepayment credits (?:are )?depleted|credit balance is too low|insufficient_quota/i;
 
 interface RawSpendGovernance {
   enabled?: unknown;

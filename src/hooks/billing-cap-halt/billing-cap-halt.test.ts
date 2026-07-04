@@ -394,7 +394,7 @@ describe('runBillingCapHalt', () => {
     writePolicy(root, 'halt');
     const r = await runBillingCapHalt({
       reaRoot: root,
-      stdinOverride: payload('node tts.mjs', 'billing limit \x1b[31m reached'),
+      stdinOverride: payload('node tts.mjs', 'spending cap \x1b[31m exceeded'),
     });
     expect(r.exitCode).toBe(2);
     const halt = fs.readFileSync(haltPath(root), 'utf8');
@@ -465,7 +465,6 @@ describe('BILLING_RE distinctness from rate-limit', () => {
       'prepayment credits depleted',
       'credit balance is too low',
       'insufficient_quota',
-      'billing hard limit exceeded',
     ]) {
       expect(BILLING_RE.test(s)).toBe(true);
     }
@@ -495,6 +494,10 @@ describe('BILLING_RE distinctness from rate-limit', () => {
       'insufficient funds',
       'insufficient balance',
       'insufficient credits',
+      // Generic subscription/billing-domain errors (round-14 P2).
+      'billing limit for this account exceeded',
+      'billing hard limit exceeded',
+      'billing cap reached',
     ]) {
       expect(BILLING_RE.test(s)).toBe(false);
     }

@@ -38,12 +38,6 @@ const CANONICAL_WALLS = [
   'prepayment credits are depleted',
   'credit balance is too low',
   'insufficient_quota',
-  'billing hard limit exceeded',
-  'billing cap reached',
-  // GAPPED billing cap/limit form (round-8 P1): words between the anchor
-  // and exceeded/reached. BILLING_RE matches via its {0,40} gap; the shim's
-  // `=~` mirror must too.
-  'billing limit for this project exceeded',
 ];
 
 /**
@@ -60,6 +54,10 @@ const BENIGN_NEAR_MISSES = [
   '402 payment required',
   'insufficient funds',
   'insufficient balance',
+  // Generic subscription/billing-domain errors (round-14 P2): the bare
+  // word "billing" is too broad without endpoint scoping.
+  'billing limit for this account exceeded',
+  'billing hard cap exceeded',
 ];
 
 interface ShimResult {
