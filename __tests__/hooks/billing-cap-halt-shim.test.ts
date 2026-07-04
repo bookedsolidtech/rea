@@ -18,6 +18,7 @@
  */
 
 import { spawnSync } from 'node:child_process';
+import fs from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { BILLING_RE } from '../../src/hooks/billing-cap-halt/index.js';
@@ -39,6 +40,10 @@ const CANONICAL_WALLS = [
   'insufficient_quota',
   'billing hard limit exceeded',
   'billing cap reached',
+  // GAPPED billing cap/limit form (round-8 P1): words between the anchor
+  // and exceeded/reached. BILLING_RE matches via its {0,40} gap; the shim's
+  // `=~` mirror must too.
+  'billing limit for this project exceeded',
 ];
 
 /**
@@ -81,10 +86,11 @@ function okStdoutPayload(command: string, stdout: string): string {
   });
 }
 
-function runShimInUnbuiltDir(payload: string): ShimResult {
+function runShimInUnbuiltDir(payload: string, policyYaml?: string): ShimResult {
   // Simulate CLI-unreachable: point CLAUDE_PROJECT_DIR at a fresh dir with
   // no node_modules/@bookedsolid/rea AND no dist/cli/index.js, so the shim
-  // takes its CLI-missing fail-closed path.
+  // takes its CLI-missing fail-closed path. Optionally seed a .rea/policy.yaml
+  // so the CLI-independent policy reader (Tier 2/3) can honor an opt-out.
   const tmpdir = path.join(
     REPO_ROOT,
     '.claude',
@@ -93,6 +99,10 @@ function runShimInUnbuiltDir(payload: string): ShimResult {
   );
   spawnSync('mkdir', ['-p', tmpdir]);
   try {
+    if (policyYaml !== undefined) {
+      spawnSync('mkdir', ['-p', path.join(tmpdir, '.rea')]);
+      fs.writeFileSync(path.join(tmpdir, '.rea', 'policy.yaml'), policyYaml);
+    }
     const res = spawnSync('bash', [SHIM], {
       cwd: tmpdir,
       env: {
@@ -109,6 +119,26 @@ function runShimInUnbuiltDir(payload: string): ShimResult {
     spawnSync('rm', ['-rf', tmpdir]);
   }
 }
+
+const OPT_OUT_POLICY = [
+  'version: "1"',
+  'profile: "test"',
+  'installed_by: "t"',
+  'blocked_paths: []',
+  'spend_governance:',
+  '  enabled: false',
+  '',
+].join('\n');
+
+const MODE_OFF_POLICY = [
+  'version: "1"',
+  'profile: "test"',
+  'installed_by: "t"',
+  'blocked_paths: []',
+  'spend_governance:',
+  '  billing_error_response: off',
+  '',
+].join('\n');
 
 function bashExists(): boolean {
   return spawnSync('bash', ['--version'], { encoding: 'utf8' }).status === 0;
@@ -185,6 +215,46 @@ describe('hooks/billing-cap-halt.sh — CLI-missing strict fail-closed (round-2 
       });
       const r = runShimInUnbuiltDir(payload);
       expect(r.status).toBe(0);
+    },
+  );
+});
+
+describe('billing-cap-halt CLI-missing opt-out (round-8 P2)', () => {
+  // The CLI-missing fail-closed path must honor an explicit opt-out via the
+  // Tier 2/3 policy reader (no CLI needed). A real billing wall on a failed
+  // command's stderr that WOULD fail closed must exit 0 when the policy
+  // opted out.
+  it.skipIf(!bashExists())('enabled:false → no fail-closed refusal even on a real wall', () => {
+    const r = runShimInUnbuiltDir(
+      failedPayload('node tts.mjs', 'FATAL: spending cap exceeded'),
+      OPT_OUT_POLICY,
+    );
+    expect(r.status).toBe(0);
+  });
+
+  it.skipIf(!bashExists())('billing_error_response:off → no fail-closed refusal', () => {
+    const r = runShimInUnbuiltDir(
+      failedPayload('node tts.mjs', 'FATAL: spending cap exceeded'),
+      MODE_OFF_POLICY,
+    );
+    expect(r.status).toBe(0);
+  });
+
+  it.skipIf(!bashExists())(
+    'opt-out default (no block) still fails closed on a real wall',
+    () => {
+      const withBlockAbsent = [
+        'version: "1"',
+        'profile: "test"',
+        'installed_by: "t"',
+        'blocked_paths: []',
+        '',
+      ].join('\n');
+      const r = runShimInUnbuiltDir(
+        failedPayload('node tts.mjs', 'FATAL: spending cap exceeded'),
+        withBlockAbsent,
+      );
+      expect(r.status).toBe(2);
     },
   );
 });

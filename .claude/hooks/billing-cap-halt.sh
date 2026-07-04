@@ -85,19 +85,17 @@ _billing_kw_match() {
 # — the parity test in `billing-cap-halt-shim.test.ts` enforces it. Takes
 # already-lower-cased text on $1. bash 3.2 `case`.
 _billing_kw_strict() {
-  case "$1" in
-    *"spending cap"*) return 0 ;;
-    *"prepayment credit"*) return 0 ;;
-    *"credit balance is too low"*) return 0 ;;
-    *"insufficient_quota"*) return 0 ;;
-    *"billing hard cap"*) return 0 ;;
-    *"billing hard limit"*) return 0 ;;
-    *"billing cap exceeded"*) return 0 ;;
-    *"billing limit exceeded"*) return 0 ;;
-    *"billing cap reached"*) return 0 ;;
-    *"billing limit reached"*) return 0 ;;
-  esac
-  return 1
+  # ERE MIRROR of the CLI's BILLING_RE (src/hooks/billing-cap-halt/
+  # index.ts), so the CLI-missing path catches the SAME provider walls the
+  # compiled hook does — including the GAPPED `billing (hard )?(cap|limit)
+  # … exceeded/reached` form (e.g. "billing limit for this project
+  # exceeded") that fixed substrings missed (codex round-8 P1). bash 3.2
+  # `=~` uses ERE; the pattern is lower-case because $1 is pre-lower-cased.
+  # `[^.]{0,40}` mirrors BILLING_RE's bounded gap (newline handling differs
+  # slightly — a coarse backstop errs toward CATCHING the wall). MUST stay
+  # in sync with BILLING_RE; the parity test enforces it.
+  local re='spending cap|prepayment credits (are )?depleted|billing (hard )?(cap|limit)[^.]{0,40}(exceeded|reached)|credit balance is too low|insufficient_quota'
+  [[ "$1" =~ $re ]]
 }
 
 # Relevance pre-gate for the CLI-PRESENT path — a pure PERF optimization.
@@ -153,6 +151,33 @@ shim_cli_missing_relevant() {
   local lower=""
   lower=$(printf '%s' "$errout" | tr '[:upper:]' '[:lower:]' 2>/dev/null || printf '%s' "$errout")
   _billing_kw_strict "$lower"
+}
+
+# Policy short-circuit — honor an explicit OPT-OUT even when the CLI is
+# unbuilt (codex round-8 P2). shim-runtime step 6 calls this BEFORE the
+# CLI-missing / node-missing banners, using the CLI-independent policy
+# reader (Tier 2 python3 / Tier 3 awk), so a repo that set
+# `spend_governance.enabled: false` or `billing_error_response: off` no
+# longer gets a fail-closed exit-2 refusal during the upgrade window.
+#
+# OPT-OUT semantics (mirrors readSpendGovernance): short-circuit (return 0
+# → exit 0) ONLY on a POSITIVE opt-out. An absent block / unreadable value
+# (e.g. a nested read the Tier 3 awk fallback can't resolve) is ON by
+# default, so we return 1 and let the fail-closed relevance decision run —
+# a spend guard must not vanish just because the value was unreadable.
+shim_policy_short_circuit() {
+  # shellcheck source=_lib/policy-reader.sh
+  source "$(dirname "$0")/_lib/policy-reader.sh"
+  local sg_enabled sg_mode
+  sg_enabled=$(policy_reader_get spend_governance.enabled 2>/dev/null || true)
+  if [ "$sg_enabled" = "false" ]; then
+    return 0
+  fi
+  sg_mode=$(policy_reader_get spend_governance.billing_error_response 2>/dev/null || true)
+  if [ "$sg_mode" = "off" ]; then
+    return 0
+  fi
+  return 1
 }
 
 # shellcheck source=_lib/shim-runtime.sh
