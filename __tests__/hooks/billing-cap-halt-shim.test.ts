@@ -20,9 +20,38 @@
 import { spawnSync } from 'node:child_process';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { BILLING_RE } from '../../src/hooks/billing-cap-halt/index.js';
 
 const REPO_ROOT = path.resolve(__dirname, '..', '..');
 const SHIM = path.join(REPO_ROOT, 'hooks', 'billing-cap-halt.sh');
+
+/**
+ * Canonical billing-wall phrases. The CLI's BILLING_RE and the shim's
+ * CLI-missing `_billing_kw_strict` MUST BOTH recognize every one — the
+ * shim's fail-closed posture cannot silently drop a wall the CLI would
+ * catch (codex round-3 P1). Kept in one list so the parity test below
+ * fails loudly if either matcher drifts.
+ */
+const CANONICAL_WALLS = [
+  'spending cap exceeded',
+  'prepayment credits are depleted',
+  'credit balance is too low',
+  'insufficient funds',
+  'insufficient credits',
+  'insufficient balance',
+  'insufficient_quota',
+  'payment required',
+  'billing hard limit exceeded',
+  'billing cap reached',
+];
+
+/** Benign strings that merely resemble a wall — neither matcher may fire. */
+const BENIGN_NEAR_MISSES = [
+  'insufficient permissions',
+  'cat: billing-report.txt: No such file or directory',
+  '429 too many requests',
+  'rate limit exceeded',
+];
 
 interface ShimResult {
   status: number;
@@ -120,4 +149,30 @@ describe('hooks/billing-cap-halt.sh — CLI-missing strict fail-closed (round-2 
       expect(r.status).toBe(0);
     },
   );
+});
+
+describe('billing-cap-halt matcher parity — shim strict set ⇔ CLI BILLING_RE (round-3 P1)', () => {
+  // Every canonical wall must be caught by BOTH matchers. This is the sync
+  // guard the shim comment references: if BILLING_RE or _billing_kw_strict
+  // drifts so a documented wall stops failing closed in the no-CLI window,
+  // one of these assertions breaks.
+  for (const phrase of CANONICAL_WALLS) {
+    it(`BILLING_RE matches "${phrase}"`, () => {
+      expect(BILLING_RE.test(phrase)).toBe(true);
+    });
+    it.skipIf(!bashExists())(`shim fails closed (CLI-missing) on "${phrase}"`, () => {
+      const r = runShimInUnbuiltDir(failedPayload('node call.mjs', `Error: ${phrase}`));
+      expect(r.status).toBe(2);
+    });
+  }
+
+  for (const phrase of BENIGN_NEAR_MISSES) {
+    it(`BILLING_RE does NOT match "${phrase}"`, () => {
+      expect(BILLING_RE.test(phrase)).toBe(false);
+    });
+    it.skipIf(!bashExists())(`shim does NOT fail closed (CLI-missing) on "${phrase}"`, () => {
+      const r = runShimInUnbuiltDir(failedPayload('cmd', phrase));
+      expect(r.status).toBe(0);
+    });
+  }
 });

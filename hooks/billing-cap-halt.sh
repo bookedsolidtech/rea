@@ -68,23 +68,41 @@ _billing_kw_match() {
   return 1
 }
 
-# STRICT billing match — only the unambiguous, multi-word billing-wall
-# phrases that essentially never appear in benign stderr. Used ONLY by the
+# SPECIFIC billing match — the FULL multi-word billing-wall phrases from
+# the CLI's BILLING_RE, matched as complete substrings. Used ONLY by the
 # CLI-MISSING fail-closed path, where an over-trigger causes a FALSE HALT
-# (exit 2) with no CLI to disambiguate (codex 0.51.0 round-2 P2). The broad
-# `_billing_kw_match` would fire on `insufficient permissions` or a failed
-# `cat billing-report.txt` during the "hooks upgraded before pnpm build"
-# window. This tighter set trades that false-block risk for a narrower
-# guarantee: during the TRANSIENT no-CLI window a rarer billing phrasing
-# may not fail-closed — it is caught the moment the CLI is built (the
-# authoritative BILLING_RE). Every phrase here is a strict subset of
-# BILLING_RE. Takes already-lower-cased text on $1.
+# (exit 2) with no CLI to disambiguate.
+#
+# This resolves the precision/recall tension both codex rounds surfaced:
+#   - round-2 P2: a BARE-WORD set (`insufficient`, `billing`) false-blocked
+#     `insufficient permissions` / a failed `cat billing-report.txt`.
+#   - round-3 P1: a too-NARROW set silently dropped documented walls
+#     (`payment required`, `insufficient funds`, `billing hard limit
+#     exceeded`) during the no-CLI window.
+# The fix is neither broad single words nor a truncated list: it is the
+# COMPLETE set of BILLING_RE's terminal phrases as full substrings. Full
+# phrases are specific enough to never match the round-2 false positives
+# (`insufficient permissions` ∌ `insufficient funds`; `billing-report.txt`
+# ∌ `billing hard cap`) yet cover every wall the authoritative matcher
+# does. MUST stay in sync with BILLING_RE (`src/hooks/billing-cap-halt/
+# index.ts`) — the parity test in `billing-cap-halt-shim.test.ts` enforces
+# it. Takes already-lower-cased text on $1. bash 3.2 `case`.
 _billing_kw_strict() {
   case "$1" in
     *"spending cap"*) return 0 ;;
     *"prepayment credit"*) return 0 ;;
     *"credit balance is too low"*) return 0 ;;
+    *"insufficient funds"*) return 0 ;;
+    *"insufficient credit"*) return 0 ;;
+    *"insufficient balance"*) return 0 ;;
     *"insufficient_quota"*) return 0 ;;
+    *"payment required"*) return 0 ;;
+    *"billing hard cap"*) return 0 ;;
+    *"billing hard limit"*) return 0 ;;
+    *"billing cap exceeded"*) return 0 ;;
+    *"billing limit exceeded"*) return 0 ;;
+    *"billing cap reached"*) return 0 ;;
+    *"billing limit reached"*) return 0 ;;
   esac
   return 1
 }
