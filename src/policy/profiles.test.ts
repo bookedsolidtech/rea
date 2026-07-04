@@ -67,3 +67,21 @@ describe('profile schema — R20-P1 package.json in blocked_paths on every profi
     },
   );
 });
+
+describe('profile schema — 0.51.0 spend_governance ON in every profile', () => {
+  // Unlike delegation_advisory (an opinion, bst-internal-only), the
+  // billing→HALT reflex ships enabled with `billing_error_response: halt`
+  // on EVERY profile: a billing-class error is unambiguously terminal and
+  // the halt reflex has no false-positive cost worth the risk. These tests
+  // pin that invariant so a future profile refactor cannot silently ship a
+  // profile with no spend wall.
+  it.each(['bst-internal', 'bst-internal-no-codex', 'client-engagement', 'lit-wc', 'minimal', 'open-source', 'open-source-no-codex'])(
+    '%s — pins spend_governance.enabled = true, billing_error_response = halt',
+    (name) => {
+      const profile = loadProfile(name);
+      expect(profile).not.toBeNull();
+      expect(profile?.spend_governance?.enabled).toBe(true);
+      expect(profile?.spend_governance?.billing_error_response).toBe('halt');
+    },
+  );
+});

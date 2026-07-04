@@ -349,6 +349,39 @@ const DelegationAdvisoryPolicySchema = z
   .strict();
 
 /**
+ * 0.51.0 — spend-governance policy (E1 seed slice). Drives the
+ * `billing-cap-halt.sh` PostToolUse hook (matcher `Bash`): when a
+ * just-run command's output carries a billing-class signature (distinct
+ * from a mere rate-limit / 429), the hook writes `.rea/HALT` — reusing
+ * the existing kill-switch every middleware + hook already respects.
+ *
+ * Introduced after INCIDENT-2026-07-04 (denial-of-wallet): rea had no
+ * concept of money, so a billing-cap error was retried like a 429 and
+ * multiplied spend against a metered endpoint. See `THREAT_MODEL.md
+ * §5.25`.
+ *
+ * SEED slice only — `enabled` + `billing_error_response`. The full E1
+ * axis (`metered_endpoints`, `retry_discipline`) and E3
+ * (`consumption_limits`) land in later PRs. Kept `.strict()` so a typo
+ * or a premature future-field fails loudly at policy load, matching
+ * every other block.
+ *
+ * Defaults live here at the schema layer: a block that is present but
+ * omits fields gets `enabled: false` (the strict-upgrade-safe default —
+ * an ABSENT block is likewise a no-op via `.optional()` at the top-level
+ * schema) and `billing_error_response: 'halt'`. Every shipped profile
+ * pins `enabled: true` because the billing→HALT reflex has no
+ * false-positive cost worth the risk (unlike delegation_advisory, which
+ * is opinion and ships bst-internal-only).
+ */
+const SpendGovernancePolicySchema = z
+  .object({
+    enabled: z.boolean().default(false),
+    billing_error_response: z.enum(['halt', 'warn', 'off']).default('halt'),
+  })
+  .strict();
+
+/**
  * 0.48.0 — per-session shim cache policy. The
  * `hooks/_lib/shim-cache.sh` helper, sourced by every Node-binary
  * shim via `hooks/_lib/shim-runtime.sh`, caches the (sandbox-ok,
@@ -506,6 +539,15 @@ const PolicySchema = z
     // when unset/false). When the block IS present the inner schema
     // supplies defaults for any omitted field.
     delegation_advisory: DelegationAdvisoryPolicySchema.optional(),
+    // 0.51.0 spend-governance (E1 seed) — drives the `billing-cap-halt.sh`
+    // PostToolUse hook. `.optional()` so a vanilla / pre-0.51.0 install
+    // with no block sees the hook as a silent no-op (an absent block is
+    // disabled, the strict-upgrade-safe posture). When the block IS
+    // present the inner schema supplies `enabled: false` +
+    // `billing_error_response: 'halt'` for any omitted field. Every
+    // shipped profile pins `enabled: true`. See `SpendGovernancePolicySchema`
+    // and `THREAT_MODEL.md §5.25`.
+    spend_governance: SpendGovernancePolicySchema.optional(),
     // 0.48.0 per-session shim cache — drives `hooks/_lib/shim-cache.sh`
     // which short-circuits the sandbox check + version probe in
     // `hooks/_lib/shim-runtime.sh` on session-warm fires of the same

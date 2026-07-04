@@ -435,6 +435,66 @@ export interface DelegationAdvisoryPolicy {
 }
 
 /**
+ * 0.51.0 — spend-governance policy axis (E1, seed slice).
+ *
+ * Introduced in response to INCIDENT-2026-07-04 (denial-of-wallet on a
+ * metered TTS lane): an agent treated a "spending cap exceeded" error as
+ * retryable and multiplied requests against a paid endpoint until the
+ * budget blew past its cap. rea had NO concept of money anywhere — no
+ * schema field, no hook, no threat class. This block is the first anchor
+ * for that axis. See `THREAT_MODEL.md §5.25` (Denial-of-wallet / runaway
+ * metered spend).
+ *
+ * This is the SEED slice only. It carries the two lowest-risk,
+ * highest-value fields:
+ *
+ *   - `enabled` — master switch. When `false` (or the whole block is
+ *     omitted) the `billing-cap-halt.sh` PostToolUse hook is a silent
+ *     no-op. Matching every other governance block, an ABSENT block =
+ *     disabled: a consumer whose `.rea/policy.yaml` predates 0.51.0 sees
+ *     no behavior change until they add the block (all shipped profiles
+ *     pin `enabled: true`).
+ *
+ *   - `billing_error_response` — what the billing→HALT reflex does when a
+ *     billing-class signature is detected in a command's output:
+ *       * `halt` (DEFAULT) — write `.rea/HALT` (the existing kill-switch,
+ *         which every middleware + hook already respects) and surface a
+ *         banner. Stop everything; NO retry. This is the field-proven
+ *         reflex from the incident: a billing-class error is TERMINAL,
+ *         never retryable like a 429.
+ *       * `warn` — surface the banner (so the agent stops retrying) but
+ *         do NOT write HALT.
+ *       * `off` — silent no-op even when a signature matches.
+ *
+ * Deliberately does NOT yet carry `metered_endpoints` / `retry_discipline`
+ * / `consumption_limits` — those are later PRs in the spend-governance
+ * sequence (E1 full / E2 run-gate / E3 consumption). The block is
+ * `.strict()` at the loader so any unknown sub-field (a typo, or a
+ * premature future-field) fails loudly at policy load, exactly like every
+ * other block.
+ */
+export type BillingErrorResponse = 'halt' | 'warn' | 'off';
+
+export interface SpendGovernancePolicy {
+  /**
+   * Master switch. When `false` — or when the whole `spend_governance`
+   * block is omitted — the `billing-cap-halt.sh` hook is a silent no-op.
+   * Default `false` at the schema layer (absent block = disabled, the
+   * safe upgrade posture); every shipped profile pins `true` because a
+   * billing→HALT reflex has no false-positive cost worth the risk.
+   */
+  enabled?: boolean;
+  /**
+   * What the billing→HALT reflex does on a billing-class match:
+   * `halt` (default) writes `.rea/HALT`; `warn` surfaces a banner only;
+   * `off` is a silent no-op. An unrecognized value is treated as `halt`
+   * by the hook (fail-safe), though the strict loader rejects any value
+   * outside the enum at load time.
+   */
+  billing_error_response?: BillingErrorResponse;
+}
+
+/**
  * G9 — injection tier escalation knobs. The classifier bucketed matches into
  * `clean` / `suspicious` / `likely_injection`; this block governs what happens
  * to the `suspicious` bucket (a single literal match at write/destructive tier,
@@ -582,6 +642,7 @@ export interface Policy {
    * blocks. See `DelegationAdvisoryPolicy` for the full contract.
    */
   delegation_advisory?: DelegationAdvisoryPolicy;
+  spend_governance?: SpendGovernancePolicy;
   /**
    * Per-session shim cache (0.48.0+).
    *

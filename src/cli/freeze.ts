@@ -14,12 +14,38 @@ export interface UnfreezeOptions {
 /**
  * Strip control characters (terminal escape injection defense).
  */
-function sanitize(input: string): string {
+export function sanitizeHaltReason(input: string): string {
   return input.replace(/[\x00-\x1f\x7f]/g, '').trim();
 }
 
+/**
+ * Write `.rea/HALT` under `targetDir` with the canonical shape
+ * (`<reason> (frozen at <ISO-timestamp>)\n`), creating `.rea/` if
+ * needed. Returns the absolute path written.
+ *
+ * Extracted from `runFreeze` (0.51.0) so the automated billing→HALT
+ * reflex (`billing-cap-halt` hook) writes byte-identical HALT files
+ * without re-implementing the write path. The hook is the automated
+ * analog of `rea freeze` — same file, same shape, same kill-switch that
+ * every middleware + hook already respects.
+ *
+ * The caller is responsible for sanitizing `reason` (via
+ * `sanitizeHaltReason`) if it is derived from untrusted input.
+ */
+export function writeHaltFile(targetDir: string, reason: string): string {
+  const reaDir = path.join(targetDir, REA_DIR);
+  if (!fs.existsSync(reaDir)) {
+    fs.mkdirSync(reaDir, { recursive: true });
+  }
+  const haltFile = reaPath(targetDir, HALT_FILE);
+  const timestamp = new Date().toISOString();
+  const content = `${reason} (frozen at ${timestamp})\n`;
+  fs.writeFileSync(haltFile, content, 'utf8');
+  return haltFile;
+}
+
 export function runFreeze(options: FreezeOptions): void {
-  const reason = options.reason !== undefined ? sanitize(options.reason) : '';
+  const reason = options.reason !== undefined ? sanitizeHaltReason(options.reason) : '';
 
   if (!reason) {
     err('`rea freeze` requires `--reason "..."`');
@@ -30,16 +56,7 @@ export function runFreeze(options: FreezeOptions): void {
   }
 
   const targetDir = process.cwd();
-  const reaDir = path.join(targetDir, REA_DIR);
-  const haltFile = reaPath(targetDir, HALT_FILE);
-
-  if (!fs.existsSync(reaDir)) {
-    fs.mkdirSync(reaDir, { recursive: true });
-  }
-
-  const timestamp = new Date().toISOString();
-  const content = `${reason} (frozen at ${timestamp})\n`;
-  fs.writeFileSync(haltFile, content, 'utf8');
+  writeHaltFile(targetDir, reason);
 
   console.log('');
   log('REA FROZEN');

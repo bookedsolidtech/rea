@@ -625,6 +625,29 @@ Stated plainly; the tier does not claim to close these.
 
 Ref: `hooks/_lib/shim-runtime.sh` (`shim_global_entry_gate`, `shim_sandbox_check_global`, `shim_resolve_cli_global`, 4-global-veto), `src/cli/global-cli.ts`, `src/cli/trust.ts`, `src/cli/install/global.ts`, `src/cli/doctor.ts` (`resolveGlobalCliTier`, `checkGlobalCli`), `src/policy/loader.ts` (`RuntimePolicySchema`), `__tests__/hooks/global-cli/`.
 
+### 5.25 Denial-of-wallet / runaway metered spend (0.51.0)
+
+> **Numbering collision note:** the OpenRouter-lane branch (PR #210, not yet merged) ALSO claims §5.25. Whichever of the two merges SECOND must renumber to §5.26 (and fix its back-references). They are independent sections; the collision is purely ordinal.
+
+**Threat class.** An agent multiplies requests against a *metered* endpoint (a paid, per-call-billed API) until spend blows past its intended cap. First observed in INCIDENT-2026-07-04 (denial-of-wallet on a Gemini TTS lane): a frontier model recommended a paid service, wrote uncommitted scripts against it, ran them unreviewed with retry/racing loops, treated the first "spending cap exceeded" error as retryable, and drove an unrated spend estimate to ~4× its cap. Every step was individually plausible. Governance that depends on the model remembering the rule is not governance — the spend layer has to be structural.
+
+The class has four distinguishing mechanics, each of which defeats a naive control:
+
+- **Agent-driven request multiplication.** Retry-on-timeout, wave-resubmission of failures, and parallel racing are all *correct* reflexes against infra flake and *catastrophic* against a metered endpoint that bills server-side completions. A limiter that counts calls-per-minute for throttling does not see the dollars.
+- **Vendor caps are unreliable walls.** The incident's vendor cap was poll-based with hours of enforcement latency (vs. its documented ~10 min). An external cap is a *signal*, never the wall. The wall must be client-side (request ceilings) and console-side (quota caps).
+- **Server-side completion billing of client-abandoned requests.** A client timeout does not stop the meter — a request the agent gave up on is still billable if the server completes it. "Patient retry" of a hanging metered endpoint therefore *adds* spend with zero client-visible progress. The learned rule — *into a hanging metered endpoint, the correct number of requests is zero* — existed nowhere in machinery until it was learned at retail price.
+- **Estimate-vs-rated ledger confusion.** The real-time "estimate" ledger and the vendor-settled "rated" ledger diverge by hours and by multiples. rea cannot and does not see rated dollars — those arrive long after the session. What rea *can* govern is **request volume as a spend proxy**: the audit log records *attempts*, not vendor-settled spend. This is an honest, load-bearing limitation. rea's own OpenRouter lane (see §5.25/§5.26 collision note) is itself such a metered endpoint and is in scope for this proxy, not for dollar accounting.
+
+**0.51.0 closure (E1 seed slice).** The first structural anchor is the `billing-cap-halt.sh` PostToolUse Bash hook (`src/hooks/billing-cap-halt/index.ts`), driven by the new `spend_governance` policy block (`src/policy/types.ts`, `src/policy/loader.ts`, `.strict()`). It scans a just-run command's output for a **billing-class** signature — a TERMINAL, non-retryable spend error — and, per `spend_governance.billing_error_response` (`halt` default / `warn` / `off`), writes `.rea/HALT`. This deliberately reuses the existing kill-switch: every middleware and hook already respects `.rea/HALT`, so "billing error ⇒ stop everything, no retry" needs no new enforcement primitive — the automated hook is the analog of `rea freeze`.
+
+The critical distinction the hook encodes: **billing-class ≠ rate-limit.** A `429` / "rate limit" / "usage limit" / "exceeded quota" is *retryable* (already detected observe-only by `RATE_LIMIT_REGEX` in `src/gateway/observability/codex-telemetry.ts`). "spending cap exceeded" / "prepayment credits depleted" / "payment required" is a *wall* — retrying it burns money. Only the billing-class set (`BILLING_RE`) writes HALT, and the pattern list is kept deliberately tight to avoid false-positive freezes (a self-inflicted denial-of-service is its own harm).
+
+**Fail posture (asymmetric, on purpose).** A billing reflex that silently disappears *is* the incident, so the two failure surfaces bias opposite ways: (1) **CLI-missing** is FAIL-CLOSED — the shim (`SHIM_FAIL_OPEN=0`) only reaches its no-CLI terminal as relevant when the raw payload already carries a billing keyword, so a real signal with no CLI to enforce it surfaces loudly rather than vanishing, while ordinary Bash output never spawns the CLI. (2) **Malformed / unreadable payload** is FAIL-SAFE — the hook body exits 0 without a freeze, because halting on unparseable input is an availability harm and the parent incident was about spend, not input integrity. The hook only ACTS on a positive match in successfully-parsed content.
+
+**Not yet closed (later PRs in the sequence).** This is the cheapest, highest-value, field-proven slice only. Still open and tracked: per-run / daily **request ceilings** and **retry-discipline** against registered metered hosts (E1 full — `metered_endpoints`, `retry_discipline`); the **run-gate** that extends the local-first review unit from "the diff you push" to "the effectful thing you execute" so an uncommitted script hitting a paid API is refused (E2); **consumption limits** for OAuth/subscription lanes where the wallet is a rolling window (E3, `consumption_limits`); and the **new-service adoption gate** (E4). Until those land, an agent can still multiply requests *below* a billing error and rea will not stop it — the 0.51.0 hook fires only once the vendor has already surfaced a terminal billing signal.
+
+Ref: `src/hooks/billing-cap-halt/index.ts`, `src/hooks/_lib/payload.ts` (`parsePostToolUsePayload`), `src/policy/loader.ts` (`SpendGovernancePolicySchema`), `src/policy/types.ts` (`SpendGovernancePolicy`), `src/cli/freeze.ts` (`writeHaltFile`), `hooks/billing-cap-halt.sh`.
+
 ---
 
 ## 6. Residual Risks and Open Issues
@@ -647,6 +670,9 @@ Ref: `hooks/_lib/shim-runtime.sh` (`shim_global_entry_gate`, `shim_sandbox_check
 | Global-CLI tier: same-uid in-place swap of resolved `dist/cli/index.js` | Low | Accepted — same residual as the in-project package tier (§5.24.6a / §8.3); realpath-exec precursor shrinks the TOCTOU window |
 | Global-CLI tier: `cp -l` / `link` hardlink-alias to a protected target | Low | Pre-existing scanner gap, equal on the in-project kill-switch (§5.24.6b) — walker follow-up (inode-aware alias detection) |
 | Global-CLI tier: POSIX ACL cross-user write evades the mode-bit walk | Low | Degraded-env class (needs 2nd uid + pre-set ACL), alongside NFS root_squash (§5.24.6c) — prefer in-project install on ACL filesystems |
+| Denial-of-wallet: request multiplication BELOW a terminal billing error | High | Partially mitigated — 0.51.0 `billing-cap-halt` (§5.25) halts on a terminal billing-class signal, but request ceilings / retry-discipline / run-gate / consumption-limits (E1-full/E2/E3) are later PRs; until then sub-error multiplication is ungoverned |
+| Denial-of-wallet: rea governs request volume as a spend proxy, never rated dollars | Medium | By design (§5.25) — vendor-settled spend arrives hours later; the audit log records attempts, not dollars. Client-side request ceilings + console quota caps are the wall, not any figure rea computes |
+| Denial-of-wallet: `billing-cap-halt` false-negative (novel billing phrasing not in `BILLING_RE`) | Medium | Accepted — pattern list kept tight to avoid false-positive freezes; new vendor phrasings are added as observed. The hook fires only after the vendor surfaces a terminal signal, so novel phrasings degrade to "no earlier than a human would notice" |
 
 ---
 

@@ -59,3 +59,17 @@ attribution:
 #     threshold: 25
 delegation_advisory:
   enabled: false
+
+# 0.51.0 spend-governance (E1 seed) — billing→HALT reflex. ON in EVERY
+# profile: unlike delegation_advisory (an opinion, bst-internal-only), a
+# billing-class error is unambiguously terminal and the halt reflex has no
+# false-positive cost worth the risk. The billing-cap-halt.sh PostToolUse
+# hook scans a Bash command's output for a billing signature (spending cap
+# / prepayment credits depleted / payment required — DISTINCT from a
+# retryable 429) and writes .rea/HALT. `billing_error_response: halt`
+# stops everything with no retry; `warn` surfaces a banner only; `off`
+# disables the reflex. See THREAT_MODEL.md §5.25 (INCIDENT-2026-07-04,
+# denial-of-wallet).
+spend_governance:
+  enabled: true
+  billing_error_response: halt
