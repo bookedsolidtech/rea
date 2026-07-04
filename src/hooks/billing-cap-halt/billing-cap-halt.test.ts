@@ -301,6 +301,19 @@ describe('runBillingCapHalt', () => {
     expect(r.haltWritten).toBe(true);
   });
 
+  it('billing on STDERR with success:false (Claude Code Bash signal) → halt (round-10 P1)', async () => {
+    writePolicy(root, 'halt');
+    const raw = JSON.stringify({
+      tool_name: 'Bash',
+      tool_input: { command: 'node tts.mjs' },
+      tool_response: { stdout: '', stderr: 'FATAL: spending cap exceeded', success: false },
+    });
+    const r = await runBillingCapHalt({ reaRoot: root, stdinOverride: raw });
+    expect(r.exitCode).toBe(2);
+    expect(r.action).toBe('halt');
+    expect(r.haltWritten).toBe(true);
+  });
+
   it('billing phrase on STDERR of a SUCCESSFUL command → no freeze (round-7 P1)', async () => {
     // A passing helper/test that logs an example provider response to
     // stderr must not freeze the session — only failed commands are scanned.

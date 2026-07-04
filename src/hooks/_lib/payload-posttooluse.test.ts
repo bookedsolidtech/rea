@@ -68,6 +68,22 @@ describe('parsePostToolUsePayload', () => {
     expect(parsePostToolUsePayload(raw).errored).toBe(true);
   });
 
+  it('derives errored=true from success:false (Claude Code Bash signal, round-10 P1)', () => {
+    const raw = JSON.stringify({
+      tool_input: { command: 'c' },
+      tool_response: { stdout: '', stderr: 'boom', success: false },
+    });
+    expect(parsePostToolUsePayload(raw).errored).toBe(true);
+  });
+
+  it('success:true is NOT errored', () => {
+    const raw = JSON.stringify({
+      tool_input: { command: 'c' },
+      tool_response: { stdout: 'ok', stderr: '', success: true },
+    });
+    expect(parsePostToolUsePayload(raw).errored).toBe(false);
+  });
+
   it('derives errored=true from a non-zero numeric exit field', () => {
     for (const key of ['exit_code', 'exitCode', 'code', 'returncode', 'status']) {
       const raw = JSON.stringify({ tool_input: { command: 'c' }, tool_response: { [key]: 9 } });

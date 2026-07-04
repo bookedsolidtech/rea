@@ -299,11 +299,12 @@ export interface PostToolUsePayload {
    */
   stdout: string;
   /**
-   * True when `tool_response` carries an explicit FAILURE signal — an
+   * True when `tool_response` carries an explicit FAILURE signal —
+   * `success: false` (Claude Code's PRIMARY Bash signal), an
    * `is_error`/`isError`/`error` flag, a non-zero numeric exit field
    * (`exit_code`/`exitCode`/`code`/`returncode`/`status`), or
-   * `interrupted: true`. Parsed for PR2; the billing gate is stderr-only
-   * and does not consult it. Absent/unknown shapes → `false`.
+   * `interrupted: true`. The billing gate scans stderr ONLY on a failed
+   * command (round-7). Absent/unknown shapes → `false`.
    */
   errored: boolean;
 }
@@ -331,6 +332,11 @@ const POST_TOOL_EXIT_KEYS = ['exit_code', 'exitCode', 'code', 'returncode', 'sta
  * only explicit, unambiguous failure markers count. Absent → false.
  */
 function toolResponseErrored(rec: Record<string, unknown>): boolean {
+  // Claude Code's Bash PostToolUse tool_response reports failure via a
+  // `success` boolean — the PRIMARY signal (see scripts/profile-hooks.mjs
+  // fixtures). Without this the billing reflex misses real walls reported as
+  // `{ success: false, stderr: ... }` (codex round-10 P1).
+  if (rec['success'] === false) return true;
   if (rec['is_error'] === true || rec['isError'] === true) return true;
   const err = rec['error'];
   if (err === true || (typeof err === 'string' && err.length > 0)) return true;

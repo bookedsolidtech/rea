@@ -86,11 +86,30 @@ function okStdoutPayload(command: string, stdout: string): string {
   });
 }
 
-function runShimInUnbuiltDir(payload: string, policyYaml?: string): ShimResult {
+// A present, ENABLING policy (no opt-out) so the CLI-missing tests exercise
+// the matcher / failure logic rather than the missing-file short-circuit
+// (round-10 P3: a MISSING policy file disables the reflex, matching
+// readSpendGovernance). Pass `null` to test the missing-file case.
+const ENABLED_POLICY = [
+  'version: "1"',
+  'profile: "test"',
+  'installed_by: "t"',
+  'blocked_paths: []',
+  'spend_governance:',
+  '  enabled: true',
+  '',
+].join('\n');
+
+function runShimInUnbuiltDir(
+  payload: string,
+  policyYaml: string | null | undefined = undefined,
+): ShimResult {
   // Simulate CLI-unreachable: point CLAUDE_PROJECT_DIR at a fresh dir with
   // no node_modules/@bookedsolid/rea AND no dist/cli/index.js, so the shim
-  // takes its CLI-missing fail-closed path. Optionally seed a .rea/policy.yaml
-  // so the CLI-independent policy reader (Tier 2/3) can honor an opt-out.
+  // takes its CLI-missing fail-closed path. Seeds an ENABLING .rea/policy.yaml
+  // by default; pass an explicit string for a different policy, or `null` for
+  // NO policy file (the missing-file / disabled case).
+  const toWrite = policyYaml === undefined ? ENABLED_POLICY : policyYaml;
   const tmpdir = path.join(
     REPO_ROOT,
     '.claude',
@@ -99,9 +118,9 @@ function runShimInUnbuiltDir(payload: string, policyYaml?: string): ShimResult {
   );
   spawnSync('mkdir', ['-p', tmpdir]);
   try {
-    if (policyYaml !== undefined) {
+    if (toWrite !== null) {
       spawnSync('mkdir', ['-p', path.join(tmpdir, '.rea')]);
-      fs.writeFileSync(path.join(tmpdir, '.rea', 'policy.yaml'), policyYaml);
+      fs.writeFileSync(path.join(tmpdir, '.rea', 'policy.yaml'), toWrite);
     }
     const res = spawnSync('bash', [SHIM], {
       cwd: tmpdir,
@@ -257,6 +276,40 @@ describe('billing-cap-halt CLI-missing opt-out (round-8 P2)', () => {
       expect(r.status).toBe(2);
     },
   );
+
+  it.skipIf(!bashExists())(
+    'MISSING policy file → disabled (no refusal), matching readSpendGovernance (round-10 P3)',
+    () => {
+      const r = runShimInUnbuiltDir(
+        failedPayload('node tts.mjs', 'FATAL: spending cap exceeded'),
+        null, // no .rea/policy.yaml at all
+      );
+      expect(r.status).toBe(0);
+    },
+  );
+
+  it.skipIf(!bashExists())(
+    'recognizes success:false (Claude Code Bash failure signal) on the CLI-missing path (round-10 P1)',
+    () => {
+      const payload = JSON.stringify({
+        tool_name: 'Bash',
+        tool_input: { command: 'node tts.mjs' },
+        tool_response: { stdout: '', stderr: 'FATAL: spending cap exceeded', success: false },
+      });
+      const r = runShimInUnbuiltDir(payload);
+      expect(r.status).toBe(2);
+    },
+  );
+
+  it.skipIf(!bashExists())('success:true with a billing phrase on stderr → no refusal', () => {
+    const payload = JSON.stringify({
+      tool_name: 'Bash',
+      tool_input: { command: 'node print-example.mjs' },
+      tool_response: { stdout: '', stderr: 'example: spending cap exceeded', success: true },
+    });
+    const r = runShimInUnbuiltDir(payload);
+    expect(r.status).toBe(0);
+  });
 });
 
 describe('billing-cap-halt matcher parity — shim strict set ⇔ CLI BILLING_RE (round-3 P1)', () => {

@@ -140,6 +140,7 @@ shim_cli_missing_relevant() {
       let stderr = "", errored = false;
       if (tr && typeof tr === "object" && !Array.isArray(tr)) {
         if (typeof tr.stderr === "string") stderr = tr.stderr;
+        if (tr.success === false) errored = true;
         if (tr.is_error === true || tr.isError === true) errored = true;
         if (tr.error === true || (typeof tr.error === "string" && tr.error.length)) errored = true;
         if (tr.interrupted === true) errored = true;
@@ -166,6 +167,16 @@ shim_cli_missing_relevant() {
 # default, so we return 1 and let the fail-closed relevance decision run —
 # a spend guard must not vanish just because the value was unreadable.
 shim_policy_short_circuit() {
+  # MISSING policy file → disabled, matching readSpendGovernance
+  # (ENOENT → no rea config → no-op). Without this the CLI-missing path
+  # would fail closed on a checkout that has the hook registered but no
+  # policy file, diverging from the built hook (codex round-10 P3). Base
+  # dir mirrors readSpendGovernance's reaRoot (CLAUDE_PROJECT_DIR else the
+  # resolved REA_ROOT).
+  local proj_dir="${CLAUDE_PROJECT_DIR:-$REA_ROOT}"
+  if [ ! -e "$proj_dir/.rea/policy.yaml" ]; then
+    return 0
+  fi
   # shellcheck source=_lib/policy-reader.sh
   source "$(dirname "$0")/_lib/policy-reader.sh"
   local sg_enabled sg_mode
