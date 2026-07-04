@@ -259,25 +259,52 @@ export function parseWriteHookPayload(raw: string | Buffer): WriteHookPayload {
 
 /**
  * Result of parsing a Claude Code PostToolUse stdin payload for a Bash
- * tool call. Unlike the PreToolUse parsers above, this one ALSO captures
- * the tool's OUTPUT (`tool_response`) — the billing→HALT gate
- * (0.51.0) needs it because a billing-class signature almost always
- * appears in a command's stdout/stderr, not in the command text itself.
+ * tool call. Unlike the PreToolUse parsers above, this one captures the
+ * tool's OUTPUT (`tool_response`) — the billing→HALT gate (0.51.0) needs
+ * it because a billing-class signature appears in a metered call's ERROR
+ * output, not in the command text.
+ *
+ * The output is split by CHANNEL on purpose (codex 0.51.0 round-1 P1/P2):
+ * a billing error is *error* output from a *failed* call. Scanning the
+ * command text or a successful command's stdout would freeze the session
+ * on entirely benign work — e.g. `cat THREAT_MODEL.md` or
+ * `rg "spending cap" .`, both of which legitimately print the watched
+ * phrases to stdout. So the caller scans `stderr` (the error channel,
+ * always) plus `stdout` ONLY when `errored` is set, and NEVER the
+ * command.
  */
 export interface PostToolUsePayload {
   /** `tool_name` from the payload, or `''` when absent. */
   toolName: string;
-  /** `tool_input.command` from the payload, or `''` when absent. */
+  /**
+   * `tool_input.command`, or `''` when absent. Retained for context /
+   * banners; the billing gate deliberately does NOT scan it.
+   */
   command: string;
   /**
-   * Flattened text of `tool_response`. Claude Code surfaces a Bash
-   * tool's result either as a bare string or as an object carrying
-   * `stdout` / `stderr` / `output`. We concatenate every string leaf we
-   * recognize (in a stable order) so a caller can scan command + output
-   * with a single regex pass. `''` when no recognizable output is
-   * present.
+   * The error channel — `tool_response.stderr`. Billing errors from a
+   * metered endpoint surface here. Scanned unconditionally by the gate.
+   * `''` when absent.
    */
-  output: string;
+  stderr: string;
+  /**
+   * The benign channel — `tool_response.stdout` (plus the `output` /
+   * `content` fallback keys some harnesses use, and a bare-string
+   * `tool_response`). A successful command's normal output. Scanned by
+   * the gate ONLY when `errored` is true. `''` when absent.
+   */
+  stdout: string;
+  /**
+   * True when `tool_response` carries an explicit FAILURE signal — an
+   * `is_error`/`isError`/`error` flag, a non-zero numeric exit field
+   * (`exit_code`/`exitCode`/`code`/`returncode`/`status`), or
+   * `interrupted: true`. Used by the gate to decide whether the benign
+   * `stdout` channel is worth scanning (a billing error printed to
+   * stdout by a script that then exits non-zero). Absent/unknown shapes
+   * → `false` (bias toward NOT scanning stdout, i.e. no false-positive
+   * freeze).
+   */
+  errored: boolean;
 }
 
 interface RawPostToolUsePayload {
@@ -289,38 +316,58 @@ interface RawPostToolUsePayload {
 }
 
 /**
- * The `tool_response` object keys we harvest, in a fixed order so the
- * flattened string is deterministic. `stdout`/`stderr` are the Bash
- * shape; `output` is the fallback some harness versions use; `content`
- * is a defensive catch for a wrapped shape. Non-string values at these
- * keys are skipped (never coerced) — the scan only cares about text.
+ * Benign (stdout-equivalent) object keys, in a fixed order. `stdout` is
+ * the Bash shape; `output` / `content` are fallbacks some harnesses use.
+ * `stderr` is handled separately (it is the error channel).
  */
-const POST_TOOL_RESPONSE_TEXT_KEYS = ['stdout', 'stderr', 'output', 'content'] as const;
+const POST_TOOL_STDOUT_KEYS = ['stdout', 'output', 'content'] as const;
+
+/** Numeric exit-status keys checked for a non-zero (failure) value. */
+const POST_TOOL_EXIT_KEYS = ['exit_code', 'exitCode', 'code', 'returncode', 'status'] as const;
+
+/**
+ * Derive a FAILURE signal from a `tool_response` object. Conservative:
+ * only explicit, unambiguous failure markers count. Absent → false.
+ */
+function toolResponseErrored(rec: Record<string, unknown>): boolean {
+  if (rec['is_error'] === true || rec['isError'] === true) return true;
+  const err = rec['error'];
+  if (err === true || (typeof err === 'string' && err.length > 0)) return true;
+  if (rec['interrupted'] === true) return true;
+  for (const key of POST_TOOL_EXIT_KEYS) {
+    const v = rec[key];
+    if (typeof v === 'number' && Number.isFinite(v) && v !== 0) return true;
+  }
+  return false;
+}
 
 /**
  * Parse a Claude Code PostToolUse stdin payload for a Bash tool call,
- * capturing BOTH `tool_input.command` and the flattened `tool_response`
- * text.
+ * capturing `tool_input.command` plus the `tool_response` split into the
+ * `stderr` (error) and `stdout` (benign) channels and an `errored` flag.
  *
  * Fail-closed posture mirrors `parseHookPayload`:
  *   - malformed JSON → throws `MalformedPayloadError`
  *   - `tool_input.command` present with a non-string type → throws
- *     `TypePayloadError` (a crafted `command: ["rm","-rf"]` would
- *     otherwise coerce to `''` and hide the command from the scan).
+ *     `TypePayloadError`.
  *
- * The OUTPUT extraction is deliberately LENIENT (never throws on a weird
+ * The channel extraction is deliberately LENIENT (never throws on a weird
  * `tool_response` shape): vendor output is untrusted and highly variable,
  * and the billing gate must not fail its whole evaluation because an
- * output field had an unexpected type. A shape we don't recognize simply
- * yields `output: ''` — the command text is still scanned, and the
- * gate's CLI body treats a parse-level failure as a no-op (never a
- * false-positive freeze), so leniency here cannot mask a real signal
- * without also being invisible to every other detector.
+ * output field had an unexpected type. A shape we don't recognize yields
+ * empty channels + `errored: false`.
  */
 export function parsePostToolUsePayload(raw: string | Buffer): PostToolUsePayload {
   const text = typeof raw === 'string' ? raw : raw.toString('utf8');
+  const empty: PostToolUsePayload = {
+    toolName: '',
+    command: '',
+    stderr: '',
+    stdout: '',
+    errored: false,
+  };
   if (text.trim().length === 0) {
-    return { toolName: '', command: '', output: '' };
+    return empty;
   }
   let parsed: RawPostToolUsePayload;
   try {
@@ -330,7 +377,7 @@ export function parsePostToolUsePayload(raw: string | Buffer): PostToolUsePayloa
     throw new MalformedPayloadError(`hook payload is not valid JSON: ${detail}`);
   }
   if (parsed === null) {
-    return { toolName: '', command: '', output: '' };
+    return empty;
   }
   if (typeof parsed !== 'object' || Array.isArray(parsed)) {
     throw new MalformedPayloadError(
@@ -357,24 +404,28 @@ export function parsePostToolUsePayload(raw: string | Buffer): PostToolUsePayloa
     if (typeof c === 'string') command = c;
   }
 
-  // Output — lenient. A bare string tool_response is used verbatim; an
-  // object contributes its recognized string leaves; anything else
-  // yields ''.
-  let output = '';
+  // Channels — lenient. A bare-string tool_response is treated as the
+  // BENIGN (stdout) channel: it carries no error signal, so it must not
+  // be scanned as if it were an error.
+  let stderr = '';
+  let stdout = '';
+  let errored = false;
   const tr = parsed.tool_response;
   if (typeof tr === 'string') {
-    output = tr;
+    stdout = tr;
   } else if (tr !== null && typeof tr === 'object' && !Array.isArray(tr)) {
     const rec = tr as Record<string, unknown>;
+    if (typeof rec['stderr'] === 'string') stderr = rec['stderr'] as string;
     const parts: string[] = [];
-    for (const key of POST_TOOL_RESPONSE_TEXT_KEYS) {
+    for (const key of POST_TOOL_STDOUT_KEYS) {
       const v = rec[key];
       if (typeof v === 'string' && v.length > 0) parts.push(v);
     }
-    output = parts.join('\n');
+    stdout = parts.join('\n');
+    errored = toolResponseErrored(rec);
   }
 
-  return { toolName, command, output };
+  return { toolName, command, stderr, stdout, errored };
 }
 
 /**

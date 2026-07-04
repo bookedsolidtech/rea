@@ -1,11 +1,11 @@
 /**
  * Unit tests for `parsePostToolUsePayload` (0.51.0 — billing→HALT gate).
  *
- * The PostToolUse parser is distinct from `parseHookPayload` in that it
- * ALSO captures the tool's OUTPUT (`tool_response`), which is where a
- * billing-class signature almost always lands. These tests pin the
- * command + output extraction, the fail-closed posture on the command
- * field, and the LENIENT posture on the output field.
+ * The parser splits `tool_response` into the `stderr` (error) and
+ * `stdout` (benign) channels plus an `errored` failure flag, so the gate
+ * can scan only the error surface. These tests pin channel extraction,
+ * the failure-flag derivation, the fail-closed posture on the command
+ * field, and the LENIENT posture on output.
  */
 
 import { describe, expect, it } from 'vitest';
@@ -18,15 +18,15 @@ import {
 describe('parsePostToolUsePayload', () => {
   it('empty stdin → all-empty', () => {
     const r = parsePostToolUsePayload('');
-    expect(r).toEqual({ toolName: '', command: '', output: '' });
+    expect(r).toEqual({ toolName: '', command: '', stderr: '', stdout: '', errored: false });
   });
 
-  it('top-level null → all-empty (mirrors jq // "")', () => {
+  it('top-level null → all-empty', () => {
     const r = parsePostToolUsePayload('null');
-    expect(r).toEqual({ toolName: '', command: '', output: '' });
+    expect(r).toEqual({ toolName: '', command: '', stderr: '', stdout: '', errored: false });
   });
 
-  it('extracts command + stdout/stderr from an object tool_response', () => {
+  it('splits stdout and stderr into separate channels', () => {
     const raw = JSON.stringify({
       tool_name: 'Bash',
       tool_input: { command: 'node tts.mjs' },
@@ -35,47 +35,82 @@ describe('parsePostToolUsePayload', () => {
     const r = parsePostToolUsePayload(raw);
     expect(r.toolName).toBe('Bash');
     expect(r.command).toBe('node tts.mjs');
-    expect(r.output).toContain('spending cap exceeded');
-    expect(r.output).toContain('ok');
+    expect(r.stderr).toBe('spending cap exceeded');
+    expect(r.stdout).toBe('ok');
   });
 
-  it('accepts a bare-string tool_response', () => {
+  it('treats a bare-string tool_response as the benign stdout channel', () => {
     const raw = JSON.stringify({
       tool_name: 'Bash',
       tool_input: { command: 'x' },
       tool_response: 'prepayment credits are depleted',
     });
     const r = parsePostToolUsePayload(raw);
-    expect(r.output).toBe('prepayment credits are depleted');
+    expect(r.stdout).toBe('prepayment credits are depleted');
+    expect(r.stderr).toBe('');
+    expect(r.errored).toBe(false);
   });
 
-  it('joins recognized keys in stable order (stdout, stderr, output, content)', () => {
+  it('joins stdout/output/content into the benign channel (stable order)', () => {
     const raw = JSON.stringify({
       tool_input: { command: 'c' },
-      tool_response: { content: 'D', output: 'C', stderr: 'B', stdout: 'A' },
+      tool_response: { content: 'C', output: 'B', stdout: 'A' },
     });
     const r = parsePostToolUsePayload(raw);
-    expect(r.output).toBe('A\nB\nC\nD');
+    expect(r.stdout).toBe('A\nB\nC');
   });
 
-  it('missing tool_response → empty output, command still present', () => {
+  it('derives errored=true from is_error', () => {
+    const raw = JSON.stringify({
+      tool_input: { command: 'c' },
+      tool_response: { stdout: '', stderr: 'boom', is_error: true },
+    });
+    expect(parsePostToolUsePayload(raw).errored).toBe(true);
+  });
+
+  it('derives errored=true from a non-zero numeric exit field', () => {
+    for (const key of ['exit_code', 'exitCode', 'code', 'returncode', 'status']) {
+      const raw = JSON.stringify({ tool_input: { command: 'c' }, tool_response: { [key]: 9 } });
+      expect(parsePostToolUsePayload(raw).errored).toBe(true);
+    }
+  });
+
+  it('exit field of 0 is NOT errored', () => {
+    const raw = JSON.stringify({ tool_input: { command: 'c' }, tool_response: { exit_code: 0 } });
+    expect(parsePostToolUsePayload(raw).errored).toBe(false);
+  });
+
+  it('derives errored=true from interrupted / string error', () => {
+    expect(
+      parsePostToolUsePayload(
+        JSON.stringify({ tool_input: {}, tool_response: { interrupted: true } }),
+      ).errored,
+    ).toBe(true);
+    expect(
+      parsePostToolUsePayload(
+        JSON.stringify({ tool_input: {}, tool_response: { error: 'nope' } }),
+      ).errored,
+    ).toBe(true);
+  });
+
+  it('missing tool_response → empty channels, command still present', () => {
     const raw = JSON.stringify({ tool_input: { command: 'echo hi' } });
     const r = parsePostToolUsePayload(raw);
     expect(r.command).toBe('echo hi');
-    expect(r.output).toBe('');
+    expect(r.stderr).toBe('');
+    expect(r.stdout).toBe('');
+    expect(r.errored).toBe(false);
   });
 
-  it('LENIENT on a non-string/object tool_response (number) → empty output, no throw', () => {
-    const raw = JSON.stringify({ tool_input: { command: 'c' }, tool_response: 42 });
-    const r = parsePostToolUsePayload(raw);
-    expect(r.output).toBe('');
-    expect(r.command).toBe('c');
-  });
-
-  it('LENIENT on an array tool_response → empty output, no throw', () => {
-    const raw = JSON.stringify({ tool_input: { command: 'c' }, tool_response: ['a', 'b'] });
-    const r = parsePostToolUsePayload(raw);
-    expect(r.output).toBe('');
+  it('LENIENT on a number/array tool_response → empty channels, no throw', () => {
+    expect(
+      parsePostToolUsePayload(JSON.stringify({ tool_input: { command: 'c' }, tool_response: 42 })),
+    ).toMatchObject({ stderr: '', stdout: '', errored: false });
+    expect(
+      parsePostToolUsePayload(
+        JSON.stringify({ tool_input: { command: 'c' }, tool_response: ['a'] }),
+      ),
+    ).toMatchObject({ stderr: '', stdout: '', errored: false });
   });
 
   it('skips non-string leaves inside the tool_response object', () => {
@@ -84,7 +119,8 @@ describe('parsePostToolUsePayload', () => {
       tool_response: { stdout: 'keep', stderr: 99, output: null },
     });
     const r = parsePostToolUsePayload(raw);
-    expect(r.output).toBe('keep');
+    expect(r.stdout).toBe('keep');
+    expect(r.stderr).toBe('');
   });
 
   it('FAIL-CLOSED: malformed JSON throws MalformedPayloadError', () => {

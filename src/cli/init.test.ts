@@ -1530,3 +1530,49 @@ describe('0.44.0 charter item 2 — postInstallVerify mode-less FS skip', () => 
     }
   });
 });
+
+describe('rea init — 0.51.0 spend_governance emission (E1 seed)', () => {
+  let prevCwd: string;
+  const cleanup: string[] = [];
+
+  beforeEach(() => {
+    prevCwd = process.cwd();
+  });
+  afterEach(async () => {
+    process.chdir(prevCwd);
+    await Promise.all(cleanup.splice(0).map((d) => fs.rm(d, { recursive: true, force: true })));
+  });
+
+  // The reflex ships ON in every profile; the zod schema default is OFF,
+  // so the block MUST be materialized into .rea/policy.yaml or the hook is
+  // a no-op. This is the codex round-2 P1 fix (block was never emitted).
+  for (const profile of ['minimal', 'open-source', 'bst-internal', 'client-engagement', 'lit-wc']) {
+    it(`emits spend_governance enabled:true + halt for profile ${profile}`, async () => {
+      const dir = await makeScratch();
+      cleanup.push(dir);
+      process.chdir(dir);
+      await runInit({ yes: true, profile, codex: false });
+      const policy = await readPolicy(dir);
+      expect(policy).toMatch(/spend_governance:\s*\n\s+enabled:\s+true/);
+      expect(policy).toMatch(/billing_error_response:\s+halt/);
+    });
+  }
+
+  it('preserves an operator billing_error_response override across re-init', async () => {
+    const dir = await makeScratch();
+    cleanup.push(dir);
+    process.chdir(dir);
+    await runInit({ yes: true, profile: 'minimal', codex: false });
+    const orig = await readPolicy(dir);
+    // Operator switches to warn.
+    await fs.writeFile(
+      path.join(dir, '.rea', 'policy.yaml'),
+      orig.replace(/billing_error_response:\s+halt/, 'billing_error_response: warn'),
+      'utf8',
+    );
+    await runInit({ yes: true, profile: 'minimal', codex: false, force: true });
+    const after = await readPolicy(dir);
+    expect(after).toMatch(/billing_error_response:\s+warn/);
+    expect(after).not.toMatch(/billing_error_response:\s+halt/);
+  });
+});

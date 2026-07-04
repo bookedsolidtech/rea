@@ -46,11 +46,20 @@ blocked_paths: []
 function haltPath(root: string): string {
   return path.join(root, '.rea', 'HALT');
 }
-function payload(command: string, output: string): string {
+/** Billing text on the STDERR (error) channel — always scanned. */
+function payload(command: string, stderr: string): string {
   return JSON.stringify({
     tool_name: 'Bash',
     tool_input: { command },
-    tool_response: { stdout: '', stderr: output },
+    tool_response: { stdout: '', stderr },
+  });
+}
+/** Text on the STDOUT (benign) channel; `errored` toggles the failure flag. */
+function stdoutPayload(command: string, stdout: string, errored = false): string {
+  return JSON.stringify({
+    tool_name: 'Bash',
+    tool_input: { command },
+    tool_response: { stdout, stderr: '', ...(errored ? { is_error: true } : {}) },
   });
 }
 
@@ -174,16 +183,63 @@ describe('runBillingCapHalt', () => {
     expect(fs.readFileSync(haltPath(root), 'utf8')).toBe(original);
   });
 
-  it('detects the signature in the COMMAND text too (not just output)', async () => {
+  it('does NOT scan the command text (billing phrase only in command → no halt)', async () => {
+    // codex round-1 P2: `rg "spending cap" .` must not self-freeze the session.
     writePolicy(root, 'halt');
     const raw = JSON.stringify({
       tool_name: 'Bash',
-      tool_input: { command: 'echo "spending cap exceeded"' },
-      tool_response: { stdout: '', stderr: '' },
+      tool_input: { command: 'rg "spending cap" .' },
+      tool_response: { stdout: 'src/foo.ts\nTHREAT_MODEL.md', stderr: '' },
     });
     const r = await runBillingCapHalt({ reaRoot: root, stdinOverride: raw });
+    expect(r.exitCode).toBe(0);
+    expect(r.action).toBe('noop');
+    expect(fs.existsSync(haltPath(root))).toBe(false);
+  });
+
+  it('does NOT scan a SUCCESSFUL command stdout (cat THREAT_MODEL.md → no halt)', async () => {
+    // codex round-1 P1: benign docs containing the phrase must not freeze.
+    writePolicy(root, 'halt');
+    const r = await runBillingCapHalt({
+      reaRoot: root,
+      stdinOverride: stdoutPayload('cat THREAT_MODEL.md', 'A billing spending cap exceeded example.'),
+    });
+    expect(r.exitCode).toBe(0);
+    expect(r.action).toBe('noop');
+    expect(fs.existsSync(haltPath(root))).toBe(false);
+  });
+
+  it('DOES scan stdout when the command errored (billing on stdout + is_error → halt)', async () => {
+    writePolicy(root, 'halt');
+    const r = await runBillingCapHalt({
+      reaRoot: root,
+      stdinOverride: stdoutPayload('node tts.mjs', 'FATAL: spending cap exceeded', true),
+    });
     expect(r.exitCode).toBe(2);
+    expect(r.action).toBe('halt');
     expect(r.haltWritten).toBe(true);
+  });
+
+  it('write failure → exit 2, haltWritten false, DEGRADED banner (does not claim frozen)', async () => {
+    writePolicy(root, 'halt');
+    // Make `.rea` read-only (r-x) so policy.yaml still reads but
+    // writeFileSync(`.rea/HALT`) throws EACCES — simulating a read-only
+    // checkout / permissions problem.
+    fs.chmodSync(path.join(root, '.rea'), 0o500);
+    try {
+      const r = await runBillingCapHalt({
+        reaRoot: root,
+        stdinOverride: payload('node tts.mjs', BILLING),
+      });
+      expect(r.exitCode).toBe(2);
+      expect(r.action).toBe('halt');
+      expect(r.haltWritten).toBe(false);
+      expect(fs.existsSync(haltPath(root))).toBe(false);
+      expect(r.stderr).toMatch(/DEGRADED/);
+      expect(r.stderr).toMatch(/NOT frozen/);
+    } finally {
+      fs.chmodSync(path.join(root, '.rea'), 0o700);
+    }
   });
 
   it('sanitizes control bytes out of the matched snippet before it reaches HALT', async () => {

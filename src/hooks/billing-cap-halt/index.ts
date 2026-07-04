@@ -10,14 +10,26 @@
  *
  * # What it does
  *
- * Fires on every Bash PostToolUse. Scans the just-run command AND its
- * output (stdout/stderr) for a BILLING-CLASS signature — a TERMINAL,
- * non-retryable spend error (e.g. "spending cap", "prepayment credits
- * are depleted"). On a match it writes `.rea/HALT` (the existing
- * kill-switch that every middleware + hook already respects), turning the
- * field-proven client-side reflex (`BILLING_RE ⇒ process.exit`, no retry)
- * into a governance-layer primitive: stop everything, no retry, zero
- * exceptions.
+ * Fires on every Bash PostToolUse. Scans the command's ERROR output for a
+ * BILLING-CLASS signature — a TERMINAL, non-retryable spend error (e.g.
+ * "spending cap", "prepayment credits are depleted"). On a match it
+ * writes `.rea/HALT` (the existing kill-switch that every middleware +
+ * hook already respects), turning the field-proven client-side reflex
+ * (`BILLING_RE ⇒ process.exit`, no retry) into a governance-layer
+ * primitive: stop everything, no retry, zero exceptions.
+ *
+ * # What it scans — and what it does NOT (codex 0.51.0 round-1 P1/P2)
+ *
+ * A billing error is ERROR output from a FAILED metered call. So the gate
+ * scans the `stderr` channel unconditionally, plus `stdout` ONLY when the
+ * tool_response carries an explicit failure signal (`is_error`, a
+ * non-zero exit field, `interrupted`). It NEVER scans the command text,
+ * and NEVER scans a successful command's stdout. Without that
+ * restriction, entirely benign work would freeze the session: `cat
+ * THREAT_MODEL.md` or `rg "spending cap" .` legitimately print the
+ * watched phrases to stdout, and the hook ships enabled on every profile
+ * firing on every Bash call. Conservatism against false-positive freezes
+ * is the governing constraint (a self-inflicted freeze is its own harm).
  *
  * Billing-class is DELIBERATELY DISTINCT from a mere rate-limit. A `429`
  * / "rate limit" / "usage limit" / "exceeded quota" is retryable
@@ -217,6 +229,26 @@ function buildBanner(matched: string, mode: 'halt' | 'warn'): string {
   return lines.join('');
 }
 
+/**
+ * Banner for the degraded case where a billing signature matched under
+ * `halt` mode but `.rea/HALT` could NOT be written. Must NOT claim the
+ * session is frozen (it isn't) — it tells the operator the reflex is
+ * degraded and the freeze must be applied manually.
+ */
+function buildWriteFailedBanner(matched: string, errMsg: string): string {
+  return [
+    'BILLING HALT (DEGRADED): billing error detected but .rea/HALT could NOT be written\n',
+    '\n',
+    `  Signature: ${matched}\n`,
+    `  Write error: ${sanitizeHaltReason(errMsg).slice(0, 200)}\n`,
+    '\n',
+    '  A billing-class error is TERMINAL — do NOT retry.\n',
+    '  The session is NOT frozen (the HALT file could not be created).\n',
+    '  Stop all metered requests and run `rea freeze` manually, or fix the\n',
+    '  filesystem permissions so the reflex can write .rea/HALT.\n',
+  ].join('');
+}
+
 export async function runBillingCapHalt(
   options: BillingCapHaltOptions = {},
 ): Promise<BillingCapHaltResult> {
@@ -251,12 +283,14 @@ export async function runBillingCapHalt(
       ? options.stdinOverride
       : await readStdinWithTimeout(5_000);
 
-  let command = '';
-  let output = '';
+  let payloadStderr = '';
+  let payloadStdout = '';
+  let errored = false;
   try {
     const payload = parsePostToolUsePayload(stdinRaw);
-    command = payload.command;
-    output = payload.output;
+    payloadStderr = payload.stderr;
+    payloadStdout = payload.stdout;
+    errored = payload.errored;
   } catch (err) {
     if (err instanceof MalformedPayloadError || err instanceof TypePayloadError) {
       writeStderr('billing-cap-halt: payload unreadable; skipping (no freeze on malformed input)\n');
@@ -265,8 +299,13 @@ export async function runBillingCapHalt(
     throw err;
   }
 
-  // 4. Scan command + output for a billing-class signature.
-  const haystack = output.length > 0 ? `${command}\n${output}` : command;
+  // 4. Scan the ERROR output for a billing-class signature. stderr is the
+  //    error channel and is always scanned; stdout is a benign channel
+  //    scanned ONLY when the command explicitly FAILED (a billing error
+  //    printed to stdout by a script that then exits non-zero). The
+  //    command text is NEVER scanned. This is the codex round-1 P1/P2
+  //    false-positive-freeze fix — see the file header.
+  const haystack = errored ? `${payloadStderr}\n${payloadStdout}` : payloadStderr;
   const m = BILLING_RE.exec(haystack);
   if (m === null) {
     return { exitCode: 0, stderr, action: 'noop', matched: null, haltWritten: false };
@@ -287,23 +326,21 @@ export async function runBillingCapHalt(
   const reason = sanitizeHaltReason(
     `billing-cap-halt: billing-class error detected ("${matched}") — automated freeze, no retry`,
   );
-  let haltWritten = false;
   try {
     writeHaltFile(reaRoot, reason);
-    haltWritten = true;
   } catch (err) {
-    // Writing HALT failed (permissions, read-only FS). Still surface the
-    // banner + exit 2 so the reflex does not silently disappear — the
-    // agent is told to stop even though the global freeze could not be
-    // laid down.
-    writeStderr(
-      `billing-cap-halt: FAILED to write .rea/HALT (${
-        err instanceof Error ? err.message : String(err)
-      }) — surfacing banner anyway\n`,
-    );
+    // Writing HALT failed (permissions, read-only FS). Do NOT emit the
+    // standard "HALT written — all governed tool calls are now blocked"
+    // banner: that would tell the operator the session is frozen when no
+    // HALT file exists and later commands are still allowed (codex
+    // round-1 P1). Emit an explicit degraded-state banner instead, still
+    // exit 2 so the reflex does not silently disappear and the agent is
+    // told to stop.
+    writeStderr(buildWriteFailedBanner(matched, err instanceof Error ? err.message : String(err)));
+    return { exitCode: 2, stderr, action: 'halt', matched, haltWritten: false };
   }
   writeStderr(buildBanner(matched, 'halt'));
-  return { exitCode: 2, stderr, action: 'halt', matched, haltWritten };
+  return { exitCode: 2, stderr, action: 'halt', matched, haltWritten: true };
 }
 
 /**
