@@ -436,6 +436,30 @@ export function defaultDesiredHooks(): DesiredHookGroup[] {
       ],
     },
     {
+      // 0.51.0 spend-governance E1 seed (INCIDENT-2026-07-04,
+      // denial-of-wallet). Matcher is `Bash` (NOT chained onto the
+      // architecture-review or delegation-advisory groups — the matcher
+      // differs from both). The hook scans a just-run command's output
+      // for a BILLING-CLASS signature (spending cap / prepayment credits
+      // depleted / payment required — TERMINAL, distinct from a retryable
+      // 429) and, per `policy.spend_governance.billing_error_response`,
+      // writes `.rea/HALT`. Default `halt` + `enabled: true` ships in
+      // EVERY profile (the reflex has no false-positive cost worth the
+      // risk); a policy with no `spend_governance` block sees the hook as
+      // a silent no-op. The shim's coarse relevance pre-gate means
+      // ordinary Bash output never spawns the CLI.
+      event: 'PostToolUse',
+      matcher: 'Bash',
+      hooks: [
+        {
+          type: 'command',
+          command: `${base}/billing-cap-halt.sh`,
+          timeout: 10000,
+          statusMessage: 'Checking for billing-class spend errors...',
+        },
+      ],
+    },
+    {
       // 0.31.0 delegation-telemetry completion — the *nudge*. The
       // matcher is `Bash|Edit|Write|MultiEdit|NotebookEdit`: every
       // write-class tool call (note this group INCLUDES Bash, unlike

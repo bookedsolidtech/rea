@@ -50,6 +50,7 @@ import { runHookLocalReviewGate } from '../hooks/local-review-gate/index.js';
 import { runHookSecretScanner } from '../hooks/secret-scanner/index.js';
 import { runHookBlockedPathsBashGate } from '../hooks/blocked-paths-bash-gate/index.js';
 import { runHookProtectedPathsBashGate } from '../hooks/protected-paths-bash-gate/index.js';
+import { runHookBillingCapHalt } from '../hooks/billing-cap-halt/index.js';
 import { runHookBlockedPathsEnforcer } from '../hooks/blocked-paths-enforcer/index.js';
 import { runHookSettingsProtection } from '../hooks/settings-protection/index.js';
 import { loadPolicy } from '../policy/loader.js';
@@ -1467,6 +1468,15 @@ export function registerHookCommand(program: Command): void {
     )
     .action(async () => {
       await runHookSettingsProtection();
+    });
+
+  hook
+    .command('billing-cap-halt')
+    .description(
+      'PostToolUse Bash billing→HALT reflex (0.51.0, spend-governance E1 seed). Reads a Claude Code PostToolUse Bash payload from stdin (command + tool_response output); when a BILLING-CLASS signature (spending cap / prepayment credits depleted / payment required / insufficient balance — DISTINCT from a retryable 429/rate-limit) matches, writes `.rea/HALT` (reusing the kill-switch every middleware + hook respects) per `policy.spend_governance.billing_error_response`: halt (default) → HALT + banner + exit 2; warn → banner + exit 2, no HALT; off / disabled / absent block → no-op. Malformed payload is fail-SAFE (exit 0, no freeze); the shim fails CLOSED only when a billing keyword is present with no CLI. Introduced after INCIDENT-2026-07-04 (denial-of-wallet).',
+    )
+    .action(async () => {
+      await runHookBillingCapHalt();
     });
 
   hook

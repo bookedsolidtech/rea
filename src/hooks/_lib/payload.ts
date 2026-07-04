@@ -258,6 +258,126 @@ export function parseWriteHookPayload(raw: string | Buffer): WriteHookPayload {
 }
 
 /**
+ * Result of parsing a Claude Code PostToolUse stdin payload for a Bash
+ * tool call. Unlike the PreToolUse parsers above, this one ALSO captures
+ * the tool's OUTPUT (`tool_response`) — the billing→HALT gate
+ * (0.51.0) needs it because a billing-class signature almost always
+ * appears in a command's stdout/stderr, not in the command text itself.
+ */
+export interface PostToolUsePayload {
+  /** `tool_name` from the payload, or `''` when absent. */
+  toolName: string;
+  /** `tool_input.command` from the payload, or `''` when absent. */
+  command: string;
+  /**
+   * Flattened text of `tool_response`. Claude Code surfaces a Bash
+   * tool's result either as a bare string or as an object carrying
+   * `stdout` / `stderr` / `output`. We concatenate every string leaf we
+   * recognize (in a stable order) so a caller can scan command + output
+   * with a single regex pass. `''` when no recognizable output is
+   * present.
+   */
+  output: string;
+}
+
+interface RawPostToolUsePayload {
+  tool_name?: unknown;
+  tool_input?: {
+    command?: unknown;
+  } | null;
+  tool_response?: unknown;
+}
+
+/**
+ * The `tool_response` object keys we harvest, in a fixed order so the
+ * flattened string is deterministic. `stdout`/`stderr` are the Bash
+ * shape; `output` is the fallback some harness versions use; `content`
+ * is a defensive catch for a wrapped shape. Non-string values at these
+ * keys are skipped (never coerced) — the scan only cares about text.
+ */
+const POST_TOOL_RESPONSE_TEXT_KEYS = ['stdout', 'stderr', 'output', 'content'] as const;
+
+/**
+ * Parse a Claude Code PostToolUse stdin payload for a Bash tool call,
+ * capturing BOTH `tool_input.command` and the flattened `tool_response`
+ * text.
+ *
+ * Fail-closed posture mirrors `parseHookPayload`:
+ *   - malformed JSON → throws `MalformedPayloadError`
+ *   - `tool_input.command` present with a non-string type → throws
+ *     `TypePayloadError` (a crafted `command: ["rm","-rf"]` would
+ *     otherwise coerce to `''` and hide the command from the scan).
+ *
+ * The OUTPUT extraction is deliberately LENIENT (never throws on a weird
+ * `tool_response` shape): vendor output is untrusted and highly variable,
+ * and the billing gate must not fail its whole evaluation because an
+ * output field had an unexpected type. A shape we don't recognize simply
+ * yields `output: ''` — the command text is still scanned, and the
+ * gate's CLI body treats a parse-level failure as a no-op (never a
+ * false-positive freeze), so leniency here cannot mask a real signal
+ * without also being invisible to every other detector.
+ */
+export function parsePostToolUsePayload(raw: string | Buffer): PostToolUsePayload {
+  const text = typeof raw === 'string' ? raw : raw.toString('utf8');
+  if (text.trim().length === 0) {
+    return { toolName: '', command: '', output: '' };
+  }
+  let parsed: RawPostToolUsePayload;
+  try {
+    parsed = JSON.parse(text) as RawPostToolUsePayload;
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    throw new MalformedPayloadError(`hook payload is not valid JSON: ${detail}`);
+  }
+  if (parsed === null) {
+    return { toolName: '', command: '', output: '' };
+  }
+  if (typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new MalformedPayloadError(
+      `hook payload top-level is ${Array.isArray(parsed) ? 'array' : typeof parsed}, expected object`,
+    );
+  }
+  const toolName = typeof parsed.tool_name === 'string' ? parsed.tool_name : '';
+
+  // Command — same type-strict extraction as parseHookPayload.
+  const ti = parsed.tool_input;
+  let command = '';
+  if (ti !== undefined && ti !== null) {
+    if (typeof ti !== 'object') {
+      throw new TypePayloadError(
+        `hook payload tool_input is ${typeof ti}, expected object`,
+      );
+    }
+    const c = ti.command;
+    if (c !== undefined && typeof c !== 'string') {
+      throw new TypePayloadError(
+        `hook payload tool_input.command is non-string (got ${typeof c}); expected string`,
+      );
+    }
+    if (typeof c === 'string') command = c;
+  }
+
+  // Output — lenient. A bare string tool_response is used verbatim; an
+  // object contributes its recognized string leaves; anything else
+  // yields ''.
+  let output = '';
+  const tr = parsed.tool_response;
+  if (typeof tr === 'string') {
+    output = tr;
+  } else if (tr !== null && typeof tr === 'object' && !Array.isArray(tr)) {
+    const rec = tr as Record<string, unknown>;
+    const parts: string[] = [];
+    for (const key of POST_TOOL_RESPONSE_TEXT_KEYS) {
+      const v = rec[key];
+      if (typeof v === 'string' && v.length > 0) parts.push(v);
+    }
+    output = parts.join('\n');
+  }
+
+  return { toolName, command, output };
+}
+
+/**
  * Read all of stdin into a string with a soft byte cap and a hard
  * timeout. Mirrors the `readStdinWithTimeout` helper in
  * `src/cli/hook.ts` (which scans a fixed timeout but no byte cap).

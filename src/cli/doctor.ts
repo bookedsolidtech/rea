@@ -195,6 +195,16 @@ export const EXPECTED_AGENTS = [
 export const EXPECTED_HOOKS = [
   'architecture-review-gate.sh',
   'attribution-advisory.sh',
+  // 0.51.0 — spend-governance E1 seed (INCIDENT-2026-07-04,
+  // denial-of-wallet). PostToolUse Bash billing→HALT reflex. Added to
+  // EXPECTED_HOOKS at ship time (not staged like delegation-advisory
+  // was) because the hook is security-load-bearing AND ships enabled in
+  // every profile — a consumer who upgrades must lay it down, and doctor
+  // should surface its absence rather than silently tolerate a missing
+  // spend wall. Consumers on pre-0.51.0 installs get a doctor `fail`
+  // until they run `rea upgrade`, which is the correct signal for a
+  // control this class.
+  'billing-cap-halt.sh',
   // 0.22.0 — Bash-tier parity with `blocked-paths-enforcer.sh`.
   // Round-27 F8 fix: was silently missing from EXPECTED_HOOKS, so
   // doctor returned pass on consumer installs that lacked this

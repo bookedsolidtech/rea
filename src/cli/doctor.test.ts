@@ -759,6 +759,10 @@ describe('rea doctor — EXPECTED_HOOKS coverage (round-25 P3)', () => {
     const allCanonical = [
       'architecture-review-gate.sh',
       'attribution-advisory.sh',
+      // 0.51.0 — spend-governance E1 seed (billing→HALT reflex). Added to
+      // EXPECTED_HOOKS at ship time (security-load-bearing + ships enabled
+      // in every profile). Hook count is now 17 (was 16 in 0.36.0+).
+      'billing-cap-halt.sh',
       'blocked-paths-bash-gate.sh',
       'blocked-paths-enforcer.sh',
       'changeset-security-gate.sh',
@@ -791,10 +795,10 @@ describe('rea doctor — EXPECTED_HOOKS coverage (round-25 P3)', () => {
     const checks = collectChecks(repo.dir);
     const hooksCheck = findCheck(checks, 'hooks installed + executable');
     expect(hooksCheck?.status).toBe('pass');
-    // 0.36.0 — 16 shipped hooks (was 15 in 0.31.0 → 0.35.0).
-    // `delegation-advisory.sh` joined EXPECTED_HOOKS this release after
-    // its 4-release upgrade-lag propagation window closed.
-    expect(hooksCheck?.detail).toMatch(/16 hooks present/);
+    // 0.51.0 — 17 shipped hooks (was 16 in 0.36.0 → 0.50.0).
+    // `billing-cap-halt.sh` (spend-governance E1 seed) joined
+    // EXPECTED_HOOKS this release.
+    expect(hooksCheck?.detail).toMatch(/17 hooks present/);
   });
 });
 
