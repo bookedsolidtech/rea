@@ -191,7 +191,7 @@ Hooks at `.claude/hooks/` (copied from `hooks/` by `rea init`). 15 ship in the p
 - `blocked-paths-enforcer.sh` — enforces `blocked_paths` from policy
 - `changeset-security-gate.sh` — checks changesets for GHSA leaks and malformed frontmatter
 - `architecture-review-gate.sh` — post-write architectural impact check
-- `billing-cap-halt.sh` — PostToolUse Bash billing→HALT reflex (0.51.0, spend-governance E1 seed): scans a command's output for a billing-class signature (spending cap / prepayment credits depleted / payment required — DISTINCT from a retryable 429) and writes `.rea/HALT` per `spend_governance.billing_error_response` (`halt`/`warn`/`off`)
+- `billing-cap-halt.sh` — PostToolUse Bash billing→HALT reflex (0.51.0, spend-governance E1 seed): scans a FAILED command's stderr for a provider-specific billing-class signature (spending cap / prepayment credits depleted / credit balance is too low / insufficient_quota — DISTINCT from a retryable 429; generic 402/"payment required" is a known gap until PR2's endpoint scoping) and acts per `spend_governance.billing_error_response` (seed default `warn` = banner only; `halt` = writes `.rea/HALT`; `off`)
 
 Slash commands at `.claude/commands/`:
 

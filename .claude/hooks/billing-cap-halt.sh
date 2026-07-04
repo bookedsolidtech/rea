@@ -4,10 +4,12 @@
 #
 # Spend-governance E1 seed (INCIDENT-2026-07-04, denial-of-wallet). Fires
 # on every Bash PostToolUse. The real logic lives in
-# `src/hooks/billing-cap-halt/index.ts`: it scans the just-run command's
-# ERROR output for a BILLING-CLASS signature (spending cap / prepayment
-# credits depleted / payment required — TERMINAL, distinct from a
-# retryable 429) and, per `policy.spend_governance.billing_error_response`,
+# `src/hooks/billing-cap-halt/index.ts`: it scans a FAILED command's stderr
+# for a provider-specific BILLING-CLASS signature (spending cap / prepayment
+# credits depleted / credit balance is too low / insufficient_quota —
+# TERMINAL, distinct from a retryable 429; generic 402/"payment required"
+# and "billing … limit" are a known gap until PR2's endpoint scoping) and,
+# per `policy.spend_governance.billing_error_response`,
 # writes `.rea/HALT` (the existing kill-switch every middleware + hook
 # respects). The CLI is authoritative on CHANNEL selection (stderr always,
 # stdout only on failure; never the command text or successful stdout);
@@ -61,9 +63,6 @@ _billing_kw_match() {
     *"prepayment credit"*) return 0 ;;
     *"credit balance"*) return 0 ;;
     *"insufficient"*) return 0 ;;
-    *"payment required"*) return 0 ;;
-    *"billing"*) return 0 ;;
-    *"402 payment"*) return 0 ;;
   esac
   return 1
 }

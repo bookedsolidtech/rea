@@ -47,8 +47,18 @@
  * / "rate limit" / "usage limit" / "exceeded quota" is retryable
  * (`RATE_LIMIT_REGEX` in `src/gateway/observability/codex-telemetry.ts`
  * already detects those, observe-only). "spending cap exceeded" /
- * "prepayment credits depleted" / "payment required" is a wall — retrying
- * it just burns more money. ONLY the billing-class set writes HALT.
+ * "prepayment credits depleted" / "credit balance is too low" /
+ * "insufficient_quota" is a wall — retrying it just burns more money. ONLY
+ * the billing-class set writes HALT.
+ *
+ * KNOWN GAP (deliberate, until PR2): generic/ambiguous spend-exhaustion
+ * signals — HTTP 402 / "payment required", "insufficient funds|balance",
+ * and bare "billing … limit exceeded" — are NOT matched, because they also
+ * occur in ordinary payments/subscription app errors and this hook has no
+ * metered-endpoint scoping to disambiguate (see BILLING_RE). A provider
+ * that reports exhausted spend ONLY as a 402 is therefore not caught here
+ * yet; PR2's endpoint registry restores those forms scoped to a known
+ * metered host, where the 402 is unambiguously a provider billing wall.
  *
  * # Response modes (`policy.spend_governance.billing_error_response`)
  *
