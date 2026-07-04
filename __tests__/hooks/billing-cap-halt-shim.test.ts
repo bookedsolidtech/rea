@@ -36,21 +36,25 @@ const CANONICAL_WALLS = [
   'spending cap exceeded',
   'prepayment credits are depleted',
   'credit balance is too low',
-  'insufficient funds',
-  'insufficient credits',
-  'insufficient balance',
   'insufficient_quota',
-  'payment required',
   'billing hard limit exceeded',
   'billing cap reached',
 ];
 
-/** Benign strings that merely resemble a wall — neither matcher may fire. */
+/**
+ * Benign strings that merely resemble a wall — neither matcher may fire.
+ * Includes the round-7 P2 exclusions (ambiguous app/402/business-domain
+ * phrases the narrowed BILLING_RE no longer treats as billing walls).
+ */
 const BENIGN_NEAR_MISSES = [
   'insufficient permissions',
   'cat: billing-report.txt: No such file or directory',
   '429 too many requests',
   'rate limit exceeded',
+  'payment required',
+  '402 payment required',
+  'insufficient funds',
+  'insufficient balance',
 ];
 
 interface ShimResult {
@@ -160,6 +164,23 @@ describe('hooks/billing-cap-halt.sh — CLI-missing strict fail-closed (round-2 
           stdout: 'docs/THREAT_MODEL.md: the spending cap wall',
           stderr: 'grep: missing_dir: No such file or directory',
           exit_code: 2,
+        },
+      });
+      const r = runShimInUnbuiltDir(payload);
+      expect(r.status).toBe(0);
+    },
+  );
+
+  it.skipIf(!bashExists())(
+    'does NOT fail closed when a SUCCESSFUL command logs a billing phrase to stderr (round-7 P1/P3)',
+    () => {
+      const payload = JSON.stringify({
+        tool_name: 'Bash',
+        tool_input: { command: 'node print-example.mjs' },
+        tool_response: {
+          stdout: '',
+          stderr: 'example provider response: spending cap exceeded',
+          exit_code: 0,
         },
       });
       const r = runShimInUnbuiltDir(payload);

@@ -18,24 +18,30 @@
  * (`BILLING_RE ⇒ process.exit`, no retry) into a governance-layer
  * primitive: stop everything, no retry, zero exceptions.
  *
- * # What it scans — and what it does NOT (codex 0.51.0 round-1 P1/P2, round-4 P1)
+ * # What it scans — and what it does NOT (codex 0.51.0 round-1/4/7)
  *
  * A billing error is ERROR output from a FAILED metered call — an
- * unhandled SDK/CLI failure surfaces on stderr with a non-zero exit. So
- * the gate scans the `stderr` channel ONLY. It NEVER scans the command
- * text, and NEVER scans stdout (not even on a non-zero exit). Without
- * those restrictions, entirely benign work would freeze the session, and
- * the hook ships enabled on every profile firing on every Bash call:
+ * unhandled SDK/CLI failure surfaces on stderr WITH a non-zero exit. So
+ * the gate scans the `stderr` channel ONLY, and ONLY when the command
+ * actually FAILED. It NEVER scans the command text, and NEVER scans stdout
+ * (not even on failure). Without those restrictions, benign work on a hook
+ * that ships enabled on every profile and fires on every Bash call would
+ * freeze the session:
  *   - `cat THREAT_MODEL.md` / `rg "spending cap" .` print the watched
  *     phrases to stdout (round-1 P1/P2);
- *   - `grep -R "spending cap" docs missing_dir` EXITS NON-ZERO (missing
- *     path) yet prints real doc matches to stdout, with only "No such
- *     file" on stderr (round-4 P1) — a stdout-on-failure scan froze on it.
- * Conservatism against false-positive freezes is the governing constraint
- * (a self-inflicted freeze is its own harm). The residual — a billing
- * error printed ONLY to stdout of a failed command — is an accepted gap
- * for this coarse backstop; PR2's metered-endpoint registry restores
- * full-output scanning once a KNOWN metered host is in play.
+ *   - `grep -R "spending cap" docs missing_dir` exits non-zero yet prints
+ *     real doc matches to stdout, with only "No such file" on stderr
+ *     (round-4 P1) — a stdout-on-failure scan froze on it;
+ *   - a SUCCESSFUL helper/test that logs an example provider response or a
+ *     business-domain error to stderr (round-7 P1) — gating on a non-zero
+ *     exit makes that a no-op.
+ * The phrase set is further restricted to PROVIDER-SPECIFIC billing walls
+ * (round-7 P2 — see BILLING_RE) since there is no metered-endpoint scoping
+ * yet. Conservatism against false-positive freezes is the governing
+ * constraint (a self-inflicted freeze is its own harm). The residual — a
+ * billing error printed ONLY to a failed command's stdout — is an accepted
+ * gap; PR2's metered-endpoint registry restores full-output scanning once a
+ * KNOWN metered host is in play.
  *
  * Billing-class is DELIBERATELY DISTINCT from a mere rate-limit. A `429`
  * / "rate limit" / "usage limit" / "exceeded quota" is retryable
@@ -120,32 +126,36 @@ export interface BillingCapHaltResult {
  * money-specific phrase that a 429 / throttle / quota-window error does
  * NOT contain, so a routine rate-limit never triggers a freeze.
  *
+ * PROVIDER-SPECIFIC ONLY (codex 0.51.0 round-7 P2). This hook fires on
+ * every Bash PostToolUse and has NO metered-endpoint scoping yet (that is
+ * PR2), so the pattern is deliberately restricted to phrases that are
+ * unambiguous MODEL-PROVIDER billing walls — not generic HTTP/business-
+ * domain errors that a failing app-under-test legitimately emits. In
+ * particular `payment required` / `402` (paywall & 402 flows) and
+ * `insufficient funds|credits|balance` (banking / business-domain test
+ * output) are EXCLUDED here; PR2 restores broader matching scoped to a
+ * KNOWN metered host, where the ambiguity is resolved by the endpoint.
+ *
  * Pattern list (case-insensitive), with provenance:
  *   - `spending cap`                         — field-proven (Gemini, the
  *                                              incident's own `BILLING_RE`)
  *   - `prepayment credits (are) depleted`    — field-proven (Gemini)
  *   - `billing (hard) (cap|limit) … exceeded/reached`
- *                                            — generic billing wall
+ *                                            — "billing" + cap/limit +
+ *                                              exceeded/reached is provider-
+ *                                              billing-specific
  *   - `credit balance is too low`            — Anthropic billing
- *   - `insufficient (funds|credit|credits|balance)`
- *                                            — generic prepay exhaustion
- *   - `payment required` / a bare `402` next to `payment`
- *                                            — HTTP 402 Payment Required
- *   - `insufficient_quota`                   — OpenAI billing error code
- *                                              (note: the human-readable
- *                                              "exceeded your current
- *                                              quota" is intentionally
- *                                              NOT matched — it overlaps
- *                                              the retryable rate-limit
- *                                              phrasing; the machine code
- *                                              is the unambiguous signal)
+ *   - `insufficient_quota`                   — OpenAI billing error CODE
+ *                                              (the machine code, not the
+ *                                              ambiguous prose)
  *
- * Deliberately NOT included (retryable — belong to RATE_LIMIT_REGEX):
- *   `429`, `rate limit`, `usage limit`, `exceeded quota`, `too many
- *   requests`, `resource exhausted`, `deadline exceeded`.
+ * Deliberately NOT included: `payment required`, `402`, `insufficient
+ * funds/credits/balance` (ambiguous — round-7 P2); and the retryable
+ * RATE_LIMIT_REGEX set (`429`, `rate limit`, `usage limit`, `exceeded
+ * quota`, `too many requests`, `resource exhausted`, `deadline exceeded`).
  */
 export const BILLING_RE =
-  /spending cap|prepayment credits (?:are )?depleted|billing (?:hard )?(?:cap|limit)[^.\n]{0,40}(?:exceeded|reached)|credit balance is too low|insufficient (?:funds|credits?|balance)|payment required|\b402 payment required\b|insufficient_quota/i;
+  /spending cap|prepayment credits (?:are )?depleted|billing (?:hard )?(?:cap|limit)[^.\n]{0,40}(?:exceeded|reached)|credit balance is too low|insufficient_quota/i;
 
 interface RawSpendGovernance {
   enabled?: unknown;
@@ -341,28 +351,26 @@ export async function runBillingCapHalt(
     throw err;
   }
 
-  // 4. Scan STDERR ONLY for a billing-class signature. A genuine billing
-  //    wall from a metered call is an ERROR: an unhandled SDK/CLI failure
-  //    surfaces on stderr with a non-zero exit. The command text and stdout
-  //    are NEVER scanned.
+  // 4. Scan STDERR, and ONLY when the command actually FAILED. A genuine
+  //    billing wall is an ERROR: an unhandled SDK/CLI failure surfaces on
+  //    stderr WITH a non-zero exit. Two guards, both load-bearing:
   //
-  //    We deliberately do NOT fall back to scanning stdout on a non-zero
-  //    exit (codex round-4 P1): a command that fails for an UNRELATED
-  //    reason while printing benign matching text to stdout would
-  //    false-freeze. The canonical case is `grep -R "spending cap" docs
-  //    missing_dir` — grep exits non-zero because one path is missing, but
-  //    prints real doc matches to stdout; its stderr is only "No such
-  //    file", which does not match. stderr-only makes that a clean no-op.
+  //    - Gate on `errored` (round-7 P1): a SUCCESSFUL command that prints a
+  //      matching phrase to stderr — an example provider response, a
+  //      business-domain log, a passing test's diagnostic — must not freeze
+  //      the session. Only a failed command's stderr is a candidate.
+  //    - stderr only, never stdout even on failure (round-4 P1): `grep -R
+  //      "spending cap" docs missing_dir` exits non-zero on the missing path
+  //      but prints real doc matches to stdout; its stderr is just "No such
+  //      file". Scanning stdout there would false-freeze.
   //
-  //    The residual gap — a script that prints a billing error ONLY to
-  //    stdout and then exits non-zero — is accepted for this coarse
-  //    backstop; full-output scanning returns with PR2's metered-endpoint
-  //    registry, where a KNOWN metered host justifies searching everything.
-  //    `payloadStdout` / `errored` stay parsed (the parser is shared and
-  //    PR2-ready) but are not consulted here.
+  //    Command text is never scanned. The residual gap (a billing error
+  //    printed only to a failed command's stdout) is accepted for this
+  //    coarse backstop; PR2's metered-endpoint registry restores full-output
+  //    scanning where a KNOWN metered host justifies it. `payloadStdout`
+  //    stays parsed (shared parser, PR2-ready) but is not consulted here.
   void payloadStdout;
-  void errored;
-  const haystack = payloadStderr;
+  const haystack = errored ? payloadStderr : '';
   const m = BILLING_RE.exec(haystack);
   if (m === null) {
     return { exitCode: 0, stderr, action: 'noop', matched: null, haltWritten: false };

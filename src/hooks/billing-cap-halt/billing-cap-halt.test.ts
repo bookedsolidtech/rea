@@ -47,12 +47,24 @@ blocked_paths: []
 function haltPath(root: string): string {
   return path.join(root, '.rea', 'HALT');
 }
-/** Billing text on the STDERR (error) channel — always scanned. */
+/**
+ * Billing text on the STDERR channel of a FAILED command (exit_code 1) —
+ * the realistic wall scenario. stderr is scanned ONLY on failure (round-7),
+ * so this helper marks the command failed.
+ */
 function payload(command: string, stderr: string): string {
   return JSON.stringify({
     tool_name: 'Bash',
     tool_input: { command },
-    tool_response: { stdout: '', stderr },
+    tool_response: { stdout: '', stderr, exit_code: 1 },
+  });
+}
+/** Billing text on the STDERR channel of a SUCCESSFUL command (exit 0). */
+function successStderrPayload(command: string, stderr: string): string {
+  return JSON.stringify({
+    tool_name: 'Bash',
+    tool_input: { command },
+    tool_response: { stdout: '', stderr, exit_code: 0 },
   });
 }
 /** Text on the STDOUT (benign) channel; `errored` toggles the failure flag. */
@@ -289,6 +301,19 @@ describe('runBillingCapHalt', () => {
     expect(r.haltWritten).toBe(true);
   });
 
+  it('billing phrase on STDERR of a SUCCESSFUL command → no freeze (round-7 P1)', async () => {
+    // A passing helper/test that logs an example provider response to
+    // stderr must not freeze the session — only failed commands are scanned.
+    writePolicy(root, 'halt');
+    const r = await runBillingCapHalt({
+      reaRoot: root,
+      stdinOverride: successStderrPayload('node print-example.mjs', 'example: spending cap exceeded'),
+    });
+    expect(r.exitCode).toBe(0);
+    expect(r.action).toBe('noop');
+    expect(fs.existsSync(haltPath(root))).toBe(false);
+  });
+
   it('write failure → exit 2, haltWritten false, DEGRADED banner (does not claim frozen)', async () => {
     writePolicy(root, 'halt');
     // Make `.rea` read-only (r-x) so policy.yaml still reads but
@@ -360,15 +385,12 @@ describe('policy degradation — malformed YAML fails toward protection (round-2
 });
 
 describe('BILLING_RE distinctness from rate-limit', () => {
-  it('matches terminal billing phrases', () => {
+  it('matches provider-specific terminal billing phrases', () => {
     for (const s of [
       'spending cap',
       'prepayment credits are depleted',
       'prepayment credits depleted',
       'credit balance is too low',
-      'insufficient funds',
-      'insufficient balance',
-      'payment required',
       'insufficient_quota',
       'billing hard limit exceeded',
     ]) {
@@ -385,6 +407,21 @@ describe('BILLING_RE distinctness from rate-limit', () => {
       'resource exhausted',
       'deadline exceeded',
       'too many requests',
+    ]) {
+      expect(BILLING_RE.test(s)).toBe(false);
+    }
+  });
+
+  it('does NOT match AMBIGUOUS phrases (round-7 P2 — app/402/business-domain)', () => {
+    // These occur in ordinary app errors, paywall/402 flows, and
+    // business-domain test output; too broad for a hook with no
+    // metered-endpoint scoping yet. PR2 restores them scoped to a host.
+    for (const s of [
+      'payment required',
+      '402 payment required',
+      'insufficient funds',
+      'insufficient balance',
+      'insufficient credits',
     ]) {
       expect(BILLING_RE.test(s)).toBe(false);
     }

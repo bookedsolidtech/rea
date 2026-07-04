@@ -68,35 +68,28 @@ _billing_kw_match() {
   return 1
 }
 
-# SPECIFIC billing match — the FULL multi-word billing-wall phrases from
-# the CLI's BILLING_RE, matched as complete substrings. Used ONLY by the
+# PROVIDER-SPECIFIC billing match — the full multi-word phrases from the
+# CLI's BILLING_RE, matched as complete substrings. Used ONLY by the
 # CLI-MISSING fail-closed path, where an over-trigger causes a FALSE HALT
 # (exit 2) with no CLI to disambiguate.
 #
-# This resolves the precision/recall tension both codex rounds surfaced:
+# History of the precision/recall tuning:
 #   - round-2 P2: a BARE-WORD set (`insufficient`, `billing`) false-blocked
 #     `insufficient permissions` / a failed `cat billing-report.txt`.
-#   - round-3 P1: a too-NARROW set silently dropped documented walls
-#     (`payment required`, `insufficient funds`, `billing hard limit
-#     exceeded`) during the no-CLI window.
-# The fix is neither broad single words nor a truncated list: it is the
-# COMPLETE set of BILLING_RE's terminal phrases as full substrings. Full
-# phrases are specific enough to never match the round-2 false positives
-# (`insufficient permissions` ∌ `insufficient funds`; `billing-report.txt`
-# ∌ `billing hard cap`) yet cover every wall the authoritative matcher
-# does. MUST stay in sync with BILLING_RE (`src/hooks/billing-cap-halt/
-# index.ts`) — the parity test in `billing-cap-halt-shim.test.ts` enforces
-# it. Takes already-lower-cased text on $1. bash 3.2 `case`.
+#   - round-3 P1: a too-narrow set dropped walls the CLI matched.
+#   - round-7 P2: `payment required` / `insufficient funds|credits|balance`
+#     are ambiguous (paywall/402 + business-domain output), so BILLING_RE
+#     itself dropped them — this set mirrors that. Until PR2's endpoint
+#     scoping, only unambiguous PROVIDER billing walls fail closed.
+# MUST stay in sync with BILLING_RE (`src/hooks/billing-cap-halt/index.ts`)
+# — the parity test in `billing-cap-halt-shim.test.ts` enforces it. Takes
+# already-lower-cased text on $1. bash 3.2 `case`.
 _billing_kw_strict() {
   case "$1" in
     *"spending cap"*) return 0 ;;
     *"prepayment credit"*) return 0 ;;
     *"credit balance is too low"*) return 0 ;;
-    *"insufficient funds"*) return 0 ;;
-    *"insufficient credit"*) return 0 ;;
-    *"insufficient balance"*) return 0 ;;
     *"insufficient_quota"*) return 0 ;;
-    *"payment required"*) return 0 ;;
     *"billing hard cap"*) return 0 ;;
     *"billing hard limit"*) return 0 ;;
     *"billing cap exceeded"*) return 0 ;;
@@ -142,14 +135,19 @@ shim_cli_missing_relevant() {
       let p; try { p = JSON.parse(d); } catch { process.exit(0); }
       if (!p || typeof p !== "object" || Array.isArray(p)) process.exit(0);
       const tr = p.tool_response;
-      // STDERR ONLY — the sole channel the TS hook scans (round-4 P1). A
-      // bare-string tool_response is stdout-equivalent, so it contributes
-      // nothing to the error channel.
-      let stderr = "";
+      // STDERR of a FAILED command only — mirrors the TS hook (round-4 +
+      // round-7 P1/P3). Emit nothing on success so a passing command that
+      // merely logs a phrase to stderr never fails closed. A bare-string
+      // tool_response is stdout-equivalent (success) → contributes nothing.
+      let stderr = "", errored = false;
       if (tr && typeof tr === "object" && !Array.isArray(tr)) {
         if (typeof tr.stderr === "string") stderr = tr.stderr;
+        if (tr.is_error === true || tr.isError === true) errored = true;
+        if (tr.error === true || (typeof tr.error === "string" && tr.error.length)) errored = true;
+        if (tr.interrupted === true) errored = true;
+        for (const k of ["exit_code","exitCode","code","returncode","status"]) if (typeof tr[k] === "number" && tr[k] !== 0) errored = true;
       }
-      process.stdout.write(stderr);
+      process.stdout.write(errored ? stderr : "");
     });
   ' 2>/dev/null) || return 0
   local lower=""

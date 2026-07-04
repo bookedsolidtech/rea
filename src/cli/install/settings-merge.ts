@@ -441,7 +441,7 @@ export function defaultDesiredHooks(): DesiredHookGroup[] {
       // architecture-review or delegation-advisory groups — the matcher
       // differs from both). The hook scans a just-run command's output
       // for a BILLING-CLASS signature (spending cap / prepayment credits
-      // depleted / payment required — TERMINAL, distinct from a retryable
+      // depleted / insufficient_quota — TERMINAL, distinct from a retryable
       // 429) and, per `policy.spend_governance.billing_error_response`,
       // writes `.rea/HALT`. OPT-OUT: `enabled` defaults true, so a policy
       // with NO `spend_governance` block still runs the reflex (`halt`) —
