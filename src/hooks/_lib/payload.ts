@@ -446,9 +446,13 @@ export function parsePostToolUsePayload(raw: string | Buffer): PostToolUsePayloa
  *
  * @param timeoutMs How long to wait for stdin to close before resolving
  *                  with whatever we have. Default 5_000 ms.
- * @param maxBytes Soft cap on total bytes accepted. Default 1 MiB.
- *                 Once reached, additional chunks are dropped silently
- *                 (the caller still gets a parseable string back).
+ * @param maxBytes Soft cap on RETAINED bytes. Default 1 MiB. Once reached,
+ *                 further bytes are discarded but stdin is STILL DRAINED to
+ *                 EOF (we do not resolve early) so the writer's pipe closes
+ *                 cleanly. A payload that ends exactly at the cap is whole;
+ *                 one that exceeds it yields a truncated head that a
+ *                 JSON-parsing caller will reject — callers treat that as a
+ *                 degraded read, not a valid document.
  */
 export function readStdinWithTimeout(
   timeoutMs = 5_000,
@@ -478,16 +482,21 @@ export function readStdinWithTimeout(
     const timer = setTimeout(finish, timeoutMs);
     process.stdin.setEncoding('utf8');
     process.stdin.on('data', (chunk: string) => {
+      if (bytesRead >= maxBytes) {
+        // Cap already reached — keep DRAINING to EOF, discarding excess,
+        // rather than resolving early (codex 0.51.0 round-11 P2). Resolving
+        // mid-stream stopped reading and left the writer's pipe undrained;
+        // for hooks that JSON.parse the payload an early cut is also a
+        // guaranteed malformed document. Draining lets the writer finish
+        // cleanly and lets a payload that ends AT the cap still be whole.
+        return;
+      }
       const chunkBytes = Buffer.byteLength(chunk, 'utf8');
       if (bytesRead + chunkBytes > maxBytes) {
-        // Truncate to the cap; further chunks are dropped silently.
-        const remaining = Math.max(0, maxBytes - bytesRead);
-        if (remaining > 0) {
-          buf += chunk.slice(0, remaining);
-          bytesRead = maxBytes;
-        }
-        finish();
-        return;
+        const remaining = maxBytes - bytesRead;
+        buf += chunk.slice(0, remaining);
+        bytesRead = maxBytes;
+        return; // keep draining; do NOT resolve early
       }
       buf += chunk;
       bytesRead += chunkBytes;
