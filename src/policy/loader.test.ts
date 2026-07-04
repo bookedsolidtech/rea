@@ -430,20 +430,21 @@ blocked_paths: []
     await fs.writeFile(path.join(baseDir, '.rea', 'policy.yaml'), body, 'utf8');
   }
 
-  it('absent block resolves to the opt-out default (enabled true, halt)', async () => {
+  it('absent block resolves to the opt-out default (enabled true, seed default warn)', async () => {
     // Opt-out (codex round-6): `.default({})` so an absent block is ON —
-    // keeping loadPolicy in lockstep with the runtime hook.
+    // keeping loadPolicy in lockstep with the runtime hook. Seed default
+    // mode is `warn` (round-12 P1), not halt.
     await write(BASE);
     const p = loadPolicy(baseDir);
     expect(p.spend_governance?.enabled).toBe(true);
-    expect(p.spend_governance?.billing_error_response).toBe('halt');
+    expect(p.spend_governance?.billing_error_response).toBe('warn');
   });
 
-  it('present block defaults billing_error_response to halt', async () => {
+  it('present block defaults billing_error_response to warn (seed default)', async () => {
     await write(BASE + 'spend_governance:\n  enabled: true\n');
     const p = loadPolicy(baseDir);
     expect(p.spend_governance?.enabled).toBe(true);
-    expect(p.spend_governance?.billing_error_response).toBe('halt');
+    expect(p.spend_governance?.billing_error_response).toBe('warn');
   });
 
   it('present block defaults enabled to TRUE when omitted (opt-out)', async () => {

@@ -184,8 +184,14 @@ shim_policy_short_circuit() {
   if [ "$sg_enabled" = "false" ]; then
     return 0
   fi
+  # SEED default is `warn` (round-12 P1): only an EXPLICIT `halt` should
+  # fail closed (exit 2) in the CLI-missing window, since only `halt` blocks
+  # at all. `warn` (banner, exit 0), `off`, and the absent-default `warn`
+  # must NOT refuse the command. The shim can't emit the warn banner without
+  # the CLI, so the correct degraded behavior for every non-halt mode is to
+  # short-circuit (exit 0). Only `halt` proceeds to the fail-closed match.
   sg_mode=$(policy_reader_get spend_governance.billing_error_response 2>/dev/null || true)
-  if [ "$sg_mode" = "off" ]; then
+  if [ "$sg_mode" != "halt" ]; then
     return 0
   fi
   return 1

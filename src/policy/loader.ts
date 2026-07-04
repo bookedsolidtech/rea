@@ -381,7 +381,15 @@ const DelegationAdvisoryPolicySchema = z
 const SpendGovernancePolicySchema = z
   .object({
     enabled: z.boolean().default(true),
-    billing_error_response: z.enum(['halt', 'warn', 'off']).default('halt'),
+    // SEED default is `warn`, NOT `halt` (codex 0.51.0 round-12 P1). The
+    // hook fires on every Bash PostToolUse with no metered-endpoint scoping
+    // yet, so a phrase-only global `halt` would freeze sessions in
+    // budgeting / payments / loyalty repos whose own errors say "spending
+    // cap" etc. `warn` detects + banners + audits without freezing. `halt`
+    // stays available as an explicit opt-in and becomes the default once
+    // PR2's endpoint registry supplies the provider discriminator that
+    // makes freezing safe.
+    billing_error_response: z.enum(['halt', 'warn', 'off']).default('warn'),
   })
   .strict();
 

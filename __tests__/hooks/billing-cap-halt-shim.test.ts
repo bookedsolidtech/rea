@@ -86,10 +86,10 @@ function okStdoutPayload(command: string, stdout: string): string {
   });
 }
 
-// A present, ENABLING policy (no opt-out) so the CLI-missing tests exercise
-// the matcher / failure logic rather than the missing-file short-circuit
-// (round-10 P3: a MISSING policy file disables the reflex, matching
-// readSpendGovernance). Pass `null` to test the missing-file case.
+// A present, HALT-mode policy so the CLI-missing tests exercise the
+// fail-closed matcher rather than the missing-file short-circuit (round-10
+// P3) or the seed default `warn` (round-12 — only explicit `halt` fails
+// closed in the CLI-missing window). Pass `null` for the missing-file case.
 const ENABLED_POLICY = [
   'version: "1"',
   'profile: "test"',
@@ -97,6 +97,7 @@ const ENABLED_POLICY = [
   'blocked_paths: []',
   'spend_governance:',
   '  enabled: true',
+  '  billing_error_response: halt',
   '',
 ].join('\n');
 
@@ -260,8 +261,11 @@ describe('billing-cap-halt CLI-missing opt-out (round-8 P2)', () => {
   });
 
   it.skipIf(!bashExists())(
-    'opt-out default (no block) still fails closed on a real wall',
+    'opt-out default (no block) → seed default warn → does NOT fail closed (round-12)',
     () => {
+      // A present policy with no spend_governance block is enabled at the
+      // SEED default `warn`. Only an EXPLICIT `halt` fails closed in the
+      // CLI-missing window; `warn` (the default) must not refuse.
       const withBlockAbsent = [
         'version: "1"',
         'profile: "test"',
@@ -273,7 +277,7 @@ describe('billing-cap-halt CLI-missing opt-out (round-8 P2)', () => {
         failedPayload('node tts.mjs', 'FATAL: spending cap exceeded'),
         withBlockAbsent,
       );
-      expect(r.status).toBe(2);
+      expect(r.status).toBe(0);
     },
   );
 

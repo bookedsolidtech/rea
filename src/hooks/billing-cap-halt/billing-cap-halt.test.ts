@@ -4,10 +4,10 @@
  *
  * Behavior matrix:
  *   - billing signature + halt  → exit 2, .rea/HALT written
- *   - billing signature + warn  → exit 2, NO HALT
+ *   - billing signature + warn  → exit 0 (advisory banner), NO HALT
  *   - billing signature + off / enabled:false → exit 0, NO HALT (opt-out)
- *   - billing signature + ABSENT block → HALT (opt-out default is ON)
- *   - billing signature + malformed block shape → HALT (protect)
+ *   - billing signature + ABSENT block → WARN (opt-out default: enabled + seed-default warn)
+ *   - billing signature + malformed block shape → WARN (protect at seed default)
  *   - rate-limit-only (429)     → exit 0, NO HALT (billing ≠ rate-limit)
  *   - clean output              → exit 0, NO HALT
  *   - malformed payload         → exit 0, NO HALT (fail-SAFE)
@@ -102,13 +102,13 @@ describe('runBillingCapHalt', () => {
     expect(r.stderr).toMatch(/BILLING HALT/);
   });
 
-  it('billing signature + warn → exit 2, NO HALT', async () => {
+  it('billing signature + warn → exit 0 (advisory, non-blocking), NO HALT', async () => {
     writePolicy(root, 'warn');
     const r = await runBillingCapHalt({
       reaRoot: root,
       stdinOverride: payload('node tts.mjs', BILLING),
     });
-    expect(r.exitCode).toBe(2);
+    expect(r.exitCode).toBe(0);
     expect(r.action).toBe('warn');
     expect(r.haltWritten).toBe(false);
     expect(fs.existsSync(haltPath(root))).toBe(false);
@@ -137,23 +137,27 @@ describe('runBillingCapHalt', () => {
     expect(fs.existsSync(haltPath(root))).toBe(false);
   });
 
-  it('billing signature + absent block → HALT (opt-out default, round-5 P1)', async () => {
+  it('billing signature + absent block → WARN detection (opt-out default enabled+warn, round-5/12)', async () => {
     // A present rea policy with NO spend_governance block is the exact
-    // upgrade-from-0.50.x state. Opt-out default: the reflex is ON, so a
-    // real billing wall still freezes rather than the hook being dead.
+    // upgrade-from-0.50.x state. Opt-out default: the reflex is ENABLED, and
+    // the SEED default mode is `warn` (round-12 P1) — detect + banner, NO
+    // freeze, because a phrase-only global halt is unsafe until PR2's
+    // endpoint scoping. So the wall is DETECTED but the session is not frozen.
     writePolicy(root); // no spend_governance block at all
     const r = await runBillingCapHalt({
       reaRoot: root,
       stdinOverride: payload('node tts.mjs', BILLING),
     });
-    expect(r.exitCode).toBe(2);
-    expect(r.action).toBe('halt');
-    expect(fs.existsSync(haltPath(root))).toBe(true);
+    expect(r.exitCode).toBe(0);
+    expect(r.action).toBe('warn');
+    expect(r.matched).not.toBeNull();
+    expect(fs.existsSync(haltPath(root))).toBe(false);
   });
 
-  it('malformed block shape (spend_governance: []) → PROTECT (round-5 P2)', async () => {
+  it('malformed block shape (spend_governance: []) → PROTECT at warn (round-5 P2 / round-12)', async () => {
     // A parseable-but-schema-invalid shape the strict loader rejects must
-    // not silently disable the guard.
+    // not silently disable the guard — it stays ENABLED, at the seed default
+    // `warn` (detect + banner, no freeze).
     fs.mkdirSync(path.join(root, '.rea'), { recursive: true });
     fs.writeFileSync(
       path.join(root, '.rea', 'policy.yaml'),
@@ -163,12 +167,13 @@ describe('runBillingCapHalt', () => {
       reaRoot: root,
       stdinOverride: payload('node tts.mjs', BILLING),
     });
-    expect(r.exitCode).toBe(2);
-    expect(r.action).toBe('halt');
-    expect(fs.existsSync(haltPath(root))).toBe(true);
+    expect(r.exitCode).toBe(0);
+    expect(r.action).toBe('warn');
+    expect(r.matched).not.toBeNull();
+    expect(fs.existsSync(haltPath(root))).toBe(false);
   });
 
-  it('malformed enabled value (enabled: "true" string) → PROTECT (round-5 P2)', async () => {
+  it('malformed enabled value (enabled: "true" string) → PROTECT at warn (round-5 P2 / round-12)', async () => {
     fs.mkdirSync(path.join(root, '.rea'), { recursive: true });
     fs.writeFileSync(
       path.join(root, '.rea', 'policy.yaml'),
@@ -178,8 +183,8 @@ describe('runBillingCapHalt', () => {
       reaRoot: root,
       stdinOverride: payload('node tts.mjs', BILLING),
     });
-    expect(r.exitCode).toBe(2);
-    expect(r.action).toBe('halt');
+    expect(r.exitCode).toBe(0);
+    expect(r.action).toBe('warn');
   });
 
   it('rate-limit only (429) + halt → exit 0, NO HALT (billing ≠ rate-limit)', async () => {
@@ -363,12 +368,12 @@ describe('runBillingCapHalt', () => {
 });
 
 describe('policy degradation — malformed YAML fails toward protection (round-2 P2)', () => {
-  it('present-but-unparseable policy → PROTECT (billing signal still HALTs)', async () => {
+  it('present-but-unparseable policy → PROTECT at warn (billing signal detected, no freeze)', async () => {
     const root = makeRoot();
-    // A real spend-governance install (feature on by default) whose YAML
-    // is broken by a syntax error in an UNRELATED section — the exact
-    // mid-edit / merge-conflict scenario. The guard must NOT silently
-    // vanish; it defaults to the protective halt.
+    // A real spend-governance install whose YAML is broken by a syntax
+    // error in an UNRELATED section — the mid-edit / merge-conflict case.
+    // The guard must NOT silently vanish; it stays ENABLED at the seed
+    // default `warn` (detect + banner, no freeze — round-12 P1).
     fs.mkdirSync(path.join(root, '.rea'), { recursive: true });
     fs.writeFileSync(
       path.join(root, '.rea', 'policy.yaml'),
@@ -378,9 +383,10 @@ describe('policy degradation — malformed YAML fails toward protection (round-2
       reaRoot: root,
       stdinOverride: payload('node tts.mjs', 'Error: spending cap exceeded'),
     });
-    expect(res.action).toBe('halt');
-    expect(res.exitCode).toBe(2);
-    expect(fs.existsSync(haltPath(root))).toBe(true);
+    expect(res.action).toBe('warn');
+    expect(res.exitCode).toBe(0);
+    expect(res.matched).not.toBeNull();
+    expect(fs.existsSync(haltPath(root))).toBe(false);
     rm(root);
   });
 
@@ -396,19 +402,21 @@ describe('policy degradation — malformed YAML fails toward protection (round-2
     rm(root);
   });
 
-  it('present-but-UNREADABLE policy (non-ENOENT) → PROTECT (round-9 P2)', async () => {
+  it('present-but-UNREADABLE policy (non-ENOENT) → PROTECT at warn (round-9 P2 / round-12)', async () => {
     // A read failure other than "missing" — here a directory at the policy
     // path (EISDIR) — is a degraded PRESENT policy, not no-config, so the
-    // guard fails toward protection rather than silently disabling.
+    // guard stays ENABLED at the seed default `warn` rather than silently
+    // disabling.
     const root = makeRoot();
     fs.mkdirSync(path.join(root, '.rea', 'policy.yaml'), { recursive: true });
     const res = await runBillingCapHalt({
       reaRoot: root,
       stdinOverride: payload('node tts.mjs', 'spending cap exceeded'),
     });
-    expect(res.action).toBe('halt');
-    expect(res.exitCode).toBe(2);
-    expect(fs.existsSync(haltPath(root))).toBe(true);
+    expect(res.action).toBe('warn');
+    expect(res.exitCode).toBe(0);
+    expect(res.matched).not.toBeNull();
+    expect(fs.existsSync(haltPath(root))).toBe(false);
     rm(root);
   });
 });

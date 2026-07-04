@@ -443,11 +443,13 @@ export function defaultDesiredHooks(): DesiredHookGroup[] {
       // for a BILLING-CLASS signature (spending cap / prepayment credits
       // depleted / insufficient_quota — TERMINAL, distinct from a retryable
       // 429) and, per `policy.spend_governance.billing_error_response`,
-      // writes `.rea/HALT`. OPT-OUT: `enabled` defaults true, so a policy
-      // with NO `spend_governance` block still runs the reflex (`halt`) —
-      // opting out is an explicit `enabled: false` / `billing_error_response:
-      // off`. The shim's coarse relevance pre-gate means ordinary Bash
-      // output never spawns the CLI.
+      // acts. OPT-OUT: `enabled` defaults true, so a policy with NO
+      // `spend_governance` block still runs the reflex at the SEED default
+      // `warn` (banner + audit, no freeze — a phrase-only global halt is
+      // unsafe without endpoint scoping; codex round-12). `halt` is an
+      // explicit opt-in; opting out entirely is `enabled: false` /
+      // `billing_error_response: off`. The shim's coarse relevance pre-gate
+      // means ordinary Bash output never spawns the CLI.
       event: 'PostToolUse',
       matcher: 'Bash',
       hooks: [

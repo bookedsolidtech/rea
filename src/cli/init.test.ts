@@ -1547,39 +1547,40 @@ describe('rea init — 0.51.0 spend_governance emission (E1 seed)', () => {
   // explicitly so .rea/policy.yaml documents it (activation itself is the
   // opt-out default). codex round-2 P1: the block was never emitted.
   for (const profile of ['minimal', 'open-source', 'bst-internal', 'client-engagement', 'lit-wc']) {
-    it(`emits spend_governance enabled:true + halt for profile ${profile}`, async () => {
+    it(`emits spend_governance enabled:true + warn for profile ${profile}`, async () => {
       const dir = await makeScratch();
       cleanup.push(dir);
       process.chdir(dir);
       await runInit({ yes: true, profile, codex: false });
       const policy = await readPolicy(dir);
       expect(policy).toMatch(/spend_governance:\s*\n\s+enabled:\s+true/);
-      expect(policy).toMatch(/billing_error_response:\s+halt/);
+      expect(policy).toMatch(/billing_error_response:\s+warn/);
     });
   }
 
-  it('preserves an operator billing_error_response override across re-init', async () => {
+  it('preserves an operator billing_error_response override (halt) across re-init', async () => {
     const dir = await makeScratch();
     cleanup.push(dir);
     process.chdir(dir);
     await runInit({ yes: true, profile: 'minimal', codex: false });
     const orig = await readPolicy(dir);
-    // Operator switches to warn.
+    // Operator opts INTO halt (the seed default is warn); it must survive.
     await fs.writeFile(
       path.join(dir, '.rea', 'policy.yaml'),
-      orig.replace(/billing_error_response:\s+halt/, 'billing_error_response: warn'),
+      orig.replace(/billing_error_response:\s+warn/, 'billing_error_response: halt'),
       'utf8',
     );
     await runInit({ yes: true, profile: 'minimal', codex: false, force: true });
     const after = await readPolicy(dir);
-    expect(after).toMatch(/billing_error_response:\s+warn/);
-    expect(after).not.toMatch(/billing_error_response:\s+halt/);
+    expect(after).toMatch(/billing_error_response:\s+halt/);
+    expect(after).not.toMatch(/billing_error_response:\s+warn/);
   });
 
   it('round-trips a MODE-ONLY block (no enabled) across re-init (round-6 P2)', async () => {
     // A valid hand-written opt-out-default block: mode only, `enabled`
     // omitted (defaults true). Pre-fix, `rea init --force` dropped it
-    // because the writer only emitted when `enabled` was defined.
+    // because the writer only emitted when `enabled` was defined. Use `halt`
+    // as the mode so it is distinguishable from the emitted seed default.
     const dir = await makeScratch();
     cleanup.push(dir);
     process.chdir(dir);
@@ -1587,15 +1588,14 @@ describe('rea init — 0.51.0 spend_governance emission (E1 seed)', () => {
     const orig = await readPolicy(dir);
     // Replace the full block with a mode-only one (no enabled line).
     const modeOnly = orig.replace(
-      /spend_governance:\s*\n\s+enabled:\s+true\n\s+billing_error_response:\s+halt/,
-      'spend_governance:\n  billing_error_response: warn',
+      /spend_governance:\s*\n\s+enabled:\s+true\n\s+billing_error_response:\s+warn/,
+      'spend_governance:\n  billing_error_response: halt',
     );
     await fs.writeFile(path.join(dir, '.rea', 'policy.yaml'), modeOnly, 'utf8');
     await runInit({ yes: true, profile: 'minimal', codex: false, force: true });
     const after = await readPolicy(dir);
-    // The mode-only override survives; it is NOT dropped or reset to halt.
+    // The mode-only override survives; it is NOT dropped or reset.
     expect(after).toMatch(/spend_governance:/);
-    expect(after).toMatch(/billing_error_response:\s+warn/);
-    expect(after).not.toMatch(/billing_error_response:\s+halt/);
+    expect(after).toMatch(/billing_error_response:\s+halt/);
   });
 });

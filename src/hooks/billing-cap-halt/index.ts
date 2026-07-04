@@ -52,14 +52,21 @@
  *
  * # Response modes (`policy.spend_governance.billing_error_response`)
  *
- *   - `halt` (DEFAULT) — write `.rea/HALT` + emit banner + exit 2.
- *   - `warn`           — emit banner + exit 2, do NOT write HALT. The
- *                        non-zero exit still surfaces the finding to the
- *                        agent so it stops retrying; it just doesn't
- *                        freeze the whole session.
+ *   - `warn` (SEED DEFAULT) — emit banner + exit 0, do NOT write HALT. A
+ *                        true non-freezing advisory: exit 0 so the
+ *                        triggering Bash call is NOT marked failed (codex
+ *                        round-12 P2), matching the other advisory
+ *                        PostToolUse hooks; the banner surfaces the finding.
+ *                        This is the seed default because a phrase-only
+ *                        global freeze is unsafe without endpoint scoping
+ *                        (round-12 P1).
+ *   - `halt`           — write `.rea/HALT` + emit banner + exit 2. Explicit
+ *                        opt-in for the freeze; becomes the default once
+ *                        PR2's metered-endpoint scoping lands.
  *   - `off`            — silent no-op (exit 0) even on a match.
  *
- * `enabled: false` or an absent `spend_governance` block → silent no-op.
+ * `enabled: false` → silent no-op. An absent `spend_governance` block is the
+ * opt-out DEFAULT (enabled, `warn`).
  *
  * # Fail posture (discussed explicitly per the incident lesson)
  *
@@ -188,26 +195,33 @@ interface RawSpendGovernance {
  *     (the caller treats `off` as no-op).
  *
  * Everything else on a PRESENT file resolves to PROTECTION
- * (`{ enabled: true, mode: 'halt' }`):
+ * (`{ enabled: true, mode: 'warn' }` — the SEED default; see below):
  *   - absent `spend_governance` block (opt-out default),
  *   - unparseable YAML (syntax error / mid-edit merge conflict) — round-2 P2,
  *   - a malformed block shape the strict loader would reject
  *     (`spend_governance: []` / `"on"`, or `enabled: "true"`) — round-5 P2.
  * Dropping the last-resort spend guard during a broken/mid-edit policy is
- * the wrong direction for a safety control; the only cost is a freeze IF a
- * genuine billing signal also appears meanwhile, which is rare and worth
- * stopping.
+ * the wrong direction for a safety control.
+ *
+ * The protection LEVEL is the SEED default `warn` (round-12 P1): the reflex
+ * detects + banners + audits but does NOT freeze, because a phrase-only
+ * global `halt` would false-freeze finance/payments-domain repos that emit
+ * the same phrases. `halt` is an explicit opt-in and becomes the default
+ * once PR2's metered-endpoint scoping supplies the provider discriminator.
  *
  * `billing_error_response` is validated against the enum; any other value
  * (including a typo the strict loader would reject) is treated as the
- * protective `'halt'`.
+ * default `'warn'`.
  */
 function readSpendGovernance(reaRoot: string): {
   enabled: boolean;
   mode: BillingErrorResponse;
 } {
-  const disabled = { enabled: false, mode: 'halt' as BillingErrorResponse };
-  const protect = { enabled: true, mode: 'halt' as BillingErrorResponse };
+  const disabled = { enabled: false, mode: 'warn' as BillingErrorResponse };
+  // PROTECT = enabled with the SEED default mode `warn` (round-12 P1): a
+  // degraded/absent policy detects + banners + audits but does NOT freeze,
+  // since a phrase-only global halt is unsafe without endpoint scoping.
+  const protect = { enabled: true, mode: 'warn' as BillingErrorResponse };
   const policyPath = path.join(reaRoot, '.rea', 'policy.yaml');
   let raw: string;
   try {
@@ -252,7 +266,7 @@ function readSpendGovernance(reaRoot: string): {
   // malformed `enabled` (e.g. the string "true") is not literal false, so it
   // stays protected rather than silently disabling (round-5 P2).
   const enabled = block.enabled !== false;
-  let mode: BillingErrorResponse = 'halt';
+  let mode: BillingErrorResponse = 'warn';
   const rawMode = block.billing_error_response;
   if (rawMode === 'warn' || rawMode === 'off' || rawMode === 'halt') {
     mode = rawMode;
@@ -391,8 +405,12 @@ export async function runBillingCapHalt(
 
   // 5. Act per mode.
   if (mode === 'warn') {
+    // Advisory: emit the banner but exit 0 (codex round-12 P2). A
+    // PostToolUse exit 2 marks the triggering Bash action failed; `warn`
+    // is the non-freezing mode, so it must NOT block the call — it just
+    // surfaces the banner (like the other advisory PostToolUse hooks).
     writeStderr(buildBanner(matched, 'warn'));
-    return { exitCode: 2, stderr, action: 'warn', matched, haltWritten: false };
+    return { exitCode: 0, stderr, action: 'warn', matched, haltWritten: false };
   }
 
   // mode === 'halt'

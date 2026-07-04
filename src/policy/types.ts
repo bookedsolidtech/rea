@@ -487,10 +487,13 @@ export interface SpendGovernancePolicy {
   enabled?: boolean;
   /**
    * What the billing→HALT reflex does on a billing-class match:
-   * `halt` (default) writes `.rea/HALT`; `warn` surfaces a banner only;
-   * `off` is a silent no-op. An unrecognized value is treated as `halt`
-   * by the hook (fail-safe), though the strict loader rejects any value
-   * outside the enum at load time.
+   * `warn` (SEED DEFAULT) surfaces a banner + exits 0 (advisory, no
+   * freeze); `halt` writes `.rea/HALT` + exits 2; `off` is a silent no-op.
+   * `warn` is the seed default because a phrase-only global freeze is
+   * unsafe without metered-endpoint scoping (codex round-12 P1); `halt`
+   * becomes the default once that scoping (PR2) lands. An unrecognized
+   * value is treated as the default `warn` by the hook (the strict loader
+   * rejects any value outside the enum at load time).
    */
   billing_error_response?: BillingErrorResponse;
 }
