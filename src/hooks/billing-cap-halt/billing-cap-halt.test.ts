@@ -5,8 +5,9 @@
  * Behavior matrix:
  *   - billing signature + halt  → exit 2, .rea/HALT written
  *   - billing signature + warn  → exit 2, NO HALT
- *   - billing signature + off   → exit 0, NO HALT
- *   - billing signature, block disabled / absent → exit 0, NO HALT
+ *   - billing signature + off / enabled:false → exit 0, NO HALT (opt-out)
+ *   - billing signature + ABSENT block → HALT (opt-out default is ON)
+ *   - billing signature + malformed block shape → HALT (protect)
  *   - rate-limit-only (429)     → exit 0, NO HALT (billing ≠ rate-limit)
  *   - clean output              → exit 0, NO HALT
  *   - malformed payload         → exit 0, NO HALT (fail-SAFE)
@@ -124,15 +125,49 @@ describe('runBillingCapHalt', () => {
     expect(fs.existsSync(haltPath(root))).toBe(false);
   });
 
-  it('billing signature + absent block → exit 0, NO HALT', async () => {
+  it('billing signature + absent block → HALT (opt-out default, round-5 P1)', async () => {
+    // A present rea policy with NO spend_governance block is the exact
+    // upgrade-from-0.50.x state. Opt-out default: the reflex is ON, so a
+    // real billing wall still freezes rather than the hook being dead.
     writePolicy(root); // no spend_governance block at all
     const r = await runBillingCapHalt({
       reaRoot: root,
       stdinOverride: payload('node tts.mjs', BILLING),
     });
-    expect(r.exitCode).toBe(0);
-    expect(r.action).toBe('noop');
-    expect(fs.existsSync(haltPath(root))).toBe(false);
+    expect(r.exitCode).toBe(2);
+    expect(r.action).toBe('halt');
+    expect(fs.existsSync(haltPath(root))).toBe(true);
+  });
+
+  it('malformed block shape (spend_governance: []) → PROTECT (round-5 P2)', async () => {
+    // A parseable-but-schema-invalid shape the strict loader rejects must
+    // not silently disable the guard.
+    fs.mkdirSync(path.join(root, '.rea'), { recursive: true });
+    fs.writeFileSync(
+      path.join(root, '.rea', 'policy.yaml'),
+      'version: "1"\nblocked_paths: []\nspend_governance: []\n',
+    );
+    const r = await runBillingCapHalt({
+      reaRoot: root,
+      stdinOverride: payload('node tts.mjs', BILLING),
+    });
+    expect(r.exitCode).toBe(2);
+    expect(r.action).toBe('halt');
+    expect(fs.existsSync(haltPath(root))).toBe(true);
+  });
+
+  it('malformed enabled value (enabled: "true" string) → PROTECT (round-5 P2)', async () => {
+    fs.mkdirSync(path.join(root, '.rea'), { recursive: true });
+    fs.writeFileSync(
+      path.join(root, '.rea', 'policy.yaml'),
+      'version: "1"\nblocked_paths: []\nspend_governance:\n  enabled: "true"\n',
+    );
+    const r = await runBillingCapHalt({
+      reaRoot: root,
+      stdinOverride: payload('node tts.mjs', BILLING),
+    });
+    expect(r.exitCode).toBe(2);
+    expect(r.action).toBe('halt');
   });
 
   it('rate-limit only (429) + halt → exit 0, NO HALT (billing ≠ rate-limit)', async () => {

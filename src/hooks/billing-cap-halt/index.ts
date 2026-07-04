@@ -162,27 +162,35 @@ interface RawSpendGovernance {
  * the whole document; we pull just the two fields we need and validate
  * them locally.
  *
- * Returns `{ enabled: false }` (disabled) when:
- *   - the policy file is missing/unreadable (genuine no-config — the
- *     operator has no rea policy for this checkout),
- *   - `spend_governance` is absent or not an object,
- *   - `enabled` is anything other than the literal `true`.
+ * OPT-OUT model (codex 0.51.0 round-5): the reflex is ON for any present
+ * rea policy unless positively disabled. This is the incident mandate
+ * ("default ON, zero-exception") and it closes the upgrade dead-hook gap —
+ * a repo upgrading from 0.50.x gets `billing-cap-halt.sh` registered but
+ * has no `spend_governance` block yet; treating that absence as ENABLED
+ * means the guard is live immediately instead of silently inert until
+ * someone re-runs `rea init`.
  *
- * FAIL-SAFE toward PROTECTION when the policy file is PRESENT but its
- * YAML does not parse (a syntax error, a mid-edit merge conflict, a typo
- * ANYWHERE in the file): returns `{ enabled: true, mode: 'halt' }` rather
- * than silently disabling the last-resort spend guard (codex 0.51.0
- * round-2 P2). A broken policy is a degraded state; dropping the billing
- * reflex during it — precisely when an operator is mid-edit — is the
- * wrong direction for a safety control. The only cost is a freeze IF a
- * genuine billing signal also appears while the policy is broken, which
- * is rare and worth stopping. A missing file is distinct (no rea config
- * at all → stays disabled). We cannot read `billing_error_response` from
- * unparseable YAML, so we default to the protective `halt`.
+ * Returns `{ enabled: false }` (disabled) ONLY for:
+ *   - a missing/unreadable policy FILE (genuine no-config — no rea policy
+ *     for this checkout at all), OR
+ *   - a present, valid block that POSITIVELY opts out:
+ *     `spend_governance.enabled: false`, or `billing_error_response: off`
+ *     (the caller treats `off` as no-op).
  *
- * `billing_error_response` is validated against the enum; any other
- * value (including a typo the strict loader would reject) is treated as
- * `'halt'` — the fail-SAFE default for a spend control.
+ * Everything else on a PRESENT file resolves to PROTECTION
+ * (`{ enabled: true, mode: 'halt' }`):
+ *   - absent `spend_governance` block (opt-out default),
+ *   - unparseable YAML (syntax error / mid-edit merge conflict) — round-2 P2,
+ *   - a malformed block shape the strict loader would reject
+ *     (`spend_governance: []` / `"on"`, or `enabled: "true"`) — round-5 P2.
+ * Dropping the last-resort spend guard during a broken/mid-edit policy is
+ * the wrong direction for a safety control; the only cost is a freeze IF a
+ * genuine billing signal also appears meanwhile, which is rare and worth
+ * stopping.
+ *
+ * `billing_error_response` is validated against the enum; any other value
+ * (including a typo the strict loader would reject) is treated as the
+ * protective `'halt'`.
  */
 function readSpendGovernance(reaRoot: string): {
   enabled: boolean;
@@ -207,14 +215,25 @@ function readSpendGovernance(reaRoot: string): {
     return protect;
   }
   if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
-    return disabled;
+    // Present file whose whole document is not a mapping (bare scalar /
+    // array) — malformed policy → protect.
+    return protect;
   }
   const sg = (parsed as Record<string, unknown>)['spend_governance'];
   if (sg === undefined || sg === null || typeof sg !== 'object' || Array.isArray(sg)) {
-    return disabled;
+    // OPT-OUT DEFAULT (round-5 P1/P2). An ABSENT block → protect: the reflex
+    // is ON for any present rea policy unless positively disabled, so a repo
+    // upgrading from 0.50.x (hook registered, no block yet) is guarded
+    // immediately instead of shipping a dead hook. A malformed non-object
+    // shape (`spend_governance: []` / `"on"`) — which the strict loader
+    // rejects — also protects rather than silently disabling.
+    return protect;
   }
   const block = sg as RawSpendGovernance;
-  const enabled = block.enabled === true;
+  // Opt-out: enabled UNLESS positively set to the literal boolean false. A
+  // malformed `enabled` (e.g. the string "true") is not literal false, so it
+  // stays protected rather than silently disabling (round-5 P2).
+  const enabled = block.enabled !== false;
   let mode: BillingErrorResponse = 'halt';
   const rawMode = block.billing_error_response;
   if (rawMode === 'warn' || rawMode === 'off' || rawMode === 'halt') {
