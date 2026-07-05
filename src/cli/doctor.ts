@@ -916,7 +916,13 @@ export function checkPrepareCommitMsgHook(baseDir: string): CheckResult {
 }
 
 function checkCommitMsgHook(baseDir: string): CheckResult {
-  const hookPath = path.join(baseDir, '.git', 'hooks', 'commit-msg');
+  // Resolve the ACTIVE hooks dir (core.hooksPath → rev-parse --git-path →
+  // .git/hooks) exactly like the prepare-commit-msg and pre-push checks do.
+  // Pre-fix this check hardcoded `.git/hooks/commit-msg`, so a repo wired
+  // through `core.hooksPath=.husky` — where git actually runs
+  // `.husky/commit-msg` and the attribution gate IS active — warned
+  // "missing" on every doctor run (a permanent false negative).
+  let hookPath = path.join(resolveHooksDirSync(baseDir), 'commit-msg');
   if (!fs.existsSync(hookPath)) {
     return {
       label: 'commit-msg hook installed',
@@ -925,7 +931,72 @@ function checkCommitMsgHook(baseDir: string): CheckResult {
     };
   }
   try {
+    // Git only RUNS the active hook file when it carries an exec bit; a
+    // 0644 commit-msg is silently ignored on POSIX, which would disable
+    // block_ai_attribution while doctor reports green. Validate the exec
+    // bit on the ACTIVE file (the one git dispatches — for husky 9 that is
+    // the stub, not the canonical body it sources), same as the
+    // hooks-installed and pre-push checks.
+    const activeStat = fs.statSync(hookPath);
+    if ((activeStat.mode & 0o111) === 0) {
+      return {
+        label: 'commit-msg hook installed',
+        status: 'fail',
+        detail:
+          `${hookPath} is not executable (mode=${(activeStat.mode & 0o777).toString(8)}) — ` +
+          'git will silently skip it (block_ai_attribution will not be enforced at commit time)',
+      };
+    }
+    // Husky 9 (`core.hooksPath=.husky/_`) auto-generates a `. "${0%/*}/h"`
+    // stub at the active hooks path; git dispatches through it to
+    // `.husky/commit-msg` (the canonical body). Classify THAT file — a
+    // non-empty stub whose canonical body is missing is NOT an installed
+    // gate. Same indirection-following as the prepare-commit-msg and
+    // pre-push doctor checks.
+    const content = fs.readFileSync(hookPath, 'utf8');
+    if (isHusky9Stub(content)) {
+      const target = resolveHusky9StubTarget(hookPath);
+      if (target === null || !fs.existsSync(target)) {
+        return {
+          label: 'commit-msg hook installed',
+          status: 'warn',
+          detail:
+            `husky 9 stub at ${hookPath} has no canonical body at ` +
+            `${target ?? '<unresolvable>'} (block_ai_attribution will not be enforced at commit time)`,
+        };
+      }
+      // The stub sources its sibling runner `.husky/_/h` BEFORE the
+      // canonical body ever runs — a partially-installed husky (stub
+      // present, runner missing) breaks `git commit` outright, which is
+      // not a healthy install even though the body exists.
+      const runner = path.join(path.dirname(hookPath), 'h');
+      try {
+        fs.accessSync(runner, fs.constants.R_OK);
+      } catch {
+        return {
+          label: 'commit-msg hook installed',
+          status: 'warn',
+          detail:
+            `husky 9 stub at ${hookPath} sources ${runner}, which is missing or ` +
+            'unreadable — git commit will fail before the hook body runs. ' +
+            'Reinstall husky (`pnpm install`) to regenerate it.',
+        };
+      }
+      hookPath = target;
+      // The canonical body must be a READABLE REGULAR FILE — a directory
+      // left behind by a bad migration, or an unreadable file, means git
+      // fails to source the hook and the gate is effectively disabled.
+      // existsSync alone would report pass for both shapes.
+      fs.accessSync(hookPath, fs.constants.R_OK);
+    }
     const stat = fs.statSync(hookPath);
+    if (!stat.isFile()) {
+      return {
+        label: 'commit-msg hook installed',
+        status: 'fail',
+        detail: `${hookPath} is not a regular file (block_ai_attribution will not be enforced at commit time)`,
+      };
+    }
     if (stat.size === 0) {
       return { label: 'commit-msg hook installed', status: 'fail', detail: 'file is empty' };
     }
