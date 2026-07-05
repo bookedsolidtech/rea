@@ -1,5 +1,52 @@
 # @bookedsolid/rea
 
+## 0.51.0
+
+### Minor Changes
+
+- 1e86fdc: OpenRouter review provider (gpt-oss-120b cheap lane) + commit-aware review granularity.
+  - `policy.review.provider: codex | openrouter | both` — `both` runs OpenRouter as a non-blocking shadow of the authoritative Codex verdict and records parity data to `.rea/review-parity.json`
+  - `policy.review.review_granularity: auto | per-commit | whole` — `auto` reviews the whole net diff when it fits the model context and escalates to Codex when it does not (never silently per-commit); `per-commit` is an explicit opt-in reviewing each commit on its own patch
+  - External-send path guard: governance surfaces (`.claude/`, `.husky/`, `.rea/`, `package.json`), `blocked_paths`, and evidentiary patterns are refused to the external lane and fall back to Codex, with an informational `rea.local_review.refused_external` audit record (rule name only — never raw paths or diff content)
+  - Outbound chokepoint: redaction (built-in + `policy.redact.patterns`) → `data_collection: deny` → optional `backend_pin` allowlist with fail-closed `served_by` verification; audit records carry `data_policy_requested` vs `data_policy_enforced` (requested ≠ verified, stated honestly)
+  - `rea config set-key|get-key|unset-key|list` manage provider API keys in `~/.config/rea/credentials` (0600); OpenRouter key resolves env-first
+  - `rea doctor` validates provider configuration; new audit events `rea.local_review.shadow` and `rea.local_review.refused_external` never cover HEAD for preflight
+  - Removes the legacy unused `src/gateway/reviewers/` surface
+  - Shipped CLAUDE.md fragment now mandates logical, manageable, connected commits and per-commit review as the routine floor
+
+- 395884c: Add spend-governance policy axis and a billing→HALT reflex (E1 seed).
+
+  Introduced in response to a denial-of-wallet incident: an agent treated a
+  "spending cap exceeded" error as retryable and multiplied requests against a
+  metered paid API until the budget blew past its cap. rea had no concept of
+  spend anywhere — no schema field, no hook, no threat class.
+
+  This release lands the cheapest, highest-value slice:
+  - **New `spend_governance` policy block** (`enabled`, `billing_error_response`)
+    — strict-validated, `billing_error_response` defaults to `halt`. Every
+    shipped profile pins `enabled: true`; an absent block is a silent no-op
+    (upgrade-safe).
+  - **New `billing-cap-halt.sh` PostToolUse Bash hook** — scans a just-run
+    command's output for a billing-class signature (spending cap / prepayment
+    credits depleted / payment required — deliberately DISTINCT from a
+    retryable 429/rate-limit) and writes `.rea/HALT`, reusing the existing
+    kill-switch every middleware and hook already respects. Modes: `halt`
+    (default) writes HALT + banner; `warn` surfaces a banner only; `off`
+    disables the reflex. The billing gate is fail-CLOSED when the CLI is
+    missing but a billing signal is present, and fail-SAFE (never a
+    false-positive freeze) on malformed input.
+  - **THREAT_MODEL.md §5.25** — new "Denial-of-wallet / runaway metered spend"
+    threat class, stating honestly that rea governs request volume as a spend
+    proxy, never vendor-settled dollars.
+
+  The shipped hook count moves from 14 to 15. Follow-on PRs add per-run request
+  ceilings, retry-discipline, the run-gate, and consumption limits.
+
+### Patch Changes
+
+- 1f0ace8: fix(doctor): commit-msg hook check resolves the active hooks dir (`core.hooksPath` → `git rev-parse --git-path hooks` → `.git/hooks`) instead of hardcoding `.git/hooks/commit-msg`. Repos wired through `core.hooksPath=.husky` — where git actually runs `.husky/commit-msg` and the attribution gate is fully active — no longer get a permanent false-negative `[warn] commit-msg hook installed (missing…)` on every `rea doctor` run. A hook left at the default `.git/hooks/` location while `core.hooksPath` points elsewhere is now correctly reported as missing (git never runs it).
+- 39b70ff: fix(global-cli): harden two degraded-path gaps in the 0.50.0 opt-in global-CLI tier. (1) `shim_global_tier_vetoed` now fails closed on a `runtime` block that is a valid YAML object but carries keys outside `RuntimePolicySchema` (e.g. `{ allow_global_cli: true, typo: 1 }`) — `policy-get` only parses YAML, so without this an unknown-key block the strict loader rejects would still enable the global CLI. (2) `rea trust` / `rea untrust` now enforce the A5.3b safe-file contract (regular file, owner, `0600`, `nlink===1`, no symlink) on `~/.rea/trusted-projects` BEFORE reading it, matching the shim and `trust --list`, so a FIFO/device/symlink planted at that path can't block or be read through by the mutating commands.
+
 ## 0.50.0
 
 ### Minor Changes
@@ -3915,13 +3962,13 @@ codex-review --also-set-cache`) on every push, produced a 1,250-line bash
 
   This release replaces the entire stack with a stateless gate:
 
-                                                                                                                    git push
-                                                                                                                      → .husky/pre-push → rea hook push-gate
-                                                                                                                      → codex exec review --base <ref> --json
-                                                                                                                      → parse verdict from streamed findings
-                                                                                                                      → block on [P1] (blocking) or [P2] when concerns_blocks=true
-                                                                                                                      → write .rea/last-review.json + audit record
-                                                                                                                      → exit 0 / 1 (HALT) / 2 (blocked)
+                                                                                                                      git push
+                                                                                                                        → .husky/pre-push → rea hook push-gate
+                                                                                                                        → codex exec review --base <ref> --json
+                                                                                                                        → parse verdict from streamed findings
+                                                                                                                        → block on [P1] (blocking) or [P2] when concerns_blocks=true
+                                                                                                                        → write .rea/last-review.json + audit record
+                                                                                                                        → exit 0 / 1 (HALT) / 2 (blocked)
 
   Codex is run fresh on every push. No cache. No SHA matching. No receipt
   consultation. When the gate blocks, Claude reads stderr + the
