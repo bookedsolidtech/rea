@@ -140,6 +140,60 @@ describe('runTrust', () => {
     expect(errs.some((e) => e.includes('a Claude Code process is an ancestor'))).toBe(true);
     expect(fs.existsSync(registryPath(home))).toBe(false);
   });
+
+  // P2 (codex): an unsafe `trusted-projects` file must be REFUSED (exit 1)
+  // BEFORE readRegistry reads through the tampered path. A symlink is the
+  // clearest, most portable tamper primitive.
+  it.skipIf(process.platform === 'win32')(
+    'exit 1, no read-through / no clobber when the registry file is a symlink',
+    () => {
+      // Point the registry at an attacker-controlled file outside the root.
+      const decoy = fs.mkdtempSync(path.join(os.tmpdir(), 'rea-trust-decoy-'));
+      const decoyReg = path.join(decoy, 'decoy-registry');
+      fs.writeFileSync(decoyReg, `${fs.realpathSync(decoy)}\n`, 'utf8');
+      try {
+        fs.mkdirSync(reaDir(home), { recursive: true });
+        fs.symlinkSync(decoyReg, registryPath(home));
+        const code = runTrust({ procReader: noClaude, path: proj, home, cwd: proj });
+        expect(code).toBe(1);
+        expect(errs.some((e) => e.includes('is a symlink'))).toBe(true);
+        // The symlink was NOT replaced (no atomic-rename clobber) and the decoy
+        // was NOT read-through / rewritten with the new project.
+        expect(fs.lstatSync(registryPath(home)).isSymbolicLink()).toBe(true);
+        expect(fs.readFileSync(decoyReg, 'utf8')).toBe(`${fs.realpathSync(decoy)}\n`);
+      } finally {
+        fs.rmSync(decoy, { recursive: true, force: true });
+      }
+    },
+  );
+
+  // Bad-mode (0644) registry: group/other-accessible → refuse before read.
+  it('exit 1 with remediation when the registry file is mode 0644', () => {
+    if (typeof process.getuid !== 'function') return; // POSIX-only
+    runTrust({ procReader: noClaude, path: proj, home, cwd: proj }); // seed a 0600 file
+    const proj2 = fs.mkdtempSync(path.join(os.tmpdir(), 'rea-trust-proj2-'));
+    try {
+      fs.chmodSync(registryPath(home), 0o644);
+      const before = fs.readFileSync(registryPath(home));
+      const code = runTrust({ procReader: noClaude, path: proj2, home, cwd: proj2 });
+      expect(code).toBe(1);
+      expect(errs.some((e) => e.includes('chmod 600'))).toBe(true);
+      // No mutation: proj2 was NOT appended.
+      expect(fs.readFileSync(registryPath(home)).equals(before)).toBe(true);
+    } finally {
+      fs.rmSync(proj2, { recursive: true, force: true });
+    }
+  });
+
+  // Regression guard: the new registry-safety gate must NOT break the
+  // first-trust bootstrap — an ABSENT registry is safe and must still write.
+  it('still bootstraps first-trust when the registry is absent (guard allows absent)', () => {
+    expect(fs.existsSync(registryPath(home))).toBe(false);
+    const code = runTrust({ procReader: noClaude, path: proj, home, cwd: proj });
+    expect(code).toBe(0);
+    expect(fs.existsSync(registryPath(home))).toBe(true);
+    expect(readRegistry(home)).toEqual([fs.realpathSync(proj)]);
+  });
 });
 
 describe('runUntrust', () => {
@@ -198,6 +252,29 @@ describe('runUntrust', () => {
     // No FS mutation: the entry is still present, bytes unchanged.
     expect(fs.readFileSync(registryPath(home)).equals(before)).toBe(true);
   });
+
+  // P2 (codex): symmetric with runTrust — refuse an unsafe registry BEFORE
+  // readRegistry reads through the tampered path.
+  it.skipIf(process.platform === 'win32')(
+    'exit 1, no read-through / no clobber when the registry file is a symlink',
+    () => {
+      const decoy = fs.mkdtempSync(path.join(os.tmpdir(), 'rea-untrust-decoy-'));
+      const decoyReg = path.join(decoy, 'decoy-registry');
+      fs.writeFileSync(decoyReg, `${fs.realpathSync(proj)}\n`, 'utf8');
+      try {
+        fs.mkdirSync(reaDir(home), { recursive: true });
+        fs.symlinkSync(decoyReg, registryPath(home));
+        const code = runUntrust({ procReader: noClaude, path: proj, home, cwd: proj });
+        expect(code).toBe(1);
+        expect(errs.some((e) => e.includes('is a symlink'))).toBe(true);
+        // The symlink was NOT replaced and the decoy target was NOT rewritten.
+        expect(fs.lstatSync(registryPath(home)).isSymbolicLink()).toBe(true);
+        expect(fs.readFileSync(decoyReg, 'utf8')).toBe(`${fs.realpathSync(proj)}\n`);
+      } finally {
+        fs.rmSync(decoy, { recursive: true, force: true });
+      }
+    },
+  );
 });
 
 describe('runTrustList', () => {

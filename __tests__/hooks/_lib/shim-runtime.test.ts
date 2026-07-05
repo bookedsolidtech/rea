@@ -966,6 +966,56 @@ ${STD_BODY}
   });
 });
 
+describe('hooks/_lib/shim-runtime.sh — global-tier veto strict-shape (codex #211 P1)', () => {
+  // shim_global_tier_vetoed must fail closed on a runtime block the STRICT
+  // loader would reject — including a valid OBJECT carrying keys outside
+  // RuntimePolicySchema (the sole permitted key is allow_global_cli). A
+  // stub CLI mimics `rea hook policy-get runtime[.allow_global_cli] --json`.
+  function runVeto(runtimeJson: string, allowJson: string): ShimResult {
+    const body = `
+STUB=$(mktemp)
+cat > "$STUB" <<'STUBEOF'
+#!/bin/bash
+# args: hook policy-get <dot.path> --json
+case "$3" in
+  runtime) printf '%s' '${runtimeJson}' ;;
+  runtime.allow_global_cli) printf '%s' '${allowJson}' ;;
+esac
+exit 0
+STUBEOF
+chmod +x "$STUB"
+REA_ARGV=(bash "$STUB")
+if shim_global_tier_vetoed; then echo VETOED; else echo ALLOWED; fi
+`;
+    return runLibFn(body);
+  }
+
+  it.skipIf(!bashExists())('valid object {allow_global_cli:true} → ALLOWED', () => {
+    const r = runVeto('{"allow_global_cli":true}', 'true');
+    expect(r.stdout.trim()).toBe('ALLOWED');
+  });
+
+  it.skipIf(!bashExists())('extra key {allow_global_cli:true,typo:1} → VETOED (strict loader rejects)', () => {
+    const r = runVeto('{"allow_global_cli":true,"typo":1}', 'true');
+    expect(r.stdout.trim()).toBe('VETOED');
+  });
+
+  it.skipIf(!bashExists())('unknown-only key {typo:1} → VETOED', () => {
+    const r = runVeto('{"typo":1}', 'null');
+    expect(r.stdout.trim()).toBe('VETOED');
+  });
+
+  it.skipIf(!bashExists())('empty object {} → ALLOWED (no keys, allow_global_cli absent)', () => {
+    const r = runVeto('{}', 'null');
+    expect(r.stdout.trim()).toBe('ALLOWED');
+  });
+
+  it.skipIf(!bashExists())('wrong type (array) → VETOED', () => {
+    const r = runVeto('[]', 'null');
+    expect(r.stdout.trim()).toBe('VETOED');
+  });
+});
+
 describe('hooks/_lib/shim-runtime.sh — shim line-budget assertion', () => {
   // 0.38.0 charter: every shim should be ≤120 LOC post-extraction.
   // local-review-gate is the documented exception (hot-path subtree

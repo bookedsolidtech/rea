@@ -531,7 +531,38 @@ shim_global_tier_vetoed() {
       return 1  # runtime block absent → allow
       ;;
     '{'*)
-      : # valid object → fall through to the type-strict leaf read
+      # Valid OBJECT — but the strict loader (`.strict()`) also rejects a
+      # runtime block carrying any key OUTSIDE its schema (e.g.
+      # `runtime: { allow_global_cli: true, typo: 1 }` or `{ typo: 1 }`).
+      # `policy-get` only PARSES YAML; it does NOT run the strict schema, so
+      # without this an unknown-key block would fall through to the leaf
+      # read and ENABLE the tier even though `loadPolicy()` would refuse the
+      # whole policy. The veto contract is to fail closed on any shape the
+      # strict loader would reject (codex #211 review P1). Reject any key
+      # beyond the RuntimePolicySchema allowlist. MUST stay in sync with
+      # `RuntimePolicySchema` in `src/policy/loader.ts` — currently the sole
+      # permitted key is `allow_global_cli`. node is guaranteed here (the
+      # global tier already required it to resolve).
+      local _rt_shape=""
+      _rt_shape=$(printf '%s' "$_rt_out" | node -e '
+        let d = "";
+        process.stdin.on("data", (c) => (d += c)).on("end", () => {
+          try {
+            const o = JSON.parse(d);
+            if (!o || typeof o !== "object" || Array.isArray(o)) {
+              process.stdout.write("bad"); return;
+            }
+            const allowed = new Set(["allow_global_cli"]);
+            for (const k of Object.keys(o)) {
+              if (!allowed.has(k)) { process.stdout.write("extra"); return; }
+            }
+            process.stdout.write("ok");
+          } catch { process.stdout.write("bad"); }
+        });
+      ' 2>/dev/null || printf 'bad')
+      if [ "$_rt_shape" != "ok" ]; then
+        return 0  # unknown key / unparseable object → strict loader rejects → veto
+      fi
       ;;
     *)
       # runtime present with the WRONG TYPE ([], "off", 42, …) — a shape the
