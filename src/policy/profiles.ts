@@ -132,6 +132,20 @@ export const ProfileSchema = z
       })
       .strict()
       .optional(),
+    // 0.51.0 spend-governance (E1 seed) — billing→HALT reflex. EVERY
+    // shipped profile pins `enabled: true` + `billing_error_response: halt`
+    // (unlike delegation_advisory, this reflex has no false-positive cost
+    // worth the risk). The profile-layer schema mirrors the policy-loader's
+    // `SpendGovernancePolicySchema`; strict mode catches typos at init.
+    // Fields are `.optional()` here so a profile can pin just `enabled`
+    // without restating the response mode.
+    spend_governance: z
+      .object({
+        enabled: z.boolean().optional(),
+        billing_error_response: z.enum(['halt', 'warn', 'off']).optional(),
+      })
+      .strict()
+      .optional(),
   })
   .strict();
 

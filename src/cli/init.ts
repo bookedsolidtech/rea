@@ -150,6 +150,20 @@ export interface ResolvedConfig {
    * default at policy load.
    */
   bootstrapAllowlistEnabled?: boolean;
+  /**
+   * 0.51.0 spend-governance (E1 seed) — the billing→HALT reflex. OPT-OUT:
+   * an absent block already resolves to ON at load (schema `.default({})`),
+   * so emitting is documentation, not activation. Seeded from the layered
+   * profile (every shipped profile pins `enabled: true` +
+   * `billing_error_response: halt`) and preserved across re-init so an
+   * operator override — including a mode-only `billing_error_response: warn`
+   * — survives. When `undefined` (a custom profile that declares no
+   * spend_governance) the writer emits no block, but the reflex is still ON
+   * for that install via the opt-out default; opting out is an explicit
+   * `enabled: false`.
+   */
+  spendGovernanceEnabled?: boolean;
+  spendGovernanceBillingErrorResponse?: 'halt' | 'warn' | 'off';
   fromReagent: boolean;
   reagentPolicyPath: string | null;
   reagentNotices: string[];
@@ -444,6 +458,9 @@ async function runWizard(
     // R12-P1 (codex round 12): preserve bootstrap_allowlist.enabled
     // so an operator opt-out survives `rea init` re-runs.
     ...bootstrapAllowlistConfigSpread(layeredBase, existingPolicy),
+    // 0.51.0 spend-governance — emit the billing→HALT block (ON in every
+    // shipped profile; schema default is OFF so it MUST be written).
+    ...spendGovernanceConfigSpread(layeredBase, existingPolicy),
     fromReagent,
     reagentPolicyPath,
     reagentNotices: [],
@@ -532,6 +549,39 @@ function bootstrapAllowlistConfigSpread(
   }
   // Neither set — omit from the emitted policy.yaml.
   return {};
+}
+
+/**
+ * 0.51.0 spend-governance (E1 seed) — resolve the `spend_governance`
+ * block for emission. Precedence mirrors `bootstrapAllowlistConfigSpread`:
+ *
+ *   1. Existing on-disk policy (highest) — preserves an operator override
+ *      (e.g. `billing_error_response: warn`, or a deliberate opt-out).
+ *   2. Layered profile — every SHIPPED profile pins `enabled: true` +
+ *      `billing_error_response: halt`.
+ *   3. Omitted — a custom profile declaring no spend_governance emits no
+ *      block, but the reflex is still ON via the opt-out default.
+ *
+ * OPT-OUT (codex round-6): the zod schema now `.default({})`s an absent
+ * block to `enabled: true`, so — like bootstrap_allowlist — omitting the
+ * block no longer disables the reflex. Emission is documentation, not
+ * activation. Fields resolve independently so an operator who set only
+ * `warn` still round-trips that mode (the writer emits a mode-only block),
+ * and one who set only `enabled` keeps it.
+ */
+function spendGovernanceConfigSpread(
+  layered: Profile,
+  existing: ExistingPolicyValues | undefined,
+): { spendGovernanceEnabled?: boolean; spendGovernanceBillingErrorResponse?: 'halt' | 'warn' | 'off' } {
+  const enabled =
+    existing?.spendGovernanceEnabled ?? layered.spend_governance?.enabled;
+  const mode =
+    existing?.spendGovernanceBillingErrorResponse ??
+    layered.spend_governance?.billing_error_response;
+  return {
+    ...(enabled !== undefined ? { spendGovernanceEnabled: enabled } : {}),
+    ...(mode !== undefined ? { spendGovernanceBillingErrorResponse: mode } : {}),
+  };
 }
 
 /**
@@ -625,6 +675,9 @@ interface ExistingPolicyValues {
    * R28-F6 closed for local_review / commit_hygiene.
    */
   bootstrapAllowlistEnabled?: boolean;
+  /** 0.51.0 spend-governance — preserved across re-init. */
+  spendGovernanceEnabled?: boolean;
+  spendGovernanceBillingErrorResponse?: 'halt' | 'warn' | 'off';
 }
 
 /**
@@ -819,6 +872,20 @@ function readExistingPolicyForPreservation(targetDir: string): ExistingPolicyVal
     }
   }
 
+  // 0.51.0 spend-governance — preserve an operator's enabled / mode
+  // override across re-init (e.g. a deliberate opt-out, or `warn`).
+  const spendGovernance = policy['spend_governance'];
+  if (spendGovernance !== null && typeof spendGovernance === 'object') {
+    const sg = spendGovernance as Record<string, unknown>;
+    if (typeof sg['enabled'] === 'boolean') {
+      out.spendGovernanceEnabled = sg['enabled'];
+    }
+    const mode = sg['billing_error_response'];
+    if (mode === 'halt' || mode === 'warn' || mode === 'off') {
+      out.spendGovernanceBillingErrorResponse = mode;
+    }
+  }
+
   return out;
 }
 
@@ -999,6 +1066,26 @@ function writePolicyYaml(targetDir: string, config: ResolvedConfig, layered: Pro
   if (config.bootstrapAllowlistEnabled !== undefined) {
     lines.push(`bootstrap_allowlist:`);
     lines.push(`  enabled: ${config.bootstrapAllowlistEnabled ? 'true' : 'false'}`);
+  }
+  // 0.51.0 spend-governance (E1 seed) — the billing→HALT reflex. Opt-out:
+  // an absent block already resolves to ON at load (schema `.default({})`),
+  // so emitting is for documentation, not activation. Emit whenever EITHER
+  // field resolves so a MODE-ONLY block (`spend_governance: {
+  // billing_error_response: warn }`, valid — `enabled` defaults true) round-
+  // trips through `rea init --force` instead of being silently dropped
+  // (codex round-6 P2). Each field emits only when present, so a mode-only
+  // block stays mode-only.
+  if (
+    config.spendGovernanceEnabled !== undefined ||
+    config.spendGovernanceBillingErrorResponse !== undefined
+  ) {
+    lines.push(`spend_governance:`);
+    if (config.spendGovernanceEnabled !== undefined) {
+      lines.push(`  enabled: ${config.spendGovernanceEnabled ? 'true' : 'false'}`);
+    }
+    if (config.spendGovernanceBillingErrorResponse !== undefined) {
+      lines.push(`  billing_error_response: ${config.spendGovernanceBillingErrorResponse}`);
+    }
   }
   lines.push(``);
   fs.writeFileSync(policyPath, lines.join('\n'), 'utf8');
@@ -1745,6 +1832,9 @@ export async function runInit(options: InitOptions): Promise<void> {
       // R12-P1 (codex round 12): preserve bootstrap_allowlist.enabled
       // so an operator opt-out survives `rea init` re-runs.
       ...bootstrapAllowlistConfigSpread(layeredBase, existingPolicy),
+      // 0.51.0 spend-governance — emit the billing→HALT block (ON in every
+      // shipped profile; schema default is OFF so it MUST be written).
+      ...spendGovernanceConfigSpread(layeredBase, existingPolicy),
       fromReagent,
       reagentPolicyPath,
       reagentNotices,

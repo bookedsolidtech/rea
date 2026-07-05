@@ -55,3 +55,20 @@ attribution:
 #     threshold: 25
 delegation_advisory:
   enabled: false
+
+# 0.51.0 spend-governance (E1 seed) — billing→HALT reflex. ON in EVERY
+# profile: unlike delegation_advisory (an opinion, bst-internal-only), a
+# billing-class error is unambiguously terminal and the halt reflex has no
+# false-positive cost worth the risk. The billing-cap-halt.sh PostToolUse
+# hook scans a FAILED Bash command's stderr for a provider-specific billing
+# signature (spending cap / prepayment credits depleted / credit balance is
+# too low / insufficient_quota — DISTINCT from a retryable 429). SEED
+# DEFAULT `warn`: banner + audit, NO freeze — a phrase-only global halt
+# would false-freeze finance/payments repos that emit the same phrases
+# (codex round-12 P1). `halt` is an explicit opt-in that writes .rea/HALT
+# and stops everything; `off` disables. The default flips to `halt` once
+# PR2's metered-endpoint scoping lands. See THREAT_MODEL.md §5.25
+# (INCIDENT-2026-07-04, denial-of-wallet).
+spend_governance:
+  enabled: true
+  billing_error_response: warn

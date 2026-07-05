@@ -349,6 +349,51 @@ const DelegationAdvisoryPolicySchema = z
   .strict();
 
 /**
+ * 0.51.0 — spend-governance policy (E1 seed slice). Drives the
+ * `billing-cap-halt.sh` PostToolUse hook (matcher `Bash`): when a
+ * just-run command's output carries a billing-class signature (distinct
+ * from a mere rate-limit / 429), the hook writes `.rea/HALT` — reusing
+ * the existing kill-switch every middleware + hook already respects.
+ *
+ * Introduced after INCIDENT-2026-07-04 (denial-of-wallet): rea had no
+ * concept of money, so a billing-cap error was retried like a 429 and
+ * multiplied spend against a metered endpoint. See `THREAT_MODEL.md
+ * §5.25`.
+ *
+ * SEED slice only — `enabled` + `billing_error_response`. The full E1
+ * axis (`metered_endpoints`, `retry_discipline`) and E3
+ * (`consumption_limits`) land in later PRs. Kept `.strict()` so a typo
+ * or a premature future-field fails loudly at policy load, matching
+ * every other block.
+ *
+ * OPT-OUT defaults (incident mandate "default ON, zero-exception", codex
+ * 0.51.0 round-5/6): a block that is present but omits `enabled` gets
+ * `enabled: true`, and an ABSENT block gets the whole default object
+ * (`.default({})` at the top-level schema) so `loadPolicy()` agrees with
+ * the runtime hook's opt-out reading — the reflex is ON for any present
+ * rea policy unless it positively sets `enabled: false` (or
+ * `billing_error_response: off`). This keeps the strict loader and the
+ * `billing-cap-halt` hook in lockstep; a split where one says on and the
+ * other off was the round-6 finding. `billing_error_response` defaults to
+ * the protective `'halt'`. Every shipped profile still pins the block
+ * explicitly for documentation, but absence no longer means disabled.
+ */
+const SpendGovernancePolicySchema = z
+  .object({
+    enabled: z.boolean().default(true),
+    // SEED default is `warn`, NOT `halt` (codex 0.51.0 round-12 P1). The
+    // hook fires on every Bash PostToolUse with no metered-endpoint scoping
+    // yet, so a phrase-only global `halt` would freeze sessions in
+    // budgeting / payments / loyalty repos whose own errors say "spending
+    // cap" etc. `warn` detects + banners + audits without freezing. `halt`
+    // stays available as an explicit opt-in and becomes the default once
+    // PR2's endpoint registry supplies the provider discriminator that
+    // makes freezing safe.
+    billing_error_response: z.enum(['halt', 'warn', 'off']).default('warn'),
+  })
+  .strict();
+
+/**
  * 0.48.0 — per-session shim cache policy. The
  * `hooks/_lib/shim-cache.sh` helper, sourced by every Node-binary
  * shim via `hooks/_lib/shim-runtime.sh`, caches the (sandbox-ok,
@@ -506,6 +551,17 @@ const PolicySchema = z
     // when unset/false). When the block IS present the inner schema
     // supplies defaults for any omitted field.
     delegation_advisory: DelegationAdvisoryPolicySchema.optional(),
+    // 0.51.0 spend-governance (E1 seed) — drives the `billing-cap-halt.sh`
+    // PostToolUse hook. `.default({})` (NOT `.optional()`) so an ABSENT
+    // block resolves to the opt-out default (`enabled: true`,
+    // `billing_error_response: 'halt'`) — the reflex is ON for any present
+    // rea policy unless it positively opts out. This keeps `loadPolicy()`
+    // in lockstep with the runtime hook's opt-out reading (codex round-6:
+    // a split where the schema said off-by-default while the hook enforced
+    // on was the defect). When the block IS present the inner schema fills
+    // any omitted field. Every shipped profile still pins it explicitly.
+    // See `SpendGovernancePolicySchema` and `THREAT_MODEL.md §5.25`.
+    spend_governance: SpendGovernancePolicySchema.default({}),
     // 0.48.0 per-session shim cache — drives `hooks/_lib/shim-cache.sh`
     // which short-circuits the sandbox check + version probe in
     // `hooks/_lib/shim-runtime.sh` on session-warm fires of the same

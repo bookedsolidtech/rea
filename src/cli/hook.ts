@@ -50,6 +50,7 @@ import { runHookLocalReviewGate } from '../hooks/local-review-gate/index.js';
 import { runHookSecretScanner } from '../hooks/secret-scanner/index.js';
 import { runHookBlockedPathsBashGate } from '../hooks/blocked-paths-bash-gate/index.js';
 import { runHookProtectedPathsBashGate } from '../hooks/protected-paths-bash-gate/index.js';
+import { runHookBillingCapHalt } from '../hooks/billing-cap-halt/index.js';
 import { runHookBlockedPathsEnforcer } from '../hooks/blocked-paths-enforcer/index.js';
 import { runHookSettingsProtection } from '../hooks/settings-protection/index.js';
 import { loadPolicy } from '../policy/loader.js';
@@ -1467,6 +1468,15 @@ export function registerHookCommand(program: Command): void {
     )
     .action(async () => {
       await runHookSettingsProtection();
+    });
+
+  hook
+    .command('billing-cap-halt')
+    .description(
+      'PostToolUse Bash billing→HALT reflex (0.51.0, spend-governance E1 seed). Reads a Claude Code PostToolUse Bash payload from stdin and scans the STDERR channel ONLY (tool_response.stderr) — NEVER the command text or stdout (not even on a non-zero exit), so `cat`/`rg` on billing docs and `grep -R "spending cap" docs missing_dir` never self-freeze; when a provider-specific BILLING-CLASS signature (spending cap / prepayment credits depleted / credit balance is too low / insufficient_quota — DISTINCT from a retryable 429/rate-limit, and from ambiguous 402/business-domain phrases) matches on a FAILED command stderr, writes `.rea/HALT` (reusing the kill-switch every middleware + hook respects) per `policy.spend_governance.billing_error_response`: halt (default) → HALT + banner + exit 2; warn → banner + exit 0 (advisory, non-blocking), no HALT; off / enabled:false → no-op. OPT-OUT: an absent/omitted block resolves to ON (halt), so the reflex is live on any present rea policy unless it opts out. Malformed payload is fail-SAFE (exit 0, no freeze); the shim fails CLOSED only when a billing keyword is present with no CLI. Introduced after INCIDENT-2026-07-04 (denial-of-wallet).',
+    )
+    .action(async () => {
+      await runHookBillingCapHalt();
     });
 
   hook

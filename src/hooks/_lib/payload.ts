@@ -258,6 +258,184 @@ export function parseWriteHookPayload(raw: string | Buffer): WriteHookPayload {
 }
 
 /**
+ * Result of parsing a Claude Code PostToolUse stdin payload for a Bash
+ * tool call. Unlike the PreToolUse parsers above, this one captures the
+ * tool's OUTPUT (`tool_response`) — the billing→HALT gate (0.51.0) needs
+ * it because a billing-class signature appears in a metered call's ERROR
+ * output, not in the command text.
+ *
+ * The output is split by CHANNEL on purpose (codex 0.51.0 round-1 P1/P2):
+ * a billing error is *error* output from a *failed* call. Scanning the
+ * command text or a successful command's stdout would freeze the session
+ * on entirely benign work — e.g. `cat THREAT_MODEL.md` or
+ * `rg "spending cap" .`, both of which legitimately print the watched
+ * phrases to stdout. So the caller scans `stderr` (the error channel,
+ * always) plus `stdout` ONLY when `errored` is set, and NEVER the
+ * command.
+ */
+export interface PostToolUsePayload {
+  /** `tool_name` from the payload, or `''` when absent. */
+  toolName: string;
+  /**
+   * `tool_input.command`, or `''` when absent. Retained for context /
+   * banners; the billing gate deliberately does NOT scan it.
+   */
+  command: string;
+  /**
+   * The error channel — `tool_response.stderr`. Billing errors from a
+   * metered endpoint surface here. Scanned unconditionally by the gate.
+   * `''` when absent.
+   */
+  stderr: string;
+  /**
+   * The benign channel — `tool_response.stdout` (plus the `output` /
+   * `content` fallback keys some harnesses use, and a bare-string
+   * `tool_response`). A successful command's normal output. Parsed but
+   * NOT scanned by the billing gate (round-4 P1: a command that fails for
+   * an unrelated reason while printing benign matches to stdout — e.g.
+   * `grep -R "spending cap" docs missing_dir` — must not freeze). Retained
+   * for PR2, where a registered metered host justifies scanning it. `''`
+   * when absent.
+   */
+  stdout: string;
+  /**
+   * True when `tool_response` carries an explicit FAILURE signal —
+   * `success: false` (Claude Code's PRIMARY Bash signal), an
+   * `is_error`/`isError`/`error` flag, a non-zero numeric exit field
+   * (`exit_code`/`exitCode`/`code`/`returncode`/`status`), or
+   * `interrupted: true`. The billing gate scans stderr ONLY on a failed
+   * command (round-7). Absent/unknown shapes → `false`.
+   */
+  errored: boolean;
+}
+
+interface RawPostToolUsePayload {
+  tool_name?: unknown;
+  tool_input?: {
+    command?: unknown;
+  } | null;
+  tool_response?: unknown;
+}
+
+/**
+ * Benign (stdout-equivalent) object keys, in a fixed order. `stdout` is
+ * the Bash shape; `output` / `content` are fallbacks some harnesses use.
+ * `stderr` is handled separately (it is the error channel).
+ */
+const POST_TOOL_STDOUT_KEYS = ['stdout', 'output', 'content'] as const;
+
+/** Numeric exit-status keys checked for a non-zero (failure) value. */
+const POST_TOOL_EXIT_KEYS = ['exit_code', 'exitCode', 'code', 'returncode', 'status'] as const;
+
+/**
+ * Derive a FAILURE signal from a `tool_response` object. Conservative:
+ * only explicit, unambiguous failure markers count. Absent → false.
+ */
+function toolResponseErrored(rec: Record<string, unknown>): boolean {
+  // Claude Code's Bash PostToolUse tool_response reports failure via a
+  // `success` boolean — the PRIMARY signal (see scripts/profile-hooks.mjs
+  // fixtures). Without this the billing reflex misses real walls reported as
+  // `{ success: false, stderr: ... }` (codex round-10 P1).
+  if (rec['success'] === false) return true;
+  if (rec['is_error'] === true || rec['isError'] === true) return true;
+  const err = rec['error'];
+  if (err === true || (typeof err === 'string' && err.length > 0)) return true;
+  if (rec['interrupted'] === true) return true;
+  for (const key of POST_TOOL_EXIT_KEYS) {
+    const v = rec[key];
+    if (typeof v === 'number' && Number.isFinite(v) && v !== 0) return true;
+  }
+  return false;
+}
+
+/**
+ * Parse a Claude Code PostToolUse stdin payload for a Bash tool call,
+ * capturing `tool_input.command` plus the `tool_response` split into the
+ * `stderr` (error) and `stdout` (benign) channels and an `errored` flag.
+ *
+ * Fail-closed posture mirrors `parseHookPayload`:
+ *   - malformed JSON → throws `MalformedPayloadError`
+ *   - `tool_input.command` present with a non-string type → throws
+ *     `TypePayloadError`.
+ *
+ * The channel extraction is deliberately LENIENT (never throws on a weird
+ * `tool_response` shape): vendor output is untrusted and highly variable,
+ * and the billing gate must not fail its whole evaluation because an
+ * output field had an unexpected type. A shape we don't recognize yields
+ * empty channels + `errored: false`.
+ */
+export function parsePostToolUsePayload(raw: string | Buffer): PostToolUsePayload {
+  const text = typeof raw === 'string' ? raw : raw.toString('utf8');
+  const empty: PostToolUsePayload = {
+    toolName: '',
+    command: '',
+    stderr: '',
+    stdout: '',
+    errored: false,
+  };
+  if (text.trim().length === 0) {
+    return empty;
+  }
+  let parsed: RawPostToolUsePayload;
+  try {
+    parsed = JSON.parse(text) as RawPostToolUsePayload;
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    throw new MalformedPayloadError(`hook payload is not valid JSON: ${detail}`);
+  }
+  if (parsed === null) {
+    return empty;
+  }
+  if (typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new MalformedPayloadError(
+      `hook payload top-level is ${Array.isArray(parsed) ? 'array' : typeof parsed}, expected object`,
+    );
+  }
+  const toolName = typeof parsed.tool_name === 'string' ? parsed.tool_name : '';
+
+  // Command — same type-strict extraction as parseHookPayload.
+  const ti = parsed.tool_input;
+  let command = '';
+  if (ti !== undefined && ti !== null) {
+    if (typeof ti !== 'object') {
+      throw new TypePayloadError(
+        `hook payload tool_input is ${typeof ti}, expected object`,
+      );
+    }
+    const c = ti.command;
+    if (c !== undefined && typeof c !== 'string') {
+      throw new TypePayloadError(
+        `hook payload tool_input.command is non-string (got ${typeof c}); expected string`,
+      );
+    }
+    if (typeof c === 'string') command = c;
+  }
+
+  // Channels — lenient. A bare-string tool_response is treated as the
+  // BENIGN (stdout) channel: it carries no error signal, so it must not
+  // be scanned as if it were an error.
+  let stderr = '';
+  let stdout = '';
+  let errored = false;
+  const tr = parsed.tool_response;
+  if (typeof tr === 'string') {
+    stdout = tr;
+  } else if (tr !== null && typeof tr === 'object' && !Array.isArray(tr)) {
+    const rec = tr as Record<string, unknown>;
+    if (typeof rec['stderr'] === 'string') stderr = rec['stderr'] as string;
+    const parts: string[] = [];
+    for (const key of POST_TOOL_STDOUT_KEYS) {
+      const v = rec[key];
+      if (typeof v === 'string' && v.length > 0) parts.push(v);
+    }
+    stdout = parts.join('\n');
+    errored = toolResponseErrored(rec);
+  }
+
+  return { toolName, command, stderr, stdout, errored };
+}
+
+/**
  * Read all of stdin into a string with a soft byte cap and a hard
  * timeout. Mirrors the `readStdinWithTimeout` helper in
  * `src/cli/hook.ts` (which scans a fixed timeout but no byte cap).
@@ -268,9 +446,13 @@ export function parseWriteHookPayload(raw: string | Buffer): WriteHookPayload {
  *
  * @param timeoutMs How long to wait for stdin to close before resolving
  *                  with whatever we have. Default 5_000 ms.
- * @param maxBytes Soft cap on total bytes accepted. Default 1 MiB.
- *                 Once reached, additional chunks are dropped silently
- *                 (the caller still gets a parseable string back).
+ * @param maxBytes Soft cap on RETAINED bytes. Default 1 MiB. Once reached,
+ *                 further bytes are discarded but stdin is STILL DRAINED to
+ *                 EOF (we do not resolve early) so the writer's pipe closes
+ *                 cleanly. A payload that ends exactly at the cap is whole;
+ *                 one that exceeds it yields a truncated head that a
+ *                 JSON-parsing caller will reject — callers treat that as a
+ *                 degraded read, not a valid document.
  */
 export function readStdinWithTimeout(
   timeoutMs = 5_000,
@@ -300,16 +482,21 @@ export function readStdinWithTimeout(
     const timer = setTimeout(finish, timeoutMs);
     process.stdin.setEncoding('utf8');
     process.stdin.on('data', (chunk: string) => {
+      if (bytesRead >= maxBytes) {
+        // Cap already reached — keep DRAINING to EOF, discarding excess,
+        // rather than resolving early (codex 0.51.0 round-11 P2). Resolving
+        // mid-stream stopped reading and left the writer's pipe undrained;
+        // for hooks that JSON.parse the payload an early cut is also a
+        // guaranteed malformed document. Draining lets the writer finish
+        // cleanly and lets a payload that ends AT the cap still be whole.
+        return;
+      }
       const chunkBytes = Buffer.byteLength(chunk, 'utf8');
       if (bytesRead + chunkBytes > maxBytes) {
-        // Truncate to the cap; further chunks are dropped silently.
-        const remaining = Math.max(0, maxBytes - bytesRead);
-        if (remaining > 0) {
-          buf += chunk.slice(0, remaining);
-          bytesRead = maxBytes;
-        }
-        finish();
-        return;
+        const remaining = maxBytes - bytesRead;
+        buf += chunk.slice(0, remaining);
+        bytesRead = maxBytes;
+        return; // keep draining; do NOT resolve early
       }
       buf += chunk;
       bytesRead += chunkBytes;

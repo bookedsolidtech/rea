@@ -175,7 +175,7 @@ This repo is **public from the first commit**. Extra rules apply because everyth
 
 ## Hook & Command Reference
 
-Hooks at `.claude/hooks/` (copied from `hooks/` by `rea init`). 14 ship in the package and ALL 14 are registered in the default `.claude/settings.json`. (Pre-0.26.0 the count was 11 ship / 11 registered; the 0.21.0 → 0.22.0 → 0.26.0 cycle added 3 new gates: `protected-paths-bash-gate.sh`, `blocked-paths-bash-gate.sh`, `local-review-gate.sh`.) The 0.10.x review-gate scripts (`push-review-gate.sh`, `push-review-gate-git.sh`, `commit-review-gate.sh`) and the bash push-review core were removed in 0.11.0; the push-gate is now a stateless `codex exec review` invocation wired through `.husky/pre-push` (not Claude Code hooks).
+Hooks at `.claude/hooks/` (copied from `hooks/` by `rea init`). 15 ship in the package and ALL 15 are registered in the default `.claude/settings.json`. (Pre-0.26.0 the count was 11 ship / 11 registered; the 0.21.0 → 0.22.0 → 0.26.0 cycle added 3 new gates: `protected-paths-bash-gate.sh`, `blocked-paths-bash-gate.sh`, `local-review-gate.sh`; 0.51.0 added `billing-cap-halt.sh` — the spend-governance billing→HALT reflex.) The 0.10.x review-gate scripts (`push-review-gate.sh`, `push-review-gate-git.sh`, `commit-review-gate.sh`) and the bash push-review core were removed in 0.11.0; the push-gate is now a stateless `codex exec review` invocation wired through `.husky/pre-push` (not Claude Code hooks).
 
 - `dangerous-bash-interceptor.sh` — blocks destructive commands (`rm -rf`, `git reset --hard`, `--no-verify`, etc.)
 - `env-file-protection.sh` — blocks reads of `.env*`
@@ -191,6 +191,7 @@ Hooks at `.claude/hooks/` (copied from `hooks/` by `rea init`). 14 ship in the p
 - `blocked-paths-enforcer.sh` — enforces `blocked_paths` from policy
 - `changeset-security-gate.sh` — checks changesets for GHSA leaks and malformed frontmatter
 - `architecture-review-gate.sh` — post-write architectural impact check
+- `billing-cap-halt.sh` — PostToolUse Bash billing→HALT reflex (0.51.0, spend-governance E1 seed): scans a FAILED command's stderr for a provider-specific billing-class signature (spending cap / prepayment credits depleted / credit balance is too low / insufficient_quota — DISTINCT from a retryable 429; generic 402/"payment required" is a known gap until PR2's endpoint scoping) and acts per `spend_governance.billing_error_response` (seed default `warn` = banner only; `halt` = writes `.rea/HALT`; `off`)
 
 Slash commands at `.claude/commands/`:
 

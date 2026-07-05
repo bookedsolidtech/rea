@@ -402,3 +402,82 @@ runtime:
     });
   });
 });
+
+describe('spend_governance policy (0.51.0 E1 seed)', () => {
+  let baseDir: string;
+
+  const BASE = `version: "1"
+profile: "minimal"
+installed_by: "tester"
+installed_at: "2026-07-04T00:00:00Z"
+autonomy_level: L1
+max_autonomy_level: L2
+promotion_requires_human_approval: true
+block_ai_attribution: true
+blocked_paths: []
+`;
+
+  beforeEach(async () => {
+    baseDir = await fs.mkdtemp(path.join(os.tmpdir(), 'rea-spend-'));
+    await fs.mkdir(path.join(baseDir, '.rea'), { recursive: true });
+    invalidatePolicyCache();
+  });
+  afterEach(async () => {
+    await fs.rm(baseDir, { recursive: true, force: true });
+  });
+
+  async function write(body: string): Promise<void> {
+    await fs.writeFile(path.join(baseDir, '.rea', 'policy.yaml'), body, 'utf8');
+  }
+
+  it('absent block resolves to the opt-out default (enabled true, seed default warn)', async () => {
+    // Opt-out (codex round-6): `.default({})` so an absent block is ON —
+    // keeping loadPolicy in lockstep with the runtime hook. Seed default
+    // mode is `warn` (round-12 P1), not halt.
+    await write(BASE);
+    const p = loadPolicy(baseDir);
+    expect(p.spend_governance?.enabled).toBe(true);
+    expect(p.spend_governance?.billing_error_response).toBe('warn');
+  });
+
+  it('present block defaults billing_error_response to warn (seed default)', async () => {
+    await write(BASE + 'spend_governance:\n  enabled: true\n');
+    const p = loadPolicy(baseDir);
+    expect(p.spend_governance?.enabled).toBe(true);
+    expect(p.spend_governance?.billing_error_response).toBe('warn');
+  });
+
+  it('present block defaults enabled to TRUE when omitted (opt-out)', async () => {
+    // Mode-only block: `enabled` defaults true (opt-out), mode preserved.
+    await write(BASE + 'spend_governance:\n  billing_error_response: warn\n');
+    const p = loadPolicy(baseDir);
+    expect(p.spend_governance?.enabled).toBe(true);
+    expect(p.spend_governance?.billing_error_response).toBe('warn');
+  });
+
+  it('accepts each enum value (halt|warn|off)', async () => {
+    for (const v of ['halt', 'warn', 'off'] as const) {
+      invalidatePolicyCache();
+      await write(BASE + `spend_governance:\n  enabled: true\n  billing_error_response: ${v}\n`);
+      const p = loadPolicy(baseDir);
+      expect(p.spend_governance?.billing_error_response).toBe(v);
+    }
+  });
+
+  it('rejects an unknown billing_error_response value (strict enum)', async () => {
+    await write(BASE + 'spend_governance:\n  enabled: true\n  billing_error_response: retry\n');
+    expect(() => loadPolicy(baseDir)).toThrow(/Invalid policy schema/);
+  });
+
+  it('rejects an unknown sub-field (strict block)', async () => {
+    await write(
+      BASE + 'spend_governance:\n  enabled: true\n  metered_endpoints: []\n',
+    );
+    expect(() => loadPolicy(baseDir)).toThrow(/Invalid policy schema/);
+  });
+
+  it('rejects a non-boolean enabled', async () => {
+    await write(BASE + 'spend_governance:\n  enabled: "yes"\n');
+    expect(() => loadPolicy(baseDir)).toThrow(/Invalid policy schema/);
+  });
+});
