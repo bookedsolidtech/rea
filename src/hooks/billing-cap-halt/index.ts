@@ -402,10 +402,19 @@ export async function runBillingCapHalt(
   //    exit 0, no HALT (see the header — never a false-positive freeze on
   //    unparseable input). A one-line breadcrumb goes to stderr so the
   //    failure is observable without being a gate.
+  //    Read with a GENEROUS byte cap (codex round-16 P2): the default
+  //    1 MiB cap would truncate a verbose command's payload into invalid
+  //    JSON, and a truncated document parses-fails → the "skip, no freeze"
+  //    path → the billing wall at the END of the output is missed. Claude
+  //    Code already truncates `tool_response` upstream, so a real
+  //    PostToolUse payload is far under 32 MiB; the cap only bounds memory
+  //    against a pathological caller. A payload beyond even this is treated
+  //    as malformed (no-op, fail-safe) — the accepted residual.
+  const BILLING_STDIN_CAP = 32 * 1024 * 1024;
   const stdinRaw =
     options.stdinOverride !== undefined
       ? options.stdinOverride
-      : await readStdinWithTimeout(5_000);
+      : await readStdinWithTimeout(5_000, BILLING_STDIN_CAP);
 
   let payloadStderr = '';
   let payloadStdout = '';
