@@ -78,7 +78,9 @@ function printRefusal(fail: SafetyFail): void {
 /**
  * `rea trust [<path>]`. Returns the process exit code.
  *   0 — trusted (or already trusted; idempotent)
- *   1 — `<home>/.rea` is unsafe (symlink/foreign/world-writable), or no passwd
+ *   1 — `<home>/.rea` is unsafe (symlink/foreign/world-writable), the
+ *       `trusted-projects` file is an unsafe shape (symlink/foreign/bad-mode/
+ *       hardlinked), or no passwd
  *   2 — path does not exist / is not a directory / contains illegal bytes
  */
 export function runTrust(options: TrustOptions = {}): number {
@@ -132,6 +134,15 @@ export function runTrust(options: TrustOptions = {}): number {
     printRefusal(safety);
     return 1;
   }
+  // Refuse an unsafe `trusted-projects` file BEFORE any read-through: both the
+  // isProjectTrusted probe below AND readRegistry() open the file, so a FIFO /
+  // device / symlink / hardlinked / mode-wrong registry must be rejected here,
+  // ahead of both reads (an ABSENT registry is safe — first-trust bootstrap).
+  const regSafety = checkRegistrySafety(home);
+  if (!regSafety.ok) {
+    printRefusal(regSafety);
+    return 1;
+  }
 
   if (isProjectTrusted(real, home)) {
     log(`Already trusted: ${real}`);
@@ -150,7 +161,8 @@ export function runTrust(options: TrustOptions = {}): number {
  * absolute path AND its realpath (when resolvable), so a since-moved or
  * symlinked project can still be untrusted. Empties → delete the file.
  *   0 — removed, or nothing to remove (idempotent)
- *   1 — `<home>/.rea` is unsafe, or no passwd
+ *   1 — `<home>/.rea` is unsafe, the `trusted-projects` file is an unsafe shape
+ *       (symlink/foreign/bad-mode/hardlinked), or no passwd
  */
 export function runUntrust(options: UntrustOptions = {}): number {
   const home = resolveHome(options.home);
@@ -188,6 +200,14 @@ export function runUntrust(options: UntrustOptions = {}): number {
   const safety = checkReaDirSafety(home);
   if (!safety.ok) {
     printRefusal(safety);
+    return 1;
+  }
+  // Refuse an unsafe `trusted-projects` file BEFORE readRegistry() reads
+  // through it (a FIFO / device / symlink / hardlinked / mode-wrong registry
+  // is a tamper primitive). An ABSENT registry is safe — nothing to remove.
+  const regSafety = checkRegistrySafety(home);
+  if (!regSafety.ok) {
+    printRefusal(regSafety);
     return 1;
   }
 
