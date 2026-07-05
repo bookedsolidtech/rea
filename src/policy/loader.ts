@@ -20,6 +20,100 @@ const ContextProtectionSchema = z.object({
 });
 
 /**
+ * 0.50.x — per-path provider override entry. Gitignore-style globs + a
+ * lane. Strict so a typo (`path`, `providr`) fails loud.
+ */
+const ReviewPathOverrideSchema = z
+  .object({
+    paths: z.array(z.string().min(1)).min(1),
+    // Round-14: DOWNGRADE targets only. `'openrouter'` removed — per-path
+    // upgrade is incoherent for a whole-diff review (was a silent no-op).
+    provider: z.enum(['codex', 'refuse']),
+  })
+  .strict();
+
+/**
+ * 0.50.x — OpenRouter (`gpt-oss-120b`) provider config. Strict-validated.
+ *
+ * Security-relevant constraints baked into the schema:
+ *   - `model`: safe character class; a `:free` suffix is rejected by a
+ *     separate runtime guard (`checkOpenRouterModel`) with a loud message
+ *     — the `:free` endpoint trains on prompts and is NOT wired.
+ *   - `base_url`: HTTPS-pinned AND host-pinned at the schema layer — only
+ *     `openrouter.ai` (or a subdomain) over TLS. The ONLY plaintext exception
+ *     is an http LOOPBACK address (127.0.0.0/8 with valid 0-255 octets, `[::1]`,
+ *     or exactly `localhost`, optional 1-65535 port) — loopback http never
+ *     leaves the machine, so it carries no exfiltration risk. The cross-repo
+ *     smoke harness drives the REAL shipped transport against a
+ *     `http://127.0.0.1:<port>` localhost responder via this exception. Any
+ *     other https host (`https://evil.example`), non-loopback http (public host,
+ *     LAN IP, `*.evil.com` suffix), or out-of-range octet/port is rejected.
+ *   - `data_policy`: only `'deny-training'` — the always-on safe default.
+ *   - `backend_pin`: a safe identifier class per entry.
+ */
+const OpenRouterProviderPolicySchema = z
+  .object({
+    model: z
+      .string()
+      .regex(/^[a-zA-Z0-9._/:-]{1,128}$/)
+      .optional(),
+    // HTTPS-pinned for the production lane. The ONLY plaintext exception is an
+    // http LOOPBACK address — the IPv4 loopback block 127.0.0.0/8 (any
+    // 127.x.x.x), the IPv6 loopback `[::1]`, or the `localhost` name — used by
+    // the cross-repo smoke harness's local fixture responder and by an operator
+    // running a local proxy. Loopback http never leaves the machine, so it
+    // carries no exfiltration risk. ANY non-loopback http (a public host, a LAN
+    // IP, 0.0.0.0, a hostname that is not exactly `localhost`) is REJECTED — the
+    // host alternation is anchored so `127.0.0.1.evil.com` / `localhost.evil.com`
+    // cannot slip through.
+    // The HTTPS host is PINNED to `openrouter.ai` (or a subdomain) — codex
+    // round-4 P1: an unconstrained `https://[^\s]+` let a config point the lane
+    // at `https://evil.example/api/v1`, which would receive the full diff +
+    // commit log and pass policy load. The security contract (THREAT_MODEL
+    // §5.25) is "openrouter.ai over TLS, plus a NARROW http-loopback test/proxy
+    // exception" — nothing else. The host alternation `(?:[a-z0-9-]+\.)*
+    // openrouter\.ai` is anchored so `openrouter.ai.evil.com` and
+    // `evilopenrouter.ai` are rejected.
+    //
+    // codex round-3 P2: the loopback exception bounds octet VALUE (0-255) and
+    // port RANGE (1-65535), not just digit count — otherwise `127.256.0.1` or
+    // `:65536` pass load and fail only at `fetch`. Octet =
+    // `25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d`; port = `6553[0-5]|655[0-2]\d|
+    // 65[0-4]\d{2}|6[0-4]\d{3}|[1-5]\d{4}|[1-9]\d{0,3}` (1-65535, no `:0`). Each
+    // alternation is fixed-width-anchored → linear, no catastrophic backtracking.
+    base_url: z
+      .string()
+      .regex(
+        /^(?:https:\/\/(?:[a-z0-9-]+\.)*openrouter\.ai(?::(?:6553[0-5]|655[0-2]\d|65[0-4]\d{2}|6[0-4]\d{3}|[1-5]\d{4}|[1-9]\d{0,3}))?(?:\/[^\s]{0,500})?|http:\/\/(?:127\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)|localhost|\[::1\])(?::(?:6553[0-5]|655[0-2]\d|65[0-4]\d{2}|6[0-4]\d{3}|[1-5]\d{4}|[1-9]\d{0,3}))?(?:\/[^\s]{0,500})?)$/,
+      )
+      .optional(),
+    data_policy: z.enum(['deny-training']).optional(),
+    backend_pin: z
+      .array(z.string().regex(/^[a-zA-Z0-9._-]{1,64}$/))
+      .optional(),
+    timeout_ms: z.number().int().positive().optional(),
+    max_diff_bytes: z.number().int().positive().optional(),
+    path_overrides: z.array(ReviewPathOverrideSchema).optional(),
+    // 0.50.x — commit-aware review granularity. `'auto'` (default) sends the
+    // whole diff when it fits the context budget and splits per-commit
+    // otherwise; `'per-commit'` always splits; `'whole'` never splits. The
+    // path-guard runs once on the whole diff regardless — granularity only
+    // shapes what is SENT post-approval. See OpenRouterProviderPolicy.
+    review_granularity: z.enum(['auto', 'per-commit', 'whole']).optional(),
+  })
+  .strict();
+
+/**
+ * 0.50.x — `policy.review.providers`. Strict so a typo in the provider
+ * name (`openrouters`, `open_router`) fails loud at load.
+ */
+const ReviewProvidersPolicySchema = z
+  .object({
+    openrouter: OpenRouterProviderPolicySchema.optional(),
+  })
+  .strict();
+
+/**
  * 0.11.0 push-gate review policy. Three knobs only — the stateless gate does
  * not have a cache and does not treat CI differently. Strict mode so typos
  * (`codex_require`, `concerns_block`) fail loudly rather than silently
@@ -124,6 +218,15 @@ const ReviewPolicySchema = z
       })
       .strict()
       .optional(),
+    /**
+     * 0.50.x — review provider selector. NO `.default` — the consumer
+     * resolves `provider ?? 'codex'` so absence stays distinguishable
+     * from an explicit value (a default here would make a 0.49 policy
+     * round-trip as `provider: 'codex'` instead of omitting the key).
+     */
+    provider: z.enum(['codex', 'openrouter', 'both']).optional(),
+    /** 0.50.x — per-provider config. Today only `openrouter` is wired. */
+    providers: ReviewProvidersPolicySchema.optional(),
   })
   .strict();
 
@@ -665,6 +768,30 @@ function checkUserRedactPatterns(policy: z.infer<typeof PolicySchema>, policyPat
   }
 }
 
+/**
+ * 0.50.x — config-vs-capability guard. The `:free` OpenRouter endpoint
+ * (`openai/gpt-oss-120b:free`) trains on prompts, has a rate-limit cliff,
+ * and routes nondeterministically — it is deliberately NOT wired. The
+ * schema's `model` regex permits `:` (other models use it legitimately),
+ * so this guard fails LOUD if a consumer points the openrouter provider
+ * at any `:free` variant rather than silently hitting a train-on-prompts
+ * endpoint. A governance layer must never quietly degrade its data
+ * posture.
+ */
+function checkOpenRouterModel(policy: z.infer<typeof PolicySchema>, policyPath: string): void {
+  const model = policy.review?.providers?.openrouter?.model;
+  if (model === undefined) return;
+  if (/:free$/i.test(model.trim())) {
+    throw new Error(
+      `Invalid review.providers.openrouter.model "${model}" at ${policyPath}: ` +
+        `the ":free" OpenRouter endpoint is NOT wired — it trains on prompts ` +
+        `and routes nondeterministically. Use the paid lane ` +
+        `("openai/gpt-oss-120b") instead. If you intended the free tier, that ` +
+        `is unsupported by design for a governance-layer review provider.`,
+    );
+  }
+}
+
 function parseRawPolicy(raw: string, policyPath: string): Policy {
   let parsed: unknown;
   try {
@@ -687,6 +814,9 @@ function parseRawPolicy(raw: string, policyPath: string): Policy {
   // G3: reject unsafe user-supplied redaction patterns. This runs BEFORE
   // stripUndefined so the error references the user-authored field exactly.
   checkUserRedactPatterns(parsedPolicy, policyPath);
+
+  // 0.50.x: reject a `:free` openrouter model loudly (config-vs-capability).
+  checkOpenRouterModel(parsedPolicy, policyPath);
 
   return applyMaxCeiling(stripUndefined(parsedPolicy));
 }

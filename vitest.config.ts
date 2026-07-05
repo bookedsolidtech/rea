@@ -13,10 +13,19 @@ export default defineConfig({
     // `pnpm test:perf` (which sets REA_INCLUDE_PERF=1 to override
     // the exclude) or as part of `pnpm perf:hooks` which also
     // refreshes the baseline JSON.
+    // 0.50.x: `*.live.test.ts` files hit the real OpenRouter endpoint and
+    // require `OPENROUTER_API_KEY` — they are NEVER in the required gate.
+    // Run them explicitly (an operator with a key) via
+    // `pnpm vitest run <file>`.
     exclude:
       process.env.REA_INCLUDE_PERF === '1'
-        ? ['**/node_modules/**', '**/dist/**']
-        : ['**/node_modules/**', '**/dist/**', '__tests__/scripts/profile-hooks.test.ts'],
+        ? ['**/node_modules/**', '**/dist/**', '**/*.live.test.ts']
+        : [
+            '**/node_modules/**',
+            '**/dist/**',
+            '**/*.live.test.ts',
+            '__tests__/scripts/profile-hooks.test.ts',
+          ],
     // Codex round 2 R2-15: bash-tier corpus expanded with 186+ new
     // fixtures, each spawning a bash hook (avg 400-600ms). The default
     // 5s test/teardown timeouts plus default RPC budget can cause

@@ -271,11 +271,14 @@ export {
   LOCAL_REVIEW_SKIPPED_OVERRIDE_TOOL_NAME,
   LOCAL_REVIEW_SKIPPED_UNAVAILABLE_TOOL_NAME,
   LOCAL_REVIEW_PREFLIGHT_SKIPPED_TOOL_NAME,
+  LOCAL_REVIEW_SHADOW_TOOL_NAME,
+  LOCAL_REVIEW_REFUSED_EXTERNAL_TOOL_NAME,
   LOCAL_REVIEW_SERVER_NAME,
   type LocalReviewVerdict,
   type LocalReviewMetadata,
   type LocalReviewSkippedOverrideMetadata,
   type LocalReviewSkippedUnavailableMetadata,
+  type LocalReviewRefusedExternalMetadata,
 } from './local-review-event.js';
 export {
   DELEGATION_SIGNAL_TOOL_NAME,

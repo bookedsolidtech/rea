@@ -110,6 +110,12 @@ export const REA_GITIGNORE_ENTRIES: readonly string[] = [
   '.rea/serve.state.json',
   '.rea/fingerprints.json',
   '.rea/last-review.json',
+  // 0.50.x — `provider: both` writes a side-by-side parity report on EVERY run;
+  // a consumer enabling the openrouter parity lane would otherwise have a dirty
+  // tree after the first review (codex round-16 P2). The per-commit parity
+  // research dataset (`scripts/parity/`) is `.rea/`-scoped too.
+  '.rea/review-parity.json',
+  '.rea/parity-dataset/',
   '.rea/*.tmp',
   '.rea/*.tmp.*',
   '.rea/install-manifest.json.bak',

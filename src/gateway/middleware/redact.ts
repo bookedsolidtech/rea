@@ -67,8 +67,14 @@ export interface RedactTimeoutEvent {
 
 /**
  * Strip null bytes and other control characters that could break regex matching.
+ *
+ * Exported (0.50.x): the openrouter response-ingress sanitizer reuses this to
+ * scrub model-sourced strings (finding title/body, served_by) of ANSI/NUL
+ * control chars BEFORE they reach the hash-chained audit log, last-review.json,
+ * stdout, or telemetry. Strips C0 controls except `\t` (0x09), `\n` (0x0a),
+ * `\r` (0x0d) so multi-line finding bodies are preserved.
  */
-function sanitizeInput(input: string): string {
+export function sanitizeInput(input: string): string {
   return input.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, '');
 }
 
@@ -96,6 +102,31 @@ export function compileDefaultSecretPatterns(
     source,
     safe: wrapRegex(pattern, opts),
   }));
+}
+
+/**
+ * Compile USER-supplied redact patterns (from `policy.redact.patterns`) into the
+ * same `CompiledSecretPattern[]` shape, each wrapped in `SafeRegex` so it is
+ * timeout-bounded. Policy-agnostic: the caller passes the raw entries
+ * (`policy.redact?.patterns ?? []`). Malformed entries are skipped defensively
+ * (the policy loader already safe-regex-validates them). Concatenate with
+ * `compileDefaultSecretPatterns()` so a redactor honors BOTH built-in and
+ * org-configured secrets (the codex path's report writer, the outbound
+ * openrouter chokepoint, and the openrouter finding sanitizer all need this).
+ */
+export function compileUserRedactPatterns(
+  entries: ReadonlyArray<{ name: string; regex: string; flags?: string }>,
+  opts: MatchTimeoutOptions = {},
+): CompiledSecretPattern[] {
+  const out: CompiledSecretPattern[] = [];
+  for (const e of entries) {
+    try {
+      out.push({ name: e.name, source: 'user', safe: wrapRegex(new RegExp(e.regex, e.flags), opts) });
+    } catch {
+      // Loader safe-regex-validates these; skip defensively on an edge case.
+    }
+  }
+  return out;
 }
 
 /**

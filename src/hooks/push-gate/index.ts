@@ -254,7 +254,7 @@ export async function runPushGate(deps: PushGateDeps): Promise<GateResult> {
   //      - REA_SKIP_PUSH_GATE     — the original 0.11.0 var
   //      - REA_SKIP_CODEX_REVIEW  — added in 0.12.0 to match the variant
   //                                 documented elsewhere in the codebase
-  //                                 (gateway/reviewers, codex-probe). Prior
+  //                                 (codex-probe). Prior
   //                                 to 0.12.0 this string only worked at
   //                                 the gateway tier; agents who set it on
   //                                 a `git push` got no skip and codex still

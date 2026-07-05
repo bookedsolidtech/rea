@@ -20,6 +20,7 @@ import { registerAuditByToolCommand } from './audit-by-tool.js';
 import { registerAuditTimelineCommand } from './audit-timeline.js';
 import { registerAuditTopBlocksCommand } from './audit-top-blocks.js';
 import { registerVerifyClaimCommand } from './verify-claim.js';
+import { registerConfigCommand } from './config-key.js';
 import { registerTrustCommands } from './trust.js';
 import { registerInstallCommand } from './install/global.js';
 import { err, getPkgVersion } from './utils.js';
@@ -232,6 +233,11 @@ async function main(): Promise<void> {
   // centerpiece of 0.28.0 (4th structural pivot — claims as
   // machine-verifiable artifacts).
   registerVerifyClaimCommand(program);
+
+  // 0.50.x — `rea config set-key|get-key|unset-key|list` manage review-provider
+  // API keys in the managed credentials file (~/.config/rea/credentials, 0600).
+  // The openrouter provider resolves its key env-first, then from this file.
+  registerConfigCommand(program);
 
   // Phase 3a — the opt-in global rea CLI tier's writer surface. `rea trust` /
   // `rea untrust` / `rea trust --list` manage the per-user allow-list

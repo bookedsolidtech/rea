@@ -2132,7 +2132,7 @@ export async function runInit(options: InitOptions): Promise<void> {
     await printCodexInstallAssist();
   } else {
     console.log('');
-    console.log('Codex review disabled. ClaudeSelfReviewer will be used.');
+    console.log('Codex review disabled.');
     console.log('  Set review.codex_required: true in .rea/policy.yaml to re-enable.');
   }
 

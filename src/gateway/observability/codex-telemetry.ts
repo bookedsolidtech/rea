@@ -64,6 +64,26 @@ export interface TelemetryRecord {
   duration_ms: number;
   exit_code: number;
   rate_limited: boolean;
+  /**
+   * 0.50.x — provider that produced this row (`'codex'` | `'openrouter'`).
+   * OMITTED on existing codex rows so they stay byte-identical; readers
+   * treat an absent `provider` as `'codex'`.
+   */
+  provider?: string;
+  /** 0.50.x — model id, when applicable (e.g. `'openai/gpt-oss-120b'`). */
+  model?: string;
+  /** 0.50.x — OpenRouter serving backend (e.g. `'fireworks'`). */
+  served_by?: string;
+  /**
+   * 0.50.x — EXACT input tokens from the provider's usage block, when
+   * present (OpenRouter returns these). Distinct from
+   * `estimated_input_tokens` (the chars/4 heuristic), which is always set.
+   */
+  input_tokens?: number;
+  /** 0.50.x — EXACT output tokens from the provider's usage block. */
+  output_tokens?: number;
+  /** 0.50.x — estimated cost in USD for this call. */
+  est_cost_usd?: number;
 }
 
 /**
@@ -77,6 +97,19 @@ export interface RecordTelemetryInput {
   duration_ms: number;
   exit_code: number;
   stderr?: string;
+  /**
+   * 0.50.x — provider identity + exact usage. All optional; when omitted
+   * the row is byte-identical to a pre-0.50.x codex row. Conditional-spread
+   * onto the record only when defined.
+   */
+  provider?: string;
+  model?: string;
+  served_by?: string;
+  usage?: {
+    input_tokens?: number;
+    output_tokens?: number;
+    est_cost_usd?: number;
+  };
 }
 
 /** Shape returned by {@link summarizeTelemetry}. */
@@ -91,6 +124,14 @@ export interface TelemetrySummary {
   rate_limited_count: number;
   /** Arithmetic mean of duration_ms across all records in the window. */
   avg_latency_ms: number;
+  /**
+   * 0.50.x — estimated spend in USD per provider across the window, for
+   * doctor's per-provider spend line. A row with no `provider` field is
+   * bucketed under `'codex'`. A row with no `est_cost_usd` contributes 0.
+   * Absent (undefined) when no row in the window carried a cost — so codex-
+   * only telemetry summaries stay shape-compatible with pre-0.50.x readers.
+   */
+  est_cost_usd_by_provider?: Record<string, number>;
 }
 
 /**
@@ -137,6 +178,21 @@ export async function recordTelemetry(baseDir: string, input: RecordTelemetryInp
     duration_ms: Math.max(0, input.duration_ms | 0),
     exit_code: input.exit_code | 0,
     rate_limited: detectRateLimited(input.stderr),
+    // 0.50.x — conditional-spread provider identity + exact usage. Each key
+    // is added ONLY when defined so a codex call (which passes none of
+    // these) produces a row byte-identical to a pre-0.50.x row.
+    ...(input.provider !== undefined ? { provider: input.provider } : {}),
+    ...(input.model !== undefined ? { model: input.model } : {}),
+    ...(input.served_by !== undefined ? { served_by: input.served_by } : {}),
+    ...(input.usage?.input_tokens !== undefined
+      ? { input_tokens: input.usage.input_tokens }
+      : {}),
+    ...(input.usage?.output_tokens !== undefined
+      ? { output_tokens: input.usage.output_tokens }
+      : {}),
+    ...(input.usage?.est_cost_usd !== undefined
+      ? { est_cost_usd: input.usage.est_cost_usd }
+      : {}),
   };
 
   const filePath = metricsFilePath(baseDir);
@@ -250,25 +306,52 @@ export async function summarizeTelemetry(
   let rateLimitedCount = 0;
   let durationSum = 0;
   let inWindow = 0;
+  // 0.50.x — per-provider spend. Only populated when at least one in-window
+  // row carries an `est_cost_usd`; otherwise left undefined so codex-only
+  // summaries stay shape-identical to the pre-0.50.x contract.
+  const costByProvider = new Map<string, number>();
 
   for (const r of records) {
     const key = dayKey(r.timestamp);
     if (!countsByKey.has(key)) continue; // outside window
     countsByKey.set(key, (countsByKey.get(key) ?? 0) + 1);
-    totalTokens += (r.estimated_input_tokens ?? 0) + (r.estimated_output_tokens ?? 0);
+    // FIX E (round-3): prefer the EXACT token counts when present. OpenRouter
+    // rows carry exact `input_tokens`/`output_tokens` from the provider's usage
+    // block but record empty `input_text`/`output_text` (payloads are never
+    // persisted), so their `estimated_*` fields are 0 — totalling only the
+    // estimated fields silently dropped every openrouter invocation to 0 and
+    // under-reported `rea doctor --metrics`. Codex rows have no exact field, so
+    // they fall back to the estimate (unchanged).
+    const inTok =
+      typeof r.input_tokens === 'number' && Number.isFinite(r.input_tokens)
+        ? r.input_tokens
+        : (r.estimated_input_tokens ?? 0);
+    const outTok =
+      typeof r.output_tokens === 'number' && Number.isFinite(r.output_tokens)
+        ? r.output_tokens
+        : (r.estimated_output_tokens ?? 0);
+    totalTokens += inTok + outTok;
     if (r.rate_limited) rateLimitedCount += 1;
     durationSum += r.duration_ms ?? 0;
     inWindow += 1;
+    if (typeof r.est_cost_usd === 'number' && Number.isFinite(r.est_cost_usd)) {
+      const prov = typeof r.provider === 'string' && r.provider.length > 0 ? r.provider : 'codex';
+      costByProvider.set(prov, (costByProvider.get(prov) ?? 0) + r.est_cost_usd);
+    }
   }
 
   const invocations_per_day = bucketKeys.map((k) => countsByKey.get(k) ?? 0);
   const avg_latency_ms = inWindow === 0 ? 0 : durationSum / inWindow;
 
-  return {
+  const summary: TelemetrySummary = {
     window_days: days,
     invocations_per_day,
     total_estimated_tokens: totalTokens,
     rate_limited_count: rateLimitedCount,
     avg_latency_ms,
   };
+  if (costByProvider.size > 0) {
+    summary.est_cost_usd_by_provider = Object.fromEntries(costByProvider);
+  }
+  return summary;
 }

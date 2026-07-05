@@ -47,6 +47,7 @@ import {
   type SafetyFail,
 } from './global-cli.js';
 import { POLICY_FILE, REA_DIR, REGISTRY_FILE, getPkgVersion, log, reaPath } from './utils.js';
+import { resolveOpenRouterKey } from './openrouter-key-source.js';
 
 export interface CheckResult {
   label: string;
@@ -1314,6 +1315,63 @@ export function checkCodexBinaryOnPath(): CheckResult {
 }
 
 /**
+ * 0.50.x — openrouter review-provider availability.
+ *
+ * SECURITY (security-architect, binding): reports the KEY PRESENCE (a bool)
+ * and, when an injectable reachability probe is provided, a reachability
+ * STATE (`reachable` / `unreachable` / `unauthorized`) — NEVER the key
+ * value, prefix, or length. The default `rea doctor` invocation does NOT
+ * hit the network (the probe is optional); an operator with a key runs the
+ * reachability probe via the manual runbook / live smoke.
+ */
+export type OpenRouterReachability = 'reachable' | 'unreachable' | 'unauthorized' | 'unprobed';
+
+export function checkOpenRouterAvailability(
+  env: NodeJS.ProcessEnv = process.env,
+  reachability: OpenRouterReachability = 'unprobed',
+  // FIX (round-11): when openrouter is the ACTIVE review lane (provider:
+  // openrouter|both) under enforced local-review, a missing key means
+  // `rea review` exits 2 — the configured provider cannot run at all. That is
+  // a FAIL, not advisory. When openrouter is merely configured-but-inactive
+  // (a `providers.openrouter` block while provider stays codex), or mode is
+  // off, a missing key is only a WARN.
+  missingKeyFatal = false,
+): CheckResult {
+  // Resolve env-FIRST, then the managed credentials file. The resolver is
+  // fail-closed: a symlinked / world-readable / foreign-owned creds file is
+  // REFUSED (→ source 'none' + a refusal reason we surface here so the operator
+  // can fix it). Never echoes the key value — only presence + source.
+  const resolved = resolveOpenRouterKey(env);
+  const present = resolved.key !== undefined && resolved.key.length > 0;
+  if (!present) {
+    // Distinguish "no creds anywhere" from "a creds file exists but was refused".
+    const refusalSuffix = resolved.refusal !== undefined ? ` Refused: ${resolved.refusal}` : '';
+    return {
+      label: 'openrouter review provider',
+      status: missingKeyFatal ? 'fail' : 'warn',
+      // No value echoed — only the absence is reported.
+      detail: missingKeyFatal
+        ? 'OPENROUTER_API_KEY not set, but policy.review.provider is openrouter|both ' +
+          'under enforced local-review — `rea review` will exit 2. Set the key ' +
+          '(`rea config set-key openrouter`, or export OPENROUTER_API_KEY=…) or change ' +
+          `the provider / mode.${refusalSuffix}`
+        : 'OPENROUTER_API_KEY not set. The openrouter review provider needs a key ' +
+          '(`rea config set-key openrouter`, or export OPENROUTER_API_KEY=…). Not required ' +
+          `unless policy.review.provider is openrouter|both.${refusalSuffix}`,
+    };
+  }
+  // Key present. Report presence + SOURCE + (optional) reachability — never the value.
+  const sourceLabel = resolved.source === 'env' ? 'env' : 'config file';
+  const reach =
+    reachability === 'unprobed'
+      ? `key present (${sourceLabel}; reachability not probed)`
+      : `key present (${sourceLabel}), ${reachability}`;
+  const status: CheckResult['status'] =
+    reachability === 'unauthorized' ? 'fail' : reachability === 'unreachable' ? 'warn' : 'pass';
+  return { label: 'openrouter review provider', status, detail: reach };
+}
+
+/**
  * 0.39.0 — `rea doctor` visibility into the 4-tier shim policy reader.
  *
  * `hooks/_lib/policy-reader.sh` (introduced 0.37.0) is the unified
@@ -2220,15 +2278,83 @@ function formatSymbol(status: CheckResult['status']): string {
  * policy; default is `true` when the field is absent. Isolated so tests can
  * stub a policy without having to touch disk.
  */
-function codexRequiredFromPolicy(baseDir: string): boolean {
+export function codexRequiredFromPolicy(baseDir: string): boolean {
   try {
     const policy = loadPolicy(baseDir);
+    // codex round-2 P2: `provider: both` makes codex the AUTHORITATIVE
+    // local-review lane (with the openrouter shadow alongside) — `rea review`
+    // exits 2 without the binary — so the codex doctor checks MUST run even when
+    // `codex_required: false` (which otherwise governs only the push-gate).
+    // Previously a `both` + `codex_required: false` install green-lit doctor
+    // while reviews could not run. This is scoped to `both` deliberately:
+    // `provider: codex` keeps the documented `codex_required: false` opt-out
+    // (the codex-less escape hatch), and `provider: openrouter` keeps codex as a
+    // fallback that's required only when `codex_required` is on.
+    // codex round-12 P2: `both` requires codex ONLY when local-review is
+    // actually active. With `local_review.mode: off` the operator opted out and
+    // `rea review` SKIPS cleanly without the binary, so forcing the codex checks
+    // would false-fail a healthy codex-less parity install. When mode is off,
+    // fall through to `codex_required` (which still governs the push-gate).
+    if (policy.review?.provider === 'both' && policy.review?.local_review?.mode !== 'off') {
+      return true;
+    }
     return policy.review?.codex_required !== false;
   } catch {
     // If the policy itself is unreadable, checkPolicyParses will already
     // report a fail. Default to "Codex required" so we still run those
     // checks and surface the full picture.
     return true;
+  }
+}
+
+/**
+ * FIX F (round-3): is the openrouter review provider actually CONFIGURED?
+ * The openrouter availability check (which warns when OPENROUTER_API_KEY is
+ * unset) should run ONLY when the operator opted into the openrouter lane —
+ * `policy.review.provider` is `openrouter` or `both`, OR a
+ * `policy.review.providers.openrouter` block exists. On the DEFAULT
+ * `provider: codex` config with no openrouter block, the check is SKIPPED so a
+ * healthy codex-only install with no OR key does not show a permanent spurious
+ * warning that drowns real warnings.
+ *
+ * A missing/unreadable policy → not configured (the default is codex; a
+ * malformed policy is already surfaced by checkPolicyParses).
+ */
+export function openrouterConfiguredFromPolicy(baseDir: string): boolean {
+  try {
+    const policy = loadPolicy(baseDir);
+    const provider = policy.review?.provider;
+    if (provider === 'openrouter' || provider === 'both') return true;
+    if (policy.review?.providers?.openrouter !== undefined) return true;
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * FIX (round-11/12): is a MISSING `OPENROUTER_API_KEY` fatal for this install?
+ * True ONLY when `provider: openrouter` (openrouter is the AUTHORITATIVE lane)
+ * AND local-review is enforced (the default) — there, `rea review` exits 2
+ * without a key, so `rea doctor` must report FAIL, not a warning.
+ *
+ * Round-12 correction: `provider: both` is NOT fatal. In `both` mode CODEX is
+ * the authoritative lane and openrouter runs only as a best-effort SHADOW;
+ * `rea review` SUCCEEDS without an OR key (the shadow simply doesn't run), so a
+ * missing key there is at most a WARN, never a hard failure. A
+ * `providers.openrouter` block while `provider` stays codex, or `mode: off`,
+ * is likewise NOT fatal.
+ */
+export function openrouterMissingKeyFatal(baseDir: string): boolean {
+  try {
+    const policy = loadPolicy(baseDir);
+    // Only `openrouter` (authoritative) — NOT `both` (codex authoritative,
+    // openrouter is a non-blocking shadow that succeeds-by-skipping w/o a key).
+    if (policy.review?.provider !== 'openrouter') return false;
+    const mode = policy.review?.local_review?.mode ?? 'enforced';
+    return mode !== 'off';
+  } catch {
+    return false;
   }
 }
 
@@ -3552,6 +3678,16 @@ export async function runDoctor(opts: RunDoctorOptions = {}): Promise<void> {
     checks.push(await checkDelegationRoundTrip(baseDir));
   }
 
+  // 0.50.x — openrouter review-provider availability (presence-only by
+  // default; reachability is the live-smoke / runbook concern). NEVER
+  // echoes the key value. FIX F (round-3): run ONLY when the openrouter lane is
+  // actually configured (provider openrouter|both OR a providers.openrouter
+  // block) — on the default codex config this check is SKIPPED so a healthy
+  // codex-only install with no OR key shows no spurious warning.
+  if (openrouterConfiguredFromPolicy(baseDir)) {
+    checks.push(checkOpenRouterAvailability(process.env, 'unprobed', openrouterMissingKeyFatal(baseDir)));
+  }
+
   console.log('');
   log(`Doctor — ${baseDir}`);
   console.log('');
@@ -3598,4 +3734,12 @@ async function printTelemetrySummary(baseDir: string): Promise<void> {
   console.log(`  total estimated tokens: ${summary.total_estimated_tokens}`);
   console.log(`  rate-limited responses: ${summary.rate_limited_count}`);
   console.log(`  avg latency:            ${Math.round(summary.avg_latency_ms)} ms`);
+  // 0.50.x — per-provider estimated spend (USD). Only printed when at least
+  // one in-window row carried a cost (codex rows carry none).
+  if (summary.est_cost_usd_by_provider !== undefined) {
+    const parts = Object.entries(summary.est_cost_usd_by_provider)
+      .map(([prov, usd]) => `${prov}: $${usd.toFixed(4)}`)
+      .join(', ');
+    console.log(`  est. spend by provider: ${parts}`);
+  }
 }
