@@ -250,7 +250,11 @@ describe('STRUCTURAL FIX 1 (round-6) — response-ingress sanitizer', () => {
     const parsed = adaptContent({ verdict: 'pass', findings: many });
     expect(parsed!.findings.length).toBe(MAX_FINDINGS);
     expect(parsed!.truncated).toBe(true);
-  });
+    // Generous timeout: sanitizing ~50 findings runs each secret pattern in a
+    // sync worker thread PER finding-field (~11s local, ~40s on a loaded 2-core
+    // CI runner). The work is BOUNDED by MAX_FINDINGS — not a hang — so we give
+    // it headroom rather than weaken the redaction worker-timeout for everyone.
+  }, 90_000);
 
   it('round-12: a P1 PAST the MAX_FINDINGS cap still drives the verdict (no under-classification)', () => {
     // 50 P3s then a P1 at index MAX_FINDINGS — the P1 is dropped from STORAGE
@@ -265,7 +269,8 @@ describe('STRUCTURAL FIX 1 (round-6) — response-ingress sanitizer', () => {
     expect(parsed!.truncated).toBe(true);
     expect(parsed!.findings.length).toBe(MAX_FINDINGS);
     expect(parsed!.verdict).toBe('blocking');
-  });
+    // Bounded (MAX_FINDINGS+1) work; see the timeout note on the P2-2 cap test.
+  }, 90_000);
 
   it('P2-2: a giant finding body is byte-capped (+ truncated marker)', () => {
     const huge = 'x'.repeat(64 * 1024); // 64 KB

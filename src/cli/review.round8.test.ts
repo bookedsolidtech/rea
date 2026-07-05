@@ -106,8 +106,19 @@ async function runCaptured(
     exitCode = code ?? 0;
     throw new Error(`__exit__${exitCode}`);
   }) as never);
+  // Default codex to AVAILABLE so these tests do not depend on the `codex`
+  // binary being installed (they mock EXECUTION via executeCodexReview; the
+  // availability probe would otherwise spawn real codex — absent in CI). A
+  // test that needs codex unavailable overrides __testProviderSeams.codexAvailable.
+  const mergedDeps: Parameters<typeof runReview>[1] = {
+    ...deps,
+    __testProviderSeams: {
+      codexAvailable: () => true,
+      ...(deps?.__testProviderSeams ?? {}),
+    },
+  };
   try {
-    await runReview(opts, deps);
+    await runReview(opts, mergedDeps);
   } catch (e) {
     if (!(e instanceof Error) || !e.message.startsWith('__exit__')) throw e;
   }

@@ -95,6 +95,10 @@ async function runBothCaptured(
         executeCodexReview: async () => codexSeam,
         executeOpenRouterReview:
           typeof shadowSeam === 'function' ? shadowSeam : async () => shadowSeam,
+        // Default codex AVAILABLE so `provider: both` (codex authoritative)
+        // does not depend on the real `codex` binary being installed — absent
+        // in CI, which otherwise flips these to codex-unavailable behavior.
+        __testProviderSeams: { codexAvailable: () => true },
       },
     );
   } catch (e) {

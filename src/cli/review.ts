@@ -1163,11 +1163,26 @@ export function selectProvider(
   }
   // codex (and the residual 'both' authoritative lane). When a test injects
   // `executeCodexReview`, wrap CodexProvider so its `execute` uses the seam.
+  // ALSO honor `ctx.testCodexAvailable` for `isAvailable` when set, so a unit
+  // test that mocks codex EXECUTION does not silently depend on codex being
+  // INSTALLED: the default `CodexProvider.isAvailable` spawns the real `codex`
+  // binary, which is absent in CI — making those tests pass locally (codex
+  // present) but fail on CI runners (exit 2, codex-unavailable-in-enforced).
+  const withCodexAvailability = (p: ReviewProvider): ReviewProvider =>
+    ctx.testCodexAvailable === undefined
+      ? p
+      : {
+          ...p,
+          isAvailable: () =>
+            Promise.resolve(
+              ctx.testCodexAvailable!() ? { available: true } : { available: false },
+            ),
+        };
   if (deps.executeCodexReview !== undefined) {
     const seam = deps.executeCodexReview;
-    return { ...CodexProvider, execute: (b, o) => seam(b, o) };
+    return withCodexAvailability({ ...CodexProvider, execute: (b, o) => seam(b, o) });
   }
-  return CodexProvider;
+  return withCodexAvailability(CodexProvider);
 }
 
 /**
