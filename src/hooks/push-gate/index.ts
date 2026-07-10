@@ -37,11 +37,11 @@ import { resolveBaseRef, type BaseResolution } from './base.js';
 import {
   createRealGitExecutor,
   runCodexReview,
+  CodexModelUnsupportedError,
   CodexNotInstalledError,
   CodexProtocolError,
   CodexSubprocessError,
   CodexTimeoutError,
-  IRON_GATE_DEFAULT_MODEL,
   IRON_GATE_DEFAULT_REASONING,
   type CodexRunError,
   type GitExecutor,
@@ -544,8 +544,9 @@ export async function runPushGate(deps: PushGateDeps): Promise<GateResult> {
       env,
       // 0.14.0+: pass the resolved policy's model + reasoning overrides so
       // codex spawns with `-c model="<name>" -c model_reasoning_effort="<level>"`.
-      // Defaults (gpt-5.4 + high) are baked into resolvePushGatePolicy so
-      // policies that omit these keys still get the iron-gate defaults.
+      // 0.52.0: an UNSET codex_model stays undefined here ON PURPOSE — the
+      // runner rides IRON_GATE_MODEL_LADDER (gpt-5.5 → gpt-5.4) in that
+      // case. Only an explicit policy pin is passed through.
       ...(policy.codex_model !== undefined ? { model: policy.codex_model } : {}),
       ...(policy.codex_reasoning_effort !== undefined
         ? { reasoningEffort: policy.codex_reasoning_effort }
@@ -632,7 +633,20 @@ export async function runPushGate(deps: PushGateDeps): Promise<GateResult> {
         verdict: summary.verdict,
         finding_count: summary.findings.length,
         reviewed_at: deps.now !== undefined ? deps.now().toISOString() : new Date().toISOString(),
-        model: policy.codex_model ?? IRON_GATE_DEFAULT_MODEL,
+        // 0.52.0: cache the model that ACTUALLY ran (ladder may have fallen
+        // from the newest flagship on this account) — not the assumption.
+        //
+        // ACCEPTED TRADE (review P2): the cache KEY does not include model
+        // capability, so a same-SHA verdict cached on a fallback account
+        // keeps serving for its TTL even if the account gains the newest
+        // flagship mid-window. Bypassing hits whose cached model is below
+        // the ladder top would force EVERY push on fallback-only accounts
+        // to re-review (the re-run re-caches the same fallback model and
+        // the next push bypasses again) — destroying caching exactly where
+        // it matters. Staleness is bounded by cache_ttl_ms (default 24h)
+        // and the cached verdict is still a valid flagship review; the
+        // upgrade lands naturally at the next SHA or TTL expiry.
+        model: codexResult.modelUsed,
         reasoning_effort: policy.codex_reasoning_effort ?? IRON_GATE_DEFAULT_REASONING,
         ttl_ms: policy.cache_ttl_ms,
       };
@@ -748,6 +762,8 @@ function classifyCodexError(e: unknown): {
 } {
   if (e instanceof CodexNotInstalledError) return { kind: 'not-installed', message: e.message };
   if (e instanceof CodexTimeoutError) return { kind: 'timeout', message: e.message };
+  if (e instanceof CodexModelUnsupportedError)
+    return { kind: 'model-unsupported', message: e.message };
   if (e instanceof CodexProtocolError) return { kind: 'protocol', message: e.message };
   if (e instanceof CodexSubprocessError) return { kind: 'subprocess', message: e.message };
   if (e instanceof Error) return { kind: 'unknown', message: e.message };

@@ -139,17 +139,22 @@ const ReviewPolicySchema = z
     /**
      * Codex CLI model override (0.13.4+; runtime-default since 0.18.0).
      * Pinned via `-c model="<name>"` on every `codex exec review`
-     * invocation. **0.18.0 iron-gate runtime default**: when unset, the
-     * runtime hardcodes `gpt-5.4` — codex's own default
-     * (`codex-auto-review` at medium) is no longer reachable through the
-     * rea push-gate. To select a different model, set this key
-     * explicitly. config.toml is consulted ONLY when the explicit value
-     * passed by rea is `undefined`, which the runtime never does.
+     * invocation. **0.52.0 model LADDER default**: when unset, the runtime
+     * walks `IRON_GATE_MODEL_LADDER` (gpt-5.5 → gpt-5.4) newest-first,
+     * falling to the next entry when the account lacks the newest flagship
+     * — so installs ride the latest codex automatically instead of going
+     * stale on a hardcode. codex's own default (`codex-auto-review` at
+     * medium) is still unreachable through the rea push-gate. Setting this
+     * key explicitly is AUTHORITATIVE: no ladder substitution — an
+     * unsupported explicit pin fails loudly (never a silent pass; see
+     * CodexModelUnsupportedError). config.toml is consulted ONLY when the
+     * explicit value passed by rea is `undefined`, which the runtime never
+     * does.
      *
-     * For serious adversarial review on consumer codebases (where verdict
-     * stability matters) the recommended setting is `gpt-5.4` with
-     * `codex_reasoning_effort: high`. Higher reasoning trades push-gate
-     * latency for finding consistency — fewer same-code-different-verdict
+     * RECOMMENDATION: leave this UNSET and ride the ladder. Pin only for
+     * cost-bounded environments or when a specific model is required for
+     * verdict reproducibility. Higher reasoning trades push-gate latency
+     * for finding consistency — fewer same-code-different-verdict
      * round-trips like the 2026-04-26 helixir migration session.
      *
      * Loose string type: codex's model catalog evolves over time and we do
@@ -168,9 +173,9 @@ const ReviewPolicySchema = z
     /**
      * Codex reasoning effort knob (0.13.4+). Pinned via
      * `-c model_reasoning_effort="<level>"` on every invocation. Only
-     * meaningful when paired with a reasoning-capable model (gpt-5.4,
-     * gpt-5.3-codex, etc.). The `codex-auto-review` model honors this
-     * but caps lower than gpt-5.4.
+     * meaningful when paired with a reasoning-capable model (gpt-5.5,
+     * gpt-5.4, etc.). The `codex-auto-review` model honors this but caps
+     * lower than the flagships.
      *
      * Recommended: `high` for serious review on long-running branches
      * (more compute spent per finding, fewer flips). `medium` is codex's

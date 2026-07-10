@@ -74,6 +74,7 @@ import {
   type CompiledSecretPattern,
 } from '../gateway/middleware/redact.js';
 import {
+  CodexModelUnsupportedError,
   CodexNotInstalledError,
   CodexProtocolError,
   CodexSubprocessError,
@@ -597,42 +598,65 @@ export async function runHookCodexReview(options: HookCodexReviewOptions): Promi
   const tmpRoot = options.rawStdoutDir ?? os.tmpdir();
   const nonce = crypto.randomBytes(4).toString('hex');
   const rawPath = path.join(tmpRoot, `rea-codex-${headSha.slice(0, 12)}-${nonce}.json`);
-  let rawStream: fs.WriteStream | null;
-  try {
-    // mode 0o600: review JSONL contains the unfiltered codex output for
-    // the repo being scanned (file paths, code excerpts, finding text).
-    // On shared workstations / CI runners other local users could read
-    // a default-mode 0644 file. Owner-only is the right floor.
-    rawStream = fs.createWriteStream(rawPath, { flags: 'w', mode: 0o600 });
-    // createWriteStream() does not throw ENOENT/EACCES/ENOSPC
-    // synchronously — it emits an `error` event later. Without a
-    // listener, the unhandled stream error terminates the process. Fall
-    // back to "no raw tee" instead so a logging failure can never crash
-    // the review itself.
-    rawStream.once('error', (err) => {
+  // 0.52.0 rounds 4–6: each ladder attempt streams to its OWN temp file
+  // (`<rawPath>.a<N>`); the finally block renames the FINAL attempt's file
+  // to `rawPath` and unlinks the rest. This is the design that satisfies
+  // every constraint at once:
+  //   - O(1) memory (round-6 P3): chunks go to disk, never a second
+  //     in-memory copy of a stream the runner already buffers.
+  //   - FULL stream preserved (round-6 P2): no byte cap — raw_path is the
+  //     complete JSONL of the attempt the verdict came from, always.
+  //   - No mixed attempts (round-3 P3): distinct files per rung.
+  //   - No reopen race (round-4 P2): a superseded stream's late flush
+  //     lands in its own dead file (unlinked later), and its late error
+  //     listener nulls only ITSELF (identity-checked), never the
+  //     replacement.
+  let attemptIdx = 0;
+  let rawStream: fs.WriteStream | null = null;
+  const attemptPath = (idx: number): string => `${rawPath}.a${idx}`;
+  const openAttemptStream = (idx: number): fs.WriteStream | null => {
+    try {
+      // mode 0o600: review JSONL contains the unfiltered codex output for
+      // the repo being scanned (file paths, code excerpts, finding text).
+      // Owner-only is the right floor on shared workstations/CI runners.
+      const stream = fs.createWriteStream(attemptPath(idx), { flags: 'w', mode: 0o600 });
+      // createWriteStream() does not throw ENOENT/EACCES/ENOSPC
+      // synchronously — it emits an `error` event later. Without a
+      // listener the unhandled error terminates the process. Null out the
+      // sink (identity-checked: a late error from a SUPERSEDED attempt's
+      // stream must not kill the current one) — a logging failure can
+      // never crash the review itself.
+      stream.once('error', (err) => {
+        process.stderr.write(
+          `rea hook codex-review: raw-stdout sink at ${attemptPath(idx)} failed: ${err.message}\n`,
+        );
+        if (rawStream === stream) rawStream = null;
+      });
+      return stream;
+    } catch (e) {
       process.stderr.write(
-        `rea hook codex-review: raw-stdout sink at ${rawPath} failed: ${err.message}\n`,
+        `rea hook codex-review: could not open raw-stdout sink at ${attemptPath(idx)}: ${
+          e instanceof Error ? e.message : String(e)
+        }\n`,
       );
-      rawStream = null;
-    });
-  } catch (e) {
-    // Synchronous failures (rare — usually invalid path shape) fall
-    // through the same way: the audit entry still gets written, we
-    // just lose the raw JSON tee.
-    process.stderr.write(
-      `rea hook codex-review: could not open raw-stdout sink at ${rawPath}: ${
-        e instanceof Error ? e.message : String(e)
-      }\n`,
-    );
-    rawStream = null;
-  }
+      return null;
+    }
+  };
+  rawStream = openAttemptStream(0);
 
   // Run codex. The runner enforces iron-gate defaults internally —
-  // gpt-5.4 + high reasoning unless policy overrides — so we pass
-  // policy-resolved values straight through. spawnImpl is forwarded to
-  // the test seam.
+  // the model LADDER (gpt-5.5 → gpt-5.4) + high reasoning unless policy
+  // overrides — so we pass policy-resolved values straight through (an
+  // UNSET codex_model stays undefined so the ladder engages). spawnImpl
+  // is forwarded to the test seam.
   let reviewText = '';
   let durationSeconds = 0;
+  // Attempt-tracked model for the ERROR path: onAttempt updates this at
+  // the start of every ladder rung, so a fallback account that fell
+  // 5.5→5.4 and THEN failed audits the rung that actually failed (review
+  // P3), not the ladder top. The success path overwrites with the
+  // result's modelUsed.
+  let modelUsed = resolved.codex_model ?? IRON_GATE_DEFAULT_MODEL;
   let codexError: unknown;
   try {
     const result = await runCodexReview({
@@ -644,41 +668,76 @@ export async function runHookCodexReview(options: HookCodexReviewOptions): Promi
       ...(resolved.codex_reasoning_effort !== undefined
         ? { reasoningEffort: resolved.codex_reasoning_effort }
         : {}),
-      ...(options.spawnImpl !== undefined ? { spawnImpl: options.spawnImpl } : {}),
-      ...(rawStream !== null
-        ? {
-            rawStdoutSink: (chunk: Buffer): void => {
-              // Defensive: swallow any write error (closed/destroyed
-              // stream, EBADF, ENOSPC). The codex-runner already
-              // wraps sink calls in try/catch so a sink failure must
-              // never change the verdict — but throwing inside the
-              // 'data' handler also triggers an uncaughtException via
-              // the readable stream. Catch it here so it stays local.
-              try {
-                if (!rawStream!.writableEnded && !rawStream!.destroyed) {
-                  rawStream!.write(chunk);
-                }
-              } catch {
-                /* sink failure is non-fatal */
-              }
-            },
+      onAttempt: (m) => {
+        modelUsed = m;
+        // Ladder RETRY (attemptIdx > 0): rotate to a fresh per-attempt
+        // file so raw_path ends up holding ONLY the final attempt
+        // (round-3 P3). The superseded stream is ended best-effort; its
+        // late events target its own dead file, never the replacement
+        // (round-4 P2).
+        if (attemptIdx > 0) {
+          const old = rawStream;
+          if (old !== null) {
+            try {
+              old.end();
+            } catch {
+              /* best-effort */
+            }
           }
-        : {}),
+          rawStream = openAttemptStream(attemptIdx);
+        }
+        attemptIdx += 1;
+      },
+      ...(options.spawnImpl !== undefined ? { spawnImpl: options.spawnImpl } : {}),
+      rawStdoutSink: (chunk: Buffer): void => {
+        // Streaming tee to the CURRENT attempt's file — O(1) memory, no
+        // byte cap (disk is the right place for a large review stream).
+        // Swallow write errors: the codex-runner wraps sink calls, but a
+        // throw inside the 'data' handler would still surface as an
+        // uncaughtException via the readable stream. The tee must never
+        // affect the verdict.
+        try {
+          if (rawStream !== null && !rawStream.writableEnded && !rawStream.destroyed) {
+            rawStream.write(chunk);
+          }
+        } catch {
+          /* sink failure is non-fatal */
+        }
+      },
     });
     reviewText = result.reviewText;
     durationSeconds = result.durationSeconds;
+    modelUsed = result.modelUsed;
   } catch (e) {
     codexError = e;
   } finally {
+    // Finalize: flush + close the final attempt's stream, promote its
+    // file to rawPath, and unlink superseded attempt files. A failure
+    // here loses only the tee, never the verdict or the audit entry.
     if (rawStream !== null) {
-      // End the stream — best-effort. The file is on disk either way,
-      // and the OS flushes pending writes when the FD closes.
       try {
         await new Promise<void>((resolve) => {
           rawStream!.end(() => resolve());
         });
       } catch {
         /* swallow */
+      }
+    }
+    const finalIdx = attemptIdx > 0 ? attemptIdx - 1 : 0;
+    try {
+      fs.renameSync(attemptPath(finalIdx), rawPath);
+    } catch (e) {
+      process.stderr.write(
+        `rea hook codex-review: could not finalize raw tee at ${rawPath}: ${
+          e instanceof Error ? e.message : String(e)
+        }\n`,
+      );
+    }
+    for (let i = 0; i < finalIdx; i += 1) {
+      try {
+        fs.unlinkSync(attemptPath(i));
+      } catch {
+        /* superseded attempt file may not exist — fine */
       }
     }
   }
@@ -693,11 +752,13 @@ export async function runHookCodexReview(options: HookCodexReviewOptions): Promi
         ? 'not-installed'
         : codexError instanceof CodexTimeoutError
           ? 'timeout'
-          : codexError instanceof CodexProtocolError
-            ? 'protocol'
-            : codexError instanceof CodexSubprocessError
-              ? 'subprocess'
-              : 'unknown';
+          : codexError instanceof CodexModelUnsupportedError
+            ? 'model-unsupported'
+            : codexError instanceof CodexProtocolError
+              ? 'protocol'
+              : codexError instanceof CodexSubprocessError
+                ? 'subprocess'
+                : 'unknown';
     let auditHash = '';
     try {
       const record = await appendAuditRecord(baseDir, {
@@ -711,7 +772,7 @@ export async function runHookCodexReview(options: HookCodexReviewOptions): Promi
           finding_count: 0,
           verdict: 'error' as CodexVerdict,
           summary: `codex error (${kind}): ${msg}`,
-          model: resolved.codex_model ?? IRON_GATE_DEFAULT_MODEL,
+          model: modelUsed,
           reasoning_effort: resolved.codex_reasoning_effort ?? IRON_GATE_DEFAULT_REASONING,
           raw_path: rawPath,
           duration_seconds: durationSeconds,
@@ -779,7 +840,7 @@ export async function runHookCodexReview(options: HookCodexReviewOptions): Promi
         finding_count: findingCount,
         verdict,
         ...(summaryLine.length > 0 ? { summary: summaryLine } : {}),
-        model: resolved.codex_model ?? IRON_GATE_DEFAULT_MODEL,
+        model: modelUsed,
         reasoning_effort: resolved.codex_reasoning_effort ?? IRON_GATE_DEFAULT_REASONING,
         raw_path: rawPath,
         duration_seconds: durationSeconds,

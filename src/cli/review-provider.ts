@@ -20,8 +20,8 @@
 
 import { spawnSync } from 'node:child_process';
 import {
-  IRON_GATE_DEFAULT_MODEL,
   IRON_GATE_DEFAULT_REASONING,
+  CodexModelUnsupportedError,
   CodexNotInstalledError,
   CodexProtocolError,
   CodexSubprocessError,
@@ -142,7 +142,8 @@ async function executeCodexReview(
     headSha,
     contentToken,
     durationSeconds: codexResult.durationSeconds,
-    model: resolved.codex_model ?? IRON_GATE_DEFAULT_MODEL,
+    // 0.52.0: audit the model that ACTUALLY ran (ladder may have fallen).
+    model: codexResult.modelUsed,
     reasoningEffort: resolved.codex_reasoning_effort ?? IRON_GATE_DEFAULT_REASONING,
     findings: summary.findings,
     reviewText: codexResult.reviewText,
@@ -154,6 +155,7 @@ async function executeCodexReview(
 function classifyCodexError(e: unknown): string {
   if (e instanceof CodexNotInstalledError) return 'not-installed';
   if (e instanceof CodexTimeoutError) return 'timeout';
+  if (e instanceof CodexModelUnsupportedError) return 'model-unsupported';
   if (e instanceof CodexProtocolError) return 'protocol';
   if (e instanceof CodexSubprocessError) return 'subprocess';
   return 'unknown';

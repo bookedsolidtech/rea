@@ -46,7 +46,10 @@ describe('resolvePushGatePolicy', () => {
       timeout_ms: PUSH_GATE_DEFAULT_TIMEOUT_MS,
       last_n_commits: undefined,
       auto_narrow_threshold: PUSH_GATE_DEFAULT_AUTO_NARROW_THRESHOLD,
-      codex_model: PUSH_GATE_DEFAULT_CODEX_MODEL,
+      // 0.52.0: unset stays undefined so the runner rides the model
+      // ladder (materializing the default here was the review-P1 bug
+      // that kept the ladder from ever running in production).
+      codex_model: undefined,
       codex_reasoning_effort: PUSH_GATE_DEFAULT_CODEX_REASONING_EFFORT,
       cache_ttl_ms: PUSH_GATE_DEFAULT_CACHE_TTL_MS,
       // 0.28.0 helix-029: filter unset → empty list and false flag.
@@ -56,12 +59,14 @@ describe('resolvePushGatePolicy', () => {
     });
   });
 
-  it('PUSH_GATE_DEFAULT_CODEX_MODEL is the flagship gpt-5.4 (iron-gate default, 0.14.0+)', () => {
+  it('PUSH_GATE_DEFAULT_CODEX_MODEL is the newest flagship (iron-gate default, 0.52.0 ladder top)', () => {
     // The plain `codex exec review` form falls through to codex-auto-review
-    // (a special-purpose lower-reasoning model). The 0.14.0 iron-gate
-    // posture pins the flagship by default — verdict consistency over
-    // per-push compute cost.
-    expect(PUSH_GATE_DEFAULT_CODEX_MODEL).toBe('gpt-5.4');
+    // (a special-purpose lower-reasoning model). The iron-gate posture pins
+    // the flagship by default — verdict consistency over per-push compute
+    // cost. 0.52.0: the flagship is the model-LADDER top (gpt-5.5, falling
+    // to gpt-5.4 on accounts without it); the codex-runner parity test pins
+    // PUSH_GATE_DEFAULT_CODEX_MODEL === IRON_GATE_MODEL_LADDER[0].
+    expect(PUSH_GATE_DEFAULT_CODEX_MODEL).toBe('gpt-5.5');
   });
 
   it('PUSH_GATE_DEFAULT_CODEX_REASONING_EFFORT is high (iron-gate default, 0.14.0+)', () => {
@@ -76,6 +81,20 @@ describe('resolvePushGatePolicy', () => {
     );
     const p = await resolvePushGatePolicy(baseDir);
     expect(p.codex_model).toBe('gpt-5.4-mini');
+  });
+
+  it('a present policy WITHOUT codex_model resolves to undefined (ladder engages, 0.52.0 P1)', async () => {
+    // The review-P1 regression guard: materializing the default here turns
+    // it into an explicit pin at the runner, which disables the ladder —
+    // an account without the newest flagship would hard-fail instead of
+    // falling back.
+    await fs.writeFile(
+      path.join(baseDir, '.rea', 'policy.yaml'),
+      MINIMAL_POLICY + 'review:\n  codex_required: true\n',
+      'utf8',
+    );
+    const p = await resolvePushGatePolicy(baseDir);
+    expect(p.codex_model).toBeUndefined();
   });
 
   it('honors explicit review.codex_reasoning_effort override', async () => {
