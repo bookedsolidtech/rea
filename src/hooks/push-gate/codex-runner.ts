@@ -338,8 +338,18 @@ export async function runCodexReview(options: CodexRunOptions): Promise<CodexRun
   const explicitModel =
     options.model !== undefined && options.model.length > 0 ? options.model : undefined;
   const candidates = explicitModel !== undefined ? [explicitModel] : [...IRON_GATE_MODEL_LADDER];
+  // Review round-3 P2: `timeoutMs` is a TOTAL wall-clock cap for the whole
+  // review, not per-rung. Each attempt gets the REMAINING budget, so a
+  // fallback account can never block for ladder-length × timeout. (In
+  // practice an unsupported rung fails in ~2s, so the fallback rung sees
+  // nearly the full budget.)
+  const deadline = Date.now() + options.timeoutMs;
   let lastErr: unknown;
   for (let i = 0; i < candidates.length; i += 1) {
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) {
+      throw new CodexTimeoutError(options.timeoutMs);
+    }
     // Review P3: announce the rung BEFORE the attempt so error-path
     // audits attribute failures to the model that actually ran.
     if (options.onAttempt !== undefined) {
@@ -350,7 +360,10 @@ export async function runCodexReview(options: CodexRunOptions): Promise<CodexRun
       }
     }
     try {
-      const result = await runCodexReviewOnce(options, candidates[i]!);
+      const result = await runCodexReviewOnce(
+        { ...options, timeoutMs: remainingMs },
+        candidates[i]!,
+      );
       return { ...result, modelFellBack: i > 0 };
     } catch (e) {
       if (e instanceof CodexModelUnsupportedError && i < candidates.length - 1) {

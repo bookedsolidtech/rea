@@ -599,34 +599,38 @@ export async function runHookCodexReview(options: HookCodexReviewOptions): Promi
   const nonce = crypto.randomBytes(4).toString('hex');
   const rawPath = path.join(tmpRoot, `rea-codex-${headSha.slice(0, 12)}-${nonce}.json`);
   let rawStream: fs.WriteStream | null;
-  try {
-    // mode 0o600: review JSONL contains the unfiltered codex output for
-    // the repo being scanned (file paths, code excerpts, finding text).
-    // On shared workstations / CI runners other local users could read
-    // a default-mode 0644 file. Owner-only is the right floor.
-    rawStream = fs.createWriteStream(rawPath, { flags: 'w', mode: 0o600 });
-    // createWriteStream() does not throw ENOENT/EACCES/ENOSPC
-    // synchronously — it emits an `error` event later. Without a
-    // listener, the unhandled stream error terminates the process. Fall
-    // back to "no raw tee" instead so a logging failure can never crash
-    // the review itself.
-    rawStream.once('error', (err) => {
+  const openRawStream = (): fs.WriteStream | null => {
+    try {
+      // mode 0o600: review JSONL contains the unfiltered codex output for
+      // the repo being scanned (file paths, code excerpts, finding text).
+      // On shared workstations / CI runners other local users could read
+      // a default-mode 0644 file. Owner-only is the right floor.
+      const stream = fs.createWriteStream(rawPath, { flags: 'w', mode: 0o600 });
+      // createWriteStream() does not throw ENOENT/EACCES/ENOSPC
+      // synchronously — it emits an `error` event later. Without a
+      // listener, the unhandled stream error terminates the process. Fall
+      // back to "no raw tee" instead so a logging failure can never crash
+      // the review itself.
+      stream.once('error', (err) => {
+        process.stderr.write(
+          `rea hook codex-review: raw-stdout sink at ${rawPath} failed: ${err.message}\n`,
+        );
+        rawStream = null;
+      });
+      return stream;
+    } catch (e) {
+      // Synchronous failures (rare — usually invalid path shape) fall
+      // through the same way: the audit entry still gets written, we
+      // just lose the raw JSON tee.
       process.stderr.write(
-        `rea hook codex-review: raw-stdout sink at ${rawPath} failed: ${err.message}\n`,
+        `rea hook codex-review: could not open raw-stdout sink at ${rawPath}: ${
+          e instanceof Error ? e.message : String(e)
+        }\n`,
       );
-      rawStream = null;
-    });
-  } catch (e) {
-    // Synchronous failures (rare — usually invalid path shape) fall
-    // through the same way: the audit entry still gets written, we
-    // just lose the raw JSON tee.
-    process.stderr.write(
-      `rea hook codex-review: could not open raw-stdout sink at ${rawPath}: ${
-        e instanceof Error ? e.message : String(e)
-      }\n`,
-    );
-    rawStream = null;
-  }
+      return null;
+    }
+  };
+  rawStream = openRawStream();
 
   // Run codex. The runner enforces iron-gate defaults internally —
   // the model LADDER (gpt-5.5 → gpt-5.4) + high reasoning unless policy
@@ -641,6 +645,7 @@ export async function runHookCodexReview(options: HookCodexReviewOptions): Promi
   // P3), not the ladder top. The success path overwrites with the
   // result's modelUsed.
   let modelUsed = resolved.codex_model ?? IRON_GATE_DEFAULT_MODEL;
+  let attemptCount = 0;
   let codexError: unknown;
   try {
     const result = await runCodexReview({
@@ -654,6 +659,21 @@ export async function runHookCodexReview(options: HookCodexReviewOptions): Promi
         : {}),
       onAttempt: (m) => {
         modelUsed = m;
+        // Review round-3 P3: on a ladder RETRY, reset the raw sink so
+        // `raw_path` holds ONLY the final attempt's stream — a mixed file
+        // (a 5.5 error event followed by the successful 5.4 review) breaks
+        // the "the codex JSON IS the review" contract for consumers.
+        // flags:'w' truncates; the old stream is ended best-effort.
+        if (attemptCount > 0 && rawStream !== null) {
+          const old = rawStream;
+          try {
+            old.end();
+          } catch {
+            /* best-effort */
+          }
+          rawStream = openRawStream();
+        }
+        attemptCount += 1;
       },
       ...(options.spawnImpl !== undefined ? { spawnImpl: options.spawnImpl } : {}),
       ...(rawStream !== null

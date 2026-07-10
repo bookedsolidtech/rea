@@ -392,3 +392,118 @@ describe('runHookCodexReview — output discipline (the contract)', () => {
     expect(audit).toMatch(/"raw_path":".+\.json"/);
   });
 });
+
+describe('runHookCodexReview — model-ladder fallback (0.52.0 round-3 P3)', () => {
+  let dir: string;
+  let rawDir: string;
+  let previousCwd: string;
+  beforeEach(async () => {
+    dir = await setupRepo();
+    rawDir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-hook-codex-raw-')));
+    previousCwd = process.cwd();
+    process.chdir(dir);
+  });
+  afterEach(async () => {
+    process.chdir(previousCwd);
+    await fs.rm(dir, { recursive: true, force: true });
+    await fs.rm(rawDir, { recursive: true, force: true });
+  });
+
+  /** Per-call scripted stdout with the file's deterministic Readable pattern. */
+  function makeScriptedSpawn(
+    scripts: string[],
+    captured: { cmd: string; args: readonly string[] }[],
+  ) {
+    let call = 0;
+    return (cmd: string, args: readonly string[]): ChildProcessWithoutNullStreams => {
+      captured.push({ cmd, args });
+      const child = new EventEmitter() as ChildProcessWithoutNullStreams;
+      const body = scripts[Math.min(call, scripts.length - 1)]!;
+      call += 1;
+      let pushed = false;
+      const stdout = new Readable({
+        read() {
+          if (!pushed) {
+            pushed = true;
+            this.push(Buffer.from(body));
+            this.push(null);
+          }
+        },
+      });
+      const stderr = new Readable({
+        read() {
+          this.push(null);
+        },
+      });
+      child.stdout = stdout as ChildProcessWithoutNullStreams['stdout'];
+      child.stderr = stderr as ChildProcessWithoutNullStreams['stderr'];
+      let exited = false;
+      let stdoutEnded = false;
+      let stderrEnded = false;
+      const maybeClose = (): void => {
+        if (exited && stdoutEnded && stderrEnded) child.emit('close', 0, null);
+      };
+      stdout.on('end', () => {
+        stdoutEnded = true;
+        maybeClose();
+      });
+      stderr.on('end', () => {
+        stderrEnded = true;
+        maybeClose();
+      });
+      queueMicrotask(() => {
+        exited = true;
+        maybeClose();
+      });
+      return child;
+    };
+  }
+
+  it('raw_path holds ONLY the successful fallback attempt; audit records the fallback model', async () => {
+    const unsupported = JSON.stringify({
+      type: 'error',
+      status: 400,
+      error: {
+        type: 'invalid_request_error',
+        message: "The 'gpt-5.5' model is not supported when using Codex with a ChatGPT account.",
+      },
+    });
+    const success = [
+      JSON.stringify({ type: 'thread.started', thread_id: 't' }),
+      JSON.stringify({
+        type: 'item.completed',
+        item: { id: '1', type: 'agent_message', text: 'No findings.' },
+      }),
+      JSON.stringify({ type: 'turn.completed' }),
+    ].join('\n');
+    const captured: { cmd: string; args: readonly string[] }[] = [];
+    const { exitCode } = await runCapturingExit({
+      reaRoot: dir,
+      rawStdoutDir: rawDir,
+      spawnImpl: makeScriptedSpawn([unsupported, success], captured),
+    });
+    expect(exitCode).toBe(0);
+    // Two attempts: ladder top then fallback.
+    expect(captured).toHaveLength(2);
+    expect(captured[0]!.args).toContain('model="gpt-5.5"');
+    expect(captured[1]!.args).toContain('model="gpt-5.4"');
+
+    // The raw tee holds ONLY the final (successful) attempt — no error
+    // event from the failed rung (round-3 P3: mixed attempts break the
+    // "the codex JSON IS the review" raw_path contract).
+    const rawFiles = await fs.readdir(rawDir);
+    expect(rawFiles).toHaveLength(1);
+    const raw = await fs.readFile(path.join(rawDir, rawFiles[0]!), 'utf8');
+    expect(raw).toContain('No findings.');
+    expect(raw).not.toContain('is not supported');
+    expect(raw).not.toContain('"type":"error"');
+
+    // The audit entry records the model that ACTUALLY ran (the fallback).
+    const audit = await fs.readFile(path.join(dir, '.rea', 'audit.jsonl'), 'utf8');
+    const last = JSON.parse(audit.trim().split('\n').pop()!) as {
+      metadata?: { model?: string; verdict?: string };
+    };
+    expect(last.metadata?.model).toBe('gpt-5.4');
+    expect(last.metadata?.verdict).toBe('pass');
+  });
+});
