@@ -545,8 +545,9 @@ export async function runPushGate(deps: PushGateDeps): Promise<GateResult> {
       env,
       // 0.14.0+: pass the resolved policy's model + reasoning overrides so
       // codex spawns with `-c model="<name>" -c model_reasoning_effort="<level>"`.
-      // Defaults (gpt-5.4 + high) are baked into resolvePushGatePolicy so
-      // policies that omit these keys still get the iron-gate defaults.
+      // 0.52.0: an UNSET codex_model stays undefined here ON PURPOSE — the
+      // runner rides IRON_GATE_MODEL_LADDER (gpt-5.5 → gpt-5.4) in that
+      // case. Only an explicit policy pin is passed through.
       ...(policy.codex_model !== undefined ? { model: policy.codex_model } : {}),
       ...(policy.codex_reasoning_effort !== undefined
         ? { reasoningEffort: policy.codex_reasoning_effort }
@@ -633,7 +634,9 @@ export async function runPushGate(deps: PushGateDeps): Promise<GateResult> {
         verdict: summary.verdict,
         finding_count: summary.findings.length,
         reviewed_at: deps.now !== undefined ? deps.now().toISOString() : new Date().toISOString(),
-        model: policy.codex_model ?? IRON_GATE_DEFAULT_MODEL,
+        // 0.52.0: cache the model that ACTUALLY ran (ladder may have fallen
+        // from the newest flagship on this account) — not the assumption.
+        model: codexResult.modelUsed,
         reasoning_effort: policy.codex_reasoning_effort ?? IRON_GATE_DEFAULT_REASONING,
         ttl_ms: policy.cache_ttl_ms,
       };

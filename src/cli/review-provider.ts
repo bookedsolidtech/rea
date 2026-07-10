@@ -143,7 +143,8 @@ async function executeCodexReview(
     headSha,
     contentToken,
     durationSeconds: codexResult.durationSeconds,
-    model: resolved.codex_model ?? IRON_GATE_DEFAULT_MODEL,
+    // 0.52.0: audit the model that ACTUALLY ran (ladder may have fallen).
+    model: codexResult.modelUsed,
     reasoningEffort: resolved.codex_reasoning_effort ?? IRON_GATE_DEFAULT_REASONING,
     findings: summary.findings,
     reviewText: codexResult.reviewText,

@@ -150,7 +150,13 @@ export const PUSH_GATE_DEFAULT_CACHE_TTL_MS = 24 * 60 * 60 * 1_000;
  *
  * Returning a fully-populated object (no `undefined` knobs) means every
  * downstream module can treat the policy as total — no `?? default` dance
- * at each call site.
+ * at each call site. EXCEPTION (0.52.0): `codex_model` stays `undefined`
+ * when the operator did not pin one — materializing the default here would
+ * turn it into an explicit pin and defeat the runner's model LADDER
+ * (`IRON_GATE_MODEL_LADDER`), which must see "unset" to fall from gpt-5.5
+ * to gpt-5.4 on accounts without the newest flagship (codex 0.52.0 review
+ * P1: the ladder never ran in production because this function pinned).
+ * Audit/display consumers use the post-run `CodexRunResult.modelUsed`.
  */
 export async function resolvePushGatePolicy(baseDir: string): Promise<ResolvedReviewPolicy> {
   const policyPath = path.join(baseDir, '.rea', 'policy.yaml');
@@ -161,7 +167,8 @@ export async function resolvePushGatePolicy(baseDir: string): Promise<ResolvedRe
       timeout_ms: PUSH_GATE_DEFAULT_TIMEOUT_MS,
       last_n_commits: undefined,
       auto_narrow_threshold: PUSH_GATE_DEFAULT_AUTO_NARROW_THRESHOLD,
-      codex_model: PUSH_GATE_DEFAULT_CODEX_MODEL,
+      // undefined → the runner rides IRON_GATE_MODEL_LADDER (0.52.0).
+      codex_model: undefined,
       codex_reasoning_effort: PUSH_GATE_DEFAULT_CODEX_REASONING_EFFORT,
       cache_ttl_ms: PUSH_GATE_DEFAULT_CACHE_TTL_MS,
       exclude_paths: [],
@@ -198,7 +205,9 @@ export async function resolvePushGatePolicy(baseDir: string): Promise<ResolvedRe
     timeout_ms: review.timeout_ms ?? PUSH_GATE_DEFAULT_TIMEOUT_MS,
     last_n_commits: review.last_n_commits,
     auto_narrow_threshold: review.auto_narrow_threshold ?? PUSH_GATE_DEFAULT_AUTO_NARROW_THRESHOLD,
-    codex_model: review.codex_model ?? PUSH_GATE_DEFAULT_CODEX_MODEL,
+    // Unset stays undefined → the runner rides IRON_GATE_MODEL_LADDER;
+    // an explicit pin passes through authoritative (0.52.0).
+    codex_model: review.codex_model,
     codex_reasoning_effort:
       review.codex_reasoning_effort ?? PUSH_GATE_DEFAULT_CODEX_REASONING_EFFORT,
     cache_ttl_ms: review.cache_ttl_ms ?? PUSH_GATE_DEFAULT_CACHE_TTL_MS,

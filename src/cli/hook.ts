@@ -629,11 +629,15 @@ export async function runHookCodexReview(options: HookCodexReviewOptions): Promi
   }
 
   // Run codex. The runner enforces iron-gate defaults internally —
-  // gpt-5.4 + high reasoning unless policy overrides — so we pass
-  // policy-resolved values straight through. spawnImpl is forwarded to
-  // the test seam.
+  // the model LADDER (gpt-5.5 → gpt-5.4) + high reasoning unless policy
+  // overrides — so we pass policy-resolved values straight through (an
+  // UNSET codex_model stays undefined so the ladder engages). spawnImpl
+  // is forwarded to the test seam.
   let reviewText = '';
   let durationSeconds = 0;
+  // Pre-run assumption for the ERROR path (no result to read); the
+  // success path overwrites this with the model that ACTUALLY ran.
+  let modelUsed = resolved.codex_model ?? IRON_GATE_DEFAULT_MODEL;
   let codexError: unknown;
   try {
     const result = await runCodexReview({
@@ -668,6 +672,7 @@ export async function runHookCodexReview(options: HookCodexReviewOptions): Promi
     });
     reviewText = result.reviewText;
     durationSeconds = result.durationSeconds;
+    modelUsed = result.modelUsed;
   } catch (e) {
     codexError = e;
   } finally {
@@ -714,7 +719,7 @@ export async function runHookCodexReview(options: HookCodexReviewOptions): Promi
           finding_count: 0,
           verdict: 'error' as CodexVerdict,
           summary: `codex error (${kind}): ${msg}`,
-          model: resolved.codex_model ?? IRON_GATE_DEFAULT_MODEL,
+          model: modelUsed,
           reasoning_effort: resolved.codex_reasoning_effort ?? IRON_GATE_DEFAULT_REASONING,
           raw_path: rawPath,
           duration_seconds: durationSeconds,
@@ -782,7 +787,7 @@ export async function runHookCodexReview(options: HookCodexReviewOptions): Promi
         finding_count: findingCount,
         verdict,
         ...(summaryLine.length > 0 ? { summary: summaryLine } : {}),
-        model: resolved.codex_model ?? IRON_GATE_DEFAULT_MODEL,
+        model: modelUsed,
         reasoning_effort: resolved.codex_reasoning_effort ?? IRON_GATE_DEFAULT_REASONING,
         raw_path: rawPath,
         duration_seconds: durationSeconds,
