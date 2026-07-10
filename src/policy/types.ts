@@ -291,7 +291,7 @@ export interface OpenRouterProviderPolicy {
    * and only against `backend_pin`. The audit record reflects this honestly:
    * `data_policy_requested` (what was asked) + a derived `data_policy_enforced`
    * (`'pin-verified'` only when `served_by ∈ backend_pin`, else
-   * `'routing-requested'`). See `LocalReviewMetadata` and THREAT_MODEL §5.25.
+   * `'routing-requested'`). See `LocalReviewMetadata` and THREAT_MODEL §5.26.
    */
   data_policy?: 'deny-training';
   /**

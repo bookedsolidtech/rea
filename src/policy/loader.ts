@@ -70,7 +70,7 @@ const OpenRouterProviderPolicySchema = z
     // round-4 P1: an unconstrained `https://[^\s]+` let a config point the lane
     // at `https://evil.example/api/v1`, which would receive the full diff +
     // commit log and pass policy load. The security contract (THREAT_MODEL
-    // §5.25) is "openrouter.ai over TLS, plus a NARROW http-loopback test/proxy
+    // §5.26) is "openrouter.ai over TLS, plus a NARROW http-loopback test/proxy
     // exception" — nothing else. The host alternation `(?:[a-z0-9-]+\.)*
     // openrouter\.ai` is anchored so `openrouter.ai.evil.com` and
     // `evilopenrouter.ai` are rejected.
