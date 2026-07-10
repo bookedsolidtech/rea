@@ -598,39 +598,20 @@ export async function runHookCodexReview(options: HookCodexReviewOptions): Promi
   const tmpRoot = options.rawStdoutDir ?? os.tmpdir();
   const nonce = crypto.randomBytes(4).toString('hex');
   const rawPath = path.join(tmpRoot, `rea-codex-${headSha.slice(0, 12)}-${nonce}.json`);
-  let rawStream: fs.WriteStream | null;
-  const openRawStream = (): fs.WriteStream | null => {
-    try {
-      // mode 0o600: review JSONL contains the unfiltered codex output for
-      // the repo being scanned (file paths, code excerpts, finding text).
-      // On shared workstations / CI runners other local users could read
-      // a default-mode 0644 file. Owner-only is the right floor.
-      const stream = fs.createWriteStream(rawPath, { flags: 'w', mode: 0o600 });
-      // createWriteStream() does not throw ENOENT/EACCES/ENOSPC
-      // synchronously — it emits an `error` event later. Without a
-      // listener, the unhandled stream error terminates the process. Fall
-      // back to "no raw tee" instead so a logging failure can never crash
-      // the review itself.
-      stream.once('error', (err) => {
-        process.stderr.write(
-          `rea hook codex-review: raw-stdout sink at ${rawPath} failed: ${err.message}\n`,
-        );
-        rawStream = null;
-      });
-      return stream;
-    } catch (e) {
-      // Synchronous failures (rare — usually invalid path shape) fall
-      // through the same way: the audit entry still gets written, we
-      // just lose the raw JSON tee.
-      process.stderr.write(
-        `rea hook codex-review: could not open raw-stdout sink at ${rawPath}: ${
-          e instanceof Error ? e.message : String(e)
-        }\n`,
-      );
-      return null;
-    }
-  };
-  rawStream = openRawStream();
+  // 0.52.0 round-4 P2: the raw tee is BUFFERED per attempt and written to
+  // disk ONCE in the finally block. The prior per-attempt WriteStream
+  // truncate-and-reopen was racy: the old stream's late flush could
+  // interleave the failed rung's JSON back into the file, and its late
+  // 'error' listener could null the healthy replacement. Buffering
+  // per-attempt removes every stream-lifecycle hazard: onAttempt resets
+  // the buffer, so what lands on disk is EXACTLY the final attempt.
+  // Memory is capped; past the cap further chunks are dropped with a
+  // stderr note (the tee is observability — it must never affect the
+  // verdict, and a partial raw file is better than an interleaved one).
+  const RAW_TEE_MAX_BYTES = 64 * 1024 * 1024;
+  let rawChunks: Buffer[] = [];
+  let rawBytes = 0;
+  let rawTruncated = false;
 
   // Run codex. The runner enforces iron-gate defaults internally —
   // the model LADDER (gpt-5.5 → gpt-5.4) + high reasoning unless policy
@@ -645,7 +626,6 @@ export async function runHookCodexReview(options: HookCodexReviewOptions): Promi
   // P3), not the ladder top. The success path overwrites with the
   // result's modelUsed.
   let modelUsed = resolved.codex_model ?? IRON_GATE_DEFAULT_MODEL;
-  let attemptCount = 0;
   let codexError: unknown;
   try {
     const result = await runCodexReview({
@@ -659,42 +639,27 @@ export async function runHookCodexReview(options: HookCodexReviewOptions): Promi
         : {}),
       onAttempt: (m) => {
         modelUsed = m;
-        // Review round-3 P3: on a ladder RETRY, reset the raw sink so
-        // `raw_path` holds ONLY the final attempt's stream — a mixed file
-        // (a 5.5 error event followed by the successful 5.4 review) breaks
-        // the "the codex JSON IS the review" contract for consumers.
-        // flags:'w' truncates; the old stream is ended best-effort.
-        if (attemptCount > 0 && rawStream !== null) {
-          const old = rawStream;
-          try {
-            old.end();
-          } catch {
-            /* best-effort */
-          }
-          rawStream = openRawStream();
-        }
-        attemptCount += 1;
+        // Round-3 P3 / round-4 P2: each attempt starts with a FRESH raw
+        // buffer, so `raw_path` holds ONLY the final attempt — a mixed
+        // file (a 5.5 error event followed by the successful 5.4 review)
+        // breaks the "the codex JSON IS the review" contract.
+        rawChunks = [];
+        rawBytes = 0;
+        rawTruncated = false;
       },
       ...(options.spawnImpl !== undefined ? { spawnImpl: options.spawnImpl } : {}),
-      ...(rawStream !== null
-        ? {
-            rawStdoutSink: (chunk: Buffer): void => {
-              // Defensive: swallow any write error (closed/destroyed
-              // stream, EBADF, ENOSPC). The codex-runner already
-              // wraps sink calls in try/catch so a sink failure must
-              // never change the verdict — but throwing inside the
-              // 'data' handler also triggers an uncaughtException via
-              // the readable stream. Catch it here so it stays local.
-              try {
-                if (!rawStream!.writableEnded && !rawStream!.destroyed) {
-                  rawStream!.write(chunk);
-                }
-              } catch {
-                /* sink failure is non-fatal */
-              }
-            },
-          }
-        : {}),
+      rawStdoutSink: (chunk: Buffer): void => {
+        // Buffered tee — no stream lifecycle to race. Capped so a
+        // pathological stream cannot exhaust memory; overflow drops
+        // further chunks (partial > interleaved; the tee never affects
+        // the verdict).
+        if (rawBytes + chunk.length > RAW_TEE_MAX_BYTES) {
+          rawTruncated = true;
+          return;
+        }
+        rawChunks.push(chunk);
+        rawBytes += chunk.length;
+      },
     });
     reviewText = result.reviewText;
     durationSeconds = result.durationSeconds;
@@ -702,16 +667,24 @@ export async function runHookCodexReview(options: HookCodexReviewOptions): Promi
   } catch (e) {
     codexError = e;
   } finally {
-    if (rawStream !== null) {
-      // End the stream — best-effort. The file is on disk either way,
-      // and the OS flushes pending writes when the FD closes.
-      try {
-        await new Promise<void>((resolve) => {
-          rawStream!.end(() => resolve());
-        });
-      } catch {
-        /* swallow */
+    // Single write-at-end. mode 0o600: review JSONL contains the
+    // unfiltered codex output for the repo being scanned (file paths,
+    // code excerpts, finding text) — owner-only is the right floor on
+    // shared workstations / CI runners. A write failure loses only the
+    // tee, never the verdict or the audit entry.
+    try {
+      fs.writeFileSync(rawPath, Buffer.concat(rawChunks), { mode: 0o600 });
+      if (rawTruncated) {
+        process.stderr.write(
+          `rea hook codex-review: raw tee at ${rawPath} truncated at ${RAW_TEE_MAX_BYTES} bytes\n`,
+        );
       }
+    } catch (e) {
+      process.stderr.write(
+        `rea hook codex-review: could not write raw-stdout tee at ${rawPath}: ${
+          e instanceof Error ? e.message : String(e)
+        }\n`,
+      );
     }
   }
 

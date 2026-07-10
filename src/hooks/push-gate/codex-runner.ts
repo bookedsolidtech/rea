@@ -338,11 +338,55 @@ export async function runCodexReview(options: CodexRunOptions): Promise<CodexRun
   const explicitModel =
     options.model !== undefined && options.model.length > 0 ? options.model : undefined;
   const candidates = explicitModel !== undefined ? [explicitModel] : [...IRON_GATE_MODEL_LADDER];
+
+  // 0.16.3 helix-016.1 #1 fix: pre-flight probe for the codex CLI before
+  // we hand control to the long-running review subprocess. The original
+  // try/catch around `spawner(...)` only caught synchronous ENOENT; on
+  // some platforms (Linux child_process under certain shell configs)
+  // the missing-binary error arrives as a `'error'` event AFTER spawn
+  // has returned a child handle, and on others codex CLI is present
+  // but a wrapper script exits non-zero before any JSONL emerges. Both
+  // shapes leak through the existing classify path as `subprocess` /
+  // `protocol` errors with stack-frame-shaped messages instead of the
+  // friendly install hint defined on `CodexNotInstalledError`.
+  //
+  // The probe runs `codex --version` synchronously with a 2-second cap
+  // (cheap; codex --version returns in <50ms when the binary exists).
+  // 0.52.0 round-4 P3: it runs ONCE PER REVIEW here — not per ladder
+  // rung — both because its answer cannot change between rungs and so
+  // the per-rung timeout budget below is not silently eroded by up to
+  // 2s per attempt. The probe is deliberately OUTSIDE the timeout cap
+  // (bounded at 2s, once); `timeoutMs` covers the review subprocess.
+  //
+  // The probe is skipped when `spawnImpl` is provided so unit tests
+  // continue to control the entire spawn surface deterministically.
+  if (options.spawnImpl === undefined) {
+    const probe = spawnSync('codex', ['--version'], {
+      cwd: options.cwd,
+      env: options.env ?? process.env,
+      timeout: 2000,
+      encoding: 'utf8',
+    });
+    // `error` is set when the OS could not start the binary at all
+    // (ENOENT, EACCES, ENOTDIR). Codex returning a non-zero status
+    // because of a downstream issue is NOT the same condition — let
+    // it fall through to the main run where the existing classifier
+    // produces a meaningful subprocess error.
+    if (probe.error !== undefined) {
+      const code = (probe.error as NodeJS.ErrnoException).code;
+      if (code === 'ENOENT') throw new CodexNotInstalledError();
+      // EACCES on the codex binary is operationally identical to "not
+      // installed" for the user — they need to install or fix perms.
+      if (code === 'EACCES') throw new CodexNotInstalledError();
+      throw probe.error;
+    }
+  }
+
   // Review round-3 P2: `timeoutMs` is a TOTAL wall-clock cap for the whole
   // review, not per-rung. Each attempt gets the REMAINING budget, so a
   // fallback account can never block for ladder-length × timeout. (In
   // practice an unsupported rung fails in ~2s, so the fallback rung sees
-  // nearly the full budget.)
+  // nearly the full budget.) The deadline starts AFTER the one-time probe.
   const deadline = Date.now() + options.timeoutMs;
   let lastErr: unknown;
   for (let i = 0; i < candidates.length; i += 1) {
@@ -418,50 +462,6 @@ async function runCodexReviewOnce(
     options.prompt !== undefined && options.prompt.length > 0
       ? [...baseArgs, options.prompt]
       : baseArgs;
-
-  // 0.16.3 helix-016.1 #1 fix: pre-flight probe for the codex CLI before
-  // we hand control to the long-running review subprocess. The original
-  // try/catch around `spawner(...)` only caught synchronous ENOENT; on
-  // some platforms (Linux child_process under certain shell configs)
-  // the missing-binary error arrives as a `'error'` event AFTER spawn
-  // has returned a child handle, and on others codex CLI is present
-  // but a wrapper script exits non-zero before any JSONL emerges. Both
-  // shapes leak through the existing classify path as `subprocess` /
-  // `protocol` errors with stack-frame-shaped messages instead of the
-  // friendly install hint defined on `CodexNotInstalledError`.
-  //
-  // The probe runs `codex --version` synchronously with a 2-second cap
-  // (cheap; codex --version returns in <50ms when the binary exists).
-  // If the binary is absent OR the probe exits non-zero AND the error
-  // is ENOENT-class, we throw `CodexNotInstalledError` directly so
-  // `index.ts:561` formats it as the headline `PUSH BLOCKED:` line.
-  // We deliberately do NOT use the probe for binaries that exist but
-  // fail their version check — those are real subprocess errors and
-  // belong in the existing classify path.
-  //
-  // The probe is skipped when `spawnImpl` is provided so unit tests
-  // continue to control the entire spawn surface deterministically.
-  if (options.spawnImpl === undefined) {
-    const probe = spawnSync('codex', ['--version'], {
-      cwd: options.cwd,
-      env: options.env ?? process.env,
-      timeout: 2000,
-      encoding: 'utf8',
-    });
-    // `error` is set when the OS could not start the binary at all
-    // (ENOENT, EACCES, ENOTDIR). Codex returning a non-zero status
-    // because of a downstream issue is NOT the same condition — let
-    // it fall through to the main run where the existing classifier
-    // produces a meaningful subprocess error.
-    if (probe.error !== undefined) {
-      const code = (probe.error as NodeJS.ErrnoException).code;
-      if (code === 'ENOENT') throw new CodexNotInstalledError();
-      // EACCES on the codex binary is operationally identical to "not
-      // installed" for the user — they need to install or fix perms.
-      if (code === 'EACCES') throw new CodexNotInstalledError();
-      throw probe.error;
-    }
-  }
 
   let child: ChildProcessWithoutNullStreams;
   try {
