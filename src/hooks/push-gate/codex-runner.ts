@@ -27,16 +27,34 @@ import type { ChildProcessWithoutNullStreams } from 'node:child_process';
 // ---------------------------------------------------------------------------
 
 /**
- * Default codex model when policy doesn't pin one. Always passed via
- * `-c model="<name>"` so codex's own default (`codex-auto-review` at
- * medium reasoning) is unreachable through the rea push-gate.
+ * Model preference LADDER for the default (no policy pin) case — newest
+ * first. 0.52.0: when policy does not pin `codex_model`, the runner tries
+ * ladder entries in order and falls to the next on a "model is not
+ * supported" error event, so an install automatically rides the newest
+ * codex flagship its account can use instead of going stale on a
+ * hardcode (the "one team still on 5.4" problem — a machine with 5.5
+ * access was stuck on 5.4 purely because rea pinned it). An EXPLICIT
+ * `policy.review.codex_model` is never substituted — the operator chose;
+ * an unsupported explicit pin fails loudly with remediation (and can
+ * never silently pass; see CodexModelUnsupportedError).
+ *
+ * Bump here (prepend the new flagship) to bump everywhere.
+ */
+export const IRON_GATE_MODEL_LADDER: readonly string[] = ['gpt-5.5', 'gpt-5.4'];
+
+/**
+ * Default codex model when policy doesn't pin one — the TOP of the
+ * ladder. Always passed via `-c model="<name>"` so codex's own default
+ * (`codex-auto-review` at medium reasoning) is unreachable through the
+ * rea push-gate.
  *
  * 0.19.0 code-reviewer P3-4: exported as a single source of truth.
  * `src/hooks/push-gate/index.ts` imports this for the verdict-cache
  * write so the cached `model` field reflects the same constant the
- * runner actually used. Bump here to bump everywhere.
+ * runner actually used. NOTE (0.52.0): with the ladder, the model a run
+ * ACTUALLY used is `CodexRunResult.modelUsed` — prefer it post-run.
  */
-export const IRON_GATE_DEFAULT_MODEL = 'gpt-5.4';
+export const IRON_GATE_DEFAULT_MODEL = IRON_GATE_MODEL_LADDER[0]!;
 
 /**
  * Default reasoning effort when policy doesn't pin one. `high` for
@@ -100,11 +118,38 @@ export class CodexSubprocessError extends Error {
   }
 }
 
+/**
+ * 0.52.0 — codex accepted the run (exit 0!) but streamed an error event
+ * saying the requested MODEL is not supported for this account, and
+ * produced no review text. Pre-0.52.0 this was the WORST failure shape in
+ * the gate: exit 0 + parseable events + no agent_message → empty
+ * reviewText → zero findings → verdict 'pass'. A one-character typo in
+ * `policy.review.codex_model` (or codex retiring an old model) silently
+ * turned every review into a rubber stamp. Now it is a typed, loud
+ * failure; for the DEFAULT (no policy pin) case the runner falls to the
+ * next `IRON_GATE_MODEL_LADDER` entry instead.
+ */
+export class CodexModelUnsupportedError extends Error {
+  readonly kind = 'model-unsupported' as const;
+  constructor(
+    public readonly model: string,
+    public readonly detail: string,
+  ) {
+    super(
+      `codex does not support model "${model}" for this account: ${detail.slice(0, 300)} — ` +
+        `update policy.review.codex_model in .rea/policy.yaml (or remove it to ride rea's ` +
+        `model ladder: ${IRON_GATE_MODEL_LADDER.join(' → ')}).`,
+    );
+    this.name = 'CodexModelUnsupportedError';
+  }
+}
+
 export type CodexRunError =
   | CodexNotInstalledError
   | CodexTimeoutError
   | CodexProtocolError
-  | CodexSubprocessError;
+  | CodexSubprocessError
+  | CodexModelUnsupportedError;
 
 // ---------------------------------------------------------------------------
 // Git executor — narrow injection surface for base resolution + HEAD probe.
@@ -248,6 +293,20 @@ export interface CodexRunResult {
   eventCount: number;
   /** Seconds of wall time spent in the subprocess. */
   durationSeconds: number;
+  /**
+   * 0.52.0 — the model the run ACTUALLY used. Equals the explicit
+   * `options.model` when pinned; in the default case it is whichever
+   * `IRON_GATE_MODEL_LADDER` entry succeeded (which may not be the top,
+   * if the account lacks the newest flagship). Callers should audit THIS,
+   * not the pre-run assumption.
+   */
+  modelUsed: string;
+  /**
+   * 0.52.0 — true when the default-model run fell past at least one
+   * ladder entry (e.g. account has no gpt-5.5 → ran gpt-5.4). Surfaced
+   * so operators can see they're not on the newest flagship.
+   */
+  modelFellBack: boolean;
 }
 
 /**
@@ -259,12 +318,45 @@ export interface CodexRunResult {
  * catch and translate to an exit code + audit event.
  */
 export async function runCodexReview(options: CodexRunOptions): Promise<CodexRunResult> {
+  // 0.52.0 model ladder. An EXPLICIT policy pin is authoritative — one
+  // candidate, no substitution (an unsupported pin throws
+  // CodexModelUnsupportedError with remediation). The DEFAULT case walks
+  // IRON_GATE_MODEL_LADDER newest-first, falling to the next entry ONLY on
+  // the model-unsupported signature — every other failure (timeout,
+  // protocol, subprocess) propagates immediately, unchanged. An
+  // unsupported-model attempt fails in ~2s with no review compute, so the
+  // fallback costs nothing when the account has the newest flagship.
+  const explicitModel =
+    options.model !== undefined && options.model.length > 0 ? options.model : undefined;
+  const candidates = explicitModel !== undefined ? [explicitModel] : [...IRON_GATE_MODEL_LADDER];
+  let lastErr: unknown;
+  for (let i = 0; i < candidates.length; i += 1) {
+    try {
+      const result = await runCodexReviewOnce(options, candidates[i]!);
+      return { ...result, modelFellBack: i > 0 };
+    } catch (e) {
+      if (e instanceof CodexModelUnsupportedError && i < candidates.length - 1) {
+        lastErr = e;
+        continue; // default-case ladder: try the next (older) flagship
+      }
+      throw e;
+    }
+  }
+  // Unreachable (the last candidate either returned or threw), but keep
+  // the compiler + a paranoid future refactor honest.
+  throw lastErr instanceof Error ? lastErr : new Error('codex model ladder exhausted');
+}
+
+async function runCodexReviewOnce(
+  options: CodexRunOptions,
+  effectiveModel: string,
+): Promise<Omit<CodexRunResult, 'modelFellBack'>> {
   const spawner = options.spawnImpl ?? spawn;
   // 0.18.0 iron-gate runtime default: ALWAYS pass model + reasoning
   // effort to codex. Pre-fix, undefined options fell back to codex's
   // own default (`codex-auto-review` at medium reasoning), which
   // bypassed the iron-gate intent and let weaker reviews ship. Now
-  // the runtime hardcodes `gpt-5.4` + `high` as the floor; policy
+  // the runtime hardcodes the ladder top + `high` as the floor; policy
   // can OVERRIDE to a different model/effort but cannot opt out into
   // codex's defaults (config.toml or otherwise). The user's directive
   // — "we want codex to be using its BEST. EVERY TIME" — is enforced
@@ -273,12 +365,8 @@ export async function runCodexReview(options: CodexRunOptions): Promise<CodexRun
   // Model + reasoning overrides go BEFORE the `exec` subcommand because
   // `-c key=value` is a top-level codex CLI flag, not an `exec` flag.
   // Codex's TOML parser interprets the value, so we wrap strings in TOML
-  // quotes — `-c model="gpt-5.4"` not `-c model=gpt-5.4` — to ensure the
+  // quotes — `-c model="gpt-5.5"` not `-c model=gpt-5.5` — to ensure the
   // value lands as a string regardless of upstream parsing changes.
-  const effectiveModel =
-    options.model !== undefined && options.model.length > 0
-      ? options.model
-      : IRON_GATE_DEFAULT_MODEL;
   const effectiveReasoning = options.reasoningEffort ?? IRON_GATE_DEFAULT_REASONING;
   const overrideArgs: string[] = [
     '-c',
@@ -416,8 +504,28 @@ export async function runCodexReview(options: CodexRunOptions): Promise<CodexRun
   }
 
   const stdout = Buffer.concat(stdoutChunks).toString('utf8');
-  const { reviewText, eventCount } = parseCodexJsonl(stdout);
-  return { reviewText, eventCount, durationSeconds };
+  const { reviewText, eventCount, errorMessages } = parseCodexJsonl(stdout);
+
+  // 0.52.0 SILENT-PASS fix. codex exits 0 even when the run FAILED via a
+  // streamed `{"type":"error",...}` event (e.g. unsupported model:
+  // status 400 invalid_request_error, still exit 0). Pre-fix that shape
+  // sailed through: parseable events, no agent_message, empty reviewText,
+  // zero findings → verdict 'pass'. A review that ERRORED must never
+  // pass. When the stream carried error events AND produced no review
+  // text, classify: model-unsupported (typed, drives the ladder) vs.
+  // generic protocol failure. Error events ALONGSIDE real review text are
+  // tolerated (transient warnings; the review completed).
+  if (reviewText.length === 0 && errorMessages.length > 0) {
+    const joined = errorMessages.join('; ');
+    if (/model.{0,40}(is )?not supported|unsupported model|unknown model/i.test(joined)) {
+      throw new CodexModelUnsupportedError(effectiveModel, joined);
+    }
+    throw new CodexProtocolError(
+      `codex streamed ${errorMessages.length} error event(s) and no review text: ${joined.slice(0, 400)}`,
+    );
+  }
+
+  return { reviewText, eventCount, durationSeconds, modelUsed: effectiveModel };
 }
 
 // ---------------------------------------------------------------------------
@@ -438,6 +546,14 @@ interface CodexEvent {
 export interface CodexJsonlParseResult {
   reviewText: string;
   eventCount: number;
+  /**
+   * 0.52.0 — messages from streamed `{"type":"error",...}` events. codex
+   * exits 0 even on failed runs (e.g. unsupported model → 400 error event
+   * + exit 0), so error events are the ONLY reliable failure signal for
+   * this class. The runner refuses to return an empty-review result when
+   * any are present (silent-pass fix).
+   */
+  errorMessages: string[];
 }
 
 /**
@@ -466,6 +582,7 @@ export function parseCodexJsonl(stdout: string): CodexJsonlParseResult {
   let reviewText = '';
   let eventCount = 0;
   let parsedAny = false;
+  const errorMessages: string[] = [];
   for (const line of lines) {
     let evt: CodexEvent;
     try {
@@ -484,11 +601,27 @@ export function parseCodexJsonl(stdout: string): CodexJsonlParseResult {
     ) {
       reviewText = reviewText.length > 0 ? `${reviewText}\n\n${evt.item.text}` : evt.item.text;
     }
+    // 0.52.0 — collect `error` events. codex exits 0 even when the run
+    // failed via a streamed error (observed shape:
+    // {"type":"error","status":400,"error":{"type":"invalid_request_error",
+    //  "message":"The 'X' model is not supported…"}}; a flat
+    // {"type":"error","message":"…"} variant is handled too). The caller
+    // uses these to refuse a silent pass on an errored, review-less run.
+    if (evt.type === 'error') {
+      const nested = (evt as { error?: { message?: unknown } }).error;
+      const msg =
+        nested !== undefined && typeof nested.message === 'string'
+          ? nested.message
+          : typeof (evt as { message?: unknown }).message === 'string'
+            ? ((evt as { message?: unknown }).message as string)
+            : line.slice(0, 200);
+      errorMessages.push(msg);
+    }
   }
   if (!parsedAny && lines.length > 0) {
     throw new CodexProtocolError('no parseable JSONL events in stdout', lines[0]);
   }
-  return { reviewText, eventCount };
+  return { reviewText, eventCount, errorMessages };
 }
 
 function isEnoent(e: unknown): boolean {

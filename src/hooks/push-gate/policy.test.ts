@@ -56,12 +56,14 @@ describe('resolvePushGatePolicy', () => {
     });
   });
 
-  it('PUSH_GATE_DEFAULT_CODEX_MODEL is the flagship gpt-5.4 (iron-gate default, 0.14.0+)', () => {
+  it('PUSH_GATE_DEFAULT_CODEX_MODEL is the newest flagship (iron-gate default, 0.52.0 ladder top)', () => {
     // The plain `codex exec review` form falls through to codex-auto-review
-    // (a special-purpose lower-reasoning model). The 0.14.0 iron-gate
-    // posture pins the flagship by default — verdict consistency over
-    // per-push compute cost.
-    expect(PUSH_GATE_DEFAULT_CODEX_MODEL).toBe('gpt-5.4');
+    // (a special-purpose lower-reasoning model). The iron-gate posture pins
+    // the flagship by default — verdict consistency over per-push compute
+    // cost. 0.52.0: the flagship is the model-LADDER top (gpt-5.5, falling
+    // to gpt-5.4 on accounts without it); the codex-runner parity test pins
+    // PUSH_GATE_DEFAULT_CODEX_MODEL === IRON_GATE_MODEL_LADDER[0].
+    expect(PUSH_GATE_DEFAULT_CODEX_MODEL).toBe('gpt-5.5');
   });
 
   it('PUSH_GATE_DEFAULT_CODEX_REASONING_EFFORT is high (iron-gate default, 0.14.0+)', () => {

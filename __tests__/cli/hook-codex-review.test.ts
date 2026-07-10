@@ -211,7 +211,8 @@ describe('runHookCodexReview — pass verdict (no findings)', () => {
     const execIdx = args.indexOf('exec');
     const lastDashC = args.lastIndexOf('-c');
     expect(execIdx).toBeGreaterThan(lastDashC);
-    expect(args).toContain('model="gpt-5.4"');
+    // 0.52.0: the iron-gate default is the model-ladder top (gpt-5.5).
+    expect(args).toContain('model="gpt-5.5"');
     expect(args).toContain('model_reasoning_effort="high"');
     expect(args).toContain('--json');
     expect(args).toContain('--ephemeral');

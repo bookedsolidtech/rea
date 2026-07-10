@@ -136,14 +136,15 @@ export interface ReviewPolicy {
   auto_narrow_threshold?: number;
   /**
    * Codex CLI model override (0.13.4+). Pinned via `-c model="<name>"` on
-   * every `codex exec review` invocation. When unset, codex's own default
-   * applies — which today is the special-purpose `codex-auto-review` model
-   * at medium reasoning, NOT the flagship.
+   * every `codex exec review` invocation. When unset (0.52.0), the runtime
+   * rides the model LADDER (`IRON_GATE_MODEL_LADDER`: gpt-5.5 → gpt-5.4,
+   * newest-first with automatic fallback for accounts lacking the newest
+   * flagship) — never codex's own `codex-auto-review` default.
    *
-   * Recommended for serious adversarial review: `gpt-5.4` paired with
-   * `codex_reasoning_effort: high`. Higher reasoning trades push-gate
-   * latency for verdict consistency — fewer same-code-different-verdict
-   * round-trips like the 2026-04-26 helixir migration session.
+   * RECOMMENDATION: leave UNSET and ride the ladder so installs stay on
+   * the newest flagship automatically. An explicit pin is authoritative
+   * (no ladder substitution) and an unsupported pin fails loudly — never
+   * a silent pass (CodexModelUnsupportedError).
    *
    * Loose string type — codex's model catalog evolves. Codex itself
    * validates the model name at exec time; an unknown name surfaces as
@@ -153,8 +154,8 @@ export interface ReviewPolicy {
   /**
    * Codex reasoning effort (0.13.4+). Pinned via
    * `-c model_reasoning_effort="<level>"` on every invocation. Only
-   * meaningful when paired with a reasoning-capable model (gpt-5.4,
-   * gpt-5.3-codex). Codex's own default is `medium`.
+   * meaningful when paired with a reasoning-capable model (gpt-5.5,
+   * gpt-5.4). Codex's own default is `medium`.
    *
    * Recommended: `high` for serious review on long-running branches
    * (more compute spent per finding, fewer flips). `low` for

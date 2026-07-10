@@ -37,6 +37,7 @@ import { resolveBaseRef, type BaseResolution } from './base.js';
 import {
   createRealGitExecutor,
   runCodexReview,
+  CodexModelUnsupportedError,
   CodexNotInstalledError,
   CodexProtocolError,
   CodexSubprocessError,
@@ -748,6 +749,8 @@ function classifyCodexError(e: unknown): {
 } {
   if (e instanceof CodexNotInstalledError) return { kind: 'not-installed', message: e.message };
   if (e instanceof CodexTimeoutError) return { kind: 'timeout', message: e.message };
+  if (e instanceof CodexModelUnsupportedError)
+    return { kind: 'model-unsupported', message: e.message };
   if (e instanceof CodexProtocolError) return { kind: 'protocol', message: e.message };
   if (e instanceof CodexSubprocessError) return { kind: 'subprocess', message: e.message };
   if (e instanceof Error) return { kind: 'unknown', message: e.message };

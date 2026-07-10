@@ -74,6 +74,7 @@ import {
   type CompiledSecretPattern,
 } from '../gateway/middleware/redact.js';
 import {
+  CodexModelUnsupportedError,
   CodexNotInstalledError,
   CodexProtocolError,
   CodexSubprocessError,
@@ -693,11 +694,13 @@ export async function runHookCodexReview(options: HookCodexReviewOptions): Promi
         ? 'not-installed'
         : codexError instanceof CodexTimeoutError
           ? 'timeout'
-          : codexError instanceof CodexProtocolError
-            ? 'protocol'
-            : codexError instanceof CodexSubprocessError
-              ? 'subprocess'
-              : 'unknown';
+          : codexError instanceof CodexModelUnsupportedError
+            ? 'model-unsupported'
+            : codexError instanceof CodexProtocolError
+              ? 'protocol'
+              : codexError instanceof CodexSubprocessError
+                ? 'subprocess'
+                : 'unknown';
     let auditHash = '';
     try {
       const record = await appendAuditRecord(baseDir, {

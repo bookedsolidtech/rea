@@ -105,18 +105,23 @@ export const PUSH_GATE_DEFAULT_AUTO_NARROW_THRESHOLD = 30;
  */
 export const PUSH_GATE_DEFAULT_LAST_N_COMMITS_FALLBACK = 10;
 /**
- * Default codex model for the push-gate (0.14.0+). Pinned to the flagship
- * (`gpt-5.4`) instead of falling through to codex's own default of
+ * Default codex model for the push-gate (0.14.0+). Pinned to the newest
+ * flagship instead of falling through to codex's own default of
  * `codex-auto-review` (a lower-reasoning special-purpose model). Verdict
  * stability matters more than per-push compute cost for adversarial
  * review of consumer codebases — the helixir 2026-04-26 thrashing came
  * from the lower-reasoning default.
  *
+ * 0.52.0: MUST stay in sync with `IRON_GATE_MODEL_LADDER[0]` in
+ * `codex-runner.ts` (a parity test enforces it). The runner rides the
+ * ladder in the default case, so an account without the newest flagship
+ * automatically falls to the next entry instead of failing.
+ *
  * Override via `policy.review.codex_model: <name>` in `.rea/policy.yaml`
  * for cost-bounded environments. `codex-auto-review` is the explicit
  * opt-in to the prior 0.13.x behavior.
  */
-export const PUSH_GATE_DEFAULT_CODEX_MODEL = 'gpt-5.4';
+export const PUSH_GATE_DEFAULT_CODEX_MODEL = 'gpt-5.5';
 /**
  * Default codex reasoning effort (0.14.0+). Pinned to `high` for maximum
  * compute per finding — fewer same-code-different-verdict round-trips.

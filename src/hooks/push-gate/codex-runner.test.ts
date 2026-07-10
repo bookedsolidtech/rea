@@ -2,11 +2,15 @@ import { EventEmitter } from 'node:events';
 import { Readable } from 'node:stream';
 import { describe, expect, it } from 'vitest';
 import {
+  CodexModelUnsupportedError,
   CodexNotInstalledError,
   CodexProtocolError,
+  IRON_GATE_DEFAULT_MODEL,
+  IRON_GATE_MODEL_LADDER,
   parseCodexJsonl,
   runCodexReview,
 } from './codex-runner.js';
+import { PUSH_GATE_DEFAULT_CODEX_MODEL } from './policy.js';
 import type { ChildProcessWithoutNullStreams } from 'node:child_process';
 
 describe('parseCodexJsonl', () => {
@@ -184,7 +188,7 @@ describe('runCodexReview — model + reasoning_effort plumbing (0.14.0)', () => 
     expect(execIdx).toBeGreaterThan(lastDashC);
   });
 
-  it('0.18.0 iron-gate: passes gpt-5.4 + high as runtime defaults when options unset (no codex-default fallback)', async () => {
+  it('0.18.0 iron-gate: passes the ladder-top model + high as runtime defaults when options unset (no codex-default fallback)', async () => {
     const captured: { cmd: string; args: readonly string[] }[] = [];
     await runCodexReview({
       baseRef: 'origin/main',
@@ -193,9 +197,11 @@ describe('runCodexReview — model + reasoning_effort plumbing (0.14.0)', () => 
       spawnImpl: makeFakeSpawn(captured),
     });
     const { args } = captured[0]!;
-    // Runtime hardcodes gpt-5.4 + high regardless of options.
+    // Runtime hardcodes the ladder top + high regardless of options
+    // (0.52.0: the default model is IRON_GATE_MODEL_LADDER[0], not a
+    // literal — the ladder is the single source of truth).
     expect(args.filter((a) => a === '-c')).toHaveLength(2);
-    expect(args).toContain('model="gpt-5.4"');
+    expect(args).toContain(`model="${IRON_GATE_MODEL_LADDER[0]}"`);
     expect(args).toContain('model_reasoning_effort="high"');
     // Overrides land BEFORE the exec subcommand.
     const lastDashC = args.lastIndexOf('-c');
@@ -274,5 +280,221 @@ describe('runCodexReview — model + reasoning_effort plumbing (0.14.0)', () => 
       '--json',
       '--ephemeral',
     ]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 0.52.0 — silent-pass fix (error events) + model ladder
+// ---------------------------------------------------------------------------
+
+/** The observed codex error-event shape for an unsupported model (exit 0!). */
+function modelUnsupportedLine(model: string): string {
+  return JSON.stringify({
+    type: 'error',
+    status: 400,
+    error: {
+      type: 'invalid_request_error',
+      message: `The '${model}' model is not supported when using Codex with a ChatGPT account.`,
+    },
+  });
+}
+
+/**
+ * Scripted spawn: each call pops the next stdout script entry and exits 0.
+ * Lets ladder tests fail attempt 1 (error event) and succeed attempt 2.
+ */
+function makeScriptedSpawn(
+  scripts: string[],
+  captured: { cmd: string; args: readonly string[] }[],
+) {
+  let call = 0;
+  return (cmd: string, args: readonly string[]): ChildProcessWithoutNullStreams => {
+    captured.push({ cmd, args });
+    const stdout = scripts[Math.min(call, scripts.length - 1)]!;
+    call += 1;
+    const child = new EventEmitter() as ChildProcessWithoutNullStreams;
+    const stdoutStream = Readable.from([Buffer.from(stdout)]);
+    child.stdout = stdoutStream as ChildProcessWithoutNullStreams['stdout'];
+    child.stderr = Readable.from([]) as ChildProcessWithoutNullStreams['stderr'];
+    // Emit `close` only AFTER stdout fully drains — a bare queueMicrotask
+    // races the stream's data delivery and the runner can see empty stdout
+    // (these tests assert on STREAM CONTENT, unlike the argv-only ones above).
+    stdoutStream.on('end', () => queueMicrotask(() => child.emit('close', 0, null)));
+    return child;
+  };
+}
+
+const OK_STREAM = [
+  JSON.stringify({ type: 'thread.started', thread_id: 't' }),
+  JSON.stringify({ type: 'turn.started' }),
+  JSON.stringify({
+    type: 'item.completed',
+    item: { id: '1', type: 'agent_message', text: 'No findings.' },
+  }),
+  JSON.stringify({ type: 'turn.completed' }),
+].join('\n');
+
+describe('parseCodexJsonl — error events (0.52.0 silent-pass fix)', () => {
+  it('collects nested error.message from the observed 400 shape', () => {
+    const r = parseCodexJsonl(
+      [JSON.stringify({ type: 'turn.started' }), modelUnsupportedLine('gpt-9.9')].join('\n'),
+    );
+    expect(r.errorMessages).toHaveLength(1);
+    expect(r.errorMessages[0]).toMatch(/model is not supported/);
+    expect(r.reviewText).toBe('');
+  });
+
+  it('collects flat message variants too', () => {
+    const r = parseCodexJsonl(JSON.stringify({ type: 'error', message: 'boom' }));
+    expect(r.errorMessages).toEqual(['boom']);
+  });
+
+  it('clean streams report zero errorMessages', () => {
+    expect(parseCodexJsonl(OK_STREAM).errorMessages).toEqual([]);
+  });
+});
+
+describe('runCodexReview — errored, review-less runs can NEVER pass (0.52.0)', () => {
+  it('unsupported-model error event + exit 0 → CodexModelUnsupportedError (was: silent pass)', async () => {
+    const captured: { cmd: string; args: readonly string[] }[] = [];
+    await expect(
+      runCodexReview({
+        baseRef: 'origin/main',
+        cwd: '/tmp',
+        timeoutMs: 60_000,
+        model: 'gpt-5.6-typo', // EXPLICIT pin — no ladder substitution
+        spawnImpl: makeScriptedSpawn([modelUnsupportedLine('gpt-5.6-typo')], captured),
+      }),
+    ).rejects.toBeInstanceOf(CodexModelUnsupportedError);
+    // Explicit pin: exactly ONE attempt, never substituted.
+    expect(captured).toHaveLength(1);
+  });
+
+  it('generic error event with no review text → CodexProtocolError, not pass', async () => {
+    const captured: { cmd: string; args: readonly string[] }[] = [];
+    await expect(
+      runCodexReview({
+        baseRef: 'origin/main',
+        cwd: '/tmp',
+        timeoutMs: 60_000,
+        model: 'gpt-5.5',
+        spawnImpl: makeScriptedSpawn(
+          [JSON.stringify({ type: 'error', message: 'stream disconnected' })],
+          captured,
+        ),
+      }),
+    ).rejects.toBeInstanceOf(CodexProtocolError);
+  });
+
+  it('error event ALONGSIDE real review text is tolerated (review completed)', async () => {
+    const captured: { cmd: string; args: readonly string[] }[] = [];
+    const stream = [
+      JSON.stringify({ type: 'error', message: 'transient warning' }),
+      JSON.stringify({
+        type: 'item.completed',
+        item: { id: '1', type: 'agent_message', text: 'Review text.' },
+      }),
+    ].join('\n');
+    const r = await runCodexReview({
+      baseRef: 'origin/main',
+      cwd: '/tmp',
+      timeoutMs: 60_000,
+      model: 'gpt-5.5',
+      spawnImpl: makeScriptedSpawn([stream], captured),
+    });
+    expect(r.reviewText).toBe('Review text.');
+  });
+
+  it('legit empty diff (events, no errors, no messages) still returns empty text', async () => {
+    const captured: { cmd: string; args: readonly string[] }[] = [];
+    const stream = [
+      JSON.stringify({ type: 'thread.started' }),
+      JSON.stringify({ type: 'turn.started' }),
+      JSON.stringify({ type: 'turn.completed' }),
+    ].join('\n');
+    const r = await runCodexReview({
+      baseRef: 'origin/main',
+      cwd: '/tmp',
+      timeoutMs: 60_000,
+      model: 'gpt-5.5',
+      spawnImpl: makeScriptedSpawn([stream], captured),
+    });
+    expect(r.reviewText).toBe('');
+    expect(r.eventCount).toBe(3);
+  });
+});
+
+describe('runCodexReview — model ladder (0.52.0, default case only)', () => {
+  it('default rides the ladder top on success (modelUsed, no fallback)', async () => {
+    const captured: { cmd: string; args: readonly string[] }[] = [];
+    const r = await runCodexReview({
+      baseRef: 'origin/main',
+      cwd: '/tmp',
+      timeoutMs: 60_000,
+      spawnImpl: makeScriptedSpawn([OK_STREAM], captured),
+    });
+    expect(captured).toHaveLength(1);
+    expect(captured[0]!.args).toContain(`model="${IRON_GATE_MODEL_LADDER[0]}"`);
+    expect(r.modelUsed).toBe(IRON_GATE_MODEL_LADDER[0]);
+    expect(r.modelFellBack).toBe(false);
+  });
+
+  it('default falls to the next ladder entry when the top is unsupported', async () => {
+    const captured: { cmd: string; args: readonly string[] }[] = [];
+    const r = await runCodexReview({
+      baseRef: 'origin/main',
+      cwd: '/tmp',
+      timeoutMs: 60_000,
+      spawnImpl: makeScriptedSpawn(
+        [modelUnsupportedLine(IRON_GATE_MODEL_LADDER[0]!), OK_STREAM],
+        captured,
+      ),
+    });
+    expect(captured).toHaveLength(2);
+    expect(captured[0]!.args).toContain(`model="${IRON_GATE_MODEL_LADDER[0]}"`);
+    expect(captured[1]!.args).toContain(`model="${IRON_GATE_MODEL_LADDER[1]}"`);
+    expect(r.modelUsed).toBe(IRON_GATE_MODEL_LADDER[1]);
+    expect(r.modelFellBack).toBe(true);
+  });
+
+  it('ladder exhausted (every entry unsupported) → CodexModelUnsupportedError', async () => {
+    const captured: { cmd: string; args: readonly string[] }[] = [];
+    await expect(
+      runCodexReview({
+        baseRef: 'origin/main',
+        cwd: '/tmp',
+        timeoutMs: 60_000,
+        spawnImpl: makeScriptedSpawn(
+          IRON_GATE_MODEL_LADDER.map((m) => modelUnsupportedLine(m)),
+          captured,
+        ),
+      }),
+    ).rejects.toBeInstanceOf(CodexModelUnsupportedError);
+    expect(captured).toHaveLength(IRON_GATE_MODEL_LADDER.length);
+  });
+
+  it('non-model failures do NOT trigger ladder fallback (single attempt)', async () => {
+    const captured: { cmd: string; args: readonly string[] }[] = [];
+    await expect(
+      runCodexReview({
+        baseRef: 'origin/main',
+        cwd: '/tmp',
+        timeoutMs: 60_000,
+        spawnImpl: makeScriptedSpawn(
+          [JSON.stringify({ type: 'error', message: 'internal server error' })],
+          captured,
+        ),
+      }),
+    ).rejects.toBeInstanceOf(CodexProtocolError);
+    expect(captured).toHaveLength(1);
+  });
+});
+
+describe('model-default parity (0.52.0)', () => {
+  it('IRON_GATE_DEFAULT_MODEL is the ladder top', () => {
+    expect(IRON_GATE_DEFAULT_MODEL).toBe(IRON_GATE_MODEL_LADDER[0]);
+  });
+  it('PUSH_GATE_DEFAULT_CODEX_MODEL matches the ladder top', () => {
+    expect(PUSH_GATE_DEFAULT_CODEX_MODEL).toBe(IRON_GATE_MODEL_LADDER[0]);
   });
 });
