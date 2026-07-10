@@ -650,10 +650,12 @@ export async function runHookCodexReview(options: HookCodexReviewOptions): Promi
       ...(options.spawnImpl !== undefined ? { spawnImpl: options.spawnImpl } : {}),
       rawStdoutSink: (chunk: Buffer): void => {
         // Buffered tee — no stream lifecycle to race. Capped so a
-        // pathological stream cannot exhaust memory; overflow drops
-        // further chunks (partial > interleaved; the tee never affects
-        // the verdict).
-        if (rawBytes + chunk.length > RAW_TEE_MAX_BYTES) {
+        // pathological stream cannot exhaust memory. Truncation is
+        // STICKY (round-5 P2): once any chunk overflows, every later
+        // chunk is dropped too, so raw_path is always a clean PREFIX of
+        // the stream — a smaller late chunk appended after a dropped one
+        // would leave a hole + tail fragment that breaks JSONL consumers.
+        if (rawTruncated || rawBytes + chunk.length > RAW_TEE_MAX_BYTES) {
           rawTruncated = true;
           return;
         }
