@@ -246,11 +246,20 @@ export interface CodexRunOptions {
   prompt?: string;
   /**
    * Codex CLI model override (0.13.4+). When set, the runner passes
-   * `-c model="<value>"` to `codex exec review`. Codex itself validates
-   * the name. `undefined` falls back to codex's own default
-   * (`codex-auto-review` today, NOT the `gpt-5.4` flagship).
+   * `-c model="<value>"` to `codex exec review` and NEVER substitutes it.
+   * `undefined` (0.52.0) rides `IRON_GATE_MODEL_LADDER` newest-first with
+   * automatic fallback on model-unsupported.
    */
   model?: string;
+  /**
+   * 0.52.0 (review P3) — fired with the model name at the START of each
+   * attempt (once per ladder rung, or once for an explicit pin). Lets
+   * callers attribute an ERROR to the rung that actually failed instead
+   * of a pre-run assumption: a fallback account that falls 5.5→5.4 and
+   * then times out on 5.4 must audit `gpt-5.4`, not the ladder top.
+   * Callback errors are swallowed (observability must not break the run).
+   */
+  onAttempt?: (model: string) => void;
   /**
    * Codex reasoning effort (0.13.4+). When set, the runner passes
    * `-c model_reasoning_effort="<value>"`. Only meaningful when paired
@@ -331,6 +340,15 @@ export async function runCodexReview(options: CodexRunOptions): Promise<CodexRun
   const candidates = explicitModel !== undefined ? [explicitModel] : [...IRON_GATE_MODEL_LADDER];
   let lastErr: unknown;
   for (let i = 0; i < candidates.length; i += 1) {
+    // Review P3: announce the rung BEFORE the attempt so error-path
+    // audits attribute failures to the model that actually ran.
+    if (options.onAttempt !== undefined) {
+      try {
+        options.onAttempt(candidates[i]!);
+      } catch {
+        /* observability must not break the run */
+      }
+    }
     try {
       const result = await runCodexReviewOnce(options, candidates[i]!);
       return { ...result, modelFellBack: i > 0 };

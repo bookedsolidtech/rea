@@ -498,3 +498,44 @@ describe('model-default parity (0.52.0)', () => {
     expect(PUSH_GATE_DEFAULT_CODEX_MODEL).toBe(IRON_GATE_MODEL_LADDER[0]);
   });
 });
+
+describe('runCodexReview — onAttempt attribution (0.52.0 review P3)', () => {
+  it('reports the rung that actually failed, not the ladder top', async () => {
+    const captured: { cmd: string; args: readonly string[] }[] = [];
+    const attempts: string[] = [];
+    // Rung 1 (5.5): model-unsupported → ladder falls. Rung 2 (5.4):
+    // generic error event → propagates. The LAST onAttempt call must be
+    // the failing rung (5.4), so error-path audits blame the right model.
+    await expect(
+      runCodexReview({
+        baseRef: 'origin/main',
+        cwd: '/tmp',
+        timeoutMs: 60_000,
+        onAttempt: (m) => attempts.push(m),
+        spawnImpl: makeScriptedSpawn(
+          [
+            modelUnsupportedLine(IRON_GATE_MODEL_LADDER[0]!),
+            JSON.stringify({ type: 'error', message: 'internal server error' }),
+          ],
+          captured,
+        ),
+      }),
+    ).rejects.toBeInstanceOf(CodexProtocolError);
+    expect(attempts).toEqual([...IRON_GATE_MODEL_LADDER]);
+    expect(attempts[attempts.length - 1]).toBe(IRON_GATE_MODEL_LADDER[1]);
+  });
+
+  it('onAttempt callback errors never break the run', async () => {
+    const captured: { cmd: string; args: readonly string[] }[] = [];
+    const r = await runCodexReview({
+      baseRef: 'origin/main',
+      cwd: '/tmp',
+      timeoutMs: 60_000,
+      onAttempt: () => {
+        throw new Error('observer exploded');
+      },
+      spawnImpl: makeScriptedSpawn([OK_STREAM], captured),
+    });
+    expect(r.reviewText).toBe('No findings.');
+  });
+});

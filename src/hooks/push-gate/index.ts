@@ -42,7 +42,6 @@ import {
   CodexProtocolError,
   CodexSubprocessError,
   CodexTimeoutError,
-  IRON_GATE_DEFAULT_MODEL,
   IRON_GATE_DEFAULT_REASONING,
   type CodexRunError,
   type GitExecutor,
@@ -636,6 +635,17 @@ export async function runPushGate(deps: PushGateDeps): Promise<GateResult> {
         reviewed_at: deps.now !== undefined ? deps.now().toISOString() : new Date().toISOString(),
         // 0.52.0: cache the model that ACTUALLY ran (ladder may have fallen
         // from the newest flagship on this account) — not the assumption.
+        //
+        // ACCEPTED TRADE (review P2): the cache KEY does not include model
+        // capability, so a same-SHA verdict cached on a fallback account
+        // keeps serving for its TTL even if the account gains the newest
+        // flagship mid-window. Bypassing hits whose cached model is below
+        // the ladder top would force EVERY push on fallback-only accounts
+        // to re-review (the re-run re-caches the same fallback model and
+        // the next push bypasses again) — destroying caching exactly where
+        // it matters. Staleness is bounded by cache_ttl_ms (default 24h)
+        // and the cached verdict is still a valid flagship review; the
+        // upgrade lands naturally at the next SHA or TTL expiry.
         model: codexResult.modelUsed,
         reasoning_effort: policy.codex_reasoning_effort ?? IRON_GATE_DEFAULT_REASONING,
         ttl_ms: policy.cache_ttl_ms,

@@ -20,7 +20,6 @@
 
 import { spawnSync } from 'node:child_process';
 import {
-  IRON_GATE_DEFAULT_MODEL,
   IRON_GATE_DEFAULT_REASONING,
   CodexModelUnsupportedError,
   CodexNotInstalledError,

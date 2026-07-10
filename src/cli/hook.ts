@@ -635,8 +635,11 @@ export async function runHookCodexReview(options: HookCodexReviewOptions): Promi
   // is forwarded to the test seam.
   let reviewText = '';
   let durationSeconds = 0;
-  // Pre-run assumption for the ERROR path (no result to read); the
-  // success path overwrites this with the model that ACTUALLY ran.
+  // Attempt-tracked model for the ERROR path: onAttempt updates this at
+  // the start of every ladder rung, so a fallback account that fell
+  // 5.5→5.4 and THEN failed audits the rung that actually failed (review
+  // P3), not the ladder top. The success path overwrites with the
+  // result's modelUsed.
   let modelUsed = resolved.codex_model ?? IRON_GATE_DEFAULT_MODEL;
   let codexError: unknown;
   try {
@@ -649,6 +652,9 @@ export async function runHookCodexReview(options: HookCodexReviewOptions): Promi
       ...(resolved.codex_reasoning_effort !== undefined
         ? { reasoningEffort: resolved.codex_reasoning_effort }
         : {}),
+      onAttempt: (m) => {
+        modelUsed = m;
+      },
       ...(options.spawnImpl !== undefined ? { spawnImpl: options.spawnImpl } : {}),
       ...(rawStream !== null
         ? {
