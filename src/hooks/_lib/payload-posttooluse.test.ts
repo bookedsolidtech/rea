@@ -18,12 +18,12 @@ import {
 describe('parsePostToolUsePayload', () => {
   it('empty stdin → all-empty', () => {
     const r = parsePostToolUsePayload('');
-    expect(r).toEqual({ toolName: '', command: '', stderr: '', stdout: '', errored: false });
+    expect(r).toEqual({ toolName: '', command: '', stderr: '', stdout: '', errored: false, cwd: '' });
   });
 
   it('top-level null → all-empty', () => {
     const r = parsePostToolUsePayload('null');
-    expect(r).toEqual({ toolName: '', command: '', stderr: '', stdout: '', errored: false });
+    expect(r).toEqual({ toolName: '', command: '', stderr: '', stdout: '', errored: false, cwd: '' });
   });
 
   it('splits stdout and stderr into separate channels', () => {
