@@ -37,7 +37,7 @@ import type { Command } from 'commander';
 import { parse as parseYaml } from 'yaml';
 import { parsePrePushStdin, runPushGate } from '../hooks/push-gate/index.js';
 import { runBlockedScan, runProtectedScan, type Verdict } from '../hooks/bash-scanner/index.js';
-import { checkHalt, checkHaltRoots, formatHaltBanner } from '../hooks/_lib/halt-check.js';
+import { checkHaltRoots, formatHaltBanner } from '../hooks/_lib/halt-check.js';
 import { resolveHookRoots, resolveReaRoots } from '../lib/worktree-roots.js';
 import { runHookPrIssueLinkGate } from '../hooks/pr-issue-link-gate/index.js';
 import { runHookSecurityDisclosureGate } from '../hooks/security-disclosure-gate/index.js';
@@ -560,9 +560,11 @@ export interface HookCodexReviewOptions {
 export async function runHookCodexReview(options: HookCodexReviewOptions): Promise<void> {
   const baseDir = options.reaRoot ?? process.cwd();
 
-  // HALT check — uniform with the rest of the hook tree.
-  // 0.32.0: shared via `src/hooks/_lib/halt-check.ts`.
-  const halt = checkHalt(baseDir);
+  // HALT check — uniform with the rest of the hook tree; probes BOTH
+  // roots (0.54.0: the kill switch is repo-wide, and a freeze written at
+  // the primary checkout must stop a /codex-review invoked from any
+  // linked worktree).
+  const halt = checkHaltRoots(baseDir);
   if (halt.halted) {
     process.stderr.write(formatHaltBanner(halt.reason));
     process.exit(2);

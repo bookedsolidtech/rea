@@ -471,11 +471,29 @@ export interface DelegationAdvisoryResult {
 export async function computeDelegationAdvisory(
   options: HookDelegationAdvisoryOptions,
 ): Promise<DelegationAdvisoryResult> {
-  // 0.54.0 worktree state: session-counter state + policy key off the
-  // LOCAL root; the audit scan ("did this session delegate") reads the
-  // COMMON root, where delegation-capture now writes the shared chain;
-  // the kill switch probes BOTH roots (repo-wide HALT).
-  const { localRoot: reaRoot, commonRoot } = resolveHookRoots(undefined, options.reaRoot);
+  // 0.54.0 worktree state (review round-1 P2): stdin is read FIRST so
+  // the payload's `cwd` feeds root resolution — otherwise a Claude
+  // worktree session resolves CLAUDE_PROJECT_DIR (the primary checkout)
+  // and every stream shares one advisory counter, letting activity in
+  // one stream trigger or suppress the nudge in another. Session state
+  // + policy key off the LOCAL root; the audit scan ("did this session
+  // delegate") reads the COMMON root, where delegation-capture writes
+  // the shared chain; the kill switch probes BOTH roots.
+  const stdinRawEarly = options.stdinOverride ?? readStdinSync();
+  let payloadCwdEarly = '';
+  try {
+    const peeked = JSON.parse(stdinRawEarly) as { cwd?: unknown };
+    if (peeked !== null && typeof peeked === 'object' && typeof peeked.cwd === 'string') {
+      payloadCwdEarly = peeked.cwd;
+    }
+  } catch {
+    // Malformed stdin is handled below (observational no-payload path);
+    // root resolution just falls down the ladder.
+  }
+  const { localRoot: reaRoot, commonRoot } = resolveHookRoots(
+    payloadCwdEarly.length > 0 ? payloadCwdEarly : undefined,
+    options.reaRoot,
+  );
 
   // HALT check — uniform with the rest of the hook tree. The advisory
   // hook is observational, but refusing to run while frozen keeps the
@@ -493,7 +511,7 @@ export async function computeDelegationAdvisory(
     return { outcome: 'disabled' };
   }
 
-  const stdinRaw = options.stdinOverride ?? readStdinSync();
+  const stdinRaw = stdinRawEarly;
   if (stdinRaw.length === 0) {
     // No payload — nothing to count. Exit clean.
     return { outcome: 'no-payload' };
