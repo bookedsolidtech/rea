@@ -473,7 +473,18 @@ shim_resolve_cli_global() {
   # → tier silently unavailable (same terminal as feature-absent).
   command -v node >/dev/null 2>&1 || return 0
   local gate=""
-  gate=$(shim_global_entry_gate "$proj" 2>/dev/null)
+  # Round-22 P1 (0.54.0 worktree state): the trust registry's exact-path
+  # membership check runs against the ACTIVE enforcement root — the
+  # worktree actually executing the hook — not the pinned primary
+  # checkout. A trusted primary must not authorize the global CLI
+  # inside an untrusted worktree, and a worktree trusted via
+  # `rea trust` must not fail closed just because the primary was
+  # never trusted. Mirrors the shim_resolve_cli tier order.
+  local _trust_root="$proj"
+  if [ -n "${REA_ROOT:-}" ] && [ "$REA_ROOT" != "$proj" ] && [ -d "${REA_ROOT}/.rea" ]; then
+    _trust_root="$REA_ROOT"
+  fi
+  gate=$(shim_global_entry_gate "$_trust_root" 2>/dev/null)
   case "$gate" in
     unavailable|"") return 0 ;; # silent A5 / registry / resolve miss
   esac
