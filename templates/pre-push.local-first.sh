@@ -28,6 +28,32 @@ set -euo pipefail
 # under both vanilla git and husky 9 layouts.
 REA_ROOT="$(pwd)"
 
+# 0.54.0 round-35 P1: a linked worktree frequently has no local install
+# (node_modules/dist live only in the PRIMARY checkout). Resolve the
+# CLI from ONE seam: the worktree first, then the primary checkout
+# (.git-file discriminator), then the PATH/npx tiers below unchanged.
+# REA_ROOT itself stays the worktree — HALT and policy are resolved
+# against it; only CLI dispatch follows REA_CLI_ROOT.
+REA_CLI_ROOT="$REA_ROOT"
+if [ ! -x "${REA_ROOT}/node_modules/.bin/rea" ] && [ ! -f "${REA_ROOT}/dist/cli/index.js" ] \
+   && [ -f "${REA_ROOT}/.git" ]; then
+  _rea_common_dir=$(git -C "$REA_ROOT" rev-parse --git-common-dir 2>/dev/null || true)
+  case "$_rea_common_dir" in
+    "") : ;;
+    /*) : ;;
+    *) _rea_common_dir="${REA_ROOT}/${_rea_common_dir}" ;;
+  esac
+  if [ -n "$_rea_common_dir" ]; then
+    _rea_common=$(dirname "$_rea_common_dir")
+    if { [ -d "${_rea_common}/.rea" ] || [ -e "${_rea_common}/.git" ]; } \
+       && { [ -x "${_rea_common}/node_modules/.bin/rea" ] \
+            || { [ -f "${_rea_common}/dist/cli/index.js" ] && [ -f "${_rea_common}/package.json" ] \
+                 && grep -q '"name": *"@bookedsolid/rea"' "${_rea_common}/package.json" 2>/dev/null; }; }; then
+      REA_CLI_ROOT="$_rea_common"
+    fi
+  fi
+fi
+
 # Round-27 F5 fix: inline the same rea-CLI resolution ladder used by
 # the canonical BODY_TEMPLATE in src/cli/install/pre-push.ts. Pre-fix
 # the body was `exec rea preflight --strict --operation push`, which assumed `rea` was
@@ -37,21 +63,21 @@ REA_ROOT="$(pwd)"
 # installs got `rea: not found` on every push.
 #
 # Resolution order (matches BODY_TEMPLATE exactly):
-#   1. ${REA_ROOT}/node_modules/.bin/rea  — local devDependency.
-#   2. ${REA_ROOT}/dist/cli/index.js      — rea's own dogfood repo.
+#   1. ${REA_CLI_ROOT}/node_modules/.bin/rea  — local devDependency.
+#   2. ${REA_CLI_ROOT}/dist/cli/index.js      — rea's own dogfood repo.
 #   3. PATH-resolved rea                  — global install.
 #   4. npx --no-install                    — last-resort npm cache hit.
-if [ -x "${REA_ROOT}/node_modules/.bin/rea" ]; then
-  exec "${REA_ROOT}/node_modules/.bin/rea" preflight --strict --operation push
-elif [ -f "${REA_ROOT}/dist/cli/index.js" ] \
-   && [ -f "${REA_ROOT}/package.json" ] \
-   && grep -q '"name": *"@bookedsolid/rea"' "${REA_ROOT}/package.json" 2>/dev/null; then
+if [ -x "${REA_CLI_ROOT}/node_modules/.bin/rea" ]; then
+  exec "${REA_CLI_ROOT}/node_modules/.bin/rea" preflight --strict --operation push
+elif [ -f "${REA_CLI_ROOT}/dist/cli/index.js" ] \
+   && [ -f "${REA_CLI_ROOT}/package.json" ] \
+   && grep -q '"name": *"@bookedsolid/rea"' "${REA_CLI_ROOT}/package.json" 2>/dev/null; then
   # rea's own repo (dogfood) — the package is not installed under
   # node_modules here because we ARE the package. Gate this branch on
   # `package.json` declaring `@bookedsolid/rea` so a consumer repo that
   # happens to ship its own `dist/cli/index.js` does not get this hook
   # executing the consumer's unrelated build.
-  exec node "${REA_ROOT}/dist/cli/index.js" preflight --strict --operation push
+  exec node "${REA_CLI_ROOT}/dist/cli/index.js" preflight --strict --operation push
 elif command -v rea >/dev/null 2>&1; then
   exec rea preflight --strict --operation push
 elif command -v npx >/dev/null 2>&1; then

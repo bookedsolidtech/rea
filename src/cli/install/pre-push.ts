@@ -171,6 +171,32 @@ const BODY_TEMPLATE = `set -eu
 # then fall back to npx so the gate runs in every documented setup.
 
 REA_ROOT=\$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+
+# 0.54.0 round-35 P1: a linked worktree frequently has no local install
+# (node_modules/dist live only in the PRIMARY checkout). Resolve the
+# CLI from ONE seam: the worktree first, then the primary checkout
+# (.git-file discriminator), then the PATH/npx tiers below unchanged.
+# REA_ROOT itself stays the worktree — HALT and policy are resolved
+# against it; only CLI dispatch follows REA_CLI_ROOT.
+REA_CLI_ROOT="\$REA_ROOT"
+if [ ! -x "\${REA_ROOT}/node_modules/.bin/rea" ] && [ ! -f "\${REA_ROOT}/dist/cli/index.js" ] \\
+   && [ -f "\${REA_ROOT}/.git" ]; then
+  _rea_common_dir=\$(git -C "\$REA_ROOT" rev-parse --git-common-dir 2>/dev/null || true)
+  case "\$_rea_common_dir" in
+    "") : ;;
+    /*) : ;;
+    *) _rea_common_dir="\${REA_ROOT}/\${_rea_common_dir}" ;;
+  esac
+  if [ -n "\$_rea_common_dir" ]; then
+    _rea_common=\$(dirname "\$_rea_common_dir")
+    if { [ -d "\${_rea_common}/.rea" ] || [ -e "\${_rea_common}/.git" ]; } \\
+       && { [ -x "\${_rea_common}/node_modules/.bin/rea" ] \\
+            || { [ -f "\${_rea_common}/dist/cli/index.js" ] && [ -f "\${_rea_common}/package.json" ] \\
+                 && grep -q '"name": *"@bookedsolid/rea"' "\${_rea_common}/package.json" 2>/dev/null; }; }; then
+      REA_CLI_ROOT="\$_rea_common"
+    fi
+  fi
+fi
 if [ -f "\${REA_ROOT}/.rea/HALT" ]; then
   reason=\$(awk 'NR==1 { print; exit }' "\${REA_ROOT}/.rea/HALT" 2>/dev/null || printf 'unknown')
   [ -z "\${reason:-}" ] && reason='unknown'
@@ -207,10 +233,10 @@ fi
 #   - REA_SKIP_LOCAL_REVIEW="<reason>"      → bypass + audit
 # We resolve the rea binary the same way the dispatch below does.
 if (
-  if [ -x "\${REA_ROOT}/node_modules/.bin/rea" ]; then
-    "\${REA_ROOT}/node_modules/.bin/rea" preflight --strict --operation push
-  elif [ -f "\${REA_ROOT}/dist/cli/index.js" ] && [ -f "\${REA_ROOT}/package.json" ] && grep -q '"name": *"@bookedsolid/rea"' "\${REA_ROOT}/package.json" 2>/dev/null; then
-    node "\${REA_ROOT}/dist/cli/index.js" preflight --strict --operation push
+  if [ -x "\${REA_CLI_ROOT}/node_modules/.bin/rea" ]; then
+    "\${REA_CLI_ROOT}/node_modules/.bin/rea" preflight --strict --operation push
+  elif [ -f "\${REA_CLI_ROOT}/dist/cli/index.js" ] && [ -f "\${REA_CLI_ROOT}/package.json" ] && grep -q '"name": *"@bookedsolid/rea"' "\${REA_CLI_ROOT}/package.json" 2>/dev/null; then
+    node "\${REA_CLI_ROOT}/dist/cli/index.js" preflight --strict --operation push
   elif command -v rea >/dev/null 2>&1; then
     rea preflight --strict --operation push
   elif command -v npx >/dev/null 2>&1; then
@@ -229,16 +255,16 @@ if [ "\$preflight_status" -ne 0 ]; then
 fi
 
 if (
-  if [ -x "\${REA_ROOT}/node_modules/.bin/rea" ]; then
-    set -- "\${REA_ROOT}/node_modules/.bin/rea" hook push-gate "\$@"
-  elif [ -f "\${REA_ROOT}/dist/cli/index.js" ] && [ -f "\${REA_ROOT}/package.json" ] && grep -q '"name": *"@bookedsolid/rea"' "\${REA_ROOT}/package.json" 2>/dev/null; then
+  if [ -x "\${REA_CLI_ROOT}/node_modules/.bin/rea" ]; then
+    set -- "\${REA_CLI_ROOT}/node_modules/.bin/rea" hook push-gate "\$@"
+  elif [ -f "\${REA_CLI_ROOT}/dist/cli/index.js" ] && [ -f "\${REA_CLI_ROOT}/package.json" ] && grep -q '"name": *"@bookedsolid/rea"' "\${REA_CLI_ROOT}/package.json" 2>/dev/null; then
     # rea's own repo (dogfood) — the package is not installed under
     # node_modules here because we ARE the package. The built CLI
     # entry point lives at dist/cli/index.js; node runs it directly.
     # Gate this branch on \`package.json\` declaring \`@bookedsolid/rea\` so a
     # consumer repo that happens to ship its own \`dist/cli/index.js\` does
     # not get this hook executing the consumer's unrelated build.
-    set -- node "\${REA_ROOT}/dist/cli/index.js" hook push-gate "\$@"
+    set -- node "\${REA_CLI_ROOT}/dist/cli/index.js" hook push-gate "\$@"
   elif command -v rea >/dev/null 2>&1; then
     set -- rea hook push-gate "\$@"
   elif command -v npx >/dev/null 2>&1; then

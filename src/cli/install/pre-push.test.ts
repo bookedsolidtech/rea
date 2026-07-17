@@ -129,8 +129,8 @@ describe('BODY_TEMPLATE — path-with-spaces portability (Fix A / 0.12.0)', () =
     // post-body extension-fragment chaining; 0.13.2 wraps the dispatch in
     // a subshell `(...)` so the `set --` rewrite of $@ does NOT bleed into
     // the parent shell where the fragment loop runs.
-    expect(body).toMatch(/set -- "\$\{REA_ROOT\}\/node_modules\/\.bin\/rea" hook push-gate "\$@"/);
-    expect(body).toMatch(/set -- node "\$\{REA_ROOT\}\/dist\/cli\/index\.js" hook push-gate "\$@"/);
+    expect(body).toMatch(/set -- "\$\{REA_CLI_ROOT\}\/node_modules\/\.bin\/rea" hook push-gate "\$@"/);
+    expect(body).toMatch(/set -- node "\$\{REA_CLI_ROOT\}\/dist\/cli\/index\.js" hook push-gate "\$@"/);
     // 0.13.2: rea body invoked via `exec "$@"` inside a subshell, with
     // status captured via `$?` after the subshell exits. The $@ rewrite
     // is scoped to the subshell so the fragment loop's `"$@"` still
@@ -149,8 +149,8 @@ describe('BODY_TEMPLATE — path-with-spaces portability (Fix A / 0.12.0)', () =
     const body = fallbackHookContent();
     // `${REA_ROOT}/...` paths inside `set --` arms must be quoted (positional
     // arg integrity when the path contains spaces).
-    expect(body).toMatch(/"\$\{REA_ROOT\}\/node_modules\/\.bin\/rea"/);
-    expect(body).toMatch(/"\$\{REA_ROOT\}\/dist\/cli\/index\.js"/);
+    expect(body).toMatch(/"\$\{REA_CLI_ROOT\}\/node_modules\/\.bin\/rea"/);
+    expect(body).toMatch(/"\$\{REA_CLI_ROOT\}\/dist\/cli\/index\.js"/);
     // The HALT-detection branch already used quoted expansion; keep it.
     expect(body).toMatch(/"\$\{REA_ROOT\}\/\.rea\/HALT"/);
   });
@@ -162,15 +162,15 @@ describe('BODY_TEMPLATE — path-with-spaces portability (Fix A / 0.12.0)', () =
     // consumer's unrelated app with `hook push-gate` instead of REA. The
     // dogfood arm must require a rea-specific package.json signal too.
     const body = fallbackHookContent();
-    expect(body).toMatch(/grep -q '"name": \*"@bookedsolid\/rea"' "\$\{REA_ROOT\}\/package\.json"/);
+    expect(body).toMatch(/grep -q '"name": \*"@bookedsolid\/rea"' "\$\{REA_CLI_ROOT\}\/package\.json"/);
     expect(body).toMatch(
-      /\[ -f "\$\{REA_ROOT\}\/dist\/cli\/index\.js" \] && \[ -f "\$\{REA_ROOT\}\/package\.json" \]/,
+      /\[ -f "\$\{REA_CLI_ROOT\}\/dist\/cli\/index\.js" \] && \[ -f "\$\{REA_CLI_ROOT\}\/package\.json" \]/,
     );
   });
 
   it('shipped husky body delegates via `set --` arms identically to the fallback', () => {
     const husky = huskyHookContent();
-    expect(husky).toMatch(/set -- "\$\{REA_ROOT\}\/node_modules\/\.bin\/rea" hook push-gate "\$@"/);
+    expect(husky).toMatch(/set -- "\$\{REA_CLI_ROOT\}\/node_modules\/\.bin\/rea" hook push-gate "\$@"/);
     // 0.13.2: rea body invoked via `exec "$@"` inside a subshell so post-body
     // extension-fragment chaining sees git's original argv.
     expect(husky).toMatch(/exec\s+"\$@"/);

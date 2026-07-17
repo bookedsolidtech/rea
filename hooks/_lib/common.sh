@@ -42,9 +42,24 @@ rea_common_root() {
   candidate=$(dirname "$common_dir")
   if [ -d "${candidate}/.rea" ] || [ -e "${candidate}/.git" ]; then
     printf '%s' "$candidate"
-  else
-    printf '%s' "$root"
+    return 0
   fi
+  # Round-35 P2 (parity with resolveCommonRoot): a --separate-git-dir
+  # primary keeps its metadata OUTSIDE the checkout, so the common
+  # dir's parent is not a checkout. Try git's FIRST listed worktree
+  # (the main one) before degrading to per-worktree isolation. In
+  # practice git reports the metadata dir itself here (no back-pointer
+  # exists), but if a future git exposes the real checkout this
+  # upgrades automatically — mirroring the Node resolver.
+  local main_wt
+  main_wt=$(git -C "$root" worktree list --porcelain 2>/dev/null \
+    | sed -n 's/^worktree //p' | head -n 1)
+  if [ -n "$main_wt" ] && [ "$main_wt" != "$root" ] \
+     && { [ -d "${main_wt}/.rea" ] || [ -e "${main_wt}/.git" ]; }; then
+    printf '%s' "$main_wt"
+    return 0
+  fi
+  printf '%s' "$root"
 }
 
 check_halt() {
