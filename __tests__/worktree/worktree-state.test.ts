@@ -282,6 +282,39 @@ describe('worktree-state integration (real git worktree add)', () => {
     expect(bv.verdict).toBe('block');
   });
 
+  it('(vi-f) ALIASED cross-root path still trips protection (round-45)', async () => {
+    // A symlink OUTSIDE both checkouts that points at the primary — the
+    // payload addresses the primary through the alias. Lexically the
+    // path is not a child of commonRoot, so cross-root detection must
+    // realpath-canonicalize to catch it.
+    const aliasPrimary = path.join(scratch, 'alias-to-primary');
+    fs.symlinkSync(repo, aliasPrimary);
+
+    // Bash tier: aliased write into the primary's shared HALT.
+    const v = runProtectedScan(
+      { reaRoot: wtA, commonRoot: repo, policy: { protected_paths_relax: [] }, stderr: () => {} },
+      `echo forged > ${aliasPrimary}/.rea/HALT`,
+    );
+    expect(v.verdict).toBe('block');
+
+    // …and the shared audit chain through the same alias.
+    const v2 = runProtectedScan(
+      { reaRoot: wtA, commonRoot: repo, policy: { protected_paths_relax: [] }, stderr: () => {} },
+      `echo forged > ${aliasPrimary}/.rea/audit.jsonl`,
+    );
+    expect(v2.verdict).toBe('block');
+
+    // Write tier: aliased Write into the primary's HALT.
+    const sp = await runSettingsProtection({
+      reaRoot: wtA,
+      stdinOverride: JSON.stringify({
+        tool_name: 'Write',
+        tool_input: { file_path: path.join(aliasPrimary, '.rea', 'HALT'), content: 'forged' },
+      }),
+    });
+    expect(sp.exitCode).toBe(2);
+  });
+
   it('(vi-e) REVERSE bridge: symlink in the PRIMARY checkout back into the worktree (round-17)', () => {
     // bridge -> <wtA>/.rea lives in the PRIMARY checkout. The logical
     // form is common-relative ("bridge/HALT" — no pattern hit); only

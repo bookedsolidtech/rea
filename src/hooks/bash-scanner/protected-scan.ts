@@ -619,9 +619,27 @@ function normalizeTarget(
       ...(commonRoot !== undefined && commonRoot !== reaRoot ? [commonRoot] : []),
       ...(siblingRoots ?? []),
     ];
+    // Round-45 P1: alias-safe cross-root detection. `isInsideRoot`
+    // realpaths the ROOT, but a payload TARGET reached through a
+    // symlink or /var↔/private/var alias won't lexically match — so
+    // compute the realpath-canonicalized target once and test
+    // membership with it too. Without this, an aliased
+    // `<primary>/.rea/HALT` slips past into the plain-outside-root
+    // allow path.
+    const collapsedCanon = ((): string | null => {
+      const r = resolveSymlinksWalkUp(collapsed);
+      return r !== null && r !== SYMLINK_DYNAMIC_SENTINEL ? r : null;
+    })();
     for (const cross of crossRoots) {
-      if (cross === reaRoot || !isInsideRoot(collapsed, cross)) continue;
-      const crossRelative = collapsed === cross ? '' : collapsed.slice(cross.length + 1);
+      if (cross === reaRoot) continue;
+      const crossCanon = realpathSafe(cross) ?? cross;
+      const insideLex = isInsideRoot(collapsed, cross);
+      const insideCanon =
+        collapsedCanon !== null && isInsideRoot(collapsedCanon, crossCanon);
+      if (!insideLex && !insideCanon) continue;
+      const baseRoot = insideLex ? cross : crossCanon;
+      const tgt = insideLex ? collapsed : (collapsedCanon as string);
+      const crossRelative = tgt === baseRoot ? '' : tgt.slice(baseRoot.length + 1);
       const trailing = normalized.endsWith('/');
       const crossPathLc = (
         trailing && crossRelative.length > 0 && !crossRelative.endsWith('/')
