@@ -673,18 +673,40 @@ shim_run() {
           # The pin only applies when the anchor is itself a rea root —
           # with no rea-rooted anchor the payload IS the session repo
           # (mirrors the Node ladder's no-anchor acceptance).
+          _stale_anchor=0
           if [ -d "${REA_ROOT}/.rea" ]; then
             _anchor_common=$(rea_common_root "$REA_ROOT")
             _payload_common=$(rea_common_root "$_payload_root")
             if [ "$_payload_common" != "$_anchor_common" ] \
                && [ "$_payload_root" != "$REA_ROOT" ]; then
-              break
+              # Round-18 P1: before pinning to the anchor, test whether
+              # the anchor is STALE — a shell that still exports repo
+              # A's REA_ROOT/CLAUDE_PROJECT_DIR while the process is
+              # physically running in the payload's repository. Live
+              # Claude sessions run hooks with cwd = the project dir
+              # (cwd agrees with the anchor), so a physical cwd whose
+              # .rea root shares the payload's common root means the
+              # payload IS the session repo — hand over instead of
+              # enforcing repo A's policy against repo B's files.
+              _phys_root=$(pwd -P 2>/dev/null || pwd)
+              while [ -n "$_phys_root" ] && [ "$_phys_root" != "/" ]; do
+                [ -d "${_phys_root}/.rea" ] && break
+                _phys_root=$(dirname "$_phys_root")
+              done
+              if [ -d "${_phys_root}/.rea" ] \
+                 && [ "$(rea_common_root "$_phys_root")" = "$_payload_common" ]; then
+                _stale_anchor=1
+              else
+                break
+              fi
             fi
             # Round-9 P1: same repo, but a payload naming a SIBLING
             # worktree of a worktree-anchored session keeps the anchor
             # (only a PRIMARY-checkout anchor hands over to the payload
-            # worktree — the Claude session shape).
-            if [ -f "${REA_ROOT}/.git" ] && [ "$_payload_root" != "$REA_ROOT" ]; then
+            # worktree — the Claude session shape). Does not apply on
+            # the stale-anchor handover (different repository).
+            if [ "$_stale_anchor" = "0" ] && [ -f "${REA_ROOT}/.git" ] \
+               && [ "$_payload_root" != "$REA_ROOT" ]; then
               break
             fi
           fi
@@ -696,7 +718,7 @@ shim_run() {
           # IS the session root and CLI resolution must search there,
           # or every shim reports the CLI missing in the exact shape
           # this handoff supports.
-          if [ ! -d "${REA_ROOT}/.rea" ]; then
+          if [ ! -d "${REA_ROOT}/.rea" ] || [ "$_stale_anchor" = "1" ]; then
             proj="$_payload_root"
           fi
           REA_ROOT="$_payload_root"

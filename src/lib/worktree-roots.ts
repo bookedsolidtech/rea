@@ -193,12 +193,26 @@ export function resolveHookRoots(
   // no-install fallback below.
   const envRoots = tryResolve(process.env['CLAUDE_PROJECT_DIR']);
   const cwdRoots = tryResolve(process.cwd());
-  const anchor =
-    envRoots !== null && hasRea(envRoots)
-      ? envRoots
-      : cwdRoots !== null && hasRea(cwdRoots)
-        ? cwdRoots
-        : (envRoots ?? cwdRoots);
+  const payload = tryResolve(payloadCwd);
+  const sameRepo = (a: ReaRoots, b: ReaRoots): boolean =>
+    path.resolve(a.commonRoot) === path.resolve(b.commonRoot);
+  const envQ = envRoots !== null && hasRea(envRoots) ? envRoots : null;
+  const cwdQ = cwdRoots !== null && hasRea(cwdRoots) ? cwdRoots : null;
+  let anchor: ReaRoots | null;
+  if (envQ !== null && cwdQ !== null && !sameRepo(envQ, cwdQ)) {
+    // Round-18 P1: CLAUDE_PROJECT_DIR and process.cwd() name DIFFERENT
+    // rea-managed repositories. Live Claude sessions run hooks with
+    // cwd = the project directory, so agreement is the norm —
+    // disagreement means one side is stale (a shell that still exports
+    // repo A's CLAUDE_PROJECT_DIR while genuinely working in repo B).
+    // The payload breaks the tie; with no payload, the process's
+    // PHYSICAL location wins — pinning enforcement to a repo the
+    // invocation is not even running in would read the wrong policy
+    // and misapply blocked/protected paths.
+    anchor = payload !== null && hasRea(payload) && sameRepo(payload, envQ) ? envQ : cwdQ;
+  } else {
+    anchor = envQ ?? cwdQ ?? envRoots ?? cwdRoots;
+  }
 
   // Payload candidate — accepted only when it (a) carries `.rea/` AND
   // (b) belongs to the SAME REPOSITORY as the session anchor (identical
@@ -211,7 +225,6 @@ export function resolveHookRoots(
   // the anchor (the pre-0.54.0 behavior). When there is no rea-rooted
   // anchor at all (the payload names the only install in sight), the
   // payload is the session repo and is accepted.
-  const payload = tryResolve(payloadCwd);
   if (payload !== null && hasRea(payload)) {
     if (anchor === null || !hasRea(anchor)) return payload;
     if (path.resolve(payload.commonRoot) === path.resolve(anchor.commonRoot)) {

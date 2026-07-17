@@ -158,11 +158,14 @@ describe('resolveHookRoots — guarded candidate ladder', () => {
     const stray = path.join(scratch, 'stray');
     fs.mkdirSync(stray, { recursive: true });
     const prev = process.env['CLAUDE_PROJECT_DIR'];
+    const prevCwd = process.cwd();
     process.env['CLAUDE_PROJECT_DIR'] = repo;
+    process.chdir(repo); // live-session shape: hook cwd = project dir
     try {
       const roots = resolveHookRoots(stray);
       expect(roots.localRoot).toBe(repo); // the agent's `cd /tmp` did not drag the gate along
     } finally {
+      process.chdir(prevCwd);
       if (prev === undefined) delete process.env['CLAUDE_PROJECT_DIR'];
       else process.env['CLAUDE_PROJECT_DIR'] = prev;
     }
@@ -204,11 +207,41 @@ describe('resolveHookRoots — guarded candidate ladder', () => {
     makeRepo(repoA);
     makeRepo(repoB);
     const prev = process.env['CLAUDE_PROJECT_DIR'];
+    const prevCwd = process.cwd();
     process.env['CLAUDE_PROJECT_DIR'] = repoA;
+    process.chdir(repoA); // live-session shape: hook cwd = project dir
     try {
       const roots = resolveHookRoots(repoB);
       expect(roots.localRoot).toBe(repoA); // pinned to the session repo
     } finally {
+      process.chdir(prevCwd);
+      if (prev === undefined) delete process.env['CLAUDE_PROJECT_DIR'];
+      else process.env['CLAUDE_PROJECT_DIR'] = prev;
+    }
+  });
+
+  it('STALE env anchor: cwd + payload agree on a DIFFERENT repo → hand over (round-18 P1)', () => {
+    // A shell still exports repo A's CLAUDE_PROJECT_DIR but the process
+    // is physically running in repo B (live sessions run hooks with
+    // cwd = the project dir, so env/cwd disagreement means staleness).
+    const repoA = path.join(scratch, 'stale-a');
+    const repoB = path.join(scratch, 'stale-b');
+    makeRepo(repoA);
+    makeRepo(repoB);
+    const prev = process.env['CLAUDE_PROJECT_DIR'];
+    const prevCwd = process.cwd();
+    process.env['CLAUDE_PROJECT_DIR'] = repoA;
+    process.chdir(repoB);
+    try {
+      // With a payload naming repo B: B wins.
+      expect(resolveHookRoots(repoB).localRoot).toBe(repoB);
+      // With NO payload (direct CLI invocation): the physical cwd wins.
+      expect(resolveHookRoots(undefined).localRoot).toBe(repoB);
+      // …but a payload that matches the ENV repo proves the env anchor
+      // is live after all — it wins the tie.
+      expect(resolveHookRoots(repoA).localRoot).toBe(repoA);
+    } finally {
+      process.chdir(prevCwd);
       if (prev === undefined) delete process.env['CLAUDE_PROJECT_DIR'];
       else process.env['CLAUDE_PROJECT_DIR'] = prev;
     }
