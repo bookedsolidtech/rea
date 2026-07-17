@@ -79,12 +79,23 @@ export async function applyTofuGate(
   // side effects and drop a server that a racing accept had already
   // trusted in the shared store.
   let classifications: TofuClassification[] = [];
-  const { lockError } = await updateFingerprintStore(baseDir, (fresh) => {
+  const { lockError } = await updateFingerprintStore(baseDir, async (fresh) => {
     classifications = classifyServers(
       servers,
       fresh,
       acceptDrift !== undefined ? { acceptDrift } : {},
     );
+    // Round-32 P2: side effects fire BEFORE the store persists — a
+    // crash/SIGTERM after persisting but before the first-seen/drift
+    // banner + audit record would make the next boot classify the
+    // fingerprint as `unchanged` and permanently swallow exactly the
+    // trust decision TOFU exists to surface. Emitting first means a
+    // crash in this window re-emits on the next boot (duplicate
+    // banner) instead of going silent. Lock ordering stays acyclic:
+    // store lock → audit lock here; no path takes them in reverse.
+    for (const c of classifications) {
+      await emitSideEffects(baseDir, c, log);
+    }
     return updateStore(fresh, classifications);
   });
   if (lockError !== undefined) {
@@ -94,15 +105,11 @@ export async function applyTofuGate(
     });
   }
 
-  // Side effects + acceptance fire AFTER the locked update, from the
-  // classifications made against the fresh store — consistent with
-  // what was persisted.
   const byName = new Map(servers.map((s) => [s.name, s]));
   const accepted: RegistryServer[] = [];
   for (const c of classifications) {
     const server = byName.get(c.server);
     if (server === undefined) continue; // defensive — classifyServers preserves order
-    await emitSideEffects(baseDir, c, log);
     if (c.verdict === 'drifted' && !c.bypassed) continue;
     accepted.push(server);
   }

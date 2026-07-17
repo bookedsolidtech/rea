@@ -698,12 +698,42 @@ shim_worktree_handoff() {
   #     worktree session CLAUDE_PROJECT_DIR pins the PRIMARY checkout,
   #     so without this every bash-tier policy read (policy-read.sh /
   #     policy-reader.sh honor a pre-set REA_ROOT) would consult the
-  #     wrong worktree's policy. Guards: jq present, cwd non-empty,
-  #     `.rea/` exists at the resolved root — any miss keeps the
-  #     halt-check-derived REA_ROOT (plain-checkout behavior).
+  #     wrong worktree's policy. Guards: a REAL JSON parser present
+  #     (round-32 P1: jq → python3 → node — never a regex scrape, which
+  #     an embedded '"cwd":"..."' inside tool_input.command could
+  #     spoof into pointing enforcement at a hostile root), cwd
+  #     non-empty, `.rea/` exists at the resolved root — any miss
+  #     keeps the halt-check-derived REA_ROOT (plain-checkout
+  #     behavior).
+  _payload_cwd=""
   if command -v jq >/dev/null 2>&1; then
     _payload_cwd=$(printf '%s' "$INPUT" | jq -r '.cwd // empty' 2>/dev/null || true)
-    if [ -n "$_payload_cwd" ] && [ -d "$_payload_cwd" ]; then
+  elif command -v python3 >/dev/null 2>&1; then
+    _payload_cwd=$(printf '%s' "$INPUT" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    c = d.get("cwd") if isinstance(d, dict) else None
+    sys.stdout.write(c if isinstance(c, str) else "")
+except Exception:
+    pass
+' 2>/dev/null || true)
+  elif command -v node >/dev/null 2>&1; then
+    _payload_cwd=$(printf '%s' "$INPUT" | node -e '
+let raw = "";
+process.stdin.on("data", (c) => { raw += c; });
+process.stdin.on("end", () => {
+  try {
+    const d = JSON.parse(raw);
+    if (d !== null && typeof d === "object" && typeof d.cwd === "string") {
+      process.stdout.write(d.cwd);
+    }
+  } catch {}
+});
+' 2>/dev/null || true)
+  fi
+  if [ -n "$_payload_cwd" ]; then
+    if [ -d "$_payload_cwd" ]; then
       _payload_root="$_payload_cwd"
       while [ "$_payload_root" != "/" ]; do
         if [ -d "${_payload_root}/.rea" ]; then
