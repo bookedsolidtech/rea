@@ -33,13 +33,52 @@ rea_root() {
 # Exit with code 2 (deny) if .rea/HALT exists.
 # Prints the first 1024 bytes of HALT to stderr so the operator sees the
 # reason the system was frozen. Safe to call from any hook.
+# 0.54.0 worktree state — resolve the COMMON (primary-checkout) root for
+# a linked worktree. Discriminator: a linked worktree's `.git` is a FILE
+# (plain checkouts have a directory and pay only this -f test, zero git
+# subprocesses). One `git rev-parse --git-common-dir` runs only inside a
+# worktree. Any failure degrades to the local root — per-worktree
+# isolation, the pre-0.54.0 behavior.
+rea_common_root() {
+  local root="$1"
+  if [ ! -f "${root}/.git" ]; then
+    printf '%s' "$root"
+    return 0
+  fi
+  local common_dir
+  common_dir=$(git -C "$root" rev-parse --git-common-dir 2>/dev/null) || {
+    printf '%s' "$root"
+    return 0
+  }
+  case "$common_dir" in
+    /*) : ;;
+    *) common_dir="${root}/${common_dir}" ;;
+  esac
+  local candidate
+  candidate=$(dirname "$common_dir")
+  if [ -d "${candidate}/.rea" ] || [ -e "${candidate}/.git" ]; then
+    printf '%s' "$candidate"
+  else
+    printf '%s' "$root"
+  fi
+}
+
 check_halt() {
   local root
   root=$(rea_root)
-  local halt_file="${root}/.rea/HALT"
-  if [ -f "$halt_file" ]; then
-    printf 'REA HALT: %s\nAll agent operations suspended. Run: rea unfreeze\n' \
-      "$(head -c 1024 "$halt_file" 2>/dev/null || echo 'Reason unknown')" >&2
-    exit 2
-  fi
+  # Repo-wide kill switch (0.54.0): probe the LOCAL worktree root first
+  # (legacy per-worktree HALT still freezes its stream), then the COMMON
+  # root, where `rea freeze` and the automated reflexes write — a freeze
+  # in one worktree stops every stream. Plain checkouts probe once.
+  local common
+  common=$(rea_common_root "$root")
+  local halt_file
+  for halt_file in "${root}/.rea/HALT" "${common}/.rea/HALT"; do
+    if [ -f "$halt_file" ]; then
+      printf 'REA HALT: %s\nAll agent operations suspended. Run: rea unfreeze\n' \
+        "$(head -c 1024 "$halt_file" 2>/dev/null || echo 'Reason unknown')" >&2
+      exit 2
+    fi
+    [ "$root" = "$common" ] && break
+  done
 }
