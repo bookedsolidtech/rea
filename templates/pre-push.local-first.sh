@@ -45,7 +45,16 @@ if [ ! -x "${REA_ROOT}/node_modules/.bin/rea" ] && [ ! -f "${REA_ROOT}/dist/cli/
   esac
   if [ -n "$_rea_common_dir" ]; then
     _rea_common=$(dirname "$_rea_common_dir")
-    if { [ -d "${_rea_common}/.rea" ] || [ -e "${_rea_common}/.git" ]; } \
+    # Round-36 P2: a --separate-git-dir primary keeps its metadata
+    # outside the checkout — dirname of the common dir is then NOT the
+    # checkout. Fall back to git's first listed worktree (the main
+    # one) before giving up on an in-repo install.
+    if [ ! -d "${_rea_common}/.rea" ] && [ ! -e "${_rea_common}/.git" ]; then
+      _rea_common=$(git -C "$REA_ROOT" worktree list --porcelain 2>/dev/null \
+        | sed -n 's/^worktree //p' | head -n 1)
+    fi
+    if [ -n "$_rea_common" ] && [ "$_rea_common" != "$REA_ROOT" ] \
+       && { [ -d "${_rea_common}/.rea" ] || [ -e "${_rea_common}/.git" ]; } \
        && { [ -x "${_rea_common}/node_modules/.bin/rea" ] \
             || { [ -f "${_rea_common}/dist/cli/index.js" ] && [ -f "${_rea_common}/package.json" ] \
                  && grep -q '"name": *"@bookedsolid/rea"' "${_rea_common}/package.json" 2>/dev/null; }; }; then

@@ -298,7 +298,24 @@ export function listSiblingWorktreeRoots(
   commonRoot: string,
   excludeRoot?: string,
 ): string[] {
-  if (!fs.existsSync(path.join(commonRoot, '.git', 'worktrees'))) return [];
+  // Round-36 P2: the primary's `.git` may itself be a FILE (a gitfile
+  // checkout — `--separate-git-dir`, absorbed submodules). Resolve the
+  // real git dir by parsing the gitfile (zero spawns) before the
+  // worktrees/ stat gate; a plain repo still pays a single stat.
+  let gitDir = path.join(commonRoot, '.git');
+  try {
+    const st = fs.statSync(gitDir);
+    if (st.isFile()) {
+      const m = /^gitdir:\s*(.+)\s*$/m.exec(fs.readFileSync(gitDir, 'utf8'));
+      if (m === null) return [];
+      const target = m[1]?.trim() ?? '';
+      if (target.length === 0) return [];
+      gitDir = path.isAbsolute(target) ? target : path.join(commonRoot, target);
+    }
+  } catch {
+    return [];
+  }
+  if (!fs.existsSync(path.join(gitDir, 'worktrees'))) return [];
   const out = tryGit(commonRoot, ['worktree', 'list', '--porcelain']);
   if (out.length === 0) return [];
   const roots: string[] = [];
