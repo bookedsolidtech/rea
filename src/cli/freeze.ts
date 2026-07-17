@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import path from 'node:path';
 import * as p from '@clack/prompts';
 import { HALT_FILE, REA_DIR, err, log, reaPath } from './utils.js';
@@ -80,10 +81,25 @@ export async function runUnfreeze(options: UnfreezeOptions): Promise<void> {
   // pre-upgrade hook, must not keep this stream frozen after the
   // operator unfroze). In a plain checkout the two coincide.
   const roots = resolveReaRoots(process.cwd());
-  const haltFiles = [
-    reaPath(roots.commonRoot, HALT_FILE),
-    ...(roots.commonRoot !== roots.localRoot ? [reaPath(roots.localRoot, HALT_FILE)] : []),
-  ].filter((f) => fs.existsSync(f));
+  // Sweep EVERY worktree of the repository (round-9 P2): a legacy
+  // pre-0.54.0 local HALT in a sibling stream must not keep that stream
+  // frozen after the operator unfroze the repo. `git worktree list` is
+  // authoritative; failure degrades to common+current (best effort).
+  const worktreeRoots = new Set<string>([roots.commonRoot, roots.localRoot]);
+  try {
+    const out = execFileSync('git', ['-C', roots.commonRoot, 'worktree', 'list', '--porcelain'], {
+      encoding: 'utf8',
+      timeout: 5_000,
+    });
+    for (const line of out.split('\n')) {
+      if (line.startsWith('worktree ')) worktreeRoots.add(line.slice('worktree '.length).trim());
+    }
+  } catch {
+    /* best effort — common + current still clear below */
+  }
+  const haltFiles = [...worktreeRoots]
+    .map((r) => reaPath(r, HALT_FILE))
+    .filter((f) => fs.existsSync(f));
 
   if (haltFiles.length === 0) {
     log('Not frozen — no .rea/HALT file found.');

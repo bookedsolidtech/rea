@@ -202,7 +202,22 @@ export function resolveHookRoots(
   const payload = tryResolve(payloadCwd);
   if (payload !== null && hasRea(payload)) {
     if (anchor === null || !hasRea(anchor)) return payload;
-    if (path.resolve(payload.commonRoot) === path.resolve(anchor.commonRoot)) return payload;
+    if (path.resolve(payload.commonRoot) === path.resolve(anchor.commonRoot)) {
+      // Same repository. Round-9 P1 refinement: the payload worktree is
+      // accepted only when the anchor is the PRIMARY checkout — the
+      // Claude worktree-session shape (CLAUDE_PROJECT_DIR pins the
+      // primary while the session works in a linked worktree). When the
+      // session is ANCHORED IN a worktree, a payload naming a SIBLING
+      // worktree keeps the anchor: switching roots to the sibling would
+      // make absolute writes back into the anchor worktree fall outside
+      // both roots and bypass its blocked/protected enforcement.
+      const anchorIsPrimary =
+        path.resolve(anchor.localRoot) === path.resolve(anchor.commonRoot);
+      if (anchorIsPrimary || path.resolve(payload.localRoot) === path.resolve(anchor.localRoot)) {
+        return payload;
+      }
+      return anchor;
+    }
     // Foreign-repo payload — pinned to the session anchor.
   }
   if (anchor !== null && hasRea(anchor)) return anchor;

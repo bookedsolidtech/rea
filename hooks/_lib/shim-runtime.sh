@@ -680,6 +680,13 @@ shim_run() {
                && [ "$_payload_root" != "$REA_ROOT" ]; then
               break
             fi
+            # Round-9 P1: same repo, but a payload naming a SIBLING
+            # worktree of a worktree-anchored session keeps the anchor
+            # (only a PRIMARY-checkout anchor hands over to the payload
+            # worktree — the Claude session shape).
+            if [ -f "${REA_ROOT}/.git" ] && [ "$_payload_root" != "$REA_ROOT" ]; then
+              break
+            fi
           fi
           # Only REA_ROOT (policy reads) follows the payload; `proj`
           # (the CLI-resolution sandbox) stays on CLAUDE_PROJECT_DIR —

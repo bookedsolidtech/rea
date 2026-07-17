@@ -231,6 +231,29 @@ describe('resolveHookRoots — guarded candidate ladder', () => {
     }
   });
 
+  it('SIBLING-worktree payload keeps a worktree-anchored session pinned (round-9 P1)', () => {
+    const repo = path.join(scratch, 'repo');
+    makeRepo(repo);
+    const wtA = path.join(scratch, 'wt-anchor');
+    const wtB = path.join(scratch, 'wt-sibling');
+    git(repo, 'worktree', 'add', '-q', wtA, '-b', 'anchor-branch');
+    git(repo, 'worktree', 'add', '-q', wtB, '-b', 'sibling-branch');
+    const prev = process.env['CLAUDE_PROJECT_DIR'];
+    process.env['CLAUDE_PROJECT_DIR'] = wtA; // session anchored IN worktree A
+    try {
+      const roots = resolveHookRoots(wtB); // payload names sibling B
+      expect(roots.localRoot).toBe(wtA); // pinned — B must not bypass A's enforcement
+      // …while a PRIMARY-checkout anchor still hands over to the payload
+      // worktree (the Claude session shape):
+      process.env['CLAUDE_PROJECT_DIR'] = repo;
+      const roots2 = resolveHookRoots(wtB);
+      expect(roots2.localRoot).toBe(wtB);
+    } finally {
+      if (prev === undefined) delete process.env['CLAUDE_PROJECT_DIR'];
+      else process.env['CLAUDE_PROJECT_DIR'] = prev;
+    }
+  });
+
   it('explicitRoot in a plain temp dir behaves exactly like today (degenerate)', () => {
     const dir = path.join(scratch, 'tmp-seam');
     fs.mkdirSync(path.join(dir, '.rea'), { recursive: true });
