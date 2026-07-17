@@ -195,7 +195,13 @@ function normalizeTarget(
       else {
         // Rounds 5+10: symlink resolved INTO the primary checkout or a
         // sibling worktree — derive the cross-root-relative form.
+        // Round-17 P2: when the LEXICAL hit was cross-root
+        // (effectiveRoot !== reaRoot), a symlink there may bridge BACK
+        // into the local worktree — include the local root so
+        // `cp x <primary>/bridge/package.json` still matches a local
+        // `blocked_paths: ["package.json"]` via the resolved form.
         const crossRootsSym = [
+          ...(effectiveRoot !== reaRoot ? [reaRoot] : []),
           ...(commonRoot !== undefined && commonRoot !== effectiveRoot ? [commonRoot] : []),
           ...(siblingRoots ?? []),
         ];

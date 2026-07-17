@@ -387,6 +387,15 @@ interface NormalizedTarget {
   original: string;
   /** The fully-resolved (symlink-walked) project-relative path, when different. */
   resolvedLc: string | null;
+  /**
+   * Round-17 P2: the root `resolvedLc` was derived against when it is
+   * NOT the same root as `pathLc` — a symlink inside the primary
+   * checkout may bridge BACK into the local worktree (or a sibling),
+   * and the resolved form must be matched with the pattern set of the
+   * root it actually lives in (the LOCAL root's own effective set, or
+   * the strict cross-root union for another stream).
+   */
+  resolvedRootPath?: string;
 }
 
 /**
@@ -588,16 +597,58 @@ function normalizeTarget(
       if (cross === reaRoot || !isInsideRoot(collapsed, cross)) continue;
       const crossRelative = collapsed === cross ? '' : collapsed.slice(cross.length + 1);
       const trailing = normalized.endsWith('/');
-      return {
-        pathLc: (trailing && crossRelative.length > 0 && !crossRelative.endsWith('/')
+      const crossPathLc = (
+        trailing && crossRelative.length > 0 && !crossRelative.endsWith('/')
           ? crossRelative + '/'
           : crossRelative
-        ).toLowerCase(),
+      ).toLowerCase();
+      // Round-17 P2: a path INSIDE the primary checkout (or a sibling)
+      // may itself be a symlink bridging BACK into the local worktree —
+      // `cp x <primary>/bridge/file` where `bridge` → `<local>/.rea`.
+      // The early return here used to skip the symlink walk entirely,
+      // so only the logical `bridge/file` form was ever matched.
+      // Resolve now, deriving the relative form against the hit cross
+      // root FIRST, then the local root, then the remaining roots.
+      let crossResolvedLc: string | null = null;
+      let crossResolvedRoot: string | undefined;
+      try {
+        const resolved = resolveSymlinksWalkUp(collapsed);
+        if (resolved === SYMLINK_DYNAMIC_SENTINEL) {
+          return {
+            pathLc: '__rea_unresolved_expansion__',
+            sentinel: 'expansion',
+            original: raw,
+            resolvedLc: null,
+          };
+        }
+        if (resolved !== null) {
+          const candidates = [cross, reaRoot, ...crossRoots.filter((r) => r !== cross)];
+          for (const candRoot of candidates) {
+            const realCand = realpathSafe(candRoot) ?? candRoot;
+            let rel: string | null = null;
+            if (resolved === realCand) rel = '';
+            else if (resolved.startsWith(realCand + '/')) rel = resolved.slice(realCand.length + 1);
+            else if (resolved.startsWith(candRoot + '/')) rel = resolved.slice(candRoot.length + 1);
+            if (rel === null) continue;
+            const candidateLc = rel.toLowerCase();
+            if (candRoot !== cross || candidateLc !== crossPathLc) {
+              crossResolvedLc = candidateLc;
+              crossResolvedRoot = candRoot;
+            }
+            break;
+          }
+        }
+      } catch {
+        // Best-effort — the logical cross-relative form is still checked.
+      }
+      return {
+        pathLc: crossPathLc,
         sentinel: null,
         original: raw,
-        resolvedLc: null,
+        resolvedLc: crossResolvedLc,
         crossRoot: true,
         crossRootPath: cross,
+        ...(crossResolvedRoot !== undefined ? { resolvedRootPath: crossResolvedRoot } : {}),
       };
     }
     if (hadDotDot) {
@@ -1229,9 +1280,27 @@ export function scanForProtectedViolations(
         ...(d.position.line > 0 ? { sourcePosition: d.position } : {}),
       });
     }
-    // Symlink-resolved-form match.
+    // Symlink-resolved-form match. Round-17 P2: when the resolved form
+    // lives in a DIFFERENT root than the logical form, match it with
+    // that root's pattern set — the caller's own effective set when the
+    // bridge lands back in the local worktree, the strict cross-root
+    // union otherwise.
+    const resolvedPatterns: EffectivePatterns =
+      norm.resolvedRootPath === undefined
+        ? patternsFor(norm)
+        : norm.resolvedRootPath === ctx.reaRoot
+          ? effective
+          : {
+              full: [
+                ...new Set([
+                  ...STRICT_CROSS_ROOT_PATTERNS,
+                  ...(ctx.protectedPatternsForRoot?.(norm.resolvedRootPath) ?? []),
+                ]),
+              ],
+              override: [],
+            };
     if (norm.resolvedLc !== null) {
-      const resolvedHit = checkPathProtected(norm.resolvedLc, patternsFor(norm), dirOptions);
+      const resolvedHit = checkPathProtected(norm.resolvedLc, resolvedPatterns, dirOptions);
       if (resolvedHit !== null) {
         return blockVerdict({
           reason: buildBlockReason({

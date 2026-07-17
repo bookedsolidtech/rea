@@ -254,6 +254,29 @@ describe('worktree-state integration (real git worktree add)', () => {
     expect(bv.verdict).toBe('block');
   });
 
+  it('(vi-e) REVERSE bridge: symlink in the PRIMARY checkout back into the worktree (round-17)', () => {
+    // bridge -> <wtA>/.rea lives in the PRIMARY checkout. The logical
+    // form is common-relative ("bridge/HALT" — no pattern hit); only
+    // the symlink-resolved form reveals the LOCAL worktree's HALT.
+    const bridge = path.join(repo, 'bridge');
+    fs.symlinkSync(path.join(wtA, '.rea'), bridge);
+    const v = runProtectedScan(
+      { reaRoot: wtA, commonRoot: repo, policy: { protected_paths_relax: [] }, stderr: () => {} },
+      `echo forged > ${repo}/bridge/HALT`,
+    );
+    expect(v.verdict).toBe('block');
+
+    // Same class at the blocked-paths tier: a primary-checkout symlink
+    // to the worktree root must not launder a local blocked_paths hit.
+    const bridge2 = path.join(repo, 'bridge2');
+    fs.symlinkSync(wtA, bridge2);
+    const bv = runBlockedScan(
+      { reaRoot: wtA, commonRoot: repo, blockedPaths: ['package.json'] },
+      `cp /tmp/x ${repo}/bridge2/package.json`,
+    );
+    expect(bv.verdict).toBe('block');
+  });
+
   it('(vi-d) SIBLING worktree governed state is protected too (round-10 P1)', async () => {
     // Absolute Write into sibling B's policy from a session in A.
     const sp = await runSettingsProtection({
