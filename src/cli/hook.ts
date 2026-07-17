@@ -38,7 +38,7 @@ import { parse as parseYaml } from 'yaml';
 import { parsePrePushStdin, runPushGate } from '../hooks/push-gate/index.js';
 import { runBlockedScan, runProtectedScan, type Verdict } from '../hooks/bash-scanner/index.js';
 import { checkHaltRoots, formatHaltBanner } from '../hooks/_lib/halt-check.js';
-import { resolveHookRoots, resolveReaRoots, resolveCommonRoot } from '../lib/worktree-roots.js';
+import { resolveHookRoots, resolveReaRoots, resolveCommonRoot, listSiblingWorktreeRoots } from '../lib/worktree-roots.js';
 import { runHookPrIssueLinkGate } from '../hooks/pr-issue-link-gate/index.js';
 import { runHookSecurityDisclosureGate } from '../hooks/security-disclosure-gate/index.js';
 import { runHookAttributionAdvisory } from '../hooks/attribution-advisory/index.js';
@@ -330,6 +330,7 @@ export async function runHookScanBash(options: HookScanBashOptions): Promise<voi
         {
           reaRoot,
           commonRoot,
+          siblingRoots: listSiblingWorktreeRoots(commonRoot, reaRoot),
           policy: {
             ...(protectedWrites !== undefined ? { protected_writes: protectedWrites } : {}),
             protected_paths_relax: protectedRelax,
@@ -340,7 +341,7 @@ export async function runHookScanBash(options: HookScanBashOptions): Promise<voi
         cmd,
       );
     } else {
-      verdict = runBlockedScan({ reaRoot, commonRoot, blockedPaths }, cmd);
+      verdict = runBlockedScan({ reaRoot, commonRoot, siblingRoots: listSiblingWorktreeRoots(commonRoot, reaRoot), blockedPaths }, cmd);
     }
   } catch (e) {
     // Any exception in the scanner is a bug; fail closed.

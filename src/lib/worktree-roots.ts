@@ -228,6 +228,36 @@ export function resolveHookRoots(
   return payload ?? anchor ?? resolveReaRoots(process.cwd(), stderrWrite);
 }
 
+/**
+ * Enumerate the OTHER worktree roots of the repository (round-10 P1):
+ * absolute writes into a SIBLING worktree's `.rea/`/`.claude/` state
+ * must be governable, so the gates normalize against these too.
+ *
+ * Zero-cost discriminator: `<commonRoot>/.git/worktrees/` only exists
+ * when linked worktrees do — plain repos return `[]` with a single
+ * stat and NO git subprocess. With worktrees present, one
+ * `git worktree list --porcelain` enumerates them; failure degrades to
+ * `[]` (the common-root coverage still applies).
+ */
+export function listSiblingWorktreeRoots(
+  commonRoot: string,
+  excludeRoot?: string,
+): string[] {
+  if (!fs.existsSync(path.join(commonRoot, '.git', 'worktrees'))) return [];
+  const out = tryGit(commonRoot, ['worktree', 'list', '--porcelain']);
+  if (out.length === 0) return [];
+  const roots: string[] = [];
+  for (const line of out.split('\n')) {
+    if (!line.startsWith('worktree ')) continue;
+    const root = line.slice('worktree '.length).trim();
+    if (root.length === 0) continue;
+    if (excludeRoot !== undefined && path.resolve(root) === path.resolve(excludeRoot)) continue;
+    if (path.resolve(root) === path.resolve(commonRoot)) continue;
+    roots.push(root);
+  }
+  return roots;
+}
+
 function tryGit(cwd: string, args: string[]): string {
   try {
     const r = spawnSync('git', args, { cwd, encoding: 'utf8', timeout: 5_000 });

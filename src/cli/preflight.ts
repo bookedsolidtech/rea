@@ -72,6 +72,18 @@ export interface RunPreflightOptions {
   noReviewCheck?: boolean;
   /** Emit a single JSON line on stdout instead of pretty output. */
   json?: boolean;
+  /**
+   * 0.54.0 round-10 P1b — what the caller is gating. For `push`, the
+   * content that leaves the machine is the COMMIT, so a coverage entry
+   * whose content_token equals the PRISTINE tree of HEAD (a clean-tree
+   * review of exactly the pushed commit, possibly from another
+   * worktree) counts even when the caller's own working tree has
+   * unrelated WIP. For `commit` (and when unset — the strict default),
+   * the round-27 F3 semantics hold unchanged: a token mismatch is
+   * authoritative staleness, because the tree being committed IS the
+   * content under review.
+   */
+  operation?: 'push' | 'commit';
 }
 
 interface PreflightOutcome {
@@ -188,7 +200,20 @@ export async function computePreflight(
   const maxAgeSeconds =
     policy?.review?.local_review?.max_age_seconds ?? DEFAULT_MAX_AGE_SECONDS;
   if (!reviewCheckSkipped) {
-    const lookup = findRecentLocalReview(commonRoot, headSha, maxAgeSeconds, new Date(), contentToken);
+    // Pristine token: only computed for PUSH gating (see the predicate's
+    // round-10 P1b branch) — one `git rev-parse HEAD^{tree}` spawn.
+    const pristineToken =
+      options.operation === 'push' && headSha.length > 0
+        ? resolveRef(baseDir, 'HEAD^{tree}')
+        : '';
+    const lookup = findRecentLocalReview(
+      commonRoot,
+      headSha,
+      maxAgeSeconds,
+      new Date(),
+      contentToken,
+      pristineToken,
+    );
     if (!lookup.found) {
       // 0.28.0 round-29 P3: when the most recent path-matching audit
       // entry was blocking/error, the operator HAS reviewed — they
@@ -515,6 +540,7 @@ export function findRecentLocalReview(
   maxAgeSeconds: number,
   now: Date = new Date(),
   contentToken: string = '',
+  pristineToken: string = '',
 ): LocalReviewLookupResult {
   // 0.26.0 helix-026 finding-1: callers can match by content_token,
   // head_sha, or both. We need at least ONE non-empty key — without
@@ -582,7 +608,24 @@ export function findRecentLocalReview(
     if (recordedToken.length > 0 && contentToken.length > 0) {
       // Both sides have a token — token comparison is AUTHORITATIVE.
       if (recordedToken === contentToken) matchKind = 'content_token';
-      // Token mismatch: this entry is stale. Do NOT fall back.
+      else if (
+        pristineToken.length > 0 &&
+        recordedToken === pristineToken &&
+        recordedSha.length > 0 &&
+        headSha.length > 0 &&
+        recordedSha === headSha
+      ) {
+        // 0.54.0 round-10 P1b (PUSH callers only — the caller supplies
+        // pristineToken exclusively for push gating): the entry reviewed
+        // the CLEAN tree of exactly this commit. The caller's own WIP
+        // is not part of what a push ships, so a clean-tree review of
+        // the pushed sha — typically written from another worktree —
+        // is coverage. The round-27 F3 defense is untouched: commit
+        // gating never passes a pristineToken, so a dirtied tree still
+        // refuses there.
+        matchKind = 'head_sha';
+      }
+      // Any other token mismatch: this entry is stale. Do NOT fall back.
     } else if (recordedSha.length > 0 && headSha.length > 0 && recordedSha === headSha) {
       // No token on this entry (or caller). Legacy / non-git fallback.
       matchKind = 'head_sha';
@@ -679,11 +722,18 @@ export function registerPreflightCommand(program: Command): void {
       'skip the audit-log lookup (still runs commit-hygiene). Audit-logged escape hatch — different from the per-invocation env-var override.',
     )
     .option('--json', 'emit a single-line JSON outcome instead of human-readable output')
-    .action(async (opts: { strict?: boolean; reviewCheck?: boolean; json?: boolean }) => {
+    .option(
+      '--operation <op>',
+      "what is being gated: 'push' enables the pristine-tree coverage fallback (a clean-tree review of exactly the pushed sha — typically from another worktree — counts even with local WIP); 'commit'/unset keeps token-authoritative staleness (round-27 F3). Husky pre-push passes 'push'.",
+    )
+    .action(async (opts: { strict?: boolean; reviewCheck?: boolean; json?: boolean; operation?: string }) => {
       // Commander negation: --no-review-check sets opts.reviewCheck = false.
       // We invert to noReviewCheck for clarity in the runner.
       const noReviewCheck = opts.reviewCheck === false;
+      const operation =
+        opts.operation === 'push' || opts.operation === 'commit' ? opts.operation : undefined;
       await runPreflight({
+        ...(operation !== undefined ? { operation } : {}),
         ...(opts.strict === true ? { strict: true } : {}),
         ...(noReviewCheck ? { noReviewCheck: true } : {}),
         ...(opts.json === true ? { json: true } : {}),

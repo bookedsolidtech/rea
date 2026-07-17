@@ -97,6 +97,14 @@ export interface ProtectedScanContext {
    * plain-checkout behavior.
    */
   commonRoot?: string;
+  /**
+   * Round-10 P1: SIBLING worktree roots of the same repository. A write
+   * target landing inside any of these normalizes sibling-relative and
+   * matches the protected list — another stream's `.rea/`/`.claude/`
+   * state is governable, not out-of-scope. Callers compute via
+   * `listSiblingWorktreeRoots` (zero-cost in plain repos).
+   */
+  siblingRoots?: readonly string[];
   policy: Pick<Policy, 'protected_writes' | 'protected_paths_relax'>;
   /**
    * Stderr sink for advisory messages (e.g. "kill-switch invariant in
@@ -368,6 +376,7 @@ function normalizeTarget(
   form?: DetectedForm,
   passwdHome?: string,
   commonRoot?: string,
+  siblingRoots?: readonly string[],
 ): NormalizedTarget {
   // 1. Strip surrounding matching quotes (the parser already strips
   //    them for SglQuoted/DblQuoted, but a literal node can still hold
@@ -542,18 +551,18 @@ function normalizeTarget(
     // shared enforcement state — an absolute path into the primary
     // checkout must not be a bypass just because the session runs in a
     // linked worktree.
-    if (
-      commonRoot !== undefined &&
-      commonRoot !== reaRoot &&
-      isInsideRoot(collapsed, commonRoot)
-    ) {
-      const commonRelative =
-        collapsed === commonRoot ? '' : collapsed.slice(commonRoot.length + 1);
+    const crossRoots = [
+      ...(commonRoot !== undefined && commonRoot !== reaRoot ? [commonRoot] : []),
+      ...(siblingRoots ?? []),
+    ];
+    for (const cross of crossRoots) {
+      if (cross === reaRoot || !isInsideRoot(collapsed, cross)) continue;
+      const crossRelative = collapsed === cross ? '' : collapsed.slice(cross.length + 1);
       const trailing = normalized.endsWith('/');
       return {
-        pathLc: (trailing && commonRelative.length > 0 && !commonRelative.endsWith('/')
-          ? commonRelative + '/'
-          : commonRelative
+        pathLc: (trailing && crossRelative.length > 0 && !crossRelative.endsWith('/')
+          ? crossRelative + '/'
+          : crossRelative
         ).toLowerCase(),
         sentinel: null,
         original: raw,
@@ -624,18 +633,26 @@ function normalizeTarget(
         resolvedRelative = resolved.slice(realRoot.length + 1);
       } else if (resolved.startsWith(reaRoot + '/')) {
         resolvedRelative = resolved.slice(reaRoot.length + 1);
-      } else if (commonRoot !== undefined && commonRoot !== reaRoot) {
-        // 0.54.0 round-5 P1: a worktree-local symlink pointed at the
-        // PRIMARY checkout (`shared -> <primary>/.rea`) resolves outside
-        // the local root — derive the common-relative form so the
-        // protected list still matches the shared enforcement state.
-        const realCommon = realpathSafe(commonRoot) ?? commonRoot;
-        if (resolved === realCommon) {
-          resolvedRelative = '';
-        } else if (resolved.startsWith(realCommon + '/')) {
-          resolvedRelative = resolved.slice(realCommon.length + 1);
-        } else if (resolved.startsWith(commonRoot + '/')) {
-          resolvedRelative = resolved.slice(commonRoot.length + 1);
+      } else {
+        // 0.54.0 rounds 5+10: a worktree-local symlink pointed at the
+        // PRIMARY checkout or a SIBLING worktree resolves outside the
+        // local root — derive the cross-root-relative form so the
+        // protected list still matches governed state in other streams.
+        const crossRoots = [
+          ...(commonRoot !== undefined && commonRoot !== reaRoot ? [commonRoot] : []),
+          ...(siblingRoots ?? []),
+        ];
+        for (const cross of crossRoots) {
+          if (cross === reaRoot) continue;
+          const realCross = realpathSafe(cross) ?? cross;
+          if (resolved === realCross) {
+            resolvedRelative = '';
+          } else if (resolved.startsWith(realCross + '/')) {
+            resolvedRelative = resolved.slice(realCross.length + 1);
+          } else if (resolved.startsWith(cross + '/')) {
+            resolvedRelative = resolved.slice(cross.length + 1);
+          }
+          if (resolvedRelative !== null) break;
         }
       }
       if (resolvedRelative !== null) {
@@ -1074,7 +1091,7 @@ export function scanForProtectedViolations(
     }
     if (d.path.length === 0) continue;
 
-    const norm = normalizeTarget(ctx.reaRoot, d.path, d.form, ctx.passwdHome, ctx.commonRoot);
+    const norm = normalizeTarget(ctx.reaRoot, d.path, d.form, ctx.passwdHome, ctx.commonRoot, ctx.siblingRoots);
     if (norm.sentinel === 'global_root') {
       return blockVerdict({
         reason: [

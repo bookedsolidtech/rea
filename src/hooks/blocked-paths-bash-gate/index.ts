@@ -37,7 +37,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { parse as parseYaml } from 'yaml';
 import { checkHaltRoots, formatHaltBanner } from '../_lib/halt-check.js';
-import { resolveHookRoots } from '../../lib/worktree-roots.js';
+import { resolveHookRoots, listSiblingWorktreeRoots } from '../../lib/worktree-roots.js';
 import {
   parseHookPayload,
   MalformedPayloadError,
@@ -172,7 +172,10 @@ export async function runBlockedPathsBashGate(
   }
 
   // 7. Scan.
-  const verdict = runBlockedScan({ reaRoot, commonRoot, blockedPaths }, cmd);
+  const verdict = runBlockedScan(
+    { reaRoot, commonRoot, siblingRoots: listSiblingWorktreeRoots(commonRoot, reaRoot), blockedPaths },
+    cmd,
+  );
 
   // 8. Audit — best-effort, never changes verdict.
   try {

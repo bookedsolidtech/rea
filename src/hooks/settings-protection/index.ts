@@ -55,7 +55,7 @@ import crypto from 'node:crypto';
 import { execSync } from 'node:child_process';
 import { parse as parseYaml } from 'yaml';
 import { checkHaltRoots, formatHaltBanner } from '../_lib/halt-check.js';
-import { resolveHookRoots } from '../../lib/worktree-roots.js';
+import { resolveHookRoots, listSiblingWorktreeRoots } from '../../lib/worktree-roots.js';
 import {
   parseWriteHookPayload,
   MalformedPayloadError,
@@ -208,6 +208,9 @@ export async function runSettingsProtection(
   // Policy/path checks key off the LOCAL (worktree) root; audit and the
   // kill switch key off the COMMON (repository) root.
   const { localRoot: reaRoot, commonRoot } = resolveHookRoots(payloadCwd, options.reaRoot);
+  // Round-10 P1: sibling worktrees' governed state is in scope too;
+  // zero-cost in plain repos (stat-gated on .git/worktrees).
+  const siblingRoots = listSiblingWorktreeRoots(commonRoot, reaRoot);
   // 1. HALT check.
   const halt = checkHaltRoots(reaRoot, commonRoot);
   if (halt.halted) {
@@ -239,13 +242,21 @@ export async function runSettingsProtection(
   // enforcement state from a worktree session. Symlink checks below
   // keep using the raw (absolute) filePath — only pattern matching
   // consumes the relative form.
-  if (
-    commonRoot !== reaRoot &&
-    path.isAbsolute(normalized) &&
-    (path.resolve(normalized) === path.resolve(commonRoot) ||
-      path.resolve(normalized).startsWith(path.resolve(commonRoot) + path.sep))
-  ) {
-    normalized = normalizePath(filePath, commonRoot);
+  if (commonRoot !== reaRoot || siblingRoots.length > 0) {
+    const crossRoots = [
+      ...(commonRoot !== reaRoot ? [commonRoot] : []),
+      ...siblingRoots,
+    ];
+    if (path.isAbsolute(normalized)) {
+      const resolvedNorm = path.resolve(normalized);
+      for (const cross of crossRoots) {
+        const crossResolved = path.resolve(cross);
+        if (resolvedNorm === crossResolved || resolvedNorm.startsWith(crossResolved + path.sep)) {
+          normalized = normalizePath(filePath, cross);
+          break;
+        }
+      }
+    }
   }
   const lowerNorm = normalized.toLowerCase();
   const safeFilePath = sanitizeForStderr(filePath);
@@ -414,6 +425,7 @@ export async function runSettingsProtection(
     resolution.patterns,
     reaRoot,
     commonRoot,
+    siblingRoots,
   );
   if (symRefused !== null) {
     writeStderr('SETTINGS PROTECTION: intermediate-symlink resolution blocked\n');
@@ -527,6 +539,7 @@ function checkProtectedSymlinkResolution(
   patterns: readonly string[],
   reaRoot: string,
   commonRoot?: string,
+  siblingRoots?: readonly string[],
 ): { pattern: string; resolvedTarget: string } | null {
   // Only attempt resolution if the target exists OR its parent dir exists.
   let targetExists = false;
@@ -554,12 +567,20 @@ function checkProtectedSymlinkResolution(
   // match the protected patterns for the repo-wide shared state.
   let canonRoot = resolveCanonRoot(reaRoot);
   if (resolvedParent !== canonRoot && !resolvedParent.startsWith(canonRoot + '/')) {
-    if (commonRoot === undefined || commonRoot === reaRoot) return null;
-    const canonCommon = resolveCanonRoot(commonRoot);
-    if (resolvedParent !== canonCommon && !resolvedParent.startsWith(canonCommon + '/')) {
-      return null;
+    const crossRoots = [
+      ...(commonRoot !== undefined && commonRoot !== reaRoot ? [commonRoot] : []),
+      ...(siblingRoots ?? []),
+    ];
+    let matched: string | null = null;
+    for (const cross of crossRoots) {
+      const canonCross = resolveCanonRoot(cross);
+      if (resolvedParent === canonCross || resolvedParent.startsWith(canonCross + '/')) {
+        matched = canonCross;
+        break;
+      }
     }
-    canonRoot = canonCommon;
+    if (matched === null) return null;
+    canonRoot = matched;
   }
   const relativeResolved =
     resolvedParent === canonRoot ? '' : resolvedParent.slice(canonRoot.length + 1);

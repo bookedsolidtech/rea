@@ -253,4 +253,51 @@ describe('worktree-state integration (real git worktree add)', () => {
     );
     expect(bv.verdict).toBe('block');
   });
+
+  it('(vi-d) SIBLING worktree governed state is protected too (round-10 P1)', async () => {
+    // Absolute Write into sibling B's policy from a session in A.
+    const sp = await runSettingsProtection({
+      reaRoot: wtA,
+      stdinOverride: JSON.stringify({
+        tool_name: 'Write',
+        tool_input: { file_path: path.join(wtB, '.rea', 'policy.yaml'), content: 'forged' },
+      }),
+    });
+    expect(sp.exitCode).toBe(2);
+
+    // Bash tier: absolute redirect into sibling B's HALT.
+    const v = runProtectedScan(
+      {
+        reaRoot: wtA,
+        commonRoot: repo,
+        siblingRoots: [wtB],
+        policy: { protected_paths_relax: [] },
+        stderr: () => {},
+      },
+      `echo forged > ${wtB}/.rea/HALT`,
+    );
+    expect(v.verdict).toBe('block');
+  });
+
+  it('(ii-b) PUSH coverage: clean-tree review of the sha covers a DIRTY sibling (round-10 P1b)', async () => {
+    const headSha = git(wtA, 'rev-parse', 'HEAD');
+    const pristine = git(wtA, 'rev-parse', 'HEAD^{tree}');
+    // Worktree A reviewed the CLEAN tree of sha X.
+    await appendAuditRecord(repo, {
+      tool_name: 'rea.local_review',
+      server_name: 'rea',
+      tier: Tier.Read,
+      status: InvocationStatus.Allowed,
+      metadata: { head_sha: headSha, content_token: pristine, verdict: 'pass' },
+    });
+    // Worktree B is at the same sha with unrelated WIP (different token).
+    const dirtyToken = 'f'.repeat(40);
+    // PUSH gating: pristine fallback covers.
+    const pushLookup = findRecentLocalReview(repo, headSha, 3600, new Date(), dirtyToken, pristine);
+    expect(pushLookup.found).toBe(true);
+    // COMMIT gating (no pristine token supplied): token mismatch stays
+    // authoritative — the round-27 F3 defense is intact.
+    const commitLookup = findRecentLocalReview(repo, headSha, 3600, new Date(), dirtyToken);
+    expect(commitLookup.found).toBe(false);
+  });
 });

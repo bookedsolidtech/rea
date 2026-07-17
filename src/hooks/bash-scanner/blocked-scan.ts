@@ -34,6 +34,8 @@ export interface BlockedScanContext {
    * equal-to-reaRoot = plain-checkout behavior.
    */
   commonRoot?: string;
+  /** Round-10 P1: sibling worktree roots — see ProtectedScanContext. */
+  siblingRoots?: readonly string[];
   blockedPaths: readonly string[];
 }
 
@@ -50,6 +52,7 @@ function normalizeTarget(
   raw: string,
   form?: DetectedForm,
   commonRoot?: string,
+  siblingRoots?: readonly string[],
 ): BlockedNormalized {
   let t = raw;
   if (t.length >= 2 && t.startsWith('"') && t.endsWith('"')) t = t.slice(1, -1);
@@ -125,8 +128,13 @@ function normalizeTarget(
     // inside the COMMON (primary-checkout) root matches blocked_paths
     // common-relative — `> "$PRIMARY/package.json"` from a worktree is
     // the same governed file.
-    if (commonRoot !== undefined && commonRoot !== reaRoot && isInsideRoot(collapsed, commonRoot)) {
-      effectiveRoot = commonRoot;
+    const crossRoots = [
+      ...(commonRoot !== undefined && commonRoot !== reaRoot ? [commonRoot] : []),
+      ...(siblingRoots ?? []),
+    ];
+    const crossHit = crossRoots.find((r) => r !== reaRoot && isInsideRoot(collapsed, r));
+    if (crossHit !== undefined) {
+      effectiveRoot = crossHit;
     } else {
       // blocked_paths is project-relative; an outside-root write can't
       // match. Return a non-matching sentinel form that the matcher
@@ -170,15 +178,23 @@ function normalizeTarget(
         resolvedRelative = resolved.slice(realRoot.length + 1);
       else if (resolved.startsWith(effectiveRoot + '/'))
         resolvedRelative = resolved.slice(effectiveRoot.length + 1);
-      else if (commonRoot !== undefined && commonRoot !== effectiveRoot) {
-        // Round-5 P2: symlink resolved INTO the primary checkout —
-        // derive the common-relative form.
-        const realCommon = realpathSafe(commonRoot) ?? commonRoot;
-        if (resolved === realCommon) resolvedRelative = '';
-        else if (resolved.startsWith(realCommon + '/'))
-          resolvedRelative = resolved.slice(realCommon.length + 1);
-        else if (resolved.startsWith(commonRoot + '/'))
-          resolvedRelative = resolved.slice(commonRoot.length + 1);
+      else {
+        // Rounds 5+10: symlink resolved INTO the primary checkout or a
+        // sibling worktree — derive the cross-root-relative form.
+        const crossRootsSym = [
+          ...(commonRoot !== undefined && commonRoot !== effectiveRoot ? [commonRoot] : []),
+          ...(siblingRoots ?? []),
+        ];
+        for (const cross of crossRootsSym) {
+          if (cross === effectiveRoot) continue;
+          const realCross = realpathSafe(cross) ?? cross;
+          if (resolved === realCross) resolvedRelative = '';
+          else if (resolved.startsWith(realCross + '/'))
+            resolvedRelative = resolved.slice(realCross.length + 1);
+          else if (resolved.startsWith(cross + '/'))
+            resolvedRelative = resolved.slice(cross.length + 1);
+          if (resolvedRelative !== null) break;
+        }
       }
       if (resolvedRelative !== null) {
         const candidate = resolvedRelative.toLowerCase();
@@ -472,7 +488,7 @@ export function scanForBlockedViolations(
     }
     if (d.path.length === 0) continue;
 
-    const norm = normalizeTarget(ctx.reaRoot, d.path, d.form, ctx.commonRoot);
+    const norm = normalizeTarget(ctx.reaRoot, d.path, d.form, ctx.commonRoot, ctx.siblingRoots);
     if (norm.expansion) {
       return blockVerdict({
         reason: [

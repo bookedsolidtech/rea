@@ -31,7 +31,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import { parse as parseYaml } from 'yaml';
 import { checkHaltRoots, formatHaltBanner } from '../_lib/halt-check.js';
-import { resolveHookRoots } from '../../lib/worktree-roots.js';
+import { resolveHookRoots, listSiblingWorktreeRoots } from '../../lib/worktree-roots.js';
 import {
   parseHookPayload,
   MalformedPayloadError,
@@ -194,9 +194,11 @@ export async function runProtectedPathsBashGate(
     {
       reaRoot,
       // 0.54.0: absolute writes into the primary checkout's shared
-      // `.rea/` state from a worktree session match the protected list
-      // via common-relative normalization.
+      // `.rea/` state — or a sibling worktree's governed state
+      // (round-10 P1) — match the protected list via cross-root
+      // normalization.
       commonRoot,
+      siblingRoots: listSiblingWorktreeRoots(commonRoot, reaRoot),
       policy: {
         ...(policy.protectedWrites !== undefined
           ? { protected_writes: policy.protectedWrites }

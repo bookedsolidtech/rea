@@ -69,7 +69,7 @@ const execFileAsync = promisify(execFile);
  * classification. Bump the version suffix whenever the body semantics
  * change so upgrades can migrate old installs cleanly.
  *
- * v5 — 0.26.0 local-first enforcement: body runs `rea preflight --strict`
+ * v5 — 0.26.0 local-first enforcement: body runs `rea preflight --strict --operation push`
  *      BEFORE the push-gate dispatch. `rea preflight` refuses the push
  *      when no recent `rea.local_review` audit entry covers HEAD; the
  *      legacy push-gate then runs as the second layer (codex on push).
@@ -198,7 +198,7 @@ fi
 # \`set --\` arm, and the parent's \$@ is preserved.
 
 # 0.26.0 local-first enforcement (CTO directive 2026-05-05). Run
-# \`rea preflight --strict\` BEFORE the push-gate dispatch. Preflight
+# \`rea preflight --strict --operation push\` BEFORE the push-gate dispatch. Preflight
 # refuses (exit 2) when no recent \`rea.local_review\` audit entry
 # covers HEAD, when commit-hygiene thresholds are exceeded, or when
 # the kill-switch is active. The legacy push-gate then runs as the
@@ -208,13 +208,13 @@ fi
 # We resolve the rea binary the same way the dispatch below does.
 if (
   if [ -x "\${REA_ROOT}/node_modules/.bin/rea" ]; then
-    "\${REA_ROOT}/node_modules/.bin/rea" preflight --strict
+    "\${REA_ROOT}/node_modules/.bin/rea" preflight --strict --operation push
   elif [ -f "\${REA_ROOT}/dist/cli/index.js" ] && [ -f "\${REA_ROOT}/package.json" ] && grep -q '"name": *"@bookedsolid/rea"' "\${REA_ROOT}/package.json" 2>/dev/null; then
-    node "\${REA_ROOT}/dist/cli/index.js" preflight --strict
+    node "\${REA_ROOT}/dist/cli/index.js" preflight --strict --operation push
   elif command -v rea >/dev/null 2>&1; then
-    rea preflight --strict
+    rea preflight --strict --operation push
   elif command -v npx >/dev/null 2>&1; then
-    npx --no-install @bookedsolid/rea preflight --strict
+    npx --no-install @bookedsolid/rea preflight --strict --operation push
   else
     printf 'rea: cannot locate the rea CLI for preflight. Install locally (\`pnpm add -D @bookedsolid/rea\`) or set policy.review.local_review.mode=off.\\n' >&2
     exit 2

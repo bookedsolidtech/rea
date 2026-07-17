@@ -446,7 +446,13 @@ export async function runLocalReviewGate(
   // 8. Run preflight in-process.
   const preflightFn =
     options.preflightImpl ?? (async (root: string) => {
-      const result = await computePreflight(root, { strict: true });
+      // Round-10 P1b: pushes get the pristine-tree coverage fallback;
+      // any commit trigger keeps the strict token-authoritative
+      // semantics (mixed segments resolve to the stricter 'commit').
+      const result = await computePreflight(root, {
+        strict: true,
+        operation: opLabel === 'git push' ? 'push' : 'commit',
+      });
       return {
         exitCode: result.outcome.exitCode,
         reason: result.outcome.reason,
