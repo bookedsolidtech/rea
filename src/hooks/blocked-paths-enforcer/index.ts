@@ -252,7 +252,7 @@ export async function runBlockedPathsEnforcer(
   }
 
   // 9. §H.2 intermediate-symlink resolution.
-  const symMatched = checkSymlinkResolution(filePath, blockedPaths, reaRoot);
+  const symMatched = checkSymlinkResolution(filePath, blockedPaths, reaRoot, commonRoot);
   if (symMatched !== null) {
     writeStderr('BLOCKED PATH: intermediate-symlink resolution blocked\n');
     writeStderr('\n');
@@ -279,6 +279,7 @@ function checkSymlinkResolution(
   filePath: string,
   blockedPaths: readonly string[],
   reaRoot: string,
+  commonRoot?: string,
 ): { entry: string; resolvedTarget: string } | null {
   // Only attempt resolution if the target exists or its parent dir
   // exists — matches the bash `if [[ -e "$FILE_PATH" || -d ... ]]`.
@@ -301,12 +302,19 @@ function checkSymlinkResolution(
   const resolvedParent = resolveParentRealpath(filePath);
   if (resolvedParent.length === 0) return null;
 
-  const canonRoot = resolveCanonRoot(reaRoot);
-  // Resolved parent must be inside REA_ROOT for the check to be
-  // meaningful — external paths are out of scope (the logical-path
-  // matchers handle them).
+  // Resolved parent must be inside the LOCAL root — or, 0.54.0 round-5
+  // P2, inside the COMMON (primary-checkout) root: a worktree-local
+  // symlink pointed at the primary must not bypass blocked_paths for
+  // the same governed files. Other external paths stay out of scope
+  // (the logical-path matchers handle them).
+  let canonRoot = resolveCanonRoot(reaRoot);
   if (resolvedParent !== canonRoot && !resolvedParent.startsWith(canonRoot + '/')) {
-    return null;
+    if (commonRoot === undefined || commonRoot === reaRoot) return null;
+    const canonCommon = resolveCanonRoot(commonRoot);
+    if (resolvedParent !== canonCommon && !resolvedParent.startsWith(canonCommon + '/')) {
+      return null;
+    }
+    canonRoot = canonCommon;
   }
   const relativeResolved =
     resolvedParent === canonRoot ? '' : resolvedParent.slice(canonRoot.length + 1);

@@ -413,6 +413,7 @@ export async function runSettingsProtection(
     filePath,
     resolution.patterns,
     reaRoot,
+    commonRoot,
   );
   if (symRefused !== null) {
     writeStderr('SETTINGS PROTECTION: intermediate-symlink resolution blocked\n');
@@ -525,6 +526,7 @@ function checkProtectedSymlinkResolution(
   filePath: string,
   patterns: readonly string[],
   reaRoot: string,
+  commonRoot?: string,
 ): { pattern: string; resolvedTarget: string } | null {
   // Only attempt resolution if the target exists OR its parent dir exists.
   let targetExists = false;
@@ -546,9 +548,18 @@ function checkProtectedSymlinkResolution(
   const resolvedParent = resolveParentRealpath(filePath);
   if (resolvedParent.length === 0) return null;
 
-  const canonRoot = resolveCanonRoot(reaRoot);
+  // 0.54.0 round-5 P1: a worktree-local symlink pointed at the PRIMARY
+  // checkout resolves outside the local canon root — fall through to
+  // the COMMON canon root so `shared -> <primary>/.rea` writes still
+  // match the protected patterns for the repo-wide shared state.
+  let canonRoot = resolveCanonRoot(reaRoot);
   if (resolvedParent !== canonRoot && !resolvedParent.startsWith(canonRoot + '/')) {
-    return null;
+    if (commonRoot === undefined || commonRoot === reaRoot) return null;
+    const canonCommon = resolveCanonRoot(commonRoot);
+    if (resolvedParent !== canonCommon && !resolvedParent.startsWith(canonCommon + '/')) {
+      return null;
+    }
+    canonRoot = canonCommon;
   }
   const relativeResolved =
     resolvedParent === canonRoot ? '' : resolvedParent.slice(canonRoot.length + 1);

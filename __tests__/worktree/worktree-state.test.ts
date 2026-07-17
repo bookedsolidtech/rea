@@ -28,7 +28,7 @@ import { computeHash } from '../../src/audit/fs.js';
 import type { AuditRecord } from '../../src/gateway/middleware/audit-types.js';
 import { findRecentLocalReview } from '../../src/cli/preflight.js';
 import { writeVerdict, lookupVerdict } from '../../src/hooks/push-gate/verdict-cache.js';
-import { runProtectedScan } from '../../src/hooks/bash-scanner/index.js';
+import { runProtectedScan, runBlockedScan } from '../../src/hooks/bash-scanner/index.js';
 import { runBlockedPathsBashGate } from '../../src/hooks/blocked-paths-bash-gate/index.js';
 import { runSettingsProtection } from '../../src/hooks/settings-protection/index.js';
 import { runBlockedPathsEnforcer } from '../../src/hooks/blocked-paths-enforcer/index.js';
@@ -219,5 +219,38 @@ describe('worktree-state integration (real git worktree add)', () => {
       }),
     });
     expect(bp.exitCode).toBe(2);
+  });
+
+  it('(vi-c) worktree-local SYMLINK into the primary checkout is refused at every tier (round-5)', async () => {
+    // shared -> <primary>/.rea, then write through it.
+    const link = path.join(wtA, 'shared');
+    fs.symlinkSync(path.join(repo, '.rea'), link);
+
+    // Bash tier (protected scan): logical path is worktree-relative,
+    // only the SYMLINK-resolved form reveals the primary target.
+    const v = runProtectedScan(
+      { reaRoot: wtA, commonRoot: repo, policy: { protected_paths_relax: [] }, stderr: () => {} },
+      'echo forged > shared/HALT',
+    );
+    expect(v.verdict).toBe('block');
+
+    // Write tier (settings-protection).
+    const sp = await runSettingsProtection({
+      reaRoot: wtA,
+      stdinOverride: JSON.stringify({
+        tool_name: 'Write',
+        tool_input: { file_path: path.join(link, 'HALT'), content: 'forged' },
+      }),
+    });
+    expect(sp.exitCode).toBe(2);
+
+    // Bash tier (blocked scan) via a link at the repo root.
+    const link2 = path.join(wtA, 'primary');
+    fs.symlinkSync(repo, link2);
+    const bv = runBlockedScan(
+      { reaRoot: wtA, commonRoot: repo, blockedPaths: ['package.json'] },
+      'echo x > primary/package.json',
+    );
+    expect(bv.verdict).toBe('block');
   });
 });

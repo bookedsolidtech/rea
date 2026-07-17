@@ -624,6 +624,19 @@ function normalizeTarget(
         resolvedRelative = resolved.slice(realRoot.length + 1);
       } else if (resolved.startsWith(reaRoot + '/')) {
         resolvedRelative = resolved.slice(reaRoot.length + 1);
+      } else if (commonRoot !== undefined && commonRoot !== reaRoot) {
+        // 0.54.0 round-5 P1: a worktree-local symlink pointed at the
+        // PRIMARY checkout (`shared -> <primary>/.rea`) resolves outside
+        // the local root — derive the common-relative form so the
+        // protected list still matches the shared enforcement state.
+        const realCommon = realpathSafe(commonRoot) ?? commonRoot;
+        if (resolved === realCommon) {
+          resolvedRelative = '';
+        } else if (resolved.startsWith(realCommon + '/')) {
+          resolvedRelative = resolved.slice(realCommon.length + 1);
+        } else if (resolved.startsWith(commonRoot + '/')) {
+          resolvedRelative = resolved.slice(commonRoot.length + 1);
+        }
       }
       if (resolvedRelative !== null) {
         const candidate = resolvedRelative.toLowerCase();

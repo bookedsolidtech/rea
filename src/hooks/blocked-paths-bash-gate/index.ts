@@ -172,7 +172,7 @@ export async function runBlockedPathsBashGate(
   }
 
   // 7. Scan.
-  const verdict = runBlockedScan({ reaRoot, blockedPaths }, cmd);
+  const verdict = runBlockedScan({ reaRoot, commonRoot, blockedPaths }, cmd);
 
   // 8. Audit — best-effort, never changes verdict.
   try {

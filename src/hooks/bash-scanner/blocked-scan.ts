@@ -25,6 +25,15 @@ import type { DetectedWrite } from './walker.js';
 
 export interface BlockedScanContext {
   reaRoot: string;
+  /**
+   * 0.54.0 worktree state: the COMMON (primary-checkout) root. An
+   * absolute or symlinked target outside the local worktree root that
+   * lands inside the common root normalizes common-relative so
+   * project-relative `blocked_paths` entries still match the primary
+   * checkout's files from a worktree session. Optional; absent or
+   * equal-to-reaRoot = plain-checkout behavior.
+   */
+  commonRoot?: string;
   blockedPaths: readonly string[];
 }
 
@@ -36,7 +45,12 @@ interface BlockedNormalized {
   resolvedLc: string | null;
 }
 
-function normalizeTarget(reaRoot: string, raw: string, form?: DetectedForm): BlockedNormalized {
+function normalizeTarget(
+  reaRoot: string,
+  raw: string,
+  form?: DetectedForm,
+  commonRoot?: string,
+): BlockedNormalized {
   let t = raw;
   if (t.length >= 2 && t.startsWith('"') && t.endsWith('"')) t = t.slice(1, -1);
   if (t.length >= 2 && t.startsWith("'") && t.endsWith("'")) t = t.slice(1, -1);
@@ -105,19 +119,29 @@ function normalizeTarget(reaRoot: string, raw: string, form?: DetectedForm): Blo
     abs = path.join(reaRoot, abs);
   }
   const collapsed = collapseDotDot(abs);
+  let effectiveRoot = reaRoot;
   if (!isInsideRoot(collapsed, reaRoot)) {
-    // blocked_paths is project-relative; an outside-root write can't
-    // match. Return a non-matching sentinel form that the matcher
-    // ignores — same posture as the bash hook's "outside root → exit 0".
-    return {
-      pathLc: `__outside_root_allowed:${collapsed.toLowerCase()}`,
-      outsideRoot: true,
-      expansion: false,
-      original: raw,
-      resolvedLc: null,
-    };
+    // 0.54.0 round-5 P1: a target outside the LOCAL root that lands
+    // inside the COMMON (primary-checkout) root matches blocked_paths
+    // common-relative — `> "$PRIMARY/package.json"` from a worktree is
+    // the same governed file.
+    if (commonRoot !== undefined && commonRoot !== reaRoot && isInsideRoot(collapsed, commonRoot)) {
+      effectiveRoot = commonRoot;
+    } else {
+      // blocked_paths is project-relative; an outside-root write can't
+      // match. Return a non-matching sentinel form that the matcher
+      // ignores — same posture as the bash hook's "outside root → exit 0".
+      return {
+        pathLc: `__outside_root_allowed:${collapsed.toLowerCase()}`,
+        outsideRoot: true,
+        expansion: false,
+        original: raw,
+        resolvedLc: null,
+      };
+    }
   }
-  const projectRelative = collapsed === reaRoot ? '' : collapsed.slice(reaRoot.length + 1);
+  const projectRelative =
+    collapsed === effectiveRoot ? '' : collapsed.slice(effectiveRoot.length + 1);
   const inputHadTrailingSlash = normalized.endsWith('/');
   const pathLc = (
     inputHadTrailingSlash && projectRelative.length > 0 && !projectRelative.endsWith('/')
@@ -139,13 +163,23 @@ function normalizeTarget(reaRoot: string, raw: string, form?: DetectedForm): Blo
       };
     }
     if (resolved !== null) {
-      const realRoot = realpathSafe(reaRoot) ?? reaRoot;
+      const realRoot = realpathSafe(effectiveRoot) ?? effectiveRoot;
       let resolvedRelative: string | null = null;
       if (resolved === realRoot) resolvedRelative = '';
       else if (resolved.startsWith(realRoot + '/'))
         resolvedRelative = resolved.slice(realRoot.length + 1);
-      else if (resolved.startsWith(reaRoot + '/'))
-        resolvedRelative = resolved.slice(reaRoot.length + 1);
+      else if (resolved.startsWith(effectiveRoot + '/'))
+        resolvedRelative = resolved.slice(effectiveRoot.length + 1);
+      else if (commonRoot !== undefined && commonRoot !== effectiveRoot) {
+        // Round-5 P2: symlink resolved INTO the primary checkout —
+        // derive the common-relative form.
+        const realCommon = realpathSafe(commonRoot) ?? commonRoot;
+        if (resolved === realCommon) resolvedRelative = '';
+        else if (resolved.startsWith(realCommon + '/'))
+          resolvedRelative = resolved.slice(realCommon.length + 1);
+        else if (resolved.startsWith(commonRoot + '/'))
+          resolvedRelative = resolved.slice(commonRoot.length + 1);
+      }
       if (resolvedRelative !== null) {
         const candidate = resolvedRelative.toLowerCase();
         if (candidate !== pathLc) resolvedLc = candidate;
@@ -438,7 +472,7 @@ export function scanForBlockedViolations(
     }
     if (d.path.length === 0) continue;
 
-    const norm = normalizeTarget(ctx.reaRoot, d.path, d.form);
+    const norm = normalizeTarget(ctx.reaRoot, d.path, d.form, ctx.commonRoot);
     if (norm.expansion) {
       return blockVerdict({
         reason: [
