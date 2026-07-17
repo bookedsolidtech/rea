@@ -245,8 +245,18 @@ export function resolveHookRoots(
   const envRoots = tryResolve(process.env['CLAUDE_PROJECT_DIR']);
   const cwdRoots = tryResolve(process.cwd());
   const payload = tryResolve(payloadCwd);
+  // Round-42 P2: canonicalize before comparing — the same repository
+  // reached through a symlinked path or macOS /var ↔ /private/var must
+  // not be classified as foreign (which would pin a stale anchor).
+  const canon = (dir: string): string => {
+    try {
+      return fs.realpathSync(dir);
+    } catch {
+      return path.resolve(dir);
+    }
+  };
   const sameRepo = (a: ReaRoots, b: ReaRoots): boolean =>
-    path.resolve(a.commonRoot) === path.resolve(b.commonRoot);
+    canon(a.commonRoot) === canon(b.commonRoot);
   const envQ = envRoots !== null && hasRea(envRoots) ? envRoots : null;
   const cwdQ = cwdRoots !== null && hasRea(cwdRoots) ? cwdRoots : null;
   let anchor: ReaRoots | null;
