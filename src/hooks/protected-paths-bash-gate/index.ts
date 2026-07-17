@@ -193,6 +193,10 @@ export async function runProtectedPathsBashGate(
   const verdict = runProtectedScan(
     {
       reaRoot,
+      // 0.54.0: absolute writes into the primary checkout's shared
+      // `.rea/` state from a worktree session match the protected list
+      // via common-relative normalization.
+      commonRoot,
       policy: {
         ...(policy.protectedWrites !== undefined
           ? { protected_writes: policy.protectedWrites }

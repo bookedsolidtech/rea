@@ -86,6 +86,17 @@ const KILL_SWITCH_INVARIANTS: readonly string[] = [
  */
 export interface ProtectedScanContext {
   reaRoot: string;
+  /**
+   * 0.54.0 worktree state: the COMMON (primary-checkout) root. When a
+   * write target resolves OUTSIDE the local worktree root but INSIDE
+   * the common root, it is normalized common-relative and matched
+   * against the protected list too — otherwise an absolute-path write
+   * from a worktree into `<main>/.rea/audit.jsonl` or `<main>/.rea/HALT`
+   * would bypass protection exactly when those files became the
+   * load-bearing shared state. Optional; absent/equal-to-reaRoot means
+   * plain-checkout behavior.
+   */
+  commonRoot?: string;
   policy: Pick<Policy, 'protected_writes' | 'protected_paths_relax'>;
   /**
    * Stderr sink for advisory messages (e.g. "kill-switch invariant in
@@ -356,6 +367,7 @@ function normalizeTarget(
   raw: string,
   form?: DetectedForm,
   passwdHome?: string,
+  commonRoot?: string,
 ): NormalizedTarget {
   // 1. Strip surrounding matching quotes (the parser already strips
   //    them for SglQuoted/DblQuoted, but a literal node can still hold
@@ -524,6 +536,30 @@ function normalizeTarget(
   //    against it (the protected list is project-relative). The bash
   //    gate pre-0.23.0 had the same behavior.
   if (!isInsideRoot(collapsed, reaRoot)) {
+    // 0.54.0 worktree state: a target outside the LOCAL root that lands
+    // INSIDE the COMMON root is normalized common-relative so the
+    // protected list (`.rea/HALT`, `.rea/audit.jsonl`, …) matches the
+    // shared enforcement state — an absolute path into the primary
+    // checkout must not be a bypass just because the session runs in a
+    // linked worktree.
+    if (
+      commonRoot !== undefined &&
+      commonRoot !== reaRoot &&
+      isInsideRoot(collapsed, commonRoot)
+    ) {
+      const commonRelative =
+        collapsed === commonRoot ? '' : collapsed.slice(commonRoot.length + 1);
+      const trailing = normalized.endsWith('/');
+      return {
+        pathLc: (trailing && commonRelative.length > 0 && !commonRelative.endsWith('/')
+          ? commonRelative + '/'
+          : commonRelative
+        ).toLowerCase(),
+        sentinel: null,
+        original: raw,
+        resolvedLc: null,
+      };
+    }
     if (hadDotDot) {
       return {
         pathLc: '__rea_outside_root__',
@@ -1025,7 +1061,7 @@ export function scanForProtectedViolations(
     }
     if (d.path.length === 0) continue;
 
-    const norm = normalizeTarget(ctx.reaRoot, d.path, d.form, ctx.passwdHome);
+    const norm = normalizeTarget(ctx.reaRoot, d.path, d.form, ctx.passwdHome, ctx.commonRoot);
     if (norm.sentinel === 'global_root') {
       return blockVerdict({
         reason: [

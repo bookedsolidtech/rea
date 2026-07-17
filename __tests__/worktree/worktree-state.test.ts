@@ -1,0 +1,194 @@
+/**
+ * 0.54.0 — worktree-state integration tests against REAL `git worktree
+ * add` topologies (the plan's verification matrix). These are the
+ * end-to-end proofs behind the multi-stream fix:
+ *
+ *   (i)   coverage audit entries land on the COMMON chain while
+ *         last-review.json stays LOCAL to the worktree;
+ *   (ii)  preflight coverage for a sha reviewed in one worktree
+ *         satisfies the gate from another;
+ *   (iii) a COMMON HALT freezes hooks running in a worktree, and a
+ *         worktree-local legacy HALT still freezes its own stream;
+ *   (iv)  concurrent audit appends from two worktrees serialize on ONE
+ *         lock and keep the hash chain verifiable;
+ *   (v)   the verdict cache is shared (sha-keyed reuse across streams);
+ *   (vi)  an absolute-path Bash write from a worktree into the primary
+ *         checkout's protected `.rea/` state is refused.
+ */
+
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { execFileSync } from 'node:child_process';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { resolveReaRoots } from '../../src/lib/worktree-roots.js';
+import { checkHaltRoots } from '../../src/hooks/_lib/halt-check.js';
+import { appendAuditRecord, InvocationStatus, Tier } from '../../src/audit/append.js';
+import { computeHash } from '../../src/audit/fs.js';
+import type { AuditRecord } from '../../src/gateway/middleware/audit-types.js';
+import { findRecentLocalReview } from '../../src/cli/preflight.js';
+import { writeVerdict, lookupVerdict } from '../../src/hooks/push-gate/verdict-cache.js';
+import { runProtectedScan } from '../../src/hooks/bash-scanner/index.js';
+import { runBlockedPathsBashGate } from '../../src/hooks/blocked-paths-bash-gate/index.js';
+
+let scratch: string;
+let repo: string;
+let wtA: string;
+let wtB: string;
+
+function git(cwd: string, ...args: string[]): string {
+  return execFileSync('git', args, { cwd, encoding: 'utf8' }).trim();
+}
+
+beforeEach(() => {
+  scratch = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'rea-wtint-')));
+  repo = path.join(scratch, 'repo');
+  fs.mkdirSync(repo);
+  git(repo, 'init', '-q');
+  git(repo, 'config', 'user.email', 't@t');
+  git(repo, 'config', 'user.name', 't');
+  fs.mkdirSync(path.join(repo, '.rea'));
+  fs.writeFileSync(
+    path.join(repo, '.rea', 'policy.yaml'),
+    'version: "1"\nprofile: "test"\ninstalled_by: "t"\nblocked_paths: []\n',
+  );
+  fs.writeFileSync(path.join(repo, 'README.md'), 'x\n');
+  git(repo, 'add', '-A');
+  git(repo, 'commit', '-q', '-m', 'init', '--no-gpg-sign');
+  wtA = path.join(scratch, 'wt-a');
+  wtB = path.join(scratch, 'wt-b');
+  git(repo, 'worktree', 'add', '-q', wtA, '-b', 'stream-a');
+  git(repo, 'worktree', 'add', '-q', wtB, '-b', 'stream-b');
+});
+afterEach(() => {
+  fs.rmSync(scratch, { recursive: true, force: true });
+});
+
+describe('worktree-state integration (real git worktree add)', () => {
+  it('(i)+(ii) coverage written from worktree A satisfies preflight lookup for worktree B', async () => {
+    const rootsA = resolveReaRoots(wtA);
+    expect(rootsA.commonRoot).toBe(repo);
+    const headSha = git(wtA, 'rev-parse', 'HEAD');
+
+    // Simulate what `rea review` does post-0.54.0: coverage entry to the
+    // COMMON chain.
+    await appendAuditRecord(rootsA.commonRoot, {
+      tool_name: 'rea.local_review',
+      server_name: 'rea',
+      tier: Tier.Read,
+      status: InvocationStatus.Allowed,
+      metadata: { head_sha: headSha, verdict: 'pass' },
+    });
+
+    // Both worktrees are at the same sha; the lookup from B's resolved
+    // COMMON root finds A's entry.
+    const rootsB = resolveReaRoots(wtB);
+    const lookup = findRecentLocalReview(rootsB.commonRoot, headSha, 3600, new Date());
+    expect(lookup.found).toBe(true);
+
+    // And the audit file physically lives in the PRIMARY checkout only.
+    expect(fs.existsSync(path.join(repo, '.rea', 'audit.jsonl'))).toBe(true);
+    expect(fs.existsSync(path.join(wtA, '.rea', 'audit.jsonl'))).toBe(false);
+  });
+
+  it('(iii) COMMON HALT freezes worktree hooks; legacy LOCAL HALT still freezes its stream', async () => {
+    const roots = resolveReaRoots(wtA);
+    // Repo-wide freeze.
+    fs.writeFileSync(path.join(repo, '.rea', 'HALT'), 'incident: freeze all streams');
+    expect(checkHaltRoots(roots.localRoot, roots.commonRoot).halted).toBe(true);
+    // A full hook honors it end-to-end (blocked-paths gate, exit 2).
+    const r = await runBlockedPathsBashGate({
+      reaRoot: wtA,
+      stdinOverride: JSON.stringify({ tool_name: 'Bash', tool_input: { command: 'echo hi' } }),
+    });
+    expect(r.exitCode).toBe(2);
+    fs.rmSync(path.join(repo, '.rea', 'HALT'));
+
+    // Legacy per-worktree HALT (pre-0.54.0 file) still freezes A…
+    fs.writeFileSync(path.join(wtA, '.rea', 'HALT'), 'legacy local freeze');
+    expect(checkHaltRoots(resolveReaRoots(wtA).localRoot, repo).halted).toBe(true);
+    // …but not B (local files are per-stream).
+    expect(checkHaltRoots(resolveReaRoots(wtB).localRoot, repo).halted).toBe(false);
+  });
+
+  it('(iv) concurrent appends from two worktrees keep ONE verifiable chain', async () => {
+    const commonA = resolveReaRoots(wtA).commonRoot;
+    const commonB = resolveReaRoots(wtB).commonRoot;
+    expect(commonA).toBe(commonB);
+    await Promise.all(
+      Array.from({ length: 12 }, (_, i) =>
+        appendAuditRecord(i % 2 === 0 ? commonA : commonB, {
+          tool_name: 'rea.test.concurrent',
+          server_name: 'rea',
+          tier: Tier.Read,
+          status: InvocationStatus.Allowed,
+          metadata: { i },
+        }),
+      ),
+    );
+    // Verify the hash chain by hand: every record's stored hash matches a
+    // recompute, and prev_hash linkage is unbroken — the property that
+    // breaks if two lock targets ever coexist.
+    const lines = fs
+      .readFileSync(path.join(repo, '.rea', 'audit.jsonl'), 'utf8')
+      .split('\n')
+      .filter((l) => l.length > 0);
+    expect(lines).toHaveLength(12);
+    let prev = '0'.repeat(64);
+    for (const line of lines) {
+      const rec = JSON.parse(line) as AuditRecord;
+      expect(rec.prev_hash).toBe(prev);
+      const { hash, ...rest } = rec;
+      expect(computeHash(rest)).toBe(hash);
+      prev = hash;
+    }
+  });
+
+  it('(v) verdict cache is shared: a PASS cached from worktree A hits from worktree B', async () => {
+    const headSha = git(wtA, 'rev-parse', 'HEAD');
+    const commonA = resolveReaRoots(wtA).commonRoot;
+    await writeVerdict(commonA, headSha, {
+      verdict: 'pass',
+      finding_count: 0,
+      reviewed_at: new Date().toISOString(),
+      model: 'gpt-5.5',
+      reasoning_effort: 'high',
+      ttl_ms: 60_000,
+    });
+    const commonB = resolveReaRoots(wtB).commonRoot;
+    const hit = lookupVerdict(commonB, headSha);
+    expect(hit.hit).toBe(true);
+  });
+
+  it('(vi) absolute-path write into the PRIMARY checkout\'s .rea/ from a worktree is refused', () => {
+    const verdict = runProtectedScan(
+      {
+        reaRoot: wtA,
+        commonRoot: repo,
+        policy: { protected_paths_relax: [] },
+        stderr: () => {},
+      },
+      `echo forged > ${repo}/.rea/HALT`,
+    );
+    expect(verdict.verdict).toBe('block');
+
+    // …and the audit chain too.
+    const verdict2 = runProtectedScan(
+      {
+        reaRoot: wtA,
+        commonRoot: repo,
+        policy: { protected_paths_relax: [] },
+        stderr: () => {},
+      },
+      `cp /tmp/x ${repo}/.rea/last-review.cache.json`,
+    );
+    expect(verdict2.verdict).toBe('block');
+
+    // Ordinary out-of-repo absolute writes stay allowed (no scope creep).
+    const verdict3 = runProtectedScan(
+      { reaRoot: wtA, commonRoot: repo, policy: { protected_paths_relax: [] }, stderr: () => {} },
+      'echo x > /tmp/unrelated.txt',
+    );
+    expect(verdict3.verdict).toBe('allow');
+  });
+});

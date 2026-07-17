@@ -209,6 +209,10 @@ Slash commands at `.claude/commands/`:
 - `/freeze` — write `.rea/HALT` with a reason
 - `/halt-check` — verify middleware + hooks respect HALT
 
+## Worktrees (multi-stream work)
+
+Linked `git worktree` checkouts are first-class (0.54.0+): per-stream state (`last-review.json`, parity, metrics, session counters) lives in each worktree's `.rea/`; per-repository ENFORCEMENT state (`audit.jsonl`, `HALT`, the verdict cache, TOFU fingerprints) lives in the PRIMARY checkout's `.rea/`. A review of a sha in one worktree covers it everywhere; `rea freeze` freezes every stream; `rea doctor` reports the topology and flags orphaned pre-0.54.0 local state. See THREAT_MODEL §10.
+
 ## Workflow
 
 - Work is LOCAL by default. Commit to a feature branch.

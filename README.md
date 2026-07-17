@@ -1248,6 +1248,10 @@ anything hits disk.
 
 ---
 
+## Worktrees
+
+Multi-stream work in linked `git worktree` checkouts is supported out of the box: each worktree keeps its own review snapshots and policy, while the audit chain, kill switch (`rea freeze` stops every stream), verdict cache, and TOFU trust are shared at the primary checkout. Plain checkouts behave exactly as before. Run `rea doctor` inside a worktree to see the topology.
+
 ## Non-goals
 
 See [What REA is NOT](#what-rea-is-not) above. Every "but what if we

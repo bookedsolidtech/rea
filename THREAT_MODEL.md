@@ -1630,3 +1630,18 @@ The cache explicitly does NOT defend against:
     is intentionally no `rea cache clear` CLI surface in 0.48.0 —
     the disable switch + on-reboot tmpfs wipe handle the realistic
     cases.
+
+## 10. Worktree state topology (0.54.0+)
+
+Multi-stream work runs each stream in a linked `git worktree`. rea splits its runtime state across TWO roots, resolved by `src/lib/worktree-roots.ts` (bash parity: `rea_common_root()` in `hooks/_lib/halt-check.sh` / `common.sh`):
+
+- **LOCAL root** (the worktree's checkout): `policy.yaml` reads (checked in, versioned with the branch), `last-review.json`, `review-parity.json`, `metrics.jsonl`, serve pid/state, delegation-advisory session state, install-manifest. Per-run forensic snapshots staying local is what fixes the multi-stream clobbering of the review file.
+- **COMMON root** (the primary checkout — the worktree whose `.git` is a directory): `audit.jsonl` + rotations + the `.rea.lock` target (one hash chain per repository; the lock target moves WITH the file because `appendAuditRecord` receives the common root as its baseDir — a split would fork the chain), `HALT` (one kill switch per repository — a freeze in any stream stops all; probes cover BOTH roots so a legacy per-worktree HALT still freezes its own stream; `rea unfreeze` clears both), `last-review.cache.json` (sha-keyed verdict reuse across streams), `fingerprints.json` (TOFU trust is per-repository).
+
+Classification rule: **enforcement state is COMMON; forensic/telemetry/process state is LOCAL.** (The unmerged spend-governance branches follow it at rebase: spend/consumption counters COMMON, run-allow LOCAL.)
+
+**Resolution.** The `.git`-is-a-file discriminator makes plain checkouts pay ZERO extra git subprocesses; only linked worktrees run one `rev-parse --git-common-dir`. Hooks resolve from a guarded candidate ladder — payload `cwd` → `CLAUDE_PROJECT_DIR` → `process.cwd()` — accepting only candidates whose root contains `.rea/`, so an agent `cd /tmp` cannot drag a gate to a policy-less root (fail-open refusal). In non-worktree repos every path degenerates byte-identically to pre-0.54.0 behavior. Bare-repo worktrees (no primary checkout to anchor shared state) degrade to per-worktree isolation with a one-line advisory.
+
+**Cross-root protection.** Because the common root's `.rea/` is now load-bearing shared enforcement state, the protected-path scanner normalizes write targets against BOTH roots: an absolute-path Bash write from a worktree into `<primary>/.rea/HALT` or the audit chain matches the protected list common-relative and is refused (previously such paths fell outside the local root and were out-of-scope).
+
+**Residuals (documented, tracked).** (1) Bash-tier policy reads (`policy-read.sh`, `policy-reader.sh`, shim-cache/runtime) and `rea hook policy-get` carry no payload and stay on the `CLAUDE_PROJECT_DIR ?? cwd` resolution — in a Claude worktree session they may read the primary checkout's policy rather than the worktree's. Exposure is advisory-tier: every blocking decision flows through the converted Node hooks. (2) Coverage across worktrees rides the `head_sha` fallback of the preflight predicate — the `content_token` form is a working-tree hash and only matches when trees are byte-identical. (3) No auto-migration of pre-0.54.0 per-worktree audit chains (merging two hash chains is not meaningfully possible); `rea doctor` warns on orphaned local state and the operator re-reviews once.

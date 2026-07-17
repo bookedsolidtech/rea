@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import fsPromises from 'node:fs/promises';
 import path from 'node:path';
 import { loadPolicy } from '../policy/loader.js';
+import { resolveReaRoots } from '../lib/worktree-roots.js';
 import { loadRegistry } from '../registry/loader.js';
 import { loadFingerprintStore } from '../registry/fingerprints-store.js';
 import { fingerprintServer } from '../registry/fingerprint.js';
@@ -3301,6 +3302,46 @@ export function checkGlobalCli(
  *
  * `activeForeign` always yields `fail` — a foreign hook bypassing the gate is a hard governance gap.
  */
+/**
+ * 0.54.0 — worktree topology check. In a LINKED worktree, report the
+ * local/common split and warn about ORPHANED pre-0.54.0 state: a local
+ * `audit.jsonl` / `HALT` / `last-review.cache.json` written by an older
+ * release is invisible to the shared enforcement paths (coverage,
+ * verdict reuse, repo-wide freeze) — the operator re-reviews once and
+ * removes the stale files. No auto-migration by design (merging two
+ * hash chains is not meaningfully possible). Plain checkouts emit a
+ * single info line.
+ */
+function checkWorktreeTopology(baseDir: string): CheckResult {
+  const roots = resolveReaRoots(baseDir, () => {});
+  if (!roots.isLinkedWorktree) {
+    return {
+      label: 'worktree topology',
+      status: 'info',
+      detail: 'primary checkout — local and common .rea/ state coincide',
+    };
+  }
+  const orphans: string[] = [];
+  for (const f of ['audit.jsonl', 'HALT', 'last-review.cache.json', 'fingerprints.json']) {
+    if (fs.existsSync(path.join(roots.localRoot, REA_DIR, f))) orphans.push(f);
+  }
+  if (orphans.length > 0) {
+    return {
+      label: 'worktree topology',
+      status: 'warn',
+      detail:
+        `linked worktree of ${roots.commonRoot} — ORPHANED pre-0.54.0 local state: ` +
+        `${orphans.join(', ')}. Shared enforcement reads the common root; re-run ` +
+        `\`rea review\` once and remove the stale local files.`,
+    };
+  }
+  return {
+    label: 'worktree topology',
+    status: 'pass',
+    detail: `linked worktree — shared state at ${roots.commonRoot}, per-stream state here`,
+  };
+}
+
 export function collectChecks(
   baseDir: string,
   codexProbeState?: CodexProbeState,
@@ -3324,6 +3365,7 @@ export function collectChecks(
     checkRegistryParses(baseDir, registryPath),
     checkAgentsPresent(baseDir),
     checkHooksInstalled(baseDir),
+    checkWorktreeTopology(baseDir),
     // 0.49.0 brick-state detector. Hook shims installed without a
     // self-pin in package.json is the exact scenario the bash-gate
     // bootstrap allowlist (paired fix) recovers from. Doctor surfaces
