@@ -36,7 +36,8 @@ import type { Buffer } from 'node:buffer';
 import path from 'node:path';
 import fs from 'node:fs';
 import { parse as parseYaml } from 'yaml';
-import { checkHalt, formatHaltBanner } from '../_lib/halt-check.js';
+import { checkHaltRoots, formatHaltBanner } from '../_lib/halt-check.js';
+import { resolveHookRoots } from '../../lib/worktree-roots.js';
 import {
   parseHookPayload,
   MalformedPayloadError,
@@ -110,22 +111,16 @@ function loadBlockedPathsPermissive(reaRoot: string): string[] {
 export async function runBlockedPathsBashGate(
   options: BlockedPathsBashGateOptions = {},
 ): Promise<BlockedPathsBashGateResult> {
-  const reaRoot =
-    options.reaRoot ?? process.env['CLAUDE_PROJECT_DIR'] ?? process.cwd();
   let stderr = '';
   const writeStderr = (s: string): void => {
     stderr += s;
     if (options.stderrWrite) options.stderrWrite(s);
   };
 
-  // 1. HALT check.
-  const halt = checkHalt(reaRoot);
-  if (halt.halted) {
-    writeStderr(formatHaltBanner(halt.reason));
-    return { exitCode: 2, stderr, verdict: { verdict: 'block', reason: 'rea HALT active' } };
-  }
-
-  // 2. Read + parse stdin.
+  // 1. Read + parse stdin FIRST (0.54.0 worktree roots): the payload's
+  //    `cwd` feeds root resolution, so parsing must precede the HALT
+  //    check. Deliberate reorder — a malformed payload still refuses
+  //    before any root-dependent decision is made.
   const stdinRaw =
     options.stdinOverride !== undefined
       ? options.stdinOverride
@@ -133,10 +128,12 @@ export async function runBlockedPathsBashGate(
 
   let toolName = '';
   let cmd = '';
+  let payloadCwd = '';
   try {
     const payload = parseHookPayload(stdinRaw);
     toolName = payload.toolName;
     cmd = payload.command;
+    payloadCwd = payload.cwd;
   } catch (err) {
     if (err instanceof MalformedPayloadError || err instanceof TypePayloadError) {
       writeStderr(
@@ -145,6 +142,15 @@ export async function runBlockedPathsBashGate(
       return { exitCode: 2, stderr, verdict: { verdict: 'block', reason: err.message } };
     }
     throw err;
+  }
+
+  // 2. Roots + HALT. Policy/scan key off the LOCAL (worktree) root;
+  //    audit + the kill switch key off the COMMON (repository) root.
+  const { localRoot: reaRoot, commonRoot } = resolveHookRoots(payloadCwd, options.reaRoot);
+  const halt = checkHaltRoots(reaRoot, commonRoot);
+  if (halt.halted) {
+    writeStderr(formatHaltBanner(halt.reason));
+    return { exitCode: 2, stderr, verdict: { verdict: 'block', reason: 'rea HALT active' } };
   }
 
   // 3. Non-Bash tool calls bypass.
@@ -170,7 +176,7 @@ export async function runBlockedPathsBashGate(
 
   // 8. Audit — best-effort, never changes verdict.
   try {
-    await appendAuditRecord(reaRoot, {
+    await appendAuditRecord(commonRoot, {
       tool_name: 'rea.hook.blocked-paths-bash-gate',
       server_name: 'rea',
       tier: Tier.Read,

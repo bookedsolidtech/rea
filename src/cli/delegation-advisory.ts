@@ -78,6 +78,7 @@ import {
   DEFAULT_EXEMPT_SUBAGENTS,
 } from './roster.js';
 import { REA_DIR } from './utils.js';
+import { resolveHookRoots } from '../lib/worktree-roots.js';
 
 /**
  * Hook payload shape (untrusted). Claude Code's PostToolUse hook for
@@ -470,14 +471,19 @@ export interface DelegationAdvisoryResult {
 export async function computeDelegationAdvisory(
   options: HookDelegationAdvisoryOptions,
 ): Promise<DelegationAdvisoryResult> {
-  const reaRoot =
-    options.reaRoot ?? process.env['CLAUDE_PROJECT_DIR'] ?? process.cwd();
+  // 0.54.0 worktree state: session-counter state + policy key off the
+  // LOCAL root; the audit scan ("did this session delegate") reads the
+  // COMMON root, where delegation-capture now writes the shared chain;
+  // the kill switch probes BOTH roots (repo-wide HALT).
+  const { localRoot: reaRoot, commonRoot } = resolveHookRoots(undefined, options.reaRoot);
 
   // HALT check — uniform with the rest of the hook tree. The advisory
   // hook is observational, but refusing to run while frozen keeps the
   // kill-switch contract simple: every hook exits 2 under HALT.
-  const haltPath = path.join(reaRoot, '.rea', 'HALT');
-  if (fs.existsSync(haltPath)) {
+  if (
+    fs.existsSync(path.join(reaRoot, '.rea', 'HALT')) ||
+    fs.existsSync(path.join(commonRoot, '.rea', 'HALT'))
+  ) {
     return { outcome: 'halt' };
   }
 
@@ -561,7 +567,7 @@ export async function computeDelegationAdvisory(
   // filesystem form would never match (see the comment at the
   // `auditSessionId` / `stateKey` split above).
   const delegated = await sessionHasRealDelegation(
-    reaRoot,
+    commonRoot,
     auditSessionId,
     policy.exemptSubagents,
     options.sleepOverride,

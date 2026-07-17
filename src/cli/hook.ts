@@ -37,7 +37,8 @@ import type { Command } from 'commander';
 import { parse as parseYaml } from 'yaml';
 import { parsePrePushStdin, runPushGate } from '../hooks/push-gate/index.js';
 import { runBlockedScan, runProtectedScan, type Verdict } from '../hooks/bash-scanner/index.js';
-import { checkHalt, formatHaltBanner } from '../hooks/_lib/halt-check.js';
+import { checkHalt, checkHaltRoots, formatHaltBanner } from '../hooks/_lib/halt-check.js';
+import { resolveHookRoots } from '../lib/worktree-roots.js';
 import { runHookPrIssueLinkGate } from '../hooks/pr-issue-link-gate/index.js';
 import { runHookSecurityDisclosureGate } from '../hooks/security-disclosure-gate/index.js';
 import { runHookAttributionAdvisory } from '../hooks/attribution-advisory/index.js';
@@ -222,6 +223,7 @@ export interface HookScanBashOptions {
 }
 
 interface ScanBashStdinPayload {
+  cwd?: unknown;
   tool_input?: {
     command?: unknown;
   };
@@ -233,27 +235,12 @@ interface ScanBashStdinPayload {
  * writes the verdict JSON, exits with the appropriate code.
  */
 export async function runHookScanBash(options: HookScanBashOptions): Promise<void> {
-  const reaRoot = options.reaRoot ?? process.env['CLAUDE_PROJECT_DIR'] ?? process.cwd();
-
-  // HALT check — uniform with the bash hooks. We exit 2 (block) so
-  // the shim refuses the command in the same way settings-protection
-  // and the bash gates do.
-  // 0.32.0: shared via `src/hooks/_lib/halt-check.ts` so the Phase 1
-  // pilots and the codex-review hook below all emit the same banner
-  // byte-for-byte and apply the same fail-closed read posture.
-  const halt = checkHalt(reaRoot);
-  if (halt.halted) {
-    process.stderr.write(formatHaltBanner(halt.reason));
-    const haltVerdict: Verdict = {
-      verdict: 'block',
-      reason: 'rea HALT active',
-    };
-    process.stdout.write(JSON.stringify(haltVerdict) + '\n');
-    process.exit(2);
-  }
-
+  // 0.54.0 worktree state: stdin is read BEFORE the HALT check — the
+  // payload's `cwd` feeds root resolution (deliberate reorder; a
+  // malformed payload still fails closed below before any verdict).
   const stdinRaw = process.stdin.isTTY ? '' : await readStdinWithTimeout(5_000);
   let cmd = '';
+  let payloadCwd = '';
   if (stdinRaw.length > 0) {
     try {
       const parsed: ScanBashStdinPayload = JSON.parse(stdinRaw);
@@ -273,6 +260,7 @@ export async function runHookScanBash(options: HookScanBashOptions): Promise<voi
         process.exit(2);
       }
       if (typeof c === 'string') cmd = c;
+      if (typeof parsed.cwd === 'string') payloadCwd = parsed.cwd;
     } catch {
       // Malformed JSON on stdin → fail closed. The bash shim only
       // forwards what Claude Code sends, so this should never happen
@@ -286,6 +274,21 @@ export async function runHookScanBash(options: HookScanBashOptions): Promise<voi
       process.exit(2);
     }
   }
+  // Roots + HALT — uniform with the bash hooks; exit 2 (block) so the
+  // shim refuses like settings-protection does. Policy keys off the
+  // LOCAL root; the kill switch probes BOTH roots (repo-wide, 0.54.0).
+  const { localRoot: reaRoot, commonRoot } = resolveHookRoots(payloadCwd, options.reaRoot);
+  const halt = checkHaltRoots(reaRoot, commonRoot);
+  if (halt.halted) {
+    process.stderr.write(formatHaltBanner(halt.reason));
+    const haltVerdict: Verdict = {
+      verdict: 'block',
+      reason: 'rea HALT active',
+    };
+    process.stdout.write(JSON.stringify(haltVerdict) + '\n');
+    process.exit(2);
+  }
+
   // Empty command → allow. Matches the bash gates' `[[ -z "$CMD" ]] && exit 0`.
   if (cmd.length === 0) {
     process.stdout.write(JSON.stringify({ verdict: 'allow' }) + '\n');
@@ -898,6 +901,7 @@ export async function runHookCodexReview(options: HookCodexReviewOptions): Promi
  */
 interface DelegationSignalStdinPayload {
   tool_name?: unknown;
+  cwd?: unknown;
   session_id?: unknown;
   hook_event_timestamp?: unknown;
   tool_input?: {
@@ -1059,8 +1063,6 @@ async function writeDelegationSignal(
 export async function runHookDelegationSignal(
   options: HookDelegationSignalOptions,
 ): Promise<void> {
-  const baseDir =
-    options.reaRoot ?? process.env['CLAUDE_PROJECT_DIR'] ?? process.cwd();
   const lockTimeoutMs = options.lockTimeoutMs ?? 2000;
 
   // Read stdin. TTY → empty (no harness payload available, nothing to
@@ -1085,6 +1087,16 @@ export async function runHookDelegationSignal(
     );
     process.exit(0);
   }
+
+  // 0.54.0 worktree state: the delegation signal is part of the audit
+  // CHAIN, which is per-repository — resolve roots from the payload cwd
+  // and write to the COMMON root so signals from every worktree land in
+  // one chain (the advisory's "did this session delegate" scan reads
+  // the same chain).
+  const { commonRoot: baseDir } = resolveHookRoots(
+    typeof payload.cwd === 'string' ? payload.cwd : undefined,
+    options.reaRoot,
+  );
 
   // Resolve which delegation tool fired. Anything else is a misfire at
   // the matcher layer (Claude Code routed a non-delegation tool to us)

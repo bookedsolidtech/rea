@@ -40,7 +40,8 @@ import type { Buffer } from 'node:buffer';
 import path from 'node:path';
 import fs from 'node:fs';
 import { parse as parseYaml } from 'yaml';
-import { checkHalt, formatHaltBanner } from '../_lib/halt-check.js';
+import { checkHaltRoots, formatHaltBanner } from '../_lib/halt-check.js';
+import { resolveHookRoots } from '../../lib/worktree-roots.js';
 import {
   parseWriteHookPayload,
   MalformedPayloadError,
@@ -126,20 +127,11 @@ function loadBlockedPathsPermissive(reaRoot: string): string[] {
 export async function runBlockedPathsEnforcer(
   options: BlockedPathsEnforcerOptions = {},
 ): Promise<BlockedPathsEnforcerResult> {
-  const reaRoot =
-    options.reaRoot ?? process.env['CLAUDE_PROJECT_DIR'] ?? process.cwd();
   let stderr = '';
   const writeStderr = (s: string): void => {
     stderr += s;
     if (options.stderrWrite) options.stderrWrite(s);
   };
-
-  // 1. HALT check.
-  const halt = checkHalt(reaRoot);
-  if (halt.halted) {
-    writeStderr(formatHaltBanner(halt.reason));
-    return { exitCode: 2, stderr, matched: null };
-  }
 
   // 2. Read + parse stdin.
   const stdinRaw =
@@ -148,8 +140,10 @@ export async function runBlockedPathsEnforcer(
       : await readStdinWithTimeout(5_000);
 
   let filePath = '';
+  let payloadCwd = '';
   try {
     const payload = parseWriteHookPayload(stdinRaw);
+    payloadCwd = payload.cwd;
     filePath = payload.filePath;
   } catch (err) {
     if (err instanceof MalformedPayloadError || err instanceof TypePayloadError) {
@@ -159,6 +153,18 @@ export async function runBlockedPathsEnforcer(
       return { exitCode: 2, stderr, matched: null };
     }
     throw err;
+  }
+
+  // Roots + HALT (0.54.0 worktree state): the payload's `cwd` feeds the
+  // resolution ladder, so stdin is parsed FIRST — a deliberate reorder.
+  // Policy/path checks key off the LOCAL (worktree) root; audit and the
+  // kill switch key off the COMMON (repository) root.
+  const { localRoot: reaRoot, commonRoot } = resolveHookRoots(payloadCwd, options.reaRoot);
+  // 1. HALT check.
+  const halt = checkHaltRoots(reaRoot, commonRoot);
+  if (halt.halted) {
+    writeStderr(formatHaltBanner(halt.reason));
+    return { exitCode: 2, stderr, matched: null };
   }
   if (filePath.length === 0) {
     return { exitCode: 0, stderr, matched: null };
@@ -226,7 +232,7 @@ export async function runBlockedPathsEnforcer(
       writeStderr('  This path is protected by policy. To modify it, a human must\n');
       writeStderr('  either update blocked_paths in policy.yaml or edit the file directly.\n');
     }
-    await maybeAudit(reaRoot, 'denied', matched, filePath);
+    await maybeAudit(commonRoot, 'denied', matched, filePath);
     return { exitCode: 2, stderr, matched };
   }
 
@@ -242,11 +248,11 @@ export async function runBlockedPathsEnforcer(
     writeStderr('\n');
     writeStderr('  Rule: an intermediate directory of the path is a symlink\n');
     writeStderr('        whose target falls inside a blocked policy entry.\n');
-    await maybeAudit(reaRoot, 'denied', symMatched.entry, filePath);
+    await maybeAudit(commonRoot, 'denied', symMatched.entry, filePath);
     return { exitCode: 2, stderr, matched: symMatched.entry };
   }
 
-  await maybeAudit(reaRoot, 'allowed', null, filePath);
+  await maybeAudit(commonRoot, 'allowed', null, filePath);
   return { exitCode: 0, stderr, matched: null };
 }
 
@@ -302,13 +308,13 @@ function checkSymlinkResolution(
 }
 
 async function maybeAudit(
-  reaRoot: string,
+  auditRoot: string,
   status: 'allowed' | 'denied',
   matched: string | null,
   filePath: string,
 ): Promise<void> {
   try {
-    await appendAuditRecord(reaRoot, {
+    await appendAuditRecord(auditRoot, {
       tool_name: 'rea.hook.blocked-paths-enforcer',
       server_name: 'rea',
       tier: Tier.Write,

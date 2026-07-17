@@ -49,7 +49,8 @@
  */
 
 import type { Buffer } from 'node:buffer';
-import { checkHalt, formatHaltBanner } from '../_lib/halt-check.js';
+import { checkHaltRoots, formatHaltBanner } from '../_lib/halt-check.js';
+import { resolveHookRoots } from '../../lib/worktree-roots.js';
 import {
   parseHookPayload,
   MalformedPayloadError,
@@ -344,8 +345,6 @@ function buildRefuseBanner(
 export async function runLocalReviewGate(
   options: LocalReviewGateOptions = {},
 ): Promise<LocalReviewGateResult> {
-  const reaRoot =
-    options.reaRoot ?? process.env['CLAUDE_PROJECT_DIR'] ?? process.cwd();
   let stderr = '';
   const writeStderr = (s: string): void => {
     stderr += s;
@@ -358,13 +357,6 @@ export async function runLocalReviewGate(
     return process.env[name];
   };
 
-  // 1. HALT check — fail-closed.
-  const halt = checkHalt(reaRoot);
-  if (halt.halted) {
-    writeStderr(formatHaltBanner(halt.reason));
-    return { exitCode: 2, stderr, decision: 'halt' };
-  }
-
   // 2. Read + parse stdin.
   const stdinRaw =
     options.stdinOverride !== undefined
@@ -373,8 +365,10 @@ export async function runLocalReviewGate(
 
   let toolName = '';
   let cmd = '';
+  let payloadCwd = '';
   try {
     const payload = parseHookPayload(stdinRaw);
+    payloadCwd = payload.cwd;
     toolName = payload.toolName;
     cmd = payload.command;
   } catch (err) {
@@ -385,6 +379,18 @@ export async function runLocalReviewGate(
       return { exitCode: 2, stderr, decision: 'malformed-payload' };
     }
     throw err;
+  }
+
+  // Roots + HALT (0.54.0 worktree state): the payload's `cwd` feeds the
+  // resolution ladder, so stdin is parsed FIRST — a deliberate reorder.
+  // Policy/path checks key off the LOCAL (worktree) root; audit and the
+  // kill switch key off the COMMON (repository) root.
+  const { localRoot: reaRoot, commonRoot } = resolveHookRoots(payloadCwd, options.reaRoot);
+  // 1. HALT check — fail-closed.
+  const halt = checkHaltRoots(reaRoot, commonRoot);
+  if (halt.halted) {
+    writeStderr(formatHaltBanner(halt.reason));
+    return { exitCode: 2, stderr, decision: 'halt' };
   }
 
   // 3. Read policy. mode=off → silent no-op BEFORE any other work

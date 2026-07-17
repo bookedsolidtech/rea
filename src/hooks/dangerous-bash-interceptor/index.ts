@@ -51,7 +51,8 @@
  */
 
 import type { Buffer } from 'node:buffer';
-import { checkHalt, formatHaltBanner } from '../_lib/halt-check.js';
+import { checkHaltRoots, formatHaltBanner } from '../_lib/halt-check.js';
+import { resolveHookRoots } from '../../lib/worktree-roots.js';
 import {
   parseHookPayload,
   MalformedPayloadError,
@@ -663,20 +664,11 @@ function loadDelegatePatterns(reaRoot: string): string[] {
 export async function runDangerousBashInterceptor(
   options: DangerousBashOptions = {},
 ): Promise<DangerousBashResult> {
-  const reaRoot =
-    options.reaRoot ?? process.env['CLAUDE_PROJECT_DIR'] ?? process.cwd();
   let stderr = '';
   const writeStderr = (s: string): void => {
     stderr += s;
     if (options.stderrWrite) options.stderrWrite(s);
   };
-
-  // 1. HALT check.
-  const halt = checkHalt(reaRoot);
-  if (halt.halted) {
-    writeStderr(formatHaltBanner(halt.reason));
-    return { exitCode: 2, stderr, violations: [] };
-  }
 
   // 2. Read + parse stdin.
   const stdinRaw =
@@ -686,8 +678,10 @@ export async function runDangerousBashInterceptor(
 
   let toolName = '';
   let cmd = '';
+  let payloadCwd = '';
   try {
     const payload = parseHookPayload(stdinRaw);
+    payloadCwd = payload.cwd;
     toolName = payload.toolName;
     cmd = payload.command;
   } catch (err) {
@@ -698,6 +692,18 @@ export async function runDangerousBashInterceptor(
       return { exitCode: 2, stderr, violations: [] };
     }
     throw err;
+  }
+
+  // Roots + HALT (0.54.0 worktree state): the payload's `cwd` feeds the
+  // resolution ladder, so stdin is parsed FIRST — a deliberate reorder.
+  // Policy/path checks key off the LOCAL (worktree) root; audit and the
+  // kill switch key off the COMMON (repository) root.
+  const { localRoot: reaRoot, commonRoot } = resolveHookRoots(payloadCwd, options.reaRoot);
+  // 1. HALT check.
+  const halt = checkHaltRoots(reaRoot, commonRoot);
+  if (halt.halted) {
+    writeStderr(formatHaltBanner(halt.reason));
+    return { exitCode: 2, stderr, violations: [] };
   }
 
   // 3. Non-Bash tool calls bypass — Claude Code's hook matcher

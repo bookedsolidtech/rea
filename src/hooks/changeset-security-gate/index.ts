@@ -47,7 +47,8 @@
  */
 
 import type { Buffer } from 'node:buffer';
-import { checkHalt, formatHaltBanner } from '../_lib/halt-check.js';
+import { checkHaltRoots, formatHaltBanner } from '../_lib/halt-check.js';
+import { resolveHookRoots } from '../../lib/worktree-roots.js';
 import {
   parseWriteHookPayload,
   MalformedPayloadError,
@@ -249,8 +250,6 @@ the event loop under concurrency. Closes #34.`;
 export async function runChangesetSecurityGate(
   options: ChangesetSecurityGateOptions = {},
 ): Promise<ChangesetSecurityGateResult> {
-  const reaRoot =
-    options.reaRoot ?? process.env['CLAUDE_PROJECT_DIR'] ?? process.cwd();
   let stderr = '';
   let stdout = '';
   const writeStderr = (s: string): void => {
@@ -262,13 +261,6 @@ export async function runChangesetSecurityGate(
     if (options.stdoutWrite) options.stdoutWrite(s);
   };
 
-  // 1. HALT.
-  const halt = checkHalt(reaRoot);
-  if (halt.halted) {
-    writeStderr(formatHaltBanner(halt.reason));
-    return { exitCode: 2, stderr, stdout };
-  }
-
   // 2. Stdin.
   const stdinRaw =
     options.stdinOverride !== undefined
@@ -278,8 +270,10 @@ export async function runChangesetSecurityGate(
   let toolName = '';
   let filePath = '';
   let content = '';
+  let payloadCwd = '';
   try {
     const payload = parseWriteHookPayload(stdinRaw);
+    payloadCwd = payload.cwd;
     toolName = payload.toolName;
     filePath = payload.filePath;
     content = payload.content;
@@ -291,6 +285,18 @@ export async function runChangesetSecurityGate(
       return { exitCode: 2, stderr, stdout };
     }
     throw err;
+  }
+
+  // Roots + HALT (0.54.0 worktree state): the payload's `cwd` feeds the
+  // resolution ladder, so stdin is parsed FIRST — a deliberate reorder.
+  // Policy/path checks key off the LOCAL (worktree) root; audit and the
+  // kill switch key off the COMMON (repository) root.
+  const { localRoot: reaRoot, commonRoot } = resolveHookRoots(payloadCwd, options.reaRoot);
+  // 1. HALT.
+  const halt = checkHaltRoots(reaRoot, commonRoot);
+  if (halt.halted) {
+    writeStderr(formatHaltBanner(halt.reason));
+    return { exitCode: 2, stderr, stdout };
   }
 
   // 3. Tool filter.

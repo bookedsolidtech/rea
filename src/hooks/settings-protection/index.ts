@@ -54,7 +54,8 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { execSync } from 'node:child_process';
 import { parse as parseYaml } from 'yaml';
-import { checkHalt, formatHaltBanner } from '../_lib/halt-check.js';
+import { checkHaltRoots, formatHaltBanner } from '../_lib/halt-check.js';
+import { resolveHookRoots } from '../../lib/worktree-roots.js';
 import {
   parseWriteHookPayload,
   MalformedPayloadError,
@@ -168,26 +169,11 @@ function gitConfig(reaRoot: string, key: string): string {
 export async function runSettingsProtection(
   options: SettingsProtectionOptions = {},
 ): Promise<SettingsProtectionResult> {
-  const reaRoot =
-    options.reaRoot ?? process.env['CLAUDE_PROJECT_DIR'] ?? process.cwd();
   let stderr = '';
   const writeStderr = (s: string): void => {
     stderr += s;
     if (options.stderrWrite) options.stderrWrite(s);
   };
-
-  // 1. HALT check.
-  const halt = checkHalt(reaRoot);
-  if (halt.halted) {
-    writeStderr(formatHaltBanner(halt.reason));
-    return {
-      exitCode: 2,
-      stderr,
-      matched: null,
-      surfaceSymlinkRefused: false,
-      patchSessionAllowed: false,
-    };
-  }
 
   // 2. Read + parse stdin.
   const stdinRaw =
@@ -196,8 +182,10 @@ export async function runSettingsProtection(
       : await readStdinWithTimeout(5_000);
 
   let filePath = '';
+  let payloadCwd = '';
   try {
     const payload = parseWriteHookPayload(stdinRaw);
+    payloadCwd = payload.cwd;
     filePath = payload.filePath;
   } catch (err) {
     if (err instanceof MalformedPayloadError || err instanceof TypePayloadError) {
@@ -213,6 +201,24 @@ export async function runSettingsProtection(
       };
     }
     throw err;
+  }
+
+  // Roots + HALT (0.54.0 worktree state): the payload's `cwd` feeds the
+  // resolution ladder, so stdin is parsed FIRST — a deliberate reorder.
+  // Policy/path checks key off the LOCAL (worktree) root; audit and the
+  // kill switch key off the COMMON (repository) root.
+  const { localRoot: reaRoot, commonRoot } = resolveHookRoots(payloadCwd, options.reaRoot);
+  // 1. HALT check.
+  const halt = checkHaltRoots(reaRoot, commonRoot);
+  if (halt.halted) {
+    writeStderr(formatHaltBanner(halt.reason));
+    return {
+      exitCode: 2,
+      stderr,
+      matched: null,
+      surfaceSymlinkRefused: false,
+      patchSessionAllowed: false,
+    };
   }
   if (filePath.length === 0) {
     return {
@@ -424,7 +430,7 @@ export async function runSettingsProtection(
       const sessionId =
         options.sessionIdOverride ?? process.env['CLAUDE_SESSION_ID'] ?? 'external';
       try {
-        await appendAuditRecord(reaRoot, {
+        await appendAuditRecord(commonRoot, {
           session_id: sessionId,
           tool_name: 'hooks.patch.session',
           server_name: 'rea',

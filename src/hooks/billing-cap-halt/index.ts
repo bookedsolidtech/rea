@@ -108,7 +108,8 @@ import type { Buffer } from 'node:buffer';
 import fs from 'node:fs';
 import path from 'node:path';
 import { parse as parseYaml } from 'yaml';
-import { checkHalt, formatHaltBanner } from '../_lib/halt-check.js';
+import { checkHaltRoots, formatHaltBanner } from '../_lib/halt-check.js';
+import { resolveHookRoots } from '../../lib/worktree-roots.js';
 import {
   parsePostToolUsePayload,
   MalformedPayloadError,
@@ -376,29 +377,13 @@ function buildWriteFailedBanner(matched: string, errMsg: string): string {
 export async function runBillingCapHalt(
   options: BillingCapHaltOptions = {},
 ): Promise<BillingCapHaltResult> {
-  const reaRoot = options.reaRoot ?? process.env['CLAUDE_PROJECT_DIR'] ?? process.cwd();
   let stderr = '';
   const writeStderr = (s: string): void => {
     stderr += s;
     if (options.stderrWrite) options.stderrWrite(s);
   };
 
-  // 1. HALT short-circuit (uniform with every hook). If already frozen we
-  //    exit 2 with the shared banner and do NOT re-write HALT — this is
-  //    what makes a repeated billing match idempotent.
-  const halt = checkHalt(reaRoot);
-  if (halt.halted) {
-    writeStderr(formatHaltBanner(halt.reason));
-    return { exitCode: 2, stderr, action: 'noop', matched: null, haltWritten: false };
-  }
-
-  // 2. Policy gate. Absent block / enabled:false / mode:off → no-op.
-  const { enabled, mode } = readSpendGovernance(reaRoot);
-  if (!enabled || mode === 'off') {
-    return { exitCode: 0, stderr, action: 'noop', matched: null, haltWritten: false };
-  }
-
-  // 3. Parse the payload (command + output). A parse failure is FAIL-SAFE:
+  // 1. Parse the payload (command + output). A parse failure is FAIL-SAFE:
   //    exit 0, no HALT (see the header — never a false-positive freeze on
   //    unparseable input). A one-line breadcrumb goes to stderr so the
   //    failure is observable without being a gate.
@@ -419,11 +404,13 @@ export async function runBillingCapHalt(
   let payloadStderr = '';
   let payloadStdout = '';
   let errored = false;
+  let payloadCwd = '';
   try {
     const payload = parsePostToolUsePayload(stdinRaw);
     payloadStderr = payload.stderr;
     payloadStdout = payload.stdout;
     errored = payload.errored;
+    payloadCwd = payload.cwd;
   } catch (err) {
     if (err instanceof MalformedPayloadError || err instanceof TypePayloadError) {
       writeStderr('billing-cap-halt: payload unreadable; skipping (no freeze on malformed input)\n');
@@ -432,7 +419,26 @@ export async function runBillingCapHalt(
     throw err;
   }
 
-  // 4. Scan STDERR, and ONLY when the command actually FAILED. A genuine
+  // 2. Roots + HALT + policy (0.54.0 worktree state — stdin parsed
+  //    first so the payload `cwd` can feed root resolution). Policy
+  //    keys off the LOCAL root; the kill switch is REPO-WIDE: probed
+  //    on both roots, and when this reflex fires it WRITES to the
+  //    COMMON root so a billing wall in one worktree freezes every
+  //    stream sharing the wallet. If already frozen we exit 2 with the
+  //    shared banner and do NOT re-write HALT — this is what makes a
+  //    repeated billing match idempotent.
+  const { localRoot: reaRoot, commonRoot } = resolveHookRoots(payloadCwd, options.reaRoot);
+  const halt = checkHaltRoots(reaRoot, commonRoot);
+  if (halt.halted) {
+    writeStderr(formatHaltBanner(halt.reason));
+    return { exitCode: 2, stderr, action: 'noop', matched: null, haltWritten: false };
+  }
+  const { enabled, mode } = readSpendGovernance(reaRoot);
+  if (!enabled || mode === 'off') {
+    return { exitCode: 0, stderr, action: 'noop', matched: null, haltWritten: false };
+  }
+
+  // 3. Scan STDERR, and ONLY when the command actually FAILED. A genuine
   //    billing wall is an ERROR: an unhandled SDK/CLI failure surfaces on
   //    stderr WITH a non-zero exit. Two guards, both load-bearing:
   //
@@ -469,7 +475,7 @@ export async function runBillingCapHalt(
     // is the non-freezing mode, so it must NOT block the call — it just
     // surfaces the banner (like the other advisory PostToolUse hooks).
     writeStderr(buildBanner(matched, 'warn'));
-    await recordBillingAudit(reaRoot, { action: 'warn', matched, haltWritten: false });
+    await recordBillingAudit(commonRoot, { action: 'warn', matched, haltWritten: false });
     return { exitCode: 0, stderr, action: 'warn', matched, haltWritten: false };
   }
 
@@ -478,7 +484,7 @@ export async function runBillingCapHalt(
     `billing-cap-halt: billing-class error detected ("${matched}") — automated freeze, no retry`,
   );
   try {
-    writeHaltFile(reaRoot, reason);
+    writeHaltFile(commonRoot, reason);
   } catch (err) {
     // Writing HALT failed (permissions, read-only FS). Do NOT emit the
     // standard "HALT written — all governed tool calls are now blocked"
@@ -489,11 +495,11 @@ export async function runBillingCapHalt(
     // told to stop.
     const writeError = err instanceof Error ? err.message : String(err);
     writeStderr(buildWriteFailedBanner(matched, writeError));
-    await recordBillingAudit(reaRoot, { action: 'halt', matched, haltWritten: false, writeError });
+    await recordBillingAudit(commonRoot, { action: 'halt', matched, haltWritten: false, writeError });
     return { exitCode: 2, stderr, action: 'halt', matched, haltWritten: false };
   }
   writeStderr(buildBanner(matched, 'halt'));
-  await recordBillingAudit(reaRoot, { action: 'halt', matched, haltWritten: true });
+  await recordBillingAudit(commonRoot, { action: 'halt', matched, haltWritten: true });
   return { exitCode: 2, stderr, action: 'halt', matched, haltWritten: true };
 }
 
