@@ -30,6 +30,8 @@ import { findRecentLocalReview } from '../../src/cli/preflight.js';
 import { writeVerdict, lookupVerdict } from '../../src/hooks/push-gate/verdict-cache.js';
 import { runProtectedScan } from '../../src/hooks/bash-scanner/index.js';
 import { runBlockedPathsBashGate } from '../../src/hooks/blocked-paths-bash-gate/index.js';
+import { runSettingsProtection } from '../../src/hooks/settings-protection/index.js';
+import { runBlockedPathsEnforcer } from '../../src/hooks/blocked-paths-enforcer/index.js';
 
 let scratch: string;
 let repo: string;
@@ -190,5 +192,32 @@ describe('worktree-state integration (real git worktree add)', () => {
       'echo x > /tmp/unrelated.txt',
     );
     expect(verdict3.verdict).toBe('allow');
+  });
+
+  it('(vi-b) WRITE-tier absolute targets into the primary checkout are refused too (round-4)', async () => {
+    // settings-protection: Write to the primary's HALT via absolute path.
+    const sp = await runSettingsProtection({
+      reaRoot: wtA,
+      stdinOverride: JSON.stringify({
+        tool_name: 'Write',
+        tool_input: { file_path: path.join(repo, '.rea', 'HALT'), content: 'forged' },
+      }),
+    });
+    expect(sp.exitCode).toBe(2);
+
+    // blocked-paths-enforcer: policy blocks package.json; absolute write
+    // into the PRIMARY checkout's copy from the worktree session refuses.
+    fs.writeFileSync(
+      path.join(wtA, '.rea', 'policy.yaml'),
+      'version: "1"\nprofile: "test"\ninstalled_by: "t"\nblocked_paths:\n  - package.json\n',
+    );
+    const bp = await runBlockedPathsEnforcer({
+      reaRoot: wtA,
+      stdinOverride: JSON.stringify({
+        tool_name: 'Write',
+        tool_input: { file_path: path.join(repo, 'package.json'), content: '{}' },
+      }),
+    });
+    expect(bp.exitCode).toBe(2);
   });
 });

@@ -231,7 +231,22 @@ export async function runSettingsProtection(
   }
 
   // 3. Normalize.
-  const normalized = normalizePath(filePath, reaRoot);
+  let normalized = normalizePath(filePath, reaRoot);
+  // 0.54.0 worktree state (review round-4): an absolute target that
+  // normalizePath left ABSOLUTE (outside the local root) but that lands
+  // INSIDE the COMMON root re-normalizes common-relative, so the
+  // protected/blocked patterns match the primary checkout's shared
+  // enforcement state from a worktree session. Symlink checks below
+  // keep using the raw (absolute) filePath — only pattern matching
+  // consumes the relative form.
+  if (
+    commonRoot !== reaRoot &&
+    path.isAbsolute(normalized) &&
+    (path.resolve(normalized) === path.resolve(commonRoot) ||
+      path.resolve(normalized).startsWith(path.resolve(commonRoot) + path.sep))
+  ) {
+    normalized = normalizePath(filePath, commonRoot);
+  }
   const lowerNorm = normalized.toLowerCase();
   const safeFilePath = sanitizeForStderr(filePath);
   const safeNormalized = sanitizeForStderr(normalized);
