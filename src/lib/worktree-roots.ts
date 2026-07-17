@@ -227,21 +227,19 @@ export function resolveHookRoots(
   // payload is the session repo and is accepted.
   if (payload !== null && hasRea(payload)) {
     if (anchor === null || !hasRea(anchor)) return payload;
-    if (path.resolve(payload.commonRoot) === path.resolve(anchor.commonRoot)) {
-      // Same repository. Round-9 P1 refinement: the payload worktree is
-      // accepted only when the anchor is the PRIMARY checkout — the
-      // Claude worktree-session shape (CLAUDE_PROJECT_DIR pins the
-      // primary while the session works in a linked worktree). When the
-      // session is ANCHORED IN a worktree, a payload naming a SIBLING
-      // worktree keeps the anchor: switching roots to the sibling would
-      // make absolute writes back into the anchor worktree fall outside
-      // both roots and bypass its blocked/protected enforcement.
-      const anchorIsPrimary =
-        path.resolve(anchor.localRoot) === path.resolve(anchor.commonRoot);
-      if (anchorIsPrimary || path.resolve(payload.localRoot) === path.resolve(anchor.localRoot)) {
-        return payload;
-      }
-      return anchor;
+    if (sameRepo(payload, anchor)) {
+      // Same repository — the payload worktree wins unconditionally.
+      // Round-19 P1 (supersedes the round-9 sibling pin): relative
+      // paths in a Bash command physically resolve against the
+      // worktree the command RUNS IN, so enforcement must read that
+      // worktree's policy — pinning to a sibling anchor checked
+      // `package.json` against the wrong stream's blocked/protected
+      // rules. The bypass round-9 worried about (absolute writes back
+      // into the anchor worktree falling outside the accepted root) is
+      // closed by the round-10 sibling cross-root coverage: the anchor
+      // is enumerated via listSiblingWorktreeRoots and its governed
+      // state matches under the strict cross-root pattern union.
+      return payload;
     }
     // Foreign-repo payload — pinned to the session anchor.
   }

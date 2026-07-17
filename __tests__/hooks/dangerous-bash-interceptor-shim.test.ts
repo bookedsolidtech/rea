@@ -26,6 +26,7 @@
  */
 
 import { spawnSync } from 'node:child_process';
+import os from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 
@@ -41,9 +42,12 @@ interface ShimResult {
 function runShimInUnbuiltDir(payload: string): ShimResult {
   // Simulate CLI-unreachable by pointing CLAUDE_PROJECT_DIR at a fresh
   // dir with no node_modules/@bookedsolid/rea AND no dist/cli/index.js.
+  // The dir must live OUTSIDE the repo: since the round-19 worktree CLI
+  // tier, a dir nested inside the repo walks up to the repo's .rea root
+  // and legitimately resolves the repo's own CLI.
   // This exercises the round-7 P1 fix: the shim must short-circuit on
   // benign commands and fail-closed on destructive commands.
-  const tmpdir = path.join(REPO_ROOT, '.claude', 'tmp', `r7-dbi-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
+  const tmpdir = path.join(os.tmpdir(), `r7-dbi-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
   spawnSync('mkdir', ['-p', tmpdir]);
   try {
     const res = spawnSync('bash', [SHIM], {

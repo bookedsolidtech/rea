@@ -264,7 +264,12 @@ describe('resolveHookRoots — guarded candidate ladder', () => {
     }
   });
 
-  it('SIBLING-worktree payload keeps a worktree-anchored session pinned (round-9 P1)', () => {
+  it('SAME-repo payload worktree wins over ANY same-repo anchor (round-19 P1)', () => {
+    // Supersedes the round-9 sibling pin: relative paths resolve
+    // against the worktree the command physically runs in, so the
+    // payload worktree must carry enforcement; the anchor worktree's
+    // own governed state stays protected via sibling cross-root
+    // coverage in the scanners.
     const repo = path.join(scratch, 'repo');
     makeRepo(repo);
     const wtA = path.join(scratch, 'wt-anchor');
@@ -275,9 +280,10 @@ describe('resolveHookRoots — guarded candidate ladder', () => {
     process.env['CLAUDE_PROJECT_DIR'] = wtA; // session anchored IN worktree A
     try {
       const roots = resolveHookRoots(wtB); // payload names sibling B
-      expect(roots.localRoot).toBe(wtA); // pinned — B must not bypass A's enforcement
-      // …while a PRIMARY-checkout anchor still hands over to the payload
-      // worktree (the Claude session shape):
+      expect(roots.localRoot).toBe(wtB); // payload worktree carries enforcement
+      expect(roots.commonRoot).toBe(repo);
+      // …and a PRIMARY-checkout anchor hands over identically (the
+      // Claude worktree-session shape):
       process.env['CLAUDE_PROJECT_DIR'] = repo;
       const roots2 = resolveHookRoots(wtB);
       expect(roots2.localRoot).toBe(wtB);

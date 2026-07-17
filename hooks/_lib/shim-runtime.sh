@@ -169,16 +169,41 @@ _shim_apply_defaults() {
 # When neither tier resolves, REA_ARGV stays empty and RESOLVED_CLI_PATH
 # stays empty.
 # -----------------------------------------------------------------------------
+_shim_try_cli_root() {
+  # Attempt the 2-tier in-project resolution against one root. Sets
+  # REA_ARGV / RESOLVED_CLI_PATH / CLI_RESOLVE_ROOT on success.
+  local _r="$1"
+  if [ -f "$_r/node_modules/@bookedsolid/rea/dist/cli/index.js" ]; then
+    REA_ARGV=(node "$_r/node_modules/@bookedsolid/rea/dist/cli/index.js")
+    RESOLVED_CLI_PATH="$_r/node_modules/@bookedsolid/rea/dist/cli/index.js"
+    CLI_RESOLVE_ROOT="$_r"
+    return 0
+  elif [ -f "$_r/dist/cli/index.js" ]; then
+    REA_ARGV=(node "$_r/dist/cli/index.js")
+    RESOLVED_CLI_PATH="$_r/dist/cli/index.js"
+    CLI_RESOLVE_ROOT="$_r"
+    return 0
+  fi
+  return 1
+}
+
 shim_resolve_cli() {
   REA_ARGV=()
   RESOLVED_CLI_PATH=""
-  if [ -f "$proj/node_modules/@bookedsolid/rea/dist/cli/index.js" ]; then
-    REA_ARGV=(node "$proj/node_modules/@bookedsolid/rea/dist/cli/index.js")
-    RESOLVED_CLI_PATH="$proj/node_modules/@bookedsolid/rea/dist/cli/index.js"
-  elif [ -f "$proj/dist/cli/index.js" ]; then
-    REA_ARGV=(node "$proj/dist/cli/index.js")
-    RESOLVED_CLI_PATH="$proj/dist/cli/index.js"
+  CLI_RESOLVE_ROOT="$proj"
+  _shim_try_cli_root "$proj" && return 0
+  # Round-19 P2 (0.54.0 worktree state): when the accepted root is a
+  # worktree of the session repo and the PRIMARY checkout has no
+  # install (node_modules / dist may exist only in the worktree the
+  # session actually works in), resolve from the active worktree
+  # before degrading to cli-missing / the global tier. The sandbox
+  # containment check below runs against CLI_RESOLVE_ROOT — the root
+  # the CLI was actually resolved from — so the worktree tier gets the
+  # same escape/realpath vetting the primary tier does.
+  if [ -n "${REA_ROOT:-}" ] && [ "$REA_ROOT" != "$proj" ] && [ -d "${REA_ROOT}/.rea" ]; then
+    _shim_try_cli_root "$REA_ROOT" && return 0
   fi
+  return 0
 }
 
 # -----------------------------------------------------------------------------
@@ -700,15 +725,13 @@ shim_run() {
                 break
               fi
             fi
-            # Round-9 P1: same repo, but a payload naming a SIBLING
-            # worktree of a worktree-anchored session keeps the anchor
-            # (only a PRIMARY-checkout anchor hands over to the payload
-            # worktree — the Claude session shape). Does not apply on
-            # the stale-anchor handover (different repository).
-            if [ "$_stale_anchor" = "0" ] && [ -f "${REA_ROOT}/.git" ] \
-               && [ "$_payload_root" != "$REA_ROOT" ]; then
-              break
-            fi
+            # (The round-9 sibling pin — a worktree-anchored session
+            # keeping its anchor against a SAME-repo sibling payload —
+            # was removed in round-19 P1: relative paths resolve
+            # against the worktree the command physically runs in, so
+            # the payload worktree must win; the anchor's own governed
+            # state stays protected via the sibling cross-root
+            # coverage in the Node scanners.)
           fi
           # REA_ROOT (policy reads) follows the payload. `proj` (the
           # CLI-resolution sandbox) stays on CLAUDE_PROJECT_DIR when the
@@ -844,7 +867,7 @@ shim_run() {
       node_missing=1
       REA_ARGV=()
     else
-      sandbox_result=$(shim_sandbox_check "$RESOLVED_CLI_PATH" "$proj" "$SHIM_ENFORCE_CLI_SHAPE")
+      sandbox_result=$(shim_sandbox_check "$RESOLVED_CLI_PATH" "${CLI_RESOLVE_ROOT:-$proj}" "$SHIM_ENFORCE_CLI_SHAPE")
       # TOCTOU precursor: shim_sandbox_check now echoes `ok:<realpath>`
       # on success. Execute the VALIDATED realpath instead of the
       # literal RESOLVED_CLI_PATH so the version probe (step 8) and the
