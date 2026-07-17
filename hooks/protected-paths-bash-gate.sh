@@ -56,6 +56,14 @@ shim_cli_missing_relevant() {
     *".rea/policy.yaml"*) matched_protected=1 ;;
     *".rea/HALT"*) matched_protected=1 ;;
     *".rea/last-review"*) matched_protected=1 ;;
+    # 0.54.0 round-34 P1: repository-wide shared enforcement state —
+    # the audit hash chain, TOFU anchors, and their lock sidecars are
+    # cross-root protected in the Node scanner; the CLI-missing
+    # fallback must carry the same markers or an unbuilt worktree
+    # becomes a bypass lane into the primary checkout.
+    *".rea/audit"*) matched_protected=1 ;;
+    *".rea/fingerprints.json"*) matched_protected=1 ;;
+    *".rea.lock"*) matched_protected=1 ;;
     *".claude\\"*|*".husky\\"*|*".rea\\"*) matched_protected=1 ;;
   esac
   # 0.37.0: route protected_writes reads through the unified

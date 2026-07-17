@@ -491,9 +491,14 @@ export async function runPushGate(deps: PushGateDeps): Promise<GateResult> {
   // would keep refusing the push until TTL expires; disabling it
   // would keep approving a previously-filtered pass. Digest is
   // SHA-256 of a sorted JSON array — same input → same digest.
+  // Round-34 P2: the digest also binds the REVIEW BASE — the reviewed
+  // patch is `git diff <base.ref> <headSha>`, and the 0.54.0 shared
+  // cache means another worktree pushing the same sha against a
+  // DIFFERENT target must not reuse a verdict for the wrong diff.
+  // (Key-shape change safely invalidates pre-0.54.0 entries.)
   const excludeDigest = crypto
     .createHash('sha256')
-    .update(JSON.stringify([...(policy.exclude_paths ?? [])].sort()))
+    .update(JSON.stringify([[...(policy.exclude_paths ?? [])].sort(), base.ref]))
     .digest('hex')
     .slice(0, 16);
   const cacheKey = `${headSha}#${excludeDigest}`;
