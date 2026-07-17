@@ -35,6 +35,7 @@
 
 import fs from 'node:fs/promises';
 import { resolveCommonRoot } from '../lib/worktree-roots.js';
+import properLockfile from 'proper-lockfile';
 import path from 'node:path';
 import { z } from 'zod';
 
@@ -62,6 +63,51 @@ export type FingerprintStore = z.infer<typeof FingerprintStoreSchema>;
  * caller (tofu CLI, gateway tofu-gate, upgrade) goes through here.
  * Degenerate in plain checkouts.
  */
+/**
+ * Round-14 P1: the shared (common-root) store makes concurrent
+ * read-modify-write across worktrees a lost-update hazard. Every
+ * mutation goes through this helper: a proper-lockfile lock on the
+ * STORE PATH (its own `<store>.lock` sidecar — deliberately NOT the
+ * `.rea/` directory, which is the audit chain's lock target; both TOFU
+ * mutation sites also append audit records, so sharing that target
+ * would deadlock). Bounded acquisition; failure degrades to the
+ * unlocked path (a stuck lockfile must not brick trust decisions) with
+ * the error surfaced to the caller.
+ */
+const STORE_LOCK_OPTIONS: Parameters<typeof properLockfile.lock>[1] = {
+  stale: 5_000,
+  retries: { retries: 8, factor: 1.5, minTimeout: 10, maxTimeout: 150, randomize: true },
+  realpath: false,
+};
+
+export async function updateFingerprintStore(
+  baseDir: string,
+  mutate: (store: FingerprintStore) => FingerprintStore | Promise<FingerprintStore>,
+): Promise<{ store: FingerprintStore; lockError?: string }> {
+  const filePath = storePathFor(baseDir);
+  let release: (() => Promise<void>) | null = null;
+  let lockError: string | undefined;
+  try {
+    release = await properLockfile.lock(filePath, STORE_LOCK_OPTIONS);
+  } catch (e) {
+    lockError = e instanceof Error ? e.message : String(e);
+  }
+  try {
+    const store = await loadFingerprintStore(baseDir);
+    const next = await mutate(store);
+    await saveFingerprintStore(baseDir, next);
+    return lockError !== undefined ? { store: next, lockError } : { store: next };
+  } finally {
+    if (release !== null) {
+      try {
+        await release();
+      } catch {
+        /* stale-cleaned — work already durable */
+      }
+    }
+  }
+}
+
 function storeRootFor(baseDir: string): string {
   return resolveCommonRoot(baseDir, () => {}).commonRoot;
 }

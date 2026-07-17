@@ -26,7 +26,7 @@ import type { RegistryServer } from './types.js';
 import { Tier, InvocationStatus } from '../policy/types.js';
 import { appendAuditRecord } from '../audit/append.js';
 import { resolveCommonRoot } from '../lib/worktree-roots.js';
-import { loadFingerprintStore, saveFingerprintStore } from './fingerprints-store.js';
+import { loadFingerprintStore, updateFingerprintStore } from './fingerprints-store.js';
 import { classifyServers, updateStore, type TofuClassification } from './tofu.js';
 import { createLogger, type Logger } from '../gateway/log.js';
 
@@ -88,8 +88,19 @@ export async function applyTofuGate(
     accepted.push(server);
   }
 
-  const nextStore = updateStore(store, classifications);
-  await saveFingerprintStore(baseDir, nextStore);
+  // Round-14 P1: write under the store lock against a FRESH read, so a
+  // concurrent accept from another worktree is merged instead of
+  // last-writer-wins dropped. Classification stays based on the store
+  // read at gate time (the decisions were made against it).
+  const { lockError } = await updateFingerprintStore(baseDir, (fresh) =>
+    updateStore(fresh, classifications),
+  );
+  if (lockError !== undefined) {
+    log.warn({
+      event: 'tofu.store_lock_degraded',
+      message: `fingerprint-store lock degraded (${lockError}) — wrote unlocked`,
+    });
+  }
 
   return { accepted, classifications };
 }

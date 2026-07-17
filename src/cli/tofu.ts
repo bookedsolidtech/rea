@@ -42,7 +42,7 @@ import { fingerprintServer } from '../registry/fingerprint.js';
 import {
   FINGERPRINT_STORE_VERSION,
   loadFingerprintStore,
-  saveFingerprintStore,
+  updateFingerprintStore,
 } from '../registry/fingerprints-store.js';
 import { loadRegistry } from '../registry/loader.js';
 import { resolveReaRoots } from '../lib/worktree-roots.js';
@@ -147,11 +147,15 @@ export async function runTofuAccept(options: RunTofuAcceptOptions): Promise<void
     return;
   }
 
-  const nextStore = {
+  // Round-14 P1: merge-write under the store lock so a concurrent
+  // accept/serve from another worktree is not last-writer-wins dropped.
+  const { lockError } = await updateFingerprintStore(commonRoot, (fresh) => ({
     version: FINGERPRINT_STORE_VERSION as typeof FINGERPRINT_STORE_VERSION,
-    servers: { ...store.servers, [server.name]: current },
-  };
-  await saveFingerprintStore(commonRoot, nextStore);
+    servers: { ...fresh.servers, [server.name]: current },
+  }));
+  if (lockError !== undefined) {
+    log(`tofu: fingerprint-store lock degraded (${lockError}) — wrote unlocked.`);
+  }
 
   const event =
     stored === undefined ? 'tofu.first_seen_accepted_by_cli' : 'tofu.drift_accepted_by_cli';

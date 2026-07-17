@@ -85,8 +85,19 @@ export async function runUnfreeze(options: UnfreezeOptions): Promise<void> {
   // pre-0.54.0 local HALT in a sibling stream must not keep that stream
   // frozen after the operator unfroze the repo. `git worktree list` is
   // authoritative; failure degrades to common+current (best effort).
+  //
+  // Round-14 P2: the sweep ONLY applies where the repo actually shares
+  // a kill switch — a linked worktree of a proper primary, or a primary
+  // with linked worktrees. Bare-repo worktrees degrade to per-worktree
+  // isolation at resolution time (commonRoot === localRoot with a .git
+  // FILE), and unfreezing one such stream must not resume its siblings.
+  const sharedKillSwitch =
+    roots.isLinkedWorktree ||
+    (fs.existsSync(path.join(roots.commonRoot, '.git', 'worktrees')) &&
+      fs.statSync(path.join(roots.commonRoot, '.git')).isDirectory());
   const worktreeRoots = new Set<string>([roots.commonRoot, roots.localRoot]);
-  try {
+  if (sharedKillSwitch) {
+    try {
     const out = execFileSync('git', ['-C', roots.commonRoot, 'worktree', 'list', '--porcelain'], {
       encoding: 'utf8',
       timeout: 5_000,
@@ -94,8 +105,9 @@ export async function runUnfreeze(options: UnfreezeOptions): Promise<void> {
     for (const line of out.split('\n')) {
       if (line.startsWith('worktree ')) worktreeRoots.add(line.slice('worktree '.length).trim());
     }
-  } catch {
-    /* best effort — common + current still clear below */
+    } catch {
+      /* best effort — common + current still clear below */
+    }
   }
   const haltFiles = [...worktreeRoots]
     .map((r) => reaPath(r, HALT_FILE))

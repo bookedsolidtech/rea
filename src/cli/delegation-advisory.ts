@@ -454,6 +454,8 @@ function readStdinSync(): string {
 export interface DelegationAdvisoryResult {
   /** `'disabled'` when policy is off; `'halt'` under HALT; otherwise `'ran'`. */
   outcome: 'disabled' | 'halt' | 'ran' | 'no-payload';
+  /** The HALT reason (whichever root held the file) when outcome is 'halt'. */
+  haltReason?: string;
   /** Post-increment counter value (only meaningful when `outcome === 'ran'`). */
   count?: number;
   /** `true` when the advisory was printed this invocation. */
@@ -498,11 +500,22 @@ export async function computeDelegationAdvisory(
   // HALT check — uniform with the rest of the hook tree. The advisory
   // hook is observational, but refusing to run while frozen keeps the
   // kill-switch contract simple: every hook exits 2 under HALT.
-  if (
-    fs.existsSync(path.join(reaRoot, '.rea', 'HALT')) ||
-    fs.existsSync(path.join(commonRoot, '.rea', 'HALT'))
-  ) {
-    return { outcome: 'halt' };
+  const haltFileHit = [
+    path.join(reaRoot, '.rea', 'HALT'),
+    path.join(commonRoot, '.rea', 'HALT'),
+  ].find((f) => fs.existsSync(f));
+  if (haltFileHit !== undefined) {
+    // Round-14 P3: carry the ACTUAL reason (and which file held it) so
+    // the banner does not degrade to "Reason unknown" when the freeze
+    // is repo-wide and lives at the common root.
+    let haltReason = 'Reason unknown';
+    try {
+      const contents = fs.readFileSync(haltFileHit, 'utf8').slice(0, 1024).trim();
+      if (contents.length > 0) haltReason = contents;
+    } catch {
+      /* keep the placeholder */
+    }
+    return { outcome: 'halt', haltReason };
   }
 
   const policy =
@@ -631,13 +644,16 @@ export async function runHookDelegationAdvisory(
     options.reaRoot ?? process.env['CLAUDE_PROJECT_DIR'] ?? process.cwd();
   const result = await computeDelegationAdvisory(options);
   if (result.outcome === 'halt') {
-    // Surface the HALT reason — same shape the other hooks print.
-    let reason = 'Reason unknown';
-    try {
-      const content = fs.readFileSync(path.join(reaRoot, '.rea', 'HALT'), 'utf8');
-      reason = content.slice(0, 1024).trim() || reason;
-    } catch {
-      /* leave default */
+    // Surface the HALT reason — carried from whichever root held the
+    // file (round-14 P3: a repo-wide freeze lives at the common root).
+    let reason = result.haltReason ?? 'Reason unknown';
+    if (result.haltReason === undefined) {
+      try {
+        const content = fs.readFileSync(path.join(reaRoot, '.rea', 'HALT'), 'utf8');
+        reason = content.slice(0, 1024).trim() || reason;
+      } catch {
+        /* leave default */
+      }
     }
     process.stderr.write(
       `REA HALT: ${reason}\nAll agent operations suspended. Run: rea unfreeze\n`,
