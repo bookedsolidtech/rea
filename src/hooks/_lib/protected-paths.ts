@@ -82,6 +82,12 @@ export const PROTECTED_PATTERNS_FULL: readonly string[] = [
 export const CROSS_ROOT_SHARED_STATE_PATTERNS: readonly string[] = [
   '.rea/audit.jsonl',
   '.rea/fingerprints.json',
+  // Round-28 P2: the proper-lockfile sidecars that serialize the
+  // shared writers. Interfering with `<primary>/.rea.lock` (audit
+  // chain / verdict cache) or the fingerprint-store lock from another
+  // stream can stall or unsynchronize repository-wide appends.
+  '.rea.lock/',
+  '.rea/fingerprints.json.lock/',
 ];
 
 export const PATCH_SESSION_PATTERNS: readonly string[] = ['.claude/hooks/'];

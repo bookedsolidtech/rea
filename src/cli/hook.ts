@@ -345,12 +345,16 @@ export async function runHookScanBash(options: HookScanBashOptions): Promise<voi
           reaRoot,
           commonRoot,
           siblingRoots: listSiblingWorktreeRoots(commonRoot, reaRoot),
-          protectedPatternsForRoot: (root: string): readonly string[] => {
+          protectedPatternsForRoot: (
+            root: string,
+          ): { patterns: readonly string[]; overridePatterns: readonly string[] } => {
             try {
               const parsed = parseYaml(
                 fs.readFileSync(path.join(root, '.rea', 'policy.yaml'), 'utf8'),
               );
-              if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return [];
+              if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+                return { patterns: [], overridePatterns: [] };
+              }
               const rec = parsed as Record<string, unknown>;
               const writes = Array.isArray(rec['protected_writes'])
                 ? (rec['protected_writes'] as unknown[]).filter(
@@ -362,12 +366,16 @@ export async function runHookScanBash(options: HookScanBashOptions): Promise<voi
                     (e): e is string => typeof e === 'string' && e.length > 0,
                   )
                 : [];
-              return resolveProtectedPatterns({
+              const resolved = resolveProtectedPatterns({
                 ...(writes !== undefined ? { protectedWrites: writes } : {}),
                 protectedPathsRelax: relaxT,
-              }).patterns;
+              });
+              // Round-28 P2: the target's overridePatterns keep their
+              // precedence over the husky .d extension-surface
+              // allow-list even when the write arrives cross-root.
+              return { patterns: resolved.patterns, overridePatterns: resolved.overridePatterns };
             } catch {
-              return [];
+              return { patterns: [], overridePatterns: [] };
             }
           },
           policy: {

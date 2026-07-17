@@ -541,15 +541,22 @@ export async function runPushGate(deps: PushGateDeps): Promise<GateResult> {
     try {
       const localSnapshotPath = path.join(deps.baseDir, '.rea', 'last-review.json');
       let localSha: string | null = null;
+      let localVerdict: string | null = null;
       try {
         const parsed = JSON.parse(fsSync.readFileSync(localSnapshotPath, 'utf8')) as {
           head_sha?: unknown;
+          verdict?: unknown;
         };
         if (typeof parsed.head_sha === 'string') localSha = parsed.head_sha;
+        if (typeof parsed.verdict === 'string') localVerdict = parsed.verdict;
       } catch {
         /* absent or unreadable → refresh */
       }
-      if (localSha !== headSha) {
+      // Round-28 P2 refinement: refresh on a VERDICT mismatch too — a
+      // sibling stream can re-review the same sha and flip the shared
+      // cache entry, leaving this stream's same-sha snapshot showing
+      // the superseded verdict while the push proceeds on the new one.
+      if (localSha !== headSha || localVerdict !== cached.verdict) {
         writeLastReviewFromCache({
           baseDir: deps.baseDir,
           verdict: cached.verdict,

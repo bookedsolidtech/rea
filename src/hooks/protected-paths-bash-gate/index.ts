@@ -246,10 +246,15 @@ export async function runProtectedPathsBashGate(
 // protected_writes | invariants, its relax applied). Permissive read —
 // a broken target policy degrades to [] (the strict defaults still
 // apply via the union in the scanner).
-function protectedPatternsForRootPermissive(root: string): readonly string[] {
+function protectedPatternsForRootPermissive(root: string): {
+  patterns: readonly string[];
+  overridePatterns: readonly string[];
+} {
   try {
     const parsed = parseYaml(fs.readFileSync(path.join(root, '.rea', 'policy.yaml'), 'utf8'));
-    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return [];
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return { patterns: [], overridePatterns: [] };
+    }
     const rec = parsed as Record<string, unknown>;
     const writes = Array.isArray(rec['protected_writes'])
       ? (rec['protected_writes'] as unknown[]).filter(
@@ -265,9 +270,11 @@ function protectedPatternsForRootPermissive(root: string): readonly string[] {
       ...(writes !== undefined ? { protectedWrites: writes } : {}),
       protectedPathsRelax: relax,
     });
-    return resolved.patterns;
+    // Round-28 P2: overridePatterns keep their precedence over the
+    // husky .d extension allow-list on cross-root writes.
+    return { patterns: resolved.patterns, overridePatterns: resolved.overridePatterns };
   } catch {
-    return [];
+    return { patterns: [], overridePatterns: [] };
   }
 }
 

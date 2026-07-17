@@ -127,7 +127,10 @@ export interface ProtectedScanContext {
    * strict defaults and this set, so a branch-specific protected_writes
    * entry in the destination stream is honored from any caller.
    */
-  protectedPatternsForRoot?: (root: string) => readonly string[];
+  protectedPatternsForRoot?: (root: string) => {
+    patterns: readonly string[];
+    overridePatterns: readonly string[];
+  };
   policy: Pick<Policy, 'protected_writes' | 'protected_paths_relax'>;
   /**
    * Stderr sink for advisory messages (e.g. "kill-switch invariant in
@@ -1261,13 +1264,17 @@ export function scanForProtectedViolations(
     // describe its own stream, never another's.
     const patternsFor = (norm2: NormalizedTarget): EffectivePatterns => {
       if (norm2.crossRoot !== true) return effective;
-      const targetPatterns =
+      const target =
         norm2.crossRootPath !== undefined && ctx.protectedPatternsForRoot !== undefined
           ? ctx.protectedPatternsForRoot(norm2.crossRootPath)
-          : [];
+          : { patterns: [] as readonly string[], overridePatterns: [] as readonly string[] };
+      // Round-28 P2: the TARGET stream's overridePatterns retain their
+      // precedence over the husky `.d` extension-surface allow-list —
+      // a branch that explicitly protects a husky fragment keeps that
+      // protection against cross-root writes.
       return {
-        full: [...new Set([...STRICT_CROSS_ROOT_PATTERNS, ...targetPatterns])],
-        override: [],
+        full: [...new Set([...STRICT_CROSS_ROOT_PATTERNS, ...target.patterns])],
+        override: [...target.overridePatterns],
       };
     };
     const logicalHit = checkPathProtected(norm.pathLc, patternsFor(norm), dirOptions);
@@ -1298,10 +1305,12 @@ export function scanForProtectedViolations(
               full: [
                 ...new Set([
                   ...STRICT_CROSS_ROOT_PATTERNS,
-                  ...(ctx.protectedPatternsForRoot?.(norm.resolvedRootPath) ?? []),
+                  ...(ctx.protectedPatternsForRoot?.(norm.resolvedRootPath).patterns ?? []),
                 ]),
               ],
-              override: [],
+              override: [
+                ...(ctx.protectedPatternsForRoot?.(norm.resolvedRootPath).overridePatterns ?? []),
+              ],
             };
     if (norm.resolvedLc !== null) {
       const resolvedHit = checkPathProtected(norm.resolvedLc, resolvedPatterns, dirOptions);
