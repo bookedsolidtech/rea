@@ -33,6 +33,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import type { Command } from 'commander';
 import { spawnSync } from 'node:child_process';
+import { resolveCommonRoot } from '../lib/worktree-roots.js';
 import { appendAuditRecord } from '../audit/append.js';
 import {
   LOCAL_REVIEW_TOOL_NAME,
@@ -91,6 +92,13 @@ export async function computePreflight(
 ): Promise<{ outcome: PreflightOutcome; policy: Policy | undefined }> {
   const policy = await tryLoadPolicy(baseDir);
 
+  // 0.54.0 worktree state: policy + git resolution stay on the LOCAL
+  // (worktree) root the caller passed; the audit chain — both the
+  // coverage lookup and the skip-audit append — lives at the COMMON
+  // (repository) root, so a review run in any worktree covers the same
+  // sha pushed from another. Degenerate (plain checkout): identical.
+  const commonRoot = resolveCommonRoot(baseDir).commonRoot;
+
   // Round-27 F4 fix: HALT check BEFORE every other path. The Bash-tier
   // `local-review-gate.sh` and the canonical husky BODY_TEMPLATE both
   // honor `.rea/HALT`, but `rea preflight` itself was missing the check —
@@ -98,7 +106,8 @@ export async function computePreflight(
   // body bypassed the kill-switch entirely. The HALT check runs BEFORE
   // `mode === 'off'` so a halted repo cannot push even when local-review
   // enforcement is opted-out.
-  const halt = readHalt(baseDir);
+  const localHalt = readHalt(baseDir);
+  const halt = localHalt.halted ? localHalt : readHalt(commonRoot);
   if (halt.halted) {
     return {
       outcome: {
@@ -145,7 +154,7 @@ export async function computePreflight(
       bypass_env_var: bypassEnvVar,
     };
     await safeAudit(
-      baseDir,
+      commonRoot,
       LOCAL_REVIEW_SKIPPED_OVERRIDE_TOOL_NAME,
       InvocationStatus.Allowed,
       meta as unknown as Record<string, unknown>,
@@ -167,7 +176,7 @@ export async function computePreflight(
   if (options.noReviewCheck === true) {
     reviewCheckSkipped = true;
     await safeAudit(
-      baseDir,
+      commonRoot,
       LOCAL_REVIEW_PREFLIGHT_SKIPPED_TOOL_NAME,
       InvocationStatus.Allowed,
       { head_sha: headSha, reason: '--no-review-check flag' },
@@ -179,7 +188,7 @@ export async function computePreflight(
   const maxAgeSeconds =
     policy?.review?.local_review?.max_age_seconds ?? DEFAULT_MAX_AGE_SECONDS;
   if (!reviewCheckSkipped) {
-    const lookup = findRecentLocalReview(baseDir, headSha, maxAgeSeconds, new Date(), contentToken);
+    const lookup = findRecentLocalReview(commonRoot, headSha, maxAgeSeconds, new Date(), contentToken);
     if (!lookup.found) {
       // 0.28.0 round-29 P3: when the most recent path-matching audit
       // entry was blocking/error, the operator HAS reviewed — they

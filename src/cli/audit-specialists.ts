@@ -42,6 +42,7 @@
  */
 
 import fs from 'node:fs/promises';
+import { resolveReaRoots } from '../lib/worktree-roots.js';
 import path from 'node:path';
 import type { Command } from 'commander';
 import type { AuditRecord } from '../gateway/middleware/audit-types.js';
@@ -365,7 +366,10 @@ export function groupBySubagent(records: DelegationRecord[]): DelegationGroup[] 
 export async function computeAuditSpecialists(
   options: AuditSpecialistsOptions = {},
 ): Promise<AuditSpecialistsResult> {
-  const baseDir = options.baseDir ?? process.cwd();
+  // 0.54.0 worktree state: the audit chain is per-REPOSITORY — read
+  // it from the common root so `rea audit *` in a worktree sees the
+  // shared chain. Degenerate in plain checkouts.
+  const baseDir = options.baseDir ?? resolveReaRoots(process.cwd()).commonRoot;
   let sessionFilter: string | null;
   let source: 'env' | 'option' | 'none';
   // Precedence: explicit `sessionFilter` test seam > `--session` flag >

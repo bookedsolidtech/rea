@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import * as p from '@clack/prompts';
 import { HALT_FILE, REA_DIR, err, log, reaPath } from './utils.js';
+import { resolveReaRoots } from '../lib/worktree-roots.js';
 
 export interface FreezeOptions {
   reason?: string | undefined;
@@ -55,8 +56,12 @@ export function runFreeze(options: FreezeOptions): void {
     process.exit(1);
   }
 
-  const targetDir = process.cwd();
-  writeHaltFile(targetDir, reason);
+  // 0.54.0 worktree state: the kill switch is REPO-WIDE — one HALT per
+  // repository, written to the COMMON (primary-checkout) root so a
+  // freeze issued from any worktree stops every stream. In a plain
+  // checkout common === cwd-root and nothing changes.
+  const roots = resolveReaRoots(process.cwd());
+  writeHaltFile(roots.commonRoot, reason);
 
   console.log('');
   log('REA FROZEN');
@@ -69,13 +74,22 @@ export function runFreeze(options: FreezeOptions): void {
 }
 
 export async function runUnfreeze(options: UnfreezeOptions): Promise<void> {
-  const targetDir = process.cwd();
-  const haltFile = reaPath(targetDir, HALT_FILE);
+  // Unfreeze clears BOTH roots (0.54.0): the common root (where freeze
+  // writes from this release on) AND the local worktree root (a legacy
+  // per-worktree HALT from an older release, or one written by a
+  // pre-upgrade hook, must not keep this stream frozen after the
+  // operator unfroze). In a plain checkout the two coincide.
+  const roots = resolveReaRoots(process.cwd());
+  const haltFiles = [
+    reaPath(roots.commonRoot, HALT_FILE),
+    ...(roots.commonRoot !== roots.localRoot ? [reaPath(roots.localRoot, HALT_FILE)] : []),
+  ].filter((f) => fs.existsSync(f));
 
-  if (!fs.existsSync(haltFile)) {
+  if (haltFiles.length === 0) {
     log('Not frozen — no .rea/HALT file found.');
     return;
   }
+  const haltFile = haltFiles[0]!;
 
   const existingReason = fs.readFileSync(haltFile, 'utf8').trim();
 
@@ -91,7 +105,9 @@ export async function runUnfreeze(options: UnfreezeOptions): Promise<void> {
     }
   }
 
-  fs.unlinkSync(haltFile);
+  for (const f of haltFiles) {
+    fs.unlinkSync(f);
+  }
   console.log('');
   log('REA UNFROZEN');
   console.log('       .rea/HALT removed — agent operations resumed.');

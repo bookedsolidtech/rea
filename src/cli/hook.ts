@@ -38,7 +38,7 @@ import { parse as parseYaml } from 'yaml';
 import { parsePrePushStdin, runPushGate } from '../hooks/push-gate/index.js';
 import { runBlockedScan, runProtectedScan, type Verdict } from '../hooks/bash-scanner/index.js';
 import { checkHalt, checkHaltRoots, formatHaltBanner } from '../hooks/_lib/halt-check.js';
-import { resolveHookRoots } from '../lib/worktree-roots.js';
+import { resolveHookRoots, resolveReaRoots } from '../lib/worktree-roots.js';
 import { runHookPrIssueLinkGate } from '../hooks/pr-issue-link-gate/index.js';
 import { runHookSecurityDisclosureGate } from '../hooks/security-disclosure-gate/index.js';
 import { runHookAttributionAdvisory } from '../hooks/attribution-advisory/index.js';
@@ -110,7 +110,11 @@ export interface HookPushGateOptions {
  * behavior consistent prevents commander from inferring its own default.
  */
 export async function runHookPushGate(options: HookPushGateOptions): Promise<void> {
-  const baseDir = process.cwd();
+  // 0.54.0 worktree state: the gate runs where git invoked the pre-push
+  // hook (the worktree). Policy/diff/last-review.json stay here; audit,
+  // the verdict cache, and the HALT probe follow `commonDir` to the
+  // primary checkout so coverage and verdict reuse span worktrees.
+  const { localRoot: baseDir, commonRoot: commonDir } = resolveReaRoots(process.cwd());
   const stderr = (line: string): void => {
     process.stderr.write(line);
   };
@@ -123,6 +127,7 @@ export async function runHookPushGate(options: HookPushGateOptions): Promise<voi
   try {
     const result = await runPushGate({
       baseDir,
+      commonDir,
       env: process.env,
       stderr,
       refspecs,

@@ -36,6 +36,7 @@ import path from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import type { Command } from 'commander';
 import { createRealGitExecutor } from '../hooks/push-gate/codex-runner.js';
+import { resolveCommonRoot } from '../lib/worktree-roots.js';
 import { appendAuditRecord } from '../audit/append.js';
 import {
   LOCAL_REVIEW_TOOL_NAME,
@@ -1201,7 +1202,12 @@ async function safeAudit(
     for (const [k, v] of Object.entries(metadata)) {
       if (v !== undefined) cleanMeta[k] = v;
     }
-    await appendAuditRecord(baseDir, {
+    // 0.54.0 worktree state: the review's coverage entry goes to the
+    // COMMON (repository) audit chain so `rea preflight` in ANY
+    // worktree sees it for the same sha. Single seam for all callers;
+    // degenerate (plain checkout) resolves to baseDir itself.
+    const auditRoot = resolveCommonRoot(baseDir).commonRoot;
+    await appendAuditRecord(auditRoot, {
       tool_name: toolName,
       server_name: LOCAL_REVIEW_SERVER_NAME,
       tier: Tier.Read,

@@ -45,6 +45,7 @@ import {
   saveFingerprintStore,
 } from '../registry/fingerprints-store.js';
 import { loadRegistry } from '../registry/loader.js';
+import { resolveReaRoots } from '../lib/worktree-roots.js';
 import type { RegistryServer } from '../registry/types.js';
 import { err, log } from './utils.js';
 
@@ -82,9 +83,12 @@ export interface RunTofuListOptions {
 }
 
 export async function runTofuList(options: RunTofuListOptions = {}): Promise<void> {
-  const baseDir = process.cwd();
+  // 0.54.0 worktree state: registry.yaml is CHECKED IN (per-worktree);
+  // the TOFU fingerprint store is per-REPOSITORY trust and lives at the
+  // common root. Degenerate in plain checkouts.
+  const { localRoot: baseDir, commonRoot } = resolveReaRoots(process.cwd());
   const registry = loadRegistry(baseDir);
-  const store = await loadFingerprintStore(baseDir);
+  const store = await loadFingerprintStore(commonRoot);
   const rows = classifyRows(registry.servers, store.servers);
 
   if (options.json === true) {
@@ -122,7 +126,7 @@ export interface RunTofuAcceptOptions {
 }
 
 export async function runTofuAccept(options: RunTofuAcceptOptions): Promise<void> {
-  const baseDir = process.cwd();
+  const { localRoot: baseDir, commonRoot } = resolveReaRoots(process.cwd());
   const registry = loadRegistry(baseDir);
   const server = registry.servers.find((s) => s.name === options.name);
   if (server === undefined) {
@@ -133,7 +137,7 @@ export async function runTofuAccept(options: RunTofuAcceptOptions): Promise<void
   }
 
   const current = fingerprintServer(server);
-  const store = await loadFingerprintStore(baseDir);
+  const store = await loadFingerprintStore(commonRoot);
   const stored = store.servers[server.name];
 
   if (stored === current) {
@@ -147,7 +151,7 @@ export async function runTofuAccept(options: RunTofuAcceptOptions): Promise<void
     version: FINGERPRINT_STORE_VERSION as typeof FINGERPRINT_STORE_VERSION,
     servers: { ...store.servers, [server.name]: current },
   };
-  await saveFingerprintStore(baseDir, nextStore);
+  await saveFingerprintStore(commonRoot, nextStore);
 
   const event =
     stored === undefined ? 'tofu.first_seen_accepted_by_cli' : 'tofu.drift_accepted_by_cli';
