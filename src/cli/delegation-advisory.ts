@@ -494,6 +494,28 @@ export async function computeDelegationAdvisory(
   // + policy key off the LOCAL root; the audit scan ("did this session
   // delegate") reads the COMMON root, where delegation-capture writes
   // the shared chain; the kill switch probes BOTH roots.
+  // Round-29 P2: probe HALT via the env ladder BEFORE touching stdin —
+  // readStdinSync blocks until EOF, and a caller that never closes the
+  // pipe would hang this hook past an active freeze. The payload-aware
+  // dual-root probe below still runs after parsing (it can see a
+  // worktree-local legacy HALT the env ladder cannot).
+  {
+    const pre = resolveHookRoots(undefined, options.reaRoot);
+    const preHit = [
+      path.join(pre.localRoot, '.rea', 'HALT'),
+      path.join(pre.commonRoot, '.rea', 'HALT'),
+    ].find((f) => fs.existsSync(f));
+    if (preHit !== undefined) {
+      let haltReason = 'Reason unknown';
+      try {
+        const contents = fs.readFileSync(preHit, 'utf8').slice(0, 1024).trim();
+        if (contents.length > 0) haltReason = contents;
+      } catch {
+        /* keep the placeholder */
+      }
+      return { outcome: 'halt', haltReason };
+    }
+  }
   const stdinRawEarly = options.stdinOverride ?? readStdinSync();
   let payloadCwdEarly = '';
   try {

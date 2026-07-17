@@ -564,6 +564,8 @@ export async function runPushGate(deps: PushGateDeps): Promise<GateResult> {
           baseRef: base.ref,
           headSha,
           cachedReviewedAt: cached.reviewed_at,
+          ...(cached.findings !== undefined ? { findings: cached.findings } : {}),
+          ...(cached.review_text !== undefined ? { reviewText: cached.review_text } : {}),
           ...(deps.now !== undefined ? { now: deps.now() } : {}),
         });
       }
@@ -698,6 +700,11 @@ export async function runPushGate(deps: PushGateDeps): Promise<GateResult> {
         model: codexResult.modelUsed,
         reasoning_effort: policy.codex_reasoning_effort ?? IRON_GATE_DEFAULT_REASONING,
         ttl_ms: policy.cache_ttl_ms,
+        // Round-29 P2: carry the REDACTED findings + review text (as
+        // written to last-review.json) so a cross-worktree cache hit
+        // can materialize an actionable snapshot in its own stream.
+        findings: payload.findings,
+        review_text: payload.review_text,
       };
       try {
         // 0.28.0 codex round-1 P2: write under the same compound key
