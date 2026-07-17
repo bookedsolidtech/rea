@@ -340,7 +340,7 @@ export async function runHookScanBash(options: HookScanBashOptions): Promise<voi
         cmd,
       );
     } else {
-      verdict = runBlockedScan({ reaRoot, blockedPaths }, cmd);
+      verdict = runBlockedScan({ reaRoot, commonRoot, blockedPaths }, cmd);
     }
   } catch (e) {
     // Any exception in the scanner is a bug; fail closed.

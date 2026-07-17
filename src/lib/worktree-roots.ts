@@ -172,27 +172,45 @@ export function resolveHookRoots(
     const { commonRoot, isLinkedWorktree } = resolveCommonRoot(explicitRoot, stderrWrite);
     return { localRoot: explicitRoot, commonRoot, isLinkedWorktree };
   }
-  const candidates: string[] = [];
-  if (payloadCwd !== undefined && payloadCwd.length > 0) candidates.push(payloadCwd);
-  const envDir = process.env['CLAUDE_PROJECT_DIR'];
-  if (envDir !== undefined && envDir.length > 0) candidates.push(envDir);
-  candidates.push(process.cwd());
 
-  let fallback: ReaRoots | null = null;
-  for (const candidate of candidates) {
-    let roots: ReaRoots;
+  const hasRea = (roots: ReaRoots): boolean =>
+    fs.existsSync(path.join(roots.localRoot, '.rea'));
+  const tryResolve = (dir: string | undefined): ReaRoots | null => {
+    if (dir === undefined || dir.length === 0) return null;
     try {
-      roots = resolveReaRoots(candidate, stderrWrite);
+      return resolveReaRoots(dir, stderrWrite);
     } catch {
-      continue;
+      return null;
     }
-    if (fs.existsSync(path.join(roots.localRoot, '.rea'))) return roots;
-    if (fallback === null) fallback = roots;
+  };
+
+  // The SESSION ANCHOR: CLAUDE_PROJECT_DIR (the repo the session was
+  // started for), falling back to process.cwd().
+  const anchor = tryResolve(process.env['CLAUDE_PROJECT_DIR']) ?? tryResolve(process.cwd());
+
+  // Payload candidate — accepted only when it (a) carries `.rea/` AND
+  // (b) belongs to the SAME REPOSITORY as the session anchor (identical
+  // commonRoot). Round-7 P1: on a machine with several rea-managed
+  // repos, an agent that `cd`s into repo B mid-session must not drag
+  // repo A's gates onto B's policy — writes back into A would become
+  // "outside root" and bypass the scanners. Worktrees of the SAME repo
+  // share a commonRoot, so the multi-stream case still resolves the
+  // worktree-local root; a payload from a FOREIGN repo falls back to
+  // the anchor (the pre-0.54.0 behavior). When there is no rea-rooted
+  // anchor at all (the payload names the only install in sight), the
+  // payload is the session repo and is accepted.
+  const payload = tryResolve(payloadCwd);
+  if (payload !== null && hasRea(payload)) {
+    if (anchor === null || !hasRea(anchor)) return payload;
+    if (path.resolve(payload.commonRoot) === path.resolve(anchor.commonRoot)) return payload;
+    // Foreign-repo payload — pinned to the session anchor.
   }
+  if (anchor !== null && hasRea(anchor)) return anchor;
+
   // No candidate has `.rea/` — preserve the historical behavior of the
   // FIRST candidate (payload cwd / env / cwd order) so a repo without a
   // rea install behaves exactly as before this module existed.
-  return fallback ?? resolveReaRoots(process.cwd(), stderrWrite);
+  return payload ?? anchor ?? resolveReaRoots(process.cwd(), stderrWrite);
 }
 
 function tryGit(cwd: string, args: string[]): string {

@@ -131,11 +131,25 @@ describe('resolveCommonRoot — the .git discriminator', () => {
 });
 
 describe('resolveHookRoots — guarded candidate ladder', () => {
-  it('accepts the payload cwd when its root has .rea/', () => {
+  it('accepts the payload cwd when no rea-rooted session anchor exists', () => {
+    // Round-7 P1 semantics: a payload repo is accepted outright only
+    // when the session anchor (CLAUDE_PROJECT_DIR / cwd) is not itself
+    // a rea root — then the payload IS the session repo.
     const repo = path.join(scratch, 'repo');
     makeRepo(repo);
-    const roots = resolveHookRoots(path.join(repo));
-    expect(roots.localRoot).toBe(repo);
+    const stray = path.join(scratch, 'no-anchor');
+    fs.mkdirSync(stray, { recursive: true });
+    const prevEnv = process.env['CLAUDE_PROJECT_DIR'];
+    const prevCwd = process.cwd();
+    delete process.env['CLAUDE_PROJECT_DIR'];
+    process.chdir(stray);
+    try {
+      const roots = resolveHookRoots(repo);
+      expect(roots.localRoot).toBe(repo);
+    } finally {
+      process.chdir(prevCwd);
+      if (prevEnv !== undefined) process.env['CLAUDE_PROJECT_DIR'] = prevEnv;
+    }
   });
 
   it('REJECTS a payload cwd whose root has no .rea/ and falls to the env candidate', () => {
@@ -179,6 +193,42 @@ describe('resolveHookRoots — guarded candidate ladder', () => {
     expect(roots.localRoot).toBe(wt);
     expect(roots.commonRoot).toBe(repo);
     expect(roots.isLinkedWorktree).toBe(true);
+  });
+
+  it('FOREIGN-repo payload cwd is pinned back to the session anchor (round-7 P1)', () => {
+    // Two independent rea-managed repos. The session anchor is repo A;
+    // the agent cd'ed into repo B before the tool call. Accepting B
+    // would load B's policy and turn writes into A into "outside root".
+    const repoA = path.join(scratch, 'repo-a');
+    const repoB = path.join(scratch, 'repo-b');
+    makeRepo(repoA);
+    makeRepo(repoB);
+    const prev = process.env['CLAUDE_PROJECT_DIR'];
+    process.env['CLAUDE_PROJECT_DIR'] = repoA;
+    try {
+      const roots = resolveHookRoots(repoB);
+      expect(roots.localRoot).toBe(repoA); // pinned to the session repo
+    } finally {
+      if (prev === undefined) delete process.env['CLAUDE_PROJECT_DIR'];
+      else process.env['CLAUDE_PROJECT_DIR'] = prev;
+    }
+  });
+
+  it('a SAME-repo worktree payload cwd still wins over the primary anchor', () => {
+    const repo = path.join(scratch, 'repo');
+    makeRepo(repo);
+    const wt = path.join(scratch, 'wt-pin');
+    git(repo, 'worktree', 'add', '-q', wt, '-b', 'wt-pin-branch');
+    const prev = process.env['CLAUDE_PROJECT_DIR'];
+    process.env['CLAUDE_PROJECT_DIR'] = repo;
+    try {
+      const roots = resolveHookRoots(wt);
+      expect(roots.localRoot).toBe(wt); // same commonRoot → worktree-local wins
+      expect(roots.commonRoot).toBe(repo);
+    } finally {
+      if (prev === undefined) delete process.env['CLAUDE_PROJECT_DIR'];
+      else process.env['CLAUDE_PROJECT_DIR'] = prev;
+    }
   });
 
   it('explicitRoot in a plain temp dir behaves exactly like today (degenerate)', () => {
