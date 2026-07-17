@@ -88,6 +88,13 @@ export async function updateFingerprintStore(
   let release: (() => Promise<void>) | null = null;
   let lockError: string | undefined;
   try {
+    // Round-20 P2 (cold start): `realpath: false` already lets the lock
+    // target be a not-yet-written fingerprints.json, but the sidecar
+    // mkdir still ENOENTs when `.rea/` itself is absent (fresh clone
+    // before any store write) — which would silently degrade every
+    // first-write to the unlocked fallback and reopen the concurrent
+    // cold-start lost-update this lock exists to close.
+    await fs.mkdir(path.dirname(filePath), { recursive: true });
     release = await properLockfile.lock(filePath, STORE_LOCK_OPTIONS);
   } catch (e) {
     lockError = e instanceof Error ? e.message : String(e);
