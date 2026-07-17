@@ -26,7 +26,7 @@ import type { RegistryServer } from './types.js';
 import { Tier, InvocationStatus } from '../policy/types.js';
 import { appendAuditRecord } from '../audit/append.js';
 import { resolveCommonRoot } from '../lib/worktree-roots.js';
-import { loadFingerprintStore, updateFingerprintStore } from './fingerprints-store.js';
+import { updateFingerprintStore } from './fingerprints-store.js';
 import { classifyServers, updateStore, type TofuClassification } from './tofu.js';
 import { createLogger, type Logger } from '../gateway/log.js';
 
@@ -69,37 +69,42 @@ export async function applyTofuGate(
   logger?: Logger,
 ): Promise<TofuGateResult> {
   const log = logger ?? createLogger();
-  const store = await loadFingerprintStore(baseDir);
   const acceptDrift = process.env.REA_ACCEPT_DRIFT;
-  const classifications = classifyServers(
-    servers,
-    store,
-    acceptDrift !== undefined ? { acceptDrift } : {},
-  );
 
+  // Rounds 14+26: classify AND write inside the store lock against the
+  // FRESH read. Round-14 P1 moved the write under the lock so a
+  // concurrent `rea tofu accept` from another worktree merges instead
+  // of last-writer-wins; round-26 P2 moves classification there too —
+  // deciding against a pre-lock snapshot could emit drift/first-seen
+  // side effects and drop a server that a racing accept had already
+  // trusted in the shared store.
+  let classifications: TofuClassification[] = [];
+  const { lockError } = await updateFingerprintStore(baseDir, (fresh) => {
+    classifications = classifyServers(
+      servers,
+      fresh,
+      acceptDrift !== undefined ? { acceptDrift } : {},
+    );
+    return updateStore(fresh, classifications);
+  });
+  if (lockError !== undefined) {
+    log.warn({
+      event: 'tofu.store_lock_degraded',
+      message: `fingerprint-store lock degraded (${lockError}) — wrote unlocked`,
+    });
+  }
+
+  // Side effects + acceptance fire AFTER the locked update, from the
+  // classifications made against the fresh store — consistent with
+  // what was persisted.
   const byName = new Map(servers.map((s) => [s.name, s]));
   const accepted: RegistryServer[] = [];
-
   for (const c of classifications) {
     const server = byName.get(c.server);
     if (server === undefined) continue; // defensive — classifyServers preserves order
     await emitSideEffects(baseDir, c, log);
     if (c.verdict === 'drifted' && !c.bypassed) continue;
     accepted.push(server);
-  }
-
-  // Round-14 P1: write under the store lock against a FRESH read, so a
-  // concurrent accept from another worktree is merged instead of
-  // last-writer-wins dropped. Classification stays based on the store
-  // read at gate time (the decisions were made against it).
-  const { lockError } = await updateFingerprintStore(baseDir, (fresh) =>
-    updateStore(fresh, classifications),
-  );
-  if (lockError !== undefined) {
-    log.warn({
-      event: 'tofu.store_lock_degraded',
-      message: `fingerprint-store lock degraded (${lockError}) — wrote unlocked`,
-    });
   }
 
   return { accepted, classifications };
