@@ -22,6 +22,7 @@
  * directly — `deps.env` and `deps.baseDir` are the only ambient state.
  */
 
+import fsSync from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { appendAuditRecord } from '../../audit/append.js';
@@ -47,7 +48,7 @@ import {
   type GitExecutor,
 } from './codex-runner.js';
 import { filterFindingsByPath, summarizeReview, type Verdict } from './findings.js';
-import { renderBanner, writeLastReview, type LastReviewPayload } from './report.js';
+import { renderBanner, writeLastReview, writeLastReviewFromCache, type LastReviewPayload } from './report.js';
 import { isFlip, lookupVerdict, writeVerdict, type VerdictCacheEntry } from './verdict-cache.js';
 
 // ---------------------------------------------------------------------------
@@ -531,6 +532,37 @@ export async function runPushGate(deps: PushGateDeps): Promise<GateResult> {
       cached_model: cached.model,
       cached_reasoning_effort: cached.reasoning_effort,
     });
+    // Round-27 P2: a cache populated by ANOTHER worktree leaves this
+    // stream's per-worktree last-review.json absent or stale. Refresh
+    // it with a cache-provenance snapshot — ONLY when the local file
+    // is missing or names a different head_sha, so a plain checkout's
+    // richer full snapshot (written when the cache was populated) is
+    // never overwritten with the thinner cache-derived shape.
+    try {
+      const localSnapshotPath = path.join(deps.baseDir, '.rea', 'last-review.json');
+      let localSha: string | null = null;
+      try {
+        const parsed = JSON.parse(fsSync.readFileSync(localSnapshotPath, 'utf8')) as {
+          head_sha?: unknown;
+        };
+        if (typeof parsed.head_sha === 'string') localSha = parsed.head_sha;
+      } catch {
+        /* absent or unreadable → refresh */
+      }
+      if (localSha !== headSha) {
+        writeLastReviewFromCache({
+          baseDir: deps.baseDir,
+          verdict: cached.verdict,
+          findingCount: cached.finding_count,
+          baseRef: base.ref,
+          headSha,
+          cachedReviewedAt: cached.reviewed_at,
+          ...(deps.now !== undefined ? { now: deps.now() } : {}),
+        });
+      }
+    } catch {
+      // Snapshot refresh is best-effort — the gate decision stands.
+    }
     // 0.19.1 P3-1 (backend): simplified return shape. Verdict maps
     // 1:1 to status; cachedBlocked maps 1:1 to exitCode. The prior
     // nested ternary recomputed the same mapping in both arms.

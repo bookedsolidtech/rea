@@ -363,6 +363,7 @@ async function scanForRealDelegationOnce(
   reaRoot: string,
   sessionId: string,
   exemptSubagents: readonly string[],
+  streamRoot?: string,
 ): Promise<'delegated' | 'not-delegated' | 'unreadable'> {
   let records: DelegationRecord[];
   try {
@@ -380,6 +381,17 @@ async function scanForRealDelegationOnce(
   if (records.length === 0) return 'not-delegated';
   const roster = discoverRoster(reaRoot);
   for (const rec of records) {
+    // Round-27 P3: stream scoping — with per-worktree counters, a
+    // delegation observed in a SIBLING worktree must not satisfy this
+    // stream's predicate. Records without local_root (pre-0.54.0)
+    // match every stream (transition posture).
+    if (
+      streamRoot !== undefined &&
+      rec.local_root !== undefined &&
+      path.resolve(rec.local_root) !== path.resolve(streamRoot)
+    ) {
+      continue;
+    }
     if (
       countsAsRealDelegation({
         delegationTool: rec.delegation_tool,
@@ -399,6 +411,7 @@ async function sessionHasRealDelegation(
   sessionId: string,
   exemptSubagents: readonly string[],
   sleep: (ms: number) => Promise<void> = realSleep,
+  streamRoot?: string,
 ): Promise<boolean> {
   // 0.40.0 charter item 1 — poll-and-backoff before declaring
   // "no delegation in this session".
@@ -420,12 +433,12 @@ async function sessionHasRealDelegation(
   // observed OR the chain becomes unreadable (preserving the pre-fix
   // "audit log unreadable → suppress the advisory" posture so a
   // missing chain never produces a false-positive nudge).
-  let outcome = await scanForRealDelegationOnce(reaRoot, sessionId, exemptSubagents);
+  let outcome = await scanForRealDelegationOnce(reaRoot, sessionId, exemptSubagents, streamRoot);
   if (outcome === 'delegated') return true;
   if (outcome === 'unreadable') return true;
   for (const waitMs of DELEGATION_POLL_BACKOFF_MS) {
     await sleep(waitMs);
-    outcome = await scanForRealDelegationOnce(reaRoot, sessionId, exemptSubagents);
+    outcome = await scanForRealDelegationOnce(reaRoot, sessionId, exemptSubagents, streamRoot);
     if (outcome === 'delegated') return true;
     if (outcome === 'unreadable') return true;
   }
@@ -602,6 +615,7 @@ export async function computeDelegationAdvisory(
     auditSessionId,
     policy.exemptSubagents,
     options.sleepOverride,
+    reaRoot,
   );
   if (delegated) {
     // Session DID delegate to a real specialist — no nudge warranted.

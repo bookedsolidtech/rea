@@ -1157,7 +1157,7 @@ export async function runHookDelegationSignal(
   // and write to the COMMON root so signals from every worktree land in
   // one chain (the advisory's "did this session delegate" scan reads
   // the same chain).
-  const { commonRoot: baseDir } = resolveHookRoots(
+  const { localRoot: signalLocalRoot, commonRoot: baseDir } = resolveHookRoots(
     typeof payload.cwd === 'string' ? payload.cwd : undefined,
     options.reaRoot,
   );
@@ -1248,6 +1248,8 @@ export async function runHookDelegationSignal(
     session_id_observed: sessionIdObserved,
     parent_subagent_type: parentValue,
     invocation_description_sha256: descriptionHash,
+    // Round-27 P3: stream scoping for the advisory predicate.
+    local_root: signalLocalRoot,
     ...(hookEventTimestamp !== undefined ? { hook_event_timestamp: hookEventTimestamp } : {}),
   };
 

@@ -137,6 +137,15 @@ export interface DelegationSignalMetadata {
    */
   subagent_type: string;
   /**
+   * 0.54.0 worktree state (round-27 P3): the LOCAL worktree root the
+   * delegation was observed in. The advisory's "did this session
+   * delegate" predicate scopes to the current stream — a delegation in
+   * worktree A must not suppress worktree B's nudge now that the
+   * counters are per-worktree. Optional: pre-0.54.0 records lack it
+   * and are treated as matching every stream (transition posture).
+   */
+  local_root?: string;
+  /**
    * The session id Claude Code attached to the hook payload — the same
    * value the harness uses for its own correlation. Captured verbatim
    * so a future per-session breakdown (deferred to 0.29.1) can group
@@ -200,6 +209,7 @@ export const DelegationSignalMetadataSchema = z
     delegation_tool: z.union([z.literal('Agent'), z.literal('Skill')]),
     subagent_type: z.string(),
     session_id_observed: z.string(),
+    local_root: z.string().optional(),
     parent_subagent_type: z.union([z.string(), z.null()]),
     invocation_description_sha256: z
       .string()

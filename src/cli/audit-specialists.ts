@@ -126,6 +126,8 @@ export interface DelegationRecord {
   parent_subagent_type: string | null;
   invocation_description_sha256: string;
   hook_event_timestamp?: string;
+  /** 0.54.0: local worktree root the signal was observed in (absent pre-0.54.0). */
+  local_root?: string;
 }
 
 interface AuditSpecialistsResult {
@@ -323,6 +325,7 @@ export async function loadDelegationRecords(
         ...(m.hook_event_timestamp !== undefined
           ? { hook_event_timestamp: m.hook_event_timestamp }
           : {}),
+        ...(typeof m.local_root === 'string' ? { local_root: m.local_root } : {}),
       };
       records.push(rec);
     }
