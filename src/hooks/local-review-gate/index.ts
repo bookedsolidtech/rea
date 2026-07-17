@@ -282,7 +282,11 @@ function collectTriggerSegments(
         map.set(s.raw, s);
       }
     }
-    if (segs.length > 0 && opLabel === '') {
+    // Round-15 P2: a MIXED trigger set (`git commit … && git push`)
+    // resolves to COMMIT semantics — the stricter gate. `git commit`
+    // therefore wins over an already-recorded `git push`; push only
+    // sticks when no commit trigger exists in the invocation.
+    if (segs.length > 0 && (opLabel === '' || op === 'git commit')) {
       opLabel = op;
     }
   };

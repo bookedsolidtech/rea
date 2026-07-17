@@ -688,10 +688,17 @@ shim_run() {
               break
             fi
           fi
-          # Only REA_ROOT (policy reads) follows the payload; `proj`
-          # (the CLI-resolution sandbox) stays on CLAUDE_PROJECT_DIR —
-          # the primary checkout may be the only one with node_modules
-          # installed, and the CLI binary is version-identical anyway.
+          # REA_ROOT (policy reads) follows the payload. `proj` (the
+          # CLI-resolution sandbox) stays on CLAUDE_PROJECT_DIR when the
+          # anchor is a rea repo — the primary checkout may be the only
+          # one with node_modules installed — but when the session had
+          # NO rea-rooted anchor at all (round-15 P2), the payload repo
+          # IS the session root and CLI resolution must search there,
+          # or every shim reports the CLI missing in the exact shape
+          # this handoff supports.
+          if [ ! -d "${REA_ROOT}/.rea" ]; then
+            proj="$_payload_root"
+          fi
           REA_ROOT="$_payload_root"
           # Exported so `rea hook policy-get` (spawned by the policy
           # readers) resolves the same worktree policy this shim does.
