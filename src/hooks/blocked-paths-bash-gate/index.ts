@@ -173,7 +173,15 @@ export async function runBlockedPathsBashGate(
 
   // 7. Scan.
   const verdict = runBlockedScan(
-    { reaRoot, commonRoot, siblingRoots: listSiblingWorktreeRoots(commonRoot, reaRoot), blockedPaths },
+    {
+      reaRoot,
+      commonRoot,
+      siblingRoots: listSiblingWorktreeRoots(commonRoot, reaRoot),
+      blockedPaths,
+      // Round-11 P1: cross-root targets also honor the TARGET stream's
+      // own blocked_paths (union semantics).
+      blockedPathsForRoot: (root) => loadBlockedPathsPermissive(root),
+    },
     cmd,
   );
 

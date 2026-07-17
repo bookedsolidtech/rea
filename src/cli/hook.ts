@@ -316,6 +316,19 @@ export async function runHookScanBash(options: HookScanBashOptions): Promise<voi
     // Policy missing or invalid. Continue with defaults — the historical
     // protected list is hardcoded; blocked_paths becomes an empty no-op.
   }
+  // Round-11 P1: permissive per-root blocked_paths loader for cross-root
+  // targets (the TARGET stream's own list joins the match via union).
+  const loadPolicyBlockedPathsPermissive = (root: string): readonly string[] => {
+    try {
+      const parsed = parseYaml(fs.readFileSync(path.join(root, '.rea', 'policy.yaml'), 'utf8'));
+      if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return [];
+      const bp = (parsed as Record<string, unknown>)['blocked_paths'];
+      if (!Array.isArray(bp)) return [];
+      return bp.filter((e): e is string => typeof e === 'string' && e.length > 0);
+    } catch {
+      return [];
+    }
+  };
 
   // Passwd-derived home for the `~/.rea` global-root gate (safe-global-
   // CLI). Never `$HOME` / `$XDG_*` — an agent can move those in-process.
@@ -341,7 +354,7 @@ export async function runHookScanBash(options: HookScanBashOptions): Promise<voi
         cmd,
       );
     } else {
-      verdict = runBlockedScan({ reaRoot, commonRoot, siblingRoots: listSiblingWorktreeRoots(commonRoot, reaRoot), blockedPaths }, cmd);
+      verdict = runBlockedScan({ reaRoot, commonRoot, siblingRoots: listSiblingWorktreeRoots(commonRoot, reaRoot), blockedPaths, blockedPathsForRoot: loadPolicyBlockedPathsPermissive }, cmd);
     }
   } catch (e) {
     // Any exception in the scanner is a bug; fail closed.

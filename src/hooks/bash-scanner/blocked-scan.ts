@@ -37,10 +37,21 @@ export interface BlockedScanContext {
   /** Round-10 P1: sibling worktree roots — see ProtectedScanContext. */
   siblingRoots?: readonly string[];
   blockedPaths: readonly string[];
+  /**
+   * Round-11 P1: loader for ANOTHER root's blocked_paths. When a target
+   * normalizes into the primary checkout or a sibling worktree, the
+   * match runs against the UNION of the caller's list and the TARGET
+   * stream's own policy — a looser branch must not write a path that
+   * the target's branch blocks. Absent → caller's list only (plain
+   * checkouts; behavior unchanged).
+   */
+  blockedPathsForRoot?: (root: string) => readonly string[];
 }
 
 interface BlockedNormalized {
   pathLc: string;
+  /** The root the relative form was derived against (cross-root cases). */
+  rootUsed?: string;
   outsideRoot: boolean;
   expansion: boolean;
   original: string;
@@ -205,7 +216,14 @@ function normalizeTarget(
     /* best-effort */
   }
 
-  return { pathLc, outsideRoot: false, expansion: false, original: raw, resolvedLc };
+  return {
+    pathLc,
+    outsideRoot: false,
+    expansion: false,
+    original: raw,
+    resolvedLc,
+    ...(effectiveRoot !== reaRoot ? { rootUsed: effectiveRoot } : {}),
+  };
 }
 
 function collapseDotDot(absPath: string): string {
@@ -509,7 +527,13 @@ export function scanForBlockedViolations(
     }
 
     const dirOptions = d.isDirTarget === true ? { forceDirSemantics: true } : undefined;
-    const logicalHit = matchBlockedEntry(norm.pathLc, ctx.blockedPaths, dirOptions);
+    // Round-11 P1: cross-root targets match the UNION of the caller's
+    // list and the TARGET root's own blocked_paths.
+    const effectiveBlocked =
+      norm.rootUsed !== undefined && ctx.blockedPathsForRoot !== undefined
+        ? [...new Set([...ctx.blockedPaths, ...ctx.blockedPathsForRoot(norm.rootUsed)])]
+        : ctx.blockedPaths;
+    const logicalHit = matchBlockedEntry(norm.pathLc, effectiveBlocked, dirOptions);
     if (logicalHit !== null) {
       return blockVerdict({
         reason: buildBlockReason({
@@ -524,7 +548,7 @@ export function scanForBlockedViolations(
       });
     }
     if (norm.resolvedLc !== null) {
-      const resolvedHit = matchBlockedEntry(norm.resolvedLc, ctx.blockedPaths, dirOptions);
+      const resolvedHit = matchBlockedEntry(norm.resolvedLc, effectiveBlocked, dirOptions);
       if (resolvedHit !== null) {
         return blockVerdict({
           reason: buildBlockReason({

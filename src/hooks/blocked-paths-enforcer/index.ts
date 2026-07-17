@@ -173,9 +173,14 @@ export async function runBlockedPathsEnforcer(
     return { exitCode: 0, stderr, matched: null };
   }
 
-  // 3. Load policy permissively.
-  const blockedPaths = loadBlockedPathsPermissive(reaRoot);
-  if (blockedPaths.length === 0) {
+  // 3. Load policy permissively. Round-11 P1: a CROSS-ROOT target also
+  //    honors the TARGET stream's own blocked_paths (union — a looser
+  //    branch cannot write a path the target's branch blocks).
+  const callerBlocked = loadBlockedPathsPermissive(reaRoot);
+  // Preserve the historical empty-policy no-op — but only when there is
+  // no cross root whose own list could still match (plain checkouts:
+  // byte-identical early exit).
+  if (callerBlocked.length === 0 && commonRoot === reaRoot && siblingRoots.length === 0) {
     return { exitCode: 0, stderr, matched: null };
   }
 
@@ -188,6 +193,7 @@ export async function runBlockedPathsEnforcer(
   // enforcement state from a worktree session. Symlink checks below
   // keep using the raw (absolute) filePath — only pattern matching
   // consumes the relative form.
+  let crossRootUsed: string | null = null;
   if (commonRoot !== reaRoot || siblingRoots.length > 0) {
     const crossRoots = [
       ...(commonRoot !== reaRoot ? [commonRoot] : []),
@@ -199,6 +205,7 @@ export async function runBlockedPathsEnforcer(
         const crossResolved = path.resolve(cross);
         if (resolvedNorm === crossResolved || resolvedNorm.startsWith(crossResolved + path.sep)) {
           normalized = normalizePath(filePath, cross);
+          crossRootUsed = cross;
           break;
         }
       }
@@ -238,7 +245,15 @@ export async function runBlockedPathsEnforcer(
     }
   }
 
-  // 8. Match against blocked_paths.
+  // 8. Match against blocked_paths — the caller's list, UNIONed with
+  //    the TARGET stream's own list when the write crossed roots.
+  const blockedPaths =
+    crossRootUsed !== null
+      ? [...new Set([...callerBlocked, ...loadBlockedPathsPermissive(crossRootUsed)])]
+      : callerBlocked;
+  if (blockedPaths.length === 0) {
+    return { exitCode: 0, stderr, matched: null };
+  }
   let matched: string | null = null;
   for (const blocked of blockedPaths) {
     if (matchBlockedEntry(lowerNorm, blocked)) {
@@ -263,7 +278,14 @@ export async function runBlockedPathsEnforcer(
   }
 
   // 9. §H.2 intermediate-symlink resolution.
-  const symMatched = checkSymlinkResolution(filePath, blockedPaths, reaRoot, commonRoot, siblingRoots);
+  const symMatched = checkSymlinkResolution(
+    filePath,
+    blockedPaths,
+    reaRoot,
+    commonRoot,
+    siblingRoots,
+    loadBlockedPathsPermissive,
+  );
   if (symMatched !== null) {
     writeStderr('BLOCKED PATH: intermediate-symlink resolution blocked\n');
     writeStderr('\n');
@@ -288,11 +310,13 @@ export async function runBlockedPathsEnforcer(
  */
 function checkSymlinkResolution(
   filePath: string,
-  blockedPaths: readonly string[],
+  blockedPathsIn: readonly string[],
   reaRoot: string,
   commonRoot?: string,
   siblingRoots?: readonly string[],
+  blockedPathsForRoot?: (root: string) => string[],
 ): { entry: string; resolvedTarget: string } | null {
+  let blockedPaths: readonly string[] = blockedPathsIn;
   // Only attempt resolution if the target exists or its parent dir
   // exists — matches the bash `if [[ -e "$FILE_PATH" || -d ... ]]`.
   let targetExists = false;
@@ -326,15 +350,21 @@ function checkSymlinkResolution(
       ...(siblingRoots ?? []),
     ];
     let matched: string | null = null;
+    let matchedOriginal: string | null = null;
     for (const cross of crossRoots) {
       const canonCross = resolveCanonRoot(cross);
       if (resolvedParent === canonCross || resolvedParent.startsWith(canonCross + '/')) {
         matched = canonCross;
+        matchedOriginal = cross;
         break;
       }
     }
     if (matched === null) return null;
     canonRoot = matched;
+    // Round-11 P1: the TARGET stream's own blocked_paths join the match.
+    if (matchedOriginal !== null && blockedPathsForRoot !== undefined) {
+      blockedPaths = [...new Set([...blockedPaths, ...blockedPathsForRoot(matchedOriginal)])];
+    }
   }
   const relativeResolved =
     resolvedParent === canonRoot ? '' : resolvedParent.slice(canonRoot.length + 1);

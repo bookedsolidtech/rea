@@ -67,6 +67,17 @@ const HISTORICAL_DEFAULT_PROTECTED_PATTERNS: readonly string[] = [
 ];
 
 /**
+ * Round-11 P2: the pattern set for CROSS-ROOT targets (writes landing in
+ * the primary checkout or a sibling worktree). Defaults ∪ kill-switch
+ * invariants, deliberately IGNORING the caller's `protected_writes`
+ * override and `protected_paths_relax` — another stream's protection is
+ * not the caller's to loosen.
+ */
+const STRICT_CROSS_ROOT_PATTERNS: readonly string[] = [
+  ...HISTORICAL_DEFAULT_PROTECTED_PATTERNS,
+];
+
+/**
  * Kill-switch invariants — never relaxable. These represent the
  * integrity of the governance layer; if a consumer could relax them
  * an agent could disable rea entirely.
@@ -344,6 +355,14 @@ function checkPathProtected(
 }
 
 interface NormalizedTarget {
+  /**
+   * Round-11 P2: true when the relative form was derived against the
+   * COMMON root or a SIBLING worktree. Cross-root matches use the
+   * UN-RELAXED default pattern set — the caller's protected_writes
+   * override and protected_paths_relax describe ITS OWN stream and must
+   * not loosen another stream's protection.
+   */
+  crossRoot?: boolean;
   /** The lowercase project-relative path, OR a sentinel string. */
   pathLc: string;
   /**
@@ -567,6 +586,7 @@ function normalizeTarget(
         sentinel: null,
         original: raw,
         resolvedLc: null,
+        crossRoot: true,
       };
     }
     if (hadDotDot) {
@@ -611,6 +631,7 @@ function normalizeTarget(
   //    resolver returns SYMLINK_DYNAMIC_SENTINEL, treat the target as
   //    dynamic — refuse on uncertainty via the `expansion` sentinel.
   let resolvedLc: string | null = null;
+  let resolvedIsCrossRoot = false;
   try {
     const resolved = resolveSymlinksWalkUp(collapsed);
     if (resolved === SYMLINK_DYNAMIC_SENTINEL) {
@@ -652,7 +673,10 @@ function normalizeTarget(
           } else if (resolved.startsWith(cross + '/')) {
             resolvedRelative = resolved.slice(cross.length + 1);
           }
-          if (resolvedRelative !== null) break;
+          if (resolvedRelative !== null) {
+            resolvedIsCrossRoot = true;
+            break;
+          }
         }
       }
       if (resolvedRelative !== null) {
@@ -667,7 +691,13 @@ function normalizeTarget(
     // is still checked.
   }
 
-  return { pathLc, sentinel: null, original: raw, resolvedLc };
+  return {
+    pathLc,
+    sentinel: null,
+    original: raw,
+    resolvedLc,
+    ...(resolvedIsCrossRoot ? { crossRoot: true } : {}),
+  };
 }
 
 /**
@@ -1155,7 +1185,12 @@ export function scanForProtectedViolations(
     if (d.isDirTarget === true) matchOptions.forceDirSemantics = true;
     if (d.isDestructive === true) matchOptions.isDestructive = true;
     const dirOptions = Object.keys(matchOptions).length > 0 ? matchOptions : undefined;
-    const logicalHit = checkPathProtected(norm.pathLc, effective, dirOptions);
+    // Round-11 P2: cross-root targets match the UN-RELAXED default set
+    // (defaults ∪ kill-switch invariants) — the caller's relax/override
+    // describe its own stream, never another's.
+    const patternsFor = (isCross: boolean | undefined): EffectivePatterns =>
+      isCross === true ? { full: [...STRICT_CROSS_ROOT_PATTERNS], override: [] } : effective;
+    const logicalHit = checkPathProtected(norm.pathLc, patternsFor(norm.crossRoot), dirOptions);
     if (logicalHit !== null) {
       return blockVerdict({
         reason: buildBlockReason({
@@ -1171,7 +1206,7 @@ export function scanForProtectedViolations(
     }
     // Symlink-resolved-form match.
     if (norm.resolvedLc !== null) {
-      const resolvedHit = checkPathProtected(norm.resolvedLc, effective, dirOptions);
+      const resolvedHit = checkPathProtected(norm.resolvedLc, patternsFor(norm.crossRoot), dirOptions);
       if (resolvedHit !== null) {
         return blockVerdict({
           reason: buildBlockReason({

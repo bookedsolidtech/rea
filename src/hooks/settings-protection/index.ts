@@ -74,6 +74,8 @@ import {
   matchAny,
   isExtensionSurface,
   PATCH_SESSION_PATTERNS,
+  PROTECTED_PATTERNS_FULL,
+  KILL_SWITCH_INVARIANTS,
   sanitizeForStderr,
 } from '../_lib/protected-paths.js';
 import { appendAuditRecord, InvocationStatus, Tier } from '../../audit/append.js';
@@ -235,6 +237,7 @@ export async function runSettingsProtection(
 
   // 3. Normalize.
   let normalized = normalizePath(filePath, reaRoot);
+  let crossRootTarget = false;
   // 0.54.0 worktree state (review round-4): an absolute target that
   // normalizePath left ABSOLUTE (outside the local root) but that lands
   // INSIDE the COMMON root re-normalizes common-relative, so the
@@ -253,6 +256,7 @@ export async function runSettingsProtection(
         const crossResolved = path.resolve(cross);
         if (resolvedNorm === crossResolved || resolvedNorm.startsWith(crossResolved + path.sep)) {
           normalized = normalizePath(filePath, cross);
+          crossRootTarget = true;
           break;
         }
       }
@@ -402,7 +406,14 @@ export async function runSettingsProtection(
   for (const adv of resolution.advisories) writeStderr(adv);
 
   // §6 match (case-insensitive — matchAny lowercases the pattern side).
-  const directHit = matchAny(lowerNorm, resolution.patterns);
+  // Round-11 P2: a CROSS-ROOT target (primary checkout / sibling
+  // worktree) matches the UN-RELAXED default set — the caller's
+  // protected_writes override and relax describe its own stream and
+  // must not loosen another's protection.
+  const matchPatterns = crossRootTarget
+    ? [...new Set([...PROTECTED_PATTERNS_FULL, ...KILL_SWITCH_INVARIANTS])]
+    : resolution.patterns;
+  const directHit = matchAny(lowerNorm, matchPatterns);
   if (directHit !== null) {
     writeStderr('SETTINGS PROTECTION: Modification blocked\n');
     writeStderr('\n');
