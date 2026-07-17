@@ -329,6 +329,7 @@ export async function runHookScanBash(options: HookScanBashOptions): Promise<voi
       verdict = runProtectedScan(
         {
           reaRoot,
+          commonRoot,
           policy: {
             ...(protectedWrites !== undefined ? { protected_writes: protectedWrites } : {}),
             protected_paths_relax: protectedRelax,
@@ -438,7 +439,21 @@ export async function runHookPolicyGet(options: HookPolicyGetOptions): Promise<v
     process.exit(1);
   }
 
-  const reaRoot = options.reaRoot ?? process.env['CLAUDE_PROJECT_DIR'] ?? process.cwd();
+  // 0.54.0 worktree state: the bash shims export the payload-derived
+  // REA_ROOT before invoking this subcommand (shim-runtime.sh §2b), so a
+  // worktree session reads the WORKTREE's policy. Falls back to the
+  // historical resolution when unset. Guarded like the shim: the value
+  // must actually carry `.rea/` or it is ignored.
+  const envReaRoot = process.env['REA_ROOT'];
+  const reaRoot =
+    options.reaRoot ??
+    (envReaRoot !== undefined &&
+    envReaRoot.length > 0 &&
+    fs.existsSync(path.join(envReaRoot, '.rea'))
+      ? envReaRoot
+      : undefined) ??
+    process.env['CLAUDE_PROJECT_DIR'] ??
+    process.cwd();
   const policyPath = path.join(reaRoot, '.rea', 'policy.yaml');
   const finishMissing = (): void => {
     if (options.json === true) process.stdout.write('null');

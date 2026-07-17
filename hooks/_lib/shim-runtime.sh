@@ -669,6 +669,9 @@ shim_run() {
           # the primary checkout may be the only one with node_modules
           # installed, and the CLI binary is version-identical anyway.
           REA_ROOT="$_payload_root"
+          # Exported so `rea hook policy-get` (spawned by the policy
+          # readers) resolves the same worktree policy this shim does.
+          export REA_ROOT
           break
         fi
         _payload_root=$(dirname "$_payload_root")

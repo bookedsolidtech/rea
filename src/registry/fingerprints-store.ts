@@ -34,6 +34,7 @@
  */
 
 import fs from 'node:fs/promises';
+import { resolveCommonRoot } from '../lib/worktree-roots.js';
 import path from 'node:path';
 import { z } from 'zod';
 
@@ -53,8 +54,20 @@ const FingerprintStoreSchema = z
 
 export type FingerprintStore = z.infer<typeof FingerprintStoreSchema>;
 
+/**
+ * 0.54.0 worktree state: TOFU trust is per-REPOSITORY — the store path
+ * resolves to the COMMON (primary-checkout) root regardless of which
+ * worktree the caller passed, so `rea tofu accept` in one stream is
+ * honored by `rea serve` started from another. Single seam: every
+ * caller (tofu CLI, gateway tofu-gate, upgrade) goes through here.
+ * Degenerate in plain checkouts.
+ */
+function storeRootFor(baseDir: string): string {
+  return resolveCommonRoot(baseDir, () => {}).commonRoot;
+}
+
 function storePathFor(baseDir: string): string {
-  return path.join(baseDir, REA_DIR, FINGERPRINTS_FILE);
+  return path.join(storeRootFor(baseDir), REA_DIR, FINGERPRINTS_FILE);
 }
 
 /**
@@ -106,7 +119,7 @@ export async function saveFingerprintStore(
 ): Promise<void> {
   const filePath = storePathFor(baseDir);
   const tmpPath = `${filePath}.new`;
-  await fs.mkdir(path.join(baseDir, REA_DIR), { recursive: true });
+  await fs.mkdir(path.join(storeRootFor(baseDir), REA_DIR), { recursive: true });
 
   // Validate before write — a malformed in-memory store should never be
   // persisted. The parse is cheap and catches bugs in the classify layer.

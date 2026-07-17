@@ -156,7 +156,7 @@ export async function runTofuAccept(options: RunTofuAcceptOptions): Promise<void
   const event =
     stored === undefined ? 'tofu.first_seen_accepted_by_cli' : 'tofu.drift_accepted_by_cli';
   try {
-    await appendAuditRecord(baseDir, {
+    await appendAuditRecord(commonRoot, {
       tool_name: 'rea.tofu',
       server_name: 'rea',
       tier: Tier.Write,
