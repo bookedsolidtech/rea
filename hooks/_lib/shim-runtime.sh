@@ -664,6 +664,23 @@ shim_run() {
       _payload_root="$_payload_cwd"
       while [ "$_payload_root" != "/" ]; do
         if [ -d "${_payload_root}/.rea" ]; then
+          # Round-8 P1: SAME-REPOSITORY pin (mirrors resolveHookRoots).
+          # A payload root from a FOREIGN rea-managed repo must not
+          # replace the session anchor — a `cd` into repo B mid-session
+          # would otherwise enforce B's policy in the pre-CLI
+          # short-circuits and silently disable A's gates. Worktrees of
+          # the same repo share a common root and still qualify.
+          # The pin only applies when the anchor is itself a rea root —
+          # with no rea-rooted anchor the payload IS the session repo
+          # (mirrors the Node ladder's no-anchor acceptance).
+          if [ -d "${REA_ROOT}/.rea" ]; then
+            _anchor_common=$(rea_common_root "$REA_ROOT")
+            _payload_common=$(rea_common_root "$_payload_root")
+            if [ "$_payload_common" != "$_anchor_common" ] \
+               && [ "$_payload_root" != "$REA_ROOT" ]; then
+              break
+            fi
+          fi
           # Only REA_ROOT (policy reads) follows the payload; `proj`
           # (the CLI-resolution sandbox) stays on CLAUDE_PROJECT_DIR —
           # the primary checkout may be the only one with node_modules

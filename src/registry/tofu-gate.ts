@@ -25,6 +25,7 @@
 import type { RegistryServer } from './types.js';
 import { Tier, InvocationStatus } from '../policy/types.js';
 import { appendAuditRecord } from '../audit/append.js';
+import { resolveCommonRoot } from '../lib/worktree-roots.js';
 import { loadFingerprintStore, saveFingerprintStore } from './fingerprints-store.js';
 import { classifyServers, updateStore, type TofuClassification } from './tofu.js';
 import { createLogger, type Logger } from '../gateway/log.js';
@@ -220,7 +221,10 @@ async function safeAudit(
       metadata: entry.metadata,
       ...(entry.error !== undefined ? { error: entry.error } : {}),
     };
-    await appendAuditRecord(baseDir, input);
+    // 0.54.0 round-8 P2: TOFU events join the repository chain — the
+    // fingerprint store already resolves the common root, and a record
+    // written to a per-worktree audit file would fork the chain.
+    await appendAuditRecord(resolveCommonRoot(baseDir, () => {}).commonRoot, input);
   } catch (err) {
     log.error({
       event: 'registry.tofu.audit_failed',
