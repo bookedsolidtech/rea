@@ -47,6 +47,8 @@
  */
 
 import type { Buffer } from 'node:buffer';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
 import { checkHaltRoots, formatHaltBanner } from '../_lib/halt-check.js';
 import { resolveHookRoots } from '../../lib/worktree-roots.js';
 import {
@@ -318,15 +320,34 @@ export async function runChangesetSecurityGate(
     return { exitCode: 2, stderr, stdout };
   }
 
-  // 6. MultiEdit short-circuit for frontmatter validation. The bash
-  //    hook exits 0 here — the disclosure scan above is the only
-  //    enforcement for fragment-style writes.
-  if (toolName === 'MultiEdit') {
+  // 6. Determine the DOCUMENT to validate for frontmatter completeness
+  //    (bug: the Edit fragment, not the file). `content` is the whole
+  //    file only for Write; for Edit it is the `new_string` FRAGMENT,
+  //    which naturally has no frontmatter — so a body-only edit to an
+  //    already-valid changeset was falsely blocked, training agents to
+  //    route around the gate with a full-file rewrite.
+  //    - Write (or unknown): `content` IS the resulting file.
+  //    - Edit: reconstruct the resulting file (apply old→new to the
+  //      current content) and validate THAT — so an edit that damages
+  //      the frontmatter is still caught, while a body edit passes.
+  //      If the result can't be reconstructed (missing file, old_string
+  //      not located), skip rather than false-block.
+  //    - MultiEdit: skip (fragment list; frontmatter was validated at
+  //      the original Write). The disclosure scan above still ran.
+  let docToValidate: string | null;
+  if (toolName === 'Edit') {
+    docToValidate = reconstructEditResult(reaRoot, filePath, stdinRaw);
+  } else if (toolName === 'MultiEdit') {
+    docToValidate = null;
+  } else {
+    docToValidate = content;
+  }
+  if (docToValidate === null) {
     return { exitCode: 0, stderr, stdout };
   }
 
   // 7. Frontmatter validation.
-  const firstLine = content.split('\n', 1)[0] ?? '';
+  const firstLine = docToValidate.split('\n', 1)[0] ?? '';
   if (!/^---/.test(firstLine)) {
     const out = emitJsonBlock(MISSING_FRONTMATTER_BANNER);
     writeStdout(out.json);
@@ -334,7 +355,7 @@ export async function runChangesetSecurityGate(
     return { exitCode: 2, stderr, stdout };
   }
 
-  const frontmatter = extractFrontmatter(content);
+  const frontmatter = extractFrontmatter(docToValidate);
   let hasBump = false;
   for (const line of frontmatter.split('\n')) {
     if (FRONTMATTER_BUMP_PATTERN.test(line)) {
@@ -349,7 +370,7 @@ export async function runChangesetSecurityGate(
     return { exitCode: 2, stderr, stdout };
   }
 
-  const description = extractDescription(content);
+  const description = extractDescription(docToValidate);
   if (description.length === 0) {
     const out = emitJsonBlock(MISSING_DESCRIPTION_BANNER);
     writeStdout(out.json);
@@ -358,6 +379,44 @@ export async function runChangesetSecurityGate(
   }
 
   return { exitCode: 0, stderr, stdout };
+}
+
+/**
+ * Reconstruct the RESULTING changeset document for a single `Edit`, so
+ * the frontmatter-completeness check validates the post-edit file
+ * rather than the `new_string` fragment. Reads the current file and
+ * applies `old_string` → `new_string` (honoring `replace_all`). Returns
+ * the resulting content, or `null` when it cannot be reconstructed
+ * (unreadable/missing file, absent or non-locatable `old_string`) — the
+ * caller treats `null` as "skip the frontmatter check", never a block,
+ * so a legitimate body edit is never falsely refused. The disclosure
+ * (GHSA/CVE) scan already ran on the fragment upstream.
+ */
+function reconstructEditResult(
+  reaRoot: string,
+  filePath: string,
+  stdinRaw: string | Buffer,
+): string | null {
+  try {
+    const parsed: unknown = JSON.parse(
+      typeof stdinRaw === 'string' ? stdinRaw : stdinRaw.toString('utf8'),
+    );
+    if (parsed === null || typeof parsed !== 'object') return null;
+    const ti = (parsed as { tool_input?: unknown }).tool_input;
+    if (ti === null || typeof ti !== 'object') return null;
+    const rec = ti as { old_string?: unknown; new_string?: unknown; replace_all?: unknown };
+    if (typeof rec.old_string !== 'string') return null;
+    const oldStr = rec.old_string;
+    const newStr = typeof rec.new_string === 'string' ? rec.new_string : '';
+    const abs = path.isAbsolute(filePath) ? filePath : path.join(reaRoot, filePath);
+    const current = fs.readFileSync(abs, 'utf8');
+    if (oldStr.length === 0 || !current.includes(oldStr)) return null;
+    if (rec.replace_all === true) return current.split(oldStr).join(newStr);
+    const idx = current.indexOf(oldStr);
+    return current.slice(0, idx) + newStr + current.slice(idx + oldStr.length);
+  } catch {
+    return null;
+  }
 }
 
 /**

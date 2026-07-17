@@ -33,10 +33,14 @@ function editPayload(opts: {
   toolName?: string;
   filePath?: string;
   newString?: string;
+  oldString?: string;
+  replaceAll?: boolean;
 }): string {
   const ti: Record<string, unknown> = {};
   if (opts.filePath !== undefined) ti['file_path'] = opts.filePath;
   if (opts.newString !== undefined) ti['new_string'] = opts.newString;
+  if (opts.oldString !== undefined) ti['old_string'] = opts.oldString;
+  if (opts.replaceAll !== undefined) ti['replace_all'] = opts.replaceAll;
   return JSON.stringify({ tool_name: opts.toolName ?? 'Edit', tool_input: ti });
 }
 
@@ -165,6 +169,88 @@ describe('runChangesetSecurityGate', () => {
         stdinOverride: notebookEditPayload({
           notebookPath: '.changeset/x.md',
           newSource: VALID_CHANGESET,
+        }),
+      });
+      expect(r.exitCode).toBe(0);
+    });
+  });
+
+  describe('Edit frontmatter reconstruction (bug fix)', () => {
+    // The pre-fix gate validated the Edit `new_string` FRAGMENT, so a
+    // body-only edit to an already-valid changeset was falsely blocked
+    // as "missing frontmatter". The gate now reconstructs the resulting
+    // file (old→new applied to the on-disk content) and validates that.
+    function writeChangeset(rel: string, content: string): void {
+      const abs = path.join(root, rel);
+      fs.mkdirSync(path.dirname(abs), { recursive: true });
+      fs.writeFileSync(abs, content);
+    }
+
+    it('allows a body-only Edit to an already-valid changeset (THE BUG)', async () => {
+      writeChangeset('.changeset/x.md', VALID_CHANGESET);
+      const r = await runChangesetSecurityGate({
+        reaRoot: root,
+        stdinOverride: editPayload({
+          filePath: '.changeset/x.md',
+          oldString: 'fix(hooks): updated env-file-protection banner text',
+          newString: 'fix(hooks): reworded banner text',
+        }),
+      });
+      expect(r.exitCode).toBe(0);
+    });
+
+    it('blocks an Edit that DELETES the bump entry (reconstruct catches it)', async () => {
+      writeChangeset('.changeset/x.md', VALID_CHANGESET);
+      const r = await runChangesetSecurityGate({
+        reaRoot: root,
+        stdinOverride: editPayload({
+          filePath: '.changeset/x.md',
+          oldString: "'@bookedsolid/rea': patch\n",
+          newString: '',
+        }),
+      });
+      expect(r.exitCode).toBe(2);
+      expect(r.stderr).toContain('valid package bump entry');
+    });
+
+    it('skips (allows) when old_string cannot be located — never false-blocks', async () => {
+      writeChangeset('.changeset/x.md', VALID_CHANGESET);
+      const r = await runChangesetSecurityGate({
+        reaRoot: root,
+        stdinOverride: editPayload({
+          filePath: '.changeset/x.md',
+          oldString: 'this text is not in the file',
+          newString: 'whatever',
+        }),
+      });
+      expect(r.exitCode).toBe(0);
+    });
+
+    it('still runs the disclosure scan on the Edit fragment', async () => {
+      writeChangeset('.changeset/x.md', VALID_CHANGESET);
+      const r = await runChangesetSecurityGate({
+        reaRoot: root,
+        stdinOverride: editPayload({
+          filePath: '.changeset/x.md',
+          oldString: 'fix(hooks): updated env-file-protection banner text',
+          newString: 'fix GHSA-abcd-efgh-ijkl in the parser',
+        }),
+      });
+      expect(r.exitCode).toBe(2);
+    });
+
+    it('honors replace_all when reconstructing', async () => {
+      writeChangeset(
+        '.changeset/x.md',
+        `---\n'@bookedsolid/rea': patch\n---\n\nfoo and foo again\n`,
+      );
+      const r = await runChangesetSecurityGate({
+        reaRoot: root,
+        stdinOverride: editPayload({
+          filePath: '.changeset/x.md',
+          oldString: 'foo',
+          newString: 'bar',
+          replaceAll: true,
         }),
       });
       expect(r.exitCode).toBe(0);
