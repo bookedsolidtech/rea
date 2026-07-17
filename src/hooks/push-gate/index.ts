@@ -547,21 +547,34 @@ export async function runPushGate(deps: PushGateDeps): Promise<GateResult> {
       const localSnapshotPath = path.join(deps.baseDir, '.rea', 'last-review.json');
       let localSha: string | null = null;
       let localVerdict: string | null = null;
+      let localBaseRef: string | null = null;
+      let localFindingCount: number | null = null;
       try {
         const parsed = JSON.parse(fsSync.readFileSync(localSnapshotPath, 'utf8')) as {
           head_sha?: unknown;
           verdict?: unknown;
+          base_ref?: unknown;
+          finding_count?: unknown;
         };
         if (typeof parsed.head_sha === 'string') localSha = parsed.head_sha;
         if (typeof parsed.verdict === 'string') localVerdict = parsed.verdict;
+        if (typeof parsed.base_ref === 'string') localBaseRef = parsed.base_ref;
+        if (typeof parsed.finding_count === 'number') localFindingCount = parsed.finding_count;
       } catch {
         /* absent or unreadable → refresh */
       }
-      // Round-28 P2 refinement: refresh on a VERDICT mismatch too — a
-      // sibling stream can re-review the same sha and flip the shared
-      // cache entry, leaving this stream's same-sha snapshot showing
-      // the superseded verdict while the push proceeds on the new one.
-      if (localSha !== headSha || localVerdict !== cached.verdict) {
+      // Rounds 28+39 P2: refresh on ANY reviewed-content mismatch, not
+      // just sha — a sibling stream can flip the verdict, re-review
+      // with a different finding set, or the hit can come from a
+      // different base's entry; the local snapshot must describe the
+      // result the gate actually returned. Plain checkouts still skip
+      // (their full snapshot matches on every axis).
+      if (
+        localSha !== headSha ||
+        localVerdict !== cached.verdict ||
+        localBaseRef !== base.ref ||
+        localFindingCount !== cached.finding_count
+      ) {
         writeLastReviewFromCache({
           baseDir: deps.baseDir,
           verdict: cached.verdict,

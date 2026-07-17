@@ -63,6 +63,7 @@ shim_cli_missing_relevant() {
     # becomes a bypass lane into the primary checkout.
     *".rea/audit.jsonl"*) matched_protected=1 ;;
     *".rea/fingerprints.json"*) matched_protected=1 ;;
+    *".rea/fingerprints.json.lock"*) matched_protected=1 ;;
     *".rea.lock"*) matched_protected=1 ;;
     *".claude\\"*|*".husky\\"*|*".rea\\"*) matched_protected=1 ;;
   esac
