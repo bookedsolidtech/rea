@@ -696,17 +696,21 @@ shim_run() {
           # Exported so `rea hook policy-get` (spawned by the policy
           # readers) resolves the same worktree policy this shim does.
           export REA_ROOT
-          # Round-4 P2: the pre-stdin check_halt derived its root from
-          # CLAUDE_PROJECT_DIR (the primary checkout) and cannot see a
-          # LEGACY per-worktree HALT. Now that the payload named the
-          # worktree, re-probe its local HALT so a pre-0.54.0 freeze in
-          # this stream still freezes it. (The common root was already
-          # probed pre-stdin.)
-          if [ -f "${REA_ROOT}/.rea/HALT" ]; then
-            printf 'REA HALT: %s\nAll agent operations suspended. Run: rea unfreeze\n' \
-              "$(head -c 1024 "${REA_ROOT}/.rea/HALT" 2>/dev/null || echo 'Reason unknown')" >&2
-            exit 2
-          fi
+          # Round-4 P2 + round-13 P1: the pre-stdin check_halt derived
+          # its root from CLAUDE_PROJECT_DIR and cannot see a LEGACY
+          # per-worktree HALT — and when the session started OUTSIDE any
+          # .rea root it never probed this repository at all. Re-probe
+          # BOTH the accepted root's local HALT and its repository
+          # (common) HALT.
+          _accepted_common=$(rea_common_root "$REA_ROOT")
+          for _halt_probe in "${REA_ROOT}/.rea/HALT" "${_accepted_common}/.rea/HALT"; do
+            if [ -f "$_halt_probe" ]; then
+              printf 'REA HALT: %s\nAll agent operations suspended. Run: rea unfreeze\n' \
+                "$(head -c 1024 "$_halt_probe" 2>/dev/null || echo 'Reason unknown')" >&2
+              exit 2
+            fi
+            [ "$REA_ROOT" = "$_accepted_common" ] && break
+          done
           break
         fi
         _payload_root=$(dirname "$_payload_root")

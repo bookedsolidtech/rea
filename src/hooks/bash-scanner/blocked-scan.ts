@@ -52,6 +52,8 @@ interface BlockedNormalized {
   pathLc: string;
   /** The root the relative form was derived against (cross-root cases). */
   rootUsed?: string;
+  /** Root the SYMLINK-RESOLVED form crossed into, when different. */
+  resolvedRootUsed?: string;
   outsideRoot: boolean;
   expansion: boolean;
   original: string;
@@ -169,6 +171,7 @@ function normalizeTarget(
   ).toLowerCase();
 
   let resolvedLc: string | null = null;
+  let resolvedRootCross: string | null = null;
   try {
     const resolved = resolveSymlinksWalkUp(collapsed);
     if (resolved === SYMLINK_DYNAMIC_SENTINEL) {
@@ -204,7 +207,10 @@ function normalizeTarget(
             resolvedRelative = resolved.slice(realCross.length + 1);
           else if (resolved.startsWith(cross + '/'))
             resolvedRelative = resolved.slice(cross.length + 1);
-          if (resolvedRelative !== null) break;
+          if (resolvedRelative !== null) {
+            resolvedRootCross = cross;
+            break;
+          }
         }
       }
       if (resolvedRelative !== null) {
@@ -223,6 +229,7 @@ function normalizeTarget(
     original: raw,
     resolvedLc,
     ...(effectiveRoot !== reaRoot ? { rootUsed: effectiveRoot } : {}),
+    ...(resolvedRootCross !== null ? { resolvedRootUsed: resolvedRootCross } : {}),
   };
 }
 
@@ -537,9 +544,18 @@ export function scanForBlockedViolations(
     const dirOptions = d.isDirTarget === true ? { forceDirSemantics: true } : undefined;
     // Round-11 P1: cross-root targets match the UNION of the caller's
     // list and the TARGET root's own blocked_paths.
+    const crossRootsHit = [
+      ...(norm.rootUsed !== undefined ? [norm.rootUsed] : []),
+      ...(norm.resolvedRootUsed !== undefined ? [norm.resolvedRootUsed] : []),
+    ];
     const effectiveBlocked =
-      norm.rootUsed !== undefined && ctx.blockedPathsForRoot !== undefined
-        ? [...new Set([...ctx.blockedPaths, ...ctx.blockedPathsForRoot(norm.rootUsed)])]
+      crossRootsHit.length > 0 && ctx.blockedPathsForRoot !== undefined
+        ? [
+            ...new Set([
+              ...ctx.blockedPaths,
+              ...crossRootsHit.flatMap((r) => [...(ctx.blockedPathsForRoot?.(r) ?? [])]),
+            ]),
+          ]
         : ctx.blockedPaths;
     const logicalHit = matchBlockedEntry(norm.pathLc, effectiveBlocked, dirOptions);
     if (logicalHit !== null) {
