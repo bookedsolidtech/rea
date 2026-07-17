@@ -263,7 +263,7 @@ describe('kill-switch middleware', () => {
     const beforeSnap = metrics.snapshot();
     expect(beforeSnap.lastHaltCheckMs).toBe(0);
 
-    const mw = createKillSwitchMiddleware(baseDir, metrics);
+    const mw = createKillSwitchMiddleware(baseDir, undefined, metrics);
     const ctx = freshCtx();
     await mw(ctx, async () => {
       /* terminal */
@@ -282,7 +282,7 @@ describe('kill-switch middleware', () => {
     metrics.markHaltCheck(0);
 
     await fs.writeFile(path.join(baseDir, '.rea', 'HALT'), 'denied\n', 'utf8');
-    const mw = createKillSwitchMiddleware(baseDir, metrics);
+    const mw = createKillSwitchMiddleware(baseDir, undefined, metrics);
     const ctx = freshCtx();
     await mw(ctx, async () => {
       throw new Error('next should not be called');
@@ -303,7 +303,7 @@ describe('kill-switch middleware', () => {
       },
     } as unknown as import('../observability/metrics.js').MetricsRegistry;
 
-    const mw = createKillSwitchMiddleware(baseDir, brokenMetrics);
+    const mw = createKillSwitchMiddleware(baseDir, undefined, brokenMetrics);
     const ctx = freshCtx();
     let nextCalled = false;
     await expect(
@@ -313,5 +313,43 @@ describe('kill-switch middleware', () => {
     ).resolves.not.toThrow();
     expect(nextCalled).toBe(true);
     expect(ctx.metadata.halt_decision).toBe('absent');
+  });
+});
+
+describe('kill-switch middleware — worktree common root (0.54.0)', () => {
+  let localDir: string;
+  let commonDir: string;
+  beforeEach(async () => {
+    localDir = await fs.mkdtemp(path.join(os.tmpdir(), 'rea-ks-local-'));
+    commonDir = await fs.mkdtemp(path.join(os.tmpdir(), 'rea-ks-common-'));
+    await fs.mkdir(path.join(localDir, '.rea'), { recursive: true });
+    await fs.mkdir(path.join(commonDir, '.rea'), { recursive: true });
+  });
+  afterEach(async () => {
+    await fs.rm(localDir, { recursive: true, force: true });
+    await fs.rm(commonDir, { recursive: true, force: true });
+  });
+
+  it('denies when HALT exists only at the COMMON root', async () => {
+    await fs.writeFile(path.join(commonDir, '.rea', 'HALT'), 'repo-wide freeze');
+    const mw = createKillSwitchMiddleware(localDir, commonDir);
+    const ctx = freshCtx();
+    let nextCalled = false;
+    await mw(ctx, async () => {
+      nextCalled = true;
+    });
+    expect(nextCalled).toBe(false);
+    expect(ctx.status).toBe(InvocationStatus.Denied);
+    expect(ctx.metadata.halt_decision).toBe('present');
+  });
+
+  it('proceeds when neither root carries HALT', async () => {
+    const mw = createKillSwitchMiddleware(localDir, commonDir);
+    const ctx = freshCtx();
+    let nextCalled = false;
+    await mw(ctx, async () => {
+      nextCalled = true;
+    });
+    expect(nextCalled).toBe(true);
   });
 });

@@ -35,6 +35,15 @@ const HALT_FILE = 'HALT';
 export function createKillSwitchMiddleware(
   baseDir: string,
   /**
+   * 0.54.0 worktree state: the COMMON (primary-checkout) root. `rea
+   * freeze` writes there so a freeze from ANY worktree stops a gateway
+   * serving this one; the LOCAL probe stays first (legacy per-worktree
+   * HALT). Defaults to `baseDir` — plain checkouts keep the exactly-one-
+   * syscall-per-invocation contract; worktrees pay one extra open only
+   * when the local probe misses.
+   */
+  commonDir?: string,
+  /**
    * Optional metrics registry. When supplied, every invocation marks the
    * `rea_seconds_since_last_halt_check` gauge with a fresh timestamp so the
    * exposed gauge reflects real per-call check cadence rather than the
@@ -45,6 +54,10 @@ export function createKillSwitchMiddleware(
 ): Middleware {
   return async (ctx, next) => {
     const haltPath = path.join(baseDir, REA_DIR, HALT_FILE);
+    const commonHaltPath =
+      commonDir !== undefined && commonDir !== baseDir
+        ? path.join(commonDir, REA_DIR, HALT_FILE)
+        : null;
 
     // Record the HALT-check attempt BEFORE we probe the filesystem so the
     // gauge reflects "how long since we last looked", regardless of whether
@@ -57,24 +70,37 @@ export function createKillSwitchMiddleware(
       // but we refuse to let them take down the chain in any case.
     }
 
+    // Probe order (0.54.0): LOCAL root first (legacy per-worktree HALT),
+    // then the COMMON root (where `rea freeze` writes — a freeze issued
+    // from any worktree stops this gateway). Plain checkouts have no
+    // common path and keep the exactly-one-syscall contract. ENOENT on a
+    // probe advances to the next; any other errno is an unknown state →
+    // fail closed. `fh` non-null after the loop ⇒ HALT present.
     let fh: fs.FileHandle | undefined;
-    try {
-      fh = await fs.open(haltPath, fsConstants.O_RDONLY);
-    } catch (err) {
-      const errno = (err as NodeJS.ErrnoException).code;
-      if (errno === 'ENOENT') {
-        // HALT absent at the moment of check. Decision is final — no re-check.
-        ctx.metadata.halt_decision = 'absent';
+    const probePaths = commonHaltPath !== null ? [haltPath, commonHaltPath] : [haltPath];
+    for (const probe of probePaths) {
+      try {
+        fh = await fs.open(probe, fsConstants.O_RDONLY);
+        break;
+      } catch (err) {
+        const errno = (err as NodeJS.ErrnoException).code;
+        if (errno === 'ENOENT') {
+          continue;
+        }
+        // EACCES, EPERM, EISDIR on some platforms, EIO, … — unknown
+        // state. Fail closed: deny the invocation and surface the errno.
+        ctx.status = InvocationStatus.Denied;
+        ctx.error = `Kill switch check failed: ${errno ?? 'unknown'} (${(err as Error).message})`;
+        ctx.metadata.halt_decision = 'unknown';
         ctx.metadata.halt_at_invocation = null;
-        await next();
         return;
       }
-      // Any other errno (EACCES, EPERM, EISDIR on some platforms, EIO, …) is an
-      // unknown state. Fail closed: deny the invocation and surface the errno.
-      ctx.status = InvocationStatus.Denied;
-      ctx.error = `Kill switch check failed: ${errno ?? 'unknown'} (${(err as Error).message})`;
-      ctx.metadata.halt_decision = 'unknown';
+    }
+    if (fh === undefined) {
+      // HALT absent at the moment of check. Decision is final — no re-check.
+      ctx.metadata.halt_decision = 'absent';
       ctx.metadata.halt_at_invocation = null;
+      await next();
       return;
     }
 
