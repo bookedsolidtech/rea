@@ -133,6 +133,25 @@ export function resolveCommonRoot(
   const looksLikeCheckout =
     fs.existsSync(path.join(candidate, '.rea')) || fs.existsSync(path.join(candidate, '.git'));
   if (!looksLikeCheckout) {
+    // Round-41 P3: the PRIMARY checkout of a --separate-git-dir repo
+    // also reaches here (.git is a gitfile, common dir external) — but
+    // its gitfile points AT the common dir itself, while a linked
+    // worktree's points under <common>/worktrees/<name>. The primary
+    // IS the shared root: degenerate silently, no bogus advisory.
+    try {
+      const m = /^gitdir:\s*(.+)\s*$/m.exec(
+        fs.readFileSync(path.join(localRoot, '.git'), 'utf8'),
+      );
+      const target = m?.[1]?.trim() ?? '';
+      if (target.length > 0) {
+        const targetAbs = path.isAbsolute(target) ? target : path.join(localRoot, target);
+        if (path.resolve(targetAbs) === path.resolve(commonDir)) {
+          return degenerate;
+        }
+      }
+    } catch {
+      /* unreadable gitfile — fall through to the loud degrade */
+    }
     const mainWorktree = firstListedWorktree(localRoot);
     if (
       mainWorktree !== null &&

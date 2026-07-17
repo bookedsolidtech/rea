@@ -388,14 +388,33 @@ export async function runSettingsProtection(
         }
       }
     }
-    // Documented extension surface — allow.
-    return {
-      exitCode: 0,
-      stderr,
-      matched: null,
-      surfaceSymlinkRefused: false,
-      patchSessionAllowed: false,
-    };
+    // Round-41 P2: a CROSS-ROOT fragment write only rides the allow
+    // when the DESTINATION stream's own protected_writes do not name
+    // it — the extension surface is the local consumer's to use, not a
+    // lane into a sibling's explicitly protected hook fragments. On a
+    // hit we fall through to §6, where the cross-root pattern union
+    // (strict ∪ target) blocks it.
+    let crossProtectedFragment = false;
+    if (crossRootTarget && crossRootUsedPath !== null) {
+      const targetPolicy = loadPolicyPermissive(crossRootUsedPath);
+      const targetResolution = resolveProtectedPatterns({
+        ...(targetPolicy.protectedWrites !== undefined
+          ? { protectedWrites: targetPolicy.protectedWrites }
+          : {}),
+        protectedPathsRelax: targetPolicy.protectedRelax,
+      });
+      crossProtectedFragment = matchAny(lowerNorm, targetResolution.overridePatterns) !== null;
+    }
+    if (!crossProtectedFragment) {
+      // Documented extension surface — allow.
+      return {
+        exitCode: 0,
+        stderr,
+        matched: null,
+        surfaceSymlinkRefused: false,
+        patchSessionAllowed: false,
+      };
+    }
   }
 
   // §6. Default-protected list resolution.
