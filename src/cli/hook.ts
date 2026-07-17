@@ -38,7 +38,7 @@ import { parse as parseYaml } from 'yaml';
 import { parsePrePushStdin, runPushGate } from '../hooks/push-gate/index.js';
 import { runBlockedScan, runProtectedScan, type Verdict } from '../hooks/bash-scanner/index.js';
 import { checkHaltRoots, formatHaltBanner } from '../hooks/_lib/halt-check.js';
-import { resolveHookRoots, resolveReaRoots, resolveCommonRoot, listSiblingWorktreeRoots } from '../lib/worktree-roots.js';
+import { resolveHookRoots, resolveReaRoots, resolveCommonRoot, resolveLocalRoot, listSiblingWorktreeRoots } from '../lib/worktree-roots.js';
 import { resolveProtectedPatterns } from '../hooks/_lib/protected-paths.js';
 import { runHookPrIssueLinkGate } from '../hooks/pr-issue-link-gate/index.js';
 import { runHookSecurityDisclosureGate } from '../hooks/security-disclosure-gate/index.js';
@@ -621,7 +621,13 @@ export interface HookCodexReviewOptions {
 }
 
 export async function runHookCodexReview(options: HookCodexReviewOptions): Promise<void> {
-  const baseDir = options.reaRoot ?? process.cwd();
+  // Round-31 P2: normalize a nested-cwd invocation to the checkout
+  // ROOT — /codex-review launched from a subdirectory of a linked
+  // worktree must probe <worktree>/.rea/HALT (and the shared common
+  // HALT) and land its codex.review audit entries on the repository
+  // chain, not under <subdir>/.rea/. The explicit test seam stays
+  // verbatim.
+  const baseDir = options.reaRoot ?? resolveLocalRoot(process.cwd());
 
   // HALT check — uniform with the rest of the hook tree; probes BOTH
   // roots (0.54.0: the kill switch is repo-wide, and a freeze written at

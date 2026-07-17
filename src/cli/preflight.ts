@@ -33,7 +33,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import type { Command } from 'commander';
 import { spawnSync } from 'node:child_process';
-import { resolveCommonRoot } from '../lib/worktree-roots.js';
+import { resolveCommonRoot, resolveLocalRoot } from '../lib/worktree-roots.js';
 import { appendAuditRecord } from '../audit/append.js';
 import {
   LOCAL_REVIEW_TOOL_NAME,
@@ -303,7 +303,10 @@ export async function computePreflight(
 }
 
 export async function runPreflight(options: RunPreflightOptions): Promise<void> {
-  const baseDir = process.cwd();
+  // Round-31 P3: normalize to the checkout root — `rea preflight` from
+  // a subdirectory of a linked worktree must read HALT/coverage from
+  // the worktree root and the shared common root, not `<subdir>/.rea`.
+  const baseDir = resolveLocalRoot(process.cwd());
   const { outcome } = await computePreflight(baseDir, options);
 
   if (options.json === true) {
