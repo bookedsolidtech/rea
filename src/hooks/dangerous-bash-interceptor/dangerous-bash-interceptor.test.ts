@@ -633,6 +633,84 @@ some_legacy_top_level_key:
   });
 });
 
+describe('dangerous-bash-interceptor: H17 sanction + runner normalization (bug H17)', () => {
+  let root: string;
+  beforeEach(() => {
+    root = mkRoot();
+    fs.mkdirSync(path.join(root, '.rea'), { recursive: true });
+    fs.writeFileSync(
+      path.join(root, '.rea', 'policy.yaml'),
+      `context_protection:
+  delegate_to_subagent:
+    - pnpm run test
+    - pnpm run build
+`,
+    );
+  });
+  afterEach(() => {
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('the sanctioned marker makes the mandated path traversable (allow, no H17)', async () => {
+    const r = await run('REA_DELEGATED_RUN=1 pnpm test', root);
+    expect(r.exitCode).toBe(0);
+    expect(r.ids).not.toContain('H17');
+  });
+
+  it('a sanctioned run is RECORDED on the audit chain', async () => {
+    await run('REA_DELEGATED_RUN=1 pnpm run test', root);
+    const auditPath = path.join(root, '.rea', 'audit.jsonl');
+    expect(fs.existsSync(auditPath)).toBe(true);
+    const records = fs
+      .readFileSync(auditPath, 'utf8')
+      .split('\n')
+      .filter((l) => l.length > 0)
+      .map((l) => JSON.parse(l) as { tool_name?: string; metadata?: Record<string, unknown> });
+    const rec = records.find((x) => x.tool_name === 'rea.context_protection');
+    expect(rec).toBeDefined();
+    expect(rec?.metadata?.['event']).toBe('delegated_run_sanctioned');
+    expect(rec?.metadata?.['sanction_source']).toBe('command_marker');
+  });
+
+  it('the coordinator (no marker) is still blocked — shorthand equivalent too', async () => {
+    // `pnpm test` is the shorthand of the listed `pnpm run test`.
+    const r = await run('pnpm test', root);
+    expect(r.exitCode).toBe(2);
+    expect(r.ids).toContain('H17');
+  });
+
+  it('closes the under-block leak: every runner-equivalent form now blocks', async () => {
+    for (const cmd of [
+      './node_modules/.bin/vitest run', // the bypass an agent found in the field
+      'node_modules/.bin/vitest run',
+      'pnpm exec vitest run',
+      'npx vitest run',
+    ]) {
+      fs.writeFileSync(
+        path.join(root, '.rea', 'policy.yaml'),
+        `context_protection:\n  delegate_to_subagent:\n    - pnpm vitest run\n`,
+      );
+      const r = await run(cmd, root);
+      expect(r.exitCode, cmd).toBe(2);
+      expect(r.ids, cmd).toContain('H17');
+    }
+  });
+
+  it('collapses whitespace so `pnpm  run  test` (extra spaces) still blocks', async () => {
+    const r = await run('pnpm  run  test', root);
+    expect(r.exitCode).toBe(2);
+  });
+
+  it('does NOT over-block: the `test` shell builtin is unaffected by a `pnpm test` delegate', async () => {
+    // Stripping the pattern down to a bare `test` would catch these —
+    // the expansion approach deliberately does not.
+    for (const cmd of ['test -f foo && echo hi', 'test "$x" = y', 'pnpm testfoo', 'pnpm test-utils run']) {
+      const r = await run(cmd, root);
+      expect(r.exitCode, cmd).toBe(0);
+    }
+  });
+});
+
 describe('dangerous-bash-interceptor: M1 (npm install --force)', () => {
   let root: string;
   beforeEach(() => {

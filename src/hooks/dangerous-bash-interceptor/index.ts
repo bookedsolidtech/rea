@@ -65,8 +65,10 @@ import {
   anySegmentRawMatches,
   forEachSegment,
   quoteMaskedCmd,
+  splitSegments,
   unwrapNestedShells,
 } from '../_lib/segments.js';
+import { appendAuditRecord, InvocationStatus, Tier } from '../../audit/append.js';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { parse as parseYaml } from 'yaml';
@@ -112,6 +114,8 @@ interface RuleContext {
   cmdIsRebaseSafe: boolean;
   cmdIsCleanDry: boolean;
   delegatePatterns: string[];
+  /** H17: the command carries the sanctioned delegated-run marker. */
+  delegatedRunSanctioned: boolean;
 }
 
 interface Rule {
@@ -122,6 +126,118 @@ interface Rule {
 
 function escapeERE(pattern: string): string {
   return pattern.replace(/[\\.*^$()+?|{}[\]]/g, (m) => `\\${m}`);
+}
+
+// ── H17 context-protection helpers (0.54.x, bug H17 fix) ────────────
+//
+// The pre-fix H17 mandated delegation ("run this in a subagent") but the
+// delegated subagent hit the same block — Claude Code fires PreToolUse
+// in every agent context and the hook has no reliable "am I in a
+// subagent?" signal (CLAUDE_PARENT_SUBAGENT's presence on a *Bash* call
+// is unverifiable and, if ever set session-wide, would disable the gate
+// entirely). The durable, verifiable fix is an explicit SANCTIONED-RUN
+// marker plus matcher normalization so the mandated path is traversable
+// and the raw-equivalent bypasses no longer leak.
+
+/**
+ * The sanctioned delegated-run marker. A delegate-listed command carried
+ * as `REA_DELEGATED_RUN=1 <cmd>` is allowed through H17 AND recorded on
+ * the audit chain — the coordinator gate stays intact (a bare command
+ * is still blocked) while the delegated runner (disposable context) has
+ * a real, auditable path. Detected from the RAW command text, because a
+ * leading env-assignment is STRIPPED from `seg.head` by
+ * `stripSegmentPrefix` — so `anySegmentStartsWith` would still fire if
+ * we relied on head-form suppression.
+ */
+const DELEGATED_RUN_MARKER = 'REA_DELEGATED_RUN';
+
+/**
+ * True when the command (or the process env) carries the sanctioned
+ * delegated-run marker with a non-empty value. Command form is the
+ * reliable one: shell `export`s do NOT survive across separate Bash
+ * tool calls, so an inline leading assignment is the only marker a
+ * PreToolUse hook can see for the command it is gating.
+ */
+function detectDelegatedRunSanction(cmd: string): boolean {
+  const env = process.env[DELEGATED_RUN_MARKER];
+  if (typeof env === 'string' && env.length > 0) return true;
+  // Leading env-assignment block that includes REA_DELEGATED_RUN=<val>.
+  // Tolerates other simple leading assigns and quoted values.
+  const re = new RegExp(
+    `^\\s*(?:[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|\\S*)\\s+)*` +
+      `${DELEGATED_RUN_MARKER}=(?:"[^"]*"|'[^']*'|\\S+)`,
+  );
+  for (const seg of splitSegments(cmd)) {
+    if (re.test(seg.raw)) return true;
+  }
+  return false;
+}
+
+/**
+ * Runner-prefix equivalence (bug H17 under-block leak). `pnpm vitest
+ * run`, `pnpm exec vitest run`, `npx vitest run`,
+ * `./node_modules/.bin/vitest run`, and `node_modules/.bin/vitest run`
+ * all invoke the same binary — but the pre-fix matcher (LEADING_KEYWORDS
+ * omits pnpm/npx/the .bin path) only caught the literal listed form.
+ *
+ * We EXPAND each policy pattern into its runner-equivalent forms and
+ * match the command against those, rather than stripping the command
+ * down to a bare token. That closes the leak WITHOUT over-blocking: a
+ * bare shell builtin like `test -f foo` never carries a pnpm/npx/.bin
+ * prefix, so it never matches an expanded `pnpm test` pattern (stripping
+ * the pattern down to `test` WOULD have caught it — the trap avoided).
+ */
+const RUNNER_PREFIXES = [
+  'pnpm ',
+  'pnpm exec ',
+  'pnpm dlx ',
+  'npx ',
+  'yarn ',
+  'yarn exec ',
+  'yarn dlx ',
+  './node_modules/.bin/',
+  'node_modules/.bin/',
+];
+
+/** Extract the "binary/script + args" tail by removing ONE known runner prefix. */
+function delegateTail(normPattern: string): string {
+  const runner =
+    /^(?:pnpm\s+exec|pnpm\s+dlx|pnpm\s+run|pnpm|yarn\s+exec|yarn\s+dlx|yarn\s+run|yarn|npx(?:\s+--\S+)*|node\s+--run)\s+(.+)$/i.exec(
+      normPattern,
+    );
+  if (runner && runner[1] !== undefined) return runner[1];
+  const binPath = /^(?:\.\/)?node_modules\/\.bin\/(.+)$/.exec(normPattern);
+  if (binPath && binPath[1] !== undefined) return binPath[1];
+  return normPattern; // no runner prefix (e.g. a bare `git push`)
+}
+
+function expandRunnerEquivalents(pattern: string): string[] {
+  const norm = pattern.trim().replace(/\s+/g, ' ');
+  const tail = delegateTail(norm);
+  const out = new Set<string>([norm]); // always match the listed form verbatim
+  // Only RUNNER-PREFIXED equivalents — deliberately NOT the bare tail,
+  // which would over-match unrelated `test`/`build` shell commands.
+  for (const pre of RUNNER_PREFIXES) out.add(pre + tail);
+  return [...out];
+}
+
+/**
+ * Return the delegate pattern that matches `cmd` (whitespace-normalized,
+ * across every runner-equivalent form), or null. Head-anchored with a
+ * trailing `(\s|$)` so a listed `pnpm vitest run` catches every runner
+ * form while `pnpm vitest-foo` does not. Empty patterns are skipped.
+ */
+function matchDelegatePattern(cmd: string, patterns: readonly string[]): string | null {
+  const heads = splitSegments(cmd).map((seg) => seg.head.trim().replace(/\s+/g, ' '));
+  for (const pattern of patterns) {
+    if (pattern.trim().length === 0) continue;
+    for (const variant of expandRunnerEquivalents(pattern)) {
+      if (variant.length === 0) continue;
+      const re = new RegExp(`^${escapeERE(variant)}(\\s|$)`, 'i');
+      if (heads.some((h) => re.test(h))) return pattern;
+    }
+  }
+  return null;
 }
 
 // ── Rule catalog ────────────────────────────────────────────────────
@@ -527,26 +643,26 @@ const RULES: ReadonlyArray<Rule> = [
     id: 'H17',
     severity: 'HIGH',
     run: (ctx) => {
-      for (const pattern of ctx.delegatePatterns) {
-        if (pattern.length === 0) continue;
-        const escaped = escapeERE(pattern);
-        if (anySegmentStartsWith(ctx.cmd, `${escaped}(\\s|$)`)) {
-          return [
-            {
-              severity: 'HIGH',
-              id: 'H17',
-              label: 'Context protection — command must run in a subagent',
-              detail:
-                'This command produces excessive output that will exhaust the coordinator context window. Delegate it to a subagent instead of running it directly.',
-              alternatives: [
-                `Alt: Use the Agent tool to delegate: Agent(subagent_type: 'qa-engineer-automation', prompt: 'Run ${pattern} and report pass/fail summary only.')`,
-                'Alt: The context_protection policy in .rea/policy.yaml lists commands that must be delegated.',
-              ],
-            },
-          ];
-        }
-      }
-      return [];
+      // Sanctioned delegated runs pass (and are audited by the caller).
+      // The coordinator — no marker — is still blocked, but with copy
+      // that names an ACTUALLY TRAVERSABLE path (bug H17).
+      if (ctx.delegatedRunSanctioned) return [];
+      const hit = matchDelegatePattern(ctx.cmd, ctx.delegatePatterns);
+      if (hit === null) return [];
+      return [
+        {
+          severity: 'HIGH',
+          id: 'H17',
+          label: 'Context protection — command must run in a subagent',
+          detail:
+            'This command produces excessive output that will exhaust the coordinator context window. Run it in a DISPOSABLE context, not the coordinator.',
+          alternatives: [
+            `Alt: Delegate to a subagent: Agent(subagent_type: 'qa-engineer-automation', prompt: 'Run ${hit} and report only a pass/fail summary.')`,
+            `Alt: If you ARE the delegated runner (disposable context), re-run as: REA_DELEGATED_RUN=1 ${hit} — this is allowed and recorded on the audit chain.`,
+            'Alt: The context_protection.delegate_to_subagent list in .rea/policy.yaml defines these commands (all runner forms — pnpm/npx/exec/direct-binary — are covered).',
+          ],
+        },
+      ];
     },
   },
   // ── M1: npm install --force ─────────────────────────────────────
@@ -727,8 +843,9 @@ export async function runDangerousBashInterceptor(
     'git\\s+clean.*([ \\t]-n|--dry-run)',
   );
 
-  // 6. Delegate patterns.
+  // 6. Delegate patterns + sanctioned-run detection (bug H17).
   const delegatePatterns = loadDelegatePatterns(reaRoot);
+  const delegatedRunSanctioned = detectDelegatedRunSanction(cmd);
 
   // 7. Run every rule.
   const ctx: RuleContext = {
@@ -736,10 +853,48 @@ export async function runDangerousBashInterceptor(
     cmdIsRebaseSafe,
     cmdIsCleanDry,
     delegatePatterns,
+    delegatedRunSanctioned,
   };
   const violations: Violation[] = [];
   for (const rule of RULES) {
     violations.push(...rule.run(ctx));
+  }
+
+  // H17: a sanctioned delegated run of a delegate-listed command passes
+  // the gate but is RECORDED — the marker is a visible, audited escape
+  // hatch (like REA_SKIP_*), so a coordinator forging it leaves a trail
+  // on the hash chain. Audit keys off the COMMON (repository) root.
+  if (delegatedRunSanctioned) {
+    const sanctionedHit = matchDelegatePattern(cmd, delegatePatterns);
+    if (sanctionedHit !== null) {
+      try {
+        await appendAuditRecord(commonRoot, {
+          tool_name: 'rea.context_protection',
+          server_name: 'rea',
+          tier: Tier.Read,
+          status: InvocationStatus.Allowed,
+          metadata: {
+            event: 'delegated_run_sanctioned',
+            pattern: sanctionedHit,
+            sanction_source:
+              typeof process.env[DELEGATED_RUN_MARKER] === 'string' &&
+              (process.env[DELEGATED_RUN_MARKER] ?? '').length > 0
+                ? 'env'
+                : 'command_marker',
+            command_preview: cmd.slice(0, 256),
+          },
+        });
+      } catch (auditErr) {
+        // Soft (MEDIUM) context gate — do NOT fail the run on an
+        // audit-infra hiccup; surface it so the missing record is
+        // visible, then allow (the coordinator gate is unaffected).
+        writeStderr(
+          `dangerous-bash-interceptor: H17 sanctioned-run audit append failed (${
+            auditErr instanceof Error ? auditErr.message : String(auditErr)
+          }); allowing the delegated run.\n`,
+        );
+      }
+    }
   }
 
   if (violations.length === 0) {
