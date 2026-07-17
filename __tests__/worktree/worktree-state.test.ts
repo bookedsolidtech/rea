@@ -186,6 +186,16 @@ describe('worktree-state integration (real git worktree add)', () => {
     );
     expect(verdict2.verdict).toBe('block');
 
+    // …and the repo's SHARED audit chain + TOFU anchors (round-23 P1:
+    // repository-wide enforcement state a sibling stream must not forge).
+    for (const target of ['.rea/audit.jsonl', '.rea/fingerprints.json']) {
+      const v = runProtectedScan(
+        { reaRoot: wtA, commonRoot: repo, policy: { protected_paths_relax: [] }, stderr: () => {} },
+        `echo forged > ${repo}/${target}`,
+      );
+      expect(v.verdict, target).toBe('block');
+    }
+
     // Ordinary out-of-repo absolute writes stay allowed (no scope creep).
     const verdict3 = runProtectedScan(
       { reaRoot: wtA, commonRoot: repo, policy: { protected_paths_relax: [] }, stderr: () => {} },

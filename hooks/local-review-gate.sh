@@ -51,6 +51,14 @@ _shim_apply_defaults
 # 2. Read stdin once.
 INPUT=$(cat)
 
+# 2a. Worktree payload-root handoff (round-23 P1): this shim bypasses
+#     shim_run, so it must apply the same guarded ladder itself —
+#     otherwise review.local_review.* policy reads (mode, refuse_at,
+#     bypass var) keep coming from the PRIMARY checkout while the
+#     session works in a linked worktree. May rewrite REA_ROOT/proj and
+#     exits 2 on a HALT discovered at the accepted root.
+shim_worktree_handoff
+
 # 2b. Early default-bypass-env-var short-circuit. We can only check the
 #     DEFAULT var name (REA_SKIP_LOCAL_REVIEW) this early because the
 #     policy-renamed var requires a policy read. The policy-aware

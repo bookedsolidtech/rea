@@ -74,6 +74,7 @@ import {
   matchAny,
   isExtensionSurface,
   PATCH_SESSION_PATTERNS,
+  CROSS_ROOT_SHARED_STATE_PATTERNS,
   PROTECTED_PATTERNS_FULL,
   KILL_SWITCH_INVARIANTS,
   sanitizeForStderr,
@@ -417,6 +418,7 @@ export async function runSettingsProtection(
         ...new Set([
           ...PROTECTED_PATTERNS_FULL,
           ...KILL_SWITCH_INVARIANTS,
+          ...CROSS_ROOT_SHARED_STATE_PATTERNS,
           ...(crossRootUsedPath !== null
             ? ((): readonly string[] => {
                 const targetPolicy = loadPolicyPermissive(crossRootUsedPath);
@@ -632,6 +634,7 @@ function checkProtectedSymlinkResolution(
       ...new Set([
         ...PROTECTED_PATTERNS_FULL,
         ...KILL_SWITCH_INVARIANTS,
+        ...CROSS_ROOT_SHARED_STATE_PATTERNS,
         ...(matchedOriginal !== null && patternsForCrossRoot !== undefined
           ? patternsForCrossRoot(matchedOriginal)
           : []),

@@ -39,6 +39,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import type { Policy } from '../../policy/types.js';
 import type { DetectedWrite } from './walker.js';
+import { CROSS_ROOT_SHARED_STATE_PATTERNS } from '../_lib/protected-paths.js';
 import { allowVerdict, blockVerdict, type DetectedForm, type Verdict } from './verdict.js';
 
 /**
@@ -75,6 +76,9 @@ const HISTORICAL_DEFAULT_PROTECTED_PATTERNS: readonly string[] = [
  */
 const STRICT_CROSS_ROOT_PATTERNS: readonly string[] = [
   ...HISTORICAL_DEFAULT_PROTECTED_PATTERNS,
+  // Round-23 P1: repo-wide shared enforcement state (the audit hash
+  // chain + TOFU anchors) — cross-root writes must not forge them.
+  ...CROSS_ROOT_SHARED_STATE_PATTERNS,
 ];
 
 /**

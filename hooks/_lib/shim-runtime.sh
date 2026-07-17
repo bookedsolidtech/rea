@@ -670,20 +670,14 @@ shim_default_forward() {
 }
 
 # -----------------------------------------------------------------------------
-# Main entry point. Reads SHIM_* variables, runs the standard flow.
+# 0.54.0 worktree state — payload-root handoff (round-23 P1: extracted
+# from shim_run so local-review-gate.sh, the one shim that bypasses the
+# orchestrator, applies the SAME guarded ladder). Reads $INPUT; may
+# rewrite REA_ROOT (exported) and proj; exits 2 on a HALT discovered at
+# the accepted root. Call after INPUT is captured and before any
+# policy read or CLI resolution.
 # -----------------------------------------------------------------------------
-shim_run() {
-  _shim_apply_defaults
-
-  # 1. HALT check — the shim is expected to have sourced halt-check.sh
-  #    and called `check_halt` BEFORE sourcing this lib, so REA_ROOT is
-  #    already set. We just use it.
-  : "${REA_ROOT:?shim-runtime: REA_ROOT must be set (source halt-check.sh + call check_halt first)}"
-  proj="${CLAUDE_PROJECT_DIR:-$REA_ROOT}"
-
-  # 2. Capture stdin once.
-  INPUT=$(cat)
-
+shim_worktree_handoff() {
   # 2b. 0.54.0 worktree state: once the payload is in hand, re-derive
   #     REA_ROOT from its top-level `cwd` when that resolves to a
   #     directory that actually carries `.rea/` — the same guarded
@@ -780,6 +774,25 @@ shim_run() {
       done
     fi
   fi
+}
+
+# -----------------------------------------------------------------------------
+# Main entry point. Reads SHIM_* variables, runs the standard flow.
+# -----------------------------------------------------------------------------
+shim_run() {
+  _shim_apply_defaults
+
+  # 1. HALT check — the shim is expected to have sourced halt-check.sh
+  #    and called `check_halt` BEFORE sourcing this lib, so REA_ROOT is
+  #    already set. We just use it.
+  : "${REA_ROOT:?shim-runtime: REA_ROOT must be set (source halt-check.sh + call check_halt first)}"
+  proj="${CLAUDE_PROJECT_DIR:-$REA_ROOT}"
+
+  # 2. Capture stdin once.
+  INPUT=$(cat)
+
+  # 2b. Worktree payload-root handoff (shared with local-review-gate.sh).
+  shim_worktree_handoff
 
   # 3. Relevance pre-gate. If the shim defined `shim_is_relevant`, call it.
   if declare -F shim_is_relevant >/dev/null 2>&1; then

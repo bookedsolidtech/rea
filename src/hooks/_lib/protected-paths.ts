@@ -66,6 +66,24 @@ export const PROTECTED_PATTERNS_FULL: readonly string[] = [
  * unlockable by setting `REA_HOOK_PATCH_SESSION=<reason>`. Mirrors
  * `PATCH_SESSION_PATTERNS` in settings-protection.sh §6b.
  */
+/**
+ * Round-23 P1 (0.54.0 worktree state): repository-wide SHARED
+ * enforcement state that only becomes a write target via CROSS-ROOT
+ * normalization. `.rea/audit.jsonl` (the repo's single hash chain) and
+ * `.rea/fingerprints.json` (shared TOFU trust anchors) live at the
+ * COMMON root; a sibling worktree must not be able to truncate or
+ * forge them via an absolute-path Bash/Write. Deliberately NOT part of
+ * the same-root defaults — plain-checkout behavior stays byte-identical
+ * (the degenerate invariant) and legitimate same-root tooling appends
+ * through the locked Node writers, which these gates do not intercept.
+ * Rotated audit archives (`audit-YYYYMMDD-HHMMSS.jsonl`) are a
+ * documented forensic residual (THREAT_MODEL §10).
+ */
+export const CROSS_ROOT_SHARED_STATE_PATTERNS: readonly string[] = [
+  '.rea/audit.jsonl',
+  '.rea/fingerprints.json',
+];
+
 export const PATCH_SESSION_PATTERNS: readonly string[] = ['.claude/hooks/'];
 
 /**
