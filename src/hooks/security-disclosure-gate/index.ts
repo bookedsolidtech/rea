@@ -460,13 +460,12 @@ export async function runSecurityDisclosureGate(
     if (options.stdoutWrite) options.stdoutWrite(s);
   };
 
-  // 2. Disclosure mode.
+  // 2. Disclosure mode. (Round-21 P2: the disabled-mode early return
+  // moved BELOW the HALT probe — a frozen repository denies this hook
+  // regardless of REA_DISCLOSURE_MODE, matching the pre-0.54.0 order.)
   const rawMode =
     options.disclosureModeOverride ?? process.env['REA_DISCLOSURE_MODE'];
   const mode = normalizeDisclosureMode(rawMode);
-  if (mode === 'disabled') {
-    return { exitCode: 0, stderr, stdout };
-  }
 
   // 3. Stdin.
   const stdinRaw =
@@ -502,6 +501,10 @@ export async function runSecurityDisclosureGate(
   if (halt.halted) {
     writeStderr(formatHaltBanner(halt.reason));
     return { exitCode: 2, stderr, stdout };
+  }
+
+  if (mode === 'disabled') {
+    return { exitCode: 0, stderr, stdout };
   }
 
   if (toolName !== '' && toolName !== 'Bash') {

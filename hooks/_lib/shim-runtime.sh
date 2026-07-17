@@ -191,18 +191,18 @@ shim_resolve_cli() {
   REA_ARGV=()
   RESOLVED_CLI_PATH=""
   CLI_RESOLVE_ROOT="$proj"
-  _shim_try_cli_root "$proj" && return 0
-  # Round-19 P2 (0.54.0 worktree state): when the accepted root is a
-  # worktree of the session repo and the PRIMARY checkout has no
-  # install (node_modules / dist may exist only in the worktree the
-  # session actually works in), resolve from the active worktree
-  # before degrading to cli-missing / the global tier. The sandbox
+  # Rounds 19+21 (0.54.0 worktree state): the ACCEPTED enforcement root
+  # (REA_ROOT — the worktree the session actually works in) resolves
+  # FIRST, so branch B's hooks run branch B's CLI even when the primary
+  # checkout also has an install; the primary is the fallback for
+  # worktrees without their own node_modules/dist. The sandbox
   # containment check below runs against CLI_RESOLVE_ROOT — the root
-  # the CLI was actually resolved from — so the worktree tier gets the
-  # same escape/realpath vetting the primary tier does.
+  # the CLI was actually resolved from — so both tiers get identical
+  # escape/realpath vetting.
   if [ -n "${REA_ROOT:-}" ] && [ "$REA_ROOT" != "$proj" ] && [ -d "${REA_ROOT}/.rea" ]; then
     _shim_try_cli_root "$REA_ROOT" && return 0
   fi
+  _shim_try_cli_root "$proj" && return 0
   return 0
 }
 
