@@ -57,7 +57,7 @@ shim_cli_missing_relevant() {
     # cross-root protected in the Node scanner; the CLI-missing
     # fallback must carry the same markers or an unbuilt worktree
     # becomes a bypass lane into the primary checkout.
-    *".rea/audit"*) return 0 ;;
+    *".rea/audit.jsonl"*) return 0 ;;
     *".rea/fingerprints.json"*) return 0 ;;
     *".rea.lock"*) return 0 ;;
     *".claude\\"*|*".husky\\"*|*".rea\\"*) return 0 ;;

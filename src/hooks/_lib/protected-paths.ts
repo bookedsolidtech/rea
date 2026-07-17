@@ -86,7 +86,13 @@ export const CROSS_ROOT_SHARED_STATE_PATTERNS: readonly string[] = [
   // shared writers. Interfering with `<primary>/.rea.lock` (audit
   // chain / verdict cache) or the fingerprint-store lock from another
   // stream can stall or unsynchronize repository-wide appends.
+  // Both forms per sidecar: the slash form prefix-matches CHILDREN
+  // (the lockfile-internal marker files), the bare form matches the
+  // sidecar directory itself (`rm -rf <primary>/.rea.lock`) — matchAny
+  // treats only trailing-slash patterns as prefixes (round-38 P1).
+  '.rea.lock',
   '.rea.lock/',
+  '.rea/fingerprints.json.lock',
   '.rea/fingerprints.json.lock/',
 ];
 
