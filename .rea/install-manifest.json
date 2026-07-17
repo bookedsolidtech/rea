@@ -1,92 +1,167 @@
 {
-  "version": "0.2.0",
-  "profile": "unknown",
+  "version": "0.51.0",
+  "profile": "bst-internal",
   "installed_at": "2026-04-18T21:31:41.169Z",
-  "upgraded_at": "2026-04-18T22:33:21.010Z",
+  "upgraded_at": "2026-07-17T23:09:40.457Z",
   "files": [
     {
+      "path": ".claude/hooks/_lib/bootstrap-allowlist.sh",
+      "sha256": "f04137740ac3905fe96d49ccfde85f424d8ff16516f1cf522831f21695331b8a",
+      "source": "hook"
+    },
+    {
+      "path": ".claude/hooks/_lib/cmd-segments.sh",
+      "sha256": "e1509d676a9b413de7bd8e7a571e4695e0c6e15719b8e6d0f000117354beb936",
+      "source": "hook"
+    },
+    {
       "path": ".claude/hooks/_lib/common.sh",
-      "sha256": "c95da81ac71257b5feb426b6123d3eee1160ea225d204da0b4f22995d44d90c7",
+      "sha256": "c6d8e0106eb72c090e5bb30c663a12b7d0e489f83475ba881a8e27d466bf316e",
       "source": "hook"
     },
     {
       "path": ".claude/hooks/_lib/halt-check.sh",
-      "sha256": "4ee5e7b3b57172ca32d17f1746471000de33a4cee0a3f2ab1d3edea4c338c4e4",
+      "sha256": "d48eb0c916249997f753f78379a75211fab49643ff08f47b1959ea9f18445392",
+      "source": "hook"
+    },
+    {
+      "path": ".claude/hooks/_lib/interpreter-scanner.sh",
+      "sha256": "1564d8aa4e337f3914b0361497a7d2900b3ac656b29e3896fbce67cbe5b0e4f9",
+      "source": "hook"
+    },
+    {
+      "path": ".claude/hooks/_lib/path-normalize.sh",
+      "sha256": "eb773a1ed5fd49ea46ac1af41c1744af8e213e5942b763ea8a936aa0557abe5b",
+      "source": "hook"
+    },
+    {
+      "path": ".claude/hooks/_lib/payload-read.sh",
+      "sha256": "d367aabb22dc81426d7322f37d62606c718b01d6aa6df895953f35aadcd98202",
       "source": "hook"
     },
     {
       "path": ".claude/hooks/_lib/policy-read.sh",
-      "sha256": "da8014b207641a2177b3b191472e7ac5937e085a9feab4ea04a02c57a23b34af",
+      "sha256": "7a2b54f5e4519026ff32db2c4f20af0c758bfd6338353b1fc446ae065a308258",
+      "source": "hook"
+    },
+    {
+      "path": ".claude/hooks/_lib/policy-reader.sh",
+      "sha256": "066ee33368279bcf87e7be6c0c209ce9202b24e5a85868f471870534a459261c",
+      "source": "hook"
+    },
+    {
+      "path": ".claude/hooks/_lib/protected-paths.sh",
+      "sha256": "9f1540c7183968d42beb92efb81303f8a8c37d79c0883d02c24a309b292d0bfa",
+      "source": "hook"
+    },
+    {
+      "path": ".claude/hooks/_lib/shim-cache.sh",
+      "sha256": "21802b345b0d1785c519ad55ce8d7c658fb7507d94b3edee5997cf216d102c6d",
+      "source": "hook"
+    },
+    {
+      "path": ".claude/hooks/_lib/shim-runtime.sh",
+      "sha256": "ba3b292c8df044744771d6e11eabf9e408f59687b19cb12764ee0cfb89acee57",
       "source": "hook"
     },
     {
       "path": ".claude/hooks/architecture-review-gate.sh",
-      "sha256": "84c3e7acc245b4a90d53e17d6fc056998a0a75007854bf65d2b1a5f9f4fbd4a7",
+      "sha256": "0bd2d96d9d8cdd5577f1c85753fbdf1adee167fc45db028142ceb17078227c65",
       "source": "hook"
     },
     {
       "path": ".claude/hooks/attribution-advisory.sh",
-      "sha256": "71e64e6e6fcd23923a18ac345b3409cd7a1f4c0b8c3c595b4fa3d35990dc1ecf",
+      "sha256": "72c52a50c3fc424add67ab5cc3e1dcfaf3b0d83cad026f7b15a4872b3bdcaa3c",
+      "source": "hook"
+    },
+    {
+      "path": ".claude/hooks/billing-cap-halt.sh",
+      "sha256": "ed2923bbd75a6988936d7ffbd5dbe3b1e79aa1060bc3d7a687ad1e4272620a85",
+      "source": "hook"
+    },
+    {
+      "path": ".claude/hooks/blocked-paths-bash-gate.sh",
+      "sha256": "7c528bdb8bf718876ffb67083112b9e9e6f3f9979557e7558c3d9b2d3fb1ca37",
       "source": "hook"
     },
     {
       "path": ".claude/hooks/blocked-paths-enforcer.sh",
-      "sha256": "be98dd8ddad684ae72cf4b00a4643137c38c1aae7778a52061878a7cdf236f2a",
+      "sha256": "df0a702ac03d740b471acaf79e9c37bfa34335422df892dec4d8179f997a4422",
       "source": "hook"
     },
     {
       "path": ".claude/hooks/changeset-security-gate.sh",
-      "sha256": "c7cfc39135166cc7827f8cbd87df212401106edd3fd5b39206eaef3ffb3b21e1",
-      "source": "hook"
-    },
-    {
-      "path": ".claude/hooks/commit-review-gate.sh",
-      "sha256": "de10cf5b69f59800118883a37bc96744fbcadaa750c1e2df2eaef9bd2a2c7e1b",
+      "sha256": "7322c113a6142487e1ddb2ae967109c2791e45d63060dab2cbe8013ea9a1f123",
       "source": "hook"
     },
     {
       "path": ".claude/hooks/dangerous-bash-interceptor.sh",
-      "sha256": "60b29565301b86394175f6d2887e86246e562309a52bd3da492bc148f7970351",
+      "sha256": "d9a82996fec6639d2bbe2ab7d3fb22dccdfc36d33f213e6e1751f3cc328c5519",
+      "source": "hook"
+    },
+    {
+      "path": ".claude/hooks/delegation-advisory.sh",
+      "sha256": "1136f43979d4090d103a92417510c01a44cf0884857114d80e4ad6b98d4d091b",
+      "source": "hook"
+    },
+    {
+      "path": ".claude/hooks/delegation-capture.sh",
+      "sha256": "b196c4814fa8d72728cc43d0d420f61402cdc63c886b3db632633a91b3c9581c",
       "source": "hook"
     },
     {
       "path": ".claude/hooks/dependency-audit-gate.sh",
-      "sha256": "6730fbae64edfa229e4095bfa68853236241a2e12f7c5f6ff68fc910dd1470a1",
+      "sha256": "b739406cf1ab38d295d987ee1c0d97cc52767207776e8cbc9008b62576abacc1",
       "source": "hook"
     },
     {
       "path": ".claude/hooks/env-file-protection.sh",
-      "sha256": "1edc6f8698323dbdeb53f09b81531173f1b692c8c2c42afbab52d815ab57f6ce",
+      "sha256": "d472371fdec30523f86384acda0344af41cabb135a068e118bd02e555034d9f0",
+      "source": "hook"
+    },
+    {
+      "path": ".claude/hooks/local-review-gate.sh",
+      "sha256": "99e14a1a6eb7bec57949145805b575b1b44fe519624c9ef8ac538b1b1e44c00b",
       "source": "hook"
     },
     {
       "path": ".claude/hooks/pr-issue-link-gate.sh",
-      "sha256": "a7d92d1c3e5c1f46c8bdc593575f5e1adb4f790485b6aaebdd15910503460e5c",
+      "sha256": "d6b69ee902514403e25ea2290a6b51fb595a96117c8fcca589c02e4833dba904",
       "source": "hook"
     },
     {
-      "path": ".claude/hooks/push-review-gate.sh",
-      "sha256": "767a8f6aa01fcf92b04a29dd03cc380667d8296c22975784d53adeb19e9d7bdc",
+      "path": ".claude/hooks/protected-paths-bash-gate.sh",
+      "sha256": "afef6822a86ace8d0fd46fbd250e72012bb3d99bca8467a8afb2dfe84f0b3e1a",
       "source": "hook"
     },
     {
       "path": ".claude/hooks/secret-scanner.sh",
-      "sha256": "8dc770ddddc75ca793294cca14d2856a3cded499f3e3c1ec93594dba8f80e279",
+      "sha256": "449b643f5da4f3a3abc8b553d1b5ab6520a09d403f3be10777e8c3b1ec152a5d",
       "source": "hook"
     },
     {
       "path": ".claude/hooks/security-disclosure-gate.sh",
-      "sha256": "3775cc14778266e862bb369a249332a8ae8a4fab511780cdca4e0531c3dce785",
+      "sha256": "94da906b25a261fcc64cf8bb3383c044c88d0474f23d03d67cec1a41ef055e98",
       "source": "hook"
     },
     {
       "path": ".claude/hooks/settings-protection.sh",
-      "sha256": "dc4918259da2d83d00097ec3a3d136c208d5112992ef63e6d211c114b0225820",
+      "sha256": "ee9e5bbb5bf30b1752232b736f4d1389e6af3ca8bde14e98e2558cdc3db63226",
       "source": "hook"
     },
     {
       "path": ".claude/agents/accessibility-engineer.md",
       "sha256": "440f172398ec4e80de936b15b57b8d22c405f57f3abd82935c578436db42fc06",
+      "source": "agent"
+    },
+    {
+      "path": ".claude/agents/adversarial-test-specialist.md",
+      "sha256": "417be3f030cc3818dac75137d53ca8627113975e2a6f88a03864409ef542db1b",
+      "source": "agent"
+    },
+    {
+      "path": ".claude/agents/ast-parser-specialist.md",
+      "sha256": "dfd6a8709d4a7c1ee0eee3305f002be9f94fa6ddee440a0b0eaa903465f2b729",
       "source": "agent"
     },
     {
@@ -101,12 +176,52 @@
     },
     {
       "path": ".claude/agents/codex-adversarial.md",
-      "sha256": "15df78b03ffcf986ea53894905043b0ac11050076ccda6c356b502a90635cb54",
+      "sha256": "edf64c5a0454a755e2d01c2fa6ec72d58c7cecd28493cc1dd5ad363634252dbf",
+      "source": "agent"
+    },
+    {
+      "path": ".claude/agents/data-architect.md",
+      "sha256": "8b23f6ca1d5b648f1fc98847312a94552ce7e811d412666f66c2175f5f6fae76",
+      "source": "agent"
+    },
+    {
+      "path": ".claude/agents/devex-architect.md",
+      "sha256": "5546c00dab675c9cc3a1ee08cb2947350de421a0d05e191ebe6caf4014f461ce",
+      "source": "agent"
+    },
+    {
+      "path": ".claude/agents/figma-dx-specialist.md",
+      "sha256": "2966c951bf423d2a55fbff0ab4d384f884b2a2264fafa4d3826a8d7fcfc52136",
       "source": "agent"
     },
     {
       "path": ".claude/agents/frontend-specialist.md",
       "sha256": "6be714dc035b6c73c2d4524ac59f5c4e88e49b2509d6eab4373e5e728e81c408",
+      "source": "agent"
+    },
+    {
+      "path": ".claude/agents/mcp-protocol-specialist.md",
+      "sha256": "fc0464339d512e4b6e996490972b0f739c0b889fb19176db8b8abb2118da6b7f",
+      "source": "agent"
+    },
+    {
+      "path": ".claude/agents/observability-specialist.md",
+      "sha256": "db57f92e3857c181ebba6a9d83419e4d738cdde2149f6972387491df6ac8e97f",
+      "source": "agent"
+    },
+    {
+      "path": ".claude/agents/platform-architect.md",
+      "sha256": "9eea80c21bde480bb58462d08dee29a0c345569a4e8c74266d6d00aeb974043f",
+      "source": "agent"
+    },
+    {
+      "path": ".claude/agents/principal-engineer.md",
+      "sha256": "09c4a43580338952a0efd207d16e84c8eaec247121f0122f67de77168ca4125e",
+      "source": "agent"
+    },
+    {
+      "path": ".claude/agents/principal-product-engineer.md",
+      "sha256": "d8aa4329f79d5ef50927cb590e75b7fffce86e10a112c61f855aaec90f8c5c2c",
       "source": "agent"
     },
     {
@@ -116,12 +231,27 @@
     },
     {
       "path": ".claude/agents/rea-orchestrator.md",
-      "sha256": "68db87af7f52c00f8c443c2edf15ac345bef4150e85b3d733c5aa6cd74c310eb",
+      "sha256": "93d1d47033e37e9076c818bc147ea05f0b7ceb5950ebf9d8c4c9a0ea011c916f",
+      "source": "agent"
+    },
+    {
+      "path": ".claude/agents/release-captain.md",
+      "sha256": "32c26d70aa5fe5c1107c05bf48bdba0c09edd6cc8b0fb00b9a92255130262b10",
+      "source": "agent"
+    },
+    {
+      "path": ".claude/agents/security-architect.md",
+      "sha256": "7a0528703f8740a53c360fe93f48185da275b5de1bad9dd0a7d940500ffb4777",
       "source": "agent"
     },
     {
       "path": ".claude/agents/security-engineer.md",
       "sha256": "cb06b3a7d526a5250f26ba3c5eb12f79a4440b498628ac91d6bfde4531906a8f",
+      "source": "agent"
+    },
+    {
+      "path": ".claude/agents/shell-scripting-specialist.md",
+      "sha256": "ca87ff80dc51c40249d1d169953a89095d434ebb2ca60cc04f7008adb44d92a0",
       "source": "agent"
     },
     {
@@ -136,12 +266,12 @@
     },
     {
       "path": ".claude/commands/codex-review.md",
-      "sha256": "4d78e6eb9dc287a847091ab32e65480145dbb12fe4cf10f7a5ddc349a0c46ea7",
+      "sha256": "79ec827bcb559d62b87070cf2a2e77b085fd73be888b0783bcf855c26593ad70",
       "source": "command"
     },
     {
       "path": ".claude/commands/freeze.md",
-      "sha256": "dfcad8b0352f82390f336ae62ccc06ccca711a05785c01b94c2cf76dcba5578b",
+      "sha256": "c5297513139fb9213ef1ad65e684484c6c2497ea963e43858f52e2d808ee9bfe",
       "source": "command"
     },
     {
@@ -156,27 +286,32 @@
     },
     {
       "path": ".claude/commands/review.md",
-      "sha256": "9c8a2e2d8bbab0fdff982df95aa0145216d0c958ed34271f9b18b6edc9364174",
+      "sha256": "97b00281a3b674b84d93e1951920f217087e7d9189efb55967863ccdc5a5c1a6",
       "source": "command"
     },
     {
       "path": ".husky/commit-msg",
-      "sha256": "ed152fb17c99606844d162e924bffb0563ad3aee800b1a087ac540cd96e82041",
+      "sha256": "70e9d3b52320f1eca888266de2fbf994de5d4617bb7a9ba814bfd6f9206c5809",
       "source": "husky"
     },
     {
       "path": ".husky/pre-push",
-      "sha256": "5014c585c4af5aa0425fde36441711fa55833e03b81967c45045c5bd716b821e",
+      "sha256": "d2d0a5a9fbc93a7d16dcb8039db96bca20bda507c28f670ff495a44ca5b746ff",
+      "source": "husky"
+    },
+    {
+      "path": ".husky/prepare-commit-msg",
+      "sha256": "15e1fc27d28c3c22f31a015da9a7845f3a517ec766c852b28fad3080f9ee89f6",
       "source": "husky"
     },
     {
       "path": ".claude/settings.json#rea:desired",
-      "sha256": "a8e15ab9b26a6685fc903b6aa57d2b48d23fe444276147df6da5451c18b2c496",
+      "sha256": "004acbc5fceef77876b6a53d78c339967f61011d2f63dffbb4f842e481bb1df1",
       "source": "settings"
     },
     {
       "path": "CLAUDE.md#rea:managed:v1",
-      "sha256": "660bcf243eb6e31939b6d9f60dbe3c2d7214ded1b2967c936326cf2aa6f20051",
+      "sha256": "aac00ceb91d079341566eac2cfa216afdc632a1da4457f60c7d991495fcd5e52",
       "source": "claude-md"
     }
   ]

@@ -52,6 +52,15 @@ shim_cli_missing_relevant() {
     *".rea/policy.yaml"*) return 0 ;;
     *".rea/HALT"*) return 0 ;;
     *".rea/last-review"*) return 0 ;;
+    # 0.54.0 round-34 P1: repository-wide shared enforcement state —
+    # the audit hash chain, TOFU anchors, and their lock sidecars are
+    # cross-root protected in the Node scanner; the CLI-missing
+    # fallback must carry the same markers or an unbuilt worktree
+    # becomes a bypass lane into the primary checkout.
+    *".rea/audit.jsonl"*) return 0 ;;
+    *".rea/fingerprints.json"*) return 0 ;;
+    *".rea/fingerprints.json.lock"*) return 0 ;;
+    *".rea.lock"*) return 0 ;;
     *".claude\\"*|*".husky\\"*|*".rea\\"*) return 0 ;;
     *"..%2F"*|*"%2E%2E"*) return 0 ;;
   esac

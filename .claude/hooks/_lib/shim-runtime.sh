@@ -169,16 +169,54 @@ _shim_apply_defaults() {
 # When neither tier resolves, REA_ARGV stays empty and RESOLVED_CLI_PATH
 # stays empty.
 # -----------------------------------------------------------------------------
+_shim_try_cli_root() {
+  # Attempt the 2-tier in-project resolution against one root. Sets
+  # REA_ARGV / RESOLVED_CLI_PATH / CLI_RESOLVE_ROOT on success.
+  local _r="$1"
+  if [ -f "$_r/node_modules/@bookedsolid/rea/dist/cli/index.js" ]; then
+    REA_ARGV=(node "$_r/node_modules/@bookedsolid/rea/dist/cli/index.js")
+    RESOLVED_CLI_PATH="$_r/node_modules/@bookedsolid/rea/dist/cli/index.js"
+    CLI_RESOLVE_ROOT="$_r"
+    return 0
+  elif [ -f "$_r/dist/cli/index.js" ]; then
+    REA_ARGV=(node "$_r/dist/cli/index.js")
+    RESOLVED_CLI_PATH="$_r/dist/cli/index.js"
+    CLI_RESOLVE_ROOT="$_r"
+    return 0
+  fi
+  return 1
+}
+
 shim_resolve_cli() {
   REA_ARGV=()
   RESOLVED_CLI_PATH=""
-  if [ -f "$proj/node_modules/@bookedsolid/rea/dist/cli/index.js" ]; then
-    REA_ARGV=(node "$proj/node_modules/@bookedsolid/rea/dist/cli/index.js")
-    RESOLVED_CLI_PATH="$proj/node_modules/@bookedsolid/rea/dist/cli/index.js"
-  elif [ -f "$proj/dist/cli/index.js" ]; then
-    REA_ARGV=(node "$proj/dist/cli/index.js")
-    RESOLVED_CLI_PATH="$proj/dist/cli/index.js"
+  CLI_RESOLVE_ROOT="$proj"
+  # Rounds 19+21 (0.54.0 worktree state): the ACCEPTED enforcement root
+  # (REA_ROOT — the worktree the session actually works in) resolves
+  # FIRST, so branch B's hooks run branch B's CLI even when the primary
+  # checkout also has an install; the primary is the fallback for
+  # worktrees without their own node_modules/dist. The sandbox
+  # containment check below runs against CLI_RESOLVE_ROOT — the root
+  # the CLI was actually resolved from — so both tiers get identical
+  # escape/realpath vetting.
+  if [ -n "${REA_ROOT:-}" ] && [ "$REA_ROOT" != "$proj" ] && [ -d "${REA_ROOT}/.rea" ]; then
+    _shim_try_cli_root "$REA_ROOT" && return 0
   fi
+  _shim_try_cli_root "$proj" && return 0
+  # Round-25 P2: after a sibling handoff (worktree A anchor → payload
+  # worktree B) neither B nor A may carry an install when only the
+  # PRIMARY checkout is built — the repository's common root is the
+  # last in-project tier before cli-missing / the global tier.
+  if [ -n "${REA_ROOT:-}" ]; then
+    _shim_common_cli_root=$(rea_common_root "$REA_ROOT")
+    if [ -n "$_shim_common_cli_root" ] \
+       && [ "$_shim_common_cli_root" != "$proj" ] \
+       && [ "$_shim_common_cli_root" != "$REA_ROOT" ] \
+       && [ -d "${_shim_common_cli_root}/.rea" ]; then
+      _shim_try_cli_root "$_shim_common_cli_root" && return 0
+    fi
+  fi
+  return 0
 }
 
 # -----------------------------------------------------------------------------
@@ -448,7 +486,18 @@ shim_resolve_cli_global() {
   # → tier silently unavailable (same terminal as feature-absent).
   command -v node >/dev/null 2>&1 || return 0
   local gate=""
-  gate=$(shim_global_entry_gate "$proj" 2>/dev/null)
+  # Round-22 P1 (0.54.0 worktree state): the trust registry's exact-path
+  # membership check runs against the ACTIVE enforcement root — the
+  # worktree actually executing the hook — not the pinned primary
+  # checkout. A trusted primary must not authorize the global CLI
+  # inside an untrusted worktree, and a worktree trusted via
+  # `rea trust` must not fail closed just because the primary was
+  # never trusted. Mirrors the shim_resolve_cli tier order.
+  local _trust_root="$proj"
+  if [ -n "${REA_ROOT:-}" ] && [ "$REA_ROOT" != "$proj" ] && [ -d "${REA_ROOT}/.rea" ]; then
+    _trust_root="$REA_ROOT"
+  fi
+  gate=$(shim_global_entry_gate "$_trust_root" 2>/dev/null)
   case "$gate" in
     unavailable|"") return 0 ;; # silent A5 / registry / resolve miss
   esac
@@ -634,6 +683,151 @@ shim_default_forward() {
 }
 
 # -----------------------------------------------------------------------------
+# 0.54.0 worktree state — payload-root handoff (round-23 P1: extracted
+# from shim_run so local-review-gate.sh, the one shim that bypasses the
+# orchestrator, applies the SAME guarded ladder). Reads $INPUT; may
+# rewrite REA_ROOT (exported) and proj; exits 2 on a HALT discovered at
+# the accepted root. Call after INPUT is captured and before any
+# policy read or CLI resolution.
+# -----------------------------------------------------------------------------
+# Round-43 P2: canonical directory spelling for same-repo comparisons —
+# /var vs /private/var (macOS) or a symlinked checkout path must not
+# classify a repo's own worktree as foreign. `cd && pwd -P` is the
+# portable realpath; failure keeps the input verbatim.
+_rea_canon_dir() {
+  (cd "$1" 2>/dev/null && pwd -P) || printf '%s' "$1"
+}
+
+shim_worktree_handoff() {
+  # 2b. 0.54.0 worktree state: once the payload is in hand, re-derive
+  #     REA_ROOT from its top-level `cwd` when that resolves to a
+  #     directory that actually carries `.rea/` — the same guarded
+  #     ladder the Node tier uses (`resolveHookRoots`). In a Claude
+  #     worktree session CLAUDE_PROJECT_DIR pins the PRIMARY checkout,
+  #     so without this every bash-tier policy read (policy-read.sh /
+  #     policy-reader.sh honor a pre-set REA_ROOT) would consult the
+  #     wrong worktree's policy. Guards: a REAL JSON parser present
+  #     (round-32 P1: jq → python3 → node — never a regex scrape, which
+  #     an embedded '"cwd":"..."' inside tool_input.command could
+  #     spoof into pointing enforcement at a hostile root), cwd
+  #     non-empty, `.rea/` exists at the resolved root — any miss
+  #     keeps the halt-check-derived REA_ROOT (plain-checkout
+  #     behavior).
+  _payload_cwd=""
+  if command -v jq >/dev/null 2>&1; then
+    _payload_cwd=$(printf '%s' "$INPUT" | jq -r '.cwd // empty' 2>/dev/null || true)
+  elif command -v python3 >/dev/null 2>&1; then
+    _payload_cwd=$(printf '%s' "$INPUT" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    c = d.get("cwd") if isinstance(d, dict) else None
+    sys.stdout.write(c if isinstance(c, str) else "")
+except Exception:
+    pass
+' 2>/dev/null || true)
+  elif command -v node >/dev/null 2>&1; then
+    _payload_cwd=$(printf '%s' "$INPUT" | node -e '
+let raw = "";
+process.stdin.on("data", (c) => { raw += c; });
+process.stdin.on("end", () => {
+  try {
+    const d = JSON.parse(raw);
+    if (d !== null && typeof d === "object" && typeof d.cwd === "string") {
+      process.stdout.write(d.cwd);
+    }
+  } catch {}
+});
+' 2>/dev/null || true)
+  fi
+  if [ -n "$_payload_cwd" ]; then
+    if [ -d "$_payload_cwd" ]; then
+      _payload_root="$_payload_cwd"
+      while [ "$_payload_root" != "/" ]; do
+        if [ -d "${_payload_root}/.rea" ]; then
+          # Round-8 P1: SAME-REPOSITORY pin (mirrors resolveHookRoots).
+          # A payload root from a FOREIGN rea-managed repo must not
+          # replace the session anchor — a `cd` into repo B mid-session
+          # would otherwise enforce B's policy in the pre-CLI
+          # short-circuits and silently disable A's gates. Worktrees of
+          # the same repo share a common root and still qualify.
+          # The pin only applies when the anchor is itself a rea root —
+          # with no rea-rooted anchor the payload IS the session repo
+          # (mirrors the Node ladder's no-anchor acceptance).
+          _stale_anchor=0
+          if [ -d "${REA_ROOT}/.rea" ]; then
+            _anchor_common=$(_rea_canon_dir "$(rea_common_root "$REA_ROOT")")
+            _payload_common=$(_rea_canon_dir "$(rea_common_root "$_payload_root")")
+            if [ "$_payload_common" != "$_anchor_common" ] \
+               && [ "$(_rea_canon_dir "$_payload_root")" != "$(_rea_canon_dir "$REA_ROOT")" ]; then
+              # Round-18 P1: before pinning to the anchor, test whether
+              # the anchor is STALE — a shell that still exports repo
+              # A's REA_ROOT/CLAUDE_PROJECT_DIR while the process is
+              # physically running in the payload's repository. Live
+              # Claude sessions run hooks with cwd = the project dir
+              # (cwd agrees with the anchor), so a physical cwd whose
+              # .rea root shares the payload's common root means the
+              # payload IS the session repo — hand over instead of
+              # enforcing repo A's policy against repo B's files.
+              _phys_root=$(pwd -P 2>/dev/null || pwd)
+              while [ -n "$_phys_root" ] && [ "$_phys_root" != "/" ]; do
+                [ -d "${_phys_root}/.rea" ] && break
+                _phys_root=$(dirname "$_phys_root")
+              done
+              if [ -d "${_phys_root}/.rea" ] \
+                 && [ "$(_rea_canon_dir "$(rea_common_root "$_phys_root")")" = "$_payload_common" ]; then
+                _stale_anchor=1
+              else
+                break
+              fi
+            fi
+            # (The round-9 sibling pin — a worktree-anchored session
+            # keeping its anchor against a SAME-repo sibling payload —
+            # was removed in round-19 P1: relative paths resolve
+            # against the worktree the command physically runs in, so
+            # the payload worktree must win; the anchor's own governed
+            # state stays protected via the sibling cross-root
+            # coverage in the Node scanners.)
+          fi
+          # REA_ROOT (policy reads) follows the payload. `proj` (the
+          # CLI-resolution sandbox) stays on CLAUDE_PROJECT_DIR when the
+          # anchor is a rea repo — the primary checkout may be the only
+          # one with node_modules installed — but when the session had
+          # NO rea-rooted anchor at all (round-15 P2), the payload repo
+          # IS the session root and CLI resolution must search there,
+          # or every shim reports the CLI missing in the exact shape
+          # this handoff supports.
+          if [ ! -d "${REA_ROOT}/.rea" ] || [ "$_stale_anchor" = "1" ]; then
+            proj="$_payload_root"
+          fi
+          REA_ROOT="$_payload_root"
+          # Exported so `rea hook policy-get` (spawned by the policy
+          # readers) resolves the same worktree policy this shim does.
+          export REA_ROOT
+          # Round-4 P2 + round-13 P1: the pre-stdin check_halt derived
+          # its root from CLAUDE_PROJECT_DIR and cannot see a LEGACY
+          # per-worktree HALT — and when the session started OUTSIDE any
+          # .rea root it never probed this repository at all. Re-probe
+          # BOTH the accepted root's local HALT and its repository
+          # (common) HALT.
+          _accepted_common=$(rea_common_root "$REA_ROOT")
+          for _halt_probe in "${REA_ROOT}/.rea/HALT" "${_accepted_common}/.rea/HALT"; do
+            if [ -f "$_halt_probe" ]; then
+              printf 'REA HALT: %s\nAll agent operations suspended. Run: rea unfreeze\n' \
+                "$(head -c 1024 "$_halt_probe" 2>/dev/null || echo 'Reason unknown')" >&2
+              exit 2
+            fi
+            [ "$REA_ROOT" = "$_accepted_common" ] && break
+          done
+          break
+        fi
+        _payload_root=$(dirname "$_payload_root")
+      done
+    fi
+  fi
+}
+
+# -----------------------------------------------------------------------------
 # Main entry point. Reads SHIM_* variables, runs the standard flow.
 # -----------------------------------------------------------------------------
 shim_run() {
@@ -647,6 +841,9 @@ shim_run() {
 
   # 2. Capture stdin once.
   INPUT=$(cat)
+
+  # 2b. Worktree payload-root handoff (shared with local-review-gate.sh).
+  shim_worktree_handoff
 
   # 3. Relevance pre-gate. If the shim defined `shim_is_relevant`, call it.
   if declare -F shim_is_relevant >/dev/null 2>&1; then
@@ -745,7 +942,7 @@ shim_run() {
       node_missing=1
       REA_ARGV=()
     else
-      sandbox_result=$(shim_sandbox_check "$RESOLVED_CLI_PATH" "$proj" "$SHIM_ENFORCE_CLI_SHAPE")
+      sandbox_result=$(shim_sandbox_check "$RESOLVED_CLI_PATH" "${CLI_RESOLVE_ROOT:-$proj}" "$SHIM_ENFORCE_CLI_SHAPE")
       # TOCTOU precursor: shim_sandbox_check now echoes `ok:<realpath>`
       # on success. Execute the VALIDATED realpath instead of the
       # literal RESOLVED_CLI_PATH so the version probe (step 8) and the
