@@ -238,6 +238,7 @@ export async function runSettingsProtection(
   // 3. Normalize.
   let normalized = normalizePath(filePath, reaRoot);
   let crossRootTarget = false;
+  let crossRootUsedPath: string | null = null;
   // 0.54.0 worktree state (review round-4): an absolute target that
   // normalizePath left ABSOLUTE (outside the local root) but that lands
   // INSIDE the COMMON root re-normalizes common-relative, so the
@@ -257,6 +258,7 @@ export async function runSettingsProtection(
         if (resolvedNorm === crossResolved || resolvedNorm.startsWith(crossResolved + path.sep)) {
           normalized = normalizePath(filePath, cross);
           crossRootTarget = true;
+          crossRootUsedPath = cross;
           break;
         }
       }
@@ -411,7 +413,23 @@ export async function runSettingsProtection(
   // protected_writes override and relax describe its own stream and
   // must not loosen another's protection.
   const matchPatterns = crossRootTarget
-    ? [...new Set([...PROTECTED_PATTERNS_FULL, ...KILL_SWITCH_INVARIANTS])]
+    ? [
+        ...new Set([
+          ...PROTECTED_PATTERNS_FULL,
+          ...KILL_SWITCH_INVARIANTS,
+          ...(crossRootUsedPath !== null
+            ? ((): readonly string[] => {
+                const targetPolicy = loadPolicyPermissive(crossRootUsedPath);
+                return resolveProtectedPatterns({
+                  ...(targetPolicy.protectedWrites !== undefined
+                    ? { protectedWrites: targetPolicy.protectedWrites }
+                    : {}),
+                  protectedPathsRelax: targetPolicy.protectedRelax,
+                }).patterns;
+              })()
+            : []),
+        ]),
+      ]
     : resolution.patterns;
   const directHit = matchAny(lowerNorm, matchPatterns);
   if (directHit !== null) {
@@ -437,6 +455,15 @@ export async function runSettingsProtection(
     reaRoot,
     commonRoot,
     siblingRoots,
+    (root) => {
+      const targetPolicy = loadPolicyPermissive(root);
+      return resolveProtectedPatterns({
+        ...(targetPolicy.protectedWrites !== undefined
+          ? { protectedWrites: targetPolicy.protectedWrites }
+          : {}),
+        protectedPathsRelax: targetPolicy.protectedRelax,
+      }).patterns;
+    },
   );
   if (symRefused !== null) {
     writeStderr('SETTINGS PROTECTION: intermediate-symlink resolution blocked\n');
@@ -547,11 +574,13 @@ export async function runSettingsProtection(
  */
 function checkProtectedSymlinkResolution(
   filePath: string,
-  patterns: readonly string[],
+  patternsIn: readonly string[],
   reaRoot: string,
   commonRoot?: string,
   siblingRoots?: readonly string[],
+  patternsForCrossRoot?: (root: string) => readonly string[],
 ): { pattern: string; resolvedTarget: string } | null {
+  let patterns: readonly string[] = patternsIn;
   // Only attempt resolution if the target exists OR its parent dir exists.
   let targetExists = false;
   try {
@@ -583,15 +612,31 @@ function checkProtectedSymlinkResolution(
       ...(siblingRoots ?? []),
     ];
     let matched: string | null = null;
+    let matchedOriginal: string | null = null;
     for (const cross of crossRoots) {
       const canonCross = resolveCanonRoot(cross);
       if (resolvedParent === canonCross || resolvedParent.startsWith(canonCross + '/')) {
         matched = canonCross;
+        matchedOriginal = cross;
         break;
       }
     }
     if (matched === null) return null;
     canonRoot = matched;
+    // Round-12 P2: a cross-root symlink target matches the UN-RELAXED
+    // strict set UNIONed with the TARGET stream's own resolved
+    // protected patterns — the caller's relax never loosens another
+    // stream, and the destination's branch-specific protected_writes
+    // are honored.
+    patterns = [
+      ...new Set([
+        ...PROTECTED_PATTERNS_FULL,
+        ...KILL_SWITCH_INVARIANTS,
+        ...(matchedOriginal !== null && patternsForCrossRoot !== undefined
+          ? patternsForCrossRoot(matchedOriginal)
+          : []),
+      ]),
+    ];
   }
   const relativeResolved =
     resolvedParent === canonRoot ? '' : resolvedParent.slice(canonRoot.length + 1);

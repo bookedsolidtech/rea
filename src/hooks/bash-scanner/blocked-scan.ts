@@ -424,7 +424,15 @@ export function scanForBlockedViolations(
   ctx: BlockedScanContext,
   detections: readonly DetectedWrite[],
 ): Verdict {
-  if (ctx.blockedPaths.length === 0) return allowVerdict();
+  // Round-12 P1: the empty-caller-list early exit only applies when no
+  // CROSS root could contribute its own blocked_paths — a worktree with
+  // `blocked_paths: []` must still refuse writes into a sibling whose
+  // branch blocks the target. Plain checkouts keep the historical exit.
+  const crossLookupPossible =
+    ctx.blockedPathsForRoot !== undefined &&
+    ((ctx.commonRoot !== undefined && ctx.commonRoot !== ctx.reaRoot) ||
+      (ctx.siblingRoots !== undefined && ctx.siblingRoots.length > 0));
+  if (ctx.blockedPaths.length === 0 && !crossLookupPossible) return allowVerdict();
   if (detections.length === 0) return allowVerdict();
   for (const d of detections) {
     if (d.dynamic) {

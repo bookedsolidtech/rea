@@ -59,7 +59,14 @@ export function runBlockedScan(ctx: BlockedScanContext, cmd: string): Verdict {
   if (cmd.trim().length === 0) {
     return { verdict: 'allow' };
   }
-  if (ctx.blockedPaths.length === 0) {
+  // Round-12 P1: with an empty caller list a CROSS root's own
+  // blocked_paths can still match — only skip when no cross lookup is
+  // possible (plain checkouts keep the historical early exit).
+  const crossPossible =
+    ctx.blockedPathsForRoot !== undefined &&
+    ((ctx.commonRoot !== undefined && ctx.commonRoot !== ctx.reaRoot) ||
+      (ctx.siblingRoots !== undefined && ctx.siblingRoots.length > 0));
+  if (ctx.blockedPaths.length === 0 && !crossPossible) {
     return { verdict: 'allow' };
   }
   const parsed = parseBashCommand(cmd);

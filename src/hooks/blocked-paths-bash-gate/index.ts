@@ -166,8 +166,10 @@ export async function runBlockedPathsBashGate(
   // 5. Load policy permissively.
   const blockedPaths = loadBlockedPathsPermissive(reaRoot);
 
-  // 6. Empty list → allow.
-  if (blockedPaths.length === 0) {
+  // 6. Empty list → allow — unless a CROSS root could contribute its
+  //    own blocked_paths (round-12 P1); the scanner's union handles it.
+  const siblingRootsForScan = listSiblingWorktreeRoots(commonRoot, reaRoot);
+  if (blockedPaths.length === 0 && commonRoot === reaRoot && siblingRootsForScan.length === 0) {
     return { exitCode: 0, stderr, verdict: { verdict: 'allow' } };
   }
 
@@ -176,7 +178,7 @@ export async function runBlockedPathsBashGate(
     {
       reaRoot,
       commonRoot,
-      siblingRoots: listSiblingWorktreeRoots(commonRoot, reaRoot),
+      siblingRoots: siblingRootsForScan,
       blockedPaths,
       // Round-11 P1: cross-root targets also honor the TARGET stream's
       // own blocked_paths (union semantics).

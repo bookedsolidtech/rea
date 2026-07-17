@@ -32,6 +32,7 @@ import os from 'node:os';
 import { parse as parseYaml } from 'yaml';
 import { checkHaltRoots, formatHaltBanner } from '../_lib/halt-check.js';
 import { resolveHookRoots, listSiblingWorktreeRoots } from '../../lib/worktree-roots.js';
+import { resolveProtectedPatterns } from '../_lib/protected-paths.js';
 import {
   parseHookPayload,
   MalformedPayloadError,
@@ -199,6 +200,7 @@ export async function runProtectedPathsBashGate(
       // normalization.
       commonRoot,
       siblingRoots: listSiblingWorktreeRoots(commonRoot, reaRoot),
+      protectedPatternsForRoot: protectedPatternsForRootPermissive,
       policy: {
         ...(policy.protectedWrites !== undefined
           ? { protected_writes: policy.protectedWrites }
@@ -237,6 +239,36 @@ export async function runProtectedPathsBashGate(
     return { exitCode: 2, stderr, verdict };
   }
   return { exitCode: 0, stderr, verdict };
+}
+
+
+// Round-12 P2: resolve a TARGET root's own protected pattern set (its
+// protected_writes | invariants, its relax applied). Permissive read —
+// a broken target policy degrades to [] (the strict defaults still
+// apply via the union in the scanner).
+function protectedPatternsForRootPermissive(root: string): readonly string[] {
+  try {
+    const parsed = parseYaml(fs.readFileSync(path.join(root, '.rea', 'policy.yaml'), 'utf8'));
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return [];
+    const rec = parsed as Record<string, unknown>;
+    const writes = Array.isArray(rec['protected_writes'])
+      ? (rec['protected_writes'] as unknown[]).filter(
+          (e): e is string => typeof e === 'string' && e.length > 0,
+        )
+      : undefined;
+    const relax = Array.isArray(rec['protected_paths_relax'])
+      ? (rec['protected_paths_relax'] as unknown[]).filter(
+          (e): e is string => typeof e === 'string' && e.length > 0,
+        )
+      : [];
+    const resolved = resolveProtectedPatterns({
+      ...(writes !== undefined ? { protectedWrites: writes } : {}),
+      protectedPathsRelax: relax,
+    });
+    return resolved.patterns;
+  } catch {
+    return [];
+  }
 }
 
 export async function runHookProtectedPathsBashGate(

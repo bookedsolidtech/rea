@@ -39,6 +39,7 @@ import { parsePrePushStdin, runPushGate } from '../hooks/push-gate/index.js';
 import { runBlockedScan, runProtectedScan, type Verdict } from '../hooks/bash-scanner/index.js';
 import { checkHaltRoots, formatHaltBanner } from '../hooks/_lib/halt-check.js';
 import { resolveHookRoots, resolveReaRoots, resolveCommonRoot, listSiblingWorktreeRoots } from '../lib/worktree-roots.js';
+import { resolveProtectedPatterns } from '../hooks/_lib/protected-paths.js';
 import { runHookPrIssueLinkGate } from '../hooks/pr-issue-link-gate/index.js';
 import { runHookSecurityDisclosureGate } from '../hooks/security-disclosure-gate/index.js';
 import { runHookAttributionAdvisory } from '../hooks/attribution-advisory/index.js';
@@ -344,6 +345,31 @@ export async function runHookScanBash(options: HookScanBashOptions): Promise<voi
           reaRoot,
           commonRoot,
           siblingRoots: listSiblingWorktreeRoots(commonRoot, reaRoot),
+          protectedPatternsForRoot: (root: string): readonly string[] => {
+            try {
+              const parsed = parseYaml(
+                fs.readFileSync(path.join(root, '.rea', 'policy.yaml'), 'utf8'),
+              );
+              if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return [];
+              const rec = parsed as Record<string, unknown>;
+              const writes = Array.isArray(rec['protected_writes'])
+                ? (rec['protected_writes'] as unknown[]).filter(
+                    (e): e is string => typeof e === 'string' && e.length > 0,
+                  )
+                : undefined;
+              const relaxT = Array.isArray(rec['protected_paths_relax'])
+                ? (rec['protected_paths_relax'] as unknown[]).filter(
+                    (e): e is string => typeof e === 'string' && e.length > 0,
+                  )
+                : [];
+              return resolveProtectedPatterns({
+                ...(writes !== undefined ? { protectedWrites: writes } : {}),
+                protectedPathsRelax: relaxT,
+              }).patterns;
+            } catch {
+              return [];
+            }
+          },
           policy: {
             ...(protectedWrites !== undefined ? { protected_writes: protectedWrites } : {}),
             protected_paths_relax: protectedRelax,
