@@ -413,6 +413,16 @@ export async function runBillingCapHalt(
     payloadCwd = payload.cwd;
   } catch (err) {
     if (err instanceof MalformedPayloadError || err instanceof TypePayloadError) {
+      // Round-16 P3: the stdin-first reorder moved the HALT probe after
+      // parsing — an unreadable payload must still honor an ACTIVE
+      // freeze (exit 2 with the shared banner) before the fail-safe
+      // no-op. Roots come from the env ladder (no payload cwd exists).
+      const frozen = resolveHookRoots(undefined, options.reaRoot);
+      const haltState = checkHaltRoots(frozen.localRoot, frozen.commonRoot);
+      if (haltState.halted) {
+        writeStderr(formatHaltBanner(haltState.reason));
+        return { exitCode: 2, stderr, action: 'noop', matched: null, haltWritten: false };
+      }
       writeStderr('billing-cap-halt: payload unreadable; skipping (no freeze on malformed input)\n');
       return { exitCode: 0, stderr, action: 'noop', matched: null, haltWritten: false };
     }

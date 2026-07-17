@@ -184,9 +184,21 @@ export function resolveHookRoots(
     }
   };
 
-  // The SESSION ANCHOR: CLAUDE_PROJECT_DIR (the repo the session was
-  // started for), falling back to process.cwd().
-  const anchor = tryResolve(process.env['CLAUDE_PROJECT_DIR']) ?? tryResolve(process.cwd());
+  // The SESSION ANCHOR: the first of CLAUDE_PROJECT_DIR → process.cwd()
+  // whose root actually carries `.rea/` (round-16 P2: a stale or
+  // non-rea CLAUDE_PROJECT_DIR — a renamed worktree, a direct CLI
+  // invocation from elsewhere — must not eclipse a perfectly good cwd
+  // anchor; the documented ladder falls all the way to cwd). When
+  // NEITHER qualifies, keep the env-first candidate for the historical
+  // no-install fallback below.
+  const envRoots = tryResolve(process.env['CLAUDE_PROJECT_DIR']);
+  const cwdRoots = tryResolve(process.cwd());
+  const anchor =
+    envRoots !== null && hasRea(envRoots)
+      ? envRoots
+      : cwdRoots !== null && hasRea(cwdRoots)
+        ? cwdRoots
+        : (envRoots ?? cwdRoots);
 
   // Payload candidate — accepted only when it (a) carries `.rea/` AND
   // (b) belongs to the SAME REPOSITORY as the session anchor (identical
