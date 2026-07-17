@@ -3,7 +3,8 @@ import { execFileSync } from 'node:child_process';
 import path from 'node:path';
 import * as p from '@clack/prompts';
 import { HALT_FILE, REA_DIR, err, log, reaPath } from './utils.js';
-import { resolveReaRoots } from '../lib/worktree-roots.js';
+import {
+  listSiblingWorktreeRoots, resolveReaRoots } from '../lib/worktree-roots.js';
 
 export interface FreezeOptions {
   reason?: string | undefined;
@@ -91,10 +92,15 @@ export async function runUnfreeze(options: UnfreezeOptions): Promise<void> {
   // with linked worktrees. Bare-repo worktrees degrade to per-worktree
   // isolation at resolution time (commonRoot === localRoot with a .git
   // FILE), and unfreezing one such stream must not resume its siblings.
+  // Round-37 P3: primary detection goes through the gitfile-aware
+  // sibling enumerator — a primary created with --separate-git-dir has
+  // a .git FILE whose real git dir still carries worktrees/, and its
+  // sweep must run. A bare-degenerate worktree (commonRoot === its own
+  // root, gitfile pointing INTO <meta>/worktrees/<name>) enumerates no
+  // siblings and stays per-stream, preserving round-14 P2.
   const sharedKillSwitch =
     roots.isLinkedWorktree ||
-    (fs.existsSync(path.join(roots.commonRoot, '.git', 'worktrees')) &&
-      fs.statSync(path.join(roots.commonRoot, '.git')).isDirectory());
+    listSiblingWorktreeRoots(roots.commonRoot, roots.localRoot).length > 0;
   const worktreeRoots = new Set<string>([roots.commonRoot, roots.localRoot]);
   if (sharedKillSwitch) {
     try {
