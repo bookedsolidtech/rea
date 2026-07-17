@@ -690,6 +690,14 @@ shim_default_forward() {
 # the accepted root. Call after INPUT is captured and before any
 # policy read or CLI resolution.
 # -----------------------------------------------------------------------------
+# Round-43 P2: canonical directory spelling for same-repo comparisons —
+# /var vs /private/var (macOS) or a symlinked checkout path must not
+# classify a repo's own worktree as foreign. `cd && pwd -P` is the
+# portable realpath; failure keeps the input verbatim.
+_rea_canon_dir() {
+  (cd "$1" 2>/dev/null && pwd -P) || printf '%s' "$1"
+}
+
 shim_worktree_handoff() {
   # 2b. 0.54.0 worktree state: once the payload is in hand, re-derive
   #     REA_ROOT from its top-level `cwd` when that resolves to a
@@ -748,10 +756,10 @@ process.stdin.on("end", () => {
           # (mirrors the Node ladder's no-anchor acceptance).
           _stale_anchor=0
           if [ -d "${REA_ROOT}/.rea" ]; then
-            _anchor_common=$(rea_common_root "$REA_ROOT")
-            _payload_common=$(rea_common_root "$_payload_root")
+            _anchor_common=$(_rea_canon_dir "$(rea_common_root "$REA_ROOT")")
+            _payload_common=$(_rea_canon_dir "$(rea_common_root "$_payload_root")")
             if [ "$_payload_common" != "$_anchor_common" ] \
-               && [ "$_payload_root" != "$REA_ROOT" ]; then
+               && [ "$(_rea_canon_dir "$_payload_root")" != "$(_rea_canon_dir "$REA_ROOT")" ]; then
               # Round-18 P1: before pinning to the anchor, test whether
               # the anchor is STALE — a shell that still exports repo
               # A's REA_ROOT/CLAUDE_PROJECT_DIR while the process is
@@ -767,7 +775,7 @@ process.stdin.on("end", () => {
                 _phys_root=$(dirname "$_phys_root")
               done
               if [ -d "${_phys_root}/.rea" ] \
-                 && [ "$(rea_common_root "$_phys_root")" = "$_payload_common" ]; then
+                 && [ "$(_rea_canon_dir "$(rea_common_root "$_phys_root")")" = "$_payload_common" ]; then
                 _stale_anchor=1
               else
                 break

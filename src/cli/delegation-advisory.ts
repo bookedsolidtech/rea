@@ -348,6 +348,19 @@ export function advisoryMessage(count: number, threshold: number): string {
  * Factored out so tests can swap it for a fake controllable scheduler
  * via `HookDelegationAdvisoryOptions.sleepOverride`.
  */
+/**
+ * Round-43 P3: canonical spelling for stream-root equality — a worktree
+ * opened through /var vs /private/var (or any symlinked path) must not
+ * have its own delegation records filtered out as another stream's.
+ */
+function canonDir(dir: string): string {
+  try {
+    return fs.realpathSync(dir);
+  } catch {
+    return path.resolve(dir);
+  }
+}
+
 function realSleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -391,7 +404,7 @@ async function scanForRealDelegationOnce(
     if (
       streamRoot !== undefined &&
       rec.local_root !== undefined &&
-      path.resolve(rec.local_root) !== path.resolve(streamRoot)
+      canonDir(rec.local_root) !== canonDir(streamRoot)
     ) {
       continue;
     }
