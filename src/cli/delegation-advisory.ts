@@ -379,7 +379,10 @@ async function scanForRealDelegationOnce(
     return 'unreadable';
   }
   if (records.length === 0) return 'not-delegated';
-  const roster = discoverRoster(reaRoot);
+  // Round-30 P2: the roster is per-STREAM state — .claude/agents/ can
+  // differ per branch, so discovery reads the local worktree root, not
+  // the common root the audit chain lives at.
+  const roster = discoverRoster(streamRoot ?? reaRoot);
   for (const rec of records) {
     // Round-27 P3: stream scoping — with per-worktree counters, a
     // delegation observed in a SIBLING worktree must not satisfy this
