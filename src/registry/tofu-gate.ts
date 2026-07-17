@@ -101,7 +101,7 @@ export async function applyTofuGate(
   if (lockError !== undefined) {
     log.warn({
       event: 'tofu.store_lock_degraded',
-      message: `fingerprint-store lock degraded (${lockError}) — wrote unlocked`,
+      message: `fingerprint-store lock degraded (${lockError}) — write skipped, will re-persist next run`,
     });
   }
 

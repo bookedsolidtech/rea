@@ -196,6 +196,24 @@ describe('worktree-state integration (real git worktree add)', () => {
       expect(v.verdict, target).toBe('block');
     }
 
+    // Round-44 P1: a SAME-ROOT session IN the primary checkout (which
+    // is the common root, with linked worktrees) must ALSO be blocked
+    // from writing the now-shared audit chain / TOFU anchors — a plain
+    // relative redirect, no cross-root path involved.
+    for (const target of ['.rea/audit.jsonl', '.rea/fingerprints.json', '.rea.lock']) {
+      const v = runProtectedScan(
+        {
+          reaRoot: repo,
+          commonRoot: repo,
+          siblingRoots: [wtA, wtB],
+          policy: { protected_paths_relax: [] },
+          stderr: () => {},
+        },
+        `echo forged > ${target}`,
+      );
+      expect(v.verdict, `same-root ${target}`).toBe('block');
+    }
+
     // Ordinary out-of-repo absolute writes stay allowed (no scope creep).
     const verdict3 = runProtectedScan(
       { reaRoot: wtA, commonRoot: repo, policy: { protected_paths_relax: [] }, stderr: () => {} },

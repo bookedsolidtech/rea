@@ -451,7 +451,13 @@ export async function runSettingsProtection(
             : []),
         ]),
       ]
-    : resolution.patterns;
+    : // Round-44 P1: same-root writes protect the repo-wide shared
+      // state (audit chain / TOFU anchors / lock sidecars) too, but
+      // ONLY when the repo has linked worktrees — otherwise a plain
+      // checkout stays byte-identical.
+      commonRoot !== reaRoot || siblingRoots.length > 0
+      ? [...new Set([...resolution.patterns, ...CROSS_ROOT_SHARED_STATE_PATTERNS])]
+      : resolution.patterns;
   const directHit = matchAny(lowerNorm, matchPatterns);
   if (directHit !== null) {
     writeStderr('SETTINGS PROTECTION: Modification blocked\n');

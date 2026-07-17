@@ -152,15 +152,24 @@ export async function runTofuAccept(options: RunTofuAcceptOptions): Promise<void
       servers: { ...fresh.servers, [server.name]: current },
     };
   });
-  if (lockError !== undefined) {
-    log(`tofu: fingerprint-store lock degraded (${lockError}) — wrote unlocked.`);
-  }
-
   if (stored === current) {
     log(
       `tofu: "${server.name}" already matches stored fingerprint (${current.slice(0, 12)}…) — no change written.`,
     );
     return;
+  }
+
+  // Round-44 P2: on a lock-acquisition failure the store was NOT
+  // persisted (the helper no longer writes unlocked). Report the accept
+  // as unapplied and exit non-zero — do NOT emit a `tofu.*_accepted`
+  // audit record claiming a durable change that did not land. The
+  // operator retries once the lock clears (stale-steal makes this rare).
+  if (lockError !== undefined) {
+    err(
+      `tofu: could not acquire the fingerprint-store lock (${lockError}) — "${server.name}" was NOT accepted. ` +
+        `Retry \`rea tofu accept ${server.name}\`; if it persists, ensure no stuck \`.rea/fingerprints.json.lock\`.`,
+    );
+    process.exit(2);
   }
 
   const event =

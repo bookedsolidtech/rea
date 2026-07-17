@@ -230,6 +230,25 @@ export function computeEffectivePatterns(ctx: ProtectedScanContext): EffectivePa
     }
   }
 
+  // Round-44 P1: repository-wide SHARED enforcement state (the audit
+  // hash chain, TOFU anchors, and their lock sidecars, at the COMMON
+  // root) must be protected on SAME-ROOT writes too once the repo has
+  // linked worktrees — a session in the primary checkout takes the
+  // same-root path, and without this it could forge/wipe the chain for
+  // every stream. Appended AFTER relax so it is un-relaxable (these are
+  // integrity invariants when shared), and ONLY when worktrees exist,
+  // so a plain checkout stays byte-identical to pre-0.54.0.
+  const hasWorktrees =
+    (ctx.commonRoot !== undefined && ctx.commonRoot !== ctx.reaRoot) ||
+    (ctx.siblingRoots?.length ?? 0) > 0;
+  if (hasWorktrees) {
+    for (const pat of CROSS_ROOT_SHARED_STATE_PATTERNS) {
+      if (!effective.some((e) => e.toLowerCase() === pat.toLowerCase())) {
+        effective.push(pat);
+      }
+    }
+  }
+
   return { full: effective, override };
 }
 

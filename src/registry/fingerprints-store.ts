@@ -70,13 +70,15 @@ export type FingerprintStore = z.infer<typeof FingerprintStoreSchema>;
  * STORE PATH (its own `<store>.lock` sidecar — deliberately NOT the
  * `.rea/` directory, which is the audit chain's lock target; both TOFU
  * mutation sites also append audit records, so sharing that target
- * would deadlock). Bounded acquisition; failure degrades to the
- * unlocked path (a stuck lockfile must not brick trust decisions) with
- * the error surfaced to the caller.
+ * would deadlock). Generous bounded acquisition (retry + stale-steal),
+ * so contention always serializes; on a genuine lock-infrastructure
+ * failure the mutate still runs (fail-loud side effects) but the write
+ * is SKIPPED rather than performed unlocked — the caller sees
+ * `lockError` and the record re-persists on the next run (round-44 P2).
  */
 const STORE_LOCK_OPTIONS: Parameters<typeof properLockfile.lock>[1] = {
   stale: 5_000,
-  retries: { retries: 8, factor: 1.5, minTimeout: 10, maxTimeout: 150, randomize: true },
+  retries: { retries: 20, factor: 1.4, minTimeout: 10, maxTimeout: 200, randomize: true },
   realpath: false,
 };
 
@@ -102,8 +104,20 @@ export async function updateFingerprintStore(
   try {
     const store = await loadFingerprintStore(baseDir);
     const next = await mutate(store);
+    // Round-44 P2: NEVER persist the shared common-root store unlocked.
+    // The `mutate` still ran (its side effects — TOFU first-seen/drift
+    // banners + audit records — fire fail-loud per round-32), but on a
+    // lock-acquisition failure we SKIP the write rather than clobber a
+    // concurrent locked writer's read-modify-write. With the generous
+    // retry budget + stale-steal above, contention always serializes;
+    // this path is reached only on a genuine lock-infrastructure
+    // failure, where the record is simply re-emitted and re-persisted
+    // on the next run (a re-prompt, never a silent trust downgrade).
+    if (lockError !== undefined) {
+      return { store: next, lockError };
+    }
     await saveFingerprintStore(baseDir, next);
-    return lockError !== undefined ? { store: next, lockError } : { store: next };
+    return { store: next };
   } finally {
     if (release !== null) {
       try {
