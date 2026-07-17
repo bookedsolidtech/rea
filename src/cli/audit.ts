@@ -12,6 +12,7 @@
  */
 
 import fs from 'node:fs/promises';
+import { resolveReaRoots } from '../lib/worktree-roots.js';
 import path from 'node:path';
 import { forceRotate } from '../gateway/audit/rotator.js';
 import { computeHash, GENESIS_HASH } from '../audit/fs.js';
@@ -42,7 +43,8 @@ export interface AuditVerifyOptions {
  * rotation marker with no meaningful predecessor.
  */
 export async function runAuditRotate(_options: AuditRotateOptions): Promise<void> {
-  const baseDir = process.cwd();
+  // 0.54.0: the audit chain is per-repository — operate on the common root.
+  const baseDir = resolveReaRoots(process.cwd()).commonRoot;
   const auditFile = reaPath(baseDir, AUDIT_FILE);
 
   let exists = true;
@@ -245,7 +247,8 @@ async function listRotatedFiles(reaDir: string): Promise<string[]> {
  * exit code is the primary signal.
  */
 export async function runAuditVerify(options: AuditVerifyOptions): Promise<void> {
-  const baseDir = process.cwd();
+  // 0.54.0: the audit chain is per-repository — operate on the common root.
+  const baseDir = resolveReaRoots(process.cwd()).commonRoot;
   const reaDir = path.join(baseDir, REA_DIR);
   const currentAudit = path.join(reaDir, AUDIT_FILE);
 

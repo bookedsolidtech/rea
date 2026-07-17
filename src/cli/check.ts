@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import { loadPolicy } from '../policy/loader.js';
+import { resolveReaRoots } from '../lib/worktree-roots.js';
 import {
   AUDIT_FILE,
   HALT_FILE,
@@ -23,10 +24,14 @@ function readLastLines(filePath: string, n: number): string[] {
 }
 
 export function runCheck(): void {
-  const baseDir = process.cwd();
+  // 0.54.0 worktree state: policy is per-worktree (checked in); the
+  // HALT probe covers both roots (repo-wide kill switch); the audit
+  // chain lives at the common root. Degenerate in plain checkouts.
+  const { localRoot: baseDir, commonRoot } = resolveReaRoots(process.cwd());
   const policyPath = reaPath(baseDir, POLICY_FILE);
-  const haltPath = reaPath(baseDir, HALT_FILE);
-  const auditPath = reaPath(baseDir, AUDIT_FILE);
+  const localHaltPath = reaPath(baseDir, HALT_FILE);
+  const haltPath = fs.existsSync(localHaltPath) ? localHaltPath : reaPath(commonRoot, HALT_FILE);
+  const auditPath = reaPath(commonRoot, AUDIT_FILE);
 
   if (!fs.existsSync(policyPath)) {
     exitWithMissingPolicy(policyPath);

@@ -648,6 +648,34 @@ shim_run() {
   # 2. Capture stdin once.
   INPUT=$(cat)
 
+  # 2b. 0.54.0 worktree state: once the payload is in hand, re-derive
+  #     REA_ROOT from its top-level `cwd` when that resolves to a
+  #     directory that actually carries `.rea/` — the same guarded
+  #     ladder the Node tier uses (`resolveHookRoots`). In a Claude
+  #     worktree session CLAUDE_PROJECT_DIR pins the PRIMARY checkout,
+  #     so without this every bash-tier policy read (policy-read.sh /
+  #     policy-reader.sh honor a pre-set REA_ROOT) would consult the
+  #     wrong worktree's policy. Guards: jq present, cwd non-empty,
+  #     `.rea/` exists at the resolved root — any miss keeps the
+  #     halt-check-derived REA_ROOT (plain-checkout behavior).
+  if command -v jq >/dev/null 2>&1; then
+    _payload_cwd=$(printf '%s' "$INPUT" | jq -r '.cwd // empty' 2>/dev/null || true)
+    if [ -n "$_payload_cwd" ] && [ -d "$_payload_cwd" ]; then
+      _payload_root="$_payload_cwd"
+      while [ "$_payload_root" != "/" ]; do
+        if [ -d "${_payload_root}/.rea" ]; then
+          # Only REA_ROOT (policy reads) follows the payload; `proj`
+          # (the CLI-resolution sandbox) stays on CLAUDE_PROJECT_DIR —
+          # the primary checkout may be the only one with node_modules
+          # installed, and the CLI binary is version-identical anyway.
+          REA_ROOT="$_payload_root"
+          break
+        fi
+        _payload_root=$(dirname "$_payload_root")
+      done
+    fi
+  fi
+
   # 3. Relevance pre-gate. If the shim defined `shim_is_relevant`, call it.
   if declare -F shim_is_relevant >/dev/null 2>&1; then
     if ! shim_is_relevant; then

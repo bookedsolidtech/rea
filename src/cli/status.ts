@@ -40,6 +40,7 @@
  */
 
 import fs from 'node:fs';
+import { resolveCommonRoot } from '../lib/worktree-roots.js';
 import { loadPolicy } from '../policy/loader.js';
 import {
   AUDIT_FILE,
@@ -430,13 +431,18 @@ function summarizeAudit(baseDir: string): AuditStats {
  * pretty outputs stay in lockstep.
  */
 export function computeStatusPayload(baseDir: string): StatusPayload {
+  // 0.54.0 worktree state: policy + serve pid/state are per-worktree;
+  // the HALT probe covers both roots and the audit summary reads the
+  // repository chain at the common root. Degenerate in plain checkouts.
+  const commonRoot = resolveCommonRoot(baseDir, () => {}).commonRoot;
   const policyPath = reaPath(baseDir, POLICY_FILE);
   if (!fs.existsSync(policyPath)) {
     exitWithMissingPolicy(policyPath);
   }
 
   const policy = loadPolicy(baseDir);
-  const haltPath = reaPath(baseDir, HALT_FILE);
+  const localHaltPath = reaPath(baseDir, HALT_FILE);
+  const haltPath = fs.existsSync(localHaltPath) ? localHaltPath : reaPath(commonRoot, HALT_FILE);
   const haltActive = fs.existsSync(haltPath);
   let haltReason: string | null = null;
   if (haltActive) {
@@ -458,7 +464,7 @@ export function computeStatusPayload(baseDir: string): StatusPayload {
       halt_active: haltActive,
       halt_reason: haltReason,
     },
-    audit: summarizeAudit(baseDir),
+    audit: summarizeAudit(commonRoot),
   };
 }
 

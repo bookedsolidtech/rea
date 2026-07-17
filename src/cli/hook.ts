@@ -38,7 +38,7 @@ import { parse as parseYaml } from 'yaml';
 import { parsePrePushStdin, runPushGate } from '../hooks/push-gate/index.js';
 import { runBlockedScan, runProtectedScan, type Verdict } from '../hooks/bash-scanner/index.js';
 import { checkHaltRoots, formatHaltBanner } from '../hooks/_lib/halt-check.js';
-import { resolveHookRoots, resolveReaRoots } from '../lib/worktree-roots.js';
+import { resolveHookRoots, resolveReaRoots, resolveCommonRoot } from '../lib/worktree-roots.js';
 import { runHookPrIssueLinkGate } from '../hooks/pr-issue-link-gate/index.js';
 import { runHookSecurityDisclosureGate } from '../hooks/security-disclosure-gate/index.js';
 import { runHookAttributionAdvisory } from '../hooks/attribution-advisory/index.js';
@@ -354,7 +354,7 @@ export async function runHookScanBash(options: HookScanBashOptions): Promise<voi
   // captures every scan-bash invocation. Best-effort — failure to
   // write an audit entry must NOT change the verdict.
   try {
-    await appendAuditRecord(reaRoot, {
+    await appendAuditRecord(commonRoot, {
       tool_name: 'rea.hook.scan-bash',
       server_name: 'rea',
       tier: Tier.Read,
@@ -771,7 +771,9 @@ export async function runHookCodexReview(options: HookCodexReviewOptions): Promi
                 : 'unknown';
     let auditHash = '';
     try {
-      const record = await appendAuditRecord(baseDir, {
+      // 0.54.0: codex.review coverage lands on the REPOSITORY chain so
+      // preflight in any worktree sees it.
+      const record = await appendAuditRecord(resolveCommonRoot(baseDir).commonRoot, {
         tool_name: CODEX_REVIEW_TOOL_NAME,
         server_name: CODEX_REVIEW_SERVER_NAME,
         status: InvocationStatus.Error,
@@ -839,7 +841,7 @@ export async function runHookCodexReview(options: HookCodexReviewOptions): Promi
 
   let auditHash = '';
   try {
-    const record = await appendAuditRecord(baseDir, {
+    const record = await appendAuditRecord(resolveCommonRoot(baseDir).commonRoot, {
       tool_name: CODEX_REVIEW_TOOL_NAME,
       server_name: CODEX_REVIEW_SERVER_NAME,
       status: verdict === 'blocking' ? InvocationStatus.Denied : InvocationStatus.Allowed,
