@@ -203,6 +203,19 @@ shim_resolve_cli() {
     _shim_try_cli_root "$REA_ROOT" && return 0
   fi
   _shim_try_cli_root "$proj" && return 0
+  # Round-25 P2: after a sibling handoff (worktree A anchor → payload
+  # worktree B) neither B nor A may carry an install when only the
+  # PRIMARY checkout is built — the repository's common root is the
+  # last in-project tier before cli-missing / the global tier.
+  if [ -n "${REA_ROOT:-}" ]; then
+    _shim_common_cli_root=$(rea_common_root "$REA_ROOT")
+    if [ -n "$_shim_common_cli_root" ] \
+       && [ "$_shim_common_cli_root" != "$proj" ] \
+       && [ "$_shim_common_cli_root" != "$REA_ROOT" ] \
+       && [ -d "${_shim_common_cli_root}/.rea" ]; then
+      _shim_try_cli_root "$_shim_common_cli_root" && return 0
+    fi
+  fi
   return 0
 }
 

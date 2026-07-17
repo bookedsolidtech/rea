@@ -4,7 +4,8 @@ import fs from 'node:fs';
 import fsPromises from 'node:fs/promises';
 import path from 'node:path';
 import { loadPolicy } from '../policy/loader.js';
-import { resolveReaRoots } from '../lib/worktree-roots.js';
+import {
+  listSiblingWorktreeRoots, resolveReaRoots } from '../lib/worktree-roots.js';
 import { loadRegistry } from '../registry/loader.js';
 import { loadFingerprintStore } from '../registry/fingerprints-store.js';
 import { fingerprintServer } from '../registry/fingerprint.js';
@@ -3314,7 +3315,29 @@ export function checkGlobalCli(
  */
 function checkWorktreeTopology(baseDir: string): CheckResult {
   const roots = resolveReaRoots(baseDir, () => {});
+  const ORPHAN_FILES = ['audit.jsonl', 'HALT', 'last-review.cache.json', 'fingerprints.json'];
   if (!roots.isLinkedWorktree) {
+    // Round-25 P3: the PRIMARY checkout inspects its linked siblings
+    // too — stale pre-0.54.0 per-worktree state is exactly what an
+    // operator running doctor from the main worktree needs surfaced.
+    const siblingOrphans: string[] = [];
+    for (const sibling of listSiblingWorktreeRoots(roots.commonRoot, roots.localRoot)) {
+      for (const f of ORPHAN_FILES) {
+        if (fs.existsSync(path.join(sibling, REA_DIR, f))) {
+          siblingOrphans.push(`${sibling}: ${f}`);
+        }
+      }
+    }
+    if (siblingOrphans.length > 0) {
+      return {
+        label: 'worktree topology',
+        status: 'warn',
+        detail:
+          `primary checkout — ORPHANED pre-0.54.0 state in linked worktree(s): ` +
+          `${siblingOrphans.join('; ')}. Shared enforcement reads this root; re-run ` +
+          `\`rea review\` in the affected stream(s) and remove the stale files.`,
+      };
+    }
     return {
       label: 'worktree topology',
       status: 'info',
@@ -3322,7 +3345,7 @@ function checkWorktreeTopology(baseDir: string): CheckResult {
     };
   }
   const orphans: string[] = [];
-  for (const f of ['audit.jsonl', 'HALT', 'last-review.cache.json', 'fingerprints.json']) {
+  for (const f of ORPHAN_FILES) {
     if (fs.existsSync(path.join(roots.localRoot, REA_DIR, f))) orphans.push(f);
   }
   if (orphans.length > 0) {
