@@ -549,17 +549,20 @@ export async function runPushGate(deps: PushGateDeps): Promise<GateResult> {
       let localVerdict: string | null = null;
       let localBaseRef: string | null = null;
       let localFindingCount: number | null = null;
+      let localReviewText: string | null = null;
       try {
         const parsed = JSON.parse(fsSync.readFileSync(localSnapshotPath, 'utf8')) as {
           head_sha?: unknown;
           verdict?: unknown;
           base_ref?: unknown;
           finding_count?: unknown;
+          review_text?: unknown;
         };
         if (typeof parsed.head_sha === 'string') localSha = parsed.head_sha;
         if (typeof parsed.verdict === 'string') localVerdict = parsed.verdict;
         if (typeof parsed.base_ref === 'string') localBaseRef = parsed.base_ref;
         if (typeof parsed.finding_count === 'number') localFindingCount = parsed.finding_count;
+        if (typeof parsed.review_text === 'string') localReviewText = parsed.review_text;
       } catch {
         /* absent or unreadable → refresh */
       }
@@ -569,11 +572,23 @@ export async function runPushGate(deps: PushGateDeps): Promise<GateResult> {
       // different base's entry; the local snapshot must describe the
       // result the gate actually returned. Plain checkouts still skip
       // (their full snapshot matches on every axis).
+      // Round-40 P2: review-TEXT identity too — a same-verdict,
+      // same-count re-review with different bodies must still refresh.
+      // Tolerant match: a full snapshot equals the cached text exactly
+      // (the entry was written from the same payload), and a previous
+      // cache-derived snapshot carries it after a provenance header —
+      // both count as current, so plain checkouts and repeat hits skip.
+      const reviewTextCurrent =
+        cached.review_text === undefined ||
+        (localReviewText !== null &&
+          (localReviewText === cached.review_text ||
+            localReviewText.endsWith(cached.review_text)));
       if (
         localSha !== headSha ||
         localVerdict !== cached.verdict ||
         localBaseRef !== base.ref ||
-        localFindingCount !== cached.finding_count
+        localFindingCount !== cached.finding_count ||
+        !reviewTextCurrent
       ) {
         writeLastReviewFromCache({
           baseDir: deps.baseDir,

@@ -137,24 +137,30 @@ export async function runTofuAccept(options: RunTofuAcceptOptions): Promise<void
   }
 
   const current = fingerprintServer(server);
-  const store = await loadFingerprintStore(commonRoot);
-  const stored = store.servers[server.name];
+
+  // Rounds 14+40: BOTH the no-op decision and the audit metadata derive
+  // from the fresh read taken UNDER the store lock — a concurrent
+  // accept/serve from another worktree could otherwise make this call
+  // log a stale stored_fingerprint (or the wrong event type), or
+  // report "already matches" against an out-of-date snapshot.
+  let stored: string | undefined;
+  const { lockError } = await updateFingerprintStore(commonRoot, (fresh) => {
+    stored = fresh.servers[server.name];
+    if (stored === current) return fresh; // no-op — write back unchanged
+    return {
+      version: FINGERPRINT_STORE_VERSION as typeof FINGERPRINT_STORE_VERSION,
+      servers: { ...fresh.servers, [server.name]: current },
+    };
+  });
+  if (lockError !== undefined) {
+    log(`tofu: fingerprint-store lock degraded (${lockError}) — wrote unlocked.`);
+  }
 
   if (stored === current) {
     log(
       `tofu: "${server.name}" already matches stored fingerprint (${current.slice(0, 12)}…) — no change written.`,
     );
     return;
-  }
-
-  // Round-14 P1: merge-write under the store lock so a concurrent
-  // accept/serve from another worktree is not last-writer-wins dropped.
-  const { lockError } = await updateFingerprintStore(commonRoot, (fresh) => ({
-    version: FINGERPRINT_STORE_VERSION as typeof FINGERPRINT_STORE_VERSION,
-    servers: { ...fresh.servers, [server.name]: current },
-  }));
-  if (lockError !== undefined) {
-    log(`tofu: fingerprint-store lock degraded (${lockError}) — wrote unlocked.`);
   }
 
   const event =
