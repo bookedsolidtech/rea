@@ -111,6 +111,40 @@ describe('resolveCommonRoot — the .git discriminator', () => {
     expect(roots.isLinkedWorktree).toBe(false);
   });
 
+  it('separate-git-dir checkout: LOUD documented degrade (round-33 P2)', () => {
+    // git init --separate-git-dir keeps the metadata OUTSIDE the
+    // checkout, and git records NO back-pointer from the metadata dir
+    // to the primary checkout (worktree list reports the metadata
+    // path; core.worktree stays unset; no gitdir file). The primary is
+    // genuinely undiscoverable from a linked worktree, so rea degrades
+    // to per-worktree state WITH an advisory — never silently.
+    const meta = path.join(scratch, 'meta.git');
+    const primary = path.join(scratch, 'sgd-primary');
+    fs.mkdirSync(primary, { recursive: true });
+    execFileSync('git', ['init', '-q', `--separate-git-dir=${meta}`, primary], {
+      encoding: 'utf8',
+    });
+    git(primary, 'config', 'user.email', 't@t');
+    git(primary, 'config', 'user.name', 't');
+    fs.mkdirSync(path.join(primary, '.rea'), { recursive: true });
+    fs.writeFileSync(path.join(primary, '.rea', 'policy.yaml'), 'version: "1"\n');
+    git(primary, 'add', '-A');
+    git(primary, 'commit', '-q', '-m', 'init', '--no-gpg-sign');
+    const wt = path.join(scratch, 'sgd-wt');
+    git(primary, 'worktree', 'add', '-q', wt, '-b', 'sgd-branch');
+    const advisories: string[] = [];
+    const r = resolveCommonRoot(wt, (m) => advisories.push(m));
+    // If a future git ever exposes the primary here, the main-worktree
+    // fallback upgrades this to shared state automatically — either
+    // outcome is sound; silence + split state is the only failure.
+    if (r.isLinkedWorktree) {
+      expect(r.commonRoot).toBe(primary);
+    } else {
+      expect(r.commonRoot).toBe(wt);
+      expect(advisories.join('')).toMatch(/separate-git-dir/);
+    }
+  });
+
   it('bare-host edge: common parent without a checkout → degenerate + advisory', () => {
     // A worktree of a BARE repo: git init --bare, then worktree add.
     const bare = path.join(scratch, 'store.git');
@@ -126,7 +160,7 @@ describe('resolveCommonRoot — the .git discriminator', () => {
     // dirname(common dir) = scratch — no .rea/, no .git/ → degenerate.
     expect(r.isLinkedWorktree).toBe(false);
     expect(r.commonRoot).toBe(wt);
-    expect(advisories.join('')).toMatch(/bare repository/);
+    expect(advisories.join('')).toMatch(/bare or separate-git-dir/);
   });
 });
 

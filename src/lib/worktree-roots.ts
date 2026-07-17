@@ -123,17 +123,49 @@ export function resolveCommonRoot(
   if (path.resolve(candidate) === path.resolve(localRoot)) return degenerate;
 
   // Bare-repo edge: the common dir's parent is not a checkout (no
-  // `.rea/`, no `.git/`) — there is nowhere sane to anchor shared
-  // state, so stay per-worktree and say so once.
+  // `.rea/`, no `.git/`) — but before degrading, try the MAIN worktree
+  // from `git worktree list` (round-33 P2: a gitfile checkout created
+  // with `--separate-git-dir` keeps its metadata OUTSIDE the primary
+  // checkout, so dirname(commonDir) is the external metadata parent,
+  // not the checkout root; git's first listed worktree IS the main
+  // one). Only when no main worktree resolves either (true bare host)
+  // do we stay per-worktree and say so once.
   const looksLikeCheckout =
     fs.existsSync(path.join(candidate, '.rea')) || fs.existsSync(path.join(candidate, '.git'));
   if (!looksLikeCheckout) {
+    const mainWorktree = firstListedWorktree(localRoot);
+    if (
+      mainWorktree !== null &&
+      path.resolve(mainWorktree) !== path.resolve(localRoot) &&
+      (fs.existsSync(path.join(mainWorktree, '.rea')) ||
+        fs.existsSync(path.join(mainWorktree, '.git')))
+    ) {
+      return { commonRoot: path.resolve(mainWorktree), isLinkedWorktree: true };
+    }
     stderrWrite(
-      `rea: linked worktree of a bare repository — shared .rea state unavailable, using per-worktree state at ${localRoot}\n`,
+      `rea: linked worktree of a bare or separate-git-dir repository — the primary ` +
+        `checkout is not discoverable from here (git records no back-pointer), so ` +
+        `shared .rea state is unavailable; using per-worktree state at ${localRoot}\n`,
     );
     return degenerate;
   }
   return { commonRoot: candidate, isLinkedWorktree: true };
+}
+
+/**
+ * The FIRST `worktree ` entry of `git worktree list --porcelain` — the
+ * main worktree per git's documented ordering. Used only on the
+ * separate-git-dir fallback path; failure returns null.
+ */
+function firstListedWorktree(cwd: string): string | null {
+  const out = tryGit(cwd, ['worktree', 'list', '--porcelain']);
+  for (const line of out.split('\n')) {
+    if (line.startsWith('worktree ')) {
+      const root = line.slice('worktree '.length).trim();
+      return root.length > 0 ? root : null;
+    }
+  }
+  return null;
 }
 
 /** Compose local + common resolution from a starting directory. */
