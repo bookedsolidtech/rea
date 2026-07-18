@@ -47,7 +47,7 @@ import type { Buffer } from 'node:buffer';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { checkHaltRoots, formatHaltBanner } from '../_lib/halt-check.js';
-import { resolveHookRoots } from '../../lib/worktree-roots.js';
+import { resolveHookRoots, listSiblingWorktreeRoots } from '../../lib/worktree-roots.js';
 import {
   parseWriteHookPayload,
   MalformedPayloadError,
@@ -144,9 +144,21 @@ function resolvesToTasksJsonl(
   filePath: string,
 ): boolean {
   if (filePath.length === 0) return false;
-  const roots = commonRoot.length > 0 && commonRoot !== reaRoot ? [reaRoot, commonRoot] : [reaRoot];
+  // Round-27 P1: the store set spans the LOCAL worktree, the COMMON (primary
+  // checkout) root, AND every SIBLING worktree of the same repository — the
+  // same enumeration the bash-tier G2 gate and the path guards use
+  // (`listSiblingWorktreeRoots(commonRoot, reaRoot)`). Without siblings, a
+  // Write to another stream's `<sibling>/.rea/tasks.jsonl` skipped G2 entirely.
+  // Siblings are worktrees of THIS repo's commonRoot, so cross-repo isolation
+  // (round-26) holds: a FOREIGN repo is not a sibling and never enters the set.
+  const roots = [
+    reaRoot,
+    ...(commonRoot.length > 0 && commonRoot !== reaRoot ? [commonRoot] : []),
+    ...(commonRoot.length > 0 ? listSiblingWorktreeRoots(commonRoot, reaRoot) : []),
+  ];
   const storeCanons: string[] = [];
   for (const root of roots) {
+    // Fail-safe: a sibling that can't be resolved yields null and is skipped.
     const c = canonicalizePath(path.resolve(root, TASKS_RELATIVE));
     if (c !== null) storeCanons.push(c);
   }

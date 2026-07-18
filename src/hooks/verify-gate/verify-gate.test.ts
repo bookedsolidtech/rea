@@ -3,6 +3,7 @@
  * deterministic completion detector.
  */
 
+import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -419,5 +420,92 @@ describe('runVerifyGate', () => {
       }),
     });
     expect(r.exitCode).toBe(2);
+  });
+
+  // ── Round-27 P1 — sibling worktree governance ────────────────────────────
+  // Two linked worktrees of one primary. From worktree A's gate, a
+  // completed-without-evidence Write to worktree B's store must be governed
+  // (siblings share commonRoot) — while a truly foreign repo stays ungoverned.
+  function git(repo: string, ...args: string[]): void {
+    execFileSync('git', ['-C', repo, ...args], { stdio: 'ignore' });
+  }
+
+  it('P1: a Write to a SIBLING worktree store under worktree A enforce → exit 2 (governed)', async () => {
+    const primary = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'rea-vg-primary-')));
+    const wtA = `${primary}-A`;
+    const wtB = `${primary}-B`;
+    try {
+      execFileSync('git', ['init', '-q', primary], { stdio: 'ignore' });
+      git(primary, 'config', 'user.email', 't@t');
+      git(primary, 'config', 'user.name', 't');
+      git(primary, 'config', 'commit.gpgsign', 'false');
+      git(primary, 'commit', '-q', '--allow-empty', '-m', 'init');
+      git(primary, 'worktree', 'add', '-q', wtA, '-b', 'stream-a');
+      git(primary, 'worktree', 'add', '-q', wtB, '-b', 'stream-b');
+
+      // Gate is rooted at worktree A (enforce); worktree B has its own store.
+      writePolicy(wtA, 'enforce');
+      fs.mkdirSync(path.join(wtB, '.rea'), { recursive: true });
+      fs.writeFileSync(path.join(wtB, '.rea', 'tasks.jsonl'), ''); // B's real store
+
+      const r = await runVerifyGate({
+        reaRoot: wtA, // local = A, common = primary, siblings include B
+        stdinOverride: writePayload({
+          filePath: path.join(wtB, '.rea', 'tasks.jsonl'),
+          content: COMPLETED_NO_EVIDENCE,
+        }),
+      });
+      expect(r.exitCode).toBe(2);
+    } finally {
+      fs.rmSync(wtA, { recursive: true, force: true });
+      fs.rmSync(wtB, { recursive: true, force: true });
+      fs.rmSync(primary, { recursive: true, force: true });
+    }
+  });
+
+  it('P1 + P2 together: sibling store → governed (2), FOREIGN repo store → NOT governed (0)', async () => {
+    const primary = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'rea-vg-primary2-')));
+    const wtA = `${primary}-A`;
+    const wtB = `${primary}-B`;
+    const foreign = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'rea-vg-foreign-')));
+    try {
+      execFileSync('git', ['init', '-q', primary], { stdio: 'ignore' });
+      git(primary, 'config', 'user.email', 't@t');
+      git(primary, 'config', 'user.name', 't');
+      git(primary, 'config', 'commit.gpgsign', 'false');
+      git(primary, 'commit', '-q', '--allow-empty', '-m', 'init');
+      git(primary, 'worktree', 'add', '-q', wtA, '-b', 's-a');
+      git(primary, 'worktree', 'add', '-q', wtB, '-b', 's-b');
+      writePolicy(wtA, 'enforce');
+      fs.mkdirSync(path.join(wtB, '.rea'), { recursive: true });
+      fs.writeFileSync(path.join(wtB, '.rea', 'tasks.jsonl'), '');
+      // A separate git repo (NOT a worktree of primary) with its own store.
+      execFileSync('git', ['init', '-q', foreign], { stdio: 'ignore' });
+      fs.mkdirSync(path.join(foreign, '.rea'), { recursive: true });
+      fs.writeFileSync(path.join(foreign, '.rea', 'tasks.jsonl'), '');
+
+      const sibling = await runVerifyGate({
+        reaRoot: wtA,
+        stdinOverride: writePayload({
+          filePath: path.join(wtB, '.rea', 'tasks.jsonl'),
+          content: COMPLETED_NO_EVIDENCE,
+        }),
+      });
+      expect(sibling.exitCode).toBe(2); // sibling governed
+
+      const foreignRes = await runVerifyGate({
+        reaRoot: wtA,
+        stdinOverride: writePayload({
+          filePath: path.join(foreign, '.rea', 'tasks.jsonl'),
+          content: COMPLETED_NO_EVIDENCE,
+        }),
+      });
+      expect(foreignRes.exitCode).toBe(0); // foreign NOT governed (isolation holds)
+    } finally {
+      fs.rmSync(wtA, { recursive: true, force: true });
+      fs.rmSync(wtB, { recursive: true, force: true });
+      fs.rmSync(primary, { recursive: true, force: true });
+      fs.rmSync(foreign, { recursive: true, force: true });
+    }
   });
 });
