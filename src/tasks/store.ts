@@ -160,6 +160,42 @@ export function appendTask(baseDir: string, record: TaskRecord): void {
 }
 
 /**
+ * Transactional read-modify-write (round-7 P1). Acquires the `.rea/` lock
+ * ONCE, reads the folded task list INSIDE the lock, calls `mutate` with it,
+ * validates + appends whatever records `mutate` returns, fsyncs, and releases.
+ * This closes the race in the CLI's former read-then-append pattern: two
+ * concurrent `add`s can no longer both compute `T-0001`, and concurrent
+ * `start`/`activate`/`evidence`/`complete` can no longer drop each other's
+ * field updates. `mutate` returns the records to append (empty = no write,
+ * e.g. a not-found / validation-refused mutation). Returns the appended set.
+ */
+export function updateTasks(
+  baseDir: string,
+  mutate: (current: TaskRecord[]) => TaskRecord[],
+): TaskRecord[] {
+  const reaDir = path.join(baseDir, REA_DIR);
+  fs.mkdirSync(reaDir, { recursive: true });
+  const file = tasksPath(baseDir);
+  const release = acquireLock(reaDir);
+  try {
+    const current = readTasks(baseDir);
+    const toAppend = mutate(current);
+    for (const rec of toAppend) TaskRecordSchema.parse(rec); // fail loud on our own bad write
+    if (toAppend.length > 0) {
+      fs.appendFileSync(file, toAppend.map((r) => JSON.stringify(r) + '\n').join(''));
+      fsyncFile(file);
+    }
+    return toAppend;
+  } finally {
+    try {
+      release();
+    } catch {
+      /* reclaimed/stale lock — the append already landed */
+    }
+  }
+}
+
+/**
  * Resolve the single active, non-completed task from a folded task list, or
  * `null`. Enforces the read side of the "at most one active non-completed
  * task per project" invariant — if the store somehow holds more than one, the

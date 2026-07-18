@@ -8,7 +8,8 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { readTasks, appendTask, activeTask, nextTaskId } from './store.js';
+import {
+  updateTasks, readTasks, appendTask, activeTask, nextTaskId } from './store.js';
 import type { TaskRecord } from './types.js';
 
 let baseDir: string;
@@ -123,5 +124,44 @@ describe('nextTaskId', () => {
 
   it('keeps at least 4 digits but grows beyond', () => {
     expect(nextTaskId([make('T-9999')])).toBe('T-10000');
+  });
+});
+
+function mk(id: string, subject: string): TaskRecord {
+  const now = '2026-07-18T00:00:00.000Z';
+  return { id, subject, status: 'pending', active: false, created_at: now, updated_at: now };
+}
+function nextId(cur: TaskRecord[]): string {
+  return nextTaskId(cur);
+}
+
+describe('updateTasks (locked transaction — round-7 P1)', () => {
+  it('reads the folded state and appends returned records atomically', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rea-tasks-tx-'));
+    try {
+      // Two sequential transactional adds must see each other and get
+      // distinct ids (the read happens inside the lock).
+      updateTasks(dir, (cur) => [mk(nextId(cur), 'first')]);
+      updateTasks(dir, (cur) => [mk(nextId(cur), 'second')]);
+      const ids = readTasks(dir).map((t) => t.id);
+      expect(ids).toEqual(['T-0001', 'T-0002']);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('appends a multi-record mutation as one write (activate-style)', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rea-tasks-tx2-'));
+    try {
+      updateTasks(dir, () => [
+        { ...mk('T-0001', 'a'), active: true },
+        { ...mk('T-0002', 'b'), active: false },
+      ]);
+      const tasks = readTasks(dir);
+      expect(tasks).toHaveLength(2);
+      expect(tasks.find((t) => t.id === 'T-0001')?.active).toBe(true);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

@@ -20,7 +20,8 @@
  */
 
 import type { Command } from 'commander';
-import { readTasks, appendTask, activeTask, nextTaskId } from '../tasks/store.js';
+import { readTasks, updateTasks, activeTask, nextTaskId } from '../tasks/store.js';
+import { resolveLocalRoot } from '../lib/worktree-roots.js';
 import type { TaskRecord } from '../tasks/types.js';
 import { err, log } from './utils.js';
 
@@ -59,23 +60,24 @@ export interface TasksAddOptions {
 }
 
 export function runTasksAdd(baseDir: string, opts: TasksAddOptions): number {
-  const tasks = readTasks(baseDir);
-  const id = nextTaskId(tasks);
-  const now = nowIso();
-  const record: TaskRecord = {
-    id,
-    subject: opts.subject,
-    status: 'pending',
-    active: false,
-    created_at: now,
-    updated_at: now,
-    ...(opts.description !== undefined ? { description: opts.description } : {}),
-    ...(opts.requiresSpec === true ? { requires_spec: true } : {}),
-    ...(opts.spec !== undefined ? { spec: opts.spec } : {}),
-    ...(opts.blockedBy && opts.blockedBy.length > 0 ? { blocked_by: opts.blockedBy } : {}),
-  };
-  appendTask(baseDir, record);
-  emit(record, opts.json, `Added ${id}: ${clean(record.subject)}`);
+  let record!: TaskRecord;
+  updateTasks(baseDir, (tasks) => {
+    const now = nowIso();
+    record = {
+      id: nextTaskId(tasks),
+      subject: opts.subject,
+      status: 'pending',
+      active: false,
+      created_at: now,
+      updated_at: now,
+      ...(opts.description !== undefined ? { description: opts.description } : {}),
+      ...(opts.requiresSpec === true ? { requires_spec: true } : {}),
+      ...(opts.spec !== undefined ? { spec: opts.spec } : {}),
+      ...(opts.blockedBy && opts.blockedBy.length > 0 ? { blocked_by: opts.blockedBy } : {}),
+    };
+    return [record];
+  });
+  emit(record, opts.json, `Added ${record.id}: ${clean(record.subject)}`);
   return 0;
 }
 
@@ -84,34 +86,43 @@ export interface TasksIdOptions {
 }
 
 export function runTasksStart(baseDir: string, id: string, opts: TasksIdOptions = {}): number {
-  const tasks = readTasks(baseDir);
-  const t = findTask(tasks, id);
-  if (t === undefined) {
+  let updated: TaskRecord | undefined;
+  updateTasks(baseDir, (tasks) => {
+    const t = findTask(tasks, id);
+    if (t === undefined) return [];
+    updated = { ...t, status: 'in_progress', updated_at: nowIso() };
+    return [updated];
+  });
+  if (updated === undefined) {
     err(`No such task: ${clean(id)}`);
     return 1;
   }
-  const updated: TaskRecord = { ...t, status: 'in_progress', updated_at: nowIso() };
-  appendTask(baseDir, updated);
   emit(updated, opts.json, `Started ${id} (in_progress)`);
   return 0;
 }
 
 export function runTasksActivate(baseDir: string, id: string, opts: TasksIdOptions = {}): number {
-  const tasks = readTasks(baseDir);
-  const t = findTask(tasks, id);
-  if (t === undefined) {
+  let updated: TaskRecord | undefined;
+  updateTasks(baseDir, (tasks) => {
+    const t = findTask(tasks, id);
+    if (t === undefined) return [];
+    const now = nowIso();
+    // Flip every OTHER currently-active task off, then activate this one —
+    // all appended atomically under one lock.
+    const out: TaskRecord[] = [];
+    for (const other of tasks) {
+      if (other.id !== id && other.active) {
+        out.push({ ...other, active: false, updated_at: now });
+      }
+    }
+    updated = { ...t, active: true, updated_at: now };
+    out.push(updated);
+    return out;
+  });
+  if (updated === undefined) {
     err(`No such task: ${clean(id)}`);
     return 1;
   }
-  const now = nowIso();
-  // Flip every OTHER currently-active task off first (append-only updates).
-  for (const other of tasks) {
-    if (other.id !== id && other.active) {
-      appendTask(baseDir, { ...other, active: false, updated_at: now });
-    }
-  }
-  const updated: TaskRecord = { ...t, active: true, updated_at: now };
-  appendTask(baseDir, updated);
   emit(updated, opts.json, `Activated ${id}`);
   return 0;
 }
@@ -122,43 +133,59 @@ export interface TasksEvidenceOptions {
 }
 
 export function runTasksEvidence(baseDir: string, id: string, opts: TasksEvidenceOptions): number {
-  const tasks = readTasks(baseDir);
-  const t = findTask(tasks, id);
-  if (t === undefined) {
-    err(`No such task: ${clean(id)}`);
-    return 1;
-  }
   if (opts.add.length === 0) {
     err('evidence requires at least one --add <path>');
     return 1;
   }
-  const merged = [...(t.evidence ?? []), ...opts.add];
-  const updated: TaskRecord = { ...t, evidence: merged, updated_at: nowIso() };
-  appendTask(baseDir, updated);
+  let updated: TaskRecord | undefined;
+  let merged: string[] = [];
+  updateTasks(baseDir, (tasks) => {
+    const t = findTask(tasks, id);
+    if (t === undefined) return [];
+    merged = [...(t.evidence ?? []), ...opts.add];
+    updated = { ...t, evidence: merged, updated_at: nowIso() };
+    return [updated];
+  });
+  if (updated === undefined) {
+    err(`No such task: ${clean(id)}`);
+    return 1;
+  }
   emit(updated, opts.json, `Evidence added to ${id} (${merged.length} total)`);
   return 0;
 }
 
 export function runTasksComplete(baseDir: string, id: string, opts: TasksIdOptions = {}): number {
-  const tasks = readTasks(baseDir);
-  const t = findTask(tasks, id);
-  if (t === undefined) {
+  let updated: TaskRecord | undefined;
+  let outcome: 'ok' | 'not-found' | 'no-evidence' = 'not-found';
+  updateTasks(baseDir, (tasks) => {
+    const t = findTask(tasks, id);
+    if (t === undefined) {
+      outcome = 'not-found';
+      return [];
+    }
+    // G2 verification invariant at the CLI tier: a task cannot be
+    // completed without recorded evidence — checked against the LOCKED
+    // snapshot so a concurrent evidence add is honored.
+    if ((t.evidence ?? []).length === 0) {
+      outcome = 'no-evidence';
+      return [];
+    }
+    outcome = 'ok';
+    updated = { ...t, status: 'completed', active: false, updated_at: nowIso() };
+    return [updated];
+  });
+  if (outcome === 'not-found') {
     err(`No such task: ${clean(id)}`);
     return 1;
   }
-  // G2 verification invariant at the CLI tier: a task cannot be completed
-  // without recorded evidence.
-  const evidence = t.evidence ?? [];
-  if (evidence.length === 0) {
+  if (outcome === 'no-evidence') {
     err(
       `Cannot complete ${id}: no evidence recorded. ` +
         `Add evidence first: rea tasks evidence ${id} --add <path>`,
     );
     return 1;
   }
-  const updated: TaskRecord = { ...t, status: 'completed', active: false, updated_at: nowIso() };
-  appendTask(baseDir, updated);
-  emit(updated, opts.json, `Completed ${id}`);
+  emit(updated as TaskRecord, opts.json, `Completed ${id}`);
   return 0;
 }
 
@@ -210,7 +237,7 @@ export function runTasksShow(baseDir: string, id: string, opts: TasksIdOptions =
 
 /**
  * Register `rea tasks <subcommand>` on the root program. Each action resolves
- * `baseDir` from `process.cwd()` and exits non-zero when the `run*` helper
+ * `baseDir` from the resolved project root and exits non-zero when the `run*` helper
  * reports a refusal / not-found.
  */
 export function registerTasksCommand(program: Command): void {
@@ -236,7 +263,7 @@ export function registerTasksCommand(program: Command): void {
         blockedBy?: string[];
         json?: boolean;
       }) => {
-        const code = runTasksAdd(process.cwd(), {
+        const code = runTasksAdd(resolveLocalRoot(process.cwd()), {
           subject: opts.subject,
           ...(opts.description !== undefined ? { description: opts.description } : {}),
           ...(opts.requiresSpec !== undefined ? { requiresSpec: opts.requiresSpec } : {}),
@@ -253,7 +280,7 @@ export function registerTasksCommand(program: Command): void {
     .description('Mark a task in_progress.')
     .option('--json', 'emit the updated record as JSON')
     .action((id: string, opts: { json?: boolean }) => {
-      const code = runTasksStart(process.cwd(), id, { ...(opts.json !== undefined ? { json: opts.json } : {}) });
+      const code = runTasksStart(resolveLocalRoot(process.cwd()), id, { ...(opts.json !== undefined ? { json: opts.json } : {}) });
       if (code !== 0) process.exit(code);
     });
 
@@ -262,7 +289,7 @@ export function registerTasksCommand(program: Command): void {
     .description('Set this task active and flip every other task inactive.')
     .option('--json', 'emit the updated record as JSON')
     .action((id: string, opts: { json?: boolean }) => {
-      const code = runTasksActivate(process.cwd(), id, { ...(opts.json !== undefined ? { json: opts.json } : {}) });
+      const code = runTasksActivate(resolveLocalRoot(process.cwd()), id, { ...(opts.json !== undefined ? { json: opts.json } : {}) });
       if (code !== 0) process.exit(code);
     });
 
@@ -272,7 +299,7 @@ export function registerTasksCommand(program: Command): void {
     .requiredOption('--add <path...>', 'evidence path(s) to append')
     .option('--json', 'emit the updated record as JSON')
     .action((id: string, opts: { add: string[]; json?: boolean }) => {
-      const code = runTasksEvidence(process.cwd(), id, {
+      const code = runTasksEvidence(resolveLocalRoot(process.cwd()), id, {
         add: opts.add,
         ...(opts.json !== undefined ? { json: opts.json } : {}),
       });
@@ -284,7 +311,7 @@ export function registerTasksCommand(program: Command): void {
     .description('Mark a task completed. Refuses when the task has no evidence.')
     .option('--json', 'emit the updated record as JSON')
     .action((id: string, opts: { json?: boolean }) => {
-      const code = runTasksComplete(process.cwd(), id, { ...(opts.json !== undefined ? { json: opts.json } : {}) });
+      const code = runTasksComplete(resolveLocalRoot(process.cwd()), id, { ...(opts.json !== undefined ? { json: opts.json } : {}) });
       if (code !== 0) process.exit(code);
     });
 
@@ -293,7 +320,7 @@ export function registerTasksCommand(program: Command): void {
     .description('List all tasks (folded latest-per-id).')
     .option('--json', 'emit the task array as JSON')
     .action((opts: { json?: boolean }) => {
-      const code = runTasksList(process.cwd(), { ...(opts.json !== undefined ? { json: opts.json } : {}) });
+      const code = runTasksList(resolveLocalRoot(process.cwd()), { ...(opts.json !== undefined ? { json: opts.json } : {}) });
       if (code !== 0) process.exit(code);
     });
 
@@ -302,7 +329,7 @@ export function registerTasksCommand(program: Command): void {
     .description('Show one task.')
     .option('--json', 'emit the record as JSON')
     .action((id: string, opts: { json?: boolean }) => {
-      const code = runTasksShow(process.cwd(), id, { ...(opts.json !== undefined ? { json: opts.json } : {}) });
+      const code = runTasksShow(resolveLocalRoot(process.cwd()), id, { ...(opts.json !== undefined ? { json: opts.json } : {}) });
       if (code !== 0) process.exit(code);
     });
 }
