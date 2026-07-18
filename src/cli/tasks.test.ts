@@ -118,6 +118,17 @@ describe('complete refuses without evidence', () => {
     expect(runTasksComplete(baseDir, 'T-0001')).toBe(1);
     expect(readTasks(baseDir)[0]?.status).toBe('pending');
   });
+
+  it('refuses to re-complete an already-terminal task (round-31 P2)', () => {
+    runTasksAdd(baseDir, { subject: 'done' });
+    runTasksEvidence(baseDir, 'T-0001', { add: ['docs/proof.md'] });
+    expect(runTasksComplete(baseDir, 'T-0001')).toBe(0);
+    const firstUpdatedAt = readTasks(baseDir)[0]?.updated_at;
+    // Completing again must refuse — not append another completed row / bump ts.
+    expect(runTasksComplete(baseDir, 'T-0001')).toBe(1);
+    expect(errs.join('\n')).toMatch(/already completed/i);
+    expect(readTasks(baseDir)[0]?.updated_at).toBe(firstUpdatedAt);
+  });
 });
 
 describe('activate flips others inactive', () => {

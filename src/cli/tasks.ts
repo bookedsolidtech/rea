@@ -194,11 +194,21 @@ export function runTasksEvidence(baseDir: string, id: string, opts: TasksEvidenc
 
 export function runTasksComplete(baseDir: string, id: string, opts: TasksIdOptions = {}): number {
   let updated: TaskRecord | undefined;
-  let outcome: 'ok' | 'not-found' | 'no-evidence' = 'not-found';
+  let outcome: 'ok' | 'not-found' | 'no-evidence' | 'terminal' = 'not-found';
+  let terminalStatus: string | undefined;
   updateTasks(baseDir, (tasks) => {
     const t = findTask(tasks, id);
     if (t === undefined) {
       outcome = 'not-found';
+      return [];
+    }
+    // Round-31 P2: `completed`/`cancelled` are terminal and immutable, like
+    // start/activate already treat them. Re-completing a completed task would
+    // bump updated_at and keep it alive in dash's 7-day review queue; completing
+    // a CANCELLED task would silently rewrite its terminal state. Refuse both.
+    if (t.status === 'completed' || t.status === 'cancelled') {
+      outcome = 'terminal';
+      terminalStatus = t.status;
       return [];
     }
     // G2 verification invariant at the CLI tier: a task cannot be
@@ -215,6 +225,10 @@ export function runTasksComplete(baseDir: string, id: string, opts: TasksIdOptio
   });
   if (outcome === 'not-found') {
     err(`No such task: ${clean(id)}`);
+    return 1;
+  }
+  if (outcome === 'terminal') {
+    err(`Cannot complete ${clean(id)}: task is already ${terminalStatus}. Terminal tasks are immutable.`);
     return 1;
   }
   if (outcome === 'no-evidence') {
