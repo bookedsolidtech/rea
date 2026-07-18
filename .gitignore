@@ -59,6 +59,9 @@ coverage/
 .rea/serve.state.json
 .rea/fingerprints.json
 .rea/last-review.json
+.rea/tasks.jsonl
+.rea/tasks.jsonl.lock
+.rea/turn-count.*.json
 .rea/review-parity.json
 .rea/parity-dataset/
 .rea/*.tmp
