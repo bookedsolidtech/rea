@@ -46,6 +46,63 @@
  *     CLI/sandbox concerns — same as 0.32.0 round-6 P2 fix for
  *     security-disclosure-gate (mode-off short-circuit before any CLI
  *     resolution).
+ *
+ * ## G3 (Artifact Gate) layering — the review gate's artifact-gates face
+ *
+ * This gate IS G3 (the review-gate) of the Artifact Gates trio (G1 spec,
+ * G2 verification, G3 review). 0.54.0 gives it the same tri-state +
+ * SHADOW tier G1/G2 carry, expressed through
+ * `policy.artifact_gates.g3_review.mode` (`off | shadow | enforce`).
+ *
+ * ### Precedence (DOCUMENTED, load-bearing)
+ *
+ *   - `g3_review.mode` ABSENT  → behavior is EXACTLY the legacy
+ *     `review.local_review.mode`-driven path (below). ZERO change for
+ *     every existing repo — no audit is emitted, banners/decisions are
+ *     byte-identical. This is the invariant the whole legacy test suite
+ *     rests on.
+ *   - `g3_review.mode` PRESENT → it is AUTHORITATIVE over
+ *     `review.local_review.mode`. The tier (off/shadow/enforce) comes
+ *     from g3_review; `refuse_at` and `bypass_env_var` STILL come from
+ *     `review.local_review` (they are NOT duplicated under g3_review).
+ *
+ * ### The three tiers (mirroring src/cli/gate.ts G1 + verify-gate G2)
+ *
+ *   - `off`     → silent exit 0 (no-op), like `local_review.mode: off`.
+ *   - `shadow`  → run the SAME coverage probe (`computePreflight` / the
+ *     injected `preflightImpl`); if it WOULD block (no fresh verdict
+ *     covers HEAD) append a `rea.gate.g3.shadow` would-block audit entry
+ *     and EXIT 0 (allow). NEVER refuses. A would-ALLOW probe is silent
+ *     (no audit), exactly as G1/G2 stay silent on a pass.
+ *   - `enforce` → identical refuse behavior to legacy enforced (refuse at
+ *     the `refuse_at` boundary, honoring `bypass_env_var`), PLUS a
+ *     `rea.gate.g3` deny audit entry before the refusal banner.
+ *
+ * ### Fail-safe parity with G1/G2 (UNCERTAIN)
+ *
+ * An UNCERTAIN coverage result (the probe throws) resolves per tier:
+ * enforce refuses (fail-closed), shadow logs `rea.gate.g3.shadow` +
+ * allows, off is silent — mirroring the G1/G2 "UNCERTAIN ≡ REFUSE at
+ * enforce only" doctrine.
+ *
+ * ### Overnight-safe + budget
+ *
+ * The gate acts ONLY at the push/commit boundary and NEVER prompts:
+ * shadow logs, enforce refuses the Bash tool call. No interactive
+ * question is ever introduced (spec §6). G3 inspects the ARTIFACT (the
+ * verdict-coverage audit probe) and adds NO subprocess beyond the
+ * coverage probe the legacy path already runs (spec §7.3).
+ *
+ * ### Known interaction (probe inherits legacy mode-off)
+ *
+ * The shadow/enforce coverage probe is `computePreflight`, which has its
+ * OWN `review.local_review.mode: off` short-circuit (exit 0). So to
+ * exercise G3 keep `review.local_review.mode` at its default (`enforced`,
+ * or simply unset) and let `g3_review.mode` govern the tier — a repo that
+ * sets `local_review.mode: off` AND a non-off `g3_review.mode` neuters the
+ * probe (it always reports "would allow"). This is deliberate: the probe
+ * and its refuse_at/bypass semantics are the local-review layer G3
+ * expresses, not a reimplementation.
  */
 
 import type { Buffer } from 'node:buffer';
@@ -67,6 +124,18 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { computePreflight } from '../../cli/preflight.js';
+import type { GateMode } from '../../policy/types.js';
+import { appendAuditRecord, InvocationStatus, Tier } from '../../audit/append.js';
+
+/** Canonical audit tool name for an enforced G3 refusal. */
+export const G3_TOOL_NAME = 'rea.gate.g3' as const;
+/**
+ * Shadow audit tool name — a would-block event that never blocks. A
+ * distinct sibling name (like `rea.gate.g1.shadow` / `rea.gate.g2.shadow`)
+ * that no coverage accept-list consults.
+ */
+export const G3_SHADOW_TOOL_NAME = 'rea.gate.g3.shadow' as const;
+const G3_SERVER_NAME = 'rea' as const;
 
 export interface LocalReviewGateOptions {
   reaRoot?: string;
@@ -101,6 +170,7 @@ export interface LocalReviewGateResult {
     | 'bypass-inline'
     | 'preflight-allow'
     | 'preflight-refuse'
+    | 'g3-shadow'
     | 'malformed-payload';
 }
 
@@ -108,6 +178,12 @@ interface LocalReviewPolicy {
   mode: 'enforced' | 'off';
   refuseAt: 'push' | 'commit' | 'both';
   bypassEnvVar: string;
+  /**
+   * G3 tri-state from `artifact_gates.g3_review.mode`. `undefined` when
+   * the block (or a valid `mode`) is absent — the precedence signal that
+   * the LEGACY `review.local_review.mode` path applies unchanged.
+   */
+  g3Mode: GateMode | undefined;
 }
 
 const DEFAULT_BYPASS_VAR = 'REA_SKIP_LOCAL_REVIEW';
@@ -148,6 +224,7 @@ function loadLocalReviewPolicy(reaRoot: string): LocalReviewPolicy {
     mode: 'enforced',
     refuseAt: 'push',
     bypassEnvVar: DEFAULT_BYPASS_VAR,
+    g3Mode: undefined,
   };
   const policyPath = path.join(reaRoot, '.rea', 'policy.yaml');
   if (!fs.existsSync(policyPath)) return defaults;
@@ -160,13 +237,18 @@ function loadLocalReviewPolicy(reaRoot: string): LocalReviewPolicy {
   if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
     return defaults;
   }
-  const review = (parsed as Record<string, unknown>)['review'];
+  const root = parsed as Record<string, unknown>;
+  // Extract the G3 tri-state FIRST from the same parse — a repo may carry
+  // `artifact_gates.g3_review.mode` even when the `review.local_review`
+  // block is absent, so it must survive the review-block early returns.
+  const g3Mode = extractG3Mode(root);
+  const review = root['review'];
   if (review === null || typeof review !== 'object' || Array.isArray(review)) {
-    return defaults;
+    return { ...defaults, g3Mode };
   }
   const lr = (review as Record<string, unknown>)['local_review'];
   if (lr === null || typeof lr !== 'object' || Array.isArray(lr)) {
-    return defaults;
+    return { ...defaults, g3Mode };
   }
   const lrObj = lr as Record<string, unknown>;
   // mode: only `off` toggles silent no-op; anything else (including
@@ -184,7 +266,26 @@ function loadLocalReviewPolicy(reaRoot: string): LocalReviewPolicy {
     typeof bypassRaw === 'string' && isValidEnvVarName(bypassRaw)
       ? bypassRaw
       : DEFAULT_BYPASS_VAR;
-  return { mode, refuseAt, bypassEnvVar };
+  return { mode, refuseAt, bypassEnvVar, g3Mode };
+}
+
+/**
+ * Tolerant read of `artifact_gates.g3_review.mode` from the parsed policy
+ * root. Only the three valid tri-state values resolve; ANY other shape
+ * (missing block, missing key, unknown/typo value) → `undefined`, which
+ * routes back to the legacy `review.local_review` path. Mirrors the
+ * gate's tolerant posture (`loadPolicy`'s strict schema validation is the
+ * loud typo-catcher at init/upgrade; this reader stays permissive so a
+ * partial/migrating policy behaves exactly as pre-G3).
+ */
+function extractG3Mode(root: Record<string, unknown>): GateMode | undefined {
+  const ag = root['artifact_gates'];
+  if (ag === null || typeof ag !== 'object' || Array.isArray(ag)) return undefined;
+  const g3 = (ag as Record<string, unknown>)['g3_review'];
+  if (g3 === null || typeof g3 !== 'object' || Array.isArray(g3)) return undefined;
+  const m = (g3 as Record<string, unknown>)['mode'];
+  if (m === 'off' || m === 'shadow' || m === 'enforce') return m;
+  return undefined;
 }
 
 /**
@@ -397,10 +498,21 @@ export async function runLocalReviewGate(
     return { exitCode: 2, stderr, decision: 'halt' };
   }
 
-  // 3. Read policy. mode=off → silent no-op BEFORE any other work
-  //    (mirrors 0.32.0 round-6 P2 fix: short-circuit before CLI checks).
+  // 3. Read policy + resolve the EFFECTIVE tier (G3 precedence).
+  //    When `artifact_gates.g3_review.mode` is present it is AUTHORITATIVE
+  //    over `review.local_review.mode`; otherwise the legacy mode drives.
+  //    `refuse_at` / `bypass_env_var` always come from `review.local_review`.
   const policy = loadLocalReviewPolicy(reaRoot);
-  if (policy.mode === 'off') {
+  const g3Active = policy.g3Mode !== undefined;
+  const effectiveMode: GateMode = g3Active
+    ? (policy.g3Mode as GateMode)
+    : policy.mode === 'off'
+      ? 'off'
+      : 'enforce';
+  // mode=off → silent no-op BEFORE any other work (mirrors 0.32.0 round-6
+  // P2 fix: short-circuit before CLI checks). Covers BOTH `g3_review.mode:
+  // off` and legacy `local_review.mode: off`; HALT above still wins.
+  if (effectiveMode === 'off') {
     return { exitCode: 0, stderr, decision: 'mode-off' };
   }
 
@@ -447,7 +559,7 @@ export async function runLocalReviewGate(
     return { exitCode: 0, stderr, decision: 'bypass-inline' };
   }
 
-  // 8. Run preflight in-process.
+  // 8. Run the coverage probe in-process (the ARTIFACT check — no model).
   const preflightFn =
     options.preflightImpl ?? (async (root: string) => {
       // Round-10 P1b: pushes get the pristine-tree coverage fallback;
@@ -462,36 +574,73 @@ export async function runLocalReviewGate(
         reason: result.outcome.reason,
       };
     });
+
+  // Best-effort audit sink — an append failure NEVER changes the verdict
+  // (mirrors src/cli/gate.ts G1 + verify-gate G2). Audit lands on the
+  // COMMON (repository) root.
+  const audit = async (
+    toolNameForRecord: string,
+    status: InvocationStatus,
+    metadata: Record<string, unknown>,
+  ): Promise<void> => {
+    try {
+      await appendAuditRecord(commonRoot, {
+        tool_name: toolNameForRecord,
+        server_name: G3_SERVER_NAME,
+        tier: Tier.Write,
+        status,
+        metadata,
+      });
+    } catch {
+      /* best-effort */
+    }
+  };
+
+  // 9. Resolve a WOULD-BLOCK coverage result through the effective tier.
+  //    Reached only for shadow/enforce (off short-circuited above).
+  //    - shadow  → audit `rea.gate.g3.shadow` (would-block) + allow.
+  //    - enforce → audit `rea.gate.g3` (deny, only when g3 is active so
+  //      the legacy path stays byte-identical) + refuse banner + exit 2.
+  const resolveBlock = async (
+    exitCode: number,
+    reason: string,
+  ): Promise<LocalReviewGateResult> => {
+    const meta: Record<string, unknown> = {
+      reason,
+      operation: opLabel,
+      refuse_at: policy.refuseAt,
+    };
+    if (effectiveMode === 'shadow') {
+      await audit(G3_SHADOW_TOOL_NAME, InvocationStatus.Allowed, {
+        would_block: true,
+        ...meta,
+      });
+      return { exitCode: 0, stderr, decision: 'g3-shadow' };
+    }
+    // enforce — g3 active emits the deny audit BEFORE the banner; the
+    // legacy path (g3 absent) refuses exactly as pre-G3 with NO audit.
+    if (g3Active) {
+      await audit(G3_TOOL_NAME, InvocationStatus.Denied, meta);
+    }
+    writeStderr(buildRefuseBanner(opLabel, exitCode, policy.bypassEnvVar, reason));
+    return { exitCode: 2, stderr, decision: 'preflight-refuse' };
+  };
+
   let preflight: { exitCode: 0 | 1 | 2; reason: string };
   try {
     preflight = await preflightFn(reaRoot);
   } catch (err) {
-    // Preflight throw is treated as refuse — same fail-closed posture as
-    // the bash shim. Emit a generic refusal banner.
-    writeStderr(
-      buildRefuseBanner(
-        opLabel,
-        2,
-        policy.bypassEnvVar,
-        err instanceof Error ? err.message : String(err),
-      ),
-    );
-    return { exitCode: 2, stderr, decision: 'preflight-refuse' };
+    // Probe throw is UNCERTAIN → fail-safe parity: enforce refuses,
+    // shadow logs+allows (fail-closed posture matches the bash shim).
+    return resolveBlock(2, err instanceof Error ? err.message : String(err));
   }
 
   if (preflight.exitCode === 0) {
+    // Would ALLOW — silent in every tier (like G1/G2 on a pass).
     return { exitCode: 0, stderr, decision: 'preflight-allow' };
   }
 
-  writeStderr(
-    buildRefuseBanner(
-      opLabel,
-      preflight.exitCode,
-      policy.bypassEnvVar,
-      preflight.reason,
-    ),
-  );
-  return { exitCode: 2, stderr, decision: 'preflight-refuse' };
+  return resolveBlock(preflight.exitCode, preflight.reason);
 }
 
 /**
