@@ -672,7 +672,13 @@ export async function runDash(opts: DashOptions = {}): Promise<number> {
   if (opts.prune === true) {
     try {
       const pruned = await pruneMissing(registryPath);
-      if (opts.json !== true && pruned.length > 0) {
+      // stdout must carry ONLY data when it's being consumed as data — `--json`
+      // OR `--emit-moc` streaming to stdout (no mocPath). Otherwise
+      // `rea dash --emit-moc --prune > Morning.md` prepends a log line before the
+      // MOC frontmatter (round-26 P2).
+      const stdoutIsData =
+        opts.json === true || (opts.emitMoc === true && opts.mocPath === undefined);
+      if (!stdoutIsData && pruned.length > 0) {
         log(`Pruned ${pruned.length} missing project${pruned.length === 1 ? '' : 's'}.`);
       }
     } catch (e) {

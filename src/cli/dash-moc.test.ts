@@ -249,6 +249,31 @@ describe('runDash --emit-moc', () => {
     expect(chunks.join('')).toContain('# Morning View');
   });
 
+  it('does NOT prepend the --prune log to stdout under --emit-moc (round-26 P2)', async () => {
+    const present = makeProject('acme', [task('T-0001', { status: 'in_progress' })]);
+    await registerProject(present, { name: 'acme', reaVersion: '0.51.0' }, registryPath);
+    // A registered-but-now-missing project so --prune actually drops one.
+    const gone = makeProject('gone', []);
+    await registerProject(gone, { name: 'gone', reaVersion: '0.51.0' }, registryPath);
+    fs.rmSync(gone, { recursive: true, force: true });
+
+    const chunks: string[] = [];
+    const outSpy = vi.spyOn(process.stdout, 'write').mockImplementation((c: unknown) => {
+      chunks.push(String(c));
+      return true;
+    });
+    const logSpy = vi.spyOn(console, 'log').mockImplementation((...a: unknown[]) => {
+      chunks.push(a.map(String).join(' '));
+    });
+    const code = await runDash({ registryPath, emitMoc: true, prune: true });
+    outSpy.mockRestore();
+    logSpy.mockRestore();
+    expect(code).toBe(0);
+    const out = chunks.join('\n');
+    expect(out).toContain('# Morning View'); // MOC still emitted
+    expect(out).not.toMatch(/Pruned/); // …with no log line corrupting the vault file
+  });
+
   it('errors cleanly when the target parent directory does not exist', async () => {
     const proj = makeProject('acme', [task('T-0001', { status: 'in_progress' })]);
     await registerProject(proj, { name: 'acme', reaVersion: '0.51.0' }, registryPath);
