@@ -2,7 +2,7 @@
   "version": "0.51.0",
   "profile": "bst-internal",
   "installed_at": "2026-04-18T21:31:41.169Z",
-  "upgraded_at": "2026-07-17T23:09:40.457Z",
+  "upgraded_at": "2026-07-18T01:10:31.692Z",
   "files": [
     {
       "path": ".claude/hooks/_lib/bootstrap-allowlist.sh",
@@ -16,12 +16,12 @@
     },
     {
       "path": ".claude/hooks/_lib/common.sh",
-      "sha256": "c6d8e0106eb72c090e5bb30c663a12b7d0e489f83475ba881a8e27d466bf316e",
+      "sha256": "80e75c7af7505d36505b533c982b63d07a8d3941502b2dbe7dc9201ab4a52467",
       "source": "hook"
     },
     {
       "path": ".claude/hooks/_lib/halt-check.sh",
-      "sha256": "d48eb0c916249997f753f78379a75211fab49643ff08f47b1959ea9f18445392",
+      "sha256": "cf3c91d43271ab1dbe58a177297c673de67ad15a3f1ec380612048ec8549d8a6",
       "source": "hook"
     },
     {

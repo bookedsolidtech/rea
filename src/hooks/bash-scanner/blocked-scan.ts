@@ -134,7 +134,7 @@ function normalizeTarget(
   if (!abs.startsWith('/')) {
     abs = path.join(reaRoot, abs);
   }
-  const collapsed = collapseDotDot(abs);
+  let collapsed = collapseDotDot(abs);
   let effectiveRoot = reaRoot;
   if (!isInsideRoot(collapsed, reaRoot)) {
     // 0.54.0 round-5 P1: a target outside the LOCAL root that lands
@@ -145,9 +145,40 @@ function normalizeTarget(
       ...(commonRoot !== undefined && commonRoot !== reaRoot ? [commonRoot] : []),
       ...(siblingRoots ?? []),
     ];
-    const crossHit = crossRoots.find((r) => r !== reaRoot && isInsideRoot(collapsed, r));
+    // Round-3 P2 (parity with protected-scan round-45): a target
+    // reaching a cross root through an alias (macOS /var↔/private/var
+    // or a symlinked checkout path) won't match lexically, so
+    // canonicalize and test membership on the realpath'd form too —
+    // otherwise the write is treated as outside-root and blocked_paths
+    // is skipped for a file that actually lands in the governed repo.
+    const collapsedCanon = ((): string | null => {
+      const r = resolveSymlinksWalkUp(collapsed);
+      return r !== null && r !== SYMLINK_DYNAMIC_SENTINEL ? r : null;
+    })();
+    let crossHit: string | undefined;
+    let matchedCanon = false;
+    for (const r of crossRoots) {
+      if (r === reaRoot) continue;
+      if (isInsideRoot(collapsed, r)) {
+        crossHit = r;
+        break;
+      }
+      const rc = realpathSafe(r) ?? r;
+      if (collapsedCanon !== null && isInsideRoot(collapsedCanon, rc)) {
+        crossHit = r;
+        matchedCanon = true;
+        break;
+      }
+    }
     if (crossHit !== undefined) {
-      effectiveRoot = crossHit;
+      if (matchedCanon) {
+        // Derive the relative form from the canonical pair so the
+        // downstream `collapsed.slice(effectiveRoot)` is coherent.
+        collapsed = collapsedCanon as string;
+        effectiveRoot = realpathSafe(crossHit) ?? crossHit;
+      } else {
+        effectiveRoot = crossHit;
+      }
     } else {
       // blocked_paths is project-relative; an outside-root write can't
       // match. Return a non-matching sentinel form that the matcher

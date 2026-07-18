@@ -189,11 +189,24 @@ if [ ! -x "\${REA_ROOT}/node_modules/.bin/rea" ] && [ ! -f "\${REA_ROOT}/dist/cl
   esac
   if [ -n "\$_rea_common_dir" ]; then
     _rea_common=\$(dirname "\$_rea_common_dir")
-    # Round-36 P2: a --separate-git-dir primary keeps its metadata
-    # outside the checkout — dirname of the common dir is then NOT the
-    # checkout. Fall back to git's first listed worktree (the main
-    # one) before giving up on an in-repo install.
-    if [ ! -d "\${_rea_common}/.rea" ] && [ ! -e "\${_rea_common}/.git" ]; then
+    # Round-3 P2: verify the dirname candidate is the SAME repository
+    # (its git-common-dir resolves to ours) — a bare/separate-git-dir
+    # layout nesting metadata under an UNRELATED checkout must not have
+    # its CLI executed against this repo's push.
+    _rea_same_repo=0
+    if [ -d "\${_rea_common}/.rea" ] || [ -e "\${_rea_common}/.git" ]; then
+      _cc=\$(git -C "\$_rea_common" rev-parse --git-common-dir 2>/dev/null || true)
+      case "\$_cc" in "") : ;; /*) : ;; *) _cc="\${_rea_common}/\${_cc}" ;; esac
+      if [ -n "\$_cc" ]; then
+        _x=\$(cd "\$_cc" 2>/dev/null && pwd -P) || _x="\$_cc"
+        _y=\$(cd "\$_rea_common_dir" 2>/dev/null && pwd -P) || _y="\$_rea_common_dir"
+        [ "\$_x" = "\$_y" ] && _rea_same_repo=1
+      fi
+    fi
+    # Round-36 P2: a foreign nested checkout (verification failed) OR a
+    # --separate-git-dir primary whose metadata is external — fall back
+    # to git's first listed worktree (THIS repo's main one).
+    if [ "\$_rea_same_repo" = "0" ]; then
       _rea_common=\$(git -C "\$REA_ROOT" worktree list --porcelain 2>/dev/null \\
         | sed -n 's/^worktree //p' | head -n 1)
     fi

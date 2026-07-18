@@ -41,8 +41,28 @@ rea_common_root() {
   local candidate
   candidate=$(dirname "$common_dir")
   if [ -d "${candidate}/.rea" ] || [ -e "${candidate}/.git" ]; then
-    printf '%s' "$candidate"
-    return 0
+    # Round-3 P2 (parity with resolveCommonRoot): verify `candidate` is
+    # the SAME repository — its own git-common-dir must resolve to ours.
+    # A bare/separate-git-dir layout nesting metadata under an UNRELATED
+    # checkout must not route HALT/shared state into that foreign repo.
+    local _cand_common
+    _cand_common=$(git -C "$candidate" rev-parse --git-common-dir 2>/dev/null || true)
+    case "$_cand_common" in
+      "") : ;;
+      /*) : ;;
+      *) _cand_common="${candidate}/${_cand_common}" ;;
+    esac
+    if [ -n "$_cand_common" ]; then
+      local _a _b
+      _a=$(cd "$_cand_common" 2>/dev/null && pwd -P) || _a="$_cand_common"
+      _b=$(cd "$common_dir" 2>/dev/null && pwd -P) || _b="$common_dir"
+      if [ "$_a" = "$_b" ]; then
+        printf '%s' "$candidate"
+        return 0
+      fi
+    fi
+    # candidate is a DIFFERENT repo (or unverifiable) — fall through to
+    # the main-worktree attempt / per-worktree degrade below.
   fi
   # Round-35 P2 (parity with resolveCommonRoot): a --separate-git-dir
   # primary keeps its metadata OUTSIDE the checkout, so the common

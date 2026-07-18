@@ -313,6 +313,15 @@ describe('worktree-state integration (real git worktree add)', () => {
       }),
     });
     expect(sp.exitCode).toBe(2);
+
+    // Blocked-scan tier (round-3 P2): a blocked_paths write into the
+    // primary through the alias must also be caught (was skipped as
+    // outside-root before canonical membership).
+    const bv = runBlockedScan(
+      { reaRoot: wtA, commonRoot: repo, blockedPaths: ['package.json'] },
+      `echo x > ${aliasPrimary}/package.json`,
+    );
+    expect(bv.verdict).toBe('block');
   });
 
   it('(vi-e) REVERSE bridge: symlink in the PRIMARY checkout back into the worktree (round-17)', () => {
