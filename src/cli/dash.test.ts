@@ -227,6 +227,34 @@ describe('readProjectVersion manifest precedence (F2)', () => {
   });
 });
 
+describe('runDash --rescan', () => {
+  it('registers nested projects under home but NOT the home dir itself (round-38 P2)', async () => {
+    // The test `registryPath` is `<tmp>/home/.rea/registry.json`, so `<tmp>/home`
+    // IS the user-global home whose `~/.rea` holds the registry. A machine that
+    // has run `rea init` has that `~/.rea` present; a rescan over home must NOT
+    // register the home dir itself as a bogus project, while a real nested
+    // project (`~/code/proj`) IS registered.
+    const home = path.join(tmp, 'home');
+    fs.mkdirSync(path.join(home, '.rea'), { recursive: true });
+    const proj = path.join(home, 'code', 'proj');
+    fs.mkdirSync(path.join(proj, '.rea'), { recursive: true });
+
+    // The home's `~/.rea/tasks.jsonl` must never be read as a repo task store.
+    const homeTasks = path.join(home, '.rea', 'tasks.jsonl');
+    const readSpy = vi.spyOn(fs, 'readFileSync');
+
+    const code = await runDash({ rescan: true, scanRoots: [home], registryPath });
+    expect(code).toBe(0);
+
+    const projects = Object.keys(loadRegistry(registryPath).projects);
+    expect(projects).toContain(path.resolve(proj));
+    expect(projects).not.toContain(path.resolve(home));
+
+    expect(readSpy.mock.calls.some((c) => String(c[0]) === homeTasks)).toBe(false);
+    readSpy.mockRestore();
+  });
+});
+
 describe('runDash review-queue ageing', () => {
   // Frozen instant all cases are classified against (threaded via generated_at).
   const NOW = '2026-07-18T00:00:00.000Z';
@@ -400,5 +428,24 @@ describe('scanForProjects', () => {
     const found = scanForProjects([tmp]);
     expect(found).toContain(path.resolve(wt));
     expect(found).not.toContain(path.join(tmp, '.venv', 'proj'));
+  });
+
+  it('excludes the user-global ~/.rea marker but keeps nested projects (round-38 P2)', () => {
+    // Simulate a home dir that has run `rea init`: `~/.rea` is the registry /
+    // global-state home (NOT a project), while `~/code/proj` is a real project.
+    const home = path.join(tmp, 'home');
+    fs.mkdirSync(path.join(home, '.rea'), { recursive: true });
+    fs.writeFileSync(path.join(home, '.rea', 'registry.json'), '{"projects":{}}\n', 'utf8');
+    const proj = path.join(home, 'code', 'proj');
+    fs.mkdirSync(path.join(proj, '.rea'), { recursive: true });
+
+    const found = scanForProjects([home], path.join(home, '.rea'));
+    expect(found).toContain(path.resolve(proj));
+    expect(found).not.toContain(path.resolve(home));
+
+    // Without the exclusion the HOME dir WOULD be registered — proves the guard
+    // is what suppresses the bogus entry, not some other filter.
+    const unguarded = scanForProjects([home]);
+    expect(unguarded).toContain(path.resolve(home));
   });
 });

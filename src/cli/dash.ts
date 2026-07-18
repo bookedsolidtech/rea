@@ -472,10 +472,19 @@ const SCAN_MAX_DEPTH = 5;
  * `node_modules`/.git/etc, caps depth, follows no symlinks. Returns absolute
  * project dirs (the PARENT of each discovered `.rea/`). Kept OUT of the no-arg
  * hot path — invoked only by `--rescan`.
+ *
+ * `excludeMarker` (optional) is a resolved `.rea` path that is NOT a project
+ * marker — the USER-GLOBAL `~/.rea` (the registry/global-state home). Without
+ * it, a rescan over `os.homedir()` on any machine that ran `rea init` finds
+ * `~/.rea/registry.json` and registers the HOME dir itself as a bogus project
+ * (round-38 P2). Legitimately-nested real projects under home (e.g.
+ * `~/code/foo` with its own `.rea/`) are unaffected — only the home dir's own
+ * `~/.rea` marker is excluded.
  */
-export function scanForProjects(roots: string[]): string[] {
+export function scanForProjects(roots: string[], excludeMarker?: string): string[] {
   const found = new Set<string>();
   const seen = new Set<string>();
+  const excluded = excludeMarker !== undefined ? path.resolve(excludeMarker) : undefined;
 
   const walk = (dir: string, depth: number): void => {
     if (depth > SCAN_MAX_DEPTH) return;
@@ -494,10 +503,13 @@ export function scanForProjects(roots: string[]): string[] {
     } catch {
       return;
     }
-    // A `.rea/` child marks this dir as a project root.
+    // A `.rea/` child marks this dir as a project root — UNLESS that `.rea` is
+    // the user-global registry home (`~/.rea`), which is global state, not a
+    // project marker (round-38 P2).
     if (entries.some((e) => e.name === '.rea' && (e.isDirectory() || e.isSymbolicLink()))) {
       try {
-        if (fs.statSync(path.join(dir, '.rea')).isDirectory()) found.add(path.resolve(dir));
+        const marker = path.resolve(dir, '.rea');
+        if (marker !== excluded && fs.statSync(marker).isDirectory()) found.add(path.resolve(dir));
       } catch {
         /* skip */
       }
@@ -684,7 +696,10 @@ export async function runDash(opts: DashOptions = {}): Promise<number> {
       opts.rescanRoots && opts.rescanRoots.length > 0
         ? opts.rescanRoots.map((r) => path.resolve(r))
         : defaultScanRoots(opts.scanRoots);
-    const discovered = scanForProjects(roots);
+    // Exclude the user-global `~/.rea` (the dir holding the active registry)
+    // from being treated as a project marker — otherwise a rescan over home
+    // registers the HOME dir itself as a bogus project (round-38 P2).
+    const discovered = scanForProjects(roots, path.dirname(registryPath));
     for (const dir of discovered) {
       try {
         // Round-8 P2: read the REAL version from the project's
