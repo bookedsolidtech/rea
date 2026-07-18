@@ -1607,6 +1607,83 @@ function resolveReaBinaryOnPath(env: NodeJS.ProcessEnv = process.env): string | 
  * the default config. `warn` when opted-in but no CLI resolves; `pass` when
  * opted-in and a CLI resolves (the gate is actually live).
  */
+/**
+ * Resolve the rea CLI INVOCATION for a single root, mirroring the pre-commit
+ * body's per-root tiers: (1) `<root>/node_modules/.bin/rea`, (2) name-guarded
+ * `<root>/dist/cli/index.js` (run via `node`). Returns `null` when neither
+ * resolves. Best-effort; never throws.
+ */
+function reaCliInvocationForRoot(root: string): { cmd: string; args: string[] } | null {
+  const bin = path.join(root, 'node_modules', '.bin', 'rea');
+  if (fs.existsSync(bin)) return { cmd: bin, args: [] };
+  const distCli = path.join(root, 'dist', 'cli', 'index.js');
+  if (fs.existsSync(distCli)) {
+    try {
+      const raw = stripUtf8Bom(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
+      const pkg = JSON.parse(raw) as { name?: unknown };
+      if (pkg && pkg.name === REA_PACKAGE_NAME) {
+        return { cmd: process.execPath, args: [distCli] };
+      }
+    } catch {
+      /* unreadable/foreign package.json — dist tier does not resolve */
+    }
+  }
+  return null;
+}
+
+/**
+ * Resolve the rea CLI the pre-commit hook would actually invoke, in the body's
+ * tier order: local root → common (primary checkout) root → global PATH `rea`.
+ * Returns `null` when nothing resolves.
+ */
+function resolveG1SpecGateCli(
+  baseDir: string,
+  env: NodeJS.ProcessEnv,
+): { cmd: string; args: string[] } | null {
+  const local = reaCliInvocationForRoot(baseDir);
+  if (local !== null) return local;
+  // Round-25 P3: a linked worktree with no local install resolves the PRIMARY
+  // checkout's CLI (REA_CLI_ROOT / git-common-dir).
+  try {
+    const { commonRoot } = resolveReaRoots(baseDir, () => {});
+    if (commonRoot && commonRoot !== baseDir) {
+      const common = reaCliInvocationForRoot(commonRoot);
+      if (common !== null) return common;
+    }
+  } catch {
+    /* best-effort — no common-root CLI */
+  }
+  const globalRea = resolveReaBinaryOnPath(env);
+  if (globalRea !== null) return { cmd: globalRea, args: [] };
+  return null;
+}
+
+/**
+ * Round-32 F2 — CAPABILITY probe. Existence of a `rea` binary is NOT enough:
+ * a pre-0.54 install exits `unknown command 'gate'` and the pre-commit hook
+ * fails OPEN, so "a CLI resolves" would be false reassurance. Verify the
+ * resolved CLI actually implements `gate spec-check` by probing
+ * `<cli> gate spec-check --help` (commander exits 0 when the subcommand
+ * exists, non-zero on unknown-command). Best-effort; a spawn failure → false
+ * (treated as "does not implement it" → warn, never a crash).
+ */
+function g1CliImplementsGate(inv: { cmd: string; args: string[] }): boolean {
+  try {
+    const res = spawnSync(inv.cmd, [...inv.args, 'gate', 'spec-check', '--help'], {
+      timeout: 10_000,
+      stdio: 'ignore',
+    });
+    return res.status === 0;
+  } catch {
+    return false;
+  }
+}
+
+const G1_FAILS_OPEN_SUFFIX =
+  'The pre-commit G1 gate FAILS OPEN — commits are NOT gated — until a rea CLI that ' +
+  'implements `gate spec-check` is installed locally (`pnpm add -D @bookedsolid/rea`) or ' +
+  'globally. This is deliberate: the hot commit path never bricks a fresh clone.';
+
 export function checkG1SpecGateCli(
   baseDir: string,
   env: NodeJS.ProcessEnv = process.env,
@@ -1620,40 +1697,32 @@ export function checkG1SpecGateCli(
   }
   if (mode !== 'enforce' && mode !== 'shadow') return null;
 
-  const inProjectBin = fs.existsSync(path.join(baseDir, 'node_modules', '.bin', 'rea'));
-  const localPkgOrDist = resolveLocalCliVersion(baseDir) !== null;
-  const globalRea = resolveReaBinaryOnPath(env) !== null;
-  // Round-25 P3: in a linked worktree with no local install, the pre-commit
-  // body resolves the PRIMARY checkout's CLI (REA_CLI_ROOT / git-common-dir).
-  // Mirror that tier here so doctor doesn't falsely warn "fails open" when the
-  // hook can in fact resolve the common-root CLI and enforce the gate.
-  let commonRootCli = false;
-  try {
-    const { commonRoot } = resolveReaRoots(baseDir, () => {});
-    if (commonRoot && commonRoot !== baseDir) {
-      commonRootCli =
-        fs.existsSync(path.join(commonRoot, 'node_modules', '.bin', 'rea')) ||
-        resolveLocalCliVersion(commonRoot) !== null;
-    }
-  } catch {
-    /* best-effort — absence just means no common-root CLI resolves */
-  }
-  if (inProjectBin || localPkgOrDist || globalRea || commonRootCli) {
+  const inv = resolveG1SpecGateCli(baseDir, env);
+  if (inv === null) {
     return {
       label: 'G1 spec-gate CLI available',
-      status: 'pass',
-      detail: `g1_spec.mode: ${mode} — a rea CLI resolves; the pre-commit gate is active`,
+      status: 'warn',
+      detail:
+        `g1_spec.mode: ${mode} but no rea CLI resolves (in-project node_modules/.bin/rea, ` +
+        `name-guarded dist/cli/index.js, common-checkout CLI, or global \`rea\` on PATH). ` +
+        G1_FAILS_OPEN_SUFFIX,
+    };
+  }
+  // Round-32 F2: a binary resolved — but does it implement `gate spec-check`?
+  if (!g1CliImplementsGate(inv)) {
+    return {
+      label: 'G1 spec-gate CLI available',
+      status: 'warn',
+      detail:
+        `g1_spec.mode: ${mode} but the resolved rea CLI does NOT implement \`gate spec-check\` ` +
+        `(a pre-0.54 install — \`unknown command 'gate'\`). ` +
+        G1_FAILS_OPEN_SUFFIX,
     };
   }
   return {
     label: 'G1 spec-gate CLI available',
-    status: 'warn',
-    detail:
-      `g1_spec.mode: ${mode} but no rea CLI resolves (in-project node_modules/.bin/rea, ` +
-      `name-guarded dist/cli/index.js, or global \`rea\` on PATH). The pre-commit G1 gate ` +
-      `FAILS OPEN — commits are NOT gated — until \`@bookedsolid/rea\` is installed locally ` +
-      `(\`pnpm add -D @bookedsolid/rea\`) or globally. This is deliberate: the hot commit ` +
-      `path never bricks a fresh clone.`,
+    status: 'pass',
+    detail: `g1_spec.mode: ${mode} — a rea CLI implementing \`gate spec-check\` resolves; the pre-commit gate is active`,
   };
 }
 

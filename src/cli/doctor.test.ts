@@ -2720,22 +2720,50 @@ describe('rea doctor — checkG1SpecGateCli (round-23 F1)', () => {
     expect(checkG1SpecGateCli(dir, noReaEnv)?.status).toBe('warn');
   });
 
-  it('mode enforce + in-project node_modules/.bin/rea → PASS (gate is live)', async () => {
+  // Round-32 F2: a `rea` that IMPLEMENTS `gate spec-check` (exits 0 on the
+  // `gate spec-check --help` capability probe).
+  const HAS_GATE = '#!/bin/sh\ncase "$1 $2" in "gate spec-check") exit 0 ;; esac\nexit 1\n';
+  // A pre-0.54 `rea` that LACKS `gate` (commander unknown-command → exit 1).
+  const LACKS_GATE = "#!/bin/sh\necho \"error: unknown command 'gate'\" >&2\nexit 1\n";
+
+  it('mode enforce + in-project node_modules/.bin/rea (implements gate) → PASS', async () => {
     const dir = await repoWithG1('enforce');
     const bin = path.join(dir, 'node_modules', '.bin');
     await fs.mkdir(bin, { recursive: true });
-    await fs.writeFile(path.join(bin, 'rea'), '#!/bin/sh\n', { mode: 0o755 });
+    await fs.writeFile(path.join(bin, 'rea'), HAS_GATE, { mode: 0o755 });
     const r = checkG1SpecGateCli(dir, noReaEnv);
     expect(r?.status).toBe('pass');
+    expect(r?.detail).toMatch(/implementing `gate spec-check`/);
   });
 
-  it('mode enforce + global rea on PATH → PASS', async () => {
+  it('mode enforce + global rea on PATH (implements gate) → PASS', async () => {
     const dir = await repoWithG1('enforce');
     const bin = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-gbin-')));
     dirs.push(bin);
-    await fs.writeFile(path.join(bin, 'rea'), '#!/bin/sh\n', { mode: 0o755 });
+    await fs.writeFile(path.join(bin, 'rea'), HAS_GATE, { mode: 0o755 });
     const r = checkG1SpecGateCli(dir, { PATH: bin });
     expect(r?.status).toBe('pass');
+  });
+
+  // Round-32 F2 — the false-reassurance case this check exists to prevent.
+  it('F2: a resolved CLI that LACKS `gate spec-check` (pre-0.54) → WARN, not PASS', async () => {
+    const dir = await repoWithG1('enforce');
+    const bin = path.join(dir, 'node_modules', '.bin');
+    await fs.mkdir(bin, { recursive: true });
+    await fs.writeFile(path.join(bin, 'rea'), LACKS_GATE, { mode: 0o755 });
+    const r = checkG1SpecGateCli(dir, noReaEnv);
+    expect(r?.status).toBe('warn');
+    expect(r?.status).not.toBe('pass');
+    expect(r?.detail).toMatch(/does NOT implement `gate spec-check`/);
+    expect(r?.detail).toMatch(/FAILS OPEN/);
+  });
+
+  it('F2: a global rea on PATH that LACKS gate → WARN', async () => {
+    const dir = await repoWithG1('enforce');
+    const bin = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-gbin-old-')));
+    dirs.push(bin);
+    await fs.writeFile(path.join(bin, 'rea'), LACKS_GATE, { mode: 0o755 });
+    expect(checkG1SpecGateCli(dir, { PATH: bin })?.status).toBe('warn');
   });
 
   it('never emits a `fail` (advisory only)', async () => {
