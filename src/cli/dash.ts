@@ -410,7 +410,30 @@ function buildJson(targets: ProjectTarget[], mode: 'global' | 'repo', all: boole
 // Deep filesystem sweep (`--rescan`, opt-in only)
 // ---------------------------------------------------------------------------
 
-const SCAN_SKIP_DIRS = new Set(['node_modules', '.git', '.hg', '.svn', 'dist', 'build', '.cache']);
+const SCAN_SKIP_DIRS = new Set([
+  'node_modules',
+  '.git',
+  '.hg',
+  '.svn',
+  'dist',
+  'build',
+  '.cache',
+  // Heavy hidden dirs that never contain a rea project — skipped explicitly
+  // now that the rescan traverses dot-directories generally (round-25 P2), so
+  // a project under `.worktrees/`/`.claude/worktrees/`/`.src/` IS discovered
+  // while these large trees are still pruned.
+  '.venv',
+  '.tox',
+  '.terraform',
+  '.gradle',
+  '.idea',
+  '.vscode',
+  '.next',
+  '.nuxt',
+  '.turbo',
+  '.pnpm-store',
+  '.yarn',
+]);
 const SCAN_MAX_DEPTH = 5;
 
 /**
@@ -450,7 +473,12 @@ export function scanForProjects(roots: string[]): string[] {
     }
     for (const e of entries) {
       if (!e.isDirectory()) continue;
-      if (e.name.startsWith('.') && e.name !== '.') continue; // skip dotdirs (incl .rea itself)
+      // The `.rea/` marker dir itself never nests a project — skip it. But do
+      // NOT blanket-skip every dot-directory (round-25 P2): a rea project under
+      // a hidden parent like `.worktrees/` or `.claude/worktrees/` (the common
+      // linked-worktree layout) must still be discovered. Heavy hidden trees
+      // are pruned explicitly via SCAN_SKIP_DIRS.
+      if (e.name === '.rea') continue;
       if (SCAN_SKIP_DIRS.has(e.name)) continue;
       walk(path.join(dir, e.name), depth + 1);
     }

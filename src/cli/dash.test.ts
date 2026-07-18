@@ -315,4 +315,17 @@ describe('scanForProjects', () => {
     expect(found).toContain(path.join(tmp, 'svc-b'));
     expect(found).not.toContain(nm);
   });
+
+  it('discovers a project under a HIDDEN parent dir (round-25 P2)', () => {
+    // A rea project nested under `.worktrees/` (the common linked-worktree
+    // layout) must still be found — the rescan no longer blanket-skips dotdirs.
+    const wt = path.join(tmp, '.worktrees', 'stream-1');
+    fs.mkdirSync(path.join(wt, '.rea'), { recursive: true });
+    // …but a heavy hidden tree (SCAN_SKIP_DIRS) is still pruned.
+    fs.mkdirSync(path.join(tmp, '.venv', 'proj', '.rea'), { recursive: true });
+
+    const found = scanForProjects([tmp]);
+    expect(found).toContain(path.resolve(wt));
+    expect(found).not.toContain(path.join(tmp, '.venv', 'proj'));
+  });
 });
