@@ -666,6 +666,30 @@ describe('local-review-gate G3: off tier', () => {
     expect(r.exitCode).toBe(0);
     expect(r.decision).toBe('mode-off');
   });
+
+  it('present g3_review block with omitted mode → off (schema default), not legacy (round-14 P2)', async () => {
+    // `artifact_gates.g3_review: {}` validates as mode:off under the strict
+    // schema (.default). The tolerant reader must resolve the SAME off — not
+    // fall back to legacy review.local_review, which would keep enforcing.
+    const body = `review:
+  local_review:
+    mode: enforced
+    refuse_at: push
+artifact_gates:
+  g3_review: {}
+`;
+    writePolicy(root, body);
+    const r = await runLocalReviewGate({
+      reaRoot: root,
+      stdinOverride: PAYLOAD('git push origin main'),
+      envOverride: {},
+      preflightImpl: refusePreflight,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(r.decision).toBe('mode-off');
+    expect(auditContains(root, G3_TOOL_NAME)).toBe(false);
+    expect(auditContains(root, G3_SHADOW_TOOL_NAME)).toBe(false);
+  });
 });
 
 describe('local-review-gate G3: shadow tier', () => {

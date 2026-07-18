@@ -271,12 +271,19 @@ function loadLocalReviewPolicy(reaRoot: string): LocalReviewPolicy {
 
 /**
  * Tolerant read of `artifact_gates.g3_review.mode` from the parsed policy
- * root. Only the three valid tri-state values resolve; ANY other shape
- * (missing block, missing key, unknown/typo value) → `undefined`, which
- * routes back to the legacy `review.local_review` path. Mirrors the
- * gate's tolerant posture (`loadPolicy`'s strict schema validation is the
- * loud typo-catcher at init/upgrade; this reader stays permissive so a
- * partial/migrating policy behaves exactly as pre-G3).
+ * root. Precedence: the PRESENCE of a `g3_review` block signals G3 opt-in
+ * and is authoritative. A valid tri-state value resolves to itself; a
+ * present block with a missing/omitted `mode` resolves to `off` — mirroring
+ * the strict schema, which `.default('off')`s the mode so `g3_review: {}`
+ * validates as `off` (round-14 P2: returning `undefined` here would wrongly
+ * fall back to legacy `review.local_review` enforcement instead of the
+ * `off` the validated policy promises). Only when the block is ABSENT (no
+ * `artifact_gates`, or no `g3_review`) do we return `undefined` and route
+ * back to the legacy path — the byte-identical pre-G3 invariant. An unknown/
+ * typo `mode` value is caught loudly by `loadPolicy`'s strict schema at
+ * init/upgrade; here a present block conservatively resolves to `off`
+ * (G3 semantics apply, gate disabled) rather than silently re-enabling the
+ * legacy gate.
  */
 function extractG3Mode(root: Record<string, unknown>): GateMode | undefined {
   const ag = root['artifact_gates'];
@@ -285,7 +292,8 @@ function extractG3Mode(root: Record<string, unknown>): GateMode | undefined {
   if (g3 === null || typeof g3 !== 'object' || Array.isArray(g3)) return undefined;
   const m = (g3 as Record<string, unknown>)['mode'];
   if (m === 'off' || m === 'shadow' || m === 'enforce') return m;
-  return undefined;
+  // Block present but mode missing/unrecognized → schema default `off`.
+  return 'off';
 }
 
 /**

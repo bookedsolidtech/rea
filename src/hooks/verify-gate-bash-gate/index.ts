@@ -112,7 +112,7 @@ function refusalBanner(): string {
     `.rea/tasks.jsonl refused.\n\n` +
     `A raw redirect / tee / cp / mv into the task store bypasses the evidence\n` +
     `invariant the store enforces. Use the sanctioned CLI instead:\n\n` +
-    `  rea tasks add "<title>"\n` +
+    `  rea tasks add --subject "<title>"\n` +
     `  rea tasks evidence <id> --add <path>\n` +
     `  rea tasks complete <id>   # refuses a no-evidence completion\n\n` +
     `The editor-tier G2 gate enforces the same on Write/Edit; this gate closes\n` +
