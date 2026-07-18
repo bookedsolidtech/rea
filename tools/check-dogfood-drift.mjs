@@ -39,10 +39,11 @@ const PAIRS = [
   { canonical: 'agents', dogfood: '.claude/agents' },
   { canonical: 'commands', dogfood: '.claude/commands' },
   // Process-spine skills payload. Source dir is `spine/`; install target
-  // (and dogfood mirror) is `.claude/skills/`. Same byte-identity invariant
-  // as the other payloads — the dogfood `.claude/skills/` MUST be a
+  // (and dogfood mirror) is the rea-owned subdir `.claude/skills/rea/` (NOT
+  // the bare, shared `.claude/skills/` root). Same byte-identity invariant
+  // as the other payloads — the dogfood `.claude/skills/rea/` MUST be a
   // byte-for-byte mirror of `spine/`.
-  { canonical: 'spine', dogfood: '.claude/skills' },
+  { canonical: 'spine', dogfood: '.claude/skills/rea' },
 ];
 
 /** @param {Pair} pair @returns {DriftResult} */

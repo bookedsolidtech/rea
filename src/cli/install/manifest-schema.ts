@@ -19,7 +19,7 @@ export const SourceKindSchema = z.enum([
   'hook',
   'agent',
   'command',
-  // Process-spine skills (`spine/*.md` → `.claude/skills/`). Distinct
+  // Process-spine skills (`spine/*.md` → `.claude/skills/rea/`). Distinct
   // source-kind from `command` so the spine payload carries its own
   // version-pin + drift scope, separate from the governance
   // `.claude/commands/`. Marker-managed, auto-update, drift-detected

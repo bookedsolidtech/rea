@@ -2560,7 +2560,7 @@ describe('rea doctor — policy-reader tier checks (0.39.0)', () => {
 
 // ── Spine distribution (spec §4): checkSpineInstalled ───────────────────────
 //
-// The process-spine skills payload (`spine/*.md` → `.claude/skills/`) is
+// The process-spine skills payload (`spine/*.md` → `.claude/skills/rea/`) is
 // version-pinned to the rea release. checkSpineInstalled mirrors
 // checkAgentsPresent/checkHooksInstalled and adds the drift dimension the
 // spec requires — the refuse-and-report surface for locally-modified spine
@@ -2576,7 +2576,7 @@ async function spinePayloadNames(): Promise<string[]> {
 }
 
 async function layDownSpine(baseDir: string): Promise<void> {
-  const dst = path.join(baseDir, '.claude', 'skills');
+  const dst = path.join(baseDir, '.claude', 'skills', 'rea');
   await fs.mkdir(dst, { recursive: true });
   for (const name of await spinePayloadNames()) {
     await fs.copyFile(path.join(SPINE_DIR, name), path.join(dst, name));
@@ -2589,13 +2589,13 @@ describe('rea doctor — checkSpineInstalled (spec §4 spine distribution)', () 
     await Promise.all(cleanup.splice(0).map((d) => fs.rm(d, { recursive: true, force: true })));
   });
 
-  it('warns (not fails) when .claude/skills/ is absent — upgrade-lag signal', async () => {
+  it('warns (not fails) when .claude/skills/rea/ is absent — upgrade-lag signal', async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'rea-spine-'));
     cleanup.push(dir);
     const r = checkSpineInstalled(dir);
     expect(r.status).toBe('warn');
-    // Names the inspected path AND the next step.
-    expect(r.detail).toContain(path.join(dir, '.claude', 'skills'));
+    // Names the inspected path (the rea-owned subdir) AND the next step.
+    expect(r.detail).toContain(path.join(dir, '.claude', 'skills', 'rea'));
     expect(r.detail).toMatch(/rea upgrade/);
   });
 
@@ -2615,7 +2615,7 @@ describe('rea doctor — checkSpineInstalled (spec §4 spine distribution)', () 
     await layDownSpine(dir);
     const names = await spinePayloadNames();
     const victim = names.find((n) => n === 'grill.md') ?? names[0]!;
-    await fs.writeFile(path.join(dir, '.claude', 'skills', victim), '# local edit\n', 'utf8');
+    await fs.writeFile(path.join(dir, '.claude', 'skills', 'rea', victim), '# local edit\n', 'utf8');
     const r = checkSpineInstalled(dir);
     expect(r.status).toBe('warn');
     expect(r.detail).toContain(victim);
@@ -2629,7 +2629,7 @@ describe('rea doctor — checkSpineInstalled (spec §4 spine distribution)', () 
     await layDownSpine(dir);
     const names = await spinePayloadNames();
     const victim = names[0]!;
-    await fs.rm(path.join(dir, '.claude', 'skills', victim));
+    await fs.rm(path.join(dir, '.claude', 'skills', 'rea', victim));
     const r = checkSpineInstalled(dir);
     expect(r.status).toBe('warn');
     expect(r.detail).toContain(victim);
@@ -2665,6 +2665,20 @@ describe('rea doctor — checkTokenEconomy (D5 advisory budget)', () => {
     await writeSkill(path.join(dir, '.claude', 'skills'), 'a', 'x');
     await writeSkill(path.join(dir, '.claude', 'skills'), 'b', 'x');
     await writeSkill(path.join(dir, '.claude', 'commands'), 'c', 'x');
+    const r = checkTokenEconomy(dir);
+    expect(r.status).toBe('info');
+    expect(r.detail).toContain('3/15 user-invoked skills');
+  });
+
+  it('counts rea-owned spine skills in .claude/skills/rea without double-counting the bare root', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'rea-tok-'));
+    cleanup.push(dir);
+    // One user skill at the shared bare root, two spine skills in the
+    // rea-owned subdir. The bare-root read is non-recursive, so the `rea/`
+    // subdir must contribute exactly its own two files (no double count).
+    await writeSkill(path.join(dir, '.claude', 'skills'), 'user', 'x');
+    await writeSkill(path.join(dir, '.claude', 'skills', 'rea'), 'grill', 'x');
+    await writeSkill(path.join(dir, '.claude', 'skills', 'rea'), 'implement', 'x');
     const r = checkTokenEconomy(dir);
     expect(r.status).toBe('info');
     expect(r.detail).toContain('3/15 user-invoked skills');

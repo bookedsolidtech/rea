@@ -110,13 +110,19 @@ export async function enumerateCanonicalFiles(
       mode: 0o644,
     },
     // Process-spine skills. Source dir is `spine/`; install target is the
-    // DEDICATED `.claude/skills/` (kept distinct from the governance
-    // `.claude/commands/` so the spine has its own version-pin + drift
-    // scope). Enumerated here so `rea init` records SHAs, `rea upgrade`
-    // classifies each spine file (new/unmodified/drifted/removed-upstream)
-    // and refreshes/version-pins it, and `rea doctor --drift` reports drift
-    // — all via the SAME machinery as commands/agents, no new mechanism.
-    { srcDir: path.join(pkgRoot, 'spine'), dstPrefix: '.claude/skills', source: 'skill', mode: 0o644 },
+    // rea-OWNED subdir `.claude/skills/rea/` — NOT the bare `.claude/skills/`
+    // root. `.claude/skills/` is a SHARED namespace (Claude Code operators
+    // drop their own skills there), and the spine ships GENERIC filenames
+    // (`implement.md`, `README.md`, …). Recording those under the bare root
+    // would make rea's manifest claim ownership of a colliding user file and
+    // later report it as drifted/removed-upstream. Namespacing to a
+    // rea-owned subdir keeps the spine's version-pin + drift scope isolated
+    // from user skills. Enumerated here so `rea init` records SHAs, `rea
+    // upgrade` classifies each spine file (new/unmodified/drifted/
+    // removed-upstream) and refreshes/version-pins it, and `rea doctor
+    // --drift` reports drift — all via the SAME machinery as commands/agents,
+    // no new mechanism.
+    { srcDir: path.join(pkgRoot, 'spine'), dstPrefix: '.claude/skills/rea', source: 'skill', mode: 0o644 },
     { srcDir: path.join(pkgRoot, '.husky'), dstPrefix: '.husky', source: 'husky', mode: 0o755 },
   ];
   const out: CanonicalFile[] = [];

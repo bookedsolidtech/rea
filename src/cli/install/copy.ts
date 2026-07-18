@@ -92,9 +92,10 @@ export interface CopyResult {
  * Payload directories `rea init` copies into `.claude/`. Each mapping names
  * a source directory under `PKG_ROOT` and its install target subdirectory
  * under `.claude/`. The two names are usually identical (`hooks` → `hooks`),
- * but the spine payload deliberately diverges — `spine/` installs to
- * `.claude/skills/` so it carries its own version-pin + drift scope,
- * distinct from the governance `.claude/commands/`. Mirrors the DirMapping
+ * but the spine payload deliberately diverges — `spine/` installs to the
+ * rea-owned subdir `.claude/skills/rea/` (NOT the bare, shared
+ * `.claude/skills/` root) so it carries its own version-pin + drift scope
+ * and never collides with a user's own skills. Mirrors the DirMapping
  * set in `install/canonical.ts` (which drives the manifest + upgrade +
  * doctor-drift surfaces).
  */
@@ -111,11 +112,12 @@ const COPY_DIRS: readonly CopyMapping[] = [
   { src: 'hooks', dst: 'hooks', executable: true },
   { src: 'commands', dst: 'commands', executable: false },
   { src: 'agents', dst: 'agents', executable: false },
-  // Process-spine skills — `spine/` → `.claude/skills/`. Same copy/skip/
+  // Process-spine skills — `spine/` → `.claude/skills/rea/` (rea-owned
+  // subdir, not the shared `.claude/skills/` root). Same copy/skip/
   // overwrite conflict policy as the other payloads, so re-running `rea
   // init` under `--yes` skips existing spine files (never a silent
   // overwrite of a consumer edit) and byte-identical output is preserved.
-  { src: 'spine', dst: 'skills', executable: false },
+  { src: 'spine', dst: 'skills/rea', executable: false },
 ];
 
 /**

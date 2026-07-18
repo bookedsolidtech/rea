@@ -300,37 +300,37 @@
       "source": "command"
     },
     {
-      "path": ".claude/skills/README.md",
+      "path": ".claude/skills/rea/README.md",
       "sha256": "4e094488b695bb96a207dea8ce46b1fa27b76bd1b73fa26f605f23fbe0fd5ad5",
       "source": "skill"
     },
     {
-      "path": ".claude/skills/code-review.md",
+      "path": ".claude/skills/rea/code-review.md",
       "sha256": "a866cd18d58b19004f704cb589cdd0cd3badf0f73cdc9868d5410f95d9f06d7c",
       "source": "skill"
     },
     {
-      "path": ".claude/skills/grill.md",
+      "path": ".claude/skills/rea/grill.md",
       "sha256": "99fd68094c10ad60b9aa0e1d4f1bd789d0db91aaeaeb43faf53ca78945479029",
       "source": "skill"
     },
     {
-      "path": ".claude/skills/implement.md",
+      "path": ".claude/skills/rea/implement.md",
       "sha256": "1c6e338529c145c1f59472c16f858308078ecfe1308292dcb1b1ccc84fee4620",
       "source": "skill"
     },
     {
-      "path": ".claude/skills/to-spec.md",
+      "path": ".claude/skills/rea/to-spec.md",
       "sha256": "45d01960ea386e87dea112cf78d1ebb35b9890ac3764a95a6b89331c2435b5a4",
       "source": "skill"
     },
     {
-      "path": ".claude/skills/to-tickets.md",
+      "path": ".claude/skills/rea/to-tickets.md",
       "sha256": "4927a7d6f8672b1221083463dce666b70e0c056d7b59ed0b34e6006c85827638",
       "source": "skill"
     },
     {
-      "path": ".claude/skills/wayfinder.md",
+      "path": ".claude/skills/rea/wayfinder.md",
       "sha256": "6386d0ddc35e94ec946d00a8464254b826a575686be558c1acc97b4d010a5cd1",
       "source": "skill"
     },

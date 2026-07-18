@@ -346,7 +346,7 @@ function readSpinePayloadFiles(): string[] | null {
 /**
  * Spine (process-spine skills) install + drift check.
  *
- * The spine payload (`spine/*.md` → `.claude/skills/`) ships with every
+ * The spine payload (`spine/*.md` → `.claude/skills/rea/`) ships with every
  * `rea init`/`rea upgrade`, version-pinned to the rea release. This mirrors
  * `checkAgentsPresent`/`checkHooksInstalled` for the skills payload and adds
  * the drift dimension the spec (§4) requires: it reports when an installed
@@ -360,7 +360,7 @@ function readSpinePayloadFiles(): string[] | null {
  * Every branch names the path inspected and a concrete next step.
  *
  *   - info  — payload dir unreadable (broken rea install; nothing to compare).
- *   - warn  — `.claude/skills/` absent (pre-spine install — run `rea upgrade`).
+ *   - warn  — `.claude/skills/rea/` absent (pre-spine install — run `rea upgrade`).
  *   - warn  — one+ payload files missing on disk (partial install).
  *   - warn  — one+ installed files drift from the release payload
  *             (locally modified — `rea upgrade` restores canonical, or keep
@@ -379,7 +379,7 @@ export function checkSpineInstalled(baseDir: string): CheckResult {
       detail: `spine payload not found at ${path.join(PKG_ROOT, 'spine')} — cannot verify skills install`,
     };
   }
-  const skillsDir = path.join(baseDir, '.claude', 'skills');
+  const skillsDir = path.join(baseDir, '.claude', 'skills', 'rea');
   if (!fs.existsSync(skillsDir)) {
     return {
       label,
@@ -444,9 +444,12 @@ export function checkSpineInstalled(baseDir: string): CheckResult {
  *
  * When either cap is exceeded it warns and flags the quarterly prune ritual.
  *
- * Counting: a "user-invoked skill" is any `.md` file — under BOTH
- * `.claude/skills/` and `.claude/commands/` (both are `/name`-invocable) —
- * that carries a `description:` field in its YAML front-matter. Files
+ * Counting: a "user-invoked skill" is any `.md` file — under the shared
+ * `.claude/skills/` root (user skills), the rea-owned `.claude/skills/rea/`
+ * subdir (the process spine), and `.claude/commands/` (all are
+ * `/name`-invocable) — that carries a `description:` field in its YAML
+ * front-matter. The two skills dirs are read non-recursively, so the
+ * `rea/` subdir is not double-counted from the bare-root read. Files
  * without front-matter (e.g. the spine `README.md` index) are not skills
  * and are not counted.
  *
@@ -461,6 +464,7 @@ export function checkTokenEconomy(baseDir: string): CheckResult {
   const TOKEN_CAP = 1000;
   const dirs = [
     path.join(baseDir, '.claude', 'skills'),
+    path.join(baseDir, '.claude', 'skills', 'rea'),
     path.join(baseDir, '.claude', 'commands'),
   ];
   let skillCount = 0;
@@ -3812,15 +3816,16 @@ export function collectChecks(
     checkAgentsPresent(baseDir),
     checkHooksInstalled(baseDir),
     // Spine distribution (spec §4): the process-spine skills payload
-    // (`spine/*.md` → `.claude/skills/`), version-pinned to the rea
+    // (`spine/*.md` → `.claude/skills/rea/`), version-pinned to the rea
     // release. Advisory (warn on absence/drift, never a hard fail) so a
     // fresh install passes and an upgrade-lagged install is nudged, not
     // reddened. Reports drift = the refuse-and-report surface for
     // locally-modified spine files.
     checkSpineInstalled(baseDir),
     // D5 token-economy lint — ADVISORY ONLY (warn/info, never fail).
-    // Counts user-invoked skills across .claude/skills + .claude/commands
-    // and flags the ratified budget (≤15 skills, ≤1000 description tokens).
+    // Counts user-invoked skills across .claude/skills, .claude/skills/rea
+    // (the process spine), and .claude/commands and flags the ratified
+    // budget (≤15 skills, ≤1000 description tokens).
     checkTokenEconomy(baseDir),
     checkWorktreeTopology(baseDir),
     // 0.49.0 brick-state detector. Hook shims installed without a
