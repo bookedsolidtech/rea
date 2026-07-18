@@ -119,6 +119,7 @@ import {
 import { writeHaltFile, sanitizeHaltReason } from '../../cli/freeze.js';
 import { appendAuditRecord } from '../../audit/append.js';
 import { InvocationStatus, Tier } from '../../policy/types.js';
+import { parseTurnBudget, runTurnBudget, type TurnBudgetConfig } from './turn-budget.js';
 
 export type BillingErrorResponse = 'halt' | 'warn' | 'off';
 
@@ -162,6 +163,12 @@ export interface BillingCapHaltOptions {
   reaRoot?: string;
   stdinOverride?: string | Buffer;
   stderrWrite?: (s: string) => void;
+  /**
+   * Per-session id for the turn-budget counter (Artifact Gates §5). Defaults
+   * to `process.env.CLAUDE_SESSION_ID`; when unset the counter degrades to a
+   * single shared `<localRoot>/.rea/turn-count.json`.
+   */
+  sessionId?: string;
 }
 
 export interface BillingCapHaltResult {
@@ -218,6 +225,7 @@ export const BILLING_RE =
 interface RawSpendGovernance {
   enabled?: unknown;
   billing_error_response?: unknown;
+  turn_budget?: unknown;
 }
 
 /**
@@ -267,12 +275,16 @@ interface RawSpendGovernance {
 function readSpendGovernance(reaRoot: string): {
   enabled: boolean;
   mode: BillingErrorResponse;
+  turnBudget: TurnBudgetConfig | null;
 } {
-  const disabled = { enabled: false, mode: 'warn' as BillingErrorResponse };
+  // Turn budget is OPT-IN (absent = off), so every degraded/absent branch
+  // resolves it to `null`. It is only populated from a present, valid
+  // `spend_governance.turn_budget` block.
+  const disabled = { enabled: false, mode: 'warn' as BillingErrorResponse, turnBudget: null };
   // PROTECT = enabled with the SEED default mode `warn` (round-12 P1): a
   // degraded/absent policy detects + banners + audits but does NOT freeze,
   // since a phrase-only global halt is unsafe without endpoint scoping.
-  const protect = { enabled: true, mode: 'warn' as BillingErrorResponse };
+  const protect = { enabled: true, mode: 'warn' as BillingErrorResponse, turnBudget: null };
   const policyPath = path.join(reaRoot, '.rea', 'policy.yaml');
   let raw: string;
   try {
@@ -322,7 +334,10 @@ function readSpendGovernance(reaRoot: string): {
   if (rawMode === 'warn' || rawMode === 'off' || rawMode === 'halt') {
     mode = rawMode;
   }
-  return { enabled, mode };
+  // Artifact Gates §5 — OPT-IN turn budget, read permissively (absent/malformed
+  // = off). Independent of the billing `enabled`/`mode` fields above.
+  const turnBudget = parseTurnBudget(block.turn_budget);
+  return { enabled, mode, turnBudget };
 }
 
 function buildBanner(matched: string, mode: 'halt' | 'warn'): string {
@@ -443,7 +458,29 @@ export async function runBillingCapHalt(
     writeStderr(formatHaltBanner(halt.reason));
     return { exitCode: 2, stderr, action: 'noop', matched: null, haltWritten: false };
   }
-  const { enabled, mode } = readSpendGovernance(reaRoot);
+  const { enabled, mode, turnBudget } = readSpendGovernance(reaRoot);
+
+  // 2a. Turn budget (Artifact Gates §5) — runs on EVERY PostToolUse,
+  //     INDEPENDENT of the billing `enabled`/`mode` fields, so a policy that
+  //     opts out of billing but declares a turn budget still counts. Absent
+  //     block → no-op. Runs after the HALT short-circuit (an already-frozen
+  //     session is not counted). If it writes HALT we return immediately: the
+  //     session is now frozen and re-writing HALT from the billing branch would
+  //     churn the file.
+  if (turnBudget !== null) {
+    const sessionId = options.sessionId ?? process.env.CLAUDE_SESSION_ID;
+    const tb = await runTurnBudget({
+      localRoot: reaRoot,
+      commonRoot,
+      config: turnBudget,
+      ...(sessionId !== undefined ? { sessionId } : {}),
+      stderrWrite: writeStderr,
+    });
+    if (tb.haltWritten) {
+      return { exitCode: 2, stderr, action: 'halt', matched: null, haltWritten: true };
+    }
+  }
+
   if (!enabled || mode === 'off') {
     return { exitCode: 0, stderr, action: 'noop', matched: null, haltWritten: false };
   }

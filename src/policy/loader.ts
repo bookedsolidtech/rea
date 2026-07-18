@@ -486,6 +486,43 @@ const DelegationAdvisoryPolicySchema = z
  * the protective `'halt'`. Every shipped profile still pins the block
  * explicitly for documentation, but absence no longer means disabled.
  */
+/**
+ * Artifact Gates §5 — turn-budget sub-block of `spend_governance`. Makes the
+ * "turn budget" folklore real: the warn/halt turn thresholds that consuming
+ * CLAUDE.md files previously stated in PROSE (relying on the model to remember
+ * and self-enforce) now live in policy and drive AUDITED warn/refuse events
+ * through the `billing-cap-halt` PostToolUse path.
+ *
+ * OPT-IN, ABSENT=disabled (unlike the parent `spend_governance` block, which
+ * is opt-OUT). The sub-block is `.optional()` — a policy that predates this
+ * feature, or simply omits `turn_budget:`, sees NO behavior change: no counter
+ * file, no events. Consumers turn it on by declaring the thresholds.
+ *
+ *   - `warn_turns` — emit an audited `rea.spend.turn_budget_warn` at/after
+ *     this many tool-calls in a session. Once per threshold-crossing, not
+ *     every turn after.
+ *   - `halt_turns` — the `response` fires at/after this many tool-calls.
+ *   - `response` — `warn` (DEFAULT) audits + banners but does NOT freeze;
+ *     `halt` writes `.rea/HALT` (the existing kill-switch) + audits
+ *     `rea.spend.turn_budget_halt` + banners; `off` is a silent no-op.
+ *
+ * `.strict()` so a typo (`warn_turn`, `halt`) fails loudly at load. The
+ * `.refine` rejects `warn_turns > halt_turns` — a warn threshold ABOVE the
+ * halt threshold could never fire (the session freezes/refuses first), so it
+ * is a policy authoring error, caught at load rather than silently dead.
+ */
+const TurnBudgetPolicySchema = z
+  .object({
+    warn_turns: z.number().int().positive(),
+    halt_turns: z.number().int().positive(),
+    response: z.enum(['warn', 'halt', 'off']).default('warn'),
+  })
+  .strict()
+  .refine((v) => v.warn_turns <= v.halt_turns, {
+    message:
+      'spend_governance.turn_budget.warn_turns must be <= halt_turns (a warn threshold above the halt threshold can never fire)',
+  });
+
 const SpendGovernancePolicySchema = z
   .object({
     enabled: z.boolean().default(true),
@@ -498,6 +535,10 @@ const SpendGovernancePolicySchema = z
     // PR2's endpoint registry supplies the provider discriminator that
     // makes freezing safe.
     billing_error_response: z.enum(['halt', 'warn', 'off']).default('warn'),
+    // Artifact Gates §5 turn-budget. OPT-IN: `.optional()` (absent = off),
+    // distinct from the opt-out billing fields above. See
+    // `TurnBudgetPolicySchema`.
+    turn_budget: TurnBudgetPolicySchema.optional(),
   })
   .strict();
 

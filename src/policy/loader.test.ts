@@ -537,3 +537,103 @@ blocked_paths: []
     expect(() => loadPolicy(baseDir)).toThrow(/Invalid policy schema/);
   });
 });
+
+describe('spend_governance.turn_budget policy (Artifact Gates §5)', () => {
+  let baseDir: string;
+
+  const BASE = `version: "1"
+profile: "minimal"
+installed_by: "tester"
+installed_at: "2026-07-04T00:00:00Z"
+autonomy_level: L1
+max_autonomy_level: L2
+promotion_requires_human_approval: true
+block_ai_attribution: true
+blocked_paths: []
+`;
+
+  beforeEach(async () => {
+    baseDir = await fs.mkdtemp(path.join(os.tmpdir(), 'rea-turnbudget-'));
+    await fs.mkdir(path.join(baseDir, '.rea'), { recursive: true });
+    invalidatePolicyCache();
+  });
+  afterEach(async () => {
+    await fs.rm(baseDir, { recursive: true, force: true });
+  });
+
+  async function write(body: string): Promise<void> {
+    await fs.writeFile(path.join(baseDir, '.rea', 'policy.yaml'), body, 'utf8');
+  }
+
+  it('absent turn_budget = feature off (undefined, no change to a pre-existing policy)', async () => {
+    await write(BASE + 'spend_governance:\n  enabled: true\n');
+    const p = loadPolicy(baseDir);
+    expect(p.spend_governance?.turn_budget).toBeUndefined();
+  });
+
+  it('accepts a valid turn_budget and defaults response to warn', async () => {
+    await write(
+      BASE + 'spend_governance:\n  enabled: true\n  turn_budget:\n    warn_turns: 50\n    halt_turns: 100\n',
+    );
+    const p = loadPolicy(baseDir);
+    expect(p.spend_governance?.turn_budget?.warn_turns).toBe(50);
+    expect(p.spend_governance?.turn_budget?.halt_turns).toBe(100);
+    expect(p.spend_governance?.turn_budget?.response).toBe('warn');
+  });
+
+  it('accepts each response enum value (warn|halt|off)', async () => {
+    for (const v of ['warn', 'halt', 'off'] as const) {
+      invalidatePolicyCache();
+      await write(
+        BASE +
+          `spend_governance:\n  enabled: true\n  turn_budget:\n    warn_turns: 10\n    halt_turns: 20\n    response: ${v}\n`,
+      );
+      const p = loadPolicy(baseDir);
+      expect(p.spend_governance?.turn_budget?.response).toBe(v);
+    }
+  });
+
+  it('accepts warn_turns === halt_turns (boundary)', async () => {
+    await write(
+      BASE + 'spend_governance:\n  enabled: true\n  turn_budget:\n    warn_turns: 30\n    halt_turns: 30\n',
+    );
+    const p = loadPolicy(baseDir);
+    expect(p.spend_governance?.turn_budget?.warn_turns).toBe(30);
+    expect(p.spend_governance?.turn_budget?.halt_turns).toBe(30);
+  });
+
+  it('rejects warn_turns > halt_turns (refine)', async () => {
+    await write(
+      BASE + 'spend_governance:\n  enabled: true\n  turn_budget:\n    warn_turns: 100\n    halt_turns: 50\n',
+    );
+    expect(() => loadPolicy(baseDir)).toThrow(/Invalid policy schema/);
+  });
+
+  it('rejects a non-positive / non-integer threshold', async () => {
+    await write(
+      BASE + 'spend_governance:\n  enabled: true\n  turn_budget:\n    warn_turns: 0\n    halt_turns: 10\n',
+    );
+    expect(() => loadPolicy(baseDir)).toThrow(/Invalid policy schema/);
+    invalidatePolicyCache();
+    await write(
+      BASE + 'spend_governance:\n  enabled: true\n  turn_budget:\n    warn_turns: 1.5\n    halt_turns: 10\n',
+    );
+    expect(() => loadPolicy(baseDir)).toThrow(/Invalid policy schema/);
+  });
+
+  it('rejects an unknown sub-field (strict block)', async () => {
+    await write(
+      BASE +
+        'spend_governance:\n  enabled: true\n  turn_budget:\n    warn_turns: 10\n    halt_turns: 20\n    reset_on: session\n',
+    );
+    expect(() => loadPolicy(baseDir)).toThrow(/Invalid policy schema/);
+  });
+
+  it('rejects an unknown response enum value', async () => {
+    await write(
+      BASE +
+        'spend_governance:\n  enabled: true\n  turn_budget:\n    warn_turns: 10\n    halt_turns: 20\n    response: freeze\n',
+    );
+    expect(() => loadPolicy(baseDir)).toThrow(/Invalid policy schema/);
+  });
+});
