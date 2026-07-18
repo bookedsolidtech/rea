@@ -11,6 +11,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { isOlderVersion, runDash, scanForProjects, type DashJson } from './dash.js';
+import { getPkgVersion } from './utils.js';
 import { registerProject, loadRegistry } from '../registry/projects.js';
 import type { TaskRecord } from '../tasks/types.js';
 
@@ -151,6 +152,78 @@ describe('runDash classification', () => {
     const dash = await runJson({});
     expect(dash.deregistered.map((d) => d.project)).toEqual(['rm-rea']);
     expect(dash.groups.health_flags.some((h) => h.flag === 'deregistered')).toBe(true);
+  });
+});
+
+describe('runDash task-store isolation (F1)', () => {
+  it('isolates an unreadable task store to that project and flags it (dash still renders)', async () => {
+    const good = makeProject('good', [task('T-0001', { status: 'in_progress' })]);
+    // Model "exists but can't be read": put a DIRECTORY where tasks.jsonl
+    // should be, so `fs.readFileSync` throws EISDIR — a non-ENOENT read failure
+    // that `readTasks` re-throws (portable, unlike relying on chmod 000 as root).
+    const badDir = path.join(tmp, 'bad');
+    fs.mkdirSync(path.join(badDir, '.rea', 'tasks.jsonl'), { recursive: true });
+    const bad = fs.realpathSync(badDir);
+    await registerProject(good, { name: 'good', reaVersion: '0.51.0' }, registryPath);
+    await registerProject(bad, { name: 'bad', reaVersion: '0.51.0' }, registryPath);
+
+    const dash = await runJson({});
+    // The other project still renders — one bad store does not abort the view.
+    expect(dash.groups.in_flight.map((i) => i.task_id)).toEqual(['T-0001']);
+    // The bad project is surfaced as a per-project health flag, not fatal.
+    expect(
+      dash.groups.health_flags.some((h) => h.project === 'bad' && h.flag === 'tasks_unreadable'),
+    ).toBe(true);
+    // A flagged project is NOT reported as idle.
+    expect(dash.groups.idle.map((p) => p.project)).not.toContain('bad');
+  });
+});
+
+describe('readProjectVersion manifest precedence (F2)', () => {
+  it('prefers the on-disk manifest over a stale registry version for a present project', async () => {
+    const proj = makeProject('upgraded', []);
+    // Registry lags a completed upgrade (best-effort registry write left it old)…
+    await registerProject(proj, { name: 'upgraded', reaVersion: '0.1.0' }, registryPath);
+    // …but the local install-manifest is already current → no stale flag.
+    fs.writeFileSync(
+      path.join(proj, '.rea', 'install-manifest.json'),
+      JSON.stringify({ version: getPkgVersion() }),
+      'utf8',
+    );
+    const dash = await runJson({});
+    expect(
+      dash.groups.health_flags.some(
+        (h) => h.project === 'upgraded' && h.flag === 'stale_version',
+      ),
+    ).toBe(false);
+    // Manifest current + no tasks → the project reads as idle, not flagged.
+    expect(dash.groups.idle.map((p) => p.project)).toContain('upgraded');
+  });
+
+  it('still flags stale_version when the on-disk manifest itself is old', async () => {
+    const proj = makeProject('reallystale', []);
+    await registerProject(proj, { name: 'reallystale', reaVersion: '0.51.0' }, registryPath);
+    fs.writeFileSync(
+      path.join(proj, '.rea', 'install-manifest.json'),
+      JSON.stringify({ version: '0.1.0' }),
+      'utf8',
+    );
+    const dash = await runJson({});
+    expect(
+      dash.groups.health_flags.some(
+        (h) => h.project === 'reallystale' && h.flag === 'stale_version',
+      ),
+    ).toBe(true);
+  });
+
+  it('uses the registry version for a project missing on disk (no manifest to read)', async () => {
+    const proj = makeProject('vanished', []);
+    await registerProject(proj, { name: 'vanished', reaVersion: '0.42.0' }, registryPath);
+    fs.rmSync(proj, { recursive: true, force: true });
+    const dash = await runJson({});
+    expect(dash.missing.map((m) => ({ project: m.project, rea_version: m.rea_version }))).toEqual([
+      { project: 'vanished', rea_version: '0.42.0' },
+    ]);
   });
 });
 

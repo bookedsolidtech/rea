@@ -88,7 +88,11 @@ export interface DashOptions {
   scanRoots?: string[];
 }
 
-export type HealthFlagKind = 'reagent_dir' | 'stale_version' | 'deregistered';
+export type HealthFlagKind =
+  | 'reagent_dir'
+  | 'stale_version'
+  | 'deregistered'
+  | 'tasks_unreadable';
 
 export interface DashItem {
   project: string;
@@ -170,19 +174,27 @@ export function deriveProjectName(projectDir: string): string {
 }
 
 /**
- * Read a project's rea version. Prefers the registry entry (authoritative for
- * "when last registered"), falls back to the on-disk `.rea/install-manifest.json`
- * so per-repo mode works for a project not in the registry. `null` if unknown.
+ * Read a project's rea version. Prefers the on-disk `.rea/install-manifest.json`
+ * — for a PRESENT project the manifest is authoritative for "what is installed
+ * right now". `rea init`/`rea upgrade` treat the registry `rea_version` as
+ * BEST-EFFORT, so a successful upgrade can leave `~/.rea/registry.json` lagging
+ * on an old version while the local manifest is already current; reading the
+ * manifest first keeps `stale_version` reflecting the real install, not a stale
+ * registry cache (F2, round-37). Falls back to the registry entry when the
+ * manifest is absent/unreadable — which is exactly the case for a missing or
+ * deregistered project (its manifest can't be read, so the registry value is
+ * all we have) and for a per-repo view of a project not in the registry.
+ * `null` if unknown.
  */
 function readProjectVersion(projectDir: string, entry: ProjectEntry | undefined): string | null {
-  if (entry !== undefined) return entry.rea_version;
   const manifestPath = path.join(projectDir, '.rea', 'install-manifest.json');
   try {
     const m = JSON.parse(fs.readFileSync(manifestPath, 'utf8')) as { version?: unknown };
     if (typeof m.version === 'string' && m.version.length > 0) return m.version;
   } catch {
-    /* unknown */
+    /* manifest absent/unreadable — fall back to the registry entry */
   }
+  if (entry !== undefined) return entry.rea_version;
   return null;
 }
 
@@ -286,12 +298,31 @@ function classifyProject(
   entry: ProjectEntry | undefined,
   nowMs: number,
 ): ProjectClassification {
-  const tasks = readTasks(projectDir);
+  const health: { flag: HealthFlagKind; detail: string }[] = [];
+  // Isolate a per-project task-store failure (F1, round-37). `readTasks` throws
+  // on a non-ENOENT read error — a `.rea/tasks.jsonl` that exists but can't be
+  // read (permission error / transient FS failure). Because `rea dash`
+  // aggregates many repos, an unhandled throw here takes down the ENTIRE global
+  // view before any project renders. Instead: treat this project's task set as
+  // empty AND raise a `tasks_unreadable` health flag so the operator SEES the
+  // broken store rather than the whole dashboard vanishing. (A missing file
+  // still yields `[]` inside `readTasks` — that is not a failure and is unflagged.)
+  let tasks: TaskRecord[];
+  try {
+    tasks = readTasks(projectDir);
+  } catch (e) {
+    tasks = [];
+    health.push({
+      flag: 'tasks_unreadable',
+      detail: clean(
+        `.rea/tasks.jsonl unreadable: ${e instanceof Error ? e.message : String(e)}`,
+      ),
+    });
+  }
   const awaiting = tasks.filter(isAwaiting);
   const review = tasks.filter((t) => isRecentReview(t, nowMs));
   const inFlight = tasks.filter((t) => t.status === 'in_progress');
 
-  const health: { flag: HealthFlagKind; detail: string }[] = [];
   // Legacy `.reagent/` migration debt.
   try {
     if (fs.statSync(path.join(projectDir, '.reagent')).isDirectory()) {
