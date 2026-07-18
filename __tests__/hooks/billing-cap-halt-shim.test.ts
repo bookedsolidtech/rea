@@ -163,6 +163,86 @@ function bashExists(): boolean {
   return spawnSync('bash', ['--version'], { encoding: 'utf8' }).status === 0;
 }
 
+/**
+ * A benign SUCCESSFUL non-Bash payload whose STDERR carries a billing phrase.
+ * A Write/Edit/Read tool has no shell command/stderr to bill on, so the
+ * billing scan MUST skip it (mirrors the TS hook's `payloadToolName !==
+ * 'Bash'` skip, index.ts step 2b). Marked failed (exit_code 1) to prove the
+ * skip is by TOOL, not by the failure gate.
+ */
+function nonBashFailedPayload(toolName: string, stderr: string): string {
+  return JSON.stringify({
+    tool_name: toolName,
+    tool_input: { file_path: '/x' },
+    tool_response: { stdout: '', stderr, exit_code: 1 },
+  });
+}
+
+/**
+ * codex round-52 P2 — the shim is now registered on PostToolUse/* (the turn
+ * COUNTER must see every tool call), but the billing SCAN stays Bash-only.
+ * These build a node-ABSENT PATH (symlink farm of every PATH executable
+ * except `node`) so the shim takes the NO-NODE coarse branch of
+ * `shim_cli_missing_relevant`, where tool_name is detected via grep/sed
+ * rather than a JSON parser. A provably non-Bash tool must not fail closed
+ * even in that doubly-degraded (no-node AND no-CLI) window.
+ */
+function makeNodeAbsentBin(): string | null {
+  const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'bch-nonode-'));
+  const dirs = (process.env.PATH ?? '').split(':').filter((d) => d.length > 0);
+  const seen = new Set<string>();
+  for (const d of dirs) {
+    let entries: string[];
+    try {
+      entries = fs.readdirSync(d);
+    } catch {
+      continue;
+    }
+    for (const name of entries) {
+      if (name === 'node' || seen.has(name)) continue;
+      seen.add(name);
+      try {
+        fs.symlinkSync(path.join(d, name), path.join(bin, name));
+      } catch {
+        /* dup / race — skip */
+      }
+    }
+  }
+  // Confirm node is truly unreachable via this PATH; if the farm somehow
+  // still resolves node, signal "cannot simulate" so the caller skips.
+  const probe = spawnSync('bash', ['-c', 'command -v node'], {
+    env: { PATH: bin },
+    encoding: 'utf8',
+  });
+  if (probe.status === 0) {
+    fs.rmSync(bin, { recursive: true, force: true });
+    return null;
+  }
+  return bin;
+}
+
+/** Drive the shim with `node` stripped from PATH (CLI also unbuilt). */
+function runShimNodeAbsent(payload: string, policyYaml: string = ENABLED_POLICY): ShimResult | null {
+  const bin = makeNodeAbsentBin();
+  if (bin === null) return null;
+  const tmpdir = fs.mkdtempSync(path.join(os.tmpdir(), 'bch-nonode-proj-'));
+  try {
+    fs.mkdirSync(path.join(tmpdir, '.rea'), { recursive: true });
+    fs.writeFileSync(path.join(tmpdir, '.rea', 'policy.yaml'), policyYaml);
+    const res = spawnSync('bash', [SHIM], {
+      cwd: tmpdir,
+      env: { PATH: bin, CLAUDE_PROJECT_DIR: tmpdir, HOME: process.env.HOME ?? '/tmp' },
+      input: payload,
+      encoding: 'utf8',
+      timeout: 20_000,
+    });
+    return { status: res.status ?? -1, stdout: res.stdout ?? '', stderr: res.stderr ?? '' };
+  } finally {
+    fs.rmSync(tmpdir, { recursive: true, force: true });
+    fs.rmSync(bin, { recursive: true, force: true });
+  }
+}
+
 describe('hooks/billing-cap-halt.sh — CLI-missing strict fail-closed (round-2 P2)', () => {
   it.skipIf(!bashExists())(
     'fails CLOSED (exit 2) on a genuine "spending cap" wall on stderr of a failed command',
@@ -234,6 +314,84 @@ describe('hooks/billing-cap-halt.sh — CLI-missing strict fail-closed (round-2 
       });
       const r = runShimInUnbuiltDir(payload);
       expect(r.status).toBe(0);
+    },
+  );
+});
+
+describe('hooks/billing-cap-halt.sh — Bash-only billing scan on CLI-missing (round-52 P2)', () => {
+  // The widened PostToolUse/* matcher feeds EVERY tool to the shim (the turn
+  // counter needs them). The billing SCAN must stay Bash-only, matching the
+  // TS hook. Before this fix, a FAILING non-Bash tool whose stderr carried a
+  // billing phrase hit the fail-closed billing path and hard-blocked — but
+  // ONLY when the CLI was unavailable (the shim's fallback ignored tool_name).
+
+  // ── node PRESENT (CLI unbuilt): the inline-node channel-extractor path ──
+  it.skipIf(!bashExists())(
+    'node path: FAILING Write with "spending cap" on stderr → NOT relevant → no block (exit 0)',
+    () => {
+      const r = runShimInUnbuiltDir(nonBashFailedPayload('Write', 'Error: spending cap exceeded'));
+      expect(r.status).toBe(0);
+    },
+  );
+
+  it.skipIf(!bashExists())(
+    'node path: FAILING Edit with "insufficient_quota" on stderr → NOT relevant → no block (exit 0)',
+    () => {
+      const r = runShimInUnbuiltDir(nonBashFailedPayload('Edit', '{"code":"insufficient_quota"}'));
+      expect(r.status).toBe(0);
+    },
+  );
+
+  it.skipIf(!bashExists())(
+    'node path CONTROL: a FAILING Bash with "insufficient_quota" still fails closed (exit 2)',
+    () => {
+      const r = runShimInUnbuiltDir(failedPayload('node call.mjs', '{"code":"insufficient_quota"}'));
+      expect(r.status).toBe(2);
+    },
+  );
+
+  // ── node ABSENT (no interpreter): the coarse grep/sed tool_name path ──
+  it.skipIf(!bashExists())(
+    'no-node path: FAILING Write with "spending cap" on stderr → provably non-Bash → no block (exit 0)',
+    () => {
+      const r = runShimNodeAbsent(nonBashFailedPayload('Write', 'Error: spending cap exceeded'));
+      if (r === null) return; // environment could not strip node — skip
+      expect(r.status).toBe(0);
+    },
+  );
+
+  it.skipIf(!bashExists())(
+    'no-node path: FAILING Edit with "insufficient_quota" on stderr → provably non-Bash → no block (exit 0)',
+    () => {
+      const r = runShimNodeAbsent(nonBashFailedPayload('Edit', '{"code":"insufficient_quota"}'));
+      if (r === null) return;
+      expect(r.status).toBe(0);
+    },
+  );
+
+  it.skipIf(!bashExists())(
+    'no-node path CONTROL: a FAILING Bash with "insufficient_quota" still fails closed (exit 2)',
+    () => {
+      const r = runShimNodeAbsent(failedPayload('node call.mjs', 'Error: insufficient_quota'));
+      if (r === null) return;
+      expect(r.status).toBe(2);
+    },
+  );
+
+  it.skipIf(!bashExists())(
+    'no-node path: MALFORMED payload (no determinable tool_name) + billing phrase → stays fail-closed (exit 2, documented degraded window)',
+    () => {
+      // No top-level tool_name AND no node to JSON-parse: the "can't tell"
+      // case is deliberately NOT relaxed — a spend guard must not vanish in a
+      // no-node-AND-no-CLI-AND-unparseable environment. Only the PROVABLY
+      // non-Bash case becomes a skip.
+      const noToolName = JSON.stringify({
+        tool_input: { command: 'node tts.mjs' },
+        tool_response: { stdout: '', stderr: 'FATAL: spending cap exceeded', exit_code: 1 },
+      });
+      const r = runShimNodeAbsent(noToolName);
+      if (r === null) return;
+      expect(r.status).toBe(2);
     },
   );
 });
