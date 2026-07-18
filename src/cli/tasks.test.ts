@@ -126,6 +126,17 @@ describe('activate flips others inactive', () => {
   });
 });
 
+describe('start refuses terminal tasks (round-20 P2)', () => {
+  it('a completed task cannot be reopened via start', () => {
+    runTasksAdd(baseDir, { subject: 'done' });
+    runTasksEvidence(baseDir, 'T-0001', { add: ['docs/proof.md'] });
+    expect(runTasksComplete(baseDir, 'T-0001')).toBe(0);
+    expect(runTasksStart(baseDir, 'T-0001')).toBe(1);
+    expect(errs.join('\n')).toMatch(/completed/i);
+    expect(readTasks(baseDir)[0]?.status).toBe('completed');
+  });
+});
+
 describe('activate refuses terminal tasks (round-16 P2)', () => {
   it('a completed task cannot be re-activated (no contradictory active:true row)', () => {
     runTasksAdd(baseDir, { subject: 'done' });

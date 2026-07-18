@@ -87,12 +87,25 @@ export interface TasksIdOptions {
 
 export function runTasksStart(baseDir: string, id: string, opts: TasksIdOptions = {}): number {
   let updated: TaskRecord | undefined;
+  let terminal: string | undefined;
   updateTasks(baseDir, (tasks) => {
     const t = findTask(tasks, id);
     if (t === undefined) return [];
+    // Round-20 P2: `completed`/`cancelled` are terminal — refuse reopening
+    // them, matching runTasksActivate. Otherwise `complete && start` would
+    // reopen closed work into in_progress and break the lifecycle invariant
+    // the tracker, G1, and rea dash rely on.
+    if (t.status === 'completed' || t.status === 'cancelled') {
+      terminal = t.status;
+      return [];
+    }
     updated = { ...t, status: 'in_progress', updated_at: nowIso() };
     return [updated];
   });
+  if (terminal !== undefined) {
+    err(`Cannot start ${clean(id)}: task is ${terminal}. Terminal tasks cannot be reopened.`);
+    return 1;
+  }
   if (updated === undefined) {
     err(`No such task: ${clean(id)}`);
     return 1;
