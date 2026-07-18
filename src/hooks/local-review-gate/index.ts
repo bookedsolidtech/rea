@@ -66,24 +66,39 @@
  *     from g3_review; `refuse_at` and `bypass_env_var` STILL come from
  *     `review.local_review` (they are NOT duplicated under g3_review).
  *
- * ### The three tiers (mirroring src/cli/gate.ts G1 + verify-gate G2)
+ * ### One resolver, one emitter (three consistent paths)
  *
- *   - `off`     → silent exit 0 (no-op), like `local_review.mode: off`.
- *   - `shadow`  → run the SAME coverage probe (`computePreflight` / the
- *     injected `preflightImpl`); if it WOULD block (no fresh verdict
- *     covers HEAD) append a `rea.gate.g3.shadow` would-block audit entry
- *     and EXIT 0 (allow). NEVER refuses. A would-ALLOW probe is silent
- *     (no audit), exactly as G1/G2 stay silent on a pass.
- *   - `enforce` → identical refuse behavior to legacy enforced (refuse at
- *     the `refuse_at` boundary, honoring `bypass_env_var`), PLUS a
- *     `rea.gate.g3` deny audit entry before the refusal banner.
+ * The effective mode is resolved by ONE shared function,
+ * `resolveEffectiveReviewMode` (src/cli/preflight.ts), consumed by all
+ * three review-gate paths: (a) `rea preflight` CLI, (b) the `.husky/pre-
+ * push` hook (which runs `rea preflight --strict`), and (c) THIS Claude
+ * Code Bash hook. There is no forked precedence rule.
  *
- * ### Fail-safe parity with G1/G2 (UNCERTAIN)
+ * This gate applies ONLY the `off` short-circuit itself (a cheap silent
+ * exit before trigger detection / git spawn). The shadow-vs-enforce
+ * COVERAGE decision AND its `rea.gate.g3[.shadow]` audit emission are
+ * owned SOLELY by `computePreflight`, which re-resolves the same effective
+ * mode:
  *
- * An UNCERTAIN coverage result (the probe throws) resolves per tier:
- * enforce refuses (fail-closed), shadow logs `rea.gate.g3.shadow` +
- * allows, off is silent — mirroring the G1/G2 "UNCERTAIN ≡ REFUSE at
- * enforce only" doctrine.
+ *   - `off`     → silent exit 0 (no-op) — handled here.
+ *   - `shadow`  → preflight logs `rea.gate.g3.shadow` (would-block) and
+ *     returns exit 0; the gate honors that and ALLOWS. NEVER refuses.
+ *   - `enforce` → preflight refuses (exit 2), emitting `rea.gate.g3` when
+ *     g3 is the active driver; the gate renders the Bash-tier banner.
+ *
+ * Because only preflight emits, the Bash-hook path and the husky/CLI path
+ * never double-log and never diverge. The gate is mode-agnostic below the
+ * `off` check: it simply honors preflight's exit code.
+ *
+ * ### Upgrade-path fix (legacy `local_review.mode: off` no longer neuters G3)
+ *
+ * `computePreflight` now resolves the SAME effective mode, so a repo on
+ * `g3_review.mode: enforce` (or `shadow`) with a stale legacy
+ * `review.local_review.mode: off` is governed by G3 — the legacy off-
+ * switch does NOT short-circuit preflight to a clean pass. This is the
+ * exact operator migration path (moving from the old knob to the new
+ * tier) and is now handled in code, replacing the round-13 documentation
+ * caveat.
  *
  * ### Overnight-safe + budget
  *
@@ -92,17 +107,6 @@
  * question is ever introduced (spec §6). G3 inspects the ARTIFACT (the
  * verdict-coverage audit probe) and adds NO subprocess beyond the
  * coverage probe the legacy path already runs (spec §7.3).
- *
- * ### Known interaction (probe inherits legacy mode-off)
- *
- * The shadow/enforce coverage probe is `computePreflight`, which has its
- * OWN `review.local_review.mode: off` short-circuit (exit 0). So to
- * exercise G3 keep `review.local_review.mode` at its default (`enforced`,
- * or simply unset) and let `g3_review.mode` govern the tier — a repo that
- * sets `local_review.mode: off` AND a non-off `g3_review.mode` neuters the
- * probe (it always reports "would allow"). This is deliberate: the probe
- * and its refuse_at/bypass semantics are the local-review layer G3
- * expresses, not a reimplementation.
  */
 
 import type { Buffer } from 'node:buffer';
@@ -123,19 +127,23 @@ import {
 import fs from 'node:fs';
 import path from 'node:path';
 import { parse as parseYaml } from 'yaml';
-import { computePreflight } from '../../cli/preflight.js';
+import {
+  computePreflight,
+  resolveEffectiveReviewMode,
+  G3_TOOL_NAME,
+  G3_SHADOW_TOOL_NAME,
+} from '../../cli/preflight.js';
 import type { GateMode } from '../../policy/types.js';
-import { appendAuditRecord, InvocationStatus, Tier } from '../../audit/append.js';
 
-/** Canonical audit tool name for an enforced G3 refusal. */
-export const G3_TOOL_NAME = 'rea.gate.g3' as const;
 /**
- * Shadow audit tool name — a would-block event that never blocks. A
- * distinct sibling name (like `rea.gate.g1.shadow` / `rea.gate.g2.shadow`)
- * that no coverage accept-list consults.
+ * The G3 gate audit tool names are DEFINED in the coverage engine
+ * (`src/cli/preflight.ts`), which is the SOLE emitter of `rea.gate.g3` /
+ * `rea.gate.g3.shadow` records — the Bash hook here delegates the coverage
+ * decision (and thus the emission) to `computePreflight`, so the husky
+ * pre-push path and this path stay byte-consistent. Re-exported so
+ * existing importers/tests of this module keep resolving them.
  */
-export const G3_SHADOW_TOOL_NAME = 'rea.gate.g3.shadow' as const;
-const G3_SERVER_NAME = 'rea' as const;
+export { G3_TOOL_NAME, G3_SHADOW_TOOL_NAME };
 
 export interface LocalReviewGateOptions {
   reaRoot?: string;
@@ -170,7 +178,6 @@ export interface LocalReviewGateResult {
     | 'bypass-inline'
     | 'preflight-allow'
     | 'preflight-refuse'
-    | 'g3-shadow'
     | 'malformed-payload';
 }
 
@@ -506,17 +513,23 @@ export async function runLocalReviewGate(
     return { exitCode: 2, stderr, decision: 'halt' };
   }
 
-  // 3. Read policy + resolve the EFFECTIVE tier (G3 precedence).
-  //    When `artifact_gates.g3_review.mode` is present it is AUTHORITATIVE
-  //    over `review.local_review.mode`; otherwise the legacy mode drives.
+  // 3. Read policy + resolve the EFFECTIVE tier (G3 precedence) via the
+  //    SHARED resolver in src/cli/preflight.ts — the SAME function
+  //    `rea preflight` (husky pre-push + coverage engine) uses, so all
+  //    three review-gate paths agree on the tier. When
+  //    `artifact_gates.g3_review.mode` is present it is AUTHORITATIVE over
+  //    `review.local_review.mode`; otherwise the legacy mode drives.
   //    `refuse_at` / `bypass_env_var` always come from `review.local_review`.
+  //
+  //    The gate applies ONLY the `off` short-circuit here. The
+  //    shadow-vs-enforce COVERAGE decision (and its `rea.gate.g3[.shadow]`
+  //    audit emission) is owned by `computePreflight`, which re-resolves
+  //    the same effective mode — so a legacy `local_review.mode: off` can
+  //    NEVER neuter an active `g3_review.mode` (the round-13 caveat is now
+  //    handled, not documented): under shadow/enforce the effective mode
+  //    is NOT `off`, the gate proceeds, and preflight governs coverage.
   const policy = loadLocalReviewPolicy(reaRoot);
-  const g3Active = policy.g3Mode !== undefined;
-  const effectiveMode: GateMode = g3Active
-    ? (policy.g3Mode as GateMode)
-    : policy.mode === 'off'
-      ? 'off'
-      : 'enforce';
+  const effectiveMode: GateMode = resolveEffectiveReviewMode(policy.g3Mode, policy.mode);
   // mode=off → silent no-op BEFORE any other work (mirrors 0.32.0 round-6
   // P2 fix: short-circuit before CLI checks). Covers BOTH `g3_review.mode:
   // off` and legacy `local_review.mode: off`; HALT above still wins.
@@ -567,7 +580,18 @@ export async function runLocalReviewGate(
     return { exitCode: 0, stderr, decision: 'bypass-inline' };
   }
 
-  // 8. Run the coverage probe in-process (the ARTIFACT check — no model).
+  // 8. Delegate the coverage decision to `computePreflight` — the SINGLE
+  //    coverage engine. It re-resolves the SAME effective mode (shared
+  //    resolver) and owns the tri-state coverage outcome AND its
+  //    `rea.gate.g3[.shadow]` audit emission:
+  //      - `off`     → clean (already short-circuited above).
+  //      - `shadow`  → logs `rea.gate.g3.shadow`, returns exit 0 (allow).
+  //      - `enforce` → refuses (exit 2), emits `rea.gate.g3` when g3-active.
+  //    The gate therefore just honors the exit code: 0 → allow (fresh
+  //    verdict OR a shadow would-block that preflight logged-not-refused);
+  //    non-zero → refuse with the friendly Bash-tier banner. Emitting the
+  //    audit ONLY in preflight guarantees the husky/CLI path and this Bash
+  //    path never double-log and never diverge.
   const preflightFn =
     options.preflightImpl ?? (async (root: string) => {
       // Round-10 P1b: pushes get the pristine-tree coverage fallback;
@@ -583,72 +607,32 @@ export async function runLocalReviewGate(
       };
     });
 
-  // Best-effort audit sink — an append failure NEVER changes the verdict
-  // (mirrors src/cli/gate.ts G1 + verify-gate G2). Audit lands on the
-  // COMMON (repository) root.
-  const audit = async (
-    toolNameForRecord: string,
-    status: InvocationStatus,
-    metadata: Record<string, unknown>,
-  ): Promise<void> => {
-    try {
-      await appendAuditRecord(commonRoot, {
-        tool_name: toolNameForRecord,
-        server_name: G3_SERVER_NAME,
-        tier: Tier.Write,
-        status,
-        metadata,
-      });
-    } catch {
-      /* best-effort */
-    }
-  };
-
-  // 9. Resolve a WOULD-BLOCK coverage result through the effective tier.
-  //    Reached only for shadow/enforce (off short-circuited above).
-  //    - shadow  → audit `rea.gate.g3.shadow` (would-block) + allow.
-  //    - enforce → audit `rea.gate.g3` (deny, only when g3 is active so
-  //      the legacy path stays byte-identical) + refuse banner + exit 2.
-  const resolveBlock = async (
-    exitCode: number,
-    reason: string,
-  ): Promise<LocalReviewGateResult> => {
-    const meta: Record<string, unknown> = {
-      reason,
-      operation: opLabel,
-      refuse_at: policy.refuseAt,
-    };
-    if (effectiveMode === 'shadow') {
-      await audit(G3_SHADOW_TOOL_NAME, InvocationStatus.Allowed, {
-        would_block: true,
-        ...meta,
-      });
-      return { exitCode: 0, stderr, decision: 'g3-shadow' };
-    }
-    // enforce — g3 active emits the deny audit BEFORE the banner; the
-    // legacy path (g3 absent) refuses exactly as pre-G3 with NO audit.
-    if (g3Active) {
-      await audit(G3_TOOL_NAME, InvocationStatus.Denied, meta);
-    }
-    writeStderr(buildRefuseBanner(opLabel, exitCode, policy.bypassEnvVar, reason));
-    return { exitCode: 2, stderr, decision: 'preflight-refuse' };
-  };
-
   let preflight: { exitCode: 0 | 1 | 2; reason: string };
   try {
     preflight = await preflightFn(reaRoot);
   } catch (err) {
-    // Probe throw is UNCERTAIN → fail-safe parity: enforce refuses,
-    // shadow logs+allows (fail-closed posture matches the bash shim).
-    return resolveBlock(2, err instanceof Error ? err.message : String(err));
+    // Probe throw is fail-closed at the Bash tier (matches the bash shim).
+    // computePreflight resolves shadow to a clean exit 0 internally, so a
+    // throw here is a genuine unexpected fault, not a shadow would-block.
+    writeStderr(
+      buildRefuseBanner(
+        opLabel,
+        2,
+        policy.bypassEnvVar,
+        err instanceof Error ? err.message : String(err),
+      ),
+    );
+    return { exitCode: 2, stderr, decision: 'preflight-refuse' };
   }
 
   if (preflight.exitCode === 0) {
-    // Would ALLOW — silent in every tier (like G1/G2 on a pass).
     return { exitCode: 0, stderr, decision: 'preflight-allow' };
   }
 
-  return resolveBlock(preflight.exitCode, preflight.reason);
+  writeStderr(
+    buildRefuseBanner(opLabel, preflight.exitCode, policy.bypassEnvVar, preflight.reason),
+  );
+  return { exitCode: 2, stderr, decision: 'preflight-refuse' };
 }
 
 /**

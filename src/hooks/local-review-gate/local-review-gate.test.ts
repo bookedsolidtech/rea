@@ -20,8 +20,10 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { execFileSync } from 'node:child_process';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { runLocalReviewGate, G3_TOOL_NAME, G3_SHADOW_TOOL_NAME } from './index.js';
+import { invalidatePolicyCache } from '../../policy/loader.js';
 
 const PAYLOAD = (cmd: string, toolName = 'Bash'): string =>
   JSON.stringify({ tool_name: toolName, tool_input: { command: cmd } });
@@ -588,10 +590,20 @@ describe('local-review-gate: payload errors', () => {
 });
 
 // ---------------------------------------------------------------------------
-// G3 (Artifact Gate) — tri-state + SHADOW tier over the review gate.
+// G3 (Artifact Gate) — the review gate's artifact-gates face.
+//
+// ARCHITECTURE: the gate resolves the EFFECTIVE mode via the SHARED
+// `resolveEffectiveReviewMode` (src/cli/preflight.ts) and applies ONLY the
+// `off` short-circuit. The shadow-vs-enforce COVERAGE decision AND its
+// `rea.gate.g3[.shadow]` audit emission are owned by `computePreflight`, so
+// stub-`preflightImpl` tests here cover the gate's off-precedence + its
+// delegation (honor the exit code); the REAL coverage-engine tri-state is
+// exercised in the `integration (real computePreflight)` block below and in
+// src/cli/preflight.g3.test.ts. This is what keeps the Bash-hook path and
+// the husky/CLI path from diverging.
 // ---------------------------------------------------------------------------
 
-/** Policy body carrying an artifact_gates.g3_review.mode tier. */
+/** Tolerant policy body carrying an artifact_gates.g3_review.mode tier. */
 function g3Body(mode: 'off' | 'shadow' | 'enforce', localReviewMode = 'enforced'): string {
   return `review:
   local_review:
@@ -603,7 +615,12 @@ artifact_gates:
 `;
 }
 
-describe('local-review-gate G3: legacy invariant (g3_review absent)', () => {
+/** A preflight stub that MUST NOT be reached (asserts a short-circuit). */
+const unreachablePreflight = async (): Promise<{ exitCode: 0 | 1 | 2; reason: string }> => {
+  throw new Error('preflight must not be called — gate should have short-circuited');
+};
+
+describe('local-review-gate G3: effective-mode off short-circuit (precedence)', () => {
   let root: string;
   beforeEach(() => {
     root = mkRoot();
@@ -612,56 +629,28 @@ describe('local-review-gate G3: legacy invariant (g3_review absent)', () => {
     fs.rmSync(root, { recursive: true, force: true });
   });
 
-  it('enforce refuse emits NO g3 audit (byte-identical to pre-G3)', async () => {
-    // No artifact_gates block → legacy review.local_review path only.
-    writePolicy(root);
-    const r = await runLocalReviewGate({
-      reaRoot: root,
-      stdinOverride: PAYLOAD('git push origin main'),
-      envOverride: {},
-      preflightImpl: refusePreflight,
-    });
-    expect(r.exitCode).toBe(2);
-    expect(r.decision).toBe('preflight-refuse');
-    // The load-bearing invariant: absent g3 → no gate audit records.
-    expect(auditContains(root, G3_TOOL_NAME)).toBe(false);
-    expect(auditContains(root, G3_SHADOW_TOOL_NAME)).toBe(false);
-  });
-});
-
-describe('local-review-gate G3: off tier', () => {
-  let root: string;
-  beforeEach(() => {
-    root = mkRoot();
-  });
-  afterEach(() => {
-    fs.rmSync(root, { recursive: true, force: true });
-  });
-
-  it('g3_review.mode: off → silent exit 0, no audit', async () => {
+  it('g3_review.mode: off → silent mode-off exit 0 (probe never called)', async () => {
     writePolicy(root, g3Body('off'));
     const r = await runLocalReviewGate({
       reaRoot: root,
       stdinOverride: PAYLOAD('git push origin main'),
       envOverride: {},
-      preflightImpl: refusePreflight,
+      preflightImpl: unreachablePreflight,
     });
     expect(r.exitCode).toBe(0);
     expect(r.decision).toBe('mode-off');
     expect(r.stderr).toBe('');
-    expect(auditContains(root, G3_TOOL_NAME)).toBe(false);
-    expect(auditContains(root, G3_SHADOW_TOOL_NAME)).toBe(false);
   });
 
   it('g3 off is AUTHORITATIVE over legacy local_review.mode: enforced', async () => {
     // Precedence: g3 present → g3 wins. Legacy enforced would refuse, but
-    // g3 off silences the gate.
+    // g3 off silences the gate before the probe.
     writePolicy(root, g3Body('off', 'enforced'));
     const r = await runLocalReviewGate({
       reaRoot: root,
       stdinOverride: PAYLOAD('git push origin main'),
       envOverride: {},
-      preflightImpl: refusePreflight,
+      preflightImpl: unreachablePreflight,
     });
     expect(r.exitCode).toBe(0);
     expect(r.decision).toBe('mode-off');
@@ -683,16 +672,42 @@ artifact_gates:
       reaRoot: root,
       stdinOverride: PAYLOAD('git push origin main'),
       envOverride: {},
-      preflightImpl: refusePreflight,
+      preflightImpl: unreachablePreflight,
     });
     expect(r.exitCode).toBe(0);
     expect(r.decision).toBe('mode-off');
-    expect(auditContains(root, G3_TOOL_NAME)).toBe(false);
-    expect(auditContains(root, G3_SHADOW_TOOL_NAME)).toBe(false);
+  });
+
+  it('g3 shadow does NOT short-circuit off — gate proceeds to the probe', async () => {
+    writePolicy(root, g3Body('shadow'));
+    const r = await runLocalReviewGate({
+      reaRoot: root,
+      stdinOverride: PAYLOAD('git push origin main'),
+      envOverride: {},
+      // Real preflight resolves shadow to a clean exit 0; the stub stands in.
+      preflightImpl: allowPreflight,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(r.decision).toBe('preflight-allow');
+  });
+
+  it('g3 enforce + legacy off does NOT short-circuit — legacy off no longer neuters (upgrade path)', async () => {
+    // The exact operator migration: moving from the old knob to the new tier
+    // while the stale `local_review.mode: off` lingers. The gate must NOT
+    // treat that as mode-off; it proceeds, and (real) preflight enforces.
+    writePolicy(root, g3Body('enforce', 'off'));
+    const r = await runLocalReviewGate({
+      reaRoot: root,
+      stdinOverride: PAYLOAD('git push origin main'),
+      envOverride: {},
+      preflightImpl: refusePreflight,
+    });
+    expect(r.exitCode).toBe(2);
+    expect(r.decision).toBe('preflight-refuse');
   });
 });
 
-describe('local-review-gate G3: shadow tier', () => {
+describe('local-review-gate G3: delegates coverage verdict to preflight', () => {
   let root: string;
   beforeEach(() => {
     root = mkRoot();
@@ -701,24 +716,8 @@ describe('local-review-gate G3: shadow tier', () => {
     fs.rmSync(root, { recursive: true, force: true });
   });
 
-  it('coverage ABSENT → logs rea.gate.g3.shadow would-block + exit 0', async () => {
-    writePolicy(root, g3Body('shadow'));
-    const r = await runLocalReviewGate({
-      reaRoot: root,
-      stdinOverride: PAYLOAD('git push origin main'),
-      envOverride: {},
-      preflightImpl: refusePreflight,
-    });
-    expect(r.exitCode).toBe(0);
-    expect(r.decision).toBe('g3-shadow');
-    expect(r.stderr).toBe('');
-    expect(auditContains(root, G3_SHADOW_TOOL_NAME)).toBe(true);
-    // Shadow NEVER emits the enforce (deny) record.
-    expect(auditContains(root, G3_TOOL_NAME)).toBe(false);
-  });
-
-  it('coverage PRESENT → exit 0, NO shadow audit (pass is silent)', async () => {
-    writePolicy(root, g3Body('shadow'));
+  it('honors a preflight ALLOW (exit 0) → allow', async () => {
+    writePolicy(root, g3Body('enforce'));
     const r = await runLocalReviewGate({
       reaRoot: root,
       stdinOverride: PAYLOAD('git push origin main'),
@@ -727,63 +726,9 @@ describe('local-review-gate G3: shadow tier', () => {
     });
     expect(r.exitCode).toBe(0);
     expect(r.decision).toBe('preflight-allow');
-    expect(auditContains(root, G3_SHADOW_TOOL_NAME)).toBe(false);
-    expect(auditContains(root, G3_TOOL_NAME)).toBe(false);
   });
 
-  it('shadow NEVER refuses — UNCERTAIN (probe throw) logs + allows', async () => {
-    writePolicy(root, g3Body('shadow'));
-    const r = await runLocalReviewGate({
-      reaRoot: root,
-      stdinOverride: PAYLOAD('git push origin main'),
-      envOverride: {},
-      preflightImpl: async () => {
-        throw new Error('probe on fire');
-      },
-    });
-    expect(r.exitCode).toBe(0);
-    expect(r.decision).toBe('g3-shadow');
-    expect(auditContains(root, G3_SHADOW_TOOL_NAME)).toBe(true);
-  });
-
-  it('shadow is AUTHORITATIVE over legacy enforced — does NOT refuse', async () => {
-    // Legacy enforced + no coverage would refuse; g3 shadow downgrades to
-    // log+allow. Proves g3_review.mode wins over review.local_review.mode.
-    writePolicy(root, g3Body('shadow', 'enforced'));
-    const r = await runLocalReviewGate({
-      reaRoot: root,
-      stdinOverride: PAYLOAD('git push origin main'),
-      envOverride: {},
-      preflightImpl: refusePreflight,
-    });
-    expect(r.exitCode).toBe(0);
-    expect(r.decision).toBe('g3-shadow');
-  });
-
-  it('shadow honors process-env bypass (no would-block when bypassed)', async () => {
-    writePolicy(root, g3Body('shadow'));
-    const r = await runLocalReviewGate({
-      reaRoot: root,
-      stdinOverride: PAYLOAD('git push origin main'),
-      envOverride: { REA_SKIP_LOCAL_REVIEW: 'reason' },
-      preflightImpl: refusePreflight,
-    });
-    expect(r.exitCode).toBe(0);
-    expect(r.decision).toBe('bypass-process-env');
-    expect(auditContains(root, G3_SHADOW_TOOL_NAME)).toBe(false);
-  });
-});
-
-describe('local-review-gate G3: enforce tier', () => {
-  let root: string;
-  beforeEach(() => {
-    root = mkRoot();
-  });
-  afterEach(() => {
-    fs.rmSync(root, { recursive: true, force: true });
-  });
-
-  it('coverage ABSENT → refuses with rea.gate.g3 deny + exit 2 + banner', async () => {
+  it('honors a preflight REFUSE (exit 2) → refuse + Bash-tier banner', async () => {
     writePolicy(root, g3Body('enforce'));
     const r = await runLocalReviewGate({
       reaRoot: root,
@@ -794,28 +739,47 @@ describe('local-review-gate G3: enforce tier', () => {
     expect(r.exitCode).toBe(2);
     expect(r.decision).toBe('preflight-refuse');
     expect(r.stderr).toContain('BASH BLOCKED');
-    expect(auditContains(root, G3_TOOL_NAME)).toBe(true);
-    expect(auditContains(root, G3_SHADOW_TOOL_NAME)).toBe(false);
+    expect(r.stderr).toContain('local-first review required');
   });
 
-  it('coverage PRESENT → exit 0, no deny audit', async () => {
+  it('probe throw is fail-closed at the Bash tier (refuse)', async () => {
     writePolicy(root, g3Body('enforce'));
     const r = await runLocalReviewGate({
       reaRoot: root,
       stdinOverride: PAYLOAD('git push origin main'),
       envOverride: {},
-      preflightImpl: allowPreflight,
+      preflightImpl: async () => {
+        throw new Error('probe on fire');
+      },
     });
-    expect(r.exitCode).toBe(0);
-    expect(r.decision).toBe('preflight-allow');
-    expect(auditContains(root, G3_TOOL_NAME)).toBe(false);
+    expect(r.exitCode).toBe(2);
+    expect(r.stderr).toContain('probe on fire');
   });
 
-  it('enforce is AUTHORITATIVE over legacy local_review.mode: off', async () => {
-    // Legacy off would silence the gate; g3 enforce refuses. The injected
-    // probe stub bypasses computePreflight's own legacy mode-off gate,
-    // isolating the precedence assertion to the gate layer.
-    writePolicy(root, g3Body('enforce', 'off'));
+  it('bypass short-circuits BEFORE the probe (enforce tier)', async () => {
+    writePolicy(root, g3Body('enforce'));
+    const r = await runLocalReviewGate({
+      reaRoot: root,
+      stdinOverride: PAYLOAD('REA_SKIP_LOCAL_REVIEW=urgent git push origin main'),
+      envOverride: {},
+      preflightImpl: unreachablePreflight,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(r.decision).toBe('bypass-inline');
+  });
+});
+
+describe('local-review-gate G3: legacy invariant (g3_review absent)', () => {
+  let root: string;
+  beforeEach(() => {
+    root = mkRoot();
+  });
+  afterEach(() => {
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('enforce refuse behaves byte-identically (no artifact_gates block)', async () => {
+    writePolicy(root); // legacy review.local_review path only
     const r = await runLocalReviewGate({
       reaRoot: root,
       stdinOverride: PAYLOAD('git push origin main'),
@@ -824,20 +788,6 @@ describe('local-review-gate G3: enforce tier', () => {
     });
     expect(r.exitCode).toBe(2);
     expect(r.decision).toBe('preflight-refuse');
-    expect(auditContains(root, G3_TOOL_NAME)).toBe(true);
-  });
-
-  it('enforce honors bypass (inline) → exit 0, no deny audit', async () => {
-    writePolicy(root, g3Body('enforce'));
-    const r = await runLocalReviewGate({
-      reaRoot: root,
-      stdinOverride: PAYLOAD('REA_SKIP_LOCAL_REVIEW=urgent git push origin main'),
-      envOverride: {},
-      preflightImpl: refusePreflight,
-    });
-    expect(r.exitCode).toBe(0);
-    expect(r.decision).toBe('bypass-inline');
-    expect(auditContains(root, G3_TOOL_NAME)).toBe(false);
   });
 });
 
@@ -850,32 +800,180 @@ describe('local-review-gate G3: HALT still wins', () => {
     fs.rmSync(root, { recursive: true, force: true });
   });
 
-  it('HALT wins over g3 enforce (exit 2, decision halt, no g3 audit)', async () => {
+  it('HALT wins over g3 enforce (exit 2, decision halt, probe never called)', async () => {
     writePolicy(root, g3Body('enforce'));
     fs.writeFileSync(path.join(root, '.rea', 'HALT'), 'maintenance');
     const r = await runLocalReviewGate({
       reaRoot: root,
       stdinOverride: PAYLOAD('git push origin main'),
       envOverride: {},
-      preflightImpl: refusePreflight,
+      preflightImpl: unreachablePreflight,
     });
     expect(r.exitCode).toBe(2);
     expect(r.decision).toBe('halt');
     expect(r.stderr).toContain('REA HALT: maintenance');
-    expect(auditContains(root, G3_TOOL_NAME)).toBe(false);
   });
 
-  it('HALT wins over g3 shadow (exit 2, decision halt, no shadow audit)', async () => {
+  it('HALT wins over g3 shadow (exit 2, decision halt)', async () => {
     writePolicy(root, g3Body('shadow'));
     fs.writeFileSync(path.join(root, '.rea', 'HALT'), 'maintenance');
     const r = await runLocalReviewGate({
       reaRoot: root,
       stdinOverride: PAYLOAD('git push origin main'),
       envOverride: {},
-      preflightImpl: refusePreflight,
+      preflightImpl: unreachablePreflight,
     });
     expect(r.exitCode).toBe(2);
     expect(r.decision).toBe('halt');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Integration: gate → REAL computePreflight → real audit. Proves the whole
+// chain (Bash hook path) end-to-end: preflight owns the tri-state coverage
+// decision + emission, the gate honors the exit code, and a stale legacy
+// `local_review.mode: off` no longer neuters an active G3.
+// ---------------------------------------------------------------------------
+
+/** Strict-loadable full policy with an artifact_gates.g3_review tier. */
+function writeFullPolicy(
+  root: string,
+  g3: 'off' | 'shadow' | 'enforce' | 'absent',
+  localReviewMode: 'enforced' | 'off' = 'enforced',
+): void {
+  const lines = [
+    'version: "0.54.0"',
+    'profile: open-source-no-codex',
+    'installed_by: t',
+    'installed_at: "2026-07-18T00:00:00Z"',
+    'autonomy_level: L1',
+    'max_autonomy_level: L2',
+    'promotion_requires_human_approval: true',
+    'block_ai_attribution: true',
+    'blocked_paths: []',
+    'protected_paths_relax: []',
+    'notification_channel: ""',
+    'review:',
+    '  local_review:',
+    `    mode: ${localReviewMode}`,
+    '    refuse_at: push',
+  ];
+  if (g3 !== 'absent') {
+    lines.push('artifact_gates:', '  g3_review:', `    mode: ${g3}`);
+  }
+  lines.push('');
+  fs.mkdirSync(path.join(root, '.rea'), { recursive: true });
+  fs.writeFileSync(path.join(root, '.rea', 'policy.yaml'), lines.join('\n'));
+  invalidatePolicyCache(root);
+  invalidatePolicyCache();
+}
+
+describe('local-review-gate G3: integration (real computePreflight)', () => {
+  let root: string;
+  const gitc = (args: string[]): void => {
+    execFileSync('git', args, { cwd: root, stdio: 'pipe' });
+  };
+  beforeEach(() => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'rea-g3-int-'));
+    gitc(['init', '-q']);
+    gitc(['config', 'user.email', 'g3@test.test']);
+    gitc(['config', 'user.name', 'G3']);
+    gitc(['config', 'commit.gpgsign', 'false']);
+    fs.writeFileSync(path.join(root, 'app.ts'), 'export const x = 1;\n');
+    gitc(['add', 'app.ts']);
+    gitc(['commit', '-qm', 'baseline']);
+  });
+  afterEach(() => {
+    invalidatePolicyCache();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('g3 shadow, no coverage → gate ALLOWS + preflight logs rea.gate.g3.shadow', async () => {
+    writeFullPolicy(root, 'shadow');
+    const r = await runLocalReviewGate({
+      reaRoot: root,
+      stdinOverride: PAYLOAD('git push origin main'),
+      envOverride: {},
+    });
+    expect(r.exitCode).toBe(0);
+    expect(r.decision).toBe('preflight-allow');
+    expect(auditContains(root, G3_SHADOW_TOOL_NAME)).toBe(true);
+    expect(auditContains(root, G3_TOOL_NAME)).toBe(false);
+  });
+
+  it('g3 enforce, no coverage → gate REFUSES + preflight logs rea.gate.g3', async () => {
+    writeFullPolicy(root, 'enforce');
+    const r = await runLocalReviewGate({
+      reaRoot: root,
+      stdinOverride: PAYLOAD('git push origin main'),
+      envOverride: {},
+    });
+    expect(r.exitCode).toBe(2);
+    expect(r.decision).toBe('preflight-refuse');
+    expect(r.stderr).toContain('BASH BLOCKED');
+    expect(auditContains(root, G3_TOOL_NAME)).toBe(true);
     expect(auditContains(root, G3_SHADOW_TOOL_NAME)).toBe(false);
+  });
+
+  it('g3 off + legacy enforced → gate mode-off exit 0, NO gate audit', async () => {
+    writeFullPolicy(root, 'off', 'enforced');
+    const r = await runLocalReviewGate({
+      reaRoot: root,
+      stdinOverride: PAYLOAD('git push origin main'),
+      envOverride: {},
+    });
+    expect(r.exitCode).toBe(0);
+    expect(r.decision).toBe('mode-off');
+    expect(auditContains(root, G3_TOOL_NAME)).toBe(false);
+    expect(auditContains(root, G3_SHADOW_TOOL_NAME)).toBe(false);
+  });
+
+  it('UPGRADE PATH: g3 enforce + legacy off → still REFUSES + logs rea.gate.g3 (F2 fix)', async () => {
+    writeFullPolicy(root, 'enforce', 'off');
+    const r = await runLocalReviewGate({
+      reaRoot: root,
+      stdinOverride: PAYLOAD('git push origin main'),
+      envOverride: {},
+    });
+    expect(r.exitCode).toBe(2);
+    expect(r.decision).toBe('preflight-refuse');
+    expect(auditContains(root, G3_TOOL_NAME)).toBe(true);
+  });
+
+  it('g3 shadow is AUTHORITATIVE over legacy enforced — logs, does NOT refuse', async () => {
+    writeFullPolicy(root, 'shadow', 'enforced');
+    const r = await runLocalReviewGate({
+      reaRoot: root,
+      stdinOverride: PAYLOAD('git push origin main'),
+      envOverride: {},
+    });
+    expect(r.exitCode).toBe(0);
+    expect(r.decision).toBe('preflight-allow');
+    expect(auditContains(root, G3_SHADOW_TOOL_NAME)).toBe(true);
+  });
+
+  it('LEGACY INVARIANT: g3 absent + legacy enforced, no coverage → refuse, NO gate audit', async () => {
+    writeFullPolicy(root, 'absent', 'enforced');
+    const r = await runLocalReviewGate({
+      reaRoot: root,
+      stdinOverride: PAYLOAD('git push origin main'),
+      envOverride: {},
+    });
+    expect(r.exitCode).toBe(2);
+    expect(r.decision).toBe('preflight-refuse');
+    // The load-bearing invariant: absent g3 emits NO gate records.
+    expect(auditContains(root, G3_TOOL_NAME)).toBe(false);
+    expect(auditContains(root, G3_SHADOW_TOOL_NAME)).toBe(false);
+  });
+
+  it('g3 absent + legacy off → gate mode-off exit 0', async () => {
+    writeFullPolicy(root, 'absent', 'off');
+    const r = await runLocalReviewGate({
+      reaRoot: root,
+      stdinOverride: PAYLOAD('git push origin main'),
+      envOverride: {},
+    });
+    expect(r.exitCode).toBe(0);
+    expect(r.decision).toBe('mode-off');
   });
 });

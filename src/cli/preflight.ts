@@ -45,7 +45,7 @@ import {
 import { CODEX_REVIEW_TOOL_NAME } from '../audit/codex-event.js';
 import { computeTreeToken, EMPTY_TREE_SHA } from '../audit/content-token.js';
 import { readHalt } from '../hooks/push-gate/halt.js';
-import { Tier, InvocationStatus, type Policy } from '../policy/types.js';
+import { Tier, InvocationStatus, type Policy, type GateMode } from '../policy/types.js';
 import { loadPolicyAsync } from '../policy/loader.js';
 import { err, log } from './utils.js';
 
@@ -56,6 +56,42 @@ export const DEFAULT_BYPASS_ENV_VAR = 'REA_SKIP_LOCAL_REVIEW';
 /** Default commit-hygiene thresholds. */
 export const DEFAULT_WARN_AT_COMMITS = 1;
 export const DEFAULT_REFUSE_AT_COMMITS = 5;
+
+/** Canonical audit tool name for an enforced G3 (review-gate) refusal. */
+export const G3_TOOL_NAME = 'rea.gate.g3' as const;
+/**
+ * Shadow audit tool name — a would-block event that never blocks. A
+ * distinct sibling name (like `rea.gate.g1.shadow` / `rea.gate.g2.shadow`)
+ * that no coverage accept-list consults.
+ */
+export const G3_SHADOW_TOOL_NAME = 'rea.gate.g3.shadow' as const;
+/** Server name stamped on G3 gate audit records (matches G1/G2). */
+export const G3_SERVER_NAME = 'rea' as const;
+
+/**
+ * THE single source of truth for the review-gate's EFFECTIVE mode (G3
+ * precedence). `artifact_gates.g3_review.mode`, when PRESENT, is
+ * authoritative and overrides the legacy `review.local_review.mode`;
+ * when ABSENT the legacy mode drives (`off` → off, anything else →
+ * enforce). This one helper is consumed by ALL THREE review-gate paths so
+ * they resolve the tier identically:
+ *
+ *   (a) `rea preflight` (this file — the coverage engine)
+ *   (b) the `.husky/pre-push` hook (runs `rea preflight --strict`)
+ *   (c) the `local-review-gate` Claude Code Bash hook
+ *       (`src/hooks/local-review-gate/index.ts` imports this function)
+ *
+ * `refuse_at` / `bypass_env_var` are NOT part of the tier and continue to
+ * come from `review.local_review` — this helper governs ONLY off/shadow/
+ * enforce.
+ */
+export function resolveEffectiveReviewMode(
+  g3Mode: GateMode | undefined,
+  legacyMode: 'enforced' | 'off' | undefined,
+): GateMode {
+  if (g3Mode !== undefined) return g3Mode;
+  return legacyMode === 'off' ? 'off' : 'enforce';
+}
 
 export interface RunPreflightOptions {
   /**
@@ -135,15 +171,26 @@ export async function computePreflight(
     };
   }
 
-  // Step 1: mode === 'off' → no-op clean exit.
-  const mode = policy?.review?.local_review?.mode ?? 'enforced';
-  if (mode === 'off') {
+  // Step 1: resolve the EFFECTIVE review-gate mode (G3 precedence).
+  // `artifact_gates.g3_review.mode`, when present, overrides the legacy
+  // `review.local_review.mode` via the SHARED resolver — the same
+  // function the local-review-gate Bash hook uses, so the CLI, husky
+  // pre-push, and the Claude Bash hook agree on the tier. `off` → clean
+  // no-op; `shadow` → probe logs but never refuses (handled at step 4);
+  // `enforce` → the historical refuse behavior.
+  const g3Mode = policy?.artifact_gates?.g3_review?.mode;
+  const legacyMode = policy?.review?.local_review?.mode;
+  const effectiveMode = resolveEffectiveReviewMode(g3Mode, legacyMode);
+  const g3Active = g3Mode !== undefined;
+  if (effectiveMode === 'off') {
     return {
       outcome: {
         status: 'clean',
-        reason: 'policy.review.local_review.mode is off',
+        reason: g3Active
+          ? 'artifact_gates.g3_review.mode is off'
+          : 'policy.review.local_review.mode is off',
         exitCode: 0,
-        details: { mode: 'off' },
+        details: { mode: 'off', ...(g3Active ? { g3_review_mode: 'off' } : {}) },
       },
       policy,
     };
@@ -185,6 +232,9 @@ export async function computePreflight(
 
   // Step 3: --no-review-check escape hatch (audit-logged).
   let reviewCheckSkipped = false;
+  // Set when G3 shadow observed absent coverage (logged, not refused) —
+  // used only to render an honest final clean-exit reason.
+  let reviewShadowed = false;
   if (options.noReviewCheck === true) {
     reviewCheckSkipped = true;
     await safeAudit(
@@ -226,27 +276,69 @@ export async function computePreflight(
           : lookup.last_blocking_verdict === 'error'
             ? 'your last local review errored — re-run `rea review` and address findings'
             : 'no recent local-review audit entry covers HEAD';
-      return {
-        outcome: {
-          status: 'refuse',
-          reason,
-          exitCode: 2,
-          details: {
+      // G3 shadow: coverage is absent (would block), but shadow NEVER
+      // refuses — log a `rea.gate.g3.shadow` would-block event and FALL
+      // THROUGH to the commit-hygiene check (a distinct gate). This is
+      // the trial tier that lets an operator watch what enforce WOULD
+      // block before flipping it on. UNCERTAIN parity: a non-git /
+      // token-less probe simply doesn't find coverage, so it lands here
+      // and shadow logs rather than refuses.
+      if (effectiveMode === 'shadow') {
+        await safeGateAudit(
+          commonRoot,
+          G3_SHADOW_TOOL_NAME,
+          InvocationStatus.Allowed,
+          {
+            would_block: true,
+            reason,
             head_sha: headSha,
             content_token: contentToken,
-            max_age_seconds: maxAgeSeconds,
-            bypass_env_var: bypassEnvVar,
-            policy_off_switch: 'policy.review.local_review.mode: off',
             ...(lookup.last_blocking_verdict !== undefined
-              ? {
-                  last_blocking_verdict: lookup.last_blocking_verdict,
-                  last_blocking_timestamp: lookup.last_blocking_timestamp,
-                }
+              ? { last_blocking_verdict: lookup.last_blocking_verdict }
               : {}),
           },
-        },
-        policy,
-      };
+          policy,
+        );
+        reviewShadowed = true;
+        // do NOT return — continue to the commit-count check below.
+      } else {
+        // enforce — the historical refuse. Emit a `rea.gate.g3` deny
+        // event ONLY when g3_review is the active driver, so the pure
+        // legacy `review.local_review` path stays byte-identical (no new
+        // audit records for repos that never opted into artifact gates).
+        if (g3Active) {
+          await safeGateAudit(
+            commonRoot,
+            G3_TOOL_NAME,
+            InvocationStatus.Denied,
+            { reason, head_sha: headSha, content_token: contentToken },
+            policy,
+          );
+        }
+        return {
+          outcome: {
+            status: 'refuse',
+            reason,
+            exitCode: 2,
+            details: {
+              head_sha: headSha,
+              content_token: contentToken,
+              max_age_seconds: maxAgeSeconds,
+              bypass_env_var: bypassEnvVar,
+              policy_off_switch: g3Active
+                ? 'artifact_gates.g3_review.mode: off (or review.local_review.mode: off)'
+                : 'policy.review.local_review.mode: off',
+              ...(lookup.last_blocking_verdict !== undefined
+                ? {
+                    last_blocking_verdict: lookup.last_blocking_verdict,
+                    last_blocking_timestamp: lookup.last_blocking_timestamp,
+                  }
+                : {}),
+            },
+          },
+          policy,
+        };
+      }
     }
   }
 
@@ -294,9 +386,16 @@ export async function computePreflight(
       status: 'clean',
       reason: reviewCheckSkipped
         ? 'review check skipped, commit-hygiene clean'
-        : 'recent local-review audit entry covers HEAD',
+        : reviewShadowed
+          ? 'g3_review shadow: coverage absent (logged, not blocking), commit-hygiene clean'
+          : 'recent local-review audit entry covers HEAD',
       exitCode: 0,
-      details: { head_sha: headSha, content_token: contentToken, commit_count: commitCount },
+      details: {
+        head_sha: headSha,
+        content_token: contentToken,
+        commit_count: commitCount,
+        ...(reviewShadowed ? { g3_review_shadowed: true } : {}),
+      },
     },
     policy,
   };
@@ -704,6 +803,39 @@ async function safeAudit(
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     process.stderr.write(`rea: audit append failed (${toolName}): ${msg}\n`);
+  }
+}
+
+/**
+ * Best-effort emit of a G3 gate audit record (`rea.gate.g3` /
+ * `rea.gate.g3.shadow`). Distinct from {@link safeAudit} in two ways: the
+ * server name is `rea` and the tier is `write`, matching the G1
+ * (`src/cli/gate.ts`) and G2 (`src/hooks/verify-gate`) sibling gates so
+ * the three artifact gates share one audit shape. An append failure NEVER
+ * changes the verdict — the caller's exit code is already decided.
+ */
+async function safeGateAudit(
+  baseDir: string,
+  toolName: string,
+  status: InvocationStatus,
+  metadata: Record<string, unknown>,
+  policy: Policy | undefined,
+): Promise<void> {
+  try {
+    const cleanMeta: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(metadata)) {
+      if (v !== undefined) cleanMeta[k] = v;
+    }
+    await appendAuditRecord(baseDir, {
+      tool_name: toolName,
+      server_name: G3_SERVER_NAME,
+      tier: Tier.Write,
+      status,
+      ...(Object.keys(cleanMeta).length > 0 ? { metadata: cleanMeta } : {}),
+      ...(policy !== undefined ? { policy } : {}),
+    });
+  } catch {
+    /* best-effort — an audit-write failure must not change the verdict */
   }
 }
 
