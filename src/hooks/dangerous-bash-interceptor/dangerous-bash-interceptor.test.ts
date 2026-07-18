@@ -521,7 +521,14 @@ describe('dangerous-bash-interceptor: H16 (alias/function with bypass)', () => {
 
 describe('dangerous-bash-interceptor: H17 (context-protection delegate)', () => {
   let root: string;
+  let savedMarker: string | undefined;
   beforeEach(() => {
+    // Scrub the ambient global env marker so the baseline is UNSANCTIONED
+    // regardless of invocation environment (a delegated runner invokes the
+    // suite with REA_DELEGATED_RUN=1 set, which would globally sanction every
+    // segment and stop H17 from ever firing on these unsanctioned commands).
+    savedMarker = process.env.REA_DELEGATED_RUN;
+    delete process.env.REA_DELEGATED_RUN;
     root = mkRoot();
     fs.mkdirSync(path.join(root, '.rea'), { recursive: true });
     fs.writeFileSync(
@@ -544,6 +551,8 @@ context_protection:
   });
   afterEach(() => {
     fs.rmSync(root, { recursive: true, force: true });
+    if (savedMarker === undefined) delete process.env.REA_DELEGATED_RUN;
+    else process.env.REA_DELEGATED_RUN = savedMarker;
   });
 
   it('blocks a configured delegate prefix', async () => {
@@ -635,7 +644,13 @@ some_legacy_top_level_key:
 
 describe('dangerous-bash-interceptor: H17 sanction + runner normalization (bug H17)', () => {
   let root: string;
+  let savedMarker: string | undefined;
   beforeEach(() => {
+    // Scrub the ambient global env marker so the baseline is UNSANCTIONED —
+    // the command-marker tests use the inline `REA_DELEGATED_RUN=1 <cmd>`
+    // form (parsed from the command STRING) and are unaffected by this.
+    savedMarker = process.env.REA_DELEGATED_RUN;
+    delete process.env.REA_DELEGATED_RUN;
     root = mkRoot();
     fs.mkdirSync(path.join(root, '.rea'), { recursive: true });
     fs.writeFileSync(
@@ -649,6 +664,8 @@ describe('dangerous-bash-interceptor: H17 sanction + runner normalization (bug H
   });
   afterEach(() => {
     fs.rmSync(root, { recursive: true, force: true });
+    if (savedMarker === undefined) delete process.env.REA_DELEGATED_RUN;
+    else process.env.REA_DELEGATED_RUN = savedMarker;
   });
 
   it('the sanctioned marker makes the mandated path traversable (allow, no H17)', async () => {
@@ -670,6 +687,43 @@ describe('dangerous-bash-interceptor: H17 sanction + runner normalization (bug H
     expect(rec).toBeDefined();
     expect(rec?.metadata?.['event']).toBe('delegated_run_sanctioned');
     expect(rec?.metadata?.['sanction_source']).toBe('command_marker');
+  });
+
+  it('the GLOBAL env marker sanctions an unmarked delegate command (source: env)', async () => {
+    // The delegated-runner branch: when REA_DELEGATED_RUN is set in the
+    // PROCESS ENV, every delegate-listed segment is globally sanctioned even
+    // without an inline `REA_DELEGATED_RUN=1` command prefix. This is the
+    // exact code path (envMarkerSet() → source:'env') that has no other
+    // coverage. The block's afterEach restores env, keeping this isolated.
+    process.env.REA_DELEGATED_RUN = '1';
+    try {
+      // `pnpm test` is the shorthand of the delegated `pnpm run test` and
+      // carries NO inline marker — only the ambient env marker sanctions it.
+      const r = await run('pnpm test', root);
+      expect(r.exitCode).toBe(0);
+      expect(r.ids).not.toContain('H17');
+      const auditPath = path.join(root, '.rea', 'audit.jsonl');
+      expect(fs.existsSync(auditPath)).toBe(true);
+      const records = fs
+        .readFileSync(auditPath, 'utf8')
+        .split('\n')
+        .filter((l) => l.length > 0)
+        .map(
+          (l) =>
+            JSON.parse(l) as {
+              tool_name?: string;
+              metadata?: Record<string, unknown>;
+            },
+        );
+      const rec = records.find((x) => x.tool_name === 'rea.context_protection');
+      expect(rec).toBeDefined();
+      expect(rec?.metadata?.['event']).toBe('delegated_run_sanctioned');
+      expect(rec?.metadata?.['sanction_source']).toBe('env');
+    } finally {
+      // Belt-and-suspenders: the afterEach also restores, but never let the
+      // set var leak to a sibling test if an assertion throws mid-body.
+      delete process.env.REA_DELEGATED_RUN;
+    }
   });
 
   it('the coordinator (no marker) is still blocked — shorthand equivalent too', async () => {
