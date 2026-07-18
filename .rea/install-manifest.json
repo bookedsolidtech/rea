@@ -2,7 +2,7 @@
   "version": "0.51.0",
   "profile": "bst-internal",
   "installed_at": "2026-04-18T21:31:41.169Z",
-  "upgraded_at": "2026-07-18T01:10:31.692Z",
+  "upgraded_at": "2026-07-18T03:34:01.354Z",
   "files": [
     {
       "path": ".claude/hooks/_lib/bootstrap-allowlist.sh",
@@ -147,6 +147,11 @@
     {
       "path": ".claude/hooks/settings-protection.sh",
       "sha256": "ee9e5bbb5bf30b1752232b736f4d1389e6af3ca8bde14e98e2558cdc3db63226",
+      "source": "hook"
+    },
+    {
+      "path": ".claude/hooks/verify-gate.sh",
+      "sha256": "e982a3ecb6eac77e95e0e48483265ad00fcdc350137d9bd1c2eb056855823548",
       "source": "hook"
     },
     {
@@ -306,7 +311,7 @@
     },
     {
       "path": ".claude/settings.json#rea:desired",
-      "sha256": "004acbc5fceef77876b6a53d78c339967f61011d2f63dffbb4f842e481bb1df1",
+      "sha256": "35729876c87e8c84334f9c126ea494a0ecee912762fc13825eecb6be73a3fcef",
       "source": "settings"
     },
     {

@@ -114,6 +114,7 @@ function checkSettingsRegistration() {
         'settings-protection.sh',
         'blocked-paths-enforcer.sh',
         'changeset-security-gate.sh',
+        'verify-gate.sh',
       ],
     },
     PostToolUse: {

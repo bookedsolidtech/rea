@@ -421,6 +421,12 @@ export function defaultDesiredHooks(): DesiredHookGroup[] {
           timeout: 5000,
           statusMessage: 'Checking changeset for security leaks...',
         },
+        {
+          type: 'command',
+          command: `${base}/verify-gate.sh`,
+          timeout: 5000,
+          statusMessage: 'Checking task-completion evidence (G2)...',
+        },
       ],
     },
     {

@@ -254,6 +254,15 @@ export const EXPECTED_HOOKS = [
   'secret-scanner.sh',
   'security-disclosure-gate.sh',
   'settings-protection.sh',
+  // 0.54.0 — Artifact Gate G2 (verification-gate). A PreToolUse hook on
+  // Write/Edit to `.rea/tasks.jsonl`; policy-driven and DEFAULT-OFF
+  // (off|shadow|enforce). Added to EXPECTED_HOOKS at ship time (the
+  // three-way canonical invariant requires this list to mirror
+  // `hooks/`); the shim is FAIL-OPEN so a pre-upgrade install is never
+  // BROKEN by its absence — doctor merely flags it missing until the
+  // consumer runs `rea upgrade`, the same upgrade-lag signal
+  // `billing-cap-halt.sh` accepts.
+  'verify-gate.sh',
 ];
 
 function checkAgentsPresent(baseDir: string): CheckResult {
