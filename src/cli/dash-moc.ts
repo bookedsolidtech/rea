@@ -111,6 +111,7 @@ export function renderMoc(dash: DashJson): string {
     g.awaiting.length +
     g.review_queue.length +
     g.in_flight.length +
+    g.ready.length +
     g.health_flags.length +
     dash.hidden.length +
     dash.missing.length +
@@ -129,6 +130,7 @@ export function renderMoc(dash: DashJson): string {
   lines.push(...section('Awaiting ratification / parked blockers', g.awaiting, itemLine));
   lines.push(...section('Review queue', g.review_queue, itemLine));
   lines.push(...section('In flight', g.in_flight, itemLine));
+  lines.push(...section('Ready to start', g.ready, itemLine));
   lines.push(...section('Hidden projects', dash.hidden, hiddenLine));
   lines.push(...section('Health flags', g.health_flags, healthLine));
   lines.push(...section('Deregistered', dash.deregistered, projectLine));

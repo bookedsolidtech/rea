@@ -98,7 +98,7 @@ describe('runDash classification', () => {
       task('T-0002', { status: 'pending', requires_spec: true }), // awaiting (spec gap)
       task('T-0003', { status: 'completed', evidence: ['x'] }), // review (recent)
       task('T-0004', { status: 'in_progress' }), // in flight
-      task('T-0005', { status: 'pending' }), // plain backlog — no group
+      task('T-0005', { status: 'pending' }), // plain backlog — ready to start
     ]);
     await registerProject(proj, { name: 'acme', reaVersion: '0.51.0' }, registryPath);
 
@@ -106,16 +106,44 @@ describe('runDash classification', () => {
     expect(dash.groups.awaiting.map((i) => i.task_id).sort()).toEqual(['T-0001', 'T-0002']);
     expect(dash.groups.review_queue.map((i) => i.task_id)).toEqual(['T-0003']);
     expect(dash.groups.in_flight.map((i) => i.task_id)).toEqual(['T-0004']);
+    // A plain pending task (no blocker, no spec-gap) surfaces as ready-to-start,
+    // NOT swallowed into idle (codex round-40 P2).
+    expect(dash.groups.ready.map((i) => i.task_id)).toEqual(['T-0005']);
     for (const i of [...dash.groups.awaiting, ...dash.groups.review_queue, ...dash.groups.in_flight]) {
       expect(i.project).toBe('acme');
     }
   });
 
-  it('classifies a project with nothing actionable as idle', async () => {
-    const proj = makeProject('quiet', [task('T-0001', { status: 'pending' })]); // plain backlog
+  it('surfaces a plain pending task as ready-to-start, not idle (round-40 P2)', async () => {
+    const proj = makeProject('backlog', [task('T-0001', { status: 'pending' })]); // plain backlog
+    await registerProject(proj, { name: 'backlog', reaVersion: '0.51.0' }, registryPath);
+    const dash = await runJson({});
+    // The "next thing to start" is visible, not swallowed by idle.
+    expect(dash.groups.ready.map((i) => i.task_id)).toEqual(['T-0001']);
+    expect(dash.groups.idle.map((p) => p.project)).not.toContain('backlog');
+    expect(dash.groups.awaiting).toHaveLength(0);
+  });
+
+  it('keeps a blocked pending task in awaiting, never double-counted in ready', async () => {
+    const proj = makeProject('parked', [task('T-0001', { status: 'pending', blocked_by: ['T-9999'] })]);
+    await registerProject(proj, { name: 'parked', reaVersion: '0.51.0' }, registryPath);
+    const dash = await runJson({});
+    expect(dash.groups.awaiting.map((i) => i.task_id)).toEqual(['T-0001']);
+    // A pending-AND-blocked task lands in exactly one group — awaiting, not ready.
+    expect(dash.groups.ready).toHaveLength(0);
+  });
+
+  it('classifies a project with nothing pending/in-flight/recent as idle', async () => {
+    // Only an OLD completed task (aged out of the review window) → genuinely calm.
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-07-18T00:00:00.000Z'));
+    const proj = makeProject('quiet', [
+      task('T-0001', { status: 'completed', evidence: ['x'], updated_at: '2026-06-01T00:00:00.000Z' }),
+    ]);
     await registerProject(proj, { name: 'quiet', reaVersion: '0.51.0' }, registryPath);
     const dash = await runJson({});
     expect(dash.groups.idle.map((p) => p.project)).toEqual(['quiet']);
+    expect(dash.groups.ready).toHaveLength(0);
     expect(dash.groups.awaiting).toHaveLength(0);
   });
 
@@ -386,6 +414,7 @@ describe('runDash quiet + json shape', () => {
       'health_flags',
       'idle',
       'in_flight',
+      'ready',
       'review_queue',
     ]);
     expect(dash).toHaveProperty('hidden');

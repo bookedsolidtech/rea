@@ -23,9 +23,12 @@
  *      Terminal work ages out after `REVIEW_WINDOW_MS`, so a project with only
  *      old completed history falls back to idle rather than nagging forever.
  *   3. In flight — `in_progress` tasks.
- *   4. Health flags — a live `.reagent/` dir (migration debt), or a registry
+ *   4. Ready — plain pending tasks (NOT blocked, NOT a spec-gap): the
+ *      "next thing to start" backlog, e.g. straight after `rea tasks add`.
+ *   5. Health flags — a live `.reagent/` dir (migration debt), or a registry
  *      `rea_version` older than this package (stale spine).
- *   5. Idle / healthy — projects with nothing pending, one collapsed line.
+ *   6. Idle / healthy — projects with nothing pending/in-flight/recent-review,
+ *      one collapsed line.
  *
  * ## Visibility
  *
@@ -129,6 +132,7 @@ export interface DashJson {
     awaiting: DashItem[];
     review_queue: DashItem[];
     in_flight: DashItem[];
+    ready: DashItem[];
     health_flags: DashHealthFlag[];
     idle: DashProjectSummary[];
   };
@@ -151,7 +155,7 @@ function emptyJson(mode: 'global' | 'repo'): DashJson {
     version: '1',
     generated_at: new Date().toISOString(),
     mode,
-    groups: { awaiting: [], review_queue: [], in_flight: [], health_flags: [], idle: [] },
+    groups: { awaiting: [], review_queue: [], in_flight: [], ready: [], health_flags: [], idle: [] },
     hidden: [],
     missing: [],
     deregistered: [],
@@ -255,6 +259,20 @@ function isAwaiting(t: TaskRecord): boolean {
 }
 
 /**
+ * A "ready to start" task: pending, but NEITHER blocked NOR a spec-gap — the
+ * common backlog item that is genuinely actionable right now (e.g. immediately
+ * after `rea tasks add`). Before this bucket existed such a task matched no
+ * group and the project fell through to `idle`, hiding real "next thing to
+ * start" work from the global view (codex round-40 P2). The `!isAwaiting`
+ * guard makes `ready` and `awaiting` mutually exclusive: a pending-AND-blocked
+ * task stays in `awaiting` and is never double-counted here.
+ */
+function isReady(t: TaskRecord): boolean {
+  if (t.status !== 'pending') return false;
+  return !isAwaiting(t);
+}
+
+/**
  * How long a terminal task stays in the review bucket. The review queue surfaces
  * "completed work awaiting operator sign-off" (spec §3.2) — a task the operator
  * still needs to glance at, NOT the project's entire completed history. Without
@@ -290,6 +308,7 @@ interface ProjectClassification {
   awaiting: TaskRecord[];
   review: TaskRecord[];
   inFlight: TaskRecord[];
+  ready: TaskRecord[];
   health: { flag: HealthFlagKind; detail: string }[];
 }
 
@@ -322,6 +341,7 @@ function classifyProject(
   const awaiting = tasks.filter(isAwaiting);
   const review = tasks.filter((t) => isRecentReview(t, nowMs));
   const inFlight = tasks.filter((t) => t.status === 'in_progress');
+  const ready = tasks.filter(isReady);
 
   // Legacy `.reagent/` migration debt.
   try {
@@ -340,7 +360,7 @@ function classifyProject(
       detail: `rea ${version} < ${current} — run \`rea upgrade\``,
     });
   }
-  return { awaiting, review, inFlight, health };
+  return { awaiting, review, inFlight, ready, health };
 }
 
 /**
@@ -406,7 +426,7 @@ function buildJson(targets: ProjectTarget[], mode: 'global' | 'repo', all: boole
       });
     }
 
-    const itemCount = c.awaiting.length + c.review.length + c.inFlight.length;
+    const itemCount = c.awaiting.length + c.review.length + c.inFlight.length + c.ready.length;
     const visible = resolveVisible(projectDir, entry, all);
 
     if (!visible) {
@@ -428,6 +448,7 @@ function buildJson(targets: ProjectTarget[], mode: 'global' | 'repo', all: boole
     for (const t of c.awaiting) out.groups.awaiting.push(toItem(t));
     for (const t of c.review) out.groups.review_queue.push(toItem(t));
     for (const t of c.inFlight) out.groups.in_flight.push(toItem(t));
+    for (const t of c.ready) out.groups.ready.push(toItem(t));
 
     if (itemCount === 0 && c.health.length === 0) {
       out.groups.idle.push({ project: name, project_path: projectDir, rea_version: version });
@@ -554,6 +575,11 @@ function renderHuman(dash: DashJson): void {
     for (const i of g.in_flight) lines.push(`  → [${i.project}] ${i.task_id}  ${i.subject}`);
     lines.push('');
   }
+  if (g.ready.length > 0) {
+    lines.push('Ready to start:');
+    for (const i of g.ready) lines.push(`  ○ [${i.project}] ${i.task_id}  ${i.subject}`);
+    lines.push('');
+  }
   if (dash.hidden.length > 0) {
     lines.push('Hidden projects:');
     for (const h of dash.hidden) {
@@ -581,6 +607,7 @@ function renderHuman(dash: DashJson): void {
     g.awaiting.length +
     g.review_queue.length +
     g.in_flight.length +
+    g.ready.length +
     g.health_flags.length +
     dash.hidden.length +
     dash.missing.length +

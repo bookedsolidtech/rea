@@ -26,7 +26,7 @@ function model(over: Partial<DashJson> = {}): DashJson {
     version: '1',
     generated_at: '2026-07-18T00:00:00.000Z',
     mode: 'global',
-    groups: { awaiting: [], review_queue: [], in_flight: [], health_flags: [], idle: [] },
+    groups: { awaiting: [], review_queue: [], in_flight: [], ready: [], health_flags: [], idle: [] },
     hidden: [],
     missing: [],
     deregistered: [],
@@ -66,6 +66,15 @@ describe('renderMoc', () => {
               status: 'in_progress',
             },
           ],
+          ready: [
+            {
+              project: 'acme',
+              project_path: '/p/acme',
+              task_id: 'T-0005',
+              subject: 'start the next thing',
+              status: 'pending',
+            },
+          ],
           health_flags: [
             {
               project: 'beta',
@@ -85,6 +94,8 @@ describe('renderMoc', () => {
     expect(md).toContain('**[acme]** `T-0003` — sign off feature');
     expect(md).toContain('## In flight');
     expect(md).toContain('**[beta]** `T-0004` — building the thing');
+    expect(md).toContain('## Ready to start');
+    expect(md).toContain('**[acme]** `T-0005` — start the next thing');
     expect(md).toContain('## Health flags');
     expect(md).toContain('legacy .reagent/ present');
     expect(md).toContain('## Idle / healthy');
@@ -120,6 +131,7 @@ describe('renderMoc', () => {
         ],
         review_queue: [],
         in_flight: [],
+        ready: [],
         health_flags: [],
         idle: [{ project: 'quiet', project_path: '/p/quiet', rea_version: '0.51.0' }],
       },
@@ -129,7 +141,7 @@ describe('renderMoc', () => {
 
   it('renders a quiet system as a short calm block', () => {
     const md = renderMoc(
-      model({ groups: { awaiting: [], review_queue: [], in_flight: [], health_flags: [], idle: [
+      model({ groups: { awaiting: [], review_queue: [], in_flight: [], ready: [], health_flags: [], idle: [
         { project: 'calm', project_path: '/p/calm', rea_version: '0.51.0' },
       ] } }),
     );
@@ -154,6 +166,7 @@ describe('renderMoc', () => {
               status: 'in_progress',
             },
           ],
+          ready: [],
           health_flags: [],
           idle: [],
         },
@@ -232,6 +245,20 @@ describe('runDash --emit-moc', () => {
     // Read-only over task artifacts (spec §5).
     expect(fs.readFileSync(tasksPath, 'utf8')).toBe(before);
     expect(fs.statSync(tasksPath).mtimeMs).toBe(beforeMtime);
+  });
+
+  it('renders a plain pending task in the Ready to start section (round-40 P2)', async () => {
+    const proj = makeProject('acme', [task('T-0001', { status: 'pending' })]); // plain backlog
+    await registerProject(proj, { name: 'acme', reaVersion: '0.51.0' }, registryPath);
+
+    const out = path.join(tmp, 'MV.md');
+    const code = await runDash({ registryPath, emitMoc: true, mocPath: out });
+    expect(code).toBe(0);
+    const md = fs.readFileSync(out, 'utf8');
+    expect(md).toContain('## Ready to start');
+    expect(md).toContain('**[acme]** `T-0001`');
+    // A ready task means the project is NOT rendered as idle.
+    expect(md).not.toContain('All clear');
   });
 
   it('emits to stdout when no path is given', async () => {
