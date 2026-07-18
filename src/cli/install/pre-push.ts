@@ -69,6 +69,14 @@ const execFileAsync = promisify(execFile);
  * classification. Bump the version suffix whenever the body semantics
  * change so upgrades can migrate old installs cleanly.
  *
+ * v7 — round-50/51/54/55 mode-aware fail-closed body: the preflight
+ *      old-CLI compat path is no longer a blanket fail-OPEN. When the
+ *      resolved rea lacks `preflight`, `_rea_review_gate_mode` resolves the
+ *      EFFECTIVE review-gate mode (g3_review authoritative over legacy
+ *      local_review, mirroring resolveEffectiveReviewMode) and the tri-state
+ *      contract applies: enforce → fail CLOSED (exit 2 + CONFIG-ERROR),
+ *      shadow → WARN + allow, off/absent → allow. The body semantics changed,
+ *      so the marker bumps to force `rea init` to rewrite stale v6 installs.
  * v6 — 0.54.0 worktree-aware body: the CLI resolves via a REA_CLI_ROOT
  *      fallback (worktree without its own install → primary checkout,
  *      cross-repo verified) and preflight runs `--operation push`. The
@@ -89,7 +97,10 @@ const execFileAsync = promisify(execFile);
  * v2 — 0.11.0 stateless push-gate body (no bash core, no audit grep).
  * v1 — 0.10.x and prior, delegated to `.claude/hooks/push-review-gate.sh`.
  */
-export const FALLBACK_MARKER = '# rea:pre-push-fallback v6';
+export const FALLBACK_MARKER = '# rea:pre-push-fallback v7';
+
+/** Legacy v6 marker (0.54.x – pre-mode-aware bodies). Refresh-on-upgrade. */
+export const LEGACY_FALLBACK_MARKER_V6 = '# rea:pre-push-fallback v6';
 
 /** Legacy v5 marker (0.26.x – 0.53.x bodies). Refresh-on-upgrade. */
 export const LEGACY_FALLBACK_MARKER_V5 = '# rea:pre-push-fallback v5';
@@ -575,6 +586,7 @@ export function isLegacyReaManagedFallback(content: string): boolean {
   if (secondLineEnd < 0) return false;
   const secondLine = content.slice(10, secondLineEnd);
   return (
+    secondLine === LEGACY_FALLBACK_MARKER_V6 ||
     secondLine === LEGACY_FALLBACK_MARKER_V5 ||
     secondLine === LEGACY_FALLBACK_MARKER_V4 ||
     secondLine === LEGACY_FALLBACK_MARKER_V3 ||
@@ -1036,6 +1048,7 @@ async function cleanupStaleTempFiles(dst: string): Promise<void> {
       if (
         !body.includes(FALLBACK_MARKER) &&
         !body.includes(HUSKY_GATE_MARKER) &&
+        !body.includes(LEGACY_FALLBACK_MARKER_V6) &&
         !body.includes(LEGACY_FALLBACK_MARKER_V4) &&
         !body.includes(LEGACY_HUSKY_GATE_MARKER_V4) &&
         !body.includes(LEGACY_FALLBACK_MARKER_V3) &&

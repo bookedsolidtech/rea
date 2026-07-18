@@ -72,6 +72,7 @@ import { validateSettings } from '../config/settings-schema.js';
 import { ensureReaGitignore } from './install/gitignore.js';
 import { installPrepareCommitMsgHook } from './install/prepare-commit-msg.js';
 import { installPreCommitHook } from './install/pre-commit.js';
+import { installPrePushFallback } from './install/pre-push.js';
 import { checkUpgradeBlockingPin, selfPinRea } from './install/self-pin.js';
 import { manifestExists, readManifest, writeManifestAtomic } from './install/manifest-io.js';
 import { type InstallManifest, type ManifestEntry } from './install/manifest-schema.js';
@@ -866,6 +867,29 @@ export async function runUpgrade(options: UpgradeOptions = {}): Promise<void> {
     } else if (preCommitResult.decision.action === 'skip') {
       warn(`  · .husky/pre-commit (kept; foreign hook detected — see MIGRATING.md)`);
     }
+
+    // Round-55 P1 follow-up — refresh the `.git/hooks/pre-push` FALLBACK on
+    // upgrade too. Unlike `.husky/pre-push` (a canonical file the reconcile
+    // loop above SHA-tracks + refreshes), the vanilla-git fallback lives
+    // OUTSIDE `.claude/`/`.husky/`, so the reconcile loop never sees it — and
+    // before this call `rea upgrade` left a stale rea-managed fallback body in
+    // place (the mode-aware G3 fix reached only re-`rea init` runs). The
+    // installer is marker-classified: it REFRESHES a rea-managed body (incl.
+    // the now-legacy v6) to the current v7 and refuses to touch foreign hooks.
+    // Same shape + reporting as the pre-commit block above.
+    const prePushResult = await installPrePushFallback({ targetDir: resolvedRoot });
+    if (prePushResult.written !== undefined) {
+      const marker = prePushResult.decision.action === 'refresh' ? '~' : '+';
+      console.log(
+        `  ${marker} ${path.relative(resolvedRoot, prePushResult.written)} (pre-push fallback)`,
+      );
+    } else if (
+      prePushResult.decision.action === 'skip' &&
+      prePushResult.decision.reason === 'foreign-pre-push'
+    ) {
+      warn(`  · ${path.relative(resolvedRoot, prePushResult.decision.hookPath)} (kept; foreign pre-push detected — see MIGRATING.md)`);
+    }
+    for (const w of prePushResult.warnings) warn(w);
   }
 
   // 0.49.0 — self-heal legacy installs that pre-date `rea init`'s

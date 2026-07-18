@@ -242,8 +242,24 @@ describe('BODY_TEMPLATE — path-with-spaces portability (Fix A / 0.12.0)', () =
 });
 
 describe('marker bumps (0.26.0 — v5 markers + v4/v3/v2 legacy detection)', () => {
-  it('FALLBACK_MARKER is the v6 marker', () => {
-    expect(FALLBACK_MARKER).toBe('# rea:pre-push-fallback v6');
+  it('FALLBACK_MARKER is the v7 marker (round-50/51/54/55 mode-aware body)', () => {
+    expect(FALLBACK_MARKER).toBe('# rea:pre-push-fallback v7');
+  });
+
+  // Round-55 P1 follow-up: the v6 fallback body predates the mode-aware G3 fix.
+  // A stale v6 install must be classified LEGACY (not current, not foreign) so
+  // `rea init` / `rea upgrade` refresh it in place to the v7 body.
+  it('isLegacyReaManagedFallback recognizes the now-legacy v6 marker (refresh-on-upgrade)', () => {
+    const v6Body = `#!/bin/sh\n# rea:pre-push-fallback v6\n# rea:gate-body-v6\nset -eu\nexec "$@"\n`;
+    expect(isLegacyReaManagedFallback(v6Body)).toBe(true);
+    // and it is NOT mistaken for the current (v7) managed body.
+    expect(isReaManagedFallback(v6Body)).toBe(false);
+  });
+
+  it('the freshly generated fallback body carries the v7 marker + the mode-aware detector', () => {
+    const body = fallbackHookContent();
+    expect(body.split('\n')[1]).toBe('# rea:pre-push-fallback v7');
+    expect(body).toContain('_rea_review_gate_mode');
   });
 
   it('HUSKY_GATE_MARKER and HUSKY_GATE_BODY_MARKER are v6', () => {
@@ -621,6 +637,27 @@ describe('classifyPrePushInstall — decision tree', () => {
     );
     const d = await classifyPrePushInstall(repo);
     expect(d.action).toBe('refresh');
+  });
+
+  // Round-55 P1 follow-up — the exact regression: a stale v6 fallback body
+  // (pre mode-aware G3 fix) must be classified LEGACY and REFRESHED to v7, not
+  // seen as "already current" and left stale.
+  it('refresh when a now-legacy v6 fallback is present, replacing it with the v7 body', async () => {
+    const hp = path.join(repo, '.git/hooks/pre-push');
+    await writeHook(
+      hp,
+      `#!/bin/sh\n# rea:pre-push-fallback v6\n# rea:gate-body-v6\nset -eu\nexec "$@"\n`,
+    );
+    const classified = await classifyExistingHook(hp);
+    expect(classified.kind).toBe('rea-managed-legacy-v1');
+    const d = await classifyPrePushInstall(repo);
+    expect(d.action).toBe('refresh');
+    // Run the install and confirm the body was replaced with the current v7.
+    const res = await installPrePushFallback({ targetDir: repo });
+    expect(res.decision.action).toBe('refresh');
+    const written = await fs.readFile(hp, 'utf8');
+    expect(written.split('\n')[1]).toBe('# rea:pre-push-fallback v7');
+    expect(written).toContain('_rea_review_gate_mode');
   });
 
   it('skip + active-pre-push-present when a canonical husky gate lives under hooksPath', async () => {
