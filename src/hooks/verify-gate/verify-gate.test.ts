@@ -329,6 +329,28 @@ describe('runVerifyGate', () => {
     },
   );
 
+  // Round-19 F2 — the FRESH-REPO case: the alias resolves to the store even
+  // though `tasks.jsonl` does NOT exist yet. Pre-fix, `canonicalizePath`
+  // resolved the dangling link to its OWN path (`.../tasklog`), so the FIRST
+  // Write through the alias bypassed enforce.
+  it.skipIf(process.platform === 'win32')(
+    'F2: first Write through a DANGLING alias (store not yet created) blocks under enforce',
+    async () => {
+      writePolicy(root, 'enforce');
+      // NOTE: `.rea/tasks.jsonl` is intentionally NOT created. The link dangles.
+      const store = path.join(root, '.rea', 'tasks.jsonl');
+      const link = path.join(root, 'tasklog');
+      fs.symlinkSync(store, link);
+      expect(fs.existsSync(store)).toBe(false); // truly dangling
+      const r = await runVerifyGate({
+        reaRoot: root,
+        stdinOverride: writePayload({ filePath: link, content: COMPLETED_NO_EVIDENCE }),
+      });
+      expect(r.exitCode).toBe(2);
+      expect(r.stdout).toContain('permissionDecision');
+    },
+  );
+
   it.skipIf(process.platform === 'win32')(
     'F3: a symlink to an UNRELATED file is not treated as the store (exit 0)',
     async () => {

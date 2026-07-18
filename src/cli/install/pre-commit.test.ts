@@ -242,6 +242,71 @@ describe('pre-commit body — worktree HALT freeze (round-18 F2)', () => {
       rm(primary);
     }
   });
+
+  // Round-19 F1 — same-repo safety under `--separate-git-dir`. When a
+  // separate-git-dir repo keeps its metadata INSIDE an UNRELATED `outer` repo,
+  // a linked worktree's `dirname(git-common-dir)` resolves to `outer` — which
+  // has its own `.rea`. The OLD dirname-based probe would route the HALT check
+  // there and FALSELY freeze on `outer`'s HALT. `git worktree list` only ever
+  // lists THIS repo's worktrees, so it can never false-route to `outer`; the
+  // probe degenerates to the local worktree (consistent with the TS
+  // `resolveCommonRoot`, which also degenerates for this topology).
+  it('F1: worktree-list is same-repo-safe — an UNRELATED repo HALT does NOT freeze', async () => {
+    if (spawnSync('bash', ['--version']).status !== 0) return;
+    const scratch = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-xrepo-')));
+    try {
+      const outer = path.join(scratch, 'outer');
+      const innerMeta = path.join(outer, 'inner.git'); // metadata nested UNDER outer
+      const innerPrimary = path.join(scratch, 'inner-primary');
+      const innerWt = path.join(scratch, 'inner-wt');
+
+      fssync.mkdirSync(outer, { recursive: true });
+      await execFileAsync('git', ['init', '-q', outer]);
+      await execFileAsync('git', ['-C', outer, 'config', 'user.email', 't@t']);
+      await execFileAsync('git', ['-C', outer, 'config', 'user.name', 't']);
+      fssync.mkdirSync(path.join(outer, '.rea'), { recursive: true });
+      fssync.writeFileSync(path.join(outer, 'f'), 'x');
+      await execFileAsync('git', ['-C', outer, 'add', '-A']);
+      await execFileAsync('git', ['-C', outer, 'commit', '-q', '-m', 'outer']);
+
+      fssync.mkdirSync(innerPrimary, { recursive: true });
+      await execFileAsync('git', ['init', '-q', `--separate-git-dir=${innerMeta}`, innerPrimary]);
+      await execFileAsync('git', ['-C', innerPrimary, 'config', 'user.email', 't@t']);
+      await execFileAsync('git', ['-C', innerPrimary, 'config', 'user.name', 't']);
+      await execFileAsync('git', ['-C', innerPrimary, 'commit', '-q', '--allow-empty', '-m', 'inner']);
+      await execFileAsync('git', ['-C', innerPrimary, 'worktree', 'add', '-q', innerWt, '-b', 'inner-b']);
+
+      // Sanity: dirname(git-common-dir) from the worktree IS `outer` (the trap).
+      const cd = (
+        await execFileAsync('git', ['-C', innerWt, 'rev-parse', '--git-common-dir'])
+      ).stdout.trim();
+      expect(await fs.realpath(path.dirname(cd))).toBe(await fs.realpath(outer));
+
+      await installPreCommitHook({ targetDir: innerWt });
+      const hookPath = (
+        await execFileAsync('git', ['-C', innerWt, 'rev-parse', '--git-path', 'hooks/pre-commit'])
+      ).stdout.trim();
+      const abs = path.isAbsolute(hookPath) ? hookPath : path.join(innerWt, hookPath);
+      const runFromWt = (): number =>
+        spawnSync('bash', [abs], {
+          cwd: innerWt,
+          env: { PATH: process.env['PATH'] ?? '', HOME: process.env['HOME'] ?? '/tmp' },
+          encoding: 'utf8',
+          timeout: 20_000,
+        }).status ?? -1;
+
+      // (a) HALT in the UNRELATED `outer` repo must NOT freeze the inner commit.
+      fssync.writeFileSync(path.join(outer, '.rea', 'HALT'), 'foreign freeze\n');
+      expect(runFromWt()).toBe(0);
+
+      // (b) A LOCAL worktree HALT still freezes (degenerate common = local).
+      fssync.mkdirSync(path.join(innerWt, '.rea'), { recursive: true });
+      fssync.writeFileSync(path.join(innerWt, '.rea', 'HALT'), 'local freeze\n');
+      expect(runFromWt()).toBe(2);
+    } finally {
+      rm(scratch);
+    }
+  });
 });
 
 describe('pre-commit installer — active-hooks-path resolution (F1)', () => {

@@ -94,18 +94,39 @@ function isTasksJsonl(filePath: string): boolean {
 }
 
 /**
- * Canonicalize an absolute path, tolerating a not-yet-existing leaf: if the
- * path itself can't be realpath'd (a `Write` to a new target), resolve the
- * realpath of its PARENT and re-append the basename. Returns `null` on any
- * failure.
+ * Canonicalize an absolute path, tolerating a not-yet-existing leaf.
  *
- * Fail-safe by construction: every fs call is guarded, so an unresolvable
- * path yields `null`. The caller treats `null` as "no match" — an
- * unresolvable path NEVER turns a previously-allowed write into a refusal;
- * F3 only ADDS detection where canonicalization SUCCEEDS and reveals a
- * symlink to the store.
+ * Round-19 F2: if `abs` is ITSELF a symlink, follow it (readlink + resolve
+ * against its dir) EVEN WHEN the target does not exist yet — chained links are
+ * followed iteratively, depth-guarded. `realpathSync` throws on a dangling
+ * link, and the parent-only fallback would canonicalize the LINK's own path
+ * (`.../tasklog`) instead of its target, so `tasklog -> .rea/tasks.jsonl` on a
+ * fresh repo (before `tasks.jsonl` exists) would slip past G2 enforce. This
+ * mirrors the bash shim's `_vg_resolve` (single-level readlink even for a
+ * non-existent target).
+ *
+ * For a non-symlink (or once the chain terminates at a non-link name): return
+ * `realpathSync(abs)` if it exists, else `realpath(dirname)+basename` so a
+ * not-yet-created leaf still canonicalizes under its resolved parent.
+ *
+ * Fail-safe by construction: every fs call is guarded, so an unresolvable path
+ * yields `null`. The caller treats `null` as "no match" — an unresolvable path
+ * NEVER turns a previously-allowed write into a refusal; this only ADDS
+ * detection where canonicalization SUCCEEDS and reveals a link to the store.
  */
-function canonicalizePath(abs: string): string | null {
+function canonicalizePath(abs: string, depth = 0): string | null {
+  if (depth >= 40) return null; // cyclic / pathological link chain — give up
+  // Follow a symlink leaf manually so a DANGLING link resolves to its target,
+  // not to the link's own path.
+  try {
+    if (fs.lstatSync(abs).isSymbolicLink()) {
+      const target = fs.readlinkSync(abs);
+      const resolved = path.isAbsolute(target) ? target : path.join(path.dirname(abs), target);
+      return canonicalizePath(resolved, depth + 1);
+    }
+  } catch {
+    /* lstat/readlink failed — fall through to the realpath attempts below */
+  }
   try {
     return fs.realpathSync(abs);
   } catch {

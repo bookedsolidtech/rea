@@ -101,19 +101,23 @@ REA_ROOT=\$(git rev-parse --show-toplevel 2>/dev/null || pwd)
 # the spec-gate ladder below fails OPEN (missing / too-old / foreign rea, fresh
 # clone, unbuilt worktree). This mirrors \`hooks/_lib/halt-check.sh\`, which this
 # standalone git hook cannot source: probe the LOCAL worktree root AND the
-# COMMON (primary-checkout) root — the discriminator is a worktree's \`.git\`
-# FILE (plain checkouts pay only the -f test, zero git subprocesses). ABSENCE
-# at both roots = fall through to the CLI ladder; this check never hard-fails a
-# commit on its own. bash-3.2 / BSD-safe.
+# COMMON (primary-checkout) root. The \`.git\`-is-a-FILE test is the cheap gate
+# for "is this even a linked worktree" (plain checkouts pay only the -f test,
+# zero git subprocesses). For the common root we use \`git worktree list
+# --porcelain\` — its FIRST \`worktree \` line is the MAIN working tree. This is
+# robust under \`--separate-git-dir\` / absorbed-submodule gitfiles, where
+# \`dirname(git-common-dir)\` points at EXTERNAL metadata rather than the
+# checkout (round-19 F1); it is the same fallback the pre-push REA_CLI_ROOT
+# resolution uses. Every git call is \`|| true\`-guarded, so a broken/absent git
+# degrades to a LOCAL-only probe. ABSENCE at both roots = fall through to the
+# CLI ladder; this check never hard-fails a commit on its own. bash-3.2/BSD-safe.
 _rea_halt_common="\$REA_ROOT"
 if [ -f "\${REA_ROOT}/.git" ]; then
-  _rea_cd=\$(git -C "\$REA_ROOT" rev-parse --git-common-dir 2>/dev/null || true)
-  if [ -n "\$_rea_cd" ]; then
-    case "\$_rea_cd" in /*) : ;; *) _rea_cd="\${REA_ROOT}/\${_rea_cd}" ;; esac
-    _rea_cand=\$(dirname "\$_rea_cd")
-    if [ -d "\${_rea_cand}/.rea" ] || [ -e "\${_rea_cand}/.git" ]; then
-      _rea_halt_common="\$_rea_cand"
-    fi
+  _rea_main=\$(git -C "\$REA_ROOT" worktree list --porcelain 2>/dev/null \\
+    | sed -n 's/^worktree //p' | head -n 1 || true)
+  if [ -n "\$_rea_main" ] && [ "\$_rea_main" != "\$REA_ROOT" ] \\
+     && { [ -d "\${_rea_main}/.rea" ] || [ -e "\${_rea_main}/.git" ]; }; then
+    _rea_halt_common="\$_rea_main"
   fi
 fi
 for _rea_hf in "\${REA_ROOT}/.rea/HALT" "\${_rea_halt_common}/.rea/HALT"; do

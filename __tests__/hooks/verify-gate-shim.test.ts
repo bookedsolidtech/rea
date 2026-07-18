@@ -200,4 +200,30 @@ describe.skipIf(!ENABLED)('verify-gate shims — end-to-end through the shim', (
     });
     expect(runShim(EDITOR_SHIM, payload)).toBe(0);
   });
+
+  // Round-19 F2 — fresh repo: the alias dangles (tasks.jsonl not yet created).
+  // The FIRST Write through it must still be blocked (shim `_vg_resolve` and the
+  // core `canonicalizePath` both follow a dangling link to its target).
+  it('editor: first Write through a DANGLING alias under ENFORCE is blocked via the shim', () => {
+    writePolicy('enforce');
+    const store = path.join(repo, '.rea', 'tasks.jsonl');
+    try {
+      fs.unlinkSync(store);
+    } catch {
+      /* already absent */
+    }
+    const link = path.join(repo, 'tasklog');
+    try {
+      fs.unlinkSync(link);
+    } catch {
+      /* not present */
+    }
+    fs.symlinkSync(store, link); // dangling — target does not exist yet
+    const payload = JSON.stringify({
+      tool_name: 'Write',
+      cwd: repo,
+      tool_input: { file_path: link, content: COMPLETED_NO_EVIDENCE },
+    });
+    expect(runShim(EDITOR_SHIM, payload)).toBe(2);
+  });
 });
