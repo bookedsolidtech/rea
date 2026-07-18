@@ -710,13 +710,23 @@ describe('dangerous-bash-interceptor: H17 sanction + runner normalization (bug H
     }
   });
 
-  it('covers the script-runner forms of a `pnpm run <script>` entry (round-1 P2)', async () => {
-    // `pnpm run test` is listed; node --run / yarn run are equivalent
-    // ways to invoke the same package script and were leaking.
-    for (const cmd of ['node --run test', 'yarn run test', 'pnpm run test']) {
+  it('covers the script-runner forms of a `pnpm run <script>` entry (round-1 P2 + round-2 P1 npm)', async () => {
+    // `pnpm run test` is listed; node --run / yarn run / npm run / npm
+    // (lifecycle shorthand) are equivalent ways to invoke the same
+    // package script and were leaking — including the Node default `npm`.
+    for (const cmd of ['node --run test', 'yarn run test', 'pnpm run test', 'npm run test', 'npm test']) {
       const r = await run(cmd, root);
       expect(r.exitCode, cmd).toBe(2);
       expect(r.ids, cmd).toContain('H17');
+    }
+  });
+
+  it('does NOT over-block npm non-script commands or the download form (round-2 P1)', async () => {
+    // `npm install` / `npm ci` are not the delegated script; `npm exec`
+    // is npx (download-arbitrary) — deliberately excluded like npx/dlx.
+    for (const cmd of ['npm install', 'npm ci', 'npm exec vitest', 'npm test-utils run']) {
+      const r = await run(cmd, root);
+      expect(r.exitCode, cmd).toBe(0);
     }
   });
 

@@ -168,6 +168,20 @@ export function resolveCommonRoot(
     );
     return degenerate;
   }
+  // Round-2 P2: `candidate` (dirname of the common dir) merely HAVING a
+  // `.git`/`.rea` does not prove it is OUR repository — a bare or
+  // separate-git-dir layout can nest the metadata under an UNRELATED
+  // checkout. Verify candidate's own git-common-dir resolves to the
+  // SAME common dir; otherwise routing shared state (`HALT`,
+  // `audit.jsonl`, verdict cache, TOFU) there would mutate a foreign
+  // repo's governance. On any mismatch/uncertainty, degrade to
+  // per-worktree isolation.
+  const candidateCommonRaw = tryGit(candidate, ['rev-parse', '--git-common-dir']);
+  if (candidateCommonRaw.length === 0) return degenerate;
+  const candidateCommon = path.isAbsolute(candidateCommonRaw)
+    ? candidateCommonRaw
+    : path.join(candidate, candidateCommonRaw);
+  if (path.resolve(candidateCommon) !== path.resolve(commonDir)) return degenerate;
   return { commonRoot: candidate, isLinkedWorktree: true };
 }
 

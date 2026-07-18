@@ -192,16 +192,20 @@ function segmentHasMarker(rawSegment: string): boolean {
  */
 // Only LOCAL script/binary runners — the ones that resolve the repo's
 // OWN `node_modules/.bin` binary or `package.json` script. Round-1 P2:
-// `pnpm dlx` / `yarn dlx` / bare `npx` are deliberately EXCLUDED — they
-// download and run an ARBITRARY package, so `npx lint` is not the same
-// program as the delegated `pnpm run lint` and treating them as
-// equivalent would over-block ordinary coordinator commands. Round-1
-// P2 also adds `pnpm run` / `yarn run` / `node --run` — the script
-// forms of the listed `pnpm run <script>` entries, which were leaking.
+// `pnpm dlx` / `yarn dlx` / bare `npx` (and `npm exec`, its alias) are
+// deliberately EXCLUDED — they download and run an ARBITRARY package,
+// so `npx lint` is not the same program as the delegated `pnpm run
+// lint` and treating them as equivalent would over-block ordinary
+// coordinator commands. Round-1 P2 adds `pnpm run` / `yarn run` /
+// `node --run`; round-2 P1 adds `npm` / `npm run` — the npm lifecycle
+// shorthand (`npm test` == `npm run test`) and script forms of the
+// listed `pnpm run <script>` entries, the common Node-default bypass.
 const RUNNER_PREFIXES = [
   'pnpm ',
   'pnpm exec ',
   'pnpm run ',
+  'npm ', // npm's lifecycle-script shorthands: `npm test` == `npm run test`
+  'npm run ',
   'yarn ',
   'yarn exec ',
   'yarn run ',
@@ -218,7 +222,7 @@ const RUNNER_PREFIXES = [
  */
 function delegateTail(normPattern: string): string {
   const runner =
-    /^(?:pnpm\s+exec|pnpm\s+run|pnpm|yarn\s+exec|yarn\s+run|yarn|node\s+--run)\s+(.+)$/i.exec(
+    /^(?:pnpm\s+exec|pnpm\s+run|pnpm|npm\s+run|npm|yarn\s+exec|yarn\s+run|yarn|node\s+--run)\s+(.+)$/i.exec(
       normPattern,
     );
   if (runner && runner[1] !== undefined) return runner[1];

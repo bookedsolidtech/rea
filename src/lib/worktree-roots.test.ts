@@ -145,6 +145,42 @@ describe('resolveCommonRoot — the .git discriminator', () => {
     }
   });
 
+  it('cross-repo safety: dirname(commonDir) is an UNRELATED repo → degrade, never route there (round-2 P2)', () => {
+    // An `outer` repo; a separate-git-dir repo whose metadata lives
+    // INSIDE outer, so a linked worktree's common dir is
+    // `<outer>/inner.git` and dirname(commonDir) === outer. Outer HAS a
+    // `.git`/`.rea`, so the `looksLikeCheckout` heuristic would wrongly
+    // accept it — but it is a DIFFERENT repository. rea must verify the
+    // same-repo binding and degrade instead of mutating outer's state.
+    const outer = path.join(scratch, 'outer');
+    fs.mkdirSync(outer, { recursive: true });
+    execFileSync('git', ['init', '-q', outer], { encoding: 'utf8' });
+    git(outer, 'config', 'user.email', 't@t');
+    git(outer, 'config', 'user.name', 't');
+    fs.mkdirSync(path.join(outer, '.rea'), { recursive: true });
+    fs.writeFileSync(path.join(outer, 'f'), 'x');
+    git(outer, 'add', '-A');
+    git(outer, 'commit', '-q', '-m', 'outer', '--no-gpg-sign');
+
+    const innerMeta = path.join(outer, 'inner.git'); // metadata nested UNDER outer
+    const innerPrimary = path.join(scratch, 'inner-primary');
+    fs.mkdirSync(innerPrimary, { recursive: true });
+    execFileSync('git', ['init', '-q', `--separate-git-dir=${innerMeta}`, innerPrimary], {
+      encoding: 'utf8',
+    });
+    git(innerPrimary, 'config', 'user.email', 't@t');
+    git(innerPrimary, 'config', 'user.name', 't');
+    fs.writeFileSync(path.join(innerPrimary, 'g'), 'y');
+    git(innerPrimary, 'add', '-A');
+    git(innerPrimary, 'commit', '-q', '-m', 'inner', '--no-gpg-sign');
+    const innerWt = path.join(scratch, 'inner-wt');
+    git(innerPrimary, 'worktree', 'add', '-q', innerWt, '-b', 'inner-branch');
+
+    const r = resolveCommonRoot(innerWt, () => {});
+    // The critical invariant: NEVER route shared state into `outer`.
+    expect(r.commonRoot).not.toBe(outer);
+  });
+
   it('bare-host edge: common parent without a checkout → degenerate + advisory', () => {
     // A worktree of a BARE repo: git init --bare, then worktree add.
     const bare = path.join(scratch, 'store.git');
