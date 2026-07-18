@@ -22,6 +22,7 @@ import { registerAuditTopBlocksCommand } from './audit-top-blocks.js';
 import { registerVerifyClaimCommand } from './verify-claim.js';
 import { registerConfigCommand } from './config-key.js';
 import { registerTasksCommand } from './tasks.js';
+import { registerDashCommand } from './dash.js';
 import { registerTrustCommands } from './trust.js';
 import { registerInstallCommand } from './install/global.js';
 import { err, getPkgVersion } from './utils.js';
@@ -252,6 +253,11 @@ async function main(): Promise<void> {
   // `.rea/tasks.jsonl` task store — the shared keystone for Artifact Gates
   // and `rea dash`. Append-only JSONL; the reader folds to latest-per-id.
   registerTasksCommand(program);
+
+  // `rea dash` — global, read-only "needs-you-first" dashboard across every
+  // rea-aware project discovered via the user-global registry. Strictly
+  // non-load-bearing: no gate/hook/spine depends on it.
+  registerDashCommand(program);
 
   const tofu = program
     .command('tofu')

@@ -42,6 +42,8 @@ import fsPromises from 'node:fs/promises';
 import path from 'node:path';
 import * as p from '@clack/prompts';
 import { loadPolicy } from '../policy/loader.js';
+import { registerProject } from '../registry/projects.js';
+import { deriveProjectName } from './dash.js';
 import {
   CLAUDE_MD_MANIFEST_PATH,
   SETTINGS_MANIFEST_PATH,
@@ -993,6 +995,20 @@ export async function runUpgrade(options: UpgradeOptions = {}): Promise<void> {
     console.log('Bootstrap mode: existing files were recorded as-is. The next `rea upgrade`');
     console.log('will compare against the canonical set and surface any legitimate drift.');
   }
+
+  // Refresh this project's entry in the user-global dashboard registry
+  // (`~/.rea/registry.json`) with the just-upgraded rea version. BEST-EFFORT:
+  // a registry write failure must NEVER fail the upgrade — the registry lives
+  // OUTSIDE the project. Idempotent (upsert keyed on the resolved root).
+  try {
+    await registerProject(resolvedRoot, {
+      name: deriveProjectName(resolvedRoot),
+      reaVersion: getPkgVersion(),
+    });
+  } catch (e) {
+    warn(`could not update the global dashboard registry: ${e instanceof Error ? e.message : String(e)}`);
+  }
+
   console.log('');
 }
 

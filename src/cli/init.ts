@@ -34,6 +34,7 @@ import {
   ReagentDroppedFieldsError,
   translateReagentPolicy,
 } from './install/reagent.js';
+import { registerProject } from '../registry/projects.js';
 import {
   PKG_ROOT,
   POLICY_FILE,
@@ -2116,6 +2117,20 @@ export async function runInit(options: InitOptions): Promise<void> {
   for (const w of prepareCommitMsgResult.warnings) warn(w);
   for (const w of prePushResult.warnings) warn(w);
   for (const n of config.reagentNotices) warn(n);
+
+  // Self-register this project into the user-global dashboard registry
+  // (`~/.rea/registry.json`) so `rea dash` can discover it. BEST-EFFORT:
+  // a registry write failure must NEVER fail init — the registry lives
+  // OUTSIDE the project, so this does not affect the byte-identical
+  // re-init invariant. Idempotent (upsert keyed on the resolved path).
+  try {
+    await registerProject(targetDir, {
+      name: detectProjectName(targetDir),
+      reaVersion: getPkgVersion(),
+    });
+  } catch (e) {
+    warn(`could not update the global dashboard registry: ${e instanceof Error ? e.message : String(e)}`);
+  }
 
   // G6 + G11.4: Codex install-assist.
   //
