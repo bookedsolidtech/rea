@@ -43,6 +43,7 @@
     "hooks/",
     "commands/",
     "agents/",
+    "spine/",
     "profiles/",
     "templates/",
     "scripts/",
