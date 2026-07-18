@@ -322,6 +322,21 @@ describe('worktree-state integration (real git worktree add)', () => {
       `echo x > ${aliasPrimary}/package.json`,
     );
     expect(bv.verdict).toBe('block');
+
+    // Write/Edit tier (round-4 P1): blocked-paths-enforcer must
+    // canonicalize the aliased absolute path too.
+    fs.writeFileSync(
+      path.join(repo, '.rea', 'policy.yaml'),
+      'version: "1"\nprofile: "test"\ninstalled_by: "t"\nblocked_paths:\n  - package.json\n',
+    );
+    const bp = await runBlockedPathsEnforcer({
+      reaRoot: wtA,
+      stdinOverride: JSON.stringify({
+        tool_name: 'Write',
+        tool_input: { file_path: path.join(aliasPrimary, 'package.json'), content: '{}' },
+      }),
+    });
+    expect(bp.exitCode).toBe(2);
   });
 
   it('(vi-e) REVERSE bridge: symlink in the PRIMARY checkout back into the worktree (round-17)', () => {

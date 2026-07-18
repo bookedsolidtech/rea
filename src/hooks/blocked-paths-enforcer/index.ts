@@ -96,6 +96,31 @@ function matchBlockedEntry(pathLc: string, blockedEntry: string): boolean {
   return pathLc === entryLc;
 }
 
+/**
+ * Realpath-canonicalize an absolute path whose leaf may not exist yet
+ * (a create target). Walks up to the nearest existing ancestor,
+ * realpaths THAT (resolving /var↔/private/var and symlinked checkout
+ * roots for the whole subtree), then re-appends the unresolved tail.
+ * Falls back to the lexical input on any error. Mirrors the helper in
+ * settings-protection (round-45). (Round-4 P1.)
+ */
+function canonicalizeExisting(abs: string): string {
+  let dir = abs;
+  const tail: string[] = [];
+  for (let i = 0; i < 64; i += 1) {
+    try {
+      const real = fs.realpathSync(dir);
+      return tail.length > 0 ? path.join(real, ...tail.slice().reverse()) : real;
+    } catch {
+      const parent = path.dirname(dir);
+      if (parent === dir) return abs;
+      tail.push(path.basename(dir));
+      dir = parent;
+    }
+  }
+  return abs;
+}
+
 function loadBlockedPathsPermissive(reaRoot: string): string[] {
   const policyPath = path.join(reaRoot, '.rea', 'policy.yaml');
   if (!fs.existsSync(policyPath)) return [];
@@ -201,10 +226,22 @@ export async function runBlockedPathsEnforcer(
     ];
     if (path.isAbsolute(normalized)) {
       const resolvedNorm = path.resolve(normalized);
+      // Round-4 P1 (parity with settings-protection round-45 +
+      // blocked-scan round-3): an aliased target (/var↔/private/var,
+      // symlinked checkout) won't match a cross root lexically — compare
+      // the realpath-canonicalized forms too, else Write/Edit to the
+      // aliased absolute path skips the target root's blocked_paths.
+      const canonNorm = canonicalizeExisting(resolvedNorm);
       for (const cross of crossRoots) {
         const crossResolved = path.resolve(cross);
         if (resolvedNorm === crossResolved || resolvedNorm.startsWith(crossResolved + path.sep)) {
           normalized = normalizePath(filePath, cross);
+          crossRootUsed = cross;
+          break;
+        }
+        const crossCanon = canonicalizeExisting(crossResolved);
+        if (canonNorm === crossCanon || canonNorm.startsWith(crossCanon + path.sep)) {
+          normalized = normalizePath(canonNorm, crossCanon);
           crossRootUsed = cross;
           break;
         }
