@@ -1110,3 +1110,113 @@ describe('local-review-gate G3: integration (real computePreflight)', () => {
     expect(r.decision).toBe('mode-off');
   });
 });
+
+// ---------------------------------------------------------------------------
+// Malformed-payload verdict is RISK-CALIBRATED by the effective gate mode
+// (codex round-47 P2 — fail-closed-when-off regression fix).
+//
+// The gate parses stdin BEFORE resolving policy (worktree cwd extraction),
+// but the MODE comes from POLICY, not the payload — so an unparseable payload
+// is still resolvable against the effective mode:
+//   - off     → silent no-op exit 0 (THE FIX: previously a hard block)
+//   - shadow  → no-op exit 0 (shadow never blocks)
+//   - enforce → fail-closed exit 2 "refusing on uncertainty"
+//   - HALT    → exit 2 (kill switch wins over EVERY mode, incl. off)
+// ---------------------------------------------------------------------------
+describe('local-review-gate: malformed payload × effective mode', () => {
+  let root: string;
+  beforeEach(() => {
+    root = mkRoot();
+  });
+  afterEach(() => {
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  const MALFORMED = '{not json';
+
+  it('mode off (g3_review.mode: off) + malformed → silent no-op exit 0', async () => {
+    writePolicy(root, g3Body('off'));
+    const r = await runLocalReviewGate({
+      reaRoot: root,
+      stdinOverride: MALFORMED,
+      envOverride: {},
+      preflightImpl: unreachablePreflight,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(r.decision).toBe('mode-off');
+    expect(r.stderr).toBe('');
+  });
+
+  it('mode off (legacy local_review.mode: off) + malformed → silent no-op exit 0', async () => {
+    writePolicy(
+      root,
+      `review:
+  local_review:
+    mode: off
+    refuse_at: push
+`,
+    );
+    const r = await runLocalReviewGate({
+      reaRoot: root,
+      stdinOverride: MALFORMED,
+      envOverride: {},
+      preflightImpl: unreachablePreflight,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(r.decision).toBe('mode-off');
+    expect(r.stderr).toBe('');
+  });
+
+  it('mode shadow + malformed → no-op exit 0 (shadow never blocks)', async () => {
+    writePolicy(root, g3Body('shadow'));
+    const r = await runLocalReviewGate({
+      reaRoot: root,
+      stdinOverride: MALFORMED,
+      envOverride: {},
+      preflightImpl: unreachablePreflight,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(r.decision).toBe('malformed-payload');
+    expect(r.stderr).toBe('');
+  });
+
+  it('mode enforce (g3_review.mode: enforce) + malformed → fail-closed exit 2', async () => {
+    writePolicy(root, g3Body('enforce'));
+    const r = await runLocalReviewGate({
+      reaRoot: root,
+      stdinOverride: MALFORMED,
+      envOverride: {},
+      preflightImpl: unreachablePreflight,
+    });
+    expect(r.exitCode).toBe(2);
+    expect(r.decision).toBe('malformed-payload');
+    expect(r.stderr).toContain('refusing on uncertainty');
+  });
+
+  it('mode enforce (legacy enforced, no g3) + malformed → fail-closed exit 2', async () => {
+    writePolicy(root); // default body: legacy mode: enforced, no artifact_gates
+    const r = await runLocalReviewGate({
+      reaRoot: root,
+      stdinOverride: MALFORMED,
+      envOverride: {},
+      preflightImpl: unreachablePreflight,
+    });
+    expect(r.exitCode).toBe(2);
+    expect(r.decision).toBe('malformed-payload');
+    expect(r.stderr).toContain('refusing on uncertainty');
+  });
+
+  it('HALT set + malformed (mode off) → exit 2, HALT WINS over off', async () => {
+    writePolicy(root, g3Body('off'));
+    fs.writeFileSync(path.join(root, '.rea', 'HALT'), 'maintenance');
+    const r = await runLocalReviewGate({
+      reaRoot: root,
+      stdinOverride: MALFORMED,
+      envOverride: {},
+      preflightImpl: unreachablePreflight,
+    });
+    expect(r.exitCode).toBe(2);
+    expect(r.decision).toBe('halt');
+    expect(r.stderr).toContain('REA HALT: maintenance');
+  });
+});

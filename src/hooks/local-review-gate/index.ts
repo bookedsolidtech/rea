@@ -530,6 +530,16 @@ export async function runLocalReviewGate(
   let toolName = '';
   let cmd = '';
   let payloadCwd = '';
+  // A malformed / wrong-shape payload is UNCERTAIN. It is NOT hard-blocked
+  // outright (that was the round-47 P2 fail-closed-when-off regression):
+  // the reorder below parses stdin BEFORE resolving policy for worktree cwd
+  // extraction, but the gate MODE comes from POLICY, not the payload — so a
+  // malformed payload can (and must) still be resolved against the effective
+  // mode. We record the error and DEFER the verdict until AFTER HALT and the
+  // effective-mode resolution, so `off` means off, `shadow` never blocks, and
+  // only `enforce` fails closed on uncertainty. HALT still wins over all.
+  let parseError = false;
+  let parseErrorMessage = '';
   try {
     const payload = parseHookPayload(stdinRaw);
     payloadCwd = payload.cwd;
@@ -537,18 +547,20 @@ export async function runLocalReviewGate(
     cmd = payload.command;
   } catch (err) {
     if (err instanceof MalformedPayloadError || err instanceof TypePayloadError) {
-      writeStderr(
-        `local-review-gate: ${err.message} — refusing on uncertainty.\n`,
-      );
-      return { exitCode: 2, stderr, decision: 'malformed-payload' };
+      parseError = true;
+      parseErrorMessage = err.message;
+    } else {
+      throw err;
     }
-    throw err;
   }
 
   // Roots + HALT (0.54.0 worktree state): the payload's `cwd` feeds the
   // resolution ladder, so stdin is parsed FIRST — a deliberate reorder.
   // Policy/path checks key off the LOCAL (worktree) root; audit and the
-  // kill switch key off the COMMON (repository) root.
+  // kill switch key off the COMMON (repository) root. On a malformed payload
+  // `payloadCwd` is '' and `resolveHookRoots` falls back through the
+  // CLAUDE_PROJECT_DIR/cwd ladder — correct, since an unparseable payload
+  // does not change WHICH repo we are in.
   const { localRoot: reaRoot, commonRoot } = resolveHookRoots(payloadCwd, options.reaRoot);
   // 1. HALT check — fail-closed.
   const halt = checkHaltRoots(reaRoot, commonRoot);
@@ -579,6 +591,31 @@ export async function runLocalReviewGate(
   // off` and legacy `local_review.mode: off`; HALT above still wins.
   if (effectiveMode === 'off') {
     return { exitCode: 0, stderr, decision: 'mode-off' };
+  }
+
+  // 3b. Malformed-payload verdict — resolved by the EFFECTIVE gate mode, now
+  //     that HALT (above, always wins) and the `off` short-circuit (above)
+  //     have had first refusal. This NARROWS the round-47 P2 defect from
+  //     "malformed ALWAYS hard-blocks" to "malformed hard-blocks ONLY under
+  //     active enforce":
+  //       - off     → already returned exit 0 above (silent no-op). `off`
+  //                   means off even for an unparseable payload.
+  //       - shadow  → NO-OP / exit 0. Shadow never blocks; the gate body
+  //                   itself must not block regardless of payload shape.
+  //       - enforce → FAIL-CLOSED (exit 2) "refusing on uncertainty" —
+  //                   preserving today's security stance for the ONLY posture
+  //                   where blocking is the designed behavior.
+  //     The mode is POLICY-derived, so it is knowable even when the payload
+  //     is not — that is what makes this safe.
+  if (parseError) {
+    if (effectiveMode === 'enforce') {
+      writeStderr(
+        `local-review-gate: ${parseErrorMessage} — refusing on uncertainty.\n`,
+      );
+      return { exitCode: 2, stderr, decision: 'malformed-payload' };
+    }
+    // shadow (off already returned above) — never blocks.
+    return { exitCode: 0, stderr, decision: 'malformed-payload' };
   }
 
   // 4. Non-Bash → allow.
