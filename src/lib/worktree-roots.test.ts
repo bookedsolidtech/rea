@@ -334,6 +334,76 @@ describe('resolveHookRoots — guarded candidate ladder', () => {
     }
   });
 
+  it('cwd-LESS payload in a linked worktree resolves the WORKTREE, not the primary (round-42 P2)', () => {
+    // Live linked-worktree shape: Claude Code pins CLAUDE_PROJECT_DIR to
+    // the PRIMARY checkout while the hook process runs in the WORKTREE
+    // (its process.cwd()). A Pre/PostToolUse payload that OMITS `cwd`
+    // must resolve the WORKTREE's local `.rea/` state, not the primary's.
+    const repo = path.join(scratch, 'repo');
+    makeRepo(repo);
+    const wt = path.join(scratch, 'wt-cwdless');
+    git(repo, 'worktree', 'add', '-q', wt, '-b', 'wt-cwdless-branch');
+    // Both roots carry `.rea/` (policy.yaml is committed, so the worktree
+    // checkout has it too).
+    const prevEnv = process.env['CLAUDE_PROJECT_DIR'];
+    const prevCwd = process.cwd();
+    process.env['CLAUDE_PROJECT_DIR'] = repo; // primary
+    process.chdir(wt); // the hook physically executes in the worktree
+    try {
+      const roots = resolveHookRoots(undefined); // payload omits cwd
+      expect(roots.localRoot).toBe(wt); // worktree local root, NOT primary
+      expect(roots.commonRoot).toBe(repo); // shared enforcement root
+      expect(roots.isLinkedWorktree).toBe(true);
+    } finally {
+      process.chdir(prevCwd);
+      if (prevEnv === undefined) delete process.env['CLAUDE_PROJECT_DIR'];
+      else process.env['CLAUDE_PROJECT_DIR'] = prevEnv;
+    }
+  });
+
+  it('cwd-LESS payload with cwd OUTSIDE any rea repo falls back to CLAUDE_PROJECT_DIR (guard preserved)', () => {
+    // The `.rea/`-presence guard must survive the reorder: when
+    // process.cwd() has no `.rea/` (agent `cd`ed to /tmp), the env anchor
+    // still wins — a gate never silently no-ops.
+    const repo = path.join(scratch, 'repo');
+    makeRepo(repo);
+    const stray = path.join(scratch, 'stray-no-rea');
+    fs.mkdirSync(stray, { recursive: true });
+    const prevEnv = process.env['CLAUDE_PROJECT_DIR'];
+    const prevCwd = process.cwd();
+    process.env['CLAUDE_PROJECT_DIR'] = repo;
+    process.chdir(stray);
+    try {
+      const roots = resolveHookRoots(undefined);
+      expect(roots.localRoot).toBe(repo); // env anchor, cwd unqualified
+    } finally {
+      process.chdir(prevCwd);
+      if (prevEnv === undefined) delete process.env['CLAUDE_PROJECT_DIR'];
+      else process.env['CLAUDE_PROJECT_DIR'] = prevEnv;
+    }
+  });
+
+  it('PLAIN repo: cwd-less payload resolves the repo root either way (invariant no-op)', () => {
+    // The load-bearing invariant: in a plain (non-worktree) repo env and
+    // cwd resolve to the SAME root, so the reorder changes nothing.
+    const repo = path.join(scratch, 'plain-repo');
+    makeRepo(repo);
+    const prevEnv = process.env['CLAUDE_PROJECT_DIR'];
+    const prevCwd = process.cwd();
+    process.env['CLAUDE_PROJECT_DIR'] = repo;
+    process.chdir(repo);
+    try {
+      const roots = resolveHookRoots(undefined);
+      expect(roots.localRoot).toBe(repo);
+      expect(roots.commonRoot).toBe(repo);
+      expect(roots.isLinkedWorktree).toBe(false);
+    } finally {
+      process.chdir(prevCwd);
+      if (prevEnv === undefined) delete process.env['CLAUDE_PROJECT_DIR'];
+      else process.env['CLAUDE_PROJECT_DIR'] = prevEnv;
+    }
+  });
+
   it('SAME-repo payload worktree wins over ANY same-repo anchor (round-19 P1)', () => {
     // Supersedes the round-9 sibling pin: relative paths resolve
     // against the worktree the command physically runs in, so the

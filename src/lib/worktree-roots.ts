@@ -225,7 +225,7 @@ export function resolveReaRoots(
 /**
  * Hook-tier resolution: the guarded candidate ladder.
  *
- *   payload `cwd` → `CLAUDE_PROJECT_DIR` → `process.cwd()`
+ *   payload `cwd` → `process.cwd()` → `CLAUDE_PROJECT_DIR`
  *
  * A candidate is accepted ONLY if its resolved localRoot actually
  * contains `.rea/` — an agent that `cd /tmp` before a tool call must
@@ -233,6 +233,15 @@ export function resolveReaRoots(
  * silently no-op (fail-open). When no candidate qualifies, the last
  * fallback (`process.cwd()`-resolved) is returned anyway, which is
  * byte-identical to the pre-worktree hook behavior.
+ *
+ * Round-42 P2: `process.cwd()` (the worktree the hook physically runs in)
+ * is preferred over `CLAUDE_PROJECT_DIR` for the LOCAL root when the
+ * payload omits `cwd` — in a linked-worktree session Claude Code pins
+ * CLAUDE_PROJECT_DIR to the PRIMARY checkout, so an env-first ladder read
+ * the primary's `.rea/` state instead of the current worktree's. For a
+ * plain repo env and cwd resolve to the same root, so this is a no-op.
+ * (A payload `cwd` that carries `.rea/` and belongs to the session repo
+ * still wins outright — most specific.)
  *
  * `explicitRoot` (the hooks' `options.reaRoot` test seam) short-
  * circuits the ladder entirely and — like today — is trusted verbatim,
@@ -260,13 +269,15 @@ export function resolveHookRoots(
     }
   };
 
-  // The SESSION ANCHOR: the first of CLAUDE_PROJECT_DIR → process.cwd()
-  // whose root actually carries `.rea/` (round-16 P2: a stale or
-  // non-rea CLAUDE_PROJECT_DIR — a renamed worktree, a direct CLI
-  // invocation from elsewhere — must not eclipse a perfectly good cwd
-  // anchor; the documented ladder falls all the way to cwd). When
-  // NEITHER qualifies, keep the env-first candidate for the historical
-  // no-install fallback below.
+  // The SESSION ANCHOR: among the candidates whose root actually carries
+  // `.rea/`, process.cwd() (the worktree physically executing) is
+  // preferred over CLAUDE_PROJECT_DIR for the local root (round-42 P2;
+  // see the else-branch note). Round-16 P2: a stale or non-rea
+  // CLAUDE_PROJECT_DIR — a renamed worktree, a direct CLI invocation from
+  // elsewhere — must not eclipse a perfectly good cwd anchor; the
+  // documented ladder falls all the way to cwd. When NEITHER qualifies,
+  // keep the env-first RAW candidate for the historical no-install
+  // fallback below.
   const envRoots = tryResolve(process.env['CLAUDE_PROJECT_DIR']);
   const cwdRoots = tryResolve(process.cwd());
   const payload = tryResolve(payloadCwd);
@@ -297,7 +308,24 @@ export function resolveHookRoots(
     // and misapply blocked/protected paths.
     anchor = payload !== null && hasRea(payload) && sameRepo(payload, envQ) ? envQ : cwdQ;
   } else {
-    anchor = envQ ?? cwdQ ?? envRoots ?? cwdRoots;
+    // Round-42 P2: prefer the QUALIFIED `process.cwd()` (the worktree the
+    // hook is physically executing in) over `CLAUDE_PROJECT_DIR` for the
+    // LOCAL root. In a linked-worktree session Claude Code pins
+    // CLAUDE_PROJECT_DIR to the PRIMARY checkout while the hook process
+    // runs in the worktree; a Pre/PostToolUse payload that OMITS `cwd`
+    // (all parsers treat it as optional) used to fall straight to the env
+    // anchor and read the PRIMARY's `.rea/` state (policy, tasks, …)
+    // instead of the current worktree's — the exact wrong-worktree-state
+    // bug this resolver exists to prevent.
+    //
+    // This is a no-op for a PLAIN repo: env and cwd resolve (via the git
+    // toplevel) to the SAME localRoot AND commonRoot, so `cwdQ` and `envQ`
+    // are interchangeable and every downstream path is byte-identical to
+    // before. `cwdQ`/`envQ` are `.rea/`-guarded, so an agent that
+    // `cd /tmp` leaves `cwdQ === null` and the env anchor still wins — a
+    // gate never silently no-ops. The raw (`envRoots ?? cwdRoots`) tail is
+    // left env-first to preserve the historical no-install fallback order.
+    anchor = cwdQ ?? envQ ?? envRoots ?? cwdRoots;
   }
 
   // Payload candidate — accepted only when it (a) carries `.rea/` AND
