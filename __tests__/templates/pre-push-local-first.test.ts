@@ -50,6 +50,88 @@ describe('templates/pre-push.local-first.sh — round-27 F5', () => {
     expect(r.stderr).toBe('');
   });
 
+  // Round-50/51 P1 — the shipped static template must carry the SAME
+  // mode-aware no-preflight fix as the generated BODY_TEMPLATE. The two are
+  // hand-synced (no shared generator); this asserts the template did not lag.
+  it('carries the round-50/51 mode-aware gate-active helper + tier-3 split', () => {
+    const body = fs.readFileSync(TEMPLATE_PATH, 'utf8');
+    // The gate-active helper exists and reads the LOCAL policy via REA_ROOT.
+    expect(body).toMatch(/_rea_review_gate_active\(\) \{/);
+    expect(body).toMatch(/_rea_pol="\$\{REA_ROOT\}\/\.rea\/policy\.yaml"/);
+    expect(body).toMatch(/\[ -f "\$_rea_pol" \] \|\| return 1/);
+    expect(body).toMatch(/command -v awk >\/dev\/null 2>&1 \|\| return 0/);
+    // Block-form + inline-flow-map (round-51 F2) detection.
+    expect(body).toMatch(/\^local_review:/);
+    expect(body).toMatch(/\^g3_review:/);
+    expect(body).toMatch(/local_review\[\^A-Za-z_\]\.\*mode:\[\^A-Za-z\]\*\(shadow\|enforce\)/);
+    expect(body).toMatch(/g3_review\[\^A-Za-z_\]\.\*mode:\[\^A-Za-z\]\*\(shadow\|enforce\)/);
+    // Tier-3 split: unknown-command gated on the helper; unknown-option fails open.
+    expect(body).toMatch(/\*"unknown command"\*\)/);
+    expect(body).toMatch(/if _rea_review_gate_active; then/);
+    expect(body).toMatch(/_pf_out=""; _pf_rc=2/);
+    expect(body).toMatch(/CONFIG-ERROR/);
+    expect(body).toMatch(/REA_SKIP_LOCAL_REVIEW/);
+    expect(body).toMatch(/# Pure flag incompatibility on a preflight-capable CLI/);
+    const innerCmd = body.indexOf('*"unknown command"*)');
+    const innerOpt = body.lastIndexOf('*"unknown option"*)');
+    expect(innerCmd).toBeGreaterThan(-1);
+    expect(innerOpt).toBeGreaterThan(innerCmd);
+  });
+
+  // Exec-harness: drive the template against a too-old `rea` (no `preflight`
+  // command) under different policies. FAIL CLOSED iff the gate is active.
+  async function runTemplateWithPolicy(
+    policy: string | null,
+  ): Promise<{ code: number; stderr: string }> {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'rea-tmpl-p51-'));
+    cleanup.push(root);
+    spawnSync('git', ['-C', root, 'init', '-q']);
+    const bin = path.join(root, 'node_modules', '.bin', 'rea');
+    fs.mkdirSync(path.dirname(bin), { recursive: true });
+    // A CLI with no `preflight` command at all → `unknown command`.
+    fs.writeFileSync(
+      bin,
+      '#!/bin/sh\ncase "$1" in preflight) echo "error: unknown command \'preflight\'" >&2; exit 1 ;; esac\nexit 0\n',
+      { mode: 0o755 },
+    );
+    if (policy !== null) {
+      fs.mkdirSync(path.join(root, '.rea'), { recursive: true });
+      fs.writeFileSync(path.join(root, '.rea', 'policy.yaml'), policy);
+    }
+    const hook = path.join(root, 'pre-push');
+    fs.copyFileSync(TEMPLATE_PATH, hook);
+    fs.chmodSync(hook, 0o755);
+    const r = spawnSync(hook, ['origin', 'git@example:r.git'], { cwd: root, encoding: 'utf8' });
+    return { code: r.status ?? -1, stderr: r.stderr ?? '' };
+  }
+
+  it('FAIL CLOSED: too-old CLI + `local_review.mode: enforce` (block) → exit 2 + CONFIG-ERROR', async () => {
+    const r = await runTemplateWithPolicy('review:\n  local_review:\n    mode: enforce\n');
+    expect(r.code).toBe(2);
+    expect(r.stderr).toContain('CONFIG-ERROR');
+    expect(r.stderr).toContain('REA_SKIP_LOCAL_REVIEW');
+  });
+
+  it('FAIL CLOSED: too-old CLI + nested inline `review: { local_review: { mode: enforce } }` → exit 2', async () => {
+    const r = await runTemplateWithPolicy('review: { local_review: { mode: enforce } }\n');
+    expect(r.code).toBe(2);
+  });
+
+  it('FAIL CLOSED: too-old CLI + nested inline `artifact_gates: { g3_review: { mode: shadow } }` → exit 2', async () => {
+    const r = await runTemplateWithPolicy('artifact_gates: { g3_review: { mode: shadow } }\n');
+    expect(r.code).toBe(2);
+  });
+
+  it('FAIL OPEN: too-old CLI + `local_review.mode: off` → exit 0', async () => {
+    const r = await runTemplateWithPolicy('review:\n  local_review:\n    mode: off\n');
+    expect(r.code).toBe(0);
+  });
+
+  it('FAIL OPEN: too-old CLI + policy ABSENT → exit 0', async () => {
+    const r = await runTemplateWithPolicy(null);
+    expect(r.code).toBe(0);
+  });
+
   it('discovers node_modules/.bin/rea from a synthetic project root', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'rea-tmpl-f5-'));
     cleanup.push(root);

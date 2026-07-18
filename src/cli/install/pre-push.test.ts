@@ -192,6 +192,10 @@ describe('BODY_TEMPLATE — path-with-spaces portability (Fix A / 0.12.0)', () =
     expect(body).toMatch(/\^local_review:/);
     expect(body).toMatch(/\^g3_review:/);
     expect(body).toMatch(/\^\(shadow\|enforce\)/);
+    // Round-51 F2: inline flow map at ANY nesting depth is recognized too
+    // (`review: { local_review: { mode: enforce } }`).
+    expect(body).toMatch(/local_review\[\^A-Za-z_\]\.\*mode:\[\^A-Za-z\]\*\(shadow\|enforce\)/);
+    expect(body).toMatch(/g3_review\[\^A-Za-z_\]\.\*mode:\[\^A-Za-z\]\*\(shadow\|enforce\)/);
     // Tier-3 split: `unknown command` is handled SEPARATELY from
     // `unknown option`, gated on `_rea_review_gate_active`.
     expect(body).toMatch(/\*"unknown command"\*\)/);
@@ -1108,6 +1112,39 @@ describe('extension-hook chaining (Fix H / 0.13.0) — `.husky/pre-push.d/*`', (
       'review:\n  local_review: { mode: enforce }\n',
     );
     expect(r.code).toBe(2);
+  });
+
+  // Round-51 F2 — DEEPLY NESTED inline flow maps must not read as "gate off".
+  it('P1/F2: no-preflight CLI + nested inline `review: { local_review: { mode: enforce } }` → FAIL CLOSED', async () => {
+    const r = await runPrePushWithStubPolicy(
+      TOO_OLD_NO_PREFLIGHT,
+      'review: { local_review: { mode: enforce } }\n',
+    );
+    expect(r.code).toBe(2);
+  });
+
+  it('P1/F2: no-preflight CLI + nested inline `artifact_gates: { g3_review: { mode: shadow } }` → FAIL CLOSED', async () => {
+    const r = await runPrePushWithStubPolicy(
+      TOO_OLD_NO_PREFLIGHT,
+      'artifact_gates: { g3_review: { mode: shadow } }\n',
+    );
+    expect(r.code).toBe(2);
+  });
+
+  it('P1/F2: no-preflight CLI + tight inline `local_review:{mode:enforce}` → FAIL CLOSED', async () => {
+    const r = await runPrePushWithStubPolicy(
+      TOO_OLD_NO_PREFLIGHT,
+      'review:\n  local_review:{mode:enforce}\n',
+    );
+    expect(r.code).toBe(2);
+  });
+
+  it('P1/F2: no-preflight CLI + inline `local_review: { mode: off }` → FAIL OPEN (off means off)', async () => {
+    const r = await runPrePushWithStubPolicy(
+      TOO_OLD_NO_PREFLIGHT,
+      'review:\n  local_review: { mode: off }\n',
+    );
+    expect(r.code).toBe(0);
   });
 
   it('P1: no-preflight CLI + `local_review.mode: off` → FAIL OPEN (exit 0)', async () => {

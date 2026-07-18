@@ -328,12 +328,16 @@ done
 #   - policy present, mode shadow/enforce → 0 (gate active → fail CLOSED)
 #   - policy present but awk unavailable  → 0 (cannot parse a governed policy →
 #                                              bias fail-CLOSED)
-# Parse: track \`local_review:\`/\`g3_review:\` blocks by indentation and match a
-# \`mode:\` value of shadow/enforce inside them; inline maps
-# (\`local_review: { mode: enforce }\`) are handled too. Value matching strips
-# non-alpha before comparing, so \`enforce\`, \`"enforce"\`, \`'enforce'\`, and
-# \`enforce # note\` all match. Known limit: no full YAML parse — a structurally
-# broken policy that our line scan reads as no-active-mode fails OPEN.
+# Parse recognizes an active gate in EITHER form: (a) block form —
+# \`local_review:\`/\`g3_review:\` on its own line with a \`mode:\` shadow/enforce
+# value on an indented line inside the block (indentation-disarmed so a sibling
+# block's \`mode:\` cannot false-trip); OR (b) inline flow map on a SINGLE
+# logical line at ANY nesting depth — \`local_review: { mode: enforce }\`,
+# \`local_review:{mode:enforce}\`, and \`review: { local_review: { mode: enforce } }\`.
+# Value matching strips non-alpha before comparing, so \`enforce\`, \`"enforce"\`,
+# \`'enforce'\`, and \`enforce # note\` all match. Known limit: no full YAML parse —
+# a structurally broken policy that our line scan reads as no-active-mode fails
+# OPEN.
 _rea_review_gate_active() {
   _rea_pol="\${REA_ROOT}/.rea/policy.yaml"
   [ -f "\$_rea_pol" ] || return 1
@@ -348,6 +352,12 @@ _rea_review_gate_active() {
     {
       s=\$0; sub(/^[ \\t]*/,"",s)
       if (s=="" || substr(s,1,1)=="#") next
+      # (b) inline flow map at ANY nesting depth: a single logical line
+      # carrying a gate key AND a mode:shadow/enforce value, e.g.
+      # \`review: { local_review: { mode: enforce } }\` or \`local_review:{mode:enforce}\`.
+      if (s ~ /local_review[^A-Za-z_].*mode:[^A-Za-z]*(shadow|enforce)/ || s ~ /g3_review[^A-Za-z_].*mode:[^A-Za-z]*(shadow|enforce)/) { f=1; exit }
+      # (a) block form across indented lines (indentation-disarmed so a
+      # sibling block mode: cannot false-trip).
       i=ind(\$0)
       if (s ~ /^local_review:/ || s ~ /^g3_review:/) {
         if (has_active(s)) { f=1; exit }
