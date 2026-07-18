@@ -268,15 +268,42 @@ fi
 #   - policy.review.local_review.mode: off  → preflight is no-op
 #   - REA_SKIP_LOCAL_REVIEW="<reason>"      → bypass + audit
 # We resolve the rea binary the same way the dispatch below does.
+#
+# 0.26.0 preflight COMPAT (round-32 F1). The \`--operation\` flag is NEW in
+# this release. A RESOLVED but OLDER rea CLI — a repo pinned below this
+# release, or a stale PATH/global fallback — does not know it, and commander
+# exits \`unknown option '--operation'\`, which would HARD-BLOCK every push
+# before the gate runs. \`_rea_preflight\` tries the current invocation; on an
+# unknown-option/unknown-command error it RETRIES the pre-0.26
+# \`preflight --strict\` form so the gate STILL RUNS on the older CLI; if even
+# that is unknown (a CLI too old to have \`preflight\` at all) it FAILS OPEN —
+# a flag/subcommand incompatibility must never block a push (the push-gate
+# below is the second layer). A GENUINE refusal (exit 2, no unknown-* marker)
+# propagates unchanged. \$@ is the resolved CLI prefix.
+_rea_preflight() {
+  _pf_out=\$("\$@" preflight --strict --operation push 2>&1) && _pf_rc=0 || _pf_rc=\$?
+  if [ "\$_pf_rc" -ne 0 ]; then
+    case "\$_pf_out" in
+      *"unknown option"* | *"unknown command"*)
+        _pf_out=\$("\$@" preflight --strict 2>&1) && _pf_rc=0 || _pf_rc=\$?
+        case "\$_pf_out" in
+          *"unknown option"* | *"unknown command"*) _pf_out=""; _pf_rc=0 ;;
+        esac
+        ;;
+    esac
+  fi
+  if [ -n "\$_pf_out" ]; then printf '%s\\n' "\$_pf_out" >&2; fi
+  return "\$_pf_rc"
+}
 if (
   if [ -x "\${REA_CLI_ROOT}/node_modules/.bin/rea" ]; then
-    "\${REA_CLI_ROOT}/node_modules/.bin/rea" preflight --strict --operation push
+    _rea_preflight "\${REA_CLI_ROOT}/node_modules/.bin/rea"
   elif [ -f "\${REA_CLI_ROOT}/dist/cli/index.js" ] && [ -f "\${REA_CLI_ROOT}/package.json" ] && grep -q '"name": *"@bookedsolid/rea"' "\${REA_CLI_ROOT}/package.json" 2>/dev/null; then
-    node "\${REA_CLI_ROOT}/dist/cli/index.js" preflight --strict --operation push
+    _rea_preflight node "\${REA_CLI_ROOT}/dist/cli/index.js"
   elif command -v rea >/dev/null 2>&1; then
-    rea preflight --strict --operation push
+    _rea_preflight rea
   elif command -v npx >/dev/null 2>&1; then
-    npx --no-install @bookedsolid/rea preflight --strict --operation push
+    _rea_preflight npx --no-install @bookedsolid/rea
   else
     printf 'rea: cannot locate the rea CLI for preflight. Install locally (\`pnpm add -D @bookedsolid/rea\`) or set policy.review.local_review.mode=off.\\n' >&2
     exit 2

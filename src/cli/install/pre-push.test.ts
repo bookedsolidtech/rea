@@ -928,6 +928,79 @@ describe('extension-hook chaining (Fix H / 0.13.0) — `.husky/pre-push.d/*`', (
     }
   });
 
+  // ── Round-32 F1 — preflight `--operation` compat against an OLD rea CLI ──
+  // Helper: run the fallback hook against a stub `rea` in a temp git repo.
+  async function runPrePushWithStub(stub: string): Promise<{ code: number; stderr: string }> {
+    const repoDir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-pp-compat-')));
+    try {
+      await execFileAsync('git', ['-C', repoDir, 'init', '-q']);
+      const stubBin = path.join(repoDir, 'node_modules', '.bin', 'rea');
+      await fs.mkdir(path.dirname(stubBin), { recursive: true });
+      await fs.writeFile(stubBin, stub, { mode: 0o755 });
+      const hookPath = path.join(repoDir, '.git', 'hooks', 'pre-push');
+      await fs.writeFile(hookPath, fallbackHookContent(), { encoding: 'utf8', mode: 0o755 });
+      const r = await execFileAsync(hookPath, ['origin', 'git@example:r.git'], {
+        cwd: repoDir,
+      }).catch((e: { code?: number; stderr?: string }) => e);
+      return { code: (r as { code?: number }).code ?? 0, stderr: (r as { stderr?: string }).stderr ?? '' };
+    } finally {
+      await fs.rm(repoDir, { recursive: true, force: true });
+    }
+  }
+
+  it('F1: an OLD CLI that rejects `--operation` does NOT block — retries `preflight --strict`', async () => {
+    // Stub: `preflight` WITH `--operation` → commander unknown-option (exit 1);
+    // `preflight` WITHOUT it (the retry) → 0; `hook push-gate` → 0.
+    const stub = [
+      '#!/bin/sh',
+      'op=0; for a in "$@"; do [ "$a" = "--operation" ] && op=1; done',
+      'case "$1" in',
+      '  preflight)',
+      '    if [ "$op" = "1" ]; then echo "error: unknown option \'--operation\'" >&2; exit 1; fi',
+      '    exit 0 ;;',
+      '  hook) exit 0 ;;',
+      'esac',
+      'exit 0',
+      '',
+    ].join('\n');
+    const r = await runPrePushWithStub(stub);
+    expect(r.code).toBe(0); // push NOT blocked
+    expect(r.stderr).not.toContain('unknown option'); // the flag error was swallowed
+  });
+
+  it('F1: a CLI too old to have `preflight` at all → FAIL OPEN (push not blocked)', async () => {
+    // Both invocations → unknown command 'preflight'. The gate can't run; the
+    // push-gate second layer still does and the push proceeds.
+    const stub = [
+      '#!/bin/sh',
+      'case "$1" in',
+      '  preflight) echo "error: unknown command \'preflight\'" >&2; exit 1 ;;',
+      '  hook) exit 0 ;;',
+      'esac',
+      'exit 0',
+      '',
+    ].join('\n');
+    const r = await runPrePushWithStub(stub);
+    expect(r.code).toBe(0);
+    expect(r.stderr).not.toContain('unknown command');
+  });
+
+  it('F1: a GENUINE preflight refusal (exit 2, no unknown-* marker) STILL blocks the push', async () => {
+    // `preflight` refuses with a real banner + exit 2 → must propagate (block).
+    const stub = [
+      '#!/bin/sh',
+      'case "$1" in',
+      '  preflight) echo "REA preflight: no recent local review covers HEAD" >&2; exit 2 ;;',
+      '  hook) exit 0 ;;',
+      'esac',
+      'exit 0',
+      '',
+    ].join('\n');
+    const r = await runPrePushWithStub(stub);
+    expect(r.code).toBe(2); // blocked
+    expect(r.stderr).toContain('no recent local review');
+  });
+
   it('non-executable files in `.husky/pre-push.d/` are silently skipped', async () => {
     const repoDir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-pp-skip-')));
     try {

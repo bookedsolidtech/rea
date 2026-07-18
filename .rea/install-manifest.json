@@ -311,7 +311,7 @@
     },
     {
       "path": ".husky/pre-push",
-      "sha256": "d2d0a5a9fbc93a7d16dcb8039db96bca20bda507c28f670ff495a44ca5b746ff",
+      "sha256": "ed788dc297d58cd4fbd84d228e99c27651636f879e704fe245ee219bfe82296b",
       "source": "husky"
     },
     {
