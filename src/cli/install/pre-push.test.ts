@@ -188,9 +188,13 @@ describe('BODY_TEMPLATE — path-with-spaces portability (Fix A / 0.12.0)', () =
     // Absent policy → off (allow); no awk → enforce (bias closed).
     expect(body).toMatch(/\[ -f "\$_rea_pol" \] \|\| \{ printf 'off'; return 0; \}/);
     expect(body).toMatch(/command -v awk >\/dev\/null 2>&1 \|\| \{ printf 'enforce'; return 0; \}/);
-    // Detection targets both gate blocks (block + inline flow map at any depth).
-    expect(body).toMatch(/opener="\^\(local_review\|g3_review\):"/);
-    expect(body).toMatch(/inlinep="\(local_review\|g3_review\)\[\^A-Za-z_\]\.\*mode:"/);
+    // round-55: presence/precedence detection — g3_review present is
+    // authoritative; local_review only consulted when g3 is absent.
+    expect(body).toMatch(/if \(s ~ \/g3_review\[\^A-Za-z_\]\.\*mode:\/\) \{ g3p=1; g3v=classify\(s\) \}/);
+    expect(body).toMatch(/else if \(s ~ \/local_review\[\^A-Za-z_\]\.\*mode:\/\) \{ lgp=1; lgv=classify\(s\) \}/);
+    expect(body).toMatch(/if \(g3p\) print \(g3v=="" \? "enforce" : g3v\)/);
+    expect(body).toMatch(/else if \(lgp\) print \(lgv=="off" \? "off" : "enforce"\)/);
+    expect(body).toMatch(/else print "off"/);
     // Tri-state: enforce → CONFIG-ERROR + rc 2; shadow → WARN + rc 0; off → rc 0.
     expect(body).toMatch(/case "\$\(_rea_review_gate_mode\)" in/);
     expect(body).toMatch(/enforce\)/);
@@ -1091,23 +1095,84 @@ describe('extension-hook chaining (Fix H / 0.13.0) — `.husky/pre-push.d/*`', (
     expect(r.stderr).toContain('REA_SKIP_LOCAL_REVIEW');
   });
 
-  it('round-54: no-preflight CLI + `local_review.mode: shadow` → WARN + ALLOW (exit 0)', async () => {
+  // round-55: legacy `local_review` speaks only `off`/`enforced`. A non-`off`
+  // legacy value (here the g3-only `shadow`) resolves to ENFORCE, mirroring
+  // resolveEffectiveReviewMode (`legacyMode === 'off' ? 'off' : 'enforce'`).
+  it('round-55: no-preflight CLI + `local_review.mode: shadow` (invalid legacy vocab) → ENFORCE → FAIL CLOSED (exit 2)', async () => {
     const r = await runPrePushWithStubPolicy(
       TOO_OLD_NO_PREFLIGHT,
       'review:\n  local_review:\n    mode: shadow\n',
+    );
+    expect(r.code).toBe(2);
+    expect(r.stderr).toContain('CONFIG-ERROR');
+  });
+
+  // ── round-55 P1 — PRESENCE/PRECEDENCE (mirrors resolveEffectiveReviewMode),
+  // NOT strongest-wins. A PRESENT g3_review.mode is authoritative over legacy.
+  it('round-55: g3_review.mode: off + stale legacy local_review.mode: enforced → OFF → ALLOW (exit 0)', async () => {
+    // The exact finding: a repo migrated to g3 off but still carrying a stale
+    // legacy enforce must NOT fail closed on the old-CLI path.
+    const r = await runPrePushWithStubPolicy(
+      TOO_OLD_NO_PREFLIGHT,
+      'artifact_gates:\n  g3_review:\n    mode: off\nreview:\n  local_review:\n    mode: enforced\n',
+    );
+    expect(r.code).toBe(0);
+    expect(r.stderr).not.toContain('CONFIG-ERROR');
+  });
+
+  it('round-55: g3_review.mode: shadow + legacy enforced → SHADOW (g3 authoritative) → WARN + ALLOW (exit 0)', async () => {
+    const r = await runPrePushWithStubPolicy(
+      TOO_OLD_NO_PREFLIGHT,
+      'artifact_gates:\n  g3_review:\n    mode: shadow\nreview:\n  local_review:\n    mode: enforced\n',
     );
     expect(r.code).toBe(0);
     expect(r.stderr).toContain('WARN — review gate (shadow) could not run');
     expect(r.stderr).not.toContain('CONFIG-ERROR');
   });
 
-  it('round-54: no-preflight CLI + mixed local_review shadow + g3_review enforce → strongest wins → FAIL CLOSED', async () => {
+  it('round-55: g3_review.mode: enforce + legacy off → ENFORCE (g3 authoritative) → FAIL CLOSED (exit 2)', async () => {
     const r = await runPrePushWithStubPolicy(
       TOO_OLD_NO_PREFLIGHT,
-      'review:\n  local_review:\n    mode: shadow\nartifact_gates:\n  g3_review:\n    mode: enforce\n',
+      'artifact_gates:\n  g3_review:\n    mode: enforce\nreview:\n  local_review:\n    mode: off\n',
     );
     expect(r.code).toBe(2);
     expect(r.stderr).toContain('CONFIG-ERROR');
+  });
+
+  it('round-55: g3 ABSENT + legacy enforced → ENFORCE → FAIL CLOSED (exit 2)', async () => {
+    const r = await runPrePushWithStubPolicy(
+      TOO_OLD_NO_PREFLIGHT,
+      'review:\n  local_review:\n    mode: enforced\n',
+    );
+    expect(r.code).toBe(2);
+    expect(r.stderr).toContain('CONFIG-ERROR');
+  });
+
+  it('round-55: g3 ABSENT + legacy off → OFF → ALLOW (exit 0)', async () => {
+    const r = await runPrePushWithStubPolicy(
+      TOO_OLD_NO_PREFLIGHT,
+      'review:\n  local_review:\n    mode: off\n',
+    );
+    expect(r.code).toBe(0);
+    expect(r.stderr).not.toContain('WARN');
+  });
+
+  it('round-55: BOTH keys absent → OFF → ALLOW (documented divergence, fresh-clone protection)', async () => {
+    const r = await runPrePushWithStubPolicy(
+      TOO_OLD_NO_PREFLIGHT,
+      'version: "0.54.0"\nprofile: bst-internal\n',
+    );
+    expect(r.code).toBe(0);
+    expect(r.stderr).not.toContain('WARN');
+  });
+
+  it('round-55: nested-inline g3 off + legacy enforced → OFF → ALLOW (exit 0)', async () => {
+    const r = await runPrePushWithStubPolicy(
+      TOO_OLD_NO_PREFLIGHT,
+      'artifact_gates: { g3_review: { mode: off } }\nreview:\n  local_review:\n    mode: enforced\n',
+    );
+    expect(r.code).toBe(0);
+    expect(r.stderr).not.toContain('CONFIG-ERROR');
   });
 
   // round-54 tri-state: shadow is OBSERVE-ONLY and must NEVER block.

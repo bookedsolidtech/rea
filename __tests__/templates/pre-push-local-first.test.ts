@@ -60,9 +60,13 @@ describe('templates/pre-push.local-first.sh — round-27 F5', () => {
     expect(body).toMatch(/_rea_pol="\$\{REA_ROOT\}\/\.rea\/policy\.yaml"/);
     expect(body).toMatch(/\[ -f "\$_rea_pol" \] \|\| \{ printf 'off'; return 0; \}/);
     expect(body).toMatch(/command -v awk >\/dev\/null 2>&1 \|\| \{ printf 'enforce'; return 0; \}/);
-    // Block-form + inline-flow-map detection (both gate keys).
-    expect(body).toMatch(/opener="\^\(local_review\|g3_review\):"/);
-    expect(body).toMatch(/inlinep="\(local_review\|g3_review\)\[\^A-Za-z_\]\.\*mode:"/);
+    // round-55: presence/precedence detection — g3_review present is
+    // authoritative; local_review only consulted when g3 is absent.
+    expect(body).toMatch(/if \(s ~ \/g3_review\[\^A-Za-z_\]\.\*mode:\/\) \{ g3p=1; g3v=classify\(s\) \}/);
+    expect(body).toMatch(/else if \(s ~ \/local_review\[\^A-Za-z_\]\.\*mode:\/\) \{ lgp=1; lgv=classify\(s\) \}/);
+    expect(body).toMatch(/if \(g3p\) print \(g3v=="" \? "enforce" : g3v\)/);
+    expect(body).toMatch(/else if \(lgp\) print \(lgv=="off" \? "off" : "enforce"\)/);
+    expect(body).toMatch(/else print "off"/);
     // Tri-state: unknown-command routed through the mode switch; enforce → rc 2
     // + CONFIG-ERROR; shadow → WARN + rc 0; unknown-option always allows.
     expect(body).toMatch(/\*"unknown command"\*\)/);
@@ -124,10 +128,12 @@ describe('templates/pre-push.local-first.sh — round-27 F5', () => {
     expect(r.stderr).not.toContain('CONFIG-ERROR');
   });
 
-  it('round-54 WARN+ALLOW: too-old CLI + `local_review.mode: shadow` (block) → exit 0 + WARN', async () => {
+  // round-55: legacy `local_review` speaks only `off`/`enforced`; a non-`off`
+  // legacy value (g3-only `shadow`) resolves to ENFORCE per precedence.
+  it('round-55: too-old CLI + `local_review.mode: shadow` (invalid legacy vocab) → ENFORCE → FAIL CLOSED (exit 2)', async () => {
     const r = await runTemplateWithPolicy('review:\n  local_review:\n    mode: shadow\n');
-    expect(r.code).toBe(0);
-    expect(r.stderr).toContain('WARN — review gate (shadow) could not run');
+    expect(r.code).toBe(2);
+    expect(r.stderr).toContain('CONFIG-ERROR');
   });
 
   it('FAIL OPEN: too-old CLI + `local_review.mode: off` → exit 0 silent', async () => {
@@ -139,6 +145,34 @@ describe('templates/pre-push.local-first.sh — round-27 F5', () => {
   it('FAIL OPEN: too-old CLI + policy ABSENT → exit 0', async () => {
     const r = await runTemplateWithPolicy(null);
     expect(r.code).toBe(0);
+  });
+
+  // round-55 P1 — presence/precedence (g3_review authoritative over legacy).
+  it('round-55: g3_review.mode: off + stale legacy enforced → OFF → ALLOW (exit 0)', async () => {
+    const r = await runTemplateWithPolicy(
+      'artifact_gates:\n  g3_review:\n    mode: off\nreview:\n  local_review:\n    mode: enforced\n',
+    );
+    expect(r.code).toBe(0);
+    expect(r.stderr).not.toContain('CONFIG-ERROR');
+  });
+
+  it('round-55: g3_review.mode: enforce + legacy off → ENFORCE → FAIL CLOSED (exit 2)', async () => {
+    const r = await runTemplateWithPolicy(
+      'artifact_gates:\n  g3_review:\n    mode: enforce\nreview:\n  local_review:\n    mode: off\n',
+    );
+    expect(r.code).toBe(2);
+    expect(r.stderr).toContain('CONFIG-ERROR');
+  });
+
+  it('round-55: g3 absent + legacy enforced → ENFORCE → FAIL CLOSED (exit 2)', async () => {
+    const r = await runTemplateWithPolicy('review:\n  local_review:\n    mode: enforced\n');
+    expect(r.code).toBe(2);
+  });
+
+  it('round-55: both keys absent → OFF → ALLOW (documented divergence)', async () => {
+    const r = await runTemplateWithPolicy('version: "0.54.0"\nprofile: bst-internal\n');
+    expect(r.code).toBe(0);
+    expect(r.stderr).not.toContain('WARN');
   });
 
   it('discovers node_modules/.bin/rea from a synthetic project root', () => {

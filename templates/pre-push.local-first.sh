@@ -114,52 +114,64 @@ fi
 #
 # _rea_review_gate_mode: ECHOES the STRONGEST review-gate mode configured in
 # THIS repo's LOCAL policy at ${REA_ROOT}/.rea/policy.yaml — `enforce`,
-# `shadow`, or `off` (across review.local_review.mode AND
-# artifact_gates.g3_review.mode; enforce > shadow > off). REA_ROOT is the
-# consumer repo root resolved above (`$(pwd)`); policy is per-branch/worktree,
-# so the LOCAL policy governs. Dependency-free (awk only), BSD/GNU/bash-3.2
-# safe, single pass. Dispositions:
-#   - policy ABSENT                       → `off`  (ALLOW)
-#   - policy present, no shadow/enforce   → `off`  (ALLOW)
-#   - policy present, mode shadow         → `shadow` (WARN + ALLOW)
-#   - policy present, mode enforce        → `enforce` (FAIL CLOSED)
-#   - policy present but awk unavailable  → `enforce` (cannot parse a governed
-#                                            policy → bias fail-CLOSED)
-# Parse recognizes a mode in EITHER form: (a) block form — `local_review:`/
-# `g3_review:` on its own line with a `mode:` value on an indented line inside
-# the block (indentation-disarmed so a sibling block's `mode:` cannot
-# false-trip); OR (b) inline flow map on a SINGLE logical line at ANY nesting
-# depth — `local_review: { mode: enforce }`, `local_review:{mode:enforce}`, and
-# `review: { local_review: { mode: enforce } }`. Value matching strips non-alpha
-# so `enforce`, `"enforce"`, `'enforce'`, `enforce # note` all match. Known
-# limit: no full YAML parse — a broken policy read as no-mode maps to `off`.
+# `shadow`, or `off`. Mirrors the canonical resolveEffectiveReviewMode
+# (src/cli/preflight.ts) by PRESENCE + PRECEDENCE, NOT strongest-wins
+# (round-55 P1):
+#   1. artifact_gates.g3_review.mode PRESENT (any value) → that value wins, even
+#      when legacy says enforce (garbage/unrecognized g3 value → `enforce`).
+#   2. else review.local_review.mode PRESENT → legacy vocab `off`/`enforced`:
+#      `off` → off, ANY other value → `enforce`.
+#   3. else BOTH keys ABSENT → `off`. DELIBERATE, DOCUMENTED DIVERGENCE from
+#      resolveEffectiveReviewMode (which returns `enforce` for all-absent as its
+#      CLI-present local-first default): on THIS degraded "CLI cannot run
+#      preflight" compat path an all-unconfigured repo must FAIL OPEN, not brick
+#      every fresh clone / old-global-CLI push (round-15 P1 fresh-clone
+#      protection). Any EXPLICIT opt-in (either key present) is honored; only the
+#      fully-unconfigured case defaults to allow.
+# REA_ROOT is the consumer repo root resolved above (`$(pwd)`); policy is
+# per-worktree, so the LOCAL policy governs. Dependency-free (awk only),
+# BSD/GNU/bash-3.2 safe, single pass. Detection recognizes each key's mode in
+# (a) block form — the key on its own line with a `mode:` value on an indented
+# line inside its block (indentation-disarmed so a sibling block's `mode:`
+# cannot false-trip); OR (b) inline flow map on a SINGLE logical line at ANY
+# nesting depth (`g3_review: { mode: off }`, `artifact_gates: { g3_review: {
+# mode: off } }`). Value matching strips non-alpha so `off`, `"off"`,
+# `enforced # note` all match. Wrapper dispositions: policy ABSENT → `off`
+# (ALLOW); awk unavailable → `enforce` (cannot parse a governed policy → bias
+# fail-CLOSED).
 _rea_review_gate_mode() {
   _rea_pol="${REA_ROOT}/.rea/policy.yaml"
   [ -f "$_rea_pol" ] || { printf 'off'; return 0; }
   command -v awk >/dev/null 2>&1 || { printf 'enforce'; return 0; }
   _rea_m=$(awk '
     function ind(str,   n){ n=0; while (substr(str,n+1,1)==" ") n++; return n }
-    function modeval(str,   v){
-      if (str !~ /mode:/) return ""
+    function classify(str,   v){
       v=str; sub(/.*mode:/,"",v); gsub(/[^A-Za-z]/,"",v)
       if (v ~ /^enforce/) return "enforce"
       if (v ~ /^shadow/) return "shadow"
+      if (v ~ /^off/) return "off"
       return ""
     }
-    function bump(m){ if (m=="enforce") best=2; else if (m=="shadow" && best<1) best=1 }
-    BEGIN { best=0; inlinep="(local_review|g3_review)[^A-Za-z_].*mode:"; opener="^(local_review|g3_review):" }
+    BEGIN { g3p=0; g3v=""; lgp=0; lgv=""; curblk=""; bi=0 }
     {
       s=$0; sub(/^[ \t]*/,"",s)
       if (s=="" || substr(s,1,1)=="#") next
-      if (s ~ inlinep) bump(modeval(s))
       i=ind($0)
-      if (s ~ opener) { bump(modeval(s)); blk=1; bi=i; next }
-      if (blk) {
-        if (i <= bi) blk=0
-        else if (s ~ /^mode:/) bump(modeval(s))
+      if (s ~ /g3_review[^A-Za-z_].*mode:/) { g3p=1; g3v=classify(s) }
+      else if (s ~ /local_review[^A-Za-z_].*mode:/) { lgp=1; lgv=classify(s) }
+      if (s ~ /^g3_review:/) { curblk="g3"; bi=i; next }
+      if (s ~ /^local_review:/) { curblk="legacy"; bi=i; next }
+      if (curblk != "" && i <= bi && s ~ /:/) curblk=""
+      if (curblk != "" && i > bi && s ~ /^mode:/) {
+        if (curblk == "g3") { g3p=1; g3v=classify(s) }
+        else { lgp=1; lgv=classify(s) }
       }
     }
-    END { if (best==2) print "enforce"; else if (best==1) print "shadow" }
+    END {
+      if (g3p) print (g3v=="" ? "enforce" : g3v)
+      else if (lgp) print (lgv=="off" ? "off" : "enforce")
+      else print "off"
+    }
   ' "$_rea_pol" 2>/dev/null)
   case "$_rea_m" in
     enforce) printf 'enforce' ;;
