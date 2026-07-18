@@ -296,6 +296,21 @@ describe('updateCounter — F3 serialization', () => {
     expect(results.map((r) => r.crossedHalt)).toEqual([false, false, true, false]);
   });
 
+  it('resets IMPOSSIBLE persisted state instead of trusting it (round-31 P2)', () => {
+    const file = path.join(root, '.rea', 'turn-count.imp.json');
+    const c = { warnTurns: 1, haltTurns: 2, response: 'warn' as const };
+    // Tampered/stale: count 0 but flags "emitted" — trusting this would suppress
+    // every future crossing. The flags must be cleared (impossible at count 0).
+    fs.writeFileSync(file, JSON.stringify({ count: 0, warn_emitted: true, halt_emitted: true }));
+    const r1 = updateCounter(file, c);
+    expect(r1.count).toBe(1);
+    expect(r1.crossedWarn).toBe(true); // fires despite the bogus warn_emitted
+    expect(updateCounter(file, c).crossedHalt).toBe(true); // and halt still fires
+    // A negative count is impossible → reset to 0, so the next increment is 1.
+    fs.writeFileSync(file, JSON.stringify({ count: -5, warn_emitted: false, halt_emitted: false }));
+    expect(updateCounter(file, c).count).toBe(1);
+  });
+
   it('concurrent cross-process increments do NOT lose a count (proper-lockfile)', () => {
     // The real race the lock addresses is CROSS-PROCESS (each PostToolUse hook
     // is a separate node process). Spawn N processes that each call the built

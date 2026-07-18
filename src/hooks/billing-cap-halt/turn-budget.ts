@@ -163,11 +163,18 @@ function readState(file: string): TurnCountState {
   }
   if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return empty;
   const p = parsed as Record<string, unknown>;
-  return {
-    count: typeof p['count'] === 'number' && Number.isFinite(p['count']) ? p['count'] : 0,
-    warn_emitted: p['warn_emitted'] === true,
-    halt_emitted: p['halt_emitted'] === true,
-  };
+  const rawCount = p['count'];
+  // Round-31 P2: `.rea/turn-count*.json` is writable local state — reject
+  // IMPOSSIBLE values instead of trusting them, or a stale/tampered file (a
+  // negative count, or emitted-flags at count 0) would silently suppress every
+  // future warn/halt crossing for the session. A count must be a non-negative
+  // integer; and no threshold (>= 1) can have been crossed at count 0, so a
+  // flag set while count is 0 is impossible — clear both.
+  const count =
+    typeof rawCount === 'number' && Number.isInteger(rawCount) && rawCount >= 0 ? rawCount : 0;
+  const warn_emitted = count > 0 && p['warn_emitted'] === true;
+  const halt_emitted = count > 0 && p['halt_emitted'] === true;
+  return { count, warn_emitted, halt_emitted };
 }
 
 function writeState(file: string, state: TurnCountState): void {
