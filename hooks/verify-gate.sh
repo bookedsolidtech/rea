@@ -45,9 +45,11 @@ SHIM_REFUSAL_NOUN="task-completion verification"
 # artifact_gates.g2_verify.mode ∈ {shadow, enforce} — a missing/unbuilt/too-old
 # CLI must NOT silently drop the gate. Fail CLOSED so a Write/Edit that
 # transitions a task to completed without evidence cannot bypass an active G2
-# just because the CLI is unavailable in this checkout. _shim_gate_active reads
-# the mode itself (self-contained awk over .rea/policy.yaml), so this editor-tier
-# shim needs no extra policy-reader wiring beyond REA_ROOT.
+# just because the CLI is unavailable in this checkout. Round-54 tri-state:
+# enforce → block; shadow → warn + allow (observe-only never blocks); off/absent
+# → allow. _shim_gate_mode reads the mode itself (self-contained awk over
+# .rea/policy.yaml), so this editor-tier shim needs no policy-reader wiring
+# beyond REA_ROOT.
 SHIM_FAIL_CLOSED_WHEN_RELEVANT=1
 SHIM_ACTIVE_GATE_KEY="g2_verify"
 

@@ -55,15 +55,19 @@ shim_is_relevant() {
   case "$mode" in
     shadow | enforce) return 0 ;;
   esac
-  # round-53 P1: policy_reader's awk tier (used when no CLI/python3 is present —
-  # exactly the CLI-missing scenario this shim now fails CLOSED on) is BLOCK-FORM
-  # ONLY, so a nested inline flow map (`artifact_gates: { g2_verify: { mode:
-  # enforce } }`) would read as `off` and short-circuit here before the
-  # fail-closed logic ever runs. Fall back to the shared robust gate-active
-  # detector (block + inline at any depth, fail-closed bias on an unparseable
-  # governed policy) so an opted-in inline gate is never missed. `_shim_gate_active`
-  # is defined by shim-runtime.sh (sourced below) and resolved at call time.
-  _shim_gate_active
+  # round-53/54: policy_reader's awk tier (used when no CLI/python3 is present —
+  # exactly the CLI-missing scenario this shim now fails CLOSED/WARNs on) is
+  # BLOCK-FORM ONLY, so a nested inline flow map (`artifact_gates: { g2_verify:
+  # { mode: enforce } }`) would read as `off` and short-circuit here before the
+  # mode-aware fail-closed/shadow-warn logic ever runs. Fall back to the shared
+  # robust gate-MODE detector (block + inline at any depth, enforce-bias on an
+  # unparseable governed policy): shadow OR enforce → relevant (the CLI still
+  # runs the scan under shadow — OBSERVE mode observes). `_shim_gate_mode` is
+  # defined by shim-runtime.sh (sourced below) and resolved at call time.
+  case "$(_shim_gate_mode)" in
+    shadow | enforce) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 # shellcheck source=_lib/shim-runtime.sh

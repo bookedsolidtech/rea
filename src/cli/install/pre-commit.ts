@@ -210,56 +210,86 @@ fi
 # Dispositions: policy ABSENT → 1 (no gate → keep fail-OPEN); active mode → 0
 # (fail CLOSED); policy present but awk unavailable → 0 (cannot parse a governed
 # policy → bias fail-CLOSED). bash-3.2 / BSD-safe, single pass.
-_rea_spec_gate_active() {
+# round-54 tri-state — gate-MODE detector for the "CLI cannot run G1" posture.
+# ECHOES the G1 gate mode from THIS repo's LOCAL policy at
+# \${REA_ROOT}/.rea/policy.yaml — \`enforce\`, \`shadow\`, or \`off\`
+# (artifact_gates.g1_spec.mode). Same block+inline-flow-map awk as the pre-push
+# review-gate detector (ONE rule across gates): mode in block form OR inline
+# flow map at ANY nesting depth (\`artifact_gates: { g1_spec: { mode: enforce } }\`,
+# \`g1_spec:{mode:enforce}\`); value strips non-alpha so \`enforce\`, \`"enforce"\`,
+# \`'enforce'\` match. Dispositions (shadow is OBSERVE-ONLY, never blocks):
+#   policy ABSENT / no g1_spec mode → \`off\`; shadow → \`shadow\`; enforce →
+#   \`enforce\`; policy present but awk unavailable → \`enforce\` (cannot parse a
+#   governed policy → bias fail-CLOSED). bash-3.2 / BSD-safe, single pass.
+_rea_spec_gate_mode() {
   _rea_pol="\${REA_ROOT}/.rea/policy.yaml"
-  [ -f "\$_rea_pol" ] || return 1
-  command -v awk >/dev/null 2>&1 || return 0
-  awk '
+  [ -f "\$_rea_pol" ] || { printf 'off'; return 0; }
+  command -v awk >/dev/null 2>&1 || { printf 'enforce'; return 0; }
+  _rea_m=\$(awk '
     function ind(str,   n){ n=0; while (substr(str,n+1,1)==" ") n++; return n }
-    function has_active(str,   v){
-      if (str !~ /mode:/) return 0
+    function modeval(str,   v){
+      if (str !~ /mode:/) return ""
       v=str; sub(/.*mode:/,"",v); gsub(/[^A-Za-z]/,"",v)
-      return (v ~ /^(shadow|enforce)/)
+      if (v ~ /^enforce/) return "enforce"
+      if (v ~ /^shadow/) return "shadow"
+      return ""
     }
+    function bump(m){ if (m=="enforce") best=2; else if (m=="shadow" && best<1) best=1 }
+    BEGIN { best=0; inlinep="g1_spec[^A-Za-z_].*mode:"; opener="^g1_spec:" }
     {
       s=\$0; sub(/^[ \\t]*/,"",s)
       if (s=="" || substr(s,1,1)=="#") next
-      if (s ~ /g1_spec[^A-Za-z_].*mode:[^A-Za-z]*(shadow|enforce)/) { f=1; exit }
+      if (s ~ inlinep) bump(modeval(s))
       i=ind(\$0)
-      if (s ~ /^g1_spec:/) {
-        if (has_active(s)) { f=1; exit }
-        blk=1; bi=i; next
-      }
+      if (s ~ opener) { bump(modeval(s)); blk=1; bi=i; next }
       if (blk) {
         if (i <= bi) blk=0
-        else if (s ~ /^mode:/ && has_active(s)) { f=1; exit }
+        else if (s ~ /^mode:/) bump(modeval(s))
       }
     }
-    END { exit (f?0:1) }
-  ' "\$_rea_pol" 2>/dev/null && return 0
-  return 1
+    END { if (best==2) print "enforce"; else if (best==1) print "shadow" }
+  ' "\$_rea_pol" 2>/dev/null)
+  case "\$_rea_m" in
+    enforce) printf 'enforce' ;;
+    shadow) printf 'shadow' ;;
+    *) printf 'off' ;;
+  esac
 }
 
-# Emit the G1 fail-closed CONFIG-ERROR. \$1 = the cause clause.
+# Emit the G1 fail-closed CONFIG-ERROR (ENFORCE only). \$1 = the cause clause.
 _rea_spec_config_error() {
   printf 'rea: CONFIG-ERROR — G1 spec gate blocked (fail-closed).\\n' >&2
-  printf '  %s, but this repo has an ACTIVE G1 gate\\n' "\$1" >&2
-  printf '  (artifact_gates.g1_spec.mode = shadow/enforce). Refusing the commit without a\\n' >&2
+  printf '  %s, but this repo has an ENFORCE G1 gate\\n' "\$1" >&2
+  printf '  (artifact_gates.g1_spec.mode = enforce). Refusing the commit without a\\n' >&2
   printf '  spec check. Fix one:\\n' >&2
   printf '    - install/build rea (\`pnpm install && pnpm build\`, or \`npm i -g @bookedsolid/rea\`), or\\n' >&2
   printf '    - set the gate mode to \`off\` in .rea/policy.yaml.\\n' >&2
 }
 
-# round-53 P1 (mirrors pre-push round-50/51). A genuine G1 refusal is exit 2 →
-# block. A CLI too old to have \`gate spec-check\` reports \`unknown command\`;
-# that USED to convert to a clean pass (fail-open), silently disabling an
-# opted-in G1 gate. Now it is MODE-AWARE: unknown-command + G1 ACTIVE → fail
-# CLOSED with a CONFIG-ERROR; unknown-command + off/absent → fail OPEN (a
-# default-off gate must stay invisible). A pure \`unknown option\` (flag mismatch
-# on a gate-capable CLI) always fails OPEN. Any other non-2 noise preserves the
-# fail-open default (round-15 P1). A pass / fail-open RETURNS 0 so control falls
-# through to the fragment chain (round-23 F2); only a genuine refusal / active
-# config-error \`exit 2\`s.
+# round-54 tri-state "the CLI could not run G1" disposition. \$1 = cause clause.
+#   enforce → CONFIG-ERROR + exit 2 (block the commit).
+#   shadow  → one-line WARN + return 0 (OBSERVE-ONLY never blocks).
+#   off / absent → return 0 silently.
+# Bias enforce on an unparseable governed policy (see _rea_spec_gate_mode).
+_rea_spec_cannot_run() {
+  case "\$(_rea_spec_gate_mode)" in
+    enforce) _rea_spec_config_error "\$1"; exit 2 ;;
+    shadow) printf 'rea: WARN — G1 spec gate (shadow) could not run: %s; not blocking.\\n' "\$1" >&2; return 0 ;;
+    *) return 0 ;;
+  esac
+}
+
+# round-53/54. A genuine G1 refusal is exit 2 → block. Every "CLI can't run the
+# gate" outcome routes through _rea_spec_cannot_run (mode-aware tri-state):
+#   - \`unknown command\` (CLI too old to have \`gate spec-check\`);
+#   - \`unknown option\` (flag mismatch on a gate-capable CLI) → ALWAYS return 0
+#     (a flag incompat is not a "gate could not run" signal — never block);
+#   - the \`*)\` catch-all (round-54 P2 finding 2): any OTHER non-2 error — node
+#     missing for the dist path, a corrupted install, the command crashing
+#     before it returns its own code — previously fail-open, silently disabling
+#     an ENFORCE gate; now routed through the same mode logic.
+# A pass / shadow-warn / off RETURNS 0 so control falls through to the fragment
+# chain (round-23 F2); only a genuine refusal / enforce config-error \`exit 2\`s.
 _rea_spec_gate() {
   _sg_out=\$("\$@" gate spec-check 2>&1) && _rc=0 || _rc=\$?
   if [ "\$_rc" -eq 0 ]; then
@@ -272,16 +302,12 @@ _rea_spec_gate() {
   fi
   case "\$_sg_out" in
     *"unknown command"*)
-      if _rea_spec_gate_active; then
-        _rea_spec_config_error 'the resolved rea CLI has no \`gate spec-check\` command'
-        exit 2
-      fi
-      return 0 ;;
+      _rea_spec_cannot_run 'the resolved rea CLI has no \`gate spec-check\` command' ;;
     *"unknown option"*)
       return 0 ;;
     *)
       [ -n "\$_sg_out" ] && printf '%s\\n' "\$_sg_out" >&2
-      return 0 ;;
+      _rea_spec_cannot_run 'rea gate spec-check failed to run (unexpected error)' ;;
   esac
 }
 
@@ -296,23 +322,14 @@ elif command -v rea >/dev/null 2>&1; then
   # global CLI fails OPEN; only a genuine G1 refusal (exit 2) blocks.
   _rea_spec_gate rea
 else
-  # No rea CLI anywhere. DEFAULT-OFF gate → FAIL OPEN (round-15 P1): failing
-  # CLOSED unconditionally would brick EVERY commit on a fresh clone /
-  # pre-\`pnpm install\` repo where the CLI is not yet built.
-  #
-  # round-53 P1 (mode-aware): but if the repo OPTED IN — G1 is ACTIVE
-  # (artifact_gates.g1_spec.mode = shadow/enforce) — a missing CLI cannot run
-  # the gate, so the silent-disable is a config error worth surfacing → FAIL
-  # CLOSED with a CONFIG-ERROR. A default-off repo is still never bricked
-  # (inactive → the \`:\` no-op below → fall through to the fragment chain). This
-  # PRESERVES round-15's fresh-clone protection for the common (unconfigured)
-  # case while closing the opted-in fail-open. \`rea doctor\` also warns here.
-  if _rea_spec_gate_active; then
-    _rea_spec_config_error 'no rea CLI is installed or built'
-    exit 2
-  fi
-  # Inactive / default-off → fall through to the fragment chain regardless.
-  :
+  # No rea CLI anywhere. round-54 tri-state (mode-aware): enforce → FAIL CLOSED
+  # (CONFIG-ERROR + exit 2); shadow → one-line WARN + ALLOW (observe-only never
+  # blocks); off / absent → ALLOW silently. This PRESERVES round-15's fresh-clone
+  # protection for the common default-off case (a missing CLI never bricks an
+  # un-opted-in repo) while closing the opted-in ENFORCE fail-open. \`rea doctor\`
+  # also warns. _rea_spec_cannot_run RETURNS 0 for shadow/off so control falls
+  # through to the fragment chain.
+  _rea_spec_cannot_run 'no rea CLI is installed or built'
 fi
 
 # Extension-hook chaining (round-23 F2, mirrors pre-push's \`.husky/pre-push.d/\`

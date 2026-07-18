@@ -375,10 +375,25 @@ describe.skipIf(!CLI_MISSING_ENABLED)('verify-gate shims — round-53 P1 CLI-mis
     }
   });
 
-  it('bash-gate: shadow + no CLI → FAIL CLOSED (exit 2)', () => {
+  // round-54 tri-state: shadow is OBSERVE-ONLY → WARN + ALLOW, never blocks.
+  it('bash-gate: shadow + no CLI → WARN + ALLOW (exit 0)', () => {
     const d = mkRepo(g2PolicyText('shadow'));
     try {
-      expect(runFull(BASH_SHIM, d, bashPayload(d)).status).toBe(2);
+      const r = runFull(BASH_SHIM, d, bashPayload(d));
+      expect(r.status).toBe(0);
+      expect(r.stderr).toContain('WARN');
+      expect(r.stderr).not.toContain('CONFIG-ERROR');
+    } finally {
+      fs.rmSync(d, { recursive: true, force: true });
+    }
+  });
+
+  it('bash-gate: nested-inline shadow + no CLI → WARN + ALLOW (exit 0)', () => {
+    const d = mkRepo('artifact_gates: { g2_verify: { mode: shadow } }\n');
+    try {
+      const r = runFull(BASH_SHIM, d, bashPayload(d));
+      expect(r.status).toBe(0);
+      expect(r.stderr).toContain('WARN');
     } finally {
       fs.rmSync(d, { recursive: true, force: true });
     }
@@ -426,6 +441,18 @@ describe.skipIf(!CLI_MISSING_ENABLED)('verify-gate shims — round-53 P1 CLI-mis
     const d = mkRepo('artifact_gates: { g2_verify: { mode: enforce } }\n');
     try {
       expect(runFull(EDITOR_SHIM, d, storeWrite(d)).status).toBe(2);
+    } finally {
+      fs.rmSync(d, { recursive: true, force: true });
+    }
+  });
+
+  it('editor: shadow + store write + no CLI → WARN + ALLOW (exit 0)', () => {
+    const d = mkRepo(g2PolicyText('shadow'));
+    try {
+      const r = runFull(EDITOR_SHIM, d, storeWrite(d));
+      expect(r.status).toBe(0);
+      expect(r.stderr).toContain('WARN');
+      expect(r.stderr).not.toContain('CONFIG-ERROR');
     } finally {
       fs.rmSync(d, { recursive: true, force: true });
     }

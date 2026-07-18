@@ -180,32 +180,25 @@ describe('BODY_TEMPLATE — path-with-spaces portability (Fix A / 0.12.0)', () =
     expect(executableHuskyLines.some((l) => /exec\s+\$REA_BIN/.test(l))).toBe(false);
   });
 
-  it('carries the round-50 mode-aware no-preflight split (helper + fail-closed/open branches)', () => {
+  it('carries the round-54 tri-state no-preflight split (mode detector + enforce/shadow/off branches)', () => {
     const body = fallbackHookContent();
-    // The gate-active helper exists and reads the LOCAL policy via REA_ROOT.
-    expect(body).toMatch(/_rea_review_gate_active\(\) \{/);
+    // The gate-MODE helper exists and reads the LOCAL policy via REA_ROOT.
+    expect(body).toMatch(/_rea_review_gate_mode\(\) \{/);
     expect(body).toMatch(/_rea_pol="\$\{REA_ROOT\}\/\.rea\/policy\.yaml"/);
-    // Absent policy → return 1 (fail open); no awk → return 0 (fail closed).
-    expect(body).toMatch(/\[ -f "\$_rea_pol" \] \|\| return 1/);
-    expect(body).toMatch(/command -v awk >\/dev\/null 2>&1 \|\| return 0/);
-    // Detection targets both gate blocks + shadow/enforce values.
-    expect(body).toMatch(/\^local_review:/);
-    expect(body).toMatch(/\^g3_review:/);
-    expect(body).toMatch(/\^\(shadow\|enforce\)/);
-    // Round-51 F2: inline flow map at ANY nesting depth is recognized too
-    // (`review: { local_review: { mode: enforce } }`).
-    expect(body).toMatch(/local_review\[\^A-Za-z_\]\.\*mode:\[\^A-Za-z\]\*\(shadow\|enforce\)/);
-    expect(body).toMatch(/g3_review\[\^A-Za-z_\]\.\*mode:\[\^A-Za-z\]\*\(shadow\|enforce\)/);
-    // Tier-3 split: `unknown command` is handled SEPARATELY from
-    // `unknown option`, gated on `_rea_review_gate_active`.
-    expect(body).toMatch(/\*"unknown command"\*\)/);
-    expect(body).toMatch(/if _rea_review_gate_active; then/);
-    // Fail-closed sets rc 2 + prints a CONFIG-ERROR; fail-open keeps rc 0.
+    // Absent policy → off (allow); no awk → enforce (bias closed).
+    expect(body).toMatch(/\[ -f "\$_rea_pol" \] \|\| \{ printf 'off'; return 0; \}/);
+    expect(body).toMatch(/command -v awk >\/dev\/null 2>&1 \|\| \{ printf 'enforce'; return 0; \}/);
+    // Detection targets both gate blocks (block + inline flow map at any depth).
+    expect(body).toMatch(/opener="\^\(local_review\|g3_review\):"/);
+    expect(body).toMatch(/inlinep="\(local_review\|g3_review\)\[\^A-Za-z_\]\.\*mode:"/);
+    // Tri-state: enforce → CONFIG-ERROR + rc 2; shadow → WARN + rc 0; off → rc 0.
+    expect(body).toMatch(/case "\$\(_rea_review_gate_mode\)" in/);
+    expect(body).toMatch(/enforce\)/);
     expect(body).toMatch(/_pf_out=""; _pf_rc=2/);
     expect(body).toMatch(/CONFIG-ERROR/);
+    expect(body).toMatch(/WARN — review gate \(shadow\) could not run/);
     expect(body).toMatch(/REA_SKIP_LOCAL_REVIEW/);
-    // The pure `unknown option` arm still fails open unconditionally: it is
-    // present as a distinct case arm and documented as never-block.
+    // The pure `unknown option` arm still allows unconditionally (any mode).
     expect(body).toMatch(/# Pure flag incompatibility on a preflight-capable CLI/);
     // Structural: within the inner (retry) case, the unknown-command arm
     // precedes the unknown-option arm so a missing command is matched first.
@@ -215,11 +208,12 @@ describe('BODY_TEMPLATE — path-with-spaces portability (Fix A / 0.12.0)', () =
     expect(innerOpt).toBeGreaterThan(innerCmd);
   });
 
-  it('husky body carries the identical round-50 mode-aware split', () => {
+  it('husky body carries the identical round-54 tri-state split', () => {
     const husky = huskyHookContent();
-    expect(husky).toMatch(/_rea_review_gate_active\(\) \{/);
-    expect(husky).toMatch(/if _rea_review_gate_active; then/);
+    expect(husky).toMatch(/_rea_review_gate_mode\(\) \{/);
+    expect(husky).toMatch(/case "\$\(_rea_review_gate_mode\)" in/);
     expect(husky).toMatch(/CONFIG-ERROR/);
+    expect(husky).toMatch(/WARN — review gate \(shadow\) could not run/);
   });
 
   it('runs end-to-end against a path containing a space (real shell exec)', async () => {
@@ -1097,13 +1091,34 @@ describe('extension-hook chaining (Fix H / 0.13.0) — `.husky/pre-push.d/*`', (
     expect(r.stderr).toContain('REA_SKIP_LOCAL_REVIEW');
   });
 
-  it('P1: no-preflight CLI + `g3_review.mode: shadow` → FAIL CLOSED (exit 2)', async () => {
+  it('round-54: no-preflight CLI + `local_review.mode: shadow` → WARN + ALLOW (exit 0)', async () => {
+    const r = await runPrePushWithStubPolicy(
+      TOO_OLD_NO_PREFLIGHT,
+      'review:\n  local_review:\n    mode: shadow\n',
+    );
+    expect(r.code).toBe(0);
+    expect(r.stderr).toContain('WARN — review gate (shadow) could not run');
+    expect(r.stderr).not.toContain('CONFIG-ERROR');
+  });
+
+  it('round-54: no-preflight CLI + mixed local_review shadow + g3_review enforce → strongest wins → FAIL CLOSED', async () => {
+    const r = await runPrePushWithStubPolicy(
+      TOO_OLD_NO_PREFLIGHT,
+      'review:\n  local_review:\n    mode: shadow\nartifact_gates:\n  g3_review:\n    mode: enforce\n',
+    );
+    expect(r.code).toBe(2);
+    expect(r.stderr).toContain('CONFIG-ERROR');
+  });
+
+  // round-54 tri-state: shadow is OBSERVE-ONLY and must NEVER block.
+  it('P1/round-54: no-preflight CLI + `g3_review.mode: shadow` → WARN + ALLOW (exit 0)', async () => {
     const r = await runPrePushWithStubPolicy(
       TOO_OLD_NO_PREFLIGHT,
       'artifact_gates:\n  g3_review:\n    mode: shadow\n',
     );
-    expect(r.code).toBe(2);
-    expect(r.stderr).toContain('CONFIG-ERROR');
+    expect(r.code).toBe(0);
+    expect(r.stderr).toContain('WARN — review gate (shadow) could not run');
+    expect(r.stderr).not.toContain('CONFIG-ERROR');
   });
 
   it('P1: no-preflight CLI + inline `local_review: { mode: enforce }` → FAIL CLOSED (exit 2)', async () => {
@@ -1123,12 +1138,13 @@ describe('extension-hook chaining (Fix H / 0.13.0) — `.husky/pre-push.d/*`', (
     expect(r.code).toBe(2);
   });
 
-  it('P1/F2: no-preflight CLI + nested inline `artifact_gates: { g3_review: { mode: shadow } }` → FAIL CLOSED', async () => {
+  it('P1/F2/round-54: no-preflight CLI + nested inline `artifact_gates: { g3_review: { mode: shadow } }` → WARN + ALLOW (exit 0)', async () => {
     const r = await runPrePushWithStubPolicy(
       TOO_OLD_NO_PREFLIGHT,
       'artifact_gates: { g3_review: { mode: shadow } }\n',
     );
-    expect(r.code).toBe(2);
+    expect(r.code).toBe(0);
+    expect(r.stderr).toContain('WARN — review gate (shadow) could not run');
   });
 
   it('P1/F2: no-preflight CLI + tight inline `local_review:{mode:enforce}` → FAIL CLOSED', async () => {

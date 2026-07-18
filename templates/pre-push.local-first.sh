@@ -102,68 +102,70 @@ fi
 # the gate STILL RUNS on the older CLI.
 #
 # When even the retry is `unknown command` (a CLI too old to have `preflight`
-# at ALL), the disposition is MODE-AWARE (round-50/51 P1 — off means off):
-#   - review gate ACTIVE (review.local_review.mode OR artifact_gates.g3_review.mode
-#     is shadow/enforce) → FAIL CLOSED (exit 2 + CONFIG-ERROR). Silently
-#     disabling a configured git-side review gate because the resolved rea is
-#     old is a security fail-open.
-#   - review gate OFF / unconfigured → FAIL OPEN — an off-gate repo must not be
-#     blocked just because the resolved rea is old.
+# at ALL), the disposition is MODE-AWARE tri-state (round-54 — shadow is
+# OBSERVE-ONLY and must NEVER block):
+#   - review gate ENFORCE → FAIL CLOSED (exit 2 + CONFIG-ERROR).
+#   - review gate SHADOW  → WARN to stderr + ALLOW (non-blocking).
+#   - review gate OFF / unconfigured → ALLOW silently.
 # A pure `unknown option` at the retry stage (flag mismatch on an otherwise
-# preflight-capable CLI) ALWAYS fails open. A GENUINE refusal (exit 2, no
-# unknown-* marker) propagates unchanged. bash-3.2 / BSD-safe. $@ is the
-# resolved CLI prefix.
+# preflight-capable CLI) ALWAYS allows regardless of mode. A GENUINE refusal
+# (exit 2, no unknown-* marker) propagates unchanged. bash-3.2 / BSD-safe. $@ is
+# the resolved CLI prefix.
 #
-# _rea_review_gate_active: 0 (success) iff THIS repo's LOCAL policy at
-# ${REA_ROOT}/.rea/policy.yaml configures an active review-gate mode. REA_ROOT
-# is the consumer repo root resolved above (`$(pwd)`); policy is
-# per-branch/worktree, so the LOCAL policy governs. Dependency-free (awk only),
-# BSD/GNU/bash-3.2 safe, cheap (single pass). Dispositions:
-#   - policy ABSENT                       → 1 (no gate → fail OPEN)
-#   - policy present, no shadow/enforce   → 1 (gate off → fail OPEN)
-#   - policy present, mode shadow/enforce → 0 (gate active → fail CLOSED)
-#   - policy present but awk unavailable  → 0 (cannot parse a governed policy →
-#                                              bias fail-CLOSED)
-# Parse recognizes an active gate in EITHER form: (a) block form —
-# `local_review:`/`g3_review:` on its own line with a `mode:` shadow/enforce
-# value on an indented line inside the block (indentation-disarmed so a sibling
-# block's `mode:` cannot false-trip); OR (b) inline flow map on a SINGLE
-# logical line at ANY nesting depth — `local_review: { mode: enforce }`,
-# `local_review:{mode:enforce}`, and `review: { local_review: { mode: enforce } }`.
-# Value matching strips non-alpha before comparing, so `enforce`, `"enforce"`,
-# `'enforce'`, and `enforce # note` all match. Known limit: no full YAML parse.
-_rea_review_gate_active() {
+# _rea_review_gate_mode: ECHOES the STRONGEST review-gate mode configured in
+# THIS repo's LOCAL policy at ${REA_ROOT}/.rea/policy.yaml — `enforce`,
+# `shadow`, or `off` (across review.local_review.mode AND
+# artifact_gates.g3_review.mode; enforce > shadow > off). REA_ROOT is the
+# consumer repo root resolved above (`$(pwd)`); policy is per-branch/worktree,
+# so the LOCAL policy governs. Dependency-free (awk only), BSD/GNU/bash-3.2
+# safe, single pass. Dispositions:
+#   - policy ABSENT                       → `off`  (ALLOW)
+#   - policy present, no shadow/enforce   → `off`  (ALLOW)
+#   - policy present, mode shadow         → `shadow` (WARN + ALLOW)
+#   - policy present, mode enforce        → `enforce` (FAIL CLOSED)
+#   - policy present but awk unavailable  → `enforce` (cannot parse a governed
+#                                            policy → bias fail-CLOSED)
+# Parse recognizes a mode in EITHER form: (a) block form — `local_review:`/
+# `g3_review:` on its own line with a `mode:` value on an indented line inside
+# the block (indentation-disarmed so a sibling block's `mode:` cannot
+# false-trip); OR (b) inline flow map on a SINGLE logical line at ANY nesting
+# depth — `local_review: { mode: enforce }`, `local_review:{mode:enforce}`, and
+# `review: { local_review: { mode: enforce } }`. Value matching strips non-alpha
+# so `enforce`, `"enforce"`, `'enforce'`, `enforce # note` all match. Known
+# limit: no full YAML parse — a broken policy read as no-mode maps to `off`.
+_rea_review_gate_mode() {
   _rea_pol="${REA_ROOT}/.rea/policy.yaml"
-  [ -f "$_rea_pol" ] || return 1
-  command -v awk >/dev/null 2>&1 || return 0
-  awk '
+  [ -f "$_rea_pol" ] || { printf 'off'; return 0; }
+  command -v awk >/dev/null 2>&1 || { printf 'enforce'; return 0; }
+  _rea_m=$(awk '
     function ind(str,   n){ n=0; while (substr(str,n+1,1)==" ") n++; return n }
-    function has_active(str,   v){
-      if (str !~ /mode:/) return 0
+    function modeval(str,   v){
+      if (str !~ /mode:/) return ""
       v=str; sub(/.*mode:/,"",v); gsub(/[^A-Za-z]/,"",v)
-      return (v ~ /^(shadow|enforce)/)
+      if (v ~ /^enforce/) return "enforce"
+      if (v ~ /^shadow/) return "shadow"
+      return ""
     }
+    function bump(m){ if (m=="enforce") best=2; else if (m=="shadow" && best<1) best=1 }
+    BEGIN { best=0; inlinep="(local_review|g3_review)[^A-Za-z_].*mode:"; opener="^(local_review|g3_review):" }
     {
       s=$0; sub(/^[ \t]*/,"",s)
       if (s=="" || substr(s,1,1)=="#") next
-      # (b) inline flow map at ANY nesting depth: a single logical line
-      # carrying a gate key AND a mode:shadow/enforce value.
-      if (s ~ /local_review[^A-Za-z_].*mode:[^A-Za-z]*(shadow|enforce)/ || s ~ /g3_review[^A-Za-z_].*mode:[^A-Za-z]*(shadow|enforce)/) { f=1; exit }
-      # (a) block form across indented lines (indentation-disarmed so a
-      # sibling block mode: cannot false-trip).
+      if (s ~ inlinep) bump(modeval(s))
       i=ind($0)
-      if (s ~ /^local_review:/ || s ~ /^g3_review:/) {
-        if (has_active(s)) { f=1; exit }
-        blk=1; bi=i; next
-      }
+      if (s ~ opener) { bump(modeval(s)); blk=1; bi=i; next }
       if (blk) {
         if (i <= bi) blk=0
-        else if (s ~ /^mode:/ && has_active(s)) { f=1; exit }
+        else if (s ~ /^mode:/) bump(modeval(s))
       }
     }
-    END { exit (f?0:1) }
-  ' "$_rea_pol" 2>/dev/null && return 0
-  return 1
+    END { if (best==2) print "enforce"; else if (best==1) print "shadow" }
+  ' "$_rea_pol" 2>/dev/null)
+  case "$_rea_m" in
+    enforce) printf 'enforce' ;;
+    shadow) printf 'shadow' ;;
+    *) printf 'off' ;;
+  esac
 }
 _rea_preflight() {
   _pf_out=$("$@" preflight --strict --operation push 2>&1) && _pf_rc=0 || _pf_rc=$?
@@ -173,20 +175,24 @@ _rea_preflight() {
         _pf_out=$("$@" preflight --strict 2>&1) && _pf_rc=0 || _pf_rc=$?
         case "$_pf_out" in
           *"unknown command"*)
-            # CLI lacks `preflight` entirely. Fail CLOSED only when the repo's
-            # review gate is actually active; otherwise preserve fail-open.
-            if _rea_review_gate_active; then
-              printf 'rea: CONFIG-ERROR — pre-push blocked (fail-closed).\n' >&2
-              printf '  The resolved rea CLI has no `preflight` command, but this repo has an\n' >&2
-              printf '  ACTIVE review gate (review.local_review.mode or artifact_gates.g3_review.mode\n' >&2
-              printf '  = shadow/enforce). Refusing to push without a coverage check. Fix one:\n' >&2
-              printf '    - upgrade rea (e.g. `npm i -g @bookedsolid/rea`), or\n' >&2
-              printf '    - set the gate mode to `off` in .rea/policy.yaml, or\n' >&2
-              printf '    - bypass this one push with REA_SKIP_LOCAL_REVIEW="<reason>".\n' >&2
-              _pf_out=""; _pf_rc=2
-            else
-              _pf_out=""; _pf_rc=0
-            fi
+            # CLI lacks `preflight` entirely. Round-54 tri-state:
+            #   enforce → FAIL CLOSED; shadow → WARN + ALLOW; off → ALLOW.
+            case "$(_rea_review_gate_mode)" in
+              enforce)
+                printf 'rea: CONFIG-ERROR — pre-push blocked (fail-closed).\n' >&2
+                printf '  The resolved rea CLI has no `preflight` command, but this repo has an\n' >&2
+                printf '  ENFORCE review gate (review.local_review.mode or artifact_gates.g3_review.mode\n' >&2
+                printf '  = enforce). Refusing to push without a coverage check. Fix one:\n' >&2
+                printf '    - upgrade rea (e.g. `npm i -g @bookedsolid/rea`), or\n' >&2
+                printf '    - set the gate mode to `off` in .rea/policy.yaml, or\n' >&2
+                printf '    - bypass this one push with REA_SKIP_LOCAL_REVIEW="<reason>".\n' >&2
+                _pf_out=""; _pf_rc=2 ;;
+              shadow)
+                printf 'rea: WARN — review gate (shadow) could not run: resolved rea CLI has no `preflight` command; not blocking.\n' >&2
+                _pf_out=""; _pf_rc=0 ;;
+              *)
+                _pf_out=""; _pf_rc=0 ;;
+            esac
             ;;
           *"unknown option"*)
             # Pure flag incompatibility on a preflight-capable CLI — never block.

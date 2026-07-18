@@ -53,23 +53,23 @@ describe('templates/pre-push.local-first.sh — round-27 F5', () => {
   // Round-50/51 P1 — the shipped static template must carry the SAME
   // mode-aware no-preflight fix as the generated BODY_TEMPLATE. The two are
   // hand-synced (no shared generator); this asserts the template did not lag.
-  it('carries the round-50/51 mode-aware gate-active helper + tier-3 split', () => {
+  it('carries the round-54 tri-state gate-MODE detector + enforce/shadow/off split', () => {
     const body = fs.readFileSync(TEMPLATE_PATH, 'utf8');
-    // The gate-active helper exists and reads the LOCAL policy via REA_ROOT.
-    expect(body).toMatch(/_rea_review_gate_active\(\) \{/);
+    // The gate-MODE helper exists and reads the LOCAL policy via REA_ROOT.
+    expect(body).toMatch(/_rea_review_gate_mode\(\) \{/);
     expect(body).toMatch(/_rea_pol="\$\{REA_ROOT\}\/\.rea\/policy\.yaml"/);
-    expect(body).toMatch(/\[ -f "\$_rea_pol" \] \|\| return 1/);
-    expect(body).toMatch(/command -v awk >\/dev\/null 2>&1 \|\| return 0/);
-    // Block-form + inline-flow-map (round-51 F2) detection.
-    expect(body).toMatch(/\^local_review:/);
-    expect(body).toMatch(/\^g3_review:/);
-    expect(body).toMatch(/local_review\[\^A-Za-z_\]\.\*mode:\[\^A-Za-z\]\*\(shadow\|enforce\)/);
-    expect(body).toMatch(/g3_review\[\^A-Za-z_\]\.\*mode:\[\^A-Za-z\]\*\(shadow\|enforce\)/);
-    // Tier-3 split: unknown-command gated on the helper; unknown-option fails open.
+    expect(body).toMatch(/\[ -f "\$_rea_pol" \] \|\| \{ printf 'off'; return 0; \}/);
+    expect(body).toMatch(/command -v awk >\/dev\/null 2>&1 \|\| \{ printf 'enforce'; return 0; \}/);
+    // Block-form + inline-flow-map detection (both gate keys).
+    expect(body).toMatch(/opener="\^\(local_review\|g3_review\):"/);
+    expect(body).toMatch(/inlinep="\(local_review\|g3_review\)\[\^A-Za-z_\]\.\*mode:"/);
+    // Tri-state: unknown-command routed through the mode switch; enforce → rc 2
+    // + CONFIG-ERROR; shadow → WARN + rc 0; unknown-option always allows.
     expect(body).toMatch(/\*"unknown command"\*\)/);
-    expect(body).toMatch(/if _rea_review_gate_active; then/);
+    expect(body).toMatch(/case "\$\(_rea_review_gate_mode\)" in/);
     expect(body).toMatch(/_pf_out=""; _pf_rc=2/);
     expect(body).toMatch(/CONFIG-ERROR/);
+    expect(body).toMatch(/WARN — review gate \(shadow\) could not run/);
     expect(body).toMatch(/REA_SKIP_LOCAL_REVIEW/);
     expect(body).toMatch(/# Pure flag incompatibility on a preflight-capable CLI/);
     const innerCmd = body.indexOf('*"unknown command"*)');
@@ -79,11 +79,11 @@ describe('templates/pre-push.local-first.sh — round-27 F5', () => {
   });
 
   // Exec-harness: drive the template against a too-old `rea` (no `preflight`
-  // command) under different policies. FAIL CLOSED iff the gate is active.
+  // command) under different policies. Tri-state per mode.
   async function runTemplateWithPolicy(
     policy: string | null,
   ): Promise<{ code: number; stderr: string }> {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'rea-tmpl-p51-'));
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'rea-tmpl-p54-'));
     cleanup.push(root);
     spawnSync('git', ['-C', root, 'init', '-q']);
     const bin = path.join(root, 'node_modules', '.bin', 'rea');
@@ -117,14 +117,23 @@ describe('templates/pre-push.local-first.sh — round-27 F5', () => {
     expect(r.code).toBe(2);
   });
 
-  it('FAIL CLOSED: too-old CLI + nested inline `artifact_gates: { g3_review: { mode: shadow } }` → exit 2', async () => {
+  it('round-54 WARN+ALLOW: too-old CLI + nested inline `artifact_gates: { g3_review: { mode: shadow } }` → exit 0 + WARN', async () => {
     const r = await runTemplateWithPolicy('artifact_gates: { g3_review: { mode: shadow } }\n');
-    expect(r.code).toBe(2);
+    expect(r.code).toBe(0);
+    expect(r.stderr).toContain('WARN — review gate (shadow) could not run');
+    expect(r.stderr).not.toContain('CONFIG-ERROR');
   });
 
-  it('FAIL OPEN: too-old CLI + `local_review.mode: off` → exit 0', async () => {
+  it('round-54 WARN+ALLOW: too-old CLI + `local_review.mode: shadow` (block) → exit 0 + WARN', async () => {
+    const r = await runTemplateWithPolicy('review:\n  local_review:\n    mode: shadow\n');
+    expect(r.code).toBe(0);
+    expect(r.stderr).toContain('WARN — review gate (shadow) could not run');
+  });
+
+  it('FAIL OPEN: too-old CLI + `local_review.mode: off` → exit 0 silent', async () => {
     const r = await runTemplateWithPolicy('review:\n  local_review:\n    mode: off\n');
     expect(r.code).toBe(0);
+    expect(r.stderr).not.toContain('WARN');
   });
 
   it('FAIL OPEN: too-old CLI + policy ABSENT → exit 0', async () => {

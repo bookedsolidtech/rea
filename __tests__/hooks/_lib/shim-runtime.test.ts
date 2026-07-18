@@ -401,11 +401,13 @@ ${STD_BODY}
   });
 });
 
-// round-53 P1 — SHIM_FAIL_CLOSED_WHEN_RELEVANT: a FAIL-OPEN shim guarding an
-// ACTIVE policy gate fails CLOSED (not open) when the CLI cannot run. Detection
-// (`_shim_gate_active`) is the shared robust awk: block + inline-flow-map at any
-// depth, fail-closed bias on an unparseable governed policy.
-describe('hooks/_lib/shim-runtime.sh — SHIM_FAIL_CLOSED_WHEN_RELEVANT (round-53 P1)', () => {
+// round-53/54 — SHIM_FAIL_CLOSED_WHEN_RELEVANT: a FAIL-OPEN shim guarding a
+// policy gate resolves the gate MODE when the CLI cannot run. Detection
+// (`_shim_gate_mode`) is the shared robust awk: block + inline-flow-map at any
+// depth, enforce-bias on an unparseable governed policy. Tri-state: enforce →
+// FAIL CLOSED (exit 2 + CONFIG-ERROR); shadow → WARN + ALLOW (exit 0);
+// off/absent → ALLOW.
+describe('hooks/_lib/shim-runtime.sh — SHIM_FAIL_CLOSED_WHEN_RELEVANT (round-53/54)', () => {
   let projectDir: string;
   beforeEach(() => {
     projectDir = makeProjectDir();
@@ -436,16 +438,28 @@ ${STD_BODY}
     expect(r.stderr).toContain('g2_verify');
   });
 
-  it('CLI-missing + gate shadow → FAIL CLOSED (exit 2)', () => {
+  // round-54 tri-state: shadow is OBSERVE-ONLY → WARN + ALLOW, never blocks.
+  it('CLI-missing + gate shadow → WARN + ALLOW (exit 0)', () => {
     if (!bashExists()) return;
     withPolicy('artifact_gates:\n  g2_verify:\n    mode: shadow\n');
-    expect(runGated().status).toBe(2);
+    const r = runGated();
+    expect(r.status).toBe(0);
+    expect(r.stderr).toContain('WARN');
+    expect(r.stderr).not.toContain('CONFIG-ERROR');
   });
 
   it('CLI-missing + nested-inline `artifact_gates: { g2_verify: { mode: enforce } }` → FAIL CLOSED (exit 2)', () => {
     if (!bashExists()) return;
     withPolicy('artifact_gates: { g2_verify: { mode: enforce } }\n');
     expect(runGated().status).toBe(2);
+  });
+
+  it('CLI-missing + nested-inline shadow → WARN + ALLOW (exit 0)', () => {
+    if (!bashExists()) return;
+    withPolicy('artifact_gates: { g2_verify: { mode: shadow } }\n');
+    const r = runGated();
+    expect(r.status).toBe(0);
+    expect(r.stderr).toContain('WARN');
   });
 
   it('CLI-missing + gate off → FAIL OPEN (exit 0)', () => {

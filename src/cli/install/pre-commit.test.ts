@@ -80,15 +80,11 @@ describe('pre-commit installer — content + markers', () => {
     it('same-repository verification guards a foreign nested checkout', () => {
       expect(body).toContain('_rea_same_repo');
     });
-    it('still fails OPEN when no CLI resolves anywhere AND the gate is off/absent', () => {
-      // Round-23 F2 + round-53 P1: the no-CLI branch is a no-op (`:`) that
-      // falls through to the fragment chain WHEN the gate is inactive; only an
-      // ACTIVE gate (checked via `_rea_spec_gate_active`) fails closed here.
-      expect(body).toMatch(/else\n\s+# No rea CLI anywhere\. DEFAULT-OFF gate → FAIL OPEN[\s\S]*:\nfi/);
-    });
-    it('round-53 P1: no-CLI branch fails CLOSED when G1 is active', () => {
-      // The mode-aware fail-closed sits inside the no-CLI else, before the `:`.
-      expect(body).toMatch(/if _rea_spec_gate_active; then\n\s+_rea_spec_config_error 'no rea CLI is installed or built'\n\s+exit 2\n\s+fi/);
+    it('round-54: no-CLI branch routes through the tri-state cannot-run helper', () => {
+      // Round-23 F2 + round-54: the no-CLI else calls `_rea_spec_cannot_run`,
+      // which is enforce → exit 2 / shadow → warn+return 0 / off → return 0
+      // (control falls through to the fragment chain for shadow/off).
+      expect(body).toMatch(/else\n\s+# No rea CLI anywhere\. round-54 tri-state[\s\S]*_rea_spec_cannot_run 'no rea CLI is installed or built'\nfi/);
     });
     // Round-15 P1 kept: `npx --no-install` (a network auto-install that exits
     // non-zero on a cache miss) is NEVER reintroduced.
@@ -110,20 +106,25 @@ describe('pre-commit installer — content + markers', () => {
       expect(body).toMatch(/if \[ "\$_rc" -eq 2 \]; then/);
       expect(body).toMatch(/_rc=\$\?[\s\S]*return 0/);
     });
-    // round-53 P1 — mode-aware no-preflight/unknown-command fail-closed.
-    it('round-53 P1: carries the g1_spec gate-active detector + tier split', () => {
-      expect(body).toContain('_rea_spec_gate_active()');
+    // round-54 — tri-state mode detector + cannot-run routing (incl. catch-all).
+    it('round-54: carries the g1_spec gate-MODE detector + tri-state routing', () => {
+      expect(body).toContain('_rea_spec_gate_mode()');
+      expect(body).toContain('_rea_spec_cannot_run()');
       expect(body).toMatch(/_rea_pol="\$\{REA_ROOT\}\/\.rea\/policy\.yaml"/);
-      expect(body).toMatch(/\[ -f "\$_rea_pol" \] \|\| return 1/);
-      expect(body).toMatch(/command -v awk >\/dev\/null 2>&1 \|\| return 0/);
+      expect(body).toMatch(/\[ -f "\$_rea_pol" \] \|\| \{ printf 'off'; return 0; \}/);
+      expect(body).toMatch(/command -v awk >\/dev\/null 2>&1 \|\| \{ printf 'enforce'; return 0; \}/);
       // block + inline-flow-map detection for g1_spec.
-      expect(body).toMatch(/\^g1_spec:/);
-      expect(body).toMatch(/g1_spec\[\^A-Za-z_\]\.\*mode:\[\^A-Za-z\]\*\(shadow\|enforce\)/);
-      // unknown-command gated on the detector; unknown-option always open.
-      expect(body).toMatch(/\*"unknown command"\*\)/);
-      expect(body).toMatch(/if _rea_spec_gate_active; then/);
-      expect(body).toMatch(/\*"unknown option"\*\)\n\s+return 0 ;;/);
+      expect(body).toMatch(/opener="\^g1_spec:"/);
+      expect(body).toMatch(/inlinep="g1_spec\[\^A-Za-z_\]\.\*mode:"/);
+      // tri-state: enforce → CONFIG-ERROR + exit 2; shadow → WARN + return 0.
+      expect(body).toMatch(/case "\$\(_rea_spec_gate_mode\)" in/);
       expect(body).toContain('CONFIG-ERROR');
+      expect(body).toMatch(/WARN — G1 spec gate \(shadow\) could not run/);
+      // unknown-command routed to cannot-run; unknown-option always returns 0;
+      // finding-2 catch-all `*)` ALSO routed to cannot-run (not a bare return 0).
+      expect(body).toMatch(/\*"unknown command"\*\)\n\s+_rea_spec_cannot_run/);
+      expect(body).toMatch(/\*"unknown option"\*\)\n\s+return 0 ;;/);
+      expect(body).toMatch(/rea gate spec-check failed to run \(unexpected error\)/);
     });
     it('F2: in-project tiers also run through _rea_spec_gate', () => {
       expect(body).toMatch(/_rea_spec_gate "\$\{REA_CLI_ROOT\}\/node_modules\/\.bin\/rea"/);
@@ -243,6 +244,20 @@ describe('pre-commit body — fail-open behaviour (round-15 P1 + round-17 F2)', 
     );
     fssync.chmodSync(p, 0o755);
   }
+  /** In-project `rea` whose `gate` subcommand CRASHES: non-2 exit, no
+   *  unknown-* marker (simulates node-missing on the dist path / corrupted
+   *  install / the command dying before it returns its own verdict). */
+  function inProjectReaGateCrash(): void {
+    const binDir = path.join(dir, 'node_modules', '.bin');
+    fssync.mkdirSync(binDir, { recursive: true });
+    const p = path.join(binDir, 'rea');
+    fssync.writeFileSync(
+      p,
+      `#!/bin/sh\ncase "$1" in gate) echo "Segmentation fault (core dumped)" >&2; exit 3 ;; esac\nexit 0\n`,
+      { mode: 0o755 },
+    );
+    fssync.chmodSync(p, 0o755);
+  }
   /** run() variant returning both status and stderr. */
   function runFull(): { status: number; stderr: string } {
     const base = process.env['PATH'] ?? '';
@@ -268,11 +283,15 @@ describe('pre-commit body — fail-open behaviour (round-15 P1 + round-17 F2)', 
     expect(r.stderr).toContain('CONFIG-ERROR');
   });
 
-  it('P1: unknown-command CLI + g1_spec shadow → FAIL CLOSED (exit 2)', () => {
+  // round-54 tri-state: shadow is OBSERVE-ONLY → WARN + ALLOW, never blocks.
+  it('round-54: unknown-command CLI + g1_spec shadow → WARN + ALLOW (exit 0)', () => {
     if (!bashOk()) return;
     writePolicy(G1_SHADOW);
     inProjectReaGateError("error: unknown command 'gate'");
-    expect(runFull().status).toBe(2);
+    const r = runFull();
+    expect(r.status).toBe(0);
+    expect(r.stderr).toContain('WARN — G1 spec gate (shadow) could not run');
+    expect(r.stderr).not.toContain('CONFIG-ERROR');
   });
 
   it('P1: unknown-command CLI + nested-inline g1_spec enforce → FAIL CLOSED (exit 2)', () => {
@@ -282,17 +301,60 @@ describe('pre-commit body — fail-open behaviour (round-15 P1 + round-17 F2)', 
     expect(runFull().status).toBe(2);
   });
 
-  it('P1: unknown-command CLI + g1_spec off → FAIL OPEN (exit 0)', () => {
+  it('round-54: unknown-command CLI + nested-inline g1_spec shadow → WARN + ALLOW (exit 0)', () => {
+    if (!bashOk()) return;
+    writePolicy('artifact_gates: { g1_spec: { mode: shadow } }\n');
+    inProjectReaGateError("error: unknown command 'gate'");
+    const r = runFull();
+    expect(r.status).toBe(0);
+    expect(r.stderr).toContain('WARN');
+  });
+
+  it('P1: unknown-command CLI + g1_spec off → FAIL OPEN (exit 0 silent)', () => {
     if (!bashOk()) return;
     writePolicy(G1_OFF);
     inProjectReaGateError("error: unknown command 'gate'");
-    expect(runFull().status).toBe(0);
+    const r = runFull();
+    expect(r.status).toBe(0);
+    expect(r.stderr).not.toContain('WARN');
   });
 
   it('P1: unknown-OPTION CLI + g1_spec enforce → FAIL OPEN (flag compat never blocks)', () => {
     if (!bashOk()) return;
     writePolicy(G1_ENFORCE);
     inProjectReaGateError("error: unknown option '--foo'");
+    const r = runFull();
+    expect(r.status).toBe(0);
+    expect(r.stderr).not.toContain('CONFIG-ERROR');
+  });
+
+  // Finding 2 (round-54 P2) — an UNEXPECTED runner error (non-2, no unknown-*
+  // marker: crash / node-missing on the dist path / corrupted install) must NOT
+  // silently pass an ENFORCE gate. Routed through the same tri-state.
+  it('F2: unexpected runner error (exit 3, no unknown-*) + enforce → FAIL CLOSED (exit 2 + CONFIG-ERROR)', () => {
+    if (!bashOk()) return;
+    writePolicy(G1_ENFORCE);
+    inProjectReaGateCrash();
+    const r = runFull();
+    expect(r.status).toBe(2);
+    expect(r.stderr).toContain('CONFIG-ERROR');
+    expect(r.stderr).toContain('failed to run');
+  });
+
+  it('F2: unexpected runner error + shadow → WARN + ALLOW (exit 0)', () => {
+    if (!bashOk()) return;
+    writePolicy(G1_SHADOW);
+    inProjectReaGateCrash();
+    const r = runFull();
+    expect(r.status).toBe(0);
+    expect(r.stderr).toContain('WARN');
+    expect(r.stderr).not.toContain('CONFIG-ERROR');
+  });
+
+  it('F2: unexpected runner error + off → FAIL OPEN (exit 0)', () => {
+    if (!bashOk()) return;
+    writePolicy(G1_OFF);
+    inProjectReaGateCrash();
     expect(runFull().status).toBe(0);
   });
 
@@ -304,9 +366,17 @@ describe('pre-commit body — fail-open behaviour (round-15 P1 + round-17 F2)', 
     expect(r.stderr).toContain('CONFIG-ERROR');
   });
 
-  it('P1: NO CLI + nested-inline g1_spec shadow → FAIL CLOSED (exit 2)', () => {
+  it('round-54: NO CLI + nested-inline g1_spec shadow → WARN + ALLOW (exit 0)', () => {
     if (!bashOk()) return;
     writePolicy('artifact_gates: { g1_spec: { mode: shadow } }\n');
+    const r = runFull();
+    expect(r.status).toBe(0);
+    expect(r.stderr).toContain('WARN');
+  });
+
+  it('P1: NO CLI + nested-inline g1_spec enforce → FAIL CLOSED (exit 2)', () => {
+    if (!bashOk()) return;
+    writePolicy('artifact_gates: { g1_spec: { mode: enforce } }\n');
     expect(runFull().status).toBe(2);
   });
 
