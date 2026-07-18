@@ -730,6 +730,24 @@ describe('dangerous-bash-interceptor: H17 sanction + runner normalization (bug H
     }
   });
 
+  it('does NOT over-block `npm build` — npm built-in ≠ the `run build` script (round-29 P2)', async () => {
+    fs.writeFileSync(
+      path.join(root, '.rea', 'policy.yaml'),
+      `context_protection:\n  delegate_to_subagent:\n    - pnpm run build\n`,
+    );
+    // Explicit `npm run build` IS the delegated script → blocked.
+    expect((await run('npm run build', root)).exitCode).toBe(2);
+    // Bare `npm build` is npm's own built-in (NOT `npm run build`) → allowed;
+    // `build` is not one of npm's four lifecycle names.
+    expect((await run('npm build', root)).exitCode).toBe(0);
+    // …but a lifecycle name still expands: `pnpm run test` → `npm test` blocks.
+    fs.writeFileSync(
+      path.join(root, '.rea', 'policy.yaml'),
+      `context_protection:\n  delegate_to_subagent:\n    - pnpm run test\n`,
+    );
+    expect((await run('npm test', root)).exitCode).toBe(2);
+  });
+
   it('does NOT treat dlx / bare npx as equivalent (they download arbitrary pkgs) (round-1 P2)', async () => {
     // `npx test` / `pnpm dlx test` fetch and run an unrelated package —
     // not the delegated local script — so they must NOT be over-blocked.

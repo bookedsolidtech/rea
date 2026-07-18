@@ -215,6 +215,17 @@ const RUNNER_PREFIXES = [
 ];
 
 /**
+ * The ONLY npm scripts that a bare `npm <name>` runs. For these four lifecycle
+ * names `npm <name>` == `npm run <name>`; for ANY other script name `npm <name>`
+ * is npm's own built-in (`npm build`, `npm publish`) or an error, NOT the
+ * project's `run <name>` script. So the bare-`npm ` runner-equivalence must
+ * apply ONLY when the delegated script is one of these — otherwise it
+ * over-matches npm's built-ins and blocks legitimate coordinator commands like
+ * `npm build` (round-29 P2).
+ */
+const NPM_LIFECYCLE_SCRIPTS = new Set(['test', 'start', 'stop', 'restart']);
+
+/**
  * Extract the "binary/script + args" tail by removing ONE known LOCAL
  * runner prefix. Kept in lockstep with `RUNNER_PREFIXES` — dlx/npx are
  * NOT stripped, so a policy pattern that literally names one only ever
@@ -237,7 +248,16 @@ function expandRunnerEquivalents(pattern: string): string[] {
   const out = new Set<string>([norm]); // always match the listed form verbatim
   // Only RUNNER-PREFIXED equivalents — deliberately NOT the bare tail,
   // which would over-match unrelated `test`/`build` shell commands.
-  for (const pre of RUNNER_PREFIXES) out.add(pre + tail);
+  const firstTailTok = tail.split(' ')[0] ?? '';
+  for (const pre of RUNNER_PREFIXES) {
+    // The bare-`npm ` form is a valid equivalent ONLY for npm's four lifecycle
+    // scripts (`npm test` == `npm run test`); for any other name `npm <name>`
+    // is npm's built-in, not the project script, so expanding e.g.
+    // `pnpm run build` to `npm build` would over-match npm's own `build`
+    // command and block a legitimate coordinator command (round-29 P2).
+    if (pre === 'npm ' && !NPM_LIFECYCLE_SCRIPTS.has(firstTailTok)) continue;
+    out.add(pre + tail);
+  }
   return [...out];
 }
 
