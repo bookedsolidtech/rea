@@ -77,9 +77,11 @@ export const PRE_COMMIT_BODY_MARKER = '# rea:pre-commit-body-v1';
  * `REA_CLI_ROOT` seam the body would fall straight through to the fail-open
  * `exit 0` and the spec gate would silently never run in a worktree. Mirrors
  * `pre-push.ts`'s v6 body: resolve the CLI from the worktree first, then the
- * primary checkout (verified same-repository). Unlike pre-push, there is no
- * PATH/npx tier — this gate FAILS OPEN (round-15 P1), so an unresolved CLI is
- * `exit 0`, never a blocked commit.
+ * primary checkout (verified same-repository), then a global/PATH `rea`
+ * (round-17 F2). Unlike pre-push there is NO `npx --no-install` tier, and the
+ * gate FAILS OPEN (round-15 P1 + round-17 F2): every tier runs through
+ * `_rea_spec_gate`, which blocks ONLY on a genuine G1 refusal (exit 2), so an
+ * absent / too-old / broken CLI at any tier is `exit 0`, never a blocked commit.
  */
 const BODY_TEMPLATE = `set -eu
 
@@ -98,7 +100,7 @@ REA_ROOT=\$(git rev-parse --show-toplevel 2>/dev/null || pwd)
 # frequently has no local install (node_modules/dist live only in the
 # PRIMARY checkout). Resolve the CLI from ONE seam: the worktree first, then
 # the primary checkout (.git-file discriminator, verified same-repository),
-# then the in-project dist tier below. REA_ROOT itself stays the worktree
+# then the in-project dist / global tier below. REA_ROOT itself stays the worktree
 # — HALT and policy resolve against it inside \`rea gate spec-check\`; only CLI
 # dispatch follows REA_CLI_ROOT.
 REA_CLI_ROOT="\$REA_ROOT"
@@ -143,24 +145,46 @@ if [ ! -x "\${REA_ROOT}/node_modules/.bin/rea" ] && [ ! -f "\${REA_ROOT}/dist/cl
   fi
 fi
 
-# Round-15 P1 — FAIL OPEN. The ONLY way this hook exits non-zero is a
-# resolved, valid rea CLI actually running \`gate spec-check\` and G1
-# refusing. A missing CLI, a too-old CLI, or an uncached network-install miss
-# must NEVER block a commit — the gate is DEFAULT-OFF and must be invisible
-# until a repo opts in. So we dispatch ONLY the two IN-PROJECT tiers (a
-# self-pinned node_modules bin, or a name-guarded dogfood dist), and if
-# neither resolves we \`exit 0\`. The pre-0.15 on-PATH and network-install
-# fallbacks propagated a hard non-zero when the CLI was absent/too-old (a
-# package runner exits non-zero on a cache miss), bricking every commit on a
-# fresh clone; they are removed. The dist tier is guarded by the package.json
-# name grep so a foreign \`dist/cli/index.js\` can never be invoked.
+# FAIL OPEN (round-15 P1 + round-17 F2). The ONLY non-zero hook exit is a
+# WORKING rea CLI — in-project OR global — actually running \`gate spec-check\`
+# and G1 genuinely REFUSING, which the CLI signals with exit code 2 (see
+# src/cli/gate.ts: enforce-block / UNCERTAIN-at-enforce → exitCode 2; off /
+# shadow / pass → 0). Every "CLI missing / too-old / broken" path is exit 0 —
+# the gate is DEFAULT-OFF and must be invisible until a repo opts in.
+#
+# \`_rea_spec_gate\` enforces that discipline uniformly across tiers: run the
+# resolved CLI and block ONLY on exit 2. A too-old CLI without the \`gate\`
+# subcommand errors with a NON-2 code (commander unknown-command → 1), so it
+# fails OPEN. That exit-code discipline is exactly what lets the global/PATH
+# tier be reintroduced here: round-15 removed the old on-PATH and
+# network-auto-install fallbacks because they propagated a HARD non-zero on a
+# fresh clone / too-old / cache-miss, bricking every commit. The
+# network-auto-install fallback is NOT reintroduced (nothing is ever
+# auto-fetched); only an ALREADY-INSTALLED global \`rea\` is reached, and only
+# its genuine exit-2 refusal blocks. The dist tier stays guarded by the
+# package.json name grep so a foreign \`dist/cli/index.js\` can never be invoked.
+_rea_spec_gate() {
+  if "\$@" gate spec-check; then
+    exit 0
+  else
+    _rc=\$?
+    [ "\$_rc" -eq 2 ] && exit 2
+    exit 0
+  fi
+}
+
 if [ -x "\${REA_CLI_ROOT}/node_modules/.bin/rea" ]; then
-  "\${REA_CLI_ROOT}/node_modules/.bin/rea" gate spec-check
+  _rea_spec_gate "\${REA_CLI_ROOT}/node_modules/.bin/rea"
 elif [ -f "\${REA_CLI_ROOT}/dist/cli/index.js" ] && [ -f "\${REA_CLI_ROOT}/package.json" ] \\
      && grep -q '"name": *"@bookedsolid/rea"' "\${REA_CLI_ROOT}/package.json" 2>/dev/null; then
-  node "\${REA_CLI_ROOT}/dist/cli/index.js" gate spec-check
+  _rea_spec_gate node "\${REA_CLI_ROOT}/dist/cli/index.js"
+elif command -v rea >/dev/null 2>&1; then
+  # Global / PATH rea (e.g. \`rea install --global\`). Reached only when no
+  # in-project CLI resolved. Same exit-2-only discipline: a too-old or broken
+  # global CLI fails OPEN; only a genuine G1 refusal (exit 2) blocks.
+  _rea_spec_gate rea
 else
-  # No resolvable in-project CLI — fail OPEN (the gate is default-off).
+  # No rea CLI anywhere — fail OPEN (the gate is default-off).
   exit 0
 fi
 `;

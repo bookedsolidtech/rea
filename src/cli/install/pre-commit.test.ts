@@ -66,9 +66,13 @@ describe('pre-commit installer — content + markers', () => {
       expect(body).toMatch(/rev-parse --git-common-dir/);
       expect(body).toMatch(/git -C "\$REA_ROOT" worktree list --porcelain/);
     });
-    it('dispatches `gate spec-check` from REA_CLI_ROOT across every tier', () => {
-      expect(body).toMatch(/"\$\{REA_CLI_ROOT\}\/node_modules\/\.bin\/rea" gate spec-check/);
-      expect(body).toMatch(/node "\$\{REA_CLI_ROOT\}\/dist\/cli\/index\.js" gate spec-check/);
+    it('dispatches from REA_CLI_ROOT across every tier (via _rea_spec_gate)', () => {
+      // Round-17: the actual `gate spec-check` invocation moved into the
+      // `_rea_spec_gate` helper (`"$@" gate spec-check`); the tiers pass the
+      // resolved CLI to it. The name-guard on the dist tier is unchanged.
+      expect(body).toMatch(/_rea_spec_gate "\$\{REA_CLI_ROOT\}\/node_modules\/\.bin\/rea"/);
+      expect(body).toMatch(/_rea_spec_gate node "\$\{REA_CLI_ROOT\}\/dist\/cli\/index\.js"/);
+      expect(body).toContain('"$@" gate spec-check');
       expect(body).toMatch(
         /grep -q '"name": \*"@bookedsolid\/rea"' "\$\{REA_CLI_ROOT\}\/package\.json"/,
       );
@@ -76,27 +80,39 @@ describe('pre-commit installer — content + markers', () => {
     it('same-repository verification guards a foreign nested checkout', () => {
       expect(body).toContain('_rea_same_repo');
     });
-    it('still fails OPEN (exit 0) when no in-project CLI resolves (default-off gate)', () => {
-      expect(body).toMatch(/else\n\s+# No resolvable in-project CLI — fail OPEN[\s\S]*exit 0\nfi/);
+    it('still fails OPEN (exit 0) when no CLI resolves anywhere (default-off gate)', () => {
+      expect(body).toMatch(/else\n\s+# No rea CLI anywhere — fail OPEN[\s\S]*exit 0\nfi/);
     });
-    // Round-15 P1 — the PATH-`rea` and `npx --no-install` fallbacks propagated
-    // a hard non-zero when the CLI was absent/too-old (npx exits non-zero on a
-    // cache miss), bricking every commit on a fresh clone. They MUST be gone:
-    // the only non-zero exit is a resolved CLI's own `gate spec-check` refusal.
-    it('has NO npx fallback (round-15 P1 fail-open)', () => {
+    // Round-15 P1 kept: `npx --no-install` (a network auto-install that exits
+    // non-zero on a cache miss) is NEVER reintroduced.
+    it('has NO npx / network-auto-install fallback (round-15 P1)', () => {
       expect(body).not.toContain('npx');
     });
-    it('has NO PATH `rea` fallback (round-15 P1 fail-open)', () => {
-      expect(body).not.toMatch(/command -v rea\b/);
-      expect(body).not.toMatch(/\n\s*rea gate spec-check/);
+    // Round-17 F2 reconciliation: a global/PATH `rea` tier IS present (for
+    // `rea install --global`), but every tier runs through `_rea_spec_gate`,
+    // which blocks ONLY on a genuine G1 refusal (exit 2) — so a too-old/broken
+    // CLI at any tier fails OPEN. This is the mechanism that lets the PATH tier
+    // come back without the round-15 fresh-clone brick.
+    it('F2: has a global/PATH `rea` tier gated by the exit-2-only discipline', () => {
+      expect(body).toContain('_rea_spec_gate()');
+      expect(body).toMatch(/command -v rea >\/dev\/null 2>&1; then/);
+      expect(body).toMatch(/_rea_spec_gate rea\b/);
+      // The discipline: block only on exit 2, else exit 0.
+      expect(body).toMatch(/\[ "\$_rc" -eq 2 \] && exit 2/);
+      expect(body).toMatch(/_rc=\$\?[\s\S]*exit 0/);
+    });
+    it('F2: in-project tiers also run through _rea_spec_gate', () => {
+      expect(body).toMatch(/_rea_spec_gate "\$\{REA_CLI_ROOT\}\/node_modules\/\.bin\/rea"/);
+      expect(body).toMatch(/_rea_spec_gate node "\$\{REA_CLI_ROOT\}\/dist\/cli\/index\.js"/);
     });
   });
 });
 
-// Round-15 P1 — behavioural proof that the installed hook FAILS OPEN. The body
-// is run as a real shell script in a temp git repo; the ONLY non-zero exit is a
-// resolved in-project CLI whose `gate spec-check` refuses.
-describe('pre-commit body — fail-open behaviour (round-15 P1)', () => {
+// Round-15 P1 + round-17 F2 — behavioural proof that the installed hook FAILS
+// OPEN across every tier. The body is run as a real shell script in a temp git
+// repo; the ONLY non-zero exit is a WORKING rea CLI (in-project OR global)
+// whose `gate spec-check` genuinely refuses (exit 2).
+describe('pre-commit body — fail-open behaviour (round-15 P1 + round-17 F2)', () => {
   let dir: string;
   beforeEach(async () => {
     dir = await makeRepo();
@@ -105,51 +121,75 @@ describe('pre-commit body — fail-open behaviour (round-15 P1)', () => {
   });
   afterEach(() => rm(dir));
 
-  function runHook(): { status: number; stdout: string; stderr: string } {
-    const hookPath = path.join(dir, '.git', 'hooks', 'pre-commit');
-    const res = spawnSync('bash', [hookPath], {
+  const HOOK = (): string => path.join(dir, '.git', 'hooks', 'pre-commit');
+  const bashOk = (): boolean => spawnSync('bash', ['--version']).status === 0;
+
+  // `bash` (and git/grep) come from the real PATH; a fake-bin dir is PREPENDED
+  // so its `rea` wins `command -v rea` inside the script. The temp repo has NO
+  // policy.yaml, so even a REAL global rea that leaks through resolves the gate
+  // to `off` → exit 0 — the assertions hold regardless of the host's global CLI.
+  function run(prependBin?: string): number {
+    const base = process.env['PATH'] ?? '';
+    const res = spawnSync('bash', [HOOK()], {
       cwd: dir,
-      env: { PATH: process.env['PATH'] ?? '', HOME: process.env['HOME'] ?? '/tmp' },
+      env: { PATH: prependBin ? `${prependBin}:${base}` : base, HOME: process.env['HOME'] ?? '/tmp' },
       encoding: 'utf8',
       timeout: 20_000,
     });
-    return { status: res.status ?? -1, stdout: res.stdout ?? '', stderr: res.stderr ?? '' };
+    return res.status ?? -1;
   }
 
-  it('exits 0 when NO in-project CLI resolves (fresh clone, pre-`pnpm install`)', () => {
-    if (spawnSync('bash', ['--version']).status !== 0) return;
-    // No node_modules/.bin/rea and no dist/ in the temp repo.
-    expect(runHook().status).toBe(0);
-  });
-
-  it('exits 0 even when `rea` exists on PATH but is not in-project (too-old/foreign)', () => {
-    if (spawnSync('bash', ['--version']).status !== 0) return;
-    // A hostile/too-old `rea` on PATH that would exit non-zero must NOT be
-    // invoked — the body only dispatches the in-project tiers.
-    const binDir = path.join(dir, 'fakebin');
+  /** Write a fake `rea` (exits `code`) into `dir/<bin>` and return that bin dir. */
+  function fakeRea(bin: string, code: number): string {
+    const binDir = path.join(dir, bin);
     fssync.mkdirSync(binDir, { recursive: true });
-    const fakeRea = path.join(binDir, 'rea');
-    fssync.writeFileSync(fakeRea, '#!/bin/sh\necho "too old" >&2\nexit 3\n', { mode: 0o755 });
-    fssync.chmodSync(fakeRea, 0o755);
-    const res = spawnSync('bash', [path.join(dir, '.git', 'hooks', 'pre-commit')], {
-      cwd: dir,
-      env: { PATH: `${binDir}:${process.env['PATH'] ?? ''}`, HOME: process.env['HOME'] ?? '/tmp' },
-      encoding: 'utf8',
-      timeout: 20_000,
-    });
-    expect(res.status ?? -1).toBe(0);
-  });
+    const p = path.join(binDir, 'rea');
+    fssync.writeFileSync(p, `#!/bin/sh\nexit ${code}\n`, { mode: 0o755 });
+    fssync.chmodSync(p, 0o755);
+    return binDir;
+  }
 
-  it('propagates a RESOLVED in-project CLI refusal (node_modules/.bin/rea exit 2)', () => {
-    if (spawnSync('bash', ['--version']).status !== 0) return;
-    // A resolvable in-project CLI that refuses (exit 2) MUST block the commit —
-    // this is the one legitimate non-zero path.
+  /** Write a fake in-project `node_modules/.bin/rea` that exits `code`. */
+  function inProjectRea(code: number): void {
     const binDir = path.join(dir, 'node_modules', '.bin');
     fssync.mkdirSync(binDir, { recursive: true });
-    const rea = path.join(binDir, 'rea');
-    fssync.writeFileSync(rea, '#!/bin/sh\n# args: "$@"\nexit 2\n', { mode: 0o755 });
-    fssync.chmodSync(rea, 0o755);
-    expect(runHook().status).toBe(2);
+    const p = path.join(binDir, 'rea');
+    fssync.writeFileSync(p, `#!/bin/sh\nexit ${code}\n`, { mode: 0o755 });
+    fssync.chmodSync(p, 0o755);
+  }
+
+  it('exits 0 on a fresh clone (no in-project CLI; gate off / no CLI → fail open)', () => {
+    if (!bashOk()) return;
+    // No node_modules/.bin/rea, no dist, no policy → exit 0.
+    expect(run()).toBe(0);
+  });
+
+  it('propagates a RESOLVED in-project CLI refusal (node_modules/.bin/rea exit 2 → 2)', () => {
+    if (!bashOk()) return;
+    inProjectRea(2); // the one legitimate non-zero path
+    expect(run()).toBe(2);
+  });
+
+  it('fails OPEN when the in-project CLI is TOO OLD (node_modules/.bin/rea exit 1 → 0)', () => {
+    if (!bashOk()) return;
+    inProjectRea(1); // commander unknown-command / any non-2 error
+    expect(run()).toBe(0);
+  });
+
+  // Round-17 F2 — the global/PATH tier (reached only when no in-project CLI).
+  it('F2: a GLOBAL rea that refuses (exit 2) blocks the commit (→ 2)', () => {
+    if (!bashOk()) return;
+    expect(run(fakeRea('globalbin', 2))).toBe(2);
+  });
+
+  it('F2: a GLOBAL rea that is too-old/broken (exit 1) fails OPEN (→ 0)', () => {
+    if (!bashOk()) return;
+    expect(run(fakeRea('globalbin', 1))).toBe(0);
+  });
+
+  it('F2: a GLOBAL rea that errors hard (exit 3, foreign) fails OPEN (→ 0)', () => {
+    if (!bashOk()) return;
+    expect(run(fakeRea('globalbin', 3))).toBe(0);
   });
 });
 

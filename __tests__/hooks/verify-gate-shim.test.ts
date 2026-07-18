@@ -169,4 +169,35 @@ describe.skipIf(!ENABLED)('verify-gate shims — end-to-end through the shim', (
     });
     expect(runShim(BASH_SHIM, payload)).toBe(0);
   });
+
+  // Round-17 F1 — editing the store from a SUBDIRECTORY via a cwd-relative
+  // path. The pre-round-17 shim resolved file_path only against REA_ROOT, so a
+  // `../../.rea/tasks.jsonl` from `packages/foo` was gated out before the core.
+  it('editor: cwd-relative `../../.rea/tasks.jsonl` from a subdir under ENFORCE is blocked', () => {
+    writePolicy('enforce');
+    const store = path.join(repo, '.rea', 'tasks.jsonl');
+    fs.writeFileSync(store, '');
+    const subdir = path.join(repo, 'packages', 'foo');
+    fs.mkdirSync(subdir, { recursive: true });
+    const payload = JSON.stringify({
+      tool_name: 'Write',
+      cwd: subdir,
+      tool_input: { file_path: '../../.rea/tasks.jsonl', content: COMPLETED_NO_EVIDENCE },
+    });
+    expect(runShim(EDITOR_SHIM, payload)).toBe(2);
+  });
+
+  it('editor: same cwd-relative store write under OFF is a no-op (exit 0)', () => {
+    writePolicy('off');
+    const store = path.join(repo, '.rea', 'tasks.jsonl');
+    fs.writeFileSync(store, '');
+    const subdir = path.join(repo, 'packages', 'foo');
+    fs.mkdirSync(subdir, { recursive: true });
+    const payload = JSON.stringify({
+      tool_name: 'Write',
+      cwd: subdir,
+      tool_input: { file_path: '../../.rea/tasks.jsonl', content: COMPLETED_NO_EVIDENCE },
+    });
+    expect(runShim(EDITOR_SHIM, payload)).toBe(0);
+  });
 });

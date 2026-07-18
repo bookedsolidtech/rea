@@ -156,7 +156,7 @@
     },
     {
       "path": ".claude/hooks/verify-gate.sh",
-      "sha256": "f214c5391583ff6f23de282592deef7a7835b38d8c1ec81888a972c4a688a9f1",
+      "sha256": "26285b11b62a07d7d1e615e0563de5ebf17bf965ac7f99c4ac04ef8df5fb5cd3",
       "source": "hook"
     },
     {
@@ -306,7 +306,7 @@
     },
     {
       "path": ".husky/pre-commit",
-      "sha256": "a47e73a0778e36d7c9f7dbd1879b3bf37acb736d2417efa8b47ed0326f85e3ee",
+      "sha256": "f85ad0e4fa4b8c4a7df932b5987e4a58875871b2579e9b118f839a7b1ee678a2",
       "source": "husky"
     },
     {
