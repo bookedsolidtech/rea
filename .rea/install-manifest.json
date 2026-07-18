@@ -2,7 +2,7 @@
   "version": "0.51.0",
   "profile": "bst-internal",
   "installed_at": "2026-04-18T21:31:41.169Z",
-  "upgraded_at": "2026-07-18T05:12:53.499Z",
+  "upgraded_at": "2026-07-18T16:10:28.802Z",
   "files": [
     {
       "path": ".claude/hooks/_lib/bootstrap-allowlist.sh",
@@ -76,7 +76,7 @@
     },
     {
       "path": ".claude/hooks/billing-cap-halt.sh",
-      "sha256": "ed2923bbd75a6988936d7ffbd5dbe3b1e79aa1060bc3d7a687ad1e4272620a85",
+      "sha256": "64428a73e1d36b63f5e965d9f27def9143171b74df96bd89984824172d42ae97",
       "source": "hook"
     },
     {
@@ -300,6 +300,41 @@
       "source": "command"
     },
     {
+      "path": ".claude/skills/README.md",
+      "sha256": "4e094488b695bb96a207dea8ce46b1fa27b76bd1b73fa26f605f23fbe0fd5ad5",
+      "source": "skill"
+    },
+    {
+      "path": ".claude/skills/code-review.md",
+      "sha256": "a866cd18d58b19004f704cb589cdd0cd3badf0f73cdc9868d5410f95d9f06d7c",
+      "source": "skill"
+    },
+    {
+      "path": ".claude/skills/grill.md",
+      "sha256": "99fd68094c10ad60b9aa0e1d4f1bd789d0db91aaeaeb43faf53ca78945479029",
+      "source": "skill"
+    },
+    {
+      "path": ".claude/skills/implement.md",
+      "sha256": "1c6e338529c145c1f59472c16f858308078ecfe1308292dcb1b1ccc84fee4620",
+      "source": "skill"
+    },
+    {
+      "path": ".claude/skills/to-spec.md",
+      "sha256": "45d01960ea386e87dea112cf78d1ebb35b9890ac3764a95a6b89331c2435b5a4",
+      "source": "skill"
+    },
+    {
+      "path": ".claude/skills/to-tickets.md",
+      "sha256": "4927a7d6f8672b1221083463dce666b70e0c056d7b59ed0b34e6006c85827638",
+      "source": "skill"
+    },
+    {
+      "path": ".claude/skills/wayfinder.md",
+      "sha256": "6386d0ddc35e94ec946d00a8464254b826a575686be558c1acc97b4d010a5cd1",
+      "source": "skill"
+    },
+    {
       "path": ".husky/commit-msg",
       "sha256": "70e9d3b52320f1eca888266de2fbf994de5d4617bb7a9ba814bfd6f9206c5809",
       "source": "husky"
@@ -321,7 +356,7 @@
     },
     {
       "path": ".claude/settings.json#rea:desired",
-      "sha256": "30e119fcd59cdc2e46b2c5b1f8d3f59a9b4e0c5d556378cbdc8118a58d640b7a",
+      "sha256": "a557ef62496450c95a566e0919315b723a691b32b3120f6c24e2cfc04458c476",
       "source": "settings"
     },
     {

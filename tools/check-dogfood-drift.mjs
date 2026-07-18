@@ -127,6 +127,13 @@ function checkSettingsRegistration() {
     },
     PostToolUse: {
       'Write|Edit|MultiEdit|NotebookEdit': ['architecture-review-gate.sh'],
+      // billing-cap-halt runs the turn-budget counter on EVERY tool call, so it
+      // must be registered under the all-tools `*` matcher (round-24). Asserting
+      // it here means a stale dogfood settings.json left on the old `Bash`
+      // matcher fails the drift check instead of silently under-counting
+      // (round-39 P3).
+      '*': ['billing-cap-halt.sh'],
+      'Bash|Edit|Write|MultiEdit|NotebookEdit': ['delegation-advisory.sh'],
     },
   };
 
