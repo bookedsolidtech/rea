@@ -7,7 +7,7 @@
  * on which checks are present and their status.
  */
 
-import { execFile } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -2741,5 +2741,47 @@ describe('rea doctor — checkG1SpecGateCli (round-23 F1)', () => {
   it('never emits a `fail` (advisory only)', async () => {
     const dir = await repoWithG1('enforce');
     expect(checkG1SpecGateCli(dir, noReaEnv)?.status).not.toBe('fail');
+  });
+
+  it('resolves the PRIMARY checkout CLI from a linked worktree → PASS (round-25 P3)', async () => {
+    // A linked worktree with g1 enforce but NO local install must PASS: the
+    // pre-commit body falls back to the primary checkout's CLI, so doctor must
+    // not falsely warn "fails open".
+    const git = (args: string[], cwd: string): void => {
+      execFileSync('git', args, { cwd, stdio: 'pipe' });
+    };
+    const primary = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-g1wt-')));
+    dirs.push(primary);
+    git(['init', '-q'], primary);
+    git(['config', 'user.email', 't@t'], primary);
+    git(['config', 'user.name', 't'], primary);
+    git(['config', 'commit.gpgsign', 'false'], primary);
+    await fs.writeFile(path.join(primary, 'seed'), 'x');
+    git(['add', '-A'], primary);
+    git(['commit', '-qm', 'init'], primary);
+    // Primary holds the in-project CLI.
+    const bin = path.join(primary, 'node_modules', '.bin');
+    await fs.mkdir(bin, { recursive: true });
+    await fs.writeFile(path.join(bin, 'rea'), '#!/bin/sh\n', { mode: 0o755 });
+    // Linked worktree: g1 enforce, no local node_modules.
+    const wt = `${primary}-wt`;
+    dirs.push(wt);
+    git(['worktree', 'add', '-q', wt, '-b', 'b1'], primary);
+    await fs.mkdir(path.join(wt, '.rea'), { recursive: true });
+    await fs.writeFile(
+      path.join(wt, '.rea', 'policy.yaml'),
+      [
+        'version: "0.54.0"',
+        'profile: bst-internal',
+        'installed_by: test',
+        'installed_at: "2026-01-01T00:00:00Z"',
+        'autonomy_level: L1',
+        'max_autonomy_level: L2',
+        'promotion_requires_human_approval: true',
+        'blocked_paths: []',
+        'artifact_gates:\n  g1_spec:\n    mode: enforce\n',
+      ].join('\n'),
+    );
+    expect(checkG1SpecGateCli(wt, noReaEnv)?.status).toBe('pass');
   });
 });

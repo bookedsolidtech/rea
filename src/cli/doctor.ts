@@ -1623,7 +1623,22 @@ export function checkG1SpecGateCli(
   const inProjectBin = fs.existsSync(path.join(baseDir, 'node_modules', '.bin', 'rea'));
   const localPkgOrDist = resolveLocalCliVersion(baseDir) !== null;
   const globalRea = resolveReaBinaryOnPath(env) !== null;
-  if (inProjectBin || localPkgOrDist || globalRea) {
+  // Round-25 P3: in a linked worktree with no local install, the pre-commit
+  // body resolves the PRIMARY checkout's CLI (REA_CLI_ROOT / git-common-dir).
+  // Mirror that tier here so doctor doesn't falsely warn "fails open" when the
+  // hook can in fact resolve the common-root CLI and enforce the gate.
+  let commonRootCli = false;
+  try {
+    const { commonRoot } = resolveReaRoots(baseDir, () => {});
+    if (commonRoot && commonRoot !== baseDir) {
+      commonRootCli =
+        fs.existsSync(path.join(commonRoot, 'node_modules', '.bin', 'rea')) ||
+        resolveLocalCliVersion(commonRoot) !== null;
+    }
+  } catch {
+    /* best-effort — absence just means no common-root CLI resolves */
+  }
+  if (inProjectBin || localPkgOrDist || globalRea || commonRootCli) {
     return {
       label: 'G1 spec-gate CLI available',
       status: 'pass',
