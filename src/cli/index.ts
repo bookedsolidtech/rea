@@ -21,6 +21,7 @@ import { registerAuditTimelineCommand } from './audit-timeline.js';
 import { registerAuditTopBlocksCommand } from './audit-top-blocks.js';
 import { registerVerifyClaimCommand } from './verify-claim.js';
 import { registerConfigCommand } from './config-key.js';
+import { registerTasksCommand } from './tasks.js';
 import { registerTrustCommands } from './trust.js';
 import { registerInstallCommand } from './install/global.js';
 import { err, getPkgVersion } from './utils.js';
@@ -247,6 +248,10 @@ async function main(): Promise<void> {
   // would re-open the N3 surface the tier closes.
   registerTrustCommands(program);
   registerInstallCommand(program);
+
+  // `.rea/tasks.jsonl` task store — the shared keystone for Artifact Gates
+  // and `rea dash`. Append-only JSONL; the reader folds to latest-per-id.
+  registerTasksCommand(program);
 
   const tofu = program
     .command('tofu')
