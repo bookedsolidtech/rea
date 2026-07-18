@@ -215,11 +215,53 @@ describe('runGateSpecCheck', () => {
     expect(r.exitCode).toBe(0);
   });
 
-  it('HALT → exit 2 (after the off short-circuit)', async () => {
+  // Round-18 F1 — HALT binds BEFORE the mode short-circuit. A frozen repo
+  // blocks the commit regardless of gate mode, including the DEFAULT `off`.
+  it('HALT → exit 2 (BEFORE the off short-circuit), enforce mode', async () => {
     writePolicy(root, { mode: 'enforce' });
     fs.writeFileSync(path.join(root, '.rea', 'HALT'), 'frozen\n');
     const r = await runGateSpecCheck({ reaRoot: root, gitRunner: failingGit });
     expect(r.exitCode).toBe(2);
     expect(r.stderr).toContain('REA HALT');
+  });
+
+  it('mode off (DEFAULT) + HALT present → exit 2 (freeze is not conditional on opt-in)', async () => {
+    writePolicy(root, { mode: 'off' });
+    fs.writeFileSync(path.join(root, '.rea', 'HALT'), 'frozen while off\n');
+    const r = await runGateSpecCheck({ reaRoot: root, gitRunner: failingGit });
+    expect(r.exitCode).toBe(2);
+    expect(r.stderr).toContain('REA HALT');
+  });
+
+  it('mode off + NO HALT → silent exit 0 (freeze absent = proceed)', async () => {
+    writePolicy(root, { mode: 'off' });
+    const r = await runGateSpecCheck({ reaRoot: root, gitRunner: failingGit });
+    expect(r.exitCode).toBe(0);
+    expect(r.stderr).toBe('');
+  });
+
+  it('absent artifact_gates block + HALT → exit 2 (default-off still freezes)', async () => {
+    writePolicy(root, { mode: 'absent' });
+    fs.writeFileSync(path.join(root, '.rea', 'HALT'), 'frozen\n');
+    const r = await runGateSpecCheck({ reaRoot: root, gitRunner: failingGit });
+    expect(r.exitCode).toBe(2);
+  });
+
+  it('common-root HALT (worktree) freezes a local commit even at mode off', async () => {
+    // Real linked worktree: local = worktree, common = primary checkout.
+    initRepo(root);
+    const wt = `${root}-wt`;
+    git(root, ['worktree', 'add', '-q', wt, '-b', 'wt-halt-branch']);
+    try {
+      // HALT lives on the COMMON (primary) root; the worktree has NO policy
+      // (→ mode off) and NO local HALT.
+      fs.mkdirSync(path.join(root, '.rea'), { recursive: true });
+      fs.writeFileSync(path.join(root, '.rea', 'HALT'), 'frozen by primary\n');
+      const r = await runGateSpecCheck({ reaRoot: wt });
+      expect(r.exitCode).toBe(2);
+      expect(r.stderr).toContain('REA HALT');
+    } finally {
+      rm(wt);
+    }
   });
 });

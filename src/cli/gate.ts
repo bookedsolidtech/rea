@@ -148,6 +148,19 @@ export async function runGateSpecCheck(options: GateSpecCheckOptions = {}): Prom
   const localRoot = options.reaRoot ?? resolveLocalRoot(process.cwd());
   const { commonRoot } = resolveCommonRoot(localRoot, () => {});
 
+  // HALT is uniform across the gate tier and BINDS BEFORE the gate mode
+  // (round-18 F1). A frozen repo blocks the commit (exit 2) even when
+  // `g1_spec.mode` is `off` (the DEFAULT) — the freeze contract is not
+  // conditional on opting into the spec gate. Mirrors G2
+  // (`src/hooks/verify-gate/index.ts`), which checks HALT before its own
+  // mode short-circuit. Resolved across BOTH the local (worktree) and common
+  // (primary-checkout) roots via the shared `checkHaltRoots` helper.
+  const halt = checkHaltRoots(localRoot, commonRoot);
+  if (halt.halted) {
+    writeStderr(formatHaltBanner(halt.reason));
+    return { exitCode: 2, stderr, stdout };
+  }
+
   // Resolve the gate mode — a missing/invalid policy or absent
   // artifact_gates block resolves to `off` (default-off).
   let mode: GateMode = 'off';
@@ -166,15 +179,6 @@ export async function runGateSpecCheck(options: GateSpecCheckOptions = {}): Prom
   }
   if (mode === 'off') {
     return { exitCode: 0, stderr, stdout };
-  }
-
-  // HALT is uniform — a frozen repo blocks the commit (exit 2). Checked
-  // AFTER the off short-circuit so a disabled gate never becomes a
-  // surprise HALT enforcer.
-  const halt = checkHaltRoots(localRoot, commonRoot);
-  if (halt.halted) {
-    writeStderr(formatHaltBanner(halt.reason));
-    return { exitCode: 2, stderr, stdout };
   }
 
   const git = options.gitRunner ?? makeRealGitRunner(localRoot);

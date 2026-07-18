@@ -191,6 +191,57 @@ describe('pre-commit body — fail-open behaviour (round-15 P1 + round-17 F2)', 
     if (!bashOk()) return;
     expect(run(fakeRea('globalbin', 3))).toBe(0);
   });
+
+  // Round-18 F2 — the shell HALT check at the TOP of the body freezes the
+  // commit with ZERO CLI dependency, BEFORE the fail-open CLI ladder.
+  it('round-18: `.rea/HALT` + NO CLI → exit 2 (frozen WINS over fail-open)', () => {
+    if (!bashOk()) return;
+    fssync.mkdirSync(path.join(dir, '.rea'), { recursive: true });
+    fssync.writeFileSync(path.join(dir, '.rea', 'HALT'), 'frozen\n');
+    expect(run()).toBe(2);
+  });
+
+  it('round-18: HALT check does NOT hard-fail when absent (no HALT + no CLI → 0)', () => {
+    if (!bashOk()) return;
+    // No .rea/HALT anywhere → the HALT block falls through to the fail-open
+    // ladder (round-15 fresh-clone proof still holds).
+    expect(run()).toBe(0);
+  });
+});
+
+// Round-18 F2 — common-root (worktree) HALT freezes a local commit, resolved
+// entirely in the shell body (no CLI). Self-contained: a real linked worktree.
+describe('pre-commit body — worktree HALT freeze (round-18 F2)', () => {
+  it('common-root HALT (primary checkout) freezes a commit run from a worktree', async () => {
+    if (spawnSync('bash', ['--version']).status !== 0) return;
+    const primary = await makeRepo();
+    try {
+      // A worktree needs a commit to branch from.
+      await execFileAsync('git', ['-C', primary, 'commit', '-q', '--allow-empty', '-m', 'init']);
+      const wt = `${primary}-wt`;
+      await execFileAsync('git', ['-C', primary, 'worktree', 'add', '-q', wt, '-b', 'wt-halt']);
+      // Install the (shared) hook via the worktree, then freeze the PRIMARY.
+      await installPreCommitHook({ targetDir: wt });
+      fssync.mkdirSync(path.join(primary, '.rea'), { recursive: true });
+      fssync.writeFileSync(path.join(primary, '.rea', 'HALT'), 'frozen by primary\n');
+      // The hook git fires lives in the shared hooks dir.
+      const hookPath = (
+        await execFileAsync('git', ['-C', wt, 'rev-parse', '--git-path', 'hooks/pre-commit'])
+      ).stdout.trim();
+      const abs = path.isAbsolute(hookPath) ? hookPath : path.join(wt, hookPath);
+      const res = spawnSync('bash', [abs], {
+        cwd: wt,
+        env: { PATH: process.env['PATH'] ?? '', HOME: process.env['HOME'] ?? '/tmp' },
+        encoding: 'utf8',
+        timeout: 20_000,
+      });
+      expect(res.status ?? -1).toBe(2);
+      expect(res.stderr).toContain('REA HALT');
+      fssync.rmSync(wt, { recursive: true, force: true });
+    } finally {
+      rm(primary);
+    }
+  });
 });
 
 describe('pre-commit installer — active-hooks-path resolution (F1)', () => {
