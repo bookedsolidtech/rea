@@ -320,13 +320,19 @@ function applyEdit(current: string, oldStr: string, newStr: string, replaceAll: 
   return current.slice(0, idx) + newStr + current.slice(idx + oldStr.length);
 }
 
-/** Read the current on-disk `.rea/tasks.jsonl`, trying repo-root then cwd bases. */
+/** Read the current on-disk `.rea/tasks.jsonl`, trying the payload cwd then repo root. */
 function readCurrentFile(reaRoot: string, payloadCwd: string, filePath: string): string | null {
+  // Round-32 P2: resolve a relative path against the payload cwd FIRST — the
+  // directory the Edit was launched from — so `../.rea/tasks.jsonl` reconstructs
+  // against the file Claude is actually editing. A repo-root-first order would,
+  // in a nested repo whose PARENT also has `.rea/tasks.jsonl`, reconstruct
+  // against the parent store (miss a new no-evidence completion, or block a
+  // valid edit). Repo root is the fallback.
   const candidates = path.isAbsolute(filePath)
     ? [filePath]
     : [
-        path.resolve(reaRoot, filePath),
         ...(payloadCwd.length > 0 ? [path.resolve(payloadCwd, filePath)] : []),
+        path.resolve(reaRoot, filePath),
       ];
   for (const cand of candidates) {
     try {

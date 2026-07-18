@@ -416,11 +416,17 @@ function reconstructEditResult(
     // root first, then the payload cwd, and read whichever exists —
     // never silently skip validation by guessing one base.
     let current: string | null = null;
+    // Round-32 P2: resolve a relative path against the payload cwd FIRST — that
+    // is the directory the Edit was actually launched from, so `../.changeset/
+    // foo.md` targets the intended file. In a nested repo/monorepo where the
+    // PARENT also has `.changeset/foo.md`, a repo-root-first order would
+    // reconstruct against the wrong file (block a valid edit, or pass an edit
+    // that removes THIS repo's bump). Repo-root is the fallback.
     const candidates = path.isAbsolute(filePath)
       ? [filePath]
       : [
-          path.resolve(reaRoot, filePath),
           ...(payloadCwd.length > 0 ? [path.resolve(payloadCwd, filePath)] : []),
+          path.resolve(reaRoot, filePath),
         ];
     for (const cand of candidates) {
       try {

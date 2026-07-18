@@ -243,6 +243,47 @@ describe('runVerifyGate', () => {
     expect(r.stderr).toContain('T-0001');
   });
 
+  it('reconstructs a relative Edit against the CWD store, not a parent decoy (round-32 P2)', async () => {
+    // Nested repo: reaRoot=<parent>/inner, cwd=<parent>/inner/sub, and the
+    // PARENT also has a `.rea/tasks.jsonl`. An Edit to `../.rea/tasks.jsonl`
+    // must reconstruct against INNER's store (cwd-first), not the parent decoy.
+    const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'rea-nested-'));
+    try {
+      const inner = path.join(parent, 'inner');
+      const sub = path.join(inner, 'sub');
+      fs.mkdirSync(path.join(inner, '.rea'), { recursive: true });
+      fs.mkdirSync(sub, { recursive: true });
+      fs.mkdirSync(path.join(parent, '.rea'), { recursive: true });
+      writePolicy(inner, 'enforce');
+      // Inner store: in_progress, NO evidence. Parent decoy: in_progress WITH
+      // evidence. The Edit flips in_progress→completed. Against inner → a
+      // no-evidence completion (BLOCK); against the parent decoy → a
+      // with-evidence completion (would wrongly ALLOW).
+      fs.writeFileSync(
+        path.join(inner, '.rea', 'tasks.jsonl'),
+        taskLine({ status: 'in_progress' }) + '\n',
+      );
+      fs.writeFileSync(
+        path.join(parent, '.rea', 'tasks.jsonl'),
+        taskLine({ status: 'in_progress', evidence: ['docs/proof.md'] }) + '\n',
+      );
+      const payload = JSON.stringify({
+        tool_name: 'Edit',
+        tool_input: {
+          file_path: '../.rea/tasks.jsonl',
+          old_string: '"status":"in_progress"',
+          new_string: '"status":"completed"',
+        },
+        cwd: sub,
+      });
+      const r = await runVerifyGate({ reaRoot: inner, stdinOverride: payload });
+      // cwd-first reconstructs inner's no-evidence completion → block.
+      expect(r.exitCode).toBe(2);
+    } finally {
+      fs.rmSync(parent, { recursive: true, force: true });
+    }
+  });
+
   it('enforce + Edit reconstruction that keeps evidence → allow (exit 0)', async () => {
     writePolicy(root, 'enforce');
     const before = taskLine({ status: 'in_progress', evidence: ['docs/proof.md'] });
