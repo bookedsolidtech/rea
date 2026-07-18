@@ -524,7 +524,12 @@ export async function runDash(opts: DashOptions = {}): Promise<number> {
     const discovered = scanForProjects(roots);
     for (const dir of discovered) {
       try {
-        await registerProject(dir, { name: deriveProjectName(dir), reaVersion: 'unknown' }, registryPath);
+        // Round-8 P2: read the REAL version from the project's
+        // install-manifest during the sweep instead of clobbering with
+        // 'unknown' (registerProject additionally preserves an existing
+        // recorded version when this resolves to 'unknown').
+        const reaVersion = readProjectVersion(dir, undefined) ?? 'unknown';
+        await registerProject(dir, { name: deriveProjectName(dir), reaVersion }, registryPath);
       } catch {
         /* best-effort — one bad project must not abort the sweep */
       }

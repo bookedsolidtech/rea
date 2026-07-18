@@ -112,6 +112,24 @@ describe('registerProject', () => {
     const reg = loadRegistry(registryPath);
     expect(Object.keys(reg.projects)).toEqual([proj]);
   });
+
+  it('does NOT clobber a real rea_version with "unknown" (round-8 P2)', async () => {
+    const proj = makeProject('epsilon');
+    await registerProject(proj, { name: 'epsilon', reaVersion: '0.51.0' }, registryPath);
+    // A --rescan-style re-register with no readable version must keep the real one.
+    await registerProject(proj, { name: 'epsilon', reaVersion: 'unknown' }, registryPath);
+    expect(loadRegistry(registryPath).projects[proj]!.rea_version).toBe('0.51.0');
+  });
+
+  it('canonicalizes the key — a symlinked spelling is the SAME entry (round-8 P3)', async () => {
+    const proj = makeProject('zeta');
+    const link = path.join(tmp, 'zeta-link');
+    fs.symlinkSync(proj, link);
+    await registerProject(proj, { name: 'zeta', reaVersion: '0.51.0' }, registryPath);
+    await registerProject(link, { name: 'zeta', reaVersion: '0.51.0' }, registryPath);
+    // One entry, keyed on the realpath — not two.
+    expect(Object.keys(loadRegistry(registryPath).projects)).toEqual([proj]);
+  });
 });
 
 describe('reconcile', () => {

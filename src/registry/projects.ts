@@ -33,6 +33,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { z } from 'zod';
 import { atomicReplaceFile } from '../cli/install/fs-safe.js';
+import properLockfile from 'proper-lockfile';
 
 export const REGISTRY_VERSION = '1';
 
@@ -114,31 +115,86 @@ export interface RegisterProjectInput {
  * (re-running init must not silently un-hide a project the operator hid).
  * Idempotent apart from the `last_registered` timestamp.
  */
+const REGISTRY_LOCK_OPTIONS: Parameters<typeof properLockfile.lock>[1] = {
+  stale: 10_000,
+  retries: { retries: 12, factor: 1.5, minTimeout: 20, maxTimeout: 200, randomize: true },
+  realpath: false,
+};
+
+/**
+ * Round-8 P2: serialize the registry read-modify-write so concurrent
+ * `rea init` / `rea upgrade` / `rea dash --rescan|--prune` cannot lose each
+ * other's entries (last-atomicReplaceFile-wins). Lock the registry path
+ * (its `.lock` sidecar); a lock-infra failure degrades to unlocked (the
+ * registry is best-effort, non-load-bearing) rather than blocking the
+ * surrounding command.
+ */
+async function withRegistryLock<T>(registryPath: string, fn: () => Promise<T>): Promise<T> {
+  await fs.promises.mkdir(path.dirname(registryPath), { recursive: true });
+  let release: (() => Promise<void>) | null = null;
+  try {
+    release = await properLockfile.lock(registryPath, REGISTRY_LOCK_OPTIONS);
+  } catch {
+    release = null;
+  }
+  try {
+    return await fn();
+  } finally {
+    if (release !== null) {
+      try {
+        await release();
+      } catch {
+        /* stale-cleaned — the write already landed */
+      }
+    }
+  }
+}
+
+/**
+ * Round-8 P3: canonical registry key — realpath so a symlinked spelling of a
+ * checkout does not create a duplicate entry. Falls back to the lexical
+ * resolve when the path does not exist yet.
+ */
+function canonicalizeProjectPath(projectDir: string): string {
+  const resolved = path.resolve(projectDir);
+  try {
+    return fs.realpathSync(resolved);
+  } catch {
+    return resolved;
+  }
+}
+
 export async function registerProject(
   projectDir: string,
   input: RegisterProjectInput,
   registryPath: string = defaultRegistryPath(),
 ): Promise<void> {
-  const abs = path.resolve(projectDir);
-  // loadRegistry may throw on a corrupt file — let it propagate to the
-  // best-effort try/catch at the call site rather than clobbering a file we
-  // could not parse (never silently reset).
-  const registry = loadRegistry(registryPath);
-
-  const existing = registry.projects[abs];
-  registry.projects[abs] = {
-    name: input.name,
-    rea_version: input.reaVersion,
-    last_registered: new Date().toISOString(),
-    ...(existing?.dashboard_visible !== undefined
-      ? { dashboard_visible: existing.dashboard_visible }
-      : {}),
-  };
-
-  // Validate our own write up front — fail loud on a malformed record.
-  RegistrySchema.parse(registry);
-  const serialized = JSON.stringify(registry, null, 2) + '\n';
-  await atomicReplaceFile(registryPath, serialized);
+  const abs = canonicalizeProjectPath(projectDir);
+  await withRegistryLock(registryPath, async () => {
+    // loadRegistry may throw on a corrupt file — let it propagate to the
+    // best-effort try/catch at the call site rather than clobbering a file
+    // we could not parse (never silently reset).
+    const registry = loadRegistry(registryPath);
+    const existing = registry.projects[abs];
+    // Round-8 P2: never clobber a real version with `unknown` (the value a
+    // `--rescan` of a project without a readable manifest passes) — keep
+    // the existing recorded version so stale-spine health flags survive.
+    const reaVersion =
+      input.reaVersion && input.reaVersion !== 'unknown'
+        ? input.reaVersion
+        : (existing?.rea_version ?? input.reaVersion);
+    registry.projects[abs] = {
+      name: input.name,
+      rea_version: reaVersion,
+      last_registered: new Date().toISOString(),
+      ...(existing?.dashboard_visible !== undefined
+        ? { dashboard_visible: existing.dashboard_visible }
+        : {}),
+    };
+    // Validate our own write up front — fail loud on a malformed record.
+    RegistrySchema.parse(registry);
+    await atomicReplaceFile(registryPath, JSON.stringify(registry, null, 2) + '\n');
+  });
 }
 
 export type ReconcileState = 'present' | 'missing' | 'deregistered';
@@ -193,19 +249,21 @@ function classifyPath(projectPath: string): ReconcileState {
  * registry is outside every project's task store).
  */
 export async function pruneMissing(registryPath: string = defaultRegistryPath()): Promise<string[]> {
-  const registry = loadRegistry(registryPath);
-  const pruned: string[] = [];
-  for (const { path: p, state } of reconcile(registry)) {
-    if (state === 'missing') {
-      pruned.push(p);
-      delete registry.projects[p];
+  return withRegistryLock(registryPath, async () => {
+    const registry = loadRegistry(registryPath);
+    const pruned: string[] = [];
+    for (const { path: p, state } of reconcile(registry)) {
+      if (state === 'missing') {
+        pruned.push(p);
+        delete registry.projects[p];
+      }
     }
-  }
-  if (pruned.length > 0) {
-    RegistrySchema.parse(registry);
-    await atomicReplaceFile(registryPath, JSON.stringify(registry, null, 2) + '\n');
-  }
-  return pruned;
+    if (pruned.length > 0) {
+      RegistrySchema.parse(registry);
+      await atomicReplaceFile(registryPath, JSON.stringify(registry, null, 2) + '\n');
+    }
+    return pruned;
+  });
 }
 
 export { RegistrySchema, ProjectEntrySchema };
