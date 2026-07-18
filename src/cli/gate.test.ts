@@ -189,6 +189,28 @@ describe('runGateSpecCheck', () => {
     expect(r.exitCode).toBe(2);
   });
 
+  it('over threshold + spec is a committed SYMLINK → enforce blocks (round-29 P2)', async () => {
+    // A symlink is a `blob` to cat-file and statSync follows it to the target,
+    // so a committed symlink pointing outside the repo would otherwise satisfy
+    // G1 with a non-portable, non-versioned document.
+    initRepo(root);
+    fs.mkdirSync(path.join(root, 'docs'), { recursive: true });
+    // The symlink points at an EXISTING external file, so statSync follows it
+    // and isFile() is true — the earlier on-disk check passes and we reach the
+    // index-mode symlink guard.
+    const ext = path.join(os.tmpdir(), `rea-ext-spec-${process.pid}.md`);
+    fs.writeFileSync(ext, '# external\n');
+    fs.symlinkSync(ext, path.join(root, 'docs', 'spec.md'));
+    git(root, ['add', 'docs/spec.md']);
+    git(root, ['commit', '-q', '-m', 'add symlink spec']);
+    writePolicy(root, { mode: 'enforce', diffLines: 10, diffFiles: 2 });
+    writeTasks(root, [{ spec: 'docs/spec.md', requires_spec: true }]);
+    stageBigChange(root, 'big.txt', 50);
+    const r = await runGateSpecCheck({ reaRoot: root });
+    expect(r.exitCode).toBe(2);
+    expect(r.stderr).toContain('symlink');
+  });
+
   it('over threshold + spec is a committed DIRECTORY → enforce blocks (round-10 P2)', async () => {
     initRepo(root);
     // Commit a directory (not a spec document). Both existsSync('docs')

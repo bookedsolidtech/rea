@@ -320,6 +320,21 @@ export async function runGateSpecCheck(options: GateSpecCheckOptions = {}): Prom
       banner(`the spec ${specPath} is not committed as a file (not staged in the index)`),
     );
   }
+  // Round-29 P2: a SYMLINK is also a `blob` to `cat-file -t`, and the earlier
+  // `statSync` FOLLOWS it to whatever it points at — so a committed symlink
+  // spec pointing at an external / machine-local file would pass, satisfying G1
+  // with a non-portable document that isn't actually versioned as the spec. A
+  // symlink is index mode `120000` (vs `100644`/`100755` for a regular file);
+  // reject it so the spec must be a real versioned document.
+  const stagedStat = git(['ls-files', '--stage', '--', specPath]);
+  const stagedFileMode = stagedStat.stdout.trim().split(/\s+/)[0] ?? '';
+  if (stagedFileMode === '120000') {
+    return resolveVerdict(
+      'spec is a symlink',
+      metaCommon,
+      banner(`the spec ${specPath} is a symlink, not a real versioned document`),
+    );
+  }
 
   // Pass — a committed spec is referenced by the active task.
   return { exitCode: 0, stderr, stdout };
