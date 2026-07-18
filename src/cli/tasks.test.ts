@@ -18,7 +18,7 @@ import {
   runTasksList,
   runTasksShow,
 } from './tasks.js';
-import { readTasks, activeTask } from '../tasks/store.js';
+import { readTasks, activeTask, updateTasks } from '../tasks/store.js';
 
 let baseDir: string;
 let out: string[];
@@ -167,6 +167,50 @@ describe('activate refuses terminal tasks (round-16 P2)', () => {
     expect(tasks[0]?.status).toBe('completed');
     expect(tasks[0]?.active).toBe(false);
     expect(activeTask(tasks)).toBeFalsy();
+  });
+});
+
+describe('evidence refuses terminal tasks (round-48 P2)', () => {
+  it('a completed task cannot accept late evidence (no append, no updated_at bump)', () => {
+    runTasksAdd(baseDir, { subject: 'done' });
+    runTasksEvidence(baseDir, 'T-0001', { add: ['docs/proof.md'] });
+    expect(runTasksComplete(baseDir, 'T-0001')).toBe(0);
+    const before = readTasks(baseDir)[0];
+    const evidenceBefore = before?.evidence;
+    const updatedAtBefore = before?.updated_at;
+    // Late evidence on a completed task must refuse — not append or bump ts.
+    expect(runTasksEvidence(baseDir, 'T-0001', { add: ['docs/late.md'] })).toBe(1);
+    expect(errs.join('\n')).toMatch(/completed/i);
+    const after = readTasks(baseDir)[0];
+    expect(after?.evidence).toEqual(evidenceBefore);
+    expect(after?.updated_at).toBe(updatedAtBefore);
+  });
+
+  it('a cancelled task cannot accept evidence (no append, no updated_at bump)', () => {
+    runTasksAdd(baseDir, { subject: 'to cancel' });
+    // No cancel command on this surface — append a terminal cancelled row
+    // directly through the store to set up the terminal state.
+    updateTasks(baseDir, (tasks) => {
+      const t = tasks.find((x) => x.id === 'T-0001');
+      if (t === undefined) return [];
+      return [{ ...t, status: 'cancelled', active: false, updated_at: new Date().toISOString() }];
+    });
+    const before = readTasks(baseDir)[0];
+    const evidenceBefore = before?.evidence;
+    const updatedAtBefore = before?.updated_at;
+    expect(runTasksEvidence(baseDir, 'T-0001', { add: ['docs/x.md'] })).toBe(1);
+    expect(errs.join('\n')).toMatch(/cancelled/i);
+    const after = readTasks(baseDir)[0];
+    expect(after?.evidence).toEqual(evidenceBefore);
+    expect(after?.updated_at).toBe(updatedAtBefore);
+  });
+
+  it('still appends evidence to a pending/in_progress task', () => {
+    runTasksAdd(baseDir, { subject: 'live' });
+    expect(runTasksEvidence(baseDir, 'T-0001', { add: ['docs/a.md'] })).toBe(0);
+    runTasksStart(baseDir, 'T-0001');
+    expect(runTasksEvidence(baseDir, 'T-0001', { add: ['docs/b.md'] })).toBe(0);
+    expect(readTasks(baseDir)[0]?.evidence).toEqual(['docs/a.md', 'docs/b.md']);
   });
 });
 

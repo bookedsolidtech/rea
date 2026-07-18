@@ -177,13 +177,28 @@ export function runTasksEvidence(baseDir: string, id: string, opts: TasksEvidenc
   }
   let updated: TaskRecord | undefined;
   let merged: string[] = [];
+  let terminal: string | undefined;
   updateTasks(baseDir, (tasks) => {
     const t = findTask(tasks, id);
     if (t === undefined) return [];
+    // Round-48 P2: `completed`/`cancelled` are terminal and immutable, like
+    // start/activate/complete already treat them. Appending evidence to a
+    // terminal task both violates terminal-immutability and bumps updated_at,
+    // which re-surfaces finished work in `rea dash`'s recency-keyed review
+    // bucket. Decide inside the locked transform (no TOCTOU) and return []
+    // to abort the write.
+    if (t.status === 'completed' || t.status === 'cancelled') {
+      terminal = t.status;
+      return [];
+    }
     merged = [...(t.evidence ?? []), ...additions];
     updated = { ...t, evidence: merged, updated_at: nowIso() };
     return [updated];
   });
+  if (terminal !== undefined) {
+    err(`Cannot add evidence to ${clean(id)}: task is ${terminal}. Evidence can only be added to pending/in_progress tasks.`);
+    return 1;
+  }
   if (updated === undefined) {
     err(`No such task: ${clean(id)}`);
     return 1;
