@@ -52,6 +52,7 @@ import {
   type ReconcileState,
 } from '../registry/projects.js';
 import { err, getPkgVersion, log } from './utils.js';
+import { renderMoc } from './dash-moc.js';
 
 // ---------------------------------------------------------------------------
 // Options + machine schema
@@ -64,6 +65,19 @@ export interface DashOptions {
   rescanRoots?: string[];
   prune?: boolean;
   all?: boolean;
+  /**
+   * Vault-MOC output mode (spec §4). When true, render the aggregated model as
+   * an Obsidian MOC markdown document instead of the terminal / JSON view.
+   * Takes precedence over `json`.
+   */
+  emitMoc?: boolean;
+  /**
+   * Destination for `--emit-moc`. Absent → write the MOC to stdout (composes
+   * with shell redirection). Present → write the file there; the parent
+   * directory must already exist or dash errors cleanly (it never mkdir's an
+   * operator's vault tree).
+   */
+  mocPath?: string;
   /** Per-repo mode: dashboard for this project only. */
   path?: string;
   /** Test seam — defaults to `~/.rea/registry.json`. */
@@ -482,6 +496,53 @@ function renderHuman(dash: DashJson): void {
 }
 
 // ---------------------------------------------------------------------------
+// Output dispatch
+// ---------------------------------------------------------------------------
+
+/**
+ * Emit the built model in the requested mode. Precedence: `--emit-moc` (vault
+ * MOC) > `--json` > terminal. Returns a process exit code (0 ok, 1 = a
+ * write-target error under `--emit-moc <path>`). Writing the MOC is derived
+ * output — it never touches any project's task store; only the caller's own
+ * chosen path is written.
+ */
+function emitOutput(dash: DashJson, opts: DashOptions): number {
+  if (opts.emitMoc === true) {
+    const markdown = renderMoc(dash);
+    if (opts.mocPath === undefined) {
+      // Default: stdout, so it composes with shell redirection.
+      process.stdout.write(markdown);
+      return 0;
+    }
+    const target = path.resolve(opts.mocPath);
+    const parent = path.dirname(target);
+    try {
+      if (!fs.statSync(parent).isDirectory()) {
+        err(`--emit-moc target parent is not a directory: ${parent}`);
+        return 1;
+      }
+    } catch {
+      err(`--emit-moc target directory does not exist: ${parent}`);
+      return 1;
+    }
+    try {
+      fs.writeFileSync(target, markdown, 'utf8');
+    } catch (e) {
+      err(`failed to write MOC to ${target}: ${e instanceof Error ? e.message : String(e)}`);
+      return 1;
+    }
+    log(`Wrote morning-view MOC to ${target}`);
+    return 0;
+  }
+  if (opts.json === true) {
+    process.stdout.write(JSON.stringify(dash, null, 2) + '\n');
+    return 0;
+  }
+  renderHuman(dash);
+  return 0;
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -516,9 +577,7 @@ export async function runDash(opts: DashOptions = {}): Promise<number> {
       state = 'missing';
     }
     const dash = buildJson([{ projectDir, entry, state }], 'repo', all);
-    if (opts.json === true) process.stdout.write(JSON.stringify(dash, null, 2) + '\n');
-    else renderHuman(dash);
-    return 0;
+    return emitOutput(dash, opts);
   }
 
   // Global mode.
@@ -570,10 +629,7 @@ export async function runDash(opts: DashOptions = {}): Promise<number> {
     state: r.state,
   }));
   const dash = buildJson(targets, 'global', all);
-
-  if (opts.json === true) process.stdout.write(JSON.stringify(dash, null, 2) + '\n');
-  else renderHuman(dash);
-  return 0;
+  return emitOutput(dash, opts);
 }
 
 /** Default `--rescan` allowlist: `/Volumes/Development` + the user's home. */
@@ -601,13 +657,26 @@ export function registerDashCommand(program: Command): void {
     .option('--rescan [roots...]', 'deep filesystem sweep for .rea/ projects, then reconcile the registry')
     .option('--prune', 'drop registry entries whose path has vanished (a registry write)')
     .option('--all', 'reveal task titles for present projects marked dashboard_visible: false')
+    .option(
+      '--emit-moc [path]',
+      'render the dashboard as an Obsidian vault MOC (markdown). No path → stdout; ' +
+        'a path writes there (parent dir must exist). Overwrite-in-place, generated — do not hand-edit.',
+    )
     .action(
       async (
         pathArg: string | undefined,
-        cliOpts: { json?: boolean; rescan?: boolean | string[]; prune?: boolean; all?: boolean },
+        cliOpts: {
+          json?: boolean;
+          rescan?: boolean | string[];
+          prune?: boolean;
+          all?: boolean;
+          emitMoc?: boolean | string;
+        },
       ) => {
         const rescan = cliOpts.rescan !== undefined && cliOpts.rescan !== false;
         const rescanRoots = Array.isArray(cliOpts.rescan) ? cliOpts.rescan : [];
+        const emitMoc = cliOpts.emitMoc !== undefined && cliOpts.emitMoc !== false;
+        const mocPath = typeof cliOpts.emitMoc === 'string' ? cliOpts.emitMoc : undefined;
         const code = await runDash({
           ...(pathArg !== undefined ? { path: pathArg } : {}),
           ...(cliOpts.json !== undefined ? { json: cliOpts.json } : {}),
@@ -615,6 +684,8 @@ export function registerDashCommand(program: Command): void {
           ...(rescanRoots.length > 0 ? { rescanRoots } : {}),
           ...(cliOpts.prune !== undefined ? { prune: cliOpts.prune } : {}),
           ...(cliOpts.all !== undefined ? { all: cliOpts.all } : {}),
+          ...(emitMoc ? { emitMoc: true } : {}),
+          ...(mocPath !== undefined ? { mocPath } : {}),
         });
         if (code !== 0) process.exit(code);
       },
