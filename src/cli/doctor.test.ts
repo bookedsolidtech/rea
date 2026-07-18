@@ -786,8 +786,9 @@ describe('rea doctor — EXPECTED_HOOKS coverage (round-25 P3)', () => {
       'secret-scanner.sh',
       'security-disclosure-gate.sh',
       'settings-protection.sh',
-      // 0.54.0 — Artifact Gate G2 verification-gate.
+      // 0.54.0 — Artifact Gate G2 verification-gate (editor + Bash tiers).
       'verify-gate.sh',
+      'verify-gate-bash-gate.sh',
     ];
     for (const name of allCanonical) {
       const p = path.join(hooksDir, name);
@@ -797,9 +798,10 @@ describe('rea doctor — EXPECTED_HOOKS coverage (round-25 P3)', () => {
     const checks = collectChecks(repo.dir);
     const hooksCheck = findCheck(checks, 'hooks installed + executable');
     expect(hooksCheck?.status).toBe('pass');
-    // 0.54.0 — 18 shipped hooks (was 17 in 0.51.0). `verify-gate.sh`
-    // (Artifact Gate G2) joined EXPECTED_HOOKS this release.
-    expect(hooksCheck?.detail).toMatch(/18 hooks present/);
+    // 0.54.0 — 19 shipped hooks (was 17 in 0.51.0). `verify-gate.sh` and
+    // `verify-gate-bash-gate.sh` (Artifact Gate G2, editor + Bash tiers)
+    // joined EXPECTED_HOOKS this release.
+    expect(hooksCheck?.detail).toMatch(/19 hooks present/);
   });
 });
 

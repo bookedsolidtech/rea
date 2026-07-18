@@ -108,6 +108,9 @@ function checkSettingsRegistration() {
         'attribution-advisory.sh',
         // 0.26.0 local-first enforcement (CTO directive 2026-05-05).
         'local-review-gate.sh',
+        // 0.54.0 — Artifact Gate G2 (verification), Bash-tier. Refuses a
+        // shell write/redirect to `.rea/tasks.jsonl` (default-off).
+        'verify-gate-bash-gate.sh',
       ],
       'Write|Edit|MultiEdit|NotebookEdit': [
         'secret-scanner.sh',

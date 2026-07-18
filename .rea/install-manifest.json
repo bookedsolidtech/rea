@@ -2,7 +2,7 @@
   "version": "0.51.0",
   "profile": "bst-internal",
   "installed_at": "2026-04-18T21:31:41.169Z",
-  "upgraded_at": "2026-07-18T03:34:01.354Z",
+  "upgraded_at": "2026-07-18T05:12:53.499Z",
   "files": [
     {
       "path": ".claude/hooks/_lib/bootstrap-allowlist.sh",
@@ -147,6 +147,11 @@
     {
       "path": ".claude/hooks/settings-protection.sh",
       "sha256": "ee9e5bbb5bf30b1752232b736f4d1389e6af3ca8bde14e98e2558cdc3db63226",
+      "source": "hook"
+    },
+    {
+      "path": ".claude/hooks/verify-gate-bash-gate.sh",
+      "sha256": "5845a1cadf3942c8838dc8f678b20b26c2cd25152acfe1c117d393e91aed04d2",
       "source": "hook"
     },
     {
@@ -300,6 +305,11 @@
       "source": "husky"
     },
     {
+      "path": ".husky/pre-commit",
+      "sha256": "8ff7e6d3e4061344dd5dc685d36f9f2ca24cfb54b212ad3f8940f14037aca57c",
+      "source": "husky"
+    },
+    {
       "path": ".husky/pre-push",
       "sha256": "d2d0a5a9fbc93a7d16dcb8039db96bca20bda507c28f670ff495a44ca5b746ff",
       "source": "husky"
@@ -311,7 +321,7 @@
     },
     {
       "path": ".claude/settings.json#rea:desired",
-      "sha256": "35729876c87e8c84334f9c126ea494a0ecee912762fc13825eecb6be73a3fcef",
+      "sha256": "30e119fcd59cdc2e46b2c5b1f8d3f59a9b4e0c5d556378cbdc8118a58d640b7a",
       "source": "settings"
     },
     {

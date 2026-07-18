@@ -1,0 +1,33 @@
+#!/bin/sh
+# rea:pre-commit-spec-gate v1
+# rea:pre-commit-body-v1
+#
+# Pre-commit hook installed by rea for the G1 spec-gate. Do NOT edit by
+# hand — re-run the installer to refresh. See src/cli/gate.ts.
+
+set -eu
+
+# REA spec-gate (G1, Artifact Gates). The gate logic — staged-diff sizing,
+# active-task + committed-spec resolution, off/shadow/enforce dispatch, and
+# audit — lives in `src/cli/gate.ts` and is invoked via
+# `rea gate spec-check`. This stub only resolves the rea CLI and dispatches.
+#
+# The gate is DEFAULT-OFF (policy.artifact_gates.g1_spec.mode defaults to
+# off), so a missing CLI fails OPEN (exit 0) rather than blocking every
+# commit on a repo whose CLI is not built.
+
+REA_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+
+if [ -x "${REA_ROOT}/node_modules/.bin/rea" ]; then
+  "${REA_ROOT}/node_modules/.bin/rea" gate spec-check
+elif [ -f "${REA_ROOT}/dist/cli/index.js" ] && [ -f "${REA_ROOT}/package.json" ] \
+     && grep -q '"name": *"@bookedsolid/rea"' "${REA_ROOT}/package.json" 2>/dev/null; then
+  node "${REA_ROOT}/dist/cli/index.js" gate spec-check
+elif command -v rea >/dev/null 2>&1; then
+  rea gate spec-check
+elif command -v npx >/dev/null 2>&1; then
+  npx --no-install @bookedsolid/rea gate spec-check
+else
+  # CLI unreachable — fail OPEN (the gate is default-off).
+  exit 0
+fi

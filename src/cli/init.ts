@@ -19,6 +19,7 @@ import { EXPECTED_HOOKS } from './doctor.js';
 import { installCommitMsgHook } from './install/commit-msg.js';
 import { installPrepareCommitMsgHook } from './install/prepare-commit-msg.js';
 import { installPrePushFallback } from './install/pre-push.js';
+import { installPreCommitHook } from './install/pre-commit.js';
 import { CodexProbe } from '../gateway/observability/codex-probe.js';
 import { buildFragment, writeClaudeMdFragment } from './install/claude-md.js';
 import {
@@ -1925,6 +1926,7 @@ export async function runInit(options: InitOptions): Promise<void> {
   let commitMsgResult: Awaited<ReturnType<typeof installCommitMsgHook>>;
   let prepareCommitMsgResult: Awaited<ReturnType<typeof installPrepareCommitMsgHook>>;
   let prePushResult: Awaited<ReturnType<typeof installPrePushFallback>>;
+  let preCommitResult: Awaited<ReturnType<typeof installPreCommitHook>>;
   let mdResult: Awaited<ReturnType<typeof writeClaudeMdFragment>>;
   let gitignoreResult: Awaited<ReturnType<typeof ensureReaGitignore>>;
   let selfPinResult: Awaited<ReturnType<typeof selfPinRea>>;
@@ -1956,6 +1958,15 @@ export async function runInit(options: InitOptions): Promise<void> {
     // .rea/policy.yaml.
     prepareCommitMsgResult = await installPrepareCommitMsgHook(targetDir);
     prePushResult = await installPrePushFallback({ targetDir });
+    // G1 spec-gate (Artifact Gates). Lay down `.husky/pre-commit`
+    // unconditionally — like the pre-push fallback, the hook body is a
+    // no-op until `policy.artifact_gates.g1_spec.mode` is opted into
+    // shadow/enforce (`rea gate spec-check` is default-off), so a
+    // default install ships a harmless gate that activates the moment
+    // the operator flips the policy. The installer never overwrites a
+    // foreign `.husky/pre-commit` (marker-guarded, same posture as
+    // pre-push's foreign-hook handling).
+    preCommitResult = await installPreCommitHook({ targetDir });
 
     fragmentInput = {
       policyPath: `.${path.sep}rea${path.sep}policy.yaml`.replace(/\\/g, '/'),
@@ -2058,6 +2069,16 @@ export async function runInit(options: InitOptions): Promise<void> {
   ) {
     console.log(
       `  = ${path.relative(targetDir, prePushResult.decision.hookPath)} (active pre-push already present — skipped fallback)`,
+    );
+  }
+  if (preCommitResult.written !== undefined) {
+    const verb = preCommitResult.decision.action === 'refresh' ? '~' : '+';
+    console.log(
+      `  ${verb} ${path.relative(targetDir, preCommitResult.written)} (G1 spec-gate; no-op until policy opt-in)`,
+    );
+  } else if (preCommitResult.decision.action === 'skip') {
+    console.log(
+      `  = ${path.relative(targetDir, preCommitResult.decision.hookPath)} (foreign pre-commit present — skipped G1 gate)`,
     );
   }
   console.log(

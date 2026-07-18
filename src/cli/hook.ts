@@ -47,6 +47,7 @@ import { runHookEnvFileProtection } from '../hooks/env-file-protection/index.js'
 import { runHookDependencyAuditGate } from '../hooks/dependency-audit-gate/index.js';
 import { runHookChangesetSecurityGate } from '../hooks/changeset-security-gate/index.js';
 import { runHookVerifyGate } from '../hooks/verify-gate/index.js';
+import { runHookVerifyGateBashGate } from '../hooks/verify-gate-bash-gate/index.js';
 import { runHookArchitectureReviewGate } from '../hooks/architecture-review-gate/index.js';
 import { runHookDangerousBashInterceptor } from '../hooks/dangerous-bash-interceptor/index.js';
 import { runHookLocalReviewGate } from '../hooks/local-review-gate/index.js';
@@ -1559,6 +1560,15 @@ export function registerHookCommand(program: Command): void {
     )
     .action(async () => {
       await runHookVerifyGate();
+    });
+
+  hook
+    .command('verify-gate-bash-gate')
+    .description(
+      'G2 verification-gate, Bash-tier (Artifact Gates, 0.54.0+). PreToolUse Bash gate refusing a shell WRITE/REDIRECT to `.rea/tasks.jsonl` (the editor-tier verify-gate only guards Write/Edit; a raw `echo ... > .rea/tasks.jsonl` / tee / cp / mv bypasses it). Write-target detection reuses the AST-backed `runBlockedScan` with a single synthetic entry — no hand-rolled redirect parsing. Governed by `policy.artifact_gates.g2_verify.mode`: off → exit 0 (byte-identical, no scan); shadow → audit `rea.gate.g2.shadow` (would_block, bash source) + exit 0; enforce → audit `rea.gate.g2` (deny) + exit 2 with a banner pointing to `rea tasks`. Fail-OPEN (default-off) when the CLI is missing. Out of scope: interpreter-internal writes (`python -c ... open(...,"w")`).',
+    )
+    .action(async () => {
+      await runHookVerifyGateBashGate();
     });
 
   hook

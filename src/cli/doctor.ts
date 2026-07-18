@@ -263,6 +263,16 @@ export const EXPECTED_HOOKS = [
   // consumer runs `rea upgrade`, the same upgrade-lag signal
   // `billing-cap-halt.sh` accepts.
   'verify-gate.sh',
+  // 0.54.0 — Artifact Gate G2 (verification), Bash-tier. Refuses a raw
+  // shell write/redirect to `.rea/tasks.jsonl` (the editor-tier
+  // `verify-gate.sh` only guards Write/Edit; a Bash redirect bypasses it).
+  // Policy-driven and DEFAULT-OFF (off|shadow|enforce). Added to
+  // EXPECTED_HOOKS at ship time — the three-way canonical invariant
+  // requires this list to mirror `hooks/`; the shim is FAIL-OPEN so a
+  // pre-upgrade install is never BROKEN by its absence, only flagged
+  // missing until `rea upgrade` — the same upgrade-lag signal
+  // `verify-gate.sh` and `billing-cap-halt.sh` accept.
+  'verify-gate-bash-gate.sh',
 ];
 
 function checkAgentsPresent(baseDir: string): CheckResult {

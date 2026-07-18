@@ -334,6 +334,16 @@ export function defaultDesiredHooks(): DesiredHookGroup[] {
           timeout: 5000,
           statusMessage: 'Checking for shell-redirect to policy-blocked paths...',
         },
+        // 0.54.0 — Artifact Gate G2 (verification), Bash-tier. Refuses a
+        // shell write/redirect to `.rea/tasks.jsonl` under
+        // policy.artifact_gates.g2_verify.mode shadow/enforce (default-off),
+        // closing the Bash-redirect bypass of the editor-tier verify-gate.
+        {
+          type: 'command',
+          command: `${base}/verify-gate-bash-gate.sh`,
+          timeout: 5000,
+          statusMessage: 'Checking for shell-write to the task store (G2)...',
+        },
         {
           type: 'command',
           command: `${base}/dependency-audit-gate.sh`,

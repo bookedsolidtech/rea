@@ -68,6 +68,7 @@ import {
 import { validateSettings } from '../config/settings-schema.js';
 import { ensureReaGitignore } from './install/gitignore.js';
 import { installPrepareCommitMsgHook } from './install/prepare-commit-msg.js';
+import { installPreCommitHook } from './install/pre-commit.js';
 import { checkUpgradeBlockingPin, selfPinRea } from './install/self-pin.js';
 import { manifestExists, readManifest, writeManifestAtomic } from './install/manifest-io.js';
 import { type InstallManifest, type ManifestEntry } from './install/manifest-schema.js';
@@ -844,6 +845,26 @@ export async function runUpgrade(options: UpgradeOptions = {}): Promise<void> {
       console.log(`  ${marker} ${target} (attribution augmenter)`);
     }
     for (const w of pcmResult.warnings) warn(w);
+
+    // 0.54.0 — G1 spec-gate (Artifact Gates). Lay down `.husky/pre-commit`
+    // on upgrade too (consumers upgrading from a pre-G1 install would not
+    // get the gate unless they re-ran `rea init`). Same shape as the
+    // prepare-commit-msg augmenter above: the hook body is a no-op until
+    // `policy.artifact_gates.g1_spec.mode` is opted into shadow/enforce, so
+    // installing unconditionally is safe; the installer refuses to overwrite
+    // a foreign `.husky/pre-commit` (marker-guarded). `.husky/pre-commit`
+    // is also a canonical file, so the reconcile loop above SHA-tracks it in
+    // the manifest — this call handles the foreign-hook guard + fresh-install
+    // case the reconcile loop's enumerate cannot (mirrors installPrePushFallback).
+    const preCommitResult = await installPreCommitHook({ targetDir: resolvedRoot });
+    if (preCommitResult.written !== undefined) {
+      const marker = preCommitResult.decision.action === 'refresh' ? '~' : '+';
+      console.log(
+        `  ${marker} ${path.relative(resolvedRoot, preCommitResult.written)} (G1 spec-gate; no-op until policy opt-in)`,
+      );
+    } else if (preCommitResult.decision.action === 'skip') {
+      warn(`  · .husky/pre-commit (kept; foreign hook detected — see MIGRATING.md)`);
+    }
   }
 
   // 0.49.0 — self-heal legacy installs that pre-date `rea init`'s
