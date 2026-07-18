@@ -362,6 +362,24 @@ describe('worktree-state integration (real git worktree add)', () => {
     expect(bv.verdict).toBe('block');
   });
 
+  it('(vi-g) same-repo symlink into .rea does not bypass shared-state protection (round-11 P1)', async () => {
+    // `logs -> .rea` inside the worktree. A Write to `logs/audit.jsonl`
+    // must be refused via the §6c symlink-resolution path (the same-root
+    // directHit already carried the shared-state patterns; the symlink
+    // path did not until round-11).
+    fs.symlinkSync(path.join(wtA, '.rea'), path.join(wtA, 'logs'));
+    for (const leaf of ['audit.jsonl', 'fingerprints.json']) {
+      const sp = await runSettingsProtection({
+        reaRoot: wtA,
+        stdinOverride: JSON.stringify({
+          tool_name: 'Write',
+          tool_input: { file_path: path.join(wtA, 'logs', leaf), content: 'forged' },
+        }),
+      });
+      expect(sp.exitCode, leaf).toBe(2);
+    }
+  });
+
   it('(vi-d) SIBLING worktree governed state is protected too (round-10 P1)', async () => {
     // Absolute Write into sibling B's policy from a session in A.
     const sp = await runSettingsProtection({

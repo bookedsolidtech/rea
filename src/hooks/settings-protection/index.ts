@@ -515,9 +515,18 @@ export async function runSettingsProtection(
   }
 
   // §6c. Intermediate-symlink resolution against the hard-protected list.
+  // Round-11 P1: the symlink path must also carry the repo-wide shared
+  // state patterns (audit chain / TOFU anchors / lock sidecars) when the
+  // repo has linked worktrees — otherwise a pre-existing symlink like
+  // `logs -> .rea` lets `Write/Edit` reach `logs/audit.jsonl` and bypass
+  // the same-root shared-state protection that `directHit` already has.
+  const symlinkPatterns =
+    commonRoot !== reaRoot || siblingRoots.length > 0
+      ? [...new Set([...resolution.patterns, ...CROSS_ROOT_SHARED_STATE_PATTERNS])]
+      : resolution.patterns;
   const symRefused = checkProtectedSymlinkResolution(
     filePath,
-    resolution.patterns,
+    symlinkPatterns,
     reaRoot,
     commonRoot,
     siblingRoots,
