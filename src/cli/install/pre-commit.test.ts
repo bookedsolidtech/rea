@@ -14,7 +14,7 @@ import fssync from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   preCommitHookContent,
   isReaManagedPreCommit,
@@ -471,5 +471,76 @@ describe('pre-commit installer — active-hooks-path resolution (F1)', () => {
     expect((await classifyPreCommit(dir)).action).toBe('install');
     await installPreCommitHook({ targetDir: dir });
     expect((await classifyPreCommit(dir)).action).toBe('refresh');
+  });
+});
+
+// ── Round-44 F1 — Windows rename-does-not-replace parity ─────────────────────
+// A refresh over an EXISTING pre-commit renames a temp file over it. On Windows
+// `rename` fails EEXIST/EPERM; the installer must unlink + retry (the same
+// fallback writeSettingsAtomic / the pre-push installer carry).
+describe('installPreCommitHook — Windows rename fallback (round-44)', () => {
+  let dir: string;
+  beforeEach(async () => {
+    dir = await makeRepo();
+    await setHooksPath(dir, '.husky'); // deterministic active path: .husky/pre-commit
+  });
+  afterEach(() => rm(dir));
+
+  it('a refresh over an existing pre-commit recovers from a rename EEXIST (Windows)', async () => {
+    // First install creates the managed hook.
+    const first = await installPreCommitHook({ targetDir: dir });
+    expect(first.decision.action).toBe('install');
+    const hookPath = path.join(dir, '.husky', 'pre-commit');
+
+    // Simulate the Windows rename-EEXIST on the FIRST rename over `pre-commit`;
+    // the fallback unlink + retry should succeed on the second.
+    const originalRename = fs.rename;
+    let calls = 0;
+    const spy = vi.spyOn(fs, 'rename').mockImplementation(async (oldPath, newPath) => {
+      calls += 1;
+      if (calls === 1 && typeof newPath === 'string' && newPath.endsWith('pre-commit')) {
+        const e = new Error('simulated EEXIST') as NodeJS.ErrnoException;
+        e.code = 'EEXIST';
+        throw e;
+      }
+      return originalRename(oldPath as fssync.PathLike, newPath as fssync.PathLike);
+    });
+
+    let second: Awaited<ReturnType<typeof installPreCommitHook>>;
+    try {
+      second = await installPreCommitHook({ targetDir: dir }); // the refresh
+    } finally {
+      spy.mockRestore();
+    }
+
+    // First rename threw (simulated Windows), the fallback retried and succeeded.
+    expect(calls).toBeGreaterThanOrEqual(2);
+    expect(second.decision.action).toBe('refresh');
+    const onDisk = fssync.readFileSync(hookPath, 'utf8');
+    expect(isReaManagedPreCommit(onDisk)).toBe(true);
+    // The hook is intact + executable; no temp artifact left behind.
+    expect((fssync.statSync(hookPath).mode & 0o111) !== 0).toBe(true);
+    const leftover = fssync
+      .readdirSync(path.join(dir, '.husky'))
+      .filter((n) => n.includes('.rea-tmp-'));
+    expect(leftover).toEqual([]);
+  });
+
+  it('a non-EEXIST rename error is re-thrown (POSIX path unchanged)', async () => {
+    await installPreCommitHook({ targetDir: dir }); // create
+    const originalRename = fs.rename;
+    const spy = vi.spyOn(fs, 'rename').mockImplementation(async (oldPath, newPath) => {
+      if (typeof newPath === 'string' && newPath.endsWith('pre-commit')) {
+        const e = new Error('boom') as NodeJS.ErrnoException;
+        e.code = 'EACCES';
+        throw e;
+      }
+      return originalRename(oldPath as fssync.PathLike, newPath as fssync.PathLike);
+    });
+    try {
+      await expect(installPreCommitHook({ targetDir: dir })).rejects.toThrow(/boom/);
+    } finally {
+      spy.mockRestore();
+    }
   });
 });

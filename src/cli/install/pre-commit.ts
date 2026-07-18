@@ -395,6 +395,35 @@ export async function installPreCommitHook(options: {
   } catch {
     /* filesystems that don't honor mode — writeFile already set it */
   }
-  await fsPromises.rename(tmp, decision.hookPath);
+  // Windows parity (round-44). POSIX `rename(2)` atomically REPLACES an
+  // existing destination, but Windows `MoveFileEx` without
+  // `MOVEFILE_REPLACE_EXISTING` fails with EEXIST/EPERM when `pre-commit`
+  // already exists — the refresh path on a re-`rea init` / `rea upgrade` of a
+  // repo that installed the hook once. Mirror the EXACT fallback
+  // `writeSettingsAtomic` (settings-merge finding #8) and the pre-push
+  // installer use: unlink the destination, then retry the rename. This opens a
+  // tiny window where the hook is briefly absent, but a crash there leaves the
+  // recoverable `.rea-tmp-*` artifact — strictly better than a failed refresh.
+  // POSIX behavior is UNCHANGED (the first rename replaces atomically and the
+  // catch never runs); the tmp was written mode 0o755, so the hook stays
+  // executable.
+  try {
+    await fsPromises.rename(tmp, decision.hookPath);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code !== 'EEXIST' && code !== 'EPERM') {
+      await fsPromises.unlink(tmp).catch(() => undefined);
+      throw err;
+    }
+    // Windows: destination exists and rename refuses to replace it. Remove and
+    // retry. If the second rename also fails, propagate.
+    await fsPromises.unlink(decision.hookPath);
+    try {
+      await fsPromises.rename(tmp, decision.hookPath);
+    } catch (retryErr) {
+      await fsPromises.unlink(tmp).catch(() => undefined);
+      throw retryErr;
+    }
+  }
   return { decision, written: decision.hookPath };
 }
