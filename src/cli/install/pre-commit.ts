@@ -1,33 +1,52 @@
 /**
  * Pre-commit hook installer for the G1 spec-gate (Artifact Gates, 0.54.0+).
  *
- * The `.husky/pre-commit` hook invokes `rea gate spec-check`, which is a
- * DEFAULT-OFF deterministic gate (`policy.artifact_gates.g1_spec.mode`
- * defaults to `off`). Because the gate is off unless a consumer opts in,
- * this installer is intentionally MINIMAL — it does NOT carry the full
- * v-marker migration machinery of `pre-push.ts`. A single managed marker
- * pair plus a foreign-hook guard is enough.
+ * The pre-commit hook invokes `rea gate spec-check`, which is a DEFAULT-OFF
+ * deterministic gate (`policy.artifact_gates.g1_spec.mode` defaults to
+ * `off`). Because the gate is off unless a consumer opts in, this installer
+ * carries a SINGLE managed marker pair plus a foreign-hook guard — no
+ * multi-version migration machinery (the marker is v1; v1 never shipped, so
+ * there is no legacy install to migrate).
+ *
+ * ## Active-hooks-path resolution (round-12 F1)
+ *
+ * A hook is only useful at the path git actually fires. This installer
+ * mirrors `installPrePushFallback`'s 4-case `core.hooksPath` resolution
+ * EXACTLY so `artifact_gates.g1_spec.mode: enforce` gives real commit-time
+ * protection in every install topology, not just Husky:
+ *
+ *   1. `core.hooksPath` unset (vanilla git)
+ *        → install `.git/hooks/pre-commit` (via `git rev-parse --git-path
+ *          hooks/pre-commit`). `.husky/pre-commit` is still shipped as the
+ *          canonical source-of-truth copy (manifest-tracked, refreshed by
+ *          `rea upgrade`'s reconcile loop) but git does not fire it.
+ *   2. `core.hooksPath=.husky` (typical Husky 9)
+ *        → install `.husky/pre-commit`.
+ *   3. `core.hooksPath` set elsewhere with a foreign pre-commit present
+ *        → leave it alone (foreign posture); `rea doctor` flags the gap.
+ *   4. `core.hooksPath` set but the target dir has no pre-commit
+ *        → install the managed hook there (that is where git looks).
+ *
+ * Reuses `resolveHooksDir` from `pre-push.ts`; `resolveGitHookPath` is
+ * replicated here (it is `pre-push`-internal) so both installers derive the
+ * active path identically.
  *
  * ## Install policy
  *
  *   - absent      → install the managed hook
  *   - rea-managed → refresh (idempotent — re-running produces the same file)
  *   - foreign     → leave alone; the operator wires the fragment themselves
- *
- * NOTE (orchestrator hand-off): this module is deliberately NOT yet wired
- * into `src/cli/install/canonical.ts` (DirMapping / synthetic set),
- * `manifest-schema` (source kind), `rea init`, or `rea upgrade`. Wiring it
- * touches the canonical enumeration + manifest + perf-baseline surface,
- * which is the "large/risky install-layer" work the gate spec flagged to
- * defer. The gate LOGIC (`src/cli/gate.ts`) is fully functional and
- * `rea gate spec-check` is registered; this file provides the ready hook
- * body + a testable installer for that follow-up.
  */
 
+import { execFile } from 'node:child_process';
 import crypto from 'node:crypto';
 import type fs from 'node:fs';
 import fsPromises from 'node:fs/promises';
 import path from 'node:path';
+import { promisify } from 'node:util';
+import { resolveHooksDir } from './pre-push.js';
+
+const execFileAsync = promisify(execFile);
 
 /**
  * Header marker (line 2, immediately after the shebang) identifying a
@@ -44,11 +63,21 @@ export const PRE_COMMIT_MARKER = '# rea:pre-commit-spec-gate v1';
 export const PRE_COMMIT_BODY_MARKER = '# rea:pre-commit-body-v1';
 
 /**
- * The POSIX-sh body. Mirrors the pre-push CLI-resolution ladder but stays
- * minimal: HALT is handled inside `rea gate spec-check` itself (it probes
- * both roots), so the body only resolves the rea CLI and dispatches. A
- * missing CLI is fail-OPEN here (exit 0) — the gate is default-off, so a
- * consumer without a built CLI must not have every commit blocked.
+ * The POSIX-sh body. Mirrors the pre-push v6 CLI-resolution ladder — most
+ * importantly the `REA_CLI_ROOT` worktree fallback — but stays minimal: HALT
+ * is handled inside `rea gate spec-check` itself (it probes both roots), so
+ * the body only resolves the rea CLI and dispatches. A missing CLI is
+ * fail-OPEN here (exit 0) — the gate is default-off, so a consumer without a
+ * built CLI must not have every commit blocked.
+ *
+ * ## Worktree fallback (round-12 F2)
+ *
+ * A linked worktree frequently has no local install — `node_modules/.bin/rea`
+ * and `dist/cli/index.js` live only in the PRIMARY checkout. Without the
+ * `REA_CLI_ROOT` seam the body would fall straight through to the fail-open
+ * `exit 0` and the spec gate would silently never run in a worktree. Mirrors
+ * `pre-push.ts`'s v6 body: resolve the CLI from the worktree first, then the
+ * primary checkout (verified same-repository), then PATH/npx.
  */
 const BODY_TEMPLATE = `set -eu
 
@@ -63,11 +92,60 @@ const BODY_TEMPLATE = `set -eu
 
 REA_ROOT=\$(git rev-parse --show-toplevel 2>/dev/null || pwd)
 
-if [ -x "\${REA_ROOT}/node_modules/.bin/rea" ]; then
-  "\${REA_ROOT}/node_modules/.bin/rea" gate spec-check
-elif [ -f "\${REA_ROOT}/dist/cli/index.js" ] && [ -f "\${REA_ROOT}/package.json" ] \\
-     && grep -q '"name": *"@bookedsolid/rea"' "\${REA_ROOT}/package.json" 2>/dev/null; then
-  node "\${REA_ROOT}/dist/cli/index.js" gate spec-check
+# Round-12 F2 (worktree fallback, mirrors pre-push v6): a linked worktree
+# frequently has no local install (node_modules/dist live only in the
+# PRIMARY checkout). Resolve the CLI from ONE seam: the worktree first, then
+# the primary checkout (.git-file discriminator, verified same-repository),
+# then the PATH/npx tiers below unchanged. REA_ROOT itself stays the worktree
+# — HALT and policy resolve against it inside \`rea gate spec-check\`; only CLI
+# dispatch follows REA_CLI_ROOT.
+REA_CLI_ROOT="\$REA_ROOT"
+if [ ! -x "\${REA_ROOT}/node_modules/.bin/rea" ] && [ ! -f "\${REA_ROOT}/dist/cli/index.js" ] \\
+   && [ -f "\${REA_ROOT}/.git" ]; then
+  _rea_common_dir=\$(git -C "\$REA_ROOT" rev-parse --git-common-dir 2>/dev/null || true)
+  case "\$_rea_common_dir" in
+    "") : ;;
+    /*) : ;;
+    *) _rea_common_dir="\${REA_ROOT}/\${_rea_common_dir}" ;;
+  esac
+  if [ -n "\$_rea_common_dir" ]; then
+    _rea_common=\$(dirname "\$_rea_common_dir")
+    # Verify the dirname candidate is the SAME repository (its git-common-dir
+    # resolves to ours) — a bare/separate-git-dir layout nesting metadata
+    # under an UNRELATED checkout must not have its CLI executed against this
+    # repo's commit.
+    _rea_same_repo=0
+    if [ -d "\${_rea_common}/.rea" ] || [ -e "\${_rea_common}/.git" ]; then
+      _cc=\$(git -C "\$_rea_common" rev-parse --git-common-dir 2>/dev/null || true)
+      case "\$_cc" in "") : ;; /*) : ;; *) _cc="\${_rea_common}/\${_cc}" ;; esac
+      if [ -n "\$_cc" ]; then
+        _x=\$(cd "\$_cc" 2>/dev/null && pwd -P) || _x="\$_cc"
+        _y=\$(cd "\$_rea_common_dir" 2>/dev/null && pwd -P) || _y="\$_rea_common_dir"
+        [ "\$_x" = "\$_y" ] && _rea_same_repo=1
+      fi
+    fi
+    # A foreign nested checkout (verification failed) OR a --separate-git-dir
+    # primary whose metadata is external — fall back to git's first listed
+    # worktree (THIS repo's main one).
+    if [ "\$_rea_same_repo" = "0" ]; then
+      _rea_common=\$(git -C "\$REA_ROOT" worktree list --porcelain 2>/dev/null \\
+        | sed -n 's/^worktree //p' | head -n 1)
+    fi
+    if [ -n "\$_rea_common" ] && [ "\$_rea_common" != "\$REA_ROOT" ] \\
+       && { [ -d "\${_rea_common}/.rea" ] || [ -e "\${_rea_common}/.git" ]; } \\
+       && { [ -x "\${_rea_common}/node_modules/.bin/rea" ] \\
+            || { [ -f "\${_rea_common}/dist/cli/index.js" ] && [ -f "\${_rea_common}/package.json" ] \\
+                 && grep -q '"name": *"@bookedsolid/rea"' "\${_rea_common}/package.json" 2>/dev/null; }; }; then
+      REA_CLI_ROOT="\$_rea_common"
+    fi
+  fi
+fi
+
+if [ -x "\${REA_CLI_ROOT}/node_modules/.bin/rea" ]; then
+  "\${REA_CLI_ROOT}/node_modules/.bin/rea" gate spec-check
+elif [ -f "\${REA_CLI_ROOT}/dist/cli/index.js" ] && [ -f "\${REA_CLI_ROOT}/package.json" ] \\
+     && grep -q '"name": *"@bookedsolid/rea"' "\${REA_CLI_ROOT}/package.json" 2>/dev/null; then
+  node "\${REA_CLI_ROOT}/dist/cli/index.js" gate spec-check
 elif command -v rea >/dev/null 2>&1; then
   rea gate spec-check
 elif command -v npx >/dev/null 2>&1; then
@@ -78,7 +156,7 @@ else
 fi
 `;
 
-/** The full `.husky/pre-commit` file content. */
+/** The full pre-commit hook file content. */
 export function preCommitHookContent(): string {
   return `#!/bin/sh
 ${PRE_COMMIT_MARKER}
@@ -102,23 +180,77 @@ export function isReaManagedPreCommit(content: string): boolean {
   return lines[1] === PRE_COMMIT_MARKER && lines[2] === PRE_COMMIT_BODY_MARKER;
 }
 
+// ---------------------------------------------------------------------------
+// Active-hooks-path resolution (round-12 F1) — mirrors pre-push.ts
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolve the absolute path git itself would fire for `hooks/pre-commit`.
+ * Works across vanilla repos, linked worktrees (shared hooks dir), and
+ * submodules. Replicated from `pre-push.ts` (there it is module-internal).
+ */
+async function resolveGitHookPath(targetDir: string): Promise<string | null> {
+  try {
+    const { stdout } = await execFileAsync(
+      'git',
+      ['-C', targetDir, 'rev-parse', '--git-path', 'hooks/pre-commit'],
+      { encoding: 'utf8' },
+    );
+    const trimmed = stdout.trim();
+    if (trimmed.length === 0) return null;
+    return path.isAbsolute(trimmed) ? trimmed : path.join(targetDir, trimmed);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The 4-case resolution, identical in shape to
+ * `pre-push.ts::resolveTargetHookPath`:
+ *
+ *   - `core.hooksPath` configured → `<hooksPath>/pre-commit`.
+ *   - else, git resolvable        → `git rev-parse --git-path hooks/pre-commit`.
+ *   - else (non-git / git failed) → `<targetDir>/.git/hooks/pre-commit`.
+ */
+export async function resolveTargetHookPath(
+  targetDir: string,
+): Promise<{ hookPath: string; hooksPathConfigured: boolean }> {
+  const hooksInfo = await resolveHooksDir(targetDir);
+  if (hooksInfo.configured && hooksInfo.dir !== null) {
+    return { hookPath: path.join(hooksInfo.dir, 'pre-commit'), hooksPathConfigured: true };
+  }
+  const gitHookPath = await resolveGitHookPath(targetDir);
+  if (gitHookPath !== null) {
+    return { hookPath: gitHookPath, hooksPathConfigured: false };
+  }
+  return {
+    hookPath: path.join(targetDir, '.git', 'hooks', 'pre-commit'),
+    hooksPathConfigured: false,
+  };
+}
+
 export type PreCommitDecision =
   | { action: 'install'; hookPath: string }
   | { action: 'refresh'; hookPath: string }
   | { action: 'skip'; reason: 'foreign-pre-commit'; hookPath: string };
 
 /**
- * Classify the existing `.husky/pre-commit` at `targetDir`.
+ * Classify the existing pre-commit at the path git actually fires for
+ * `targetDir` (resolved via `resolveTargetHookPath`).
  */
 export async function classifyPreCommit(targetDir: string): Promise<PreCommitDecision> {
-  const hookPath = path.join(targetDir, '.husky', 'pre-commit');
+  const { hookPath } = await resolveTargetHookPath(targetDir);
   let stat: fs.Stats;
   try {
     stat = await fsPromises.lstat(hookPath);
   } catch {
     return { action: 'install', hookPath };
   }
-  if (!stat.isFile()) return { action: 'skip', reason: 'foreign-pre-commit', hookPath };
+  // A symlink / directory / device at the hook path is foreign — never
+  // written through (mirrors pre-push's non-regular-file refusal).
+  if (stat.isSymbolicLink() || !stat.isFile()) {
+    return { action: 'skip', reason: 'foreign-pre-commit', hookPath };
+  }
   let content: string;
   try {
     content = await fsPromises.readFile(hookPath, 'utf8');
@@ -135,8 +267,9 @@ export interface PreCommitInstallResult {
 }
 
 /**
- * Install (or refresh) the managed `.husky/pre-commit` hook. Never
- * overwrites a foreign hook. Writes atomically via a temp file + rename.
+ * Install (or refresh) the managed pre-commit hook at the path git actually
+ * fires (per `resolveTargetHookPath`). Never overwrites a foreign hook.
+ * Writes atomically via a temp file + rename.
  */
 export async function installPreCommitHook(options: {
   targetDir: string;

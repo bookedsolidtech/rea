@@ -93,6 +93,66 @@ function isTasksJsonl(filePath: string): boolean {
   return posix === TASKS_RELATIVE || posix.endsWith('/' + TASKS_RELATIVE);
 }
 
+/**
+ * Canonicalize an absolute path, tolerating a not-yet-existing leaf: if the
+ * path itself can't be realpath'd (a `Write` to a new target), resolve the
+ * realpath of its PARENT and re-append the basename. Returns `null` on any
+ * failure.
+ *
+ * Fail-safe by construction: every fs call is guarded, so an unresolvable
+ * path yields `null`. The caller treats `null` as "no match" — an
+ * unresolvable path NEVER turns a previously-allowed write into a refusal;
+ * F3 only ADDS detection where canonicalization SUCCEEDS and reveals a
+ * symlink to the store.
+ */
+function canonicalizePath(abs: string): string | null {
+  try {
+    return fs.realpathSync(abs);
+  } catch {
+    try {
+      return path.join(fs.realpathSync(path.dirname(abs)), path.basename(abs));
+    } catch {
+      return null;
+    }
+  }
+}
+
+/**
+ * True when `filePath` — after symlink resolution — points at the real
+ * `.rea/tasks.jsonl` of the worktree (or the primary checkout). Closes the
+ * round-12 F3 gap: a `Write`/`Edit` to `tasklog -> .rea/tasks.jsonl` mutates
+ * the real store, but its raw `file_path` does not literally name it, so
+ * `isTasksJsonl` alone would wave it through. Mirrors the bash-tier gate's
+ * symlink canonicalization (`bash-scanner` resolves redirect/cp/mv targets).
+ */
+function resolvesToTasksJsonl(
+  reaRoot: string,
+  commonRoot: string,
+  payloadCwd: string,
+  filePath: string,
+): boolean {
+  if (filePath.length === 0) return false;
+  const roots = commonRoot.length > 0 && commonRoot !== reaRoot ? [reaRoot, commonRoot] : [reaRoot];
+  const storeCanons: string[] = [];
+  for (const root of roots) {
+    const c = canonicalizePath(path.resolve(root, TASKS_RELATIVE));
+    if (c !== null) storeCanons.push(c);
+  }
+  if (storeCanons.length === 0) return false;
+
+  const candidates = path.isAbsolute(filePath)
+    ? [filePath]
+    : [
+        path.resolve(reaRoot, filePath),
+        ...(payloadCwd.length > 0 ? [path.resolve(payloadCwd, filePath)] : []),
+      ];
+  for (const cand of candidates) {
+    const cc = canonicalizePath(cand);
+    if (cc !== null && storeCanons.includes(cc)) return true;
+  }
+  return false;
+}
+
 interface LooseTaskRecord {
   id?: unknown;
   status?: unknown;
@@ -379,8 +439,14 @@ export async function runVerifyGate(options: VerifyGateOptions = {}): Promise<Ve
     });
   }
 
-  // Only act on `.rea/tasks.jsonl`.
-  if (!isTasksJsonl(filePath)) {
+  // Only act on `.rea/tasks.jsonl` — the literal name (fast path) OR a
+  // symlink resolving to it (round-12 F3). The resolved check canonicalizes
+  // `file_path` and its parent, so `tasklog -> .rea/tasks.jsonl` is caught;
+  // it is fail-safe (an unresolvable path yields no match, never a crash).
+  if (
+    !isTasksJsonl(filePath) &&
+    !resolvesToTasksJsonl(reaRoot, commonRoot, payloadCwd, filePath)
+  ) {
     return { exitCode: 0, stderr, stdout };
   }
 

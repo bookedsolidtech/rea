@@ -18,11 +18,60 @@ set -eu
 
 REA_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
 
-if [ -x "${REA_ROOT}/node_modules/.bin/rea" ]; then
-  "${REA_ROOT}/node_modules/.bin/rea" gate spec-check
-elif [ -f "${REA_ROOT}/dist/cli/index.js" ] && [ -f "${REA_ROOT}/package.json" ] \
-     && grep -q '"name": *"@bookedsolid/rea"' "${REA_ROOT}/package.json" 2>/dev/null; then
-  node "${REA_ROOT}/dist/cli/index.js" gate spec-check
+# Round-12 F2 (worktree fallback, mirrors pre-push v6): a linked worktree
+# frequently has no local install (node_modules/dist live only in the
+# PRIMARY checkout). Resolve the CLI from ONE seam: the worktree first, then
+# the primary checkout (.git-file discriminator, verified same-repository),
+# then the PATH/npx tiers below unchanged. REA_ROOT itself stays the worktree
+# — HALT and policy resolve against it inside `rea gate spec-check`; only CLI
+# dispatch follows REA_CLI_ROOT.
+REA_CLI_ROOT="$REA_ROOT"
+if [ ! -x "${REA_ROOT}/node_modules/.bin/rea" ] && [ ! -f "${REA_ROOT}/dist/cli/index.js" ] \
+   && [ -f "${REA_ROOT}/.git" ]; then
+  _rea_common_dir=$(git -C "$REA_ROOT" rev-parse --git-common-dir 2>/dev/null || true)
+  case "$_rea_common_dir" in
+    "") : ;;
+    /*) : ;;
+    *) _rea_common_dir="${REA_ROOT}/${_rea_common_dir}" ;;
+  esac
+  if [ -n "$_rea_common_dir" ]; then
+    _rea_common=$(dirname "$_rea_common_dir")
+    # Verify the dirname candidate is the SAME repository (its git-common-dir
+    # resolves to ours) — a bare/separate-git-dir layout nesting metadata
+    # under an UNRELATED checkout must not have its CLI executed against this
+    # repo's commit.
+    _rea_same_repo=0
+    if [ -d "${_rea_common}/.rea" ] || [ -e "${_rea_common}/.git" ]; then
+      _cc=$(git -C "$_rea_common" rev-parse --git-common-dir 2>/dev/null || true)
+      case "$_cc" in "") : ;; /*) : ;; *) _cc="${_rea_common}/${_cc}" ;; esac
+      if [ -n "$_cc" ]; then
+        _x=$(cd "$_cc" 2>/dev/null && pwd -P) || _x="$_cc"
+        _y=$(cd "$_rea_common_dir" 2>/dev/null && pwd -P) || _y="$_rea_common_dir"
+        [ "$_x" = "$_y" ] && _rea_same_repo=1
+      fi
+    fi
+    # A foreign nested checkout (verification failed) OR a --separate-git-dir
+    # primary whose metadata is external — fall back to git's first listed
+    # worktree (THIS repo's main one).
+    if [ "$_rea_same_repo" = "0" ]; then
+      _rea_common=$(git -C "$REA_ROOT" worktree list --porcelain 2>/dev/null \
+        | sed -n 's/^worktree //p' | head -n 1)
+    fi
+    if [ -n "$_rea_common" ] && [ "$_rea_common" != "$REA_ROOT" ] \
+       && { [ -d "${_rea_common}/.rea" ] || [ -e "${_rea_common}/.git" ]; } \
+       && { [ -x "${_rea_common}/node_modules/.bin/rea" ] \
+            || { [ -f "${_rea_common}/dist/cli/index.js" ] && [ -f "${_rea_common}/package.json" ] \
+                 && grep -q '"name": *"@bookedsolid/rea"' "${_rea_common}/package.json" 2>/dev/null; }; }; then
+      REA_CLI_ROOT="$_rea_common"
+    fi
+  fi
+fi
+
+if [ -x "${REA_CLI_ROOT}/node_modules/.bin/rea" ]; then
+  "${REA_CLI_ROOT}/node_modules/.bin/rea" gate spec-check
+elif [ -f "${REA_CLI_ROOT}/dist/cli/index.js" ] && [ -f "${REA_CLI_ROOT}/package.json" ] \
+     && grep -q '"name": *"@bookedsolid/rea"' "${REA_CLI_ROOT}/package.json" 2>/dev/null; then
+  node "${REA_CLI_ROOT}/dist/cli/index.js" gate spec-check
 elif command -v rea >/dev/null 2>&1; then
   rea gate spec-check
 elif command -v npx >/dev/null 2>&1; then

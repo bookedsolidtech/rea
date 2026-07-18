@@ -307,4 +307,57 @@ describe('runVerifyGate', () => {
     expect(r.exitCode).toBe(2);
     expect(r.stderr).toContain('REA HALT');
   });
+
+  // ── Round-12 F3: symlinked task-store paths ──────────────────────────
+  // A Write/Edit to `tasklog -> .rea/tasks.jsonl` mutates the real store but
+  // its raw file_path does not literally name it. The gate now canonicalizes
+  // (realpath) before the isTasksJsonl test — mirroring the bash-tier gate.
+  it.skipIf(process.platform === 'win32')(
+    'F3: Write through a symlink resolving to the store blocks under enforce',
+    async () => {
+      writePolicy(root, 'enforce');
+      const store = path.join(root, '.rea', 'tasks.jsonl');
+      fs.writeFileSync(store, ''); // store exists so realpath can follow the link
+      const link = path.join(root, 'tasklog');
+      fs.symlinkSync(store, link);
+      const r = await runVerifyGate({
+        reaRoot: root,
+        stdinOverride: writePayload({ filePath: link, content: COMPLETED_NO_EVIDENCE }),
+      });
+      expect(r.exitCode).toBe(2);
+      expect(r.stdout).toContain('permissionDecision');
+    },
+  );
+
+  it.skipIf(process.platform === 'win32')(
+    'F3: a symlink to an UNRELATED file is not treated as the store (exit 0)',
+    async () => {
+      writePolicy(root, 'enforce');
+      const other = path.join(root, 'other.json');
+      fs.writeFileSync(other, '{}');
+      const link = path.join(root, 'tasklog');
+      fs.symlinkSync(other, link);
+      const r = await runVerifyGate({
+        reaRoot: root,
+        stdinOverride: writePayload({ filePath: link, content: COMPLETED_NO_EVIDENCE }),
+      });
+      expect(r.exitCode).toBe(0);
+    },
+  );
+
+  it.skipIf(process.platform === 'win32')(
+    'F3: an unresolvable symlink is fail-safe (never crashes; exit 0 at enforce)',
+    async () => {
+      writePolicy(root, 'enforce');
+      // Dangling link → realpath throws; the fallback resolves the link's own
+      // parent+name, which is NOT the store, so the gate treats it as no-match.
+      const link = path.join(root, 'tasklog');
+      fs.symlinkSync(path.join(root, 'does-not-exist'), link);
+      const r = await runVerifyGate({
+        reaRoot: root,
+        stdinOverride: writePayload({ filePath: link, content: COMPLETED_NO_EVIDENCE }),
+      });
+      expect(r.exitCode).toBe(0);
+    },
+  );
 });
