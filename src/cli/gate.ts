@@ -293,15 +293,24 @@ export async function runGateSpecCheck(options: GateSpecCheckOptions = {}): Prom
       banner(`the spec ${specPath} does not exist on disk as a file`),
     );
   }
-  // `cat-file -t` returns the object type; require a `blob` (a committed
-  // FILE), not a `tree` (a committed directory).
-  const committedType = git(['cat-file', '-t', `HEAD:${specPath}`]);
-  const committedAsFile = committedType.status === 0 && committedType.stdout.trim() === 'blob';
-  if (!committedAsFile) {
+  // `cat-file -t` returns the object type; require a `blob` (a FILE), not a
+  // `tree` (a directory). Accept the spec when it is a blob in the INDEX
+  // (`:${specPath}` — STAGED in the commit being made) OR at HEAD (committed
+  // in a prior commit). The index check is what unblocks the documented
+  // `rea tasks add --spec … --requires-spec` flow (round-27 P1): the very
+  // commit that INTRODUCES the spec has it staged but not yet at HEAD, so a
+  // HEAD-only check would deadlock — the only commit that could satisfy the
+  // gate would be the one it refuses. A directory is a `tree` in both and a
+  // path with no index/HEAD entry fails both, so both stay rejected.
+  const stagedType = git(['cat-file', '-t', `:${specPath}`]);
+  const stagedAsFile = stagedType.status === 0 && stagedType.stdout.trim() === 'blob';
+  const headType = git(['cat-file', '-t', `HEAD:${specPath}`]);
+  const headAsFile = headType.status === 0 && headType.stdout.trim() === 'blob';
+  if (!stagedAsFile && !headAsFile) {
     return resolveVerdict(
-      'spec not committed at HEAD',
+      'spec not committed',
       metaCommon,
-      banner(`the spec ${specPath} is not committed at HEAD as a file`),
+      banner(`the spec ${specPath} is not committed as a file (staged or at HEAD)`),
     );
   }
 

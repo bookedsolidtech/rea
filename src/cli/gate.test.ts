@@ -157,6 +157,21 @@ describe('runGateSpecCheck', () => {
     expect(r.exitCode).toBe(0);
   });
 
+  it('over threshold + spec STAGED in THIS commit (not yet at HEAD) → pass (round-27 P1)', async () => {
+    // The documented `rea tasks add --spec … --requires-spec` flow introduces
+    // the spec IN the same commit: it is staged but cannot be at HEAD yet. A
+    // HEAD-only check would deadlock the only commit that could satisfy it.
+    initRepo(root);
+    writePolicy(root, { mode: 'enforce', diffLines: 10, diffFiles: 2 });
+    writeTasks(root, [{ spec: 'docs/spec.md', requires_spec: true }]);
+    fs.mkdirSync(path.join(root, 'docs'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'docs', 'spec.md'), '# spec\n');
+    git(root, ['add', 'docs/spec.md']); // staged, NOT committed
+    stageBigChange(root, 'big.txt', 50);
+    const r = await runGateSpecCheck({ reaRoot: root });
+    expect(r.exitCode).toBe(0);
+  });
+
   it('over threshold + spec is a committed DIRECTORY → enforce blocks (round-10 P2)', async () => {
     initRepo(root);
     // Commit a directory (not a spec document). Both existsSync('docs')
