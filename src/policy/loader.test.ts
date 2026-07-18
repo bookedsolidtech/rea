@@ -110,6 +110,40 @@ describe('policy loader', () => {
       }
     });
 
+    it('accepts artifact_gates with default modes (off)', async () => {
+      const yaml = SAMPLE + '\nartifact_gates:\n  g1_spec: {}\n  g2_verify: {}\n  g3_review: {}\n';
+      await fs.writeFile(path.join(baseDir, '.rea', 'policy.yaml'), yaml, 'utf8');
+      const p2 = loadPolicy(baseDir);
+      expect(p2.artifact_gates?.g1_spec.mode).toBe('off');
+      expect(p2.artifact_gates?.g1_spec.diff_lines).toBe(150);
+      expect(p2.artifact_gates?.g1_spec.diff_files).toBe(5);
+      expect(p2.artifact_gates?.g2_verify.mode).toBe('off');
+      expect(p2.artifact_gates?.g3_review.mode).toBe('off');
+    });
+
+    it('accepts artifact_gates shadow/enforce modes + custom thresholds', async () => {
+      const yaml =
+        SAMPLE +
+        '\nartifact_gates:\n  g1_spec: { mode: shadow, diff_lines: 40, diff_files: 3 }\n  g2_verify: { mode: enforce }\n  g3_review: { mode: shadow }\n';
+      await fs.writeFile(path.join(baseDir, '.rea', 'policy.yaml'), yaml, 'utf8');
+      const p2 = loadPolicy(baseDir);
+      expect(p2.artifact_gates?.g1_spec.mode).toBe('shadow');
+      expect(p2.artifact_gates?.g1_spec.diff_lines).toBe(40);
+      expect(p2.artifact_gates?.g2_verify.mode).toBe('enforce');
+      expect(p2.artifact_gates?.g3_review.mode).toBe('shadow');
+    });
+
+    it('leaves artifact_gates undefined when the block is absent (no-op)', async () => {
+      await fs.writeFile(path.join(baseDir, '.rea', 'policy.yaml'), SAMPLE, 'utf8');
+      expect(loadPolicy(baseDir).artifact_gates).toBeUndefined();
+    });
+
+    it('rejects an unknown artifact_gates mode', async () => {
+      const yaml = SAMPLE + '\nartifact_gates:\n  g1_spec: { mode: block }\n';
+      await fs.writeFile(path.join(baseDir, '.rea', 'policy.yaml'), yaml, 'utf8');
+      expect(() => loadPolicy(baseDir)).toThrow(/Invalid policy schema/);
+    });
+
     it('rejects an unknown reasoning tier', async () => {
       const yaml = SAMPLE + '\nreview:\n  codex_reasoning_effort: ultra\n';
       await fs.writeFile(path.join(baseDir, '.rea', 'policy.yaml'), yaml, 'utf8');

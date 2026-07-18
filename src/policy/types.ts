@@ -22,6 +22,24 @@ export interface ContextProtection {
   max_bash_output_lines?: number;
 }
 
+/** Three-state enforcement mode for an Artifact Gate. */
+export type GateMode = 'off' | 'shadow' | 'enforce';
+
+/**
+ * Artifact Gates policy (0.54.0+). Present-block fields are always
+ * populated (zod defaults); an ABSENT `artifact_gates` block means all
+ * gates `off`. `mode`: `off` (silent no-op), `shadow` (log would-block,
+ * never block), `enforce` (block into the review queue).
+ */
+export interface ArtifactGatesPolicy {
+  /** G1 spec-gate: non-trivial diff → active ticket must reference a committed spec. */
+  g1_spec: { mode: GateMode; diff_lines: number; diff_files: number };
+  /** G2 verification-gate: no evidence → a ticket cannot close. */
+  g2_verify: { mode: GateMode };
+  /** G3 review-gate: no fresh verdict → no push (tiered). */
+  g3_review: { mode: GateMode };
+}
+
 /**
  * Review policy knobs for the 0.11.0 stateless push-gate.
  *
@@ -745,6 +763,12 @@ export interface Policy {
   redact?: RedactPolicy;
   audit?: AuditPolicy;
   gateway?: GatewayPolicy;
+  /**
+   * Artifact Gates (0.54.0+) — three deterministic process gates.
+   * Absent block = all gates `off` (byte-identical no-op). Each `mode`
+   * is `off | shadow | enforce`; policy tightens but never loosens.
+   */
+  artifact_gates?: ArtifactGatesPolicy;
   /**
    * Architecture-review patterns (0.20.1+). When set, the
    * `architecture-review-gate.sh` hook fires an advisory when a
