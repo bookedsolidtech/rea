@@ -84,16 +84,6 @@ export interface VerifyGateResult {
 const TASKS_RELATIVE = '.rea/tasks.jsonl';
 
 /**
- * True when `filePath` names `.rea/tasks.jsonl` (relative or absolute,
- * Windows or POSIX separators). The gate only acts on this one file.
- */
-function isTasksJsonl(filePath: string): boolean {
-  if (filePath.length === 0) return false;
-  const posix = filePath.replace(/\\/g, '/');
-  return posix === TASKS_RELATIVE || posix.endsWith('/' + TASKS_RELATIVE);
-}
-
-/**
  * Canonicalize an absolute path, tolerating a not-yet-existing leaf.
  *
  * Round-19 F2: if `abs` is ITSELF a symlink, follow it (readlink + resolve
@@ -140,10 +130,11 @@ function canonicalizePath(abs: string, depth = 0): string | null {
 
 /**
  * True when `filePath` — after symlink resolution — points at the real
- * `.rea/tasks.jsonl` of the worktree (or the primary checkout). Closes the
- * round-12 F3 gap: a `Write`/`Edit` to `tasklog -> .rea/tasks.jsonl` mutates
- * the real store, but its raw `file_path` does not literally name it, so
- * `isTasksJsonl` alone would wave it through. Mirrors the bash-tier gate's
+ * `.rea/tasks.jsonl` of THIS repo (the local worktree OR the primary
+ * checkout), and ONLY this repo (round-26 P2: repo-scoped, no unscoped suffix
+ * match). Closes the round-12 F3 gap: a `Write`/`Edit` to
+ * `tasklog -> .rea/tasks.jsonl` mutates the real store, but its raw
+ * `file_path` does not literally name it. Mirrors the bash-tier gate's
  * symlink canonicalization (`bash-scanner` resolves redirect/cp/mv targets).
  */
 function resolvesToTasksJsonl(
@@ -460,14 +451,19 @@ export async function runVerifyGate(options: VerifyGateOptions = {}): Promise<Ve
     });
   }
 
-  // Only act on `.rea/tasks.jsonl` — the literal name (fast path) OR a
-  // symlink resolving to it (round-12 F3). The resolved check canonicalizes
-  // `file_path` and its parent, so `tasklog -> .rea/tasks.jsonl` is caught;
-  // it is fail-safe (an unresolvable path yields no match, never a crash).
-  if (
-    !isTasksJsonl(filePath) &&
-    !resolvesToTasksJsonl(reaRoot, commonRoot, payloadCwd, filePath)
-  ) {
+  // Only act on THIS repo's `.rea/tasks.jsonl` (round-26 P2 — cross-repo
+  // isolation). The match is REPO-SCOPED via `resolvesToTasksJsonl`, which
+  // canonicalizes `file_path` (+ its parent, following symlinks) and compares
+  // it to the resolved store of the LOCAL and COMMON roots. The pre-round-26
+  // `isTasksJsonl(filePath)` fast-path was a suffix-only check (`*/.rea/
+  // tasks.jsonl`) that matched ANY repo's store — so a Write from repo A to
+  // `<repoB>/.rea/tasks.jsonl` was governed by repo A's policy and audited into
+  // repo A's chain. Dropping it closes that leak while `resolvesToTasksJsonl`
+  // still covers every in-repo case the fast-path used to (absolute
+  // `<reaRoot>/.rea/tasks.jsonl`, relative resolved against cwd/reaRoot, the
+  // common-root store in a linked worktree, symlink aliases, dangling links).
+  // Fail-safe: an unresolvable path yields no match, never a crash.
+  if (!resolvesToTasksJsonl(reaRoot, commonRoot, payloadCwd, filePath)) {
     return { exitCode: 0, stderr, stdout };
   }
 

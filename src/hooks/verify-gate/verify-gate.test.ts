@@ -382,4 +382,42 @@ describe('runVerifyGate', () => {
       expect(r.exitCode).toBe(0);
     },
   );
+
+  // ── Round-26 P2 — cross-repo isolation ───────────────────────────────────
+  // The pre-fix `isTasksJsonl` suffix-match governed ANY repo's store. The
+  // match is now repo-scoped: a Write to a FOREIGN repo's store while the gate
+  // is rooted at repo A must NOT be governed by A's policy.
+  it('P2: a Write to a FOREIGN repo B store under repo A enforce → exit 0 (not governed)', async () => {
+    writePolicy(root, 'enforce'); // root = repo A
+    const repoB = fs.mkdtempSync(path.join(os.tmpdir(), 'rea-verify-gate-B-'));
+    try {
+      fs.mkdirSync(path.join(repoB, '.rea'), { recursive: true });
+      fs.writeFileSync(path.join(repoB, '.rea', 'tasks.jsonl'), ''); // B's real store
+      // A completed-no-evidence write to B's store — WOULD block if A governed it.
+      const res = await runVerifyGate({
+        reaRoot: root, // gate rooted at repo A
+        stdinOverride: writePayload({
+          filePath: path.join(repoB, '.rea', 'tasks.jsonl'),
+          content: COMPLETED_NO_EVIDENCE,
+        }),
+      });
+      expect(res.exitCode).toBe(0);
+      // And nothing was audited into repo A's chain.
+      expect(fs.existsSync(path.join(root, '.rea', 'audit.jsonl'))).toBe(false);
+    } finally {
+      fs.rmSync(repoB, { recursive: true, force: true });
+    }
+  });
+
+  it('P2 control: repo A still governs its OWN store (in-repo literal → exit 2)', async () => {
+    writePolicy(root, 'enforce');
+    const r = await runVerifyGate({
+      reaRoot: root,
+      stdinOverride: writePayload({
+        filePath: path.join(root, '.rea', 'tasks.jsonl'), // A's own store, absolute
+        content: COMPLETED_NO_EVIDENCE,
+      }),
+    });
+    expect(r.exitCode).toBe(2);
+  });
 });
