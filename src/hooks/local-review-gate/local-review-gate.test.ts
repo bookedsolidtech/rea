@@ -678,6 +678,29 @@ artifact_gates:
     expect(r.decision).toBe('mode-off');
   });
 
+  it('MALFORMED g3_review.mode → legacy path (not off), matching preflight (round-26 P2)', async () => {
+    // A typo'd mode is REJECTED by the strict schema, so `rea preflight`
+    // strict-loads-fails → legacy enforced. This Bash hook must agree: fall to
+    // legacy (enforced → refuse), NOT silently allow via `off`.
+    const body = `review:
+  local_review:
+    mode: enforced
+    refuse_at: push
+artifact_gates:
+  g3_review:
+    mode: bogus
+`;
+    writePolicy(root, body);
+    const r = await runLocalReviewGate({
+      reaRoot: root,
+      stdinOverride: PAYLOAD('git push origin main'),
+      envOverride: {},
+      preflightImpl: refusePreflight,
+    });
+    expect(r.exitCode).toBe(2);
+    expect(r.decision).toBe('preflight-refuse');
+  });
+
   it('g3 shadow does NOT short-circuit off — gate proceeds to the probe', async () => {
     writePolicy(root, g3Body('shadow'));
     const r = await runLocalReviewGate({

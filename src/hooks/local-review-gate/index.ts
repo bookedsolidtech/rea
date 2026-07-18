@@ -286,21 +286,31 @@ function loadLocalReviewPolicy(reaRoot: string): LocalReviewPolicy {
  * fall back to legacy `review.local_review` enforcement instead of the
  * `off` the validated policy promises). Only when the block is ABSENT (no
  * `artifact_gates`, or no `g3_review`) do we return `undefined` and route
- * back to the legacy path — the byte-identical pre-G3 invariant. An unknown/
- * typo `mode` value is caught loudly by `loadPolicy`'s strict schema at
- * init/upgrade; here a present block conservatively resolves to `off`
- * (G3 semantics apply, gate disabled) rather than silently re-enabling the
- * legacy gate.
+ * back to the legacy path — the byte-identical pre-G3 invariant.
+ *
+ * A present block with a MISSING `mode` key → `off` (the strict schema
+ * `.default('off')`s it, so `g3_review: {}` validates as off). But a present
+ * `mode` with a MALFORMED value (typo, wrong type) → `undefined` (legacy),
+ * NOT `off` (round-26 P2): the strict `loadPolicy` REJECTS such a value, so
+ * `rea preflight` (which strict-loads) falls back to the legacy enforced path.
+ * Returning `off` here would make THIS Bash hook silently allow while
+ * preflight/pre-push enforce — the exact cross-path disagreement the shared
+ * resolver was built to prevent. Matching preflight's strict-fail-to-legacy
+ * keeps all three paths consistent on a malformed policy.
  */
 function extractG3Mode(root: Record<string, unknown>): GateMode | undefined {
   const ag = root['artifact_gates'];
   if (ag === null || typeof ag !== 'object' || Array.isArray(ag)) return undefined;
   const g3 = (ag as Record<string, unknown>)['g3_review'];
   if (g3 === null || typeof g3 !== 'object' || Array.isArray(g3)) return undefined;
-  const m = (g3 as Record<string, unknown>)['mode'];
+  const g3obj = g3 as Record<string, unknown>;
+  const m = g3obj['mode'];
   if (m === 'off' || m === 'shadow' || m === 'enforce') return m;
-  // Block present but mode missing/unrecognized → schema default `off`.
-  return 'off';
+  // Mode key entirely absent (`g3_review: {}`) → schema default `off`.
+  if (!Object.prototype.hasOwnProperty.call(g3obj, 'mode')) return 'off';
+  // Mode present but malformed → strict schema rejects → legacy (undefined),
+  // consistent with preflight's strict-load-fails-to-legacy behavior.
+  return undefined;
 }
 
 /**
