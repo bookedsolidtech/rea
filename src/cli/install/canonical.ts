@@ -109,6 +109,14 @@ export async function enumerateCanonicalFiles(
       source: 'command',
       mode: 0o644,
     },
+    // Process-spine skills. Source dir is `spine/`; install target is the
+    // DEDICATED `.claude/skills/` (kept distinct from the governance
+    // `.claude/commands/` so the spine has its own version-pin + drift
+    // scope). Enumerated here so `rea init` records SHAs, `rea upgrade`
+    // classifies each spine file (new/unmodified/drifted/removed-upstream)
+    // and refreshes/version-pins it, and `rea doctor --drift` reports drift
+    // — all via the SAME machinery as commands/agents, no new mechanism.
+    { srcDir: path.join(pkgRoot, 'spine'), dstPrefix: '.claude/skills', source: 'skill', mode: 0o644 },
     { srcDir: path.join(pkgRoot, '.husky'), dstPrefix: '.husky', source: 'husky', mode: 0o755 },
   ];
   const out: CanonicalFile[] = [];

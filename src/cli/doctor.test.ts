@@ -23,6 +23,8 @@ import {
   checkPolicyReaderTier3,
   checkPolicyReaderTierSummary,
   checkPrepareCommitMsgHook,
+  checkSpineInstalled,
+  checkTokenEconomy,
   checksFromProbeState,
   collectChecks,
   type CheckResult,
@@ -2502,5 +2504,159 @@ describe('rea doctor — policy-reader tier checks (0.39.0)', () => {
       expect(findCheck(checks, 'policy-reader jq (JSON accelerator)')).toBeUndefined();
       expect(findCheck(checks, 'policy-reader effective floor')).toBeUndefined();
     });
+  });
+});
+
+// ── Spine distribution (spec §4): checkSpineInstalled ───────────────────────
+//
+// The process-spine skills payload (`spine/*.md` → `.claude/skills/`) is
+// version-pinned to the rea release. checkSpineInstalled mirrors
+// checkAgentsPresent/checkHooksInstalled and adds the drift dimension the
+// spec requires — the refuse-and-report surface for locally-modified spine
+// files. Advisory: warn on absence/drift, never a hard fail.
+import { PKG_ROOT } from './utils.js';
+
+const SPINE_DIR = path.join(PKG_ROOT, 'spine');
+
+async function spinePayloadNames(): Promise<string[]> {
+  const names = (await fs.readdir(SPINE_DIR)).filter((n) => n.endsWith('.md'));
+  names.sort();
+  return names;
+}
+
+async function layDownSpine(baseDir: string): Promise<void> {
+  const dst = path.join(baseDir, '.claude', 'skills');
+  await fs.mkdir(dst, { recursive: true });
+  for (const name of await spinePayloadNames()) {
+    await fs.copyFile(path.join(SPINE_DIR, name), path.join(dst, name));
+  }
+}
+
+describe('rea doctor — checkSpineInstalled (spec §4 spine distribution)', () => {
+  const cleanup: string[] = [];
+  afterEach(async () => {
+    await Promise.all(cleanup.splice(0).map((d) => fs.rm(d, { recursive: true, force: true })));
+  });
+
+  it('warns (not fails) when .claude/skills/ is absent — upgrade-lag signal', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'rea-spine-'));
+    cleanup.push(dir);
+    const r = checkSpineInstalled(dir);
+    expect(r.status).toBe('warn');
+    // Names the inspected path AND the next step.
+    expect(r.detail).toContain(path.join(dir, '.claude', 'skills'));
+    expect(r.detail).toMatch(/rea upgrade/);
+  });
+
+  it('passes when every payload file is present and byte-identical', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'rea-spine-'));
+    cleanup.push(dir);
+    await layDownSpine(dir);
+    const r = checkSpineInstalled(dir);
+    expect(r.status).toBe('pass');
+    const count = (await spinePayloadNames()).length;
+    expect(r.detail).toContain(`${count} spine skills present`);
+  });
+
+  it('warns and names the drifted file when an installed spine file is locally modified', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'rea-spine-'));
+    cleanup.push(dir);
+    await layDownSpine(dir);
+    const names = await spinePayloadNames();
+    const victim = names.find((n) => n === 'grill.md') ?? names[0]!;
+    await fs.writeFile(path.join(dir, '.claude', 'skills', victim), '# local edit\n', 'utf8');
+    const r = checkSpineInstalled(dir);
+    expect(r.status).toBe('warn');
+    expect(r.detail).toContain(victim);
+    expect(r.detail).toMatch(/locally modified/);
+    expect(r.detail).toMatch(/rea upgrade/);
+  });
+
+  it('warns and names the missing file when a payload file is absent on disk', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'rea-spine-'));
+    cleanup.push(dir);
+    await layDownSpine(dir);
+    const names = await spinePayloadNames();
+    const victim = names[0]!;
+    await fs.rm(path.join(dir, '.claude', 'skills', victim));
+    const r = checkSpineInstalled(dir);
+    expect(r.status).toBe('warn');
+    expect(r.detail).toContain(victim);
+    expect(r.detail).toMatch(/missing/);
+  });
+
+  it('never returns fail (advisory only — must not block install/CI)', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'rea-spine-'));
+    cleanup.push(dir);
+    // absent case
+    expect(checkSpineInstalled(dir).status).not.toBe('fail');
+    await layDownSpine(dir);
+    expect(checkSpineInstalled(dir).status).not.toBe('fail');
+  });
+});
+
+// ── D5 token-economy lint: checkTokenEconomy (advisory-only) ────────────────
+describe('rea doctor — checkTokenEconomy (D5 advisory budget)', () => {
+  const cleanup: string[] = [];
+  afterEach(async () => {
+    await Promise.all(cleanup.splice(0).map((d) => fs.rm(d, { recursive: true, force: true })));
+  });
+
+  async function writeSkill(dir: string, name: string, description: string): Promise<void> {
+    await fs.mkdir(dir, { recursive: true });
+    const body = `---\nname: ${name}\ndescription: "${description}"\n---\n\nbody\n`;
+    await fs.writeFile(path.join(dir, `${name}.md`), body, 'utf8');
+  }
+
+  it('info + counts skills across BOTH .claude/skills and .claude/commands', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'rea-tok-'));
+    cleanup.push(dir);
+    await writeSkill(path.join(dir, '.claude', 'skills'), 'a', 'x');
+    await writeSkill(path.join(dir, '.claude', 'skills'), 'b', 'x');
+    await writeSkill(path.join(dir, '.claude', 'commands'), 'c', 'x');
+    const r = checkTokenEconomy(dir);
+    expect(r.status).toBe('info');
+    expect(r.detail).toContain('3/15 user-invoked skills');
+  });
+
+  it('does NOT count files without a description front-matter (e.g. README)', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'rea-tok-'));
+    cleanup.push(dir);
+    const skillsDir = path.join(dir, '.claude', 'skills');
+    await writeSkill(skillsDir, 'real', 'x');
+    await fs.writeFile(path.join(skillsDir, 'README.md'), '# index\n\nno front-matter\n', 'utf8');
+    const r = checkTokenEconomy(dir);
+    expect(r.detail).toContain('1/15 user-invoked skills');
+  });
+
+  it('warns and flags the prune ritual when the skill count exceeds 15', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'rea-tok-'));
+    cleanup.push(dir);
+    const skillsDir = path.join(dir, '.claude', 'skills');
+    for (let i = 0; i < 16; i++) await writeSkill(skillsDir, `s${i}`, 'x');
+    const r = checkTokenEconomy(dir);
+    expect(r.status).toBe('warn');
+    expect(r.detail).toMatch(/16 skills \(cap 15\)/);
+    expect(r.detail).toMatch(/quarterly prune ritual/);
+  });
+
+  it('warns when description tokens exceed 1000 (estimate = chars ÷ 4)', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'rea-tok-'));
+    cleanup.push(dir);
+    const skillsDir = path.join(dir, '.claude', 'skills');
+    // 5 skills × 900 chars = 4500 chars → ~1125 tokens > 1000, but only 5 skills.
+    const longDesc = 'z'.repeat(900);
+    for (let i = 0; i < 5; i++) await writeSkill(skillsDir, `s${i}`, longDesc);
+    const r = checkTokenEconomy(dir);
+    expect(r.status).toBe('warn');
+    expect(r.detail).toMatch(/description tokens \(cap 1000\)/);
+  });
+
+  it('never returns fail (advisory only — must not affect exit code)', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'rea-tok-'));
+    cleanup.push(dir);
+    const skillsDir = path.join(dir, '.claude', 'skills');
+    for (let i = 0; i < 20; i++) await writeSkill(skillsDir, `s${i}`, 'z'.repeat(500));
+    expect(checkTokenEconomy(dir).status).not.toBe('fail');
   });
 });

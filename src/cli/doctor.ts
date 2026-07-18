@@ -48,7 +48,7 @@ import {
   type GlobalCandidateFail,
   type SafetyFail,
 } from './global-cli.js';
-import { POLICY_FILE, REA_DIR, REGISTRY_FILE, getPkgVersion, log, reaPath } from './utils.js';
+import { PKG_ROOT, POLICY_FILE, REA_DIR, REGISTRY_FILE, getPkgVersion, log, reaPath } from './utils.js';
 import { resolveOpenRouterKey } from './openrouter-key-source.js';
 
 export interface CheckResult {
@@ -323,6 +323,218 @@ function checkHooksInstalled(baseDir: string): CheckResult {
     };
   }
   return { label: 'hooks installed + executable', status: 'fail', detail: issues.join('; ') };
+}
+
+/**
+ * List the packaged spine payload (`PKG_ROOT/spine/*.md`). The spine ships
+ * as flat markdown, so a single non-recursive read is sufficient. Returns
+ * `null` when the payload directory is unreadable (a broken/partial rea
+ * install — the caller renders an `info` line rather than a false failure).
+ */
+function readSpinePayloadFiles(): string[] | null {
+  const payloadDir = path.join(PKG_ROOT, 'spine');
+  try {
+    return fs
+      .readdirSync(payloadDir)
+      .filter((name) => name.endsWith('.md'))
+      .sort();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Spine (process-spine skills) install + drift check.
+ *
+ * The spine payload (`spine/*.md` → `.claude/skills/`) ships with every
+ * `rea init`/`rea upgrade`, version-pinned to the rea release. This mirrors
+ * `checkAgentsPresent`/`checkHooksInstalled` for the skills payload and adds
+ * the drift dimension the spec (§4) requires: it reports when an installed
+ * spine file diverges from the release payload — the refuse-and-report
+ * surface for locally-modified spine files (`rea upgrade` never silently
+ * overwrites them; it prompts keep/overwrite, and `--yes` keeps).
+ *
+ * Statuses are ADVISORY — never a hard fail — so a fresh install and an
+ * upgrade-lagged (pre-spine) install both keep `rea doctor` green; the
+ * actionable signal is a warn row naming the inspected path + `rea upgrade`.
+ * Every branch names the path inspected and a concrete next step.
+ *
+ *   - info  — payload dir unreadable (broken rea install; nothing to compare).
+ *   - warn  — `.claude/skills/` absent (pre-spine install — run `rea upgrade`).
+ *   - warn  — one+ payload files missing on disk (partial install).
+ *   - warn  — one+ installed files drift from the release payload
+ *             (locally modified — `rea upgrade` restores canonical, or keep
+ *             your edits).
+ *   - pass  — every payload file present and byte-identical to the pinned
+ *             release payload.
+ */
+export function checkSpineInstalled(baseDir: string): CheckResult {
+  const label = 'spine skills installed';
+  const version = getPkgVersion();
+  const payload = readSpinePayloadFiles();
+  if (payload === null || payload.length === 0) {
+    return {
+      label,
+      status: 'info',
+      detail: `spine payload not found at ${path.join(PKG_ROOT, 'spine')} — cannot verify skills install`,
+    };
+  }
+  const skillsDir = path.join(baseDir, '.claude', 'skills');
+  if (!fs.existsSync(skillsDir)) {
+    return {
+      label,
+      status: 'warn',
+      detail:
+        `not installed (expected at ${skillsDir}) — run \`rea upgrade\` to install the ` +
+        `process spine (${payload.length} skills, rea v${version})`,
+    };
+  }
+  const payloadDir = path.join(PKG_ROOT, 'spine');
+  const missing: string[] = [];
+  const drifted: string[] = [];
+  for (const name of payload) {
+    const installed = path.join(skillsDir, name);
+    if (!fs.existsSync(installed)) {
+      missing.push(name);
+      continue;
+    }
+    try {
+      const a = fs.readFileSync(installed);
+      const b = fs.readFileSync(path.join(payloadDir, name));
+      if (!a.equals(b)) drifted.push(name);
+    } catch {
+      // Unreadable installed file — treat as the partial-install shape.
+      missing.push(name);
+    }
+  }
+  if (missing.length > 0) {
+    return {
+      label,
+      status: 'warn',
+      detail:
+        `${missing.length} spine file(s) missing at ${skillsDir}: ${missing.join(', ')} — ` +
+        `run \`rea upgrade\` to install the rea v${version} spine payload`,
+    };
+  }
+  if (drifted.length > 0) {
+    return {
+      label,
+      status: 'warn',
+      detail:
+        `${drifted.length} spine file(s) locally modified at ${skillsDir}: ${drifted.join(', ')} — ` +
+        `\`rea upgrade\` restores the rea v${version} canonical (kept by default under --yes; ` +
+        `overwrite to discard your edits)`,
+    };
+  }
+  return {
+    label,
+    status: 'pass',
+    detail: `${payload.length} spine skills present (rea v${version}, pinned)`,
+  };
+}
+
+/**
+ * D5 token-economy lint — ADVISORY ONLY. This check NEVER returns `fail`
+ * and therefore never contributes to the `rea doctor` exit code (it must
+ * not block install or CI). It surfaces the ratified budget from the spec
+ * (§4 / owner decision D5):
+ *
+ *   - ≤ 15 user-invoked skills per repo, and
+ *   - ≤ 1,000 tokens total across their `description:` front-matter.
+ *
+ * When either cap is exceeded it warns and flags the quarterly prune ritual.
+ *
+ * Counting: a "user-invoked skill" is any `.md` file — under BOTH
+ * `.claude/skills/` and `.claude/commands/` (both are `/name`-invocable) —
+ * that carries a `description:` field in its YAML front-matter. Files
+ * without front-matter (e.g. the spine `README.md` index) are not skills
+ * and are not counted.
+ *
+ * Token estimate: `ceil(totalDescriptionChars / 4)` — the standard
+ * ~4-chars-per-token heuristic. Documented here and in the emitted detail
+ * so operators know how the number was derived; it is an estimate, not an
+ * exact tokenizer count.
+ */
+export function checkTokenEconomy(baseDir: string): CheckResult {
+  const label = 'skill token-economy budget (advisory)';
+  const SKILL_CAP = 15;
+  const TOKEN_CAP = 1000;
+  const dirs = [
+    path.join(baseDir, '.claude', 'skills'),
+    path.join(baseDir, '.claude', 'commands'),
+  ];
+  let skillCount = 0;
+  let descriptionChars = 0;
+  for (const dir of dirs) {
+    let entries: string[];
+    try {
+      entries = fs.readdirSync(dir).filter((n) => n.endsWith('.md'));
+    } catch {
+      continue; // dir absent — nothing to count from this source
+    }
+    for (const name of entries) {
+      let content: string;
+      try {
+        content = fs.readFileSync(path.join(dir, name), 'utf8');
+      } catch {
+        continue;
+      }
+      const description = extractFrontMatterDescription(content);
+      if (description === null) continue; // not a skill (no description)
+      skillCount += 1;
+      descriptionChars += description.length;
+    }
+  }
+  const tokenEstimate = Math.ceil(descriptionChars / 4);
+  const overSkills = skillCount > SKILL_CAP;
+  const overTokens = tokenEstimate > TOKEN_CAP;
+  if (overSkills || overTokens) {
+    const breaches: string[] = [];
+    if (overSkills) breaches.push(`${skillCount} skills (cap ${SKILL_CAP})`);
+    if (overTokens) breaches.push(`~${tokenEstimate} description tokens (cap ${TOKEN_CAP})`);
+    return {
+      label,
+      status: 'warn',
+      detail:
+        `over budget: ${breaches.join(', ')} across .claude/skills + .claude/commands — ` +
+        `run the quarterly prune ritual (retire unused skills) to stay within the ratified ` +
+        `budget. [token estimate = description chars ÷ 4]`,
+    };
+  }
+  return {
+    label,
+    status: 'info',
+    detail:
+      `${skillCount}/${SKILL_CAP} user-invoked skills, ~${tokenEstimate}/${TOKEN_CAP} description ` +
+      `tokens across .claude/skills + .claude/commands (estimate = chars ÷ 4)`,
+  };
+}
+
+/**
+ * Extract the `description:` scalar from a markdown file's leading YAML
+ * front-matter block. Returns the trimmed value (surrounding quotes
+ * stripped) or `null` when the file has no front-matter or no
+ * `description:` key. Intentionally simple — a single-line scalar reader,
+ * sufficient for the house command-doc convention (`name` + `description`
+ * front-matter). Used by the token-economy lint to identify user-invoked
+ * skills and measure their description budget.
+ */
+function extractFrontMatterDescription(content: string): string | null {
+  if (!content.startsWith('---')) return null;
+  const closeIdx = content.indexOf('\n---', 3);
+  if (closeIdx < 0) return null;
+  const frontMatter = content.slice(3, closeIdx);
+  const match = /^description:[ \t]*(.*)$/m.exec(frontMatter);
+  if (match === null) return null;
+  let value = (match[1] ?? '').trim();
+  if (
+    value.length >= 2 &&
+    ((value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'")))
+  ) {
+    value = value.slice(1, -1);
+  }
+  return value;
 }
 
 /**
@@ -3407,6 +3619,17 @@ export function collectChecks(
     checkRegistryParses(baseDir, registryPath),
     checkAgentsPresent(baseDir),
     checkHooksInstalled(baseDir),
+    // Spine distribution (spec §4): the process-spine skills payload
+    // (`spine/*.md` → `.claude/skills/`), version-pinned to the rea
+    // release. Advisory (warn on absence/drift, never a hard fail) so a
+    // fresh install passes and an upgrade-lagged install is nudged, not
+    // reddened. Reports drift = the refuse-and-report surface for
+    // locally-modified spine files.
+    checkSpineInstalled(baseDir),
+    // D5 token-economy lint — ADVISORY ONLY (warn/info, never fail).
+    // Counts user-invoked skills across .claude/skills + .claude/commands
+    // and flags the ratified budget (≤15 skills, ≤1000 description tokens).
+    checkTokenEconomy(baseDir),
     checkWorktreeTopology(baseDir),
     // 0.49.0 brick-state detector. Hook shims installed without a
     // self-pin in package.json is the exact scenario the bash-gate
