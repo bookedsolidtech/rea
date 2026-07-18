@@ -1001,6 +1001,95 @@ describe('extension-hook chaining (Fix H / 0.13.0) — `.husky/pre-push.d/*`', (
     expect(r.stderr).toContain('no recent local review');
   });
 
+  // ── Round-33 P1 — HALT freeze covers BOTH roots, zero CLI dependency ──────
+  // Run the fallback hook in a repo with a given HALT layout and (optional) stub.
+  async function runPrePush(opts: {
+    haltLocal?: string; // write .rea/HALT in the pushed repo
+    stub?: string; // node_modules/.bin/rea contents (omit → no CLI at all)
+  }): Promise<{ code: number; stderr: string }> {
+    const repoDir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-pp-halt-')));
+    try {
+      await execFileAsync('git', ['-C', repoDir, 'init', '-q']);
+      if (opts.stub !== undefined) {
+        const stubBin = path.join(repoDir, 'node_modules', '.bin', 'rea');
+        await fs.mkdir(path.dirname(stubBin), { recursive: true });
+        await fs.writeFile(stubBin, opts.stub, { mode: 0o755 });
+      }
+      if (opts.haltLocal !== undefined) {
+        await fs.mkdir(path.join(repoDir, '.rea'), { recursive: true });
+        await fs.writeFile(path.join(repoDir, '.rea', 'HALT'), opts.haltLocal);
+      }
+      const hookPath = path.join(repoDir, '.git', 'hooks', 'pre-push');
+      await fs.writeFile(hookPath, fallbackHookContent(), { encoding: 'utf8', mode: 0o755 });
+      const r = await execFileAsync(hookPath, ['origin', 'git@example:r.git'], {
+        cwd: repoDir,
+      }).catch((e: { code?: number; stderr?: string }) => e);
+      return { code: (r as { code?: number }).code ?? 0, stderr: (r as { stderr?: string }).stderr ?? '' };
+    } finally {
+      await fs.rm(repoDir, { recursive: true, force: true });
+    }
+  }
+
+  const OK_STUB = '#!/bin/sh\nexit 0\n'; // preflight + push-gate both pass
+  const TOO_OLD_STUB = [
+    '#!/bin/sh',
+    "case \"$1\" in preflight) echo \"error: unknown command 'preflight'\" >&2; exit 1 ;; hook) exit 0 ;; esac",
+    'exit 0',
+    '',
+  ].join('\n');
+
+  it('P1: `.rea/HALT` + NO CLI at all → push blocked (exit 2), before the CLI ladder', async () => {
+    const r = await runPrePush({ haltLocal: 'frozen\n' }); // no stub
+    expect(r.code).toBe(2);
+    expect(r.stderr).toContain('REA HALT');
+  });
+
+  it('P1: HALT WINS even when the CLI would fail-open (too-old preflight stub)', async () => {
+    const r = await runPrePush({ haltLocal: 'frozen mid-push\n', stub: TOO_OLD_STUB });
+    expect(r.code).toBe(2);
+    expect(r.stderr).toContain('REA HALT');
+  });
+
+  it('P1 control: NO HALT + too-old preflight stub → round-32 fail-open still holds (exit 0)', async () => {
+    const r = await runPrePush({ stub: TOO_OLD_STUB });
+    expect(r.code).toBe(0);
+  });
+
+  it('P1 control: NO HALT + OK stub → push proceeds (exit 0)', async () => {
+    const r = await runPrePush({ stub: OK_STUB });
+    expect(r.code).toBe(0);
+  });
+
+  it('P1: common-root (sibling worktree) HALT → push from the worktree is blocked (exit 2)', async () => {
+    const primary = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-pp-wt-')));
+    const wtA = `${primary}-A`;
+    try {
+      await execFileAsync('git', ['-C', primary, 'init', '-q']);
+      await execFileAsync('git', ['-C', primary, 'config', 'user.email', 't@t']);
+      await execFileAsync('git', ['-C', primary, 'config', 'user.name', 't']);
+      await execFileAsync('git', ['-C', primary, 'commit', '-q', '--allow-empty', '-m', 'init']);
+      await execFileAsync('git', ['-C', primary, 'worktree', 'add', '-q', wtA, '-b', 'stream-a']);
+      // Freeze the PRIMARY (common root); worktree A has NO local HALT + no CLI.
+      await fs.mkdir(path.join(primary, '.rea'), { recursive: true });
+      await fs.writeFile(path.join(primary, '.rea', 'HALT'), 'repo-wide freeze\n');
+      // Resolve + write the hook git fires for the worktree, then run FROM wtA.
+      const hookPath = (
+        await execFileAsync('git', ['-C', wtA, 'rev-parse', '--git-path', 'hooks/pre-push'])
+      ).stdout.trim();
+      const abs = path.isAbsolute(hookPath) ? hookPath : path.join(wtA, hookPath);
+      await fs.mkdir(path.dirname(abs), { recursive: true });
+      await fs.writeFile(abs, fallbackHookContent(), { encoding: 'utf8', mode: 0o755 });
+      const r = await execFileAsync(abs, ['origin', 'git@example:r.git'], { cwd: wtA }).catch(
+        (e: { code?: number; stderr?: string }) => e,
+      );
+      expect((r as { code?: number }).code).toBe(2);
+      expect((r as { stderr?: string }).stderr ?? '').toContain('REA HALT');
+    } finally {
+      await fs.rm(wtA, { recursive: true, force: true });
+      await fs.rm(primary, { recursive: true, force: true });
+    }
+  });
+
   it('non-executable files in `.husky/pre-push.d/` are silently skipped', async () => {
     const repoDir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-pp-skip-')));
     try {

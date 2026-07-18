@@ -72,12 +72,40 @@ if [ ! -x "${REA_ROOT}/node_modules/.bin/rea" ] && [ ! -f "${REA_ROOT}/dist/cli/
     fi
   fi
 fi
-if [ -f "${REA_ROOT}/.rea/HALT" ]; then
-  reason=$(awk 'NR==1 { print; exit }' "${REA_ROOT}/.rea/HALT" 2>/dev/null || printf 'unknown')
-  [ -z "${reason:-}" ] && reason='unknown'
-  printf 'REA HALT: %s\nAll push operations suspended. Run: rea unfreeze\n' "$reason" >&2
-  exit 1
+# HALT freeze contract (round-33 P1). A frozen repo (`.rea/HALT` present) must
+# refuse the push with ZERO CLI dependency — the freeze has to hold even when
+# the CLI ladder below falls back to an older/global rea or hits the
+# no-preflight compat path (round-32 F1). Mirrors the pre-commit HALT probe
+# (round-18 F2 / round-19 F1) and `hooks/_lib/halt-check.sh`, which this
+# standalone git hook cannot source: probe the LOCAL worktree root AND the
+# COMMON (primary-checkout) root, so a sibling-worktree push cannot bypass a
+# repo-wide freeze. The `.git`-is-a-FILE test is the cheap gate for "is this
+# even a linked worktree" (plain checkouts pay only the -f test, zero git
+# subprocesses). The common root is `git worktree list --porcelain`'s FIRST
+# `worktree ` line (the main working tree) — robust under `--separate-git-dir`
+# / absorbed-submodule gitfiles where dirname(git-common-dir) is EXTERNAL
+# metadata, and it never false-freezes on a foreign repo's HALT (git lists only
+# THIS repo's worktrees). Every git call is `|| true`-guarded → a broken/absent
+# git degrades to a LOCAL-only probe. ABSENCE at both roots = fall through to
+# the CLI/preflight ladder; this check never hard-fails a push on its own.
+# bash-3.2/BSD-safe.
+_rea_halt_common="$REA_ROOT"
+if [ -f "${REA_ROOT}/.git" ]; then
+  _rea_main=$(git -C "$REA_ROOT" worktree list --porcelain 2>/dev/null \
+    | sed -n 's/^worktree //p' | head -n 1 || true)
+  if [ -n "$_rea_main" ] && [ "$_rea_main" != "$REA_ROOT" ] \
+     && { [ -d "${_rea_main}/.rea" ] || [ -e "${_rea_main}/.git" ]; }; then
+    _rea_halt_common="$_rea_main"
+  fi
 fi
+for _rea_hf in "${REA_ROOT}/.rea/HALT" "${_rea_halt_common}/.rea/HALT"; do
+  if [ -f "$_rea_hf" ]; then
+    printf 'REA HALT: %s\nAll push operations suspended. Run: rea unfreeze\n' \
+      "$(head -c 1024 "$_rea_hf" 2>/dev/null || echo 'Reason unknown')" >&2
+    exit 2
+  fi
+  [ "$REA_ROOT" = "$_rea_halt_common" ] && break
+done
 
 # Dispatch the rea CLI as a positional-args list rather than a string
 # (the 0.11.x `exec $REA_BIN ...` pattern broke when REA_ROOT contained
