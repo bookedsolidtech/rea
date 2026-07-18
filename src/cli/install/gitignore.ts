@@ -120,6 +120,10 @@ export const REA_GITIGNORE_ENTRIES: readonly string[] = [
   '.rea/tasks.jsonl.lock',
   '.rea/turn-count.json',
   '.rea/turn-count.*.json',
+  // proper-lockfile sidecar for the per-session counters (round-33 P3): an
+  // interrupted hook / stale lock leaves `.rea/turn-count.<session>.json.lock`
+  // untracked otherwise — the dirty-tree regression this block prevents.
+  '.rea/turn-count*.lock',
   // 0.50.x — `provider: both` writes a side-by-side parity report on EVERY run;
   // a consumer enabling the openrouter parity lane would otherwise have a dirty
   // tree after the first review (codex round-16 P2). The per-commit parity
