@@ -60,6 +60,14 @@ export interface TasksAddOptions {
 }
 
 export function runTasksAdd(baseDir: string, opts: TasksAddOptions): number {
+  // Round-27 P3: Commander accepts `--subject ""`, but TaskRecordSchema
+  // requires a non-empty subject — forwarding a blank straight in throws an
+  // uncaught zod error instead of a normal CLI refusal like the other
+  // mutations. Reject it up front.
+  if (opts.subject.trim().length === 0) {
+    err('Task subject must not be empty.');
+    return 1;
+  }
   let record!: TaskRecord;
   updateTasks(baseDir, (tasks) => {
     const now = nowIso();

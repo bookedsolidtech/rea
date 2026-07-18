@@ -92,6 +92,13 @@ describe('add options', () => {
     runTasksAdd(baseDir, { subject: 'b' });
     expect(readTasks(baseDir).map((t) => t.id)).toEqual(['T-0001', 'T-0002']);
   });
+
+  it('rejects a blank --subject with a clean refusal, not a zod throw (round-27 P3)', () => {
+    expect(runTasksAdd(baseDir, { subject: '' })).toBe(1);
+    expect(runTasksAdd(baseDir, { subject: '   ' })).toBe(1);
+    expect(errs.join('\n')).toMatch(/subject/i);
+    expect(readTasks(baseDir)).toHaveLength(0);
+  });
 });
 
 describe('complete refuses without evidence', () => {
