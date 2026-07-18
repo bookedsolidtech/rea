@@ -1087,3 +1087,75 @@ describe('runPushGate — auto-narrow on large divergence (J / 0.13.0)', () => {
     expect(stderrText).not.toMatch(/auto-narrow/);
   });
 });
+
+describe('runPushGate — verdict cache key binds the RESOLVED base SHA (round-41 P1)', () => {
+  let baseDir: string;
+  beforeEach(async () => {
+    baseDir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-pg-idx-cachekey-')));
+  });
+  afterEach(async () => {
+    await fs.rm(baseDir, { recursive: true, force: true });
+  });
+
+  const CACHE_POLICY = { ...DEFAULT_POLICY, cache_ttl_ms: 60 * 60 * 1000 };
+  const HEAD = 'aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111';
+
+  // Fake git resolving the base to the symbolic `refs/remotes/origin/main`
+  // (upstream absent → origin/HEAD absent → origin/main probe hits), while
+  // `<ref>^{commit}` resolves to the mutable base SHA the test controls.
+  function gitWithBaseSha(baseShaRef: { value: string }): GitExecutor {
+    return fakeGit({
+      headSha: () => HEAD,
+      diffNames: () => ['src/changed.ts'],
+      revListCount: () => null,
+      trySymbolicRef: () => '',
+      tryRevParse: (args) => {
+        const s = args.join(' ');
+        if (s.includes('@{upstream}')) return '';
+        if (s.includes('refs/remotes/origin/main^{commit}')) return baseShaRef.value;
+        if (s.includes('refs/remotes/origin/main')) return 'orig-main-probe-sha';
+        return '';
+      },
+    });
+  }
+
+  it('same base.ref but ADVANCED base SHA → cache MISS (re-review)', async () => {
+    const baseShaRef = { value: 'basexshaxOLDx0000000000000000000000000000' };
+    let codexCalls = 0;
+    const mkDeps = (): PushGateDeps =>
+      baseDeps(baseDir, {
+        resolvePolicy: async () => CACHE_POLICY,
+        git: gitWithBaseSha(baseShaRef),
+        runCodex: async () => {
+          codexCalls += 1;
+          return { reviewText: 'No issues.', eventCount: 1, durationSeconds: 0.1 };
+        },
+      });
+    await runPushGate(mkDeps());
+    expect(codexCalls).toBe(1);
+    // origin/main advances: SAME symbolic ref, NEW commit SHA → the reviewed
+    // `git diff <base> <head>` changed, so the stale entry must NOT hit.
+    baseShaRef.value = 'basexshaxNEWx1111111111111111111111111111';
+    await runPushGate(mkDeps());
+    expect(codexCalls).toBe(2);
+  });
+
+  it('identical (base SHA, head SHA) → cache HIT (codex NOT re-invoked)', async () => {
+    const baseShaRef = { value: 'basexshaxSTABLEx22222222222222222222222222' };
+    let codexCalls = 0;
+    const mkDeps = (): PushGateDeps =>
+      baseDeps(baseDir, {
+        resolvePolicy: async () => CACHE_POLICY,
+        git: gitWithBaseSha(baseShaRef),
+        runCodex: async () => {
+          codexCalls += 1;
+          return { reviewText: 'No issues.', eventCount: 1, durationSeconds: 0.1 };
+        },
+      });
+    await runPushGate(mkDeps());
+    expect(codexCalls).toBe(1);
+    // Same base SHA + same head SHA → the reviewed patch is identical → HIT.
+    await runPushGate(mkDeps());
+    expect(codexCalls).toBe(1);
+  });
+});

@@ -736,6 +736,81 @@ artifact_gates:
     expect(r.decision).not.toBe('mode-off');
   });
 
+  // Round-41 P2: a wrong-TYPE OUTER block (artifact_gates / g3_review given as
+  // a string/number/array/null) is ALSO malformed — the strict loadPolicy
+  // rejects the whole policy and computePreflight enforces. The Bash gate must
+  // NOT short-circuit to `off` via legacy on these.
+  const wrongTypeArtifactGates = `review:
+  local_review:
+    mode: off
+    refuse_at: push
+artifact_gates: "not-an-object"
+`;
+  const wrongTypeG3Review = `review:
+  local_review:
+    mode: off
+    refuse_at: push
+artifact_gates:
+  g3_review: 42
+`;
+
+  it('WRONG-TYPE artifact_gates block + legacy OFF → delegates (no mode-off short-circuit)', async () => {
+    writePolicy(root, wrongTypeArtifactGates);
+    const r = await runLocalReviewGate({
+      reaRoot: root,
+      stdinOverride: PAYLOAD('git push origin main'),
+      envOverride: {},
+      preflightImpl: refusePreflight,
+    });
+    expect(r.exitCode).toBe(2);
+    expect(r.decision).toBe('preflight-refuse');
+  });
+
+  it('WRONG-TYPE g3_review block + legacy OFF → delegates (no mode-off short-circuit)', async () => {
+    writePolicy(root, wrongTypeG3Review);
+    const r = await runLocalReviewGate({
+      reaRoot: root,
+      stdinOverride: PAYLOAD('git push origin main'),
+      envOverride: {},
+      preflightImpl: refusePreflight,
+    });
+    expect(r.exitCode).toBe(2);
+    expect(r.decision).toBe('preflight-refuse');
+  });
+
+  it('WRONG-TYPE artifact_gates + legacy OFF + ALLOW stub → delegates (proves NOT mode-off)', async () => {
+    // If the gate wrongly resolved undefined→legacy off it would short-circuit
+    // to `mode-off`; delegating to the (allow) probe yields `preflight-allow`.
+    writePolicy(root, wrongTypeArtifactGates);
+    const r = await runLocalReviewGate({
+      reaRoot: root,
+      stdinOverride: PAYLOAD('git push origin main'),
+      envOverride: {},
+      preflightImpl: allowPreflight,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(r.decision).toBe('preflight-allow');
+    expect(r.decision).not.toBe('mode-off');
+  });
+
+  it('ABSENT artifact_gates block → byte-identical legacy (off short-circuits)', async () => {
+    // The invariant that must survive the wrong-type fix: a genuinely ABSENT
+    // block still routes to legacy, so legacy off silences the gate.
+    writePolicy(root, `review:
+  local_review:
+    mode: off
+    refuse_at: push
+`);
+    const r = await runLocalReviewGate({
+      reaRoot: root,
+      stdinOverride: PAYLOAD('git push origin main'),
+      envOverride: {},
+      preflightImpl: unreachablePreflight,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(r.decision).toBe('mode-off');
+  });
+
   it('g3 shadow does NOT short-circuit off — gate proceeds to the probe', async () => {
     writePolicy(root, g3Body('shadow'));
     const r = await runLocalReviewGate({

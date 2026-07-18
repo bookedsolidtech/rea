@@ -221,4 +221,44 @@ describe('computePreflight G3 malformed policy (strict-fail-to-enforced)', () =>
     // entire policy, so `legacyMode` is undefined too → enforced default.
     expect(outcome.exitCode).toBe(2);
   });
+
+  function writeWrongTypeBlock(kind: 'artifact_gates' | 'g3_review'): void {
+    const lines = [
+      'version: "0.54.0"',
+      'profile: open-source-no-codex',
+      'installed_by: t',
+      'installed_at: "2026-07-18T00:00:00Z"',
+      'autonomy_level: L1',
+      'max_autonomy_level: L2',
+      'promotion_requires_human_approval: true',
+      'block_ai_attribution: true',
+      'blocked_paths: []',
+      'protected_paths_relax: []',
+      'notification_channel: ""',
+      'review:',
+      '  local_review:',
+      '    mode: off',
+      '    refuse_at: push',
+      ...(kind === 'artifact_gates'
+        ? ['artifact_gates: "not-an-object"']
+        : ['artifact_gates:', '  g3_review: 42']),
+      '',
+    ];
+    fs.mkdirSync(path.join(tmpDir, '.rea'), { recursive: true });
+    fs.writeFileSync(path.join(tmpDir, '.rea', 'policy.yaml'), lines.join('\n'));
+    invalidatePolicyCache(tmpDir);
+    invalidatePolicyCache();
+  }
+
+  it('WRONG-TYPE artifact_gates block + legacy OFF → REFUSE (strict rejects the whole policy, round-41 P2)', async () => {
+    writeWrongTypeBlock('artifact_gates');
+    const { outcome } = await computePreflight(tmpDir, { operation: 'push' });
+    expect(outcome.exitCode).toBe(2);
+  });
+
+  it('WRONG-TYPE g3_review block + legacy OFF → REFUSE (strict rejects the whole policy, round-41 P2)', async () => {
+    writeWrongTypeBlock('g3_review');
+    const { outcome } = await computePreflight(tmpDir, { operation: 'push' });
+    expect(outcome.exitCode).toBe(2);
+  });
 });

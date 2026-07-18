@@ -34,7 +34,7 @@ import {
   type ResolvedReviewPolicy,
 } from './policy.js';
 import { readHalt, type HaltState } from './halt.js';
-import { resolveBaseRef, type BaseResolution } from './base.js';
+import { resolveBaseRef, EMPTY_TREE_SHA, type BaseResolution } from './base.js';
 import {
   createRealGitExecutor,
   runCodexReview,
@@ -496,9 +496,32 @@ export async function runPushGate(deps: PushGateDeps): Promise<GateResult> {
   // cache means another worktree pushing the same sha against a
   // DIFFERENT target must not reuse a verdict for the wrong diff.
   // (Key-shape change safely invalidates pre-0.54.0 entries.)
+  //
+  // Round-41 P1: bind the RESOLVED base COMMIT SHA, not the symbolic
+  // `base.ref` name. A symbolic base (`origin/main`, `@{upstream}`,
+  // `refs/heads/main`, …) keeps its NAME while its tip MOVES; keying on
+  // the name alone reuses a verdict for an OLDER `git diff <base> <head>`
+  // after the base advances — a stale PASS that skips re-running Codex on
+  // a patch that actually changed. Resolving `base.ref → <commit sha>`
+  // makes a moved base MISS. An already-resolved SHA base (last-n-commits,
+  // explicit SHA) resolves to itself, so its behavior is unchanged, and
+  // two symbolic refs pointing at the SAME commit collapse to the same
+  // key — the intended path-blind, per-(base-sha, head-sha) cross-worktree
+  // reuse. FAIL-SAFE: an unresolvable base that is NOT the fixed empty-tree
+  // sentinel folds a per-invocation random token so the key MISSES
+  // (re-review) rather than risk a false hit on a stale name.
+  const resolvedBaseSha = git
+    .tryRevParse(['--verify', '--quiet', `${base.ref}^{commit}`])
+    .trim();
+  const baseKeyPart =
+    resolvedBaseSha.length > 0
+      ? resolvedBaseSha
+      : base.ref === EMPTY_TREE_SHA
+        ? EMPTY_TREE_SHA // fixed sentinel — the empty tree never moves
+        : `unresolved:${crypto.randomBytes(8).toString('hex')}`;
   const excludeDigest = crypto
     .createHash('sha256')
-    .update(JSON.stringify([[...(policy.exclude_paths ?? [])].sort(), base.ref]))
+    .update(JSON.stringify([[...(policy.exclude_paths ?? [])].sort(), baseKeyPart]))
     .digest('hex')
     .slice(0, 16);
   const cacheKey = `${headSha}#${excludeDigest}`;

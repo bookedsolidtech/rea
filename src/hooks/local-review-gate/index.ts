@@ -302,19 +302,39 @@ function loadLocalReviewPolicy(reaRoot: string): LocalReviewPolicy {
  * DEFAULT — NOT to the legacy `local_review.mode` (which was lost with the
  * rejected policy). The shared resolver maps `'malformed' → enforce` to match.
  *
- * Returning `undefined` (legacy) here was the round-26 bug: with legacy
- * `local_review.mode: off` the gate short-circuited to `off` and ALLOWED,
- * while preflight/pre-push strict-failed to enforced and REFUSED — a
- * commit/push bypass of the review gate through the Bash tool. Signalling
- * `'malformed'` makes the gate DELEGATE to `computePreflight` (which refuses),
- * keeping all three paths consistent on a malformed policy regardless of the
- * legacy mode.
+ * ## PRESENT-but-wrong-type OUTER blocks (codex round-41 P2)
+ *
+ * The round-38 fix only caught a bad `mode` FIELD. A wrong-TYPE OUTER block —
+ * `artifact_gates` or `g3_review` given as a string/number/array/null — must
+ * ALSO signal `'malformed'`, for the same reason: the strict `loadPolicy`
+ * REJECTS such a policy (the block must be a plain object) and enforces, so a
+ * gate that returned `undefined` (→ legacy) would let `local_review.mode: off`
+ * short-circuit-ALLOW while preflight ENFORCES — the exact commit/push
+ * divergence, reintroduced through the outer blocks. So we distinguish:
+ *   - key ABSENT (`!('artifact_gates' in root)` / `!('g3_review' in ag)`) →
+ *     `undefined` (legacy) — the byte-identical pre-G3 invariant;
+ *   - key PRESENT but NOT a plain object → `'malformed'` (→ enforce).
+ *
+ * Returning `undefined` (legacy) for a malformed block was the bug: with
+ * legacy `local_review.mode: off` the gate short-circuited to `off` and
+ * ALLOWED while preflight/pre-push strict-failed to enforced and REFUSED.
+ * Signalling `'malformed'` makes the gate DELEGATE to `computePreflight`
+ * (which refuses), keeping all paths consistent on a malformed policy
+ * regardless of the legacy mode.
  */
 function extractG3Mode(root: Record<string, unknown>): GateMode | 'malformed' | undefined {
+  // artifact_gates ABSENT → legacy path (byte-identical pre-G3 invariant).
+  if (!('artifact_gates' in root)) return undefined;
   const ag = root['artifact_gates'];
-  if (ag === null || typeof ag !== 'object' || Array.isArray(ag)) return undefined;
-  const g3 = (ag as Record<string, unknown>)['g3_review'];
-  if (g3 === null || typeof g3 !== 'object' || Array.isArray(g3)) return undefined;
+  // PRESENT but not a plain object → strict loadPolicy rejects → enforce.
+  if (ag === null || typeof ag !== 'object' || Array.isArray(ag)) return 'malformed';
+  const agObj = ag as Record<string, unknown>;
+  // g3_review ABSENT → legacy (this artifact_gates block configures other
+  // gates but not the review gate; fall back to review.local_review).
+  if (!('g3_review' in agObj)) return undefined;
+  const g3 = agObj['g3_review'];
+  // PRESENT but not a plain object → malformed (same rejection posture).
+  if (g3 === null || typeof g3 !== 'object' || Array.isArray(g3)) return 'malformed';
   const g3obj = g3 as Record<string, unknown>;
   const m = g3obj['mode'];
   if (m === 'off' || m === 'shadow' || m === 'enforce') return m;
