@@ -1230,3 +1230,85 @@ describe('extension-hook chaining (Fix H / 0.13.0) — `.husky/pre-push.d/*`', (
     }
   });
 });
+
+// ── Round-34 F2 — templates/pre-push.local-first.sh `--operation` compat ─────
+// This minimal reference template must carry the SAME compat-fallback as the
+// canonical BODY_TEMPLATE (round-32 F1): an older resolved `rea` that rejects
+// `--operation` must not hard-block the push.
+describe('templates/pre-push.local-first.sh — --operation compat-fallback (round-34 F2)', () => {
+  const TEMPLATE = path.resolve(__dirname, '..', '..', '..', 'templates', 'pre-push.local-first.sh');
+
+  async function runTemplate(stub: string): Promise<{ code: number; stderr: string }> {
+    const repoDir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-tmpl-')));
+    try {
+      await execFileAsync('git', ['-C', repoDir, 'init', '-q']);
+      const stubBin = path.join(repoDir, 'node_modules', '.bin', 'rea');
+      await fs.mkdir(path.dirname(stubBin), { recursive: true });
+      await fs.writeFile(stubBin, stub, { mode: 0o755 });
+      const tmpl = await fs.readFile(TEMPLATE, 'utf8');
+      const hookPath = path.join(repoDir, 'pp.sh');
+      await fs.writeFile(hookPath, tmpl, { mode: 0o755 });
+      const r = await execFileAsync('bash', [hookPath], { cwd: repoDir }).catch(
+        (e: { code?: number; stderr?: string }) => e,
+      );
+      return {
+        code: (r as { code?: number }).code ?? 0,
+        stderr: (r as { stderr?: string }).stderr ?? '',
+      };
+    } finally {
+      await fs.rm(repoDir, { recursive: true, force: true });
+    }
+  }
+
+  it('bash -n parses (template is syntactically valid)', async () => {
+    const tmpl = await fs.readFile(TEMPLATE, 'utf8');
+    const dir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-tmpl-n-')));
+    try {
+      const p = path.join(dir, 'pp.sh');
+      await fs.writeFile(p, tmpl);
+      const r = await execFileAsync('bash', ['-n', p]).catch((e: { code?: number }) => e);
+      expect((r as { code?: number }).code ?? 0).toBe(0);
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('F2: an OLD CLI rejecting `--operation` → retries `--strict`, push NOT blocked (exit 0)', async () => {
+    const stub = [
+      '#!/bin/sh',
+      'op=0; for a in "$@"; do [ "$a" = "--operation" ] && op=1; done',
+      'case "$1" in',
+      '  preflight)',
+      '    if [ "$op" = "1" ]; then echo "error: unknown option \'--operation\'" >&2; exit 1; fi',
+      '    exit 0 ;;',
+      'esac',
+      'exit 0',
+      '',
+    ].join('\n');
+    const r = await runTemplate(stub);
+    expect(r.code).toBe(0);
+    expect(r.stderr).not.toContain('unknown option');
+  });
+
+  it('F2: a CLI with no `preflight` at all → FAIL OPEN (exit 0)', async () => {
+    const stub = [
+      '#!/bin/sh',
+      "case \"$1\" in preflight) echo \"error: unknown command 'preflight'\" >&2; exit 1 ;; esac",
+      'exit 0',
+      '',
+    ].join('\n');
+    expect((await runTemplate(stub)).code).toBe(0);
+  });
+
+  it('F2: a GENUINE refusal (exit 2) STILL blocks the push', async () => {
+    const stub = [
+      '#!/bin/sh',
+      'case "$1" in preflight) echo "no recent local review covers HEAD" >&2; exit 2 ;; esac',
+      'exit 0',
+      '',
+    ].join('\n');
+    const r = await runTemplate(stub);
+    expect(r.code).toBe(2);
+    expect(r.stderr).toContain('no recent local review');
+  });
+});

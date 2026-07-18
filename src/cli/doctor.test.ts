@@ -1717,6 +1717,56 @@ describe('rea doctor — checkDelegationRoundTrip drives the shell hook (0.31.0)
     expect(result.status).toBe('pass');
     expect(result.detail).toMatch(/delegation-capture\.sh shell hook/);
   });
+
+  // Round-34 F1 — from a LINKED WORKTREE, `delegation-capture.sh` appends the
+  // signal to the COMMON-root (primary checkout) audit chain. The probe must
+  // resolve `auditPath` against the common root, not the local worktree, or it
+  // falsely reports the hook broken.
+  it('F1: finds a common-root-chain signal when run from a linked worktree', async () => {
+    const distCli = path.join(REPO_ROOT, 'dist', 'cli', 'index.js');
+    try {
+      await fs.access(distCli);
+    } catch {
+      return; // build not present — CI builds before test
+    }
+    // Primary checkout (a real git repo) + a linked worktree.
+    const primary = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-deleg-wt-')));
+    cleanup.push(primary);
+    execFileSync('git', ['init', '-q', primary], { stdio: 'ignore' });
+    execFileSync('git', ['-C', primary, 'config', 'user.email', 't@t'], { stdio: 'ignore' });
+    execFileSync('git', ['-C', primary, 'config', 'user.name', 't'], { stdio: 'ignore' });
+    execFileSync('git', ['-C', primary, 'commit', '-q', '--allow-empty', '-m', 'init'], {
+      stdio: 'ignore',
+    });
+    const wt = `${primary}-wt`;
+    cleanup.push(wt);
+    execFileSync('git', ['-C', primary, 'worktree', 'add', '-q', wt, '-b', 'stream-a'], {
+      stdio: 'ignore',
+    });
+    // Stage a sandboxed dogfood CLI INSIDE the worktree (so the shim resolves a
+    // CLI whose realpath is under CLAUDE_PROJECT_DIR = the worktree). The CLI
+    // itself resolves the common root and appends the signal to
+    // <primary>/.rea/audit.jsonl.
+    await fs.cp(path.join(REPO_ROOT, 'hooks'), path.join(wt, '.claude', 'hooks'), {
+      recursive: true,
+    });
+    await fs.cp(path.join(REPO_ROOT, 'dist'), path.join(wt, 'dist'), { recursive: true });
+    await fs.symlink(path.join(REPO_ROOT, 'node_modules'), path.join(wt, 'node_modules'), 'dir');
+    await fs.writeFile(
+      path.join(wt, 'package.json'),
+      JSON.stringify({ name: '@bookedsolid/rea', version: '0.0.0-test' }),
+    );
+    await fs.mkdir(path.join(wt, '.rea'), { recursive: true });
+
+    const result = await checkDelegationRoundTrip(wt);
+    // The record landed in the COMMON-root chain; with the fix the probe polls
+    // <primary>/.rea/audit.jsonl and finds it → pass.
+    expect(result.status).toBe('pass');
+    // And the signal is physically in the PRIMARY's chain, not the worktree's
+    // (readFile throws if it never landed there).
+    const primaryAudit = path.join(primary, '.rea', 'audit.jsonl');
+    expect(await fs.readFile(primaryAudit, 'utf8')).toContain('rea.delegation_signal');
+  });
 });
 
 /**

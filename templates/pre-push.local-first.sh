@@ -89,25 +89,59 @@ fi
 #   2. ${REA_CLI_ROOT}/dist/cli/index.js      — rea's own dogfood repo.
 #   3. PATH-resolved rea                  — global install.
 #   4. npx --no-install                    — last-resort npm cache hit.
-if [ -x "${REA_CLI_ROOT}/node_modules/.bin/rea" ]; then
-  exec "${REA_CLI_ROOT}/node_modules/.bin/rea" preflight --strict --operation push
-elif [ -f "${REA_CLI_ROOT}/dist/cli/index.js" ] \
-   && [ -f "${REA_CLI_ROOT}/package.json" ] \
-   && grep -q '"name": *"@bookedsolid/rea"' "${REA_CLI_ROOT}/package.json" 2>/dev/null; then
-  # rea's own repo (dogfood) — the package is not installed under
-  # node_modules here because we ARE the package. Gate this branch on
-  # `package.json` declaring `@bookedsolid/rea` so a consumer repo that
-  # happens to ship its own `dist/cli/index.js` does not get this hook
-  # executing the consumer's unrelated build.
-  exec node "${REA_CLI_ROOT}/dist/cli/index.js" preflight --strict --operation push
-elif command -v rea >/dev/null 2>&1; then
-  exec rea preflight --strict --operation push
-elif command -v npx >/dev/null 2>&1; then
-  # Last resort: npx will resolve the package from npm or the cache.
-  # Pass `--no-install` so a rare cache-cold machine surfaces a clear
-  # error instead of silently downloading at push time.
-  exec npx --no-install @bookedsolid/rea preflight --strict --operation push
+# Round-34 F2 (mirrors round-32 F1 in the canonical BODY_TEMPLATE of
+# src/cli/install/pre-push.ts — these two are kept in sync BY HAND; they do
+# NOT share a generator, so any change here must be replicated there and vice
+# versa). The `--operation` flag is NEWER than some resolvable rea binaries (a
+# project pinned below this release, or a stale global/PATH install). Such a
+# CLI exits `unknown option '--operation'` and would HARD-BLOCK every push.
+# `_rea_preflight` tries the current invocation; on an unknown-option /
+# unknown-command error it RETRIES the pre-0.26 `preflight --strict` form so
+# the gate STILL RUNS on the older CLI; if even that is unknown (a CLI too old
+# to have `preflight` at all) it FAILS OPEN. A GENUINE refusal (exit 2, no
+# unknown-* marker) propagates unchanged. This REPLACES the previous `exec`
+# per branch — a retry is impossible once `exec` has replaced the process.
+# bash-3.2 / BSD-safe. $@ is the resolved CLI prefix.
+_rea_preflight() {
+  _pf_out=$("$@" preflight --strict --operation push 2>&1) && _pf_rc=0 || _pf_rc=$?
+  if [ "$_pf_rc" -ne 0 ]; then
+    case "$_pf_out" in
+      *"unknown option"* | *"unknown command"*)
+        _pf_out=$("$@" preflight --strict 2>&1) && _pf_rc=0 || _pf_rc=$?
+        case "$_pf_out" in
+          *"unknown option"* | *"unknown command"*) _pf_out=""; _pf_rc=0 ;;
+        esac
+        ;;
+    esac
+  fi
+  if [ -n "$_pf_out" ]; then printf '%s\n' "$_pf_out" >&2; fi
+  return "$_pf_rc"
+}
+if (
+  if [ -x "${REA_CLI_ROOT}/node_modules/.bin/rea" ]; then
+    _rea_preflight "${REA_CLI_ROOT}/node_modules/.bin/rea"
+  elif [ -f "${REA_CLI_ROOT}/dist/cli/index.js" ] \
+     && [ -f "${REA_CLI_ROOT}/package.json" ] \
+     && grep -q '"name": *"@bookedsolid/rea"' "${REA_CLI_ROOT}/package.json" 2>/dev/null; then
+    # rea's own repo (dogfood) — the package is not installed under
+    # node_modules here because we ARE the package. Gate this branch on
+    # `package.json` declaring `@bookedsolid/rea` so a consumer repo that
+    # happens to ship its own `dist/cli/index.js` does not get this hook
+    # executing the consumer's unrelated build.
+    _rea_preflight node "${REA_CLI_ROOT}/dist/cli/index.js"
+  elif command -v rea >/dev/null 2>&1; then
+    _rea_preflight rea
+  elif command -v npx >/dev/null 2>&1; then
+    # Last resort: npx will resolve the package from npm or the cache.
+    # Pass `--no-install` so a rare cache-cold machine surfaces a clear
+    # error instead of silently downloading at push time.
+    _rea_preflight npx --no-install @bookedsolid/rea
+  else
+    printf 'rea: cannot locate the rea CLI for preflight. Install locally (`pnpm add -D @bookedsolid/rea`) or set policy.review.local_review.mode=off.\n' >&2
+    exit 2
+  fi
+); then
+  exit 0
 else
-  printf 'rea: cannot locate the rea CLI for preflight. Install locally (`pnpm add -D @bookedsolid/rea`) or set policy.review.local_review.mode=off.\n' >&2
-  exit 2
+  exit "$?"
 fi

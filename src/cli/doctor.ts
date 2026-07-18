@@ -3110,7 +3110,20 @@ export async function checkDelegationRoundTrip(baseDir: string): Promise<CheckRe
       description: probeDescription,
     },
   });
-  const auditPath = path.join(baseDir, '.rea', 'audit.jsonl');
+  // Round-34 F1: audit is per-repo COMMON-root state (worktree model).
+  // `delegation-capture.sh` → `rea hook delegation-signal` appends the
+  // `rea.delegation_signal` record to `<commonRoot>/.rea/audit.jsonl`, NOT the
+  // local worktree's chain. Resolve the audit path against the COMMON root (the
+  // same resolver the gates/hooks use) so the probe finds the signal when
+  // `rea doctor` runs from a linked worktree. Plain checkouts are unchanged
+  // (commonRoot === baseDir). Best-effort: fall back to the local root.
+  let auditRoot = baseDir;
+  try {
+    auditRoot = resolveReaRoots(baseDir, () => {}).commonRoot;
+  } catch {
+    /* fall back to the local root */
+  }
+  const auditPath = path.join(auditRoot, '.rea', 'audit.jsonl');
 
   // Drive the REAL shell hook. `delegation-capture.sh` reads the
   // payload on stdin, resolves + sandbox-checks the rea CLI, then
