@@ -187,22 +187,35 @@ function detectDelegatedRunSanction(cmd: string): boolean {
  * prefix, so it never matches an expanded `pnpm test` pattern (stripping
  * the pattern down to `test` WOULD have caught it — the trap avoided).
  */
+// Only LOCAL script/binary runners — the ones that resolve the repo's
+// OWN `node_modules/.bin` binary or `package.json` script. Round-1 P2:
+// `pnpm dlx` / `yarn dlx` / bare `npx` are deliberately EXCLUDED — they
+// download and run an ARBITRARY package, so `npx lint` is not the same
+// program as the delegated `pnpm run lint` and treating them as
+// equivalent would over-block ordinary coordinator commands. Round-1
+// P2 also adds `pnpm run` / `yarn run` / `node --run` — the script
+// forms of the listed `pnpm run <script>` entries, which were leaking.
 const RUNNER_PREFIXES = [
   'pnpm ',
   'pnpm exec ',
-  'pnpm dlx ',
-  'npx ',
+  'pnpm run ',
   'yarn ',
   'yarn exec ',
-  'yarn dlx ',
+  'yarn run ',
+  'node --run ',
   './node_modules/.bin/',
   'node_modules/.bin/',
 ];
 
-/** Extract the "binary/script + args" tail by removing ONE known runner prefix. */
+/**
+ * Extract the "binary/script + args" tail by removing ONE known LOCAL
+ * runner prefix. Kept in lockstep with `RUNNER_PREFIXES` — dlx/npx are
+ * NOT stripped, so a policy pattern that literally names one only ever
+ * matches that verbatim form (never a local-binary equivalent).
+ */
 function delegateTail(normPattern: string): string {
   const runner =
-    /^(?:pnpm\s+exec|pnpm\s+dlx|pnpm\s+run|pnpm|yarn\s+exec|yarn\s+dlx|yarn\s+run|yarn|npx(?:\s+--\S+)*|node\s+--run)\s+(.+)$/i.exec(
+    /^(?:pnpm\s+exec|pnpm\s+run|pnpm|yarn\s+exec|yarn\s+run|yarn|node\s+--run)\s+(.+)$/i.exec(
       normPattern,
     );
   if (runner && runner[1] !== undefined) return runner[1];
@@ -859,12 +872,17 @@ export async function runDangerousBashInterceptor(
   for (const rule of RULES) {
     violations.push(...rule.run(ctx));
   }
+  const highs = violations.filter((v) => v.severity === 'HIGH');
 
   // H17: a sanctioned delegated run of a delegate-listed command passes
   // the gate but is RECORDED — the marker is a visible, audited escape
   // hatch (like REA_SKIP_*), so a coordinator forging it leaves a trail
-  // on the hash chain. Audit keys off the COMMON (repository) root.
-  if (delegatedRunSanctioned) {
+  // on the hash chain. Round-1 P3: the record is written ONLY when the
+  // invocation is actually ALLOWED (no HIGH violation) — a sanctioned
+  // command that another rule (H1/H11/…) still blocks never ran, so an
+  // `Allowed` audit line for it would be a false record. Audit keys off
+  // the COMMON (repository) root.
+  if (delegatedRunSanctioned && highs.length === 0) {
     const sanctionedHit = matchDelegatePattern(cmd, delegatePatterns);
     if (sanctionedHit !== null) {
       try {
@@ -902,7 +920,6 @@ export async function runDangerousBashInterceptor(
   }
 
   const display = truncate(cmd);
-  const highs = violations.filter((v) => v.severity === 'HIGH');
   if (highs.length > 0) {
     writeStderr(buildBlockBanner(violations, display));
     return { exitCode: 2, stderr, violations };

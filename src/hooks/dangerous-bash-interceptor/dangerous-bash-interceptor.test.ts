@@ -679,17 +679,17 @@ describe('dangerous-bash-interceptor: H17 sanction + runner normalization (bug H
     expect(r.ids).toContain('H17');
   });
 
-  it('closes the under-block leak: every runner-equivalent form now blocks', async () => {
+  it('closes the under-block leak: every LOCAL runner-equivalent form now blocks', async () => {
+    fs.writeFileSync(
+      path.join(root, '.rea', 'policy.yaml'),
+      `context_protection:\n  delegate_to_subagent:\n    - pnpm vitest run\n`,
+    );
     for (const cmd of [
       './node_modules/.bin/vitest run', // the bypass an agent found in the field
       'node_modules/.bin/vitest run',
       'pnpm exec vitest run',
-      'npx vitest run',
+      'pnpm vitest run',
     ]) {
-      fs.writeFileSync(
-        path.join(root, '.rea', 'policy.yaml'),
-        `context_protection:\n  delegate_to_subagent:\n    - pnpm vitest run\n`,
-      );
       const r = await run(cmd, root);
       expect(r.exitCode, cmd).toBe(2);
       expect(r.ids, cmd).toContain('H17');
@@ -708,6 +708,39 @@ describe('dangerous-bash-interceptor: H17 sanction + runner normalization (bug H
       const r = await run(cmd, root);
       expect(r.exitCode, cmd).toBe(0);
     }
+  });
+
+  it('covers the script-runner forms of a `pnpm run <script>` entry (round-1 P2)', async () => {
+    // `pnpm run test` is listed; node --run / yarn run are equivalent
+    // ways to invoke the same package script and were leaking.
+    for (const cmd of ['node --run test', 'yarn run test', 'pnpm run test']) {
+      const r = await run(cmd, root);
+      expect(r.exitCode, cmd).toBe(2);
+      expect(r.ids, cmd).toContain('H17');
+    }
+  });
+
+  it('does NOT treat dlx / bare npx as equivalent (they download arbitrary pkgs) (round-1 P2)', async () => {
+    // `npx test` / `pnpm dlx test` fetch and run an unrelated package —
+    // not the delegated local script — so they must NOT be over-blocked.
+    for (const cmd of ['pnpm dlx test', 'yarn dlx test', 'npx test']) {
+      const r = await run(cmd, root);
+      expect(r.exitCode, cmd).toBe(0);
+    }
+  });
+
+  it('does NOT write a sanctioned-run audit record when another rule blocks (round-1 P3)', async () => {
+    const r = await run('REA_DELEGATED_RUN=1 pnpm test && rm -rf /', root);
+    expect(r.exitCode).toBe(2); // H11 (rm -rf) blocks
+    const auditPath = path.join(root, '.rea', 'audit.jsonl');
+    const hasCtx =
+      fs.existsSync(auditPath) &&
+      fs
+        .readFileSync(auditPath, 'utf8')
+        .split('\n')
+        .filter((l) => l.length > 0)
+        .some((l) => (JSON.parse(l) as { tool_name?: string }).tool_name === 'rea.context_protection');
+    expect(hasCtx).toBe(false);
   });
 });
 
