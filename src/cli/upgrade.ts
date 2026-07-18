@@ -62,8 +62,10 @@ import {
   defaultDesiredHooks,
   mergeSettings,
   pruneHookCommands,
+  pruneMatcherScopedHooks,
   readSettings,
   writeSettingsAtomic,
+  type MatcherScopedPruneSpec,
 } from './install/settings-merge.js';
 import { validateSettings } from '../config/settings-schema.js';
 import { ensureReaGitignore } from './install/gitignore.js';
@@ -472,6 +474,32 @@ const STALE_HOOK_COMMAND_TOKENS: readonly string[] = [
   'push-review-gate-git.sh',
 ];
 
+/**
+ * Hooks that MOVED matchers between releases. `mergeSettings` is
+ * additive-only, so without a matcher-scoped prune a repo upgrading from an
+ * older release keeps its OLD-matcher registration AND gains the NEW one,
+ * double-invoking the hook on every matched tool call. Unlike
+ * `STALE_HOOK_COMMAND_TOKENS` (outright hook DELETIONS), these entries keep
+ * the same command string under a new matcher, so the prune MUST be
+ * matcher-scoped — a blanket command-substring prune would delete both the old
+ * AND the new registration.
+ *
+ * Migration history:
+ *   - `billing-cap-halt.sh`: `PostToolUse/Bash` → `PostToolUse/*` (round-24 —
+ *     the turn counter must count EVERY tool call, not just Bash). Scoped to
+ *     the rea-managed shape: event `PostToolUse`, matcher EXACTLY `Bash`,
+ *     command `billing-cap-halt.sh`. Entry-level, so a consumer who chained
+ *     other hooks onto their own `Bash` matcher keeps those siblings; only the
+ *     stale rea entry is removed, and the group is dropped only if it becomes
+ *     empty. The new `*` group (different matcher) is never touched.
+ *
+ * Add future matcher MOVES here rather than baking them into the prune helper
+ * — the list is release history, not a static setting.
+ */
+const STALE_MATCHER_SCOPED_HOOKS: readonly MatcherScopedPruneSpec[] = [
+  { event: 'PostToolUse', matcher: 'Bash', commandIncludes: 'billing-cap-halt.sh' },
+];
+
 async function upgradeSettings(
   baseDir: string,
   opts: UpgradeOptions,
@@ -490,7 +518,13 @@ async function upgradeSettings(
   // stale entry only to have the prune re-delete it on the next line —
   // pointless work. Pruning first means the merge sees a clean baseline.
   const pruned = pruneHookCommands(settings, STALE_HOOK_COMMAND_TOKENS);
-  const mergeResult = mergeSettings(pruned.merged, desired);
+  // Matcher-scoped prune for hooks that MOVED matchers (round-24
+  // billing-cap-halt Bash→*). Runs AFTER the command-token prune and BEFORE
+  // the additive merge, so the merge re-adds the hook under its NEW matcher
+  // against a baseline with the stale old-matcher registration already gone —
+  // exactly one registration remains, no double-invocation.
+  const movedPruned = pruneMatcherScopedHooks(pruned.merged, STALE_MATCHER_SCOPED_HOOKS);
+  const mergeResult = mergeSettings(movedPruned.merged, desired);
   // 0.30.0 Class M — validate the merged result with the non-strict
   // schema before writing. If the merged output would fail zod parse,
   // refuse the write and leave the consumer settings untouched. This
@@ -515,11 +549,18 @@ async function upgradeSettings(
       } from .claude/settings.json (removed in 0.11.0)`,
     );
   }
+  if (movedPruned.removedCount > 0) {
+    warnings.push(
+      `pruned ${movedPruned.removedCount} stale matcher-scoped hook registration${
+        movedPruned.removedCount === 1 ? '' : 's'
+      } from .claude/settings.json (billing-cap-halt.sh moved PostToolUse/Bash → PostToolUse/*)`,
+    );
+  }
   return {
     sha,
     addedCount: mergeResult.addedCount,
     skippedCount: mergeResult.skippedCount,
-    removedCount: pruned.removedCount,
+    removedCount: pruned.removedCount + movedPruned.removedCount,
     warnings,
   };
 }
@@ -585,7 +626,8 @@ export async function runUpgrade(options: UpgradeOptions = {}): Promise<void> {
     const desired = defaultDesiredHooks();
     const { settings: existingSettings } = readSettings(resolvedRoot);
     const pruned = pruneHookCommands(existingSettings, STALE_HOOK_COMMAND_TOKENS);
-    const mergeResult = mergeSettings(pruned.merged, desired);
+    const movedPruned = pruneMatcherScopedHooks(pruned.merged, STALE_MATCHER_SCOPED_HOOKS);
+    const mergeResult = mergeSettings(movedPruned.merged, desired);
     const validation = validateSettings(mergeResult.merged);
     if (!validation.parsed) {
       throw new Error(

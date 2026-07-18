@@ -93,6 +93,77 @@ function keyFor(matcher: string, command: string): string {
  * `.claude/settings.json` would keep executing stale commands that
  * point at files we just deleted from `.claude/hooks/`.
  */
+/**
+ * A single matcher-scoped prune target. Removes hook ENTRIES whose `command`
+ * contains `commandIncludes` from ONLY the group(s) under `event` whose
+ * matcher is EXACTLY `matcher`. Used for hooks that MOVED matchers between
+ * releases, where a blanket `pruneHookCommands` (command-substring across ALL
+ * matchers) would wrongly delete the NEW registration too because the old and
+ * new entries share the same command string.
+ */
+export interface MatcherScopedPruneSpec {
+  event: string;
+  matcher: string;
+  commandIncludes: string;
+}
+
+/**
+ * Remove hook entries that MOVED matchers in a release, scoped so the NEW
+ * registration survives. For each spec, within `event` groups whose matcher is
+ * EXACTLY `spec.matcher`, drop any hook whose `command` includes
+ * `spec.commandIncludes`; a group left with no hooks is dropped, and an event
+ * left with no groups is deleted. Groups under a DIFFERENT matcher (e.g. the
+ * new `*` group, or a consumer's own matcher) are never touched.
+ *
+ * Removal is ENTRY-LEVEL, not group-level: if a consumer chained other hooks
+ * onto the same `Bash` matcher, those siblings are preserved — only the stale
+ * rea-managed entry is pruned. This is the additive-merge counterpart for a
+ * matcher MOVE (vs `pruneHookCommands` for an outright hook DELETION): without
+ * it, `mergeSettings` (additive-only) would leave a repo upgrading from an
+ * older release with BOTH the old-matcher and new-matcher registrations of the
+ * same command, double-invoking the hook on every matched tool call.
+ *
+ * Idempotent: a fresh install that already has only the new-matcher group
+ * matches nothing here (removedCount 0); running twice is a no-op.
+ */
+export function pruneMatcherScopedHooks(
+  existing: Record<string, unknown>,
+  specs: readonly MatcherScopedPruneSpec[],
+): { merged: Record<string, unknown>; removedCount: number } {
+  const merged = deepClone(existing);
+  const hooks = ensureHooksShape(merged);
+  let removedCount = 0;
+  for (const spec of specs) {
+    const groups = hooks[spec.event];
+    if (!Array.isArray(groups)) continue;
+    for (const group of groups) {
+      if (group.matcher !== spec.matcher) continue;
+      const entries = group.hooks ?? [];
+      if (!Array.isArray(entries)) continue;
+      const kept: typeof entries = [];
+      for (const entry of entries) {
+        const cmd = typeof entry.command === 'string' ? entry.command : '';
+        if (cmd.includes(spec.commandIncludes)) {
+          removedCount += 1;
+          continue;
+        }
+        kept.push(entry);
+      }
+      group.hooks = kept;
+    }
+    // Drop now-empty groups under this event.
+    hooks[spec.event] = groups.filter((g) => Array.isArray(g.hooks) && g.hooks.length > 0);
+  }
+  // Drop events whose group list is now empty.
+  for (const event of Object.keys(hooks)) {
+    const groups = hooks[event];
+    if (Array.isArray(groups) && groups.length === 0) {
+      delete hooks[event];
+    }
+  }
+  return { merged, removedCount };
+}
+
 export function pruneHookCommands(
   existing: Record<string, unknown>,
   staleSubstrings: readonly string[],

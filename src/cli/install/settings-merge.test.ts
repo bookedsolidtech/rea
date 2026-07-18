@@ -6,6 +6,7 @@ import {
   mergeSettings,
   defaultDesiredHooks,
   pruneHookCommands,
+  pruneMatcherScopedHooks,
   writeSettingsAtomic,
   type DesiredHookGroup,
 } from './settings-merge.js';
@@ -261,5 +262,98 @@ describe('pruneHookCommands — 0.11.0 migration of deleted hook references', ()
     };
     const res = pruneHookCommands(existing, ['x']);
     expect(res.merged.somethingElse).toEqual({ keep: true });
+  });
+});
+
+describe('pruneMatcherScopedHooks — round-24 billing-cap-halt Bash→* matcher move', () => {
+  const SPEC = [{ event: 'PostToolUse', matcher: 'Bash', commandIncludes: 'billing-cap-halt.sh' }] as const;
+  const cmd = (name: string): string => `"$CLAUDE_PROJECT_DIR"/.claude/hooks/${name}`;
+
+  it('removes the billing entry ONLY from a PostToolUse/Bash group (drops the now-empty group)', () => {
+    const existing = {
+      hooks: {
+        PostToolUse: [
+          { matcher: 'Bash', hooks: [{ type: 'command', command: cmd('billing-cap-halt.sh') }] },
+          { matcher: '*', hooks: [{ type: 'command', command: cmd('billing-cap-halt.sh') }] },
+        ],
+      },
+    };
+    const res = pruneMatcherScopedHooks(existing, SPEC);
+    expect(res.removedCount).toBe(1);
+    const groups = (res.merged.hooks as Record<string, unknown>).PostToolUse as Array<{ matcher: string }>;
+    // The Bash group is gone; only the `*` group remains.
+    expect(groups.map((g) => g.matcher)).toEqual(['*']);
+  });
+
+  it('NEVER touches the new `*` group (different matcher, same command)', () => {
+    const existing = {
+      hooks: { PostToolUse: [{ matcher: '*', hooks: [{ type: 'command', command: cmd('billing-cap-halt.sh') }] }] },
+    };
+    const res = pruneMatcherScopedHooks(existing, SPEC);
+    expect(res.removedCount).toBe(0);
+    const groups = (res.merged.hooks as Record<string, unknown>).PostToolUse as unknown[];
+    expect(groups).toHaveLength(1);
+  });
+
+  it('is entry-level: preserves a consumer hook chained onto the same Bash matcher', () => {
+    const existing = {
+      hooks: {
+        PostToolUse: [
+          {
+            matcher: 'Bash',
+            hooks: [
+              { type: 'command', command: cmd('billing-cap-halt.sh') },
+              { type: 'command', command: cmd('consumer-thing.sh') },
+            ],
+          },
+        ],
+      },
+    };
+    const res = pruneMatcherScopedHooks(existing, SPEC);
+    expect(res.removedCount).toBe(1);
+    const groups = (res.merged.hooks as Record<string, unknown>).PostToolUse as Array<{
+      matcher: string;
+      hooks: Array<{ command: string }>;
+    }>;
+    expect(groups).toHaveLength(1);
+    expect(groups[0]?.matcher).toBe('Bash');
+    expect(groups[0]?.hooks.map((h) => h.command)).toEqual([cmd('consumer-thing.sh')]);
+  });
+
+  it('is idempotent — a second run over an already-migrated file is a no-op', () => {
+    const migrated = {
+      hooks: { PostToolUse: [{ matcher: '*', hooks: [{ type: 'command', command: cmd('billing-cap-halt.sh') }] }] },
+    };
+    const first = pruneMatcherScopedHooks(migrated, SPEC);
+    expect(first.removedCount).toBe(0);
+    const second = pruneMatcherScopedHooks(first.merged, SPEC);
+    expect(second.removedCount).toBe(0);
+    expect(second.merged).toEqual(migrated);
+  });
+
+  it('prune-then-merge yields EXACTLY ONE billing registration under `*` (no double)', () => {
+    // Simulate a pre-round-24 install: billing under Bash, plus the other
+    // PostToolUse groups. Prune (matcher move) then additive merge with the
+    // current desired set — the result must not double-register billing.
+    const oldInstall = {
+      hooks: {
+        PostToolUse: [
+          { matcher: 'Bash', hooks: [{ type: 'command', command: cmd('billing-cap-halt.sh') }] },
+          {
+            matcher: 'Bash|Edit|Write|MultiEdit|NotebookEdit',
+            hooks: [{ type: 'command', command: cmd('delegation-advisory.sh') }],
+          },
+        ],
+      },
+    };
+    const pruned = pruneMatcherScopedHooks(oldInstall, SPEC);
+    const merged = mergeSettings(pruned.merged, defaultDesiredHooks());
+    const groups = (merged.merged.hooks as Record<string, unknown>).PostToolUse as Array<{
+      matcher: string;
+      hooks: Array<{ command: string }>;
+    }>;
+    const billing = groups.filter((g) => g.hooks.some((h) => h.command.includes('billing-cap-halt.sh')));
+    expect(billing).toHaveLength(1);
+    expect(billing[0]?.matcher).toBe('*');
   });
 });
