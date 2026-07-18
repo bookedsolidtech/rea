@@ -19,7 +19,9 @@
  *
  *   1. Awaiting ratification / parked blockers — pending tasks with a
  *      `blocked_by`, or `requires_spec` without a `spec`. Leads.
- *   2. Review queue — completed tasks (proxy for "awaiting sign-off").
+ *   2. Review queue — RECENTLY completed tasks (proxy for "awaiting sign-off").
+ *      Terminal work ages out after `REVIEW_WINDOW_MS`, so a project with only
+ *      old completed history falls back to idle rather than nagging forever.
  *   3. In flight — `in_progress` tasks.
  *   4. Health flags — a live `.reagent/` dir (migration debt), or a registry
  *      `rea_version` older than this package (stale spine).
@@ -240,6 +242,34 @@ function isAwaiting(t: TaskRecord): boolean {
   return blocked || specGap;
 }
 
+/**
+ * How long a terminal task stays in the review bucket. The review queue surfaces
+ * "completed work awaiting operator sign-off" (spec §3.2) — a task the operator
+ * still needs to glance at, NOT the project's entire completed history. Without
+ * an ageing window the bucket is monotonic: `.rea/tasks.jsonl` is append-only,
+ * there is no reviewed/archived state and no CLI to un-complete a task, so after
+ * the first completion a project could never fall back to idle/healthy and would
+ * perpetually read as "needs you." A completed task is therefore review-worthy
+ * only while its last update is within this window; older ones age out and the
+ * project can return to calm. 7 days = a comfortable sign-off horizon.
+ */
+export const REVIEW_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+
+/**
+ * Does a completed task still belong in the review queue? True only while it was
+ * updated within `REVIEW_WINDOW_MS` of `nowMs`. `nowMs` is threaded from the
+ * model's `generated_at` stamp (not a raw `Date.now()`) so the classifier is
+ * deterministic and test-freezable. Only `completed` qualifies — `cancelled` is
+ * terminal but is abandoned work, never sign-off work, so it never surfaces here.
+ * An unparseable/future `updated_at` yields NaN/negative deltas: NaN drops out
+ * (never a false "recent" flag), a future stamp is treated as recent.
+ */
+function isRecentReview(t: TaskRecord, nowMs: number): boolean {
+  if (t.status !== 'completed') return false;
+  const updatedMs = Date.parse(t.updated_at);
+  return nowMs - updatedMs <= REVIEW_WINDOW_MS;
+}
+
 // ---------------------------------------------------------------------------
 // Classification
 // ---------------------------------------------------------------------------
@@ -251,10 +281,14 @@ interface ProjectClassification {
   health: { flag: HealthFlagKind; detail: string }[];
 }
 
-function classifyProject(projectDir: string, entry: ProjectEntry | undefined): ProjectClassification {
+function classifyProject(
+  projectDir: string,
+  entry: ProjectEntry | undefined,
+  nowMs: number,
+): ProjectClassification {
   const tasks = readTasks(projectDir);
   const awaiting = tasks.filter(isAwaiting);
-  const review = tasks.filter((t) => t.status === 'completed');
+  const review = tasks.filter((t) => isRecentReview(t, nowMs));
   const inFlight = tasks.filter((t) => t.status === 'in_progress');
 
   const health: { flag: HealthFlagKind; detail: string }[] = [];
@@ -306,6 +340,10 @@ interface ProjectTarget {
 
 function buildJson(targets: ProjectTarget[], mode: 'global' | 'repo', all: boolean): DashJson {
   const out = emptyJson(mode);
+  // Single clock reference for terminal-task ageing, reused from the model's
+  // own `generated_at` stamp so every project is classified against one instant
+  // and tests can freeze it (fake timers flow through `emptyJson`'s `new Date`).
+  const nowMs = Date.parse(out.generated_at);
 
   for (const { projectDir, entry, state } of targets) {
     const name = entry?.name ?? deriveProjectName(projectDir);
@@ -327,7 +365,7 @@ function buildJson(targets: ProjectTarget[], mode: 'global' | 'repo', all: boole
     }
 
     // Present project — classify + emit.
-    const c = classifyProject(projectDir, entry);
+    const c = classifyProject(projectDir, entry, nowMs);
     for (const h of c.health) {
       out.groups.health_flags.push({
         project: name,

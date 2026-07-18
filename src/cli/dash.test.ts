@@ -24,6 +24,7 @@ beforeEach(() => {
 
 afterEach(() => {
   fs.rmSync(tmp, { recursive: true, force: true });
+  vi.useRealTimers();
   vi.restoreAllMocks();
 });
 
@@ -87,10 +88,14 @@ describe('isOlderVersion', () => {
 
 describe('runDash classification', () => {
   it('sorts tasks into awaiting / review / in-flight groups, naming projects', async () => {
+    // Freeze near the tasks' `updated_at` (helper default 2026-07-17) so the
+    // completed task is inside the review window regardless of the wall clock.
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-07-17T12:00:00.000Z'));
     const proj = makeProject('acme', [
       task('T-0001', { status: 'pending', blocked_by: ['T-9999'] }), // awaiting (blocked)
       task('T-0002', { status: 'pending', requires_spec: true }), // awaiting (spec gap)
-      task('T-0003', { status: 'completed', evidence: ['x'] }), // review
+      task('T-0003', { status: 'completed', evidence: ['x'] }), // review (recent)
       task('T-0004', { status: 'in_progress' }), // in flight
       task('T-0005', { status: 'pending' }), // plain backlog — no group
     ]);
@@ -149,8 +154,77 @@ describe('runDash classification', () => {
   });
 });
 
+describe('runDash review-queue ageing', () => {
+  // Frozen instant all cases are classified against (threaded via generated_at).
+  const NOW = '2026-07-18T00:00:00.000Z';
+
+  it('drops OLD completed tasks so the project returns to idle/healthy', async () => {
+    // Only terminal history, all beyond the 7-day window → nothing needs you.
+    const proj = makeProject('shipped', [
+      task('T-0001', {
+        status: 'completed',
+        evidence: ['x'],
+        updated_at: '2026-07-01T00:00:00.000Z', // 17 days old
+      }),
+      task('T-0002', {
+        status: 'completed',
+        evidence: ['y'],
+        updated_at: '2026-07-10T00:00:00.000Z', // 8 days old — just outside
+      }),
+    ]);
+    await registerProject(proj, { name: 'shipped', reaVersion: '0.51.0' }, registryPath);
+
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(NOW));
+    const dash = await runJson({});
+
+    expect(dash.groups.review_queue).toHaveLength(0);
+    expect(dash.groups.idle.map((p) => p.project)).toEqual(['shipped']);
+  });
+
+  it('keeps a RECENTLY completed task in the review queue', async () => {
+    const proj = makeProject('fresh', [
+      task('T-0001', {
+        status: 'completed',
+        evidence: ['x'],
+        updated_at: '2026-07-17T00:00:00.000Z', // 1 day old — inside the window
+      }),
+    ]);
+    await registerProject(proj, { name: 'fresh', reaVersion: '0.51.0' }, registryPath);
+
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(NOW));
+    const dash = await runJson({});
+
+    expect(dash.groups.review_queue.map((i) => i.task_id)).toEqual(['T-0001']);
+    // A project with a live review item is NOT idle.
+    expect(dash.groups.idle.map((p) => p.project)).not.toContain('fresh');
+  });
+
+  it('never surfaces a cancelled task in review, even a fresh one', async () => {
+    const proj = makeProject('abandoned', [
+      task('T-0001', {
+        status: 'cancelled',
+        updated_at: '2026-07-17T23:00:00.000Z', // fresh but terminal-abandoned
+      }),
+    ]);
+    await registerProject(proj, { name: 'abandoned', reaVersion: '0.51.0' }, registryPath);
+
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(NOW));
+    const dash = await runJson({});
+
+    expect(dash.groups.review_queue).toHaveLength(0);
+    // Cancelled is neither review nor in-flight, so the project reads as idle.
+    expect(dash.groups.idle.map((p) => p.project)).toEqual(['abandoned']);
+  });
+});
+
 describe('runDash visibility', () => {
   it('withholds task titles for a policy-hidden project (opaque count)', async () => {
+    // Completed task must stay recent so the opaque count is a stable 2.
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-07-17T12:00:00.000Z'));
     const proj = makeProject(
       'secret',
       [task('T-0001', { status: 'completed', evidence: ['x'] }), task('T-0002', { status: 'in_progress' })],
