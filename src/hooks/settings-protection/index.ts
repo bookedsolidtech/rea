@@ -647,14 +647,21 @@ function checkProtectedSymlinkResolution(
   patternsForCrossRoot?: (root: string) => readonly string[],
 ): { pattern: string; resolvedTarget: string } | null {
   let patterns: readonly string[] = patternsIn;
+  // Round-6 P1: probe the filesystem against the ACCEPTED worktree root.
+  // In a linked-worktree session the hook process cwd may be pinned to
+  // the primary checkout while `reaRoot` (from payload.cwd) is the
+  // worktree — a RELATIVE target like `shared/HALT` must be resolved in
+  // the worktree, not the primary, or the symlink protections probe the
+  // wrong tree and miss a symlink into protected state.
+  const probePath = path.isAbsolute(filePath) ? filePath : path.resolve(reaRoot, filePath);
   // Only attempt resolution if the target exists OR its parent dir exists.
   let targetExists = false;
   try {
-    targetExists = fs.existsSync(filePath);
+    targetExists = fs.existsSync(probePath);
   } catch {
     /* fall through */
   }
-  const parentDir = path.dirname(filePath);
+  const parentDir = path.dirname(probePath);
   let parentExists = false;
   try {
     parentExists = fs.statSync(parentDir).isDirectory();
@@ -664,7 +671,7 @@ function checkProtectedSymlinkResolution(
   if (!targetExists && !parentExists) return null;
   if (!parentExists) return null;
 
-  const resolvedParent = resolveParentRealpath(filePath);
+  const resolvedParent = resolveParentRealpath(probePath);
   if (resolvedParent.length === 0) return null;
 
   // 0.54.0 round-5 P1: a worktree-local symlink pointed at the PRIMARY

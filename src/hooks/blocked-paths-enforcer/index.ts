@@ -354,15 +354,22 @@ function checkSymlinkResolution(
   blockedPathsForRoot?: (root: string) => string[],
 ): { entry: string; resolvedTarget: string } | null {
   let blockedPaths: readonly string[] = blockedPathsIn;
+  // Round-6 P2: probe against the ACCEPTED worktree root — in a
+  // linked-worktree session the hook process cwd may be the primary
+  // checkout while `reaRoot` (from payload.cwd) is the worktree, so a
+  // RELATIVE target like `bridge/package.json` must be resolved in the
+  // worktree, not the primary, or the cross-root symlink enforcement
+  // probes the wrong tree.
+  const probePath = path.isAbsolute(filePath) ? filePath : path.resolve(reaRoot, filePath);
   // Only attempt resolution if the target exists or its parent dir
   // exists — matches the bash `if [[ -e "$FILE_PATH" || -d ... ]]`.
   let targetExists = false;
   try {
-    targetExists = fs.existsSync(filePath);
+    targetExists = fs.existsSync(probePath);
   } catch {
     /* fall through */
   }
-  const parentDir = path.dirname(filePath);
+  const parentDir = path.dirname(probePath);
   let parentExists = false;
   try {
     parentExists = fs.statSync(parentDir).isDirectory();
@@ -372,7 +379,7 @@ function checkSymlinkResolution(
   if (!targetExists && !parentExists) return null;
   if (!parentExists) return null;
 
-  const resolvedParent = resolveParentRealpath(filePath);
+  const resolvedParent = resolveParentRealpath(probePath);
   if (resolvedParent.length === 0) return null;
 
   // Resolved parent must be inside the LOCAL root — or, 0.54.0 round-5
