@@ -453,21 +453,31 @@ export function defaultDesiredHooks(): DesiredHookGroup[] {
     },
     {
       // 0.51.0 spend-governance E1 seed (INCIDENT-2026-07-04,
-      // denial-of-wallet). Matcher is `Bash` (NOT chained onto the
-      // architecture-review or delegation-advisory groups — the matcher
-      // differs from both). The hook scans a just-run command's output
-      // for a BILLING-CLASS signature (spending cap / prepayment credits
-      // depleted / insufficient_quota — TERMINAL, distinct from a retryable
-      // 429) and, per `policy.spend_governance.billing_error_response`,
-      // acts. OPT-OUT: `enabled` defaults true, so a policy with NO
-      // `spend_governance` block still runs the reflex at the SEED default
-      // `warn` (banner + audit, no freeze — a phrase-only global halt is
-      // unsafe without endpoint scoping; codex round-12). `halt` is an
-      // explicit opt-in; opting out entirely is `enabled: false` /
-      // `billing_error_response: off`. The shim's coarse relevance pre-gate
-      // means ordinary Bash output never spawns the CLI.
+      // denial-of-wallet) + Artifact Gates §5 turn budget. The hook does TWO
+      // jobs: (1) the billing-signature scan of a just-run command's failed
+      // stderr (spending cap / prepayment credits depleted / insufficient_
+      // quota — TERMINAL, distinct from a retryable 429), Bash-only; and
+      // (2) a per-session TOOL-CALL counter (Artifact Gates §5) that emits
+      // audited warn/refuse events at `spend_governance.turn_budget`
+      // thresholds. The counter must count EVERY tool call, so the matcher
+      // is `Bash|Edit|Write|MultiEdit|NotebookEdit` — the SAME string
+      // delegation-advisory uses, which mergeSettings collapses into ONE
+      // group `[billing-cap-halt.sh, delegation-advisory.sh]` (one hook
+      // invocation per tool call → exactly one increment, no double-count).
+      // The billing SCAN inside the body stays Bash-only (a non-Bash tool
+      // has no command/stderr); only the turn counter runs for the editor
+      // tools. OPT-OUT (billing): `enabled` defaults true, seed default
+      // `warn`. OPT-IN (turn budget): absent `turn_budget` block = off. The
+      // shim's relevance pre-gate proceeds to the CLI whenever a
+      // `turn_budget` is configured (so the counter runs) OR a billing
+      // keyword is present; with neither, ordinary output never spawns the
+      // CLI.
+      //
+      // ORDER: this group is declared BEFORE the delegation-advisory group
+      // (same matcher) so the merge places billing-cap-halt.sh first in the
+      // collapsed group — keep them in this order.
       event: 'PostToolUse',
-      matcher: 'Bash',
+      matcher: 'Bash|Edit|Write|MultiEdit|NotebookEdit',
       hooks: [
         {
           type: 'command',
@@ -475,26 +485,21 @@ export function defaultDesiredHooks(): DesiredHookGroup[] {
           timeout: 10000,
           statusMessage: 'Checking for billing-class spend errors...',
         },
-      ],
-    },
-    {
-      // 0.31.0 delegation-telemetry completion — the *nudge*. The
-      // matcher is `Bash|Edit|Write|MultiEdit|NotebookEdit`: every
-      // write-class tool call (note this group INCLUDES Bash, unlike
-      // the architecture-review group above). The hook maintains a
-      // per-session counter and emits a one-time stderr advisory when
-      // a session crosses `policy.delegation_advisory.threshold`
-      // without dispatching a curated specialist. Advisory only — it
-      // never blocks a tool call, and `policy.delegation_advisory`
-      // defaults to disabled (only `bst-internal*` profiles pin
-      // `enabled: true`), so a vanilla install sees the hook as a
-      // silent no-op. Kept as its own matcher group rather than
-      // chained onto the architecture-review group because the
-      // matcher string differs (Bash is in this one, not that one).
-      event: 'PostToolUse',
-      matcher: 'Bash|Edit|Write|MultiEdit|NotebookEdit',
-      hooks: [
         {
+          // 0.31.0 delegation-telemetry completion — the *nudge*. Shares
+          // THIS PostToolUse group (same `Bash|Edit|Write|MultiEdit|
+          // NotebookEdit` matcher) as a SECOND hook rather than a separate
+          // same-matcher group: two rea-desired groups on one matcher make
+          // the second warn "chained onto existing" on a FRESH install
+          // (the merge sees the group the first just created) — a spurious
+          // self-chain. One group, ordered [billing-cap-halt,
+          // delegation-advisory], avoids it. The hook maintains a
+          // per-session counter and emits a one-time stderr advisory when a
+          // session crosses `policy.delegation_advisory.threshold` without
+          // dispatching a curated specialist. Advisory only — never blocks;
+          // `delegation_advisory` defaults disabled (only `bst-internal*`
+          // profiles pin `enabled: true`), so a vanilla install sees a
+          // silent no-op.
           type: 'command',
           command: `${base}/delegation-advisory.sh`,
           timeout: 10000,

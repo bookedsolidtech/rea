@@ -50,6 +50,7 @@ function readAudit(root: string): Array<Record<string, unknown>> {
 function writePolicy(
   root: string,
   turnBudget: { warn: number; halt: number; response?: 'warn' | 'halt' | 'off' } | null,
+  billingMode: 'off' | 'warn' | 'halt' = 'off',
 ): void {
   fs.mkdirSync(path.join(root, '.rea'), { recursive: true });
   let body = `version: "1"
@@ -63,7 +64,7 @@ block_ai_attribution: false
 blocked_paths: []
 spend_governance:
   enabled: true
-  billing_error_response: off
+  billing_error_response: ${billingMode}
 `;
   if (turnBudget !== null) {
     body += `  turn_budget:\n    warn_turns: ${turnBudget.warn}\n    halt_turns: ${turnBudget.halt}\n`;
@@ -77,6 +78,16 @@ function benignPayload(): string {
     tool_name: 'Bash',
     tool_input: { command: 'echo hi' },
     tool_response: { stdout: 'hi', stderr: '', exit_code: 0 },
+  });
+}
+/** An Edit PostToolUse payload (non-Bash — no command/stderr). */
+function editPayload(stderr = ''): string {
+  return JSON.stringify({
+    tool_name: 'Edit',
+    tool_input: { file_path: '/x/y.ts', old_string: 'a', new_string: 'b' },
+    // Even if a (nonsensical) stderr with a billing phrase is present on a
+    // non-Bash tool, the billing scan must NOT run — it is Bash-only.
+    tool_response: { filePath: '/x/y.ts', ...(stderr ? { stderr, is_error: true } : {}) },
   });
 }
 
@@ -269,6 +280,60 @@ describe('runBillingCapHalt — turn-budget integration', () => {
     expect(await run()).toBe(2);
     const haltEvents = readAudit(root).filter((e) => e.tool_name === 'rea.spend.turn_budget_halt');
     expect(haltEvents).toHaveLength(1);
+  });
+
+  it('counts a NON-Bash (Edit) PostToolUse tool call — the counter is tool-agnostic', async () => {
+    writePolicy(root, { warn: 2, halt: 100, response: 'warn' });
+    const runEdit = async (): Promise<number> =>
+      (await runBillingCapHalt({ reaRoot: root, stdinOverride: editPayload(), sessionId: 'e', stderrWrite: () => {} }))
+        .exitCode;
+    expect(await runEdit()).toBe(0); // turn 1
+    expect(await runEdit()).toBe(0); // turn 2 — warn crossing on an Edit call
+    const warnEvents = readAudit(root).filter((e) => e.tool_name === 'rea.spend.turn_budget_warn');
+    expect(warnEvents).toHaveLength(1);
+    // Counter persisted at 2 from Edit calls alone.
+    expect(JSON.parse(fs.readFileSync(path.join(root, '.rea', 'turn-count.e.json'), 'utf8')).count).toBe(2);
+  });
+
+  it('halt threshold fires from a non-Bash-only session (Edit calls)', async () => {
+    writePolicy(root, { warn: 1, halt: 2, response: 'halt' });
+    const runEdit = async (): Promise<number> =>
+      (await runBillingCapHalt({ reaRoot: root, stdinOverride: editPayload(), sessionId: 'e', stderrWrite: () => {} }))
+        .exitCode;
+    expect(await runEdit()).toBe(0); // turn 1 — warn
+    const exit2 = await runEdit(); // turn 2 — halt
+    expect(exit2).toBe(2);
+    expect(fs.existsSync(haltPath(root))).toBe(true);
+  });
+
+  it('billing scan stays Bash-ONLY: a billing phrase on an Edit payload never freezes', async () => {
+    // Billing ENABLED in halt mode so the flow reaches the Bash-only tool gate
+    // (an Edit call must still not scan/freeze despite the billing phrase).
+    writePolicy(root, { warn: 100, halt: 200, response: 'warn' }, 'halt');
+    const r = await runBillingCapHalt({
+      reaRoot: root,
+      // Edit tool with a "spending cap" phrase on stderr + errored — must NOT
+      // trigger a billing HALT (the scan is Bash-only). The turn counter still
+      // runs (count increments) but no billing action.
+      stdinOverride: editPayload('Error: you have exceeded your spending cap.'),
+      sessionId: 'e',
+      stderrWrite: () => {},
+    });
+    expect(r.exitCode).toBe(0);
+    expect(r.action).toBe('noop');
+    expect(fs.existsSync(haltPath(root))).toBe(false);
+    // No billing audit; counter did increment (turn accounting is tool-agnostic).
+    expect(readAudit(root).filter((e) => e.tool_name === 'rea.spend_governance.billing')).toHaveLength(0);
+    expect(JSON.parse(fs.readFileSync(path.join(root, '.rea', 'turn-count.e.json'), 'utf8')).count).toBe(1);
+  });
+
+  it('exactly one increment per invocation (no double-count)', async () => {
+    writePolicy(root, { warn: 100, halt: 200, response: 'warn' });
+    // Mix Bash and Edit calls; each invocation increments by exactly 1.
+    await runBillingCapHalt({ reaRoot: root, stdinOverride: benignPayload(), sessionId: 'm', stderrWrite: () => {} });
+    await runBillingCapHalt({ reaRoot: root, stdinOverride: editPayload(), sessionId: 'm', stderrWrite: () => {} });
+    await runBillingCapHalt({ reaRoot: root, stdinOverride: benignPayload(), sessionId: 'm', stderrWrite: () => {} });
+    expect(JSON.parse(fs.readFileSync(path.join(root, '.rea', 'turn-count.m.json'), 'utf8')).count).toBe(3);
   });
 
   it('response: off is silent (parseTurnBudget → null → no counter, no events)', async () => {

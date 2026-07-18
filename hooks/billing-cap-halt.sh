@@ -97,11 +97,31 @@ _billing_kw_strict() {
   [[ "$1" =~ $re ]]
 }
 
+# Artifact Gates §5 — the per-session TURN COUNTER lives in the CLI body and
+# must run on EVERY tool call when a turn budget is configured. So this hook
+# proceeds to the CLI whenever `spend_governance.turn_budget` is present,
+# regardless of billing keywords. A single cheap grep (NO interpreter spawn);
+# the CLI does the authoritative parse and no-ops if the block is malformed.
+# When no turn_budget is configured (the common case) this returns 1 and the
+# billing-keyword perf gate below decides — byte-identical to pre-feature, so
+# ordinary output still never spawns the CLI. Over-trigger (a comment that
+# merely says "turn_budget:") just spawns the CLI, which then no-ops — cheap.
+_turn_budget_configured() {
+  local pf="${CLAUDE_PROJECT_DIR:-$REA_ROOT}/.rea/policy.yaml"
+  [ -f "$pf" ] || return 1
+  grep -qE 'turn_budget[[:space:]]*:' "$pf" 2>/dev/null
+}
+
 # Relevance pre-gate for the CLI-PRESENT path — a pure PERF optimization.
 # Scans the whole lower-cased payload (a cheap superset); an over-trigger
 # just spawns the CLI, which then applies the precise, channel-restricted
-# BILLING_RE and no-ops on benign input. Never misses a real signal.
+# BILLING_RE and no-ops on benign input. Never misses a real signal. Also
+# proceeds unconditionally when a turn budget is configured (see
+# `_turn_budget_configured`) so the CLI-body turn counter runs every call.
 shim_is_relevant() {
+  if _turn_budget_configured; then
+    return 0
+  fi
   local lower=""
   lower=$(printf '%s' "$INPUT" | tr '[:upper:]' '[:lower:]' 2>/dev/null || printf '%s' "$INPUT")
   _billing_kw_match "$lower"

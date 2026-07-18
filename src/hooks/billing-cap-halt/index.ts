@@ -420,12 +420,14 @@ export async function runBillingCapHalt(
   let payloadStdout = '';
   let errored = false;
   let payloadCwd = '';
+  let payloadToolName = '';
   try {
     const payload = parsePostToolUsePayload(stdinRaw);
     payloadStderr = payload.stderr;
     payloadStdout = payload.stdout;
     errored = payload.errored;
     payloadCwd = payload.cwd;
+    payloadToolName = payload.toolName;
   } catch (err) {
     if (err instanceof MalformedPayloadError || err instanceof TypePayloadError) {
       // Round-16 P3: the stdin-first reorder moved the HALT probe after
@@ -482,6 +484,18 @@ export async function runBillingCapHalt(
   }
 
   if (!enabled || mode === 'off') {
+    return { exitCode: 0, stderr, action: 'noop', matched: null, haltWritten: false };
+  }
+
+  // 2b. Billing scan is Bash-ONLY. The turn counter above runs on EVERY
+  //     PostToolUse tool (Bash + Edit/Write/MultiEdit/NotebookEdit — the
+  //     hook is registered on all of them so per-session tool-call budgets
+  //     count every call). The billing-signature scan, by contrast, reads a
+  //     shell command's failed stderr: a non-Bash tool has no command/stderr
+  //     to scan, so skip it. (For a non-Bash payload `errored`/`stderr` are
+  //     empty anyway and the scan below would no-op — this gate makes the
+  //     Bash-only contract explicit and cheap.)
+  if (payloadToolName !== 'Bash') {
     return { exitCode: 0, stderr, action: 'noop', matched: null, haltWritten: false };
   }
 
