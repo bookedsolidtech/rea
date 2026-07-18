@@ -126,6 +126,8 @@ function banner(reason: string): string {
     `Create a spec, commit it, and point the active ticket at it:\n` +
     `  rea tasks add --subject "<title>" --spec <path> --requires-spec\n` +
     `  rea tasks activate <id>\n` +
+    `or attach one to the existing active task:\n` +
+    `  rea tasks spec <id> --set <path>\n` +
     `then stage + commit the spec before this change.\n`
   );
 }

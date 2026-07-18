@@ -207,6 +207,71 @@ export function runTasksEvidence(baseDir: string, id: string, opts: TasksEvidenc
   return 0;
 }
 
+export interface TasksSpecOptions {
+  /** Repo-relative spec path to set (from `--set <path>`). */
+  set?: string;
+  /** Set `requires_spec` true/false (from `--requires-spec` / `--no-requires-spec`). */
+  requiresSpec?: boolean;
+  json?: boolean;
+}
+
+/**
+ * `rea tasks spec <id>` — set `spec` and/or `requires_spec` on an EXISTING
+ * task. Round-49 P2: once G1 (`artifact_gates.g1_spec`) is enabled, an active
+ * task without a committed `spec` blocks commits, but those fields were only
+ * settable at creation via `add`. A team enabling G1 against a pre-existing
+ * task list, or a task that crosses the "needs a spec" threshold mid-flight,
+ * had no CLI mutation path — the only recourse was hand-editing
+ * `.rea/tasks.jsonl`, exactly the manual state mutation the store exists to
+ * prevent. This is the missing mutator.
+ */
+export function runTasksSpec(baseDir: string, id: string, opts: TasksSpecOptions): number {
+  const specVal = opts.set;
+  const requiresVal = opts.requiresSpec;
+  // At least one mutation flag is required — a bare `spec <id>` is a no-op.
+  if (specVal === undefined && requiresVal === undefined) {
+    err('spec requires at least one of --set <path> / --requires-spec / --no-requires-spec');
+    return 1;
+  }
+  // A blank spec path can't satisfy G1 (which requires an on-disk, committed
+  // file), so reject it up front — mirrors the blank-evidence refusal.
+  if (specVal !== undefined && specVal.trim().length === 0) {
+    err('spec requires a non-blank --set <path>');
+    return 1;
+  }
+  let updated: TaskRecord | undefined;
+  let terminal: string | undefined;
+  updateTasks(baseDir, (tasks) => {
+    const t = findTask(tasks, id);
+    if (t === undefined) return [];
+    // `completed`/`cancelled` are terminal and immutable, like the other
+    // mutators treat them (start/activate/evidence/complete). A terminal task
+    // needs no spec compliance and its record must not be rewritten. Decide
+    // inside the locked transform (no TOCTOU) and return [] to abort the write.
+    if (t.status === 'completed' || t.status === 'cancelled') {
+      terminal = t.status;
+      return [];
+    }
+    updated = {
+      ...t,
+      ...(specVal !== undefined ? { spec: specVal } : {}),
+      ...(requiresVal !== undefined ? { requires_spec: requiresVal } : {}),
+      updated_at: nowIso(),
+    };
+    return [updated];
+  });
+  if (terminal !== undefined) {
+    err(`Cannot set spec on ${clean(id)}: task is ${terminal}. Spec can only be set on pending/in_progress tasks.`);
+    return 1;
+  }
+  if (updated === undefined) {
+    err(`No such task: ${clean(id)}`);
+    return 1;
+  }
+  emit(updated, opts.json, `Spec updated on ${id}`);
+  return 0;
+}
+
 export function runTasksComplete(baseDir: string, id: string, opts: TasksIdOptions = {}): number {
   let updated: TaskRecord | undefined;
   let outcome: 'ok' | 'not-found' | 'no-evidence' | 'terminal' = 'not-found';
@@ -369,6 +434,22 @@ export function registerTasksCommand(program: Command): void {
     .action((id: string, opts: { add: string[]; json?: boolean }) => {
       const code = runTasksEvidence(resolveLocalRoot(process.cwd()), id, {
         add: opts.add,
+        ...(opts.json !== undefined ? { json: opts.json } : {}),
+      });
+      if (code !== 0) process.exit(code);
+    });
+
+  tasks
+    .command('spec <id>')
+    .description('Set the spec path and/or requires_spec flag on an existing task.')
+    .option('--set <path>', 'repo-relative spec path to set')
+    .option('--requires-spec', 'mark that this task requires a spec')
+    .option('--no-requires-spec', 'clear the requires_spec flag')
+    .option('--json', 'emit the updated record as JSON')
+    .action((id: string, opts: { set?: string; requiresSpec?: boolean; json?: boolean }) => {
+      const code = runTasksSpec(resolveLocalRoot(process.cwd()), id, {
+        ...(opts.set !== undefined ? { set: opts.set } : {}),
+        ...(opts.requiresSpec !== undefined ? { requiresSpec: opts.requiresSpec } : {}),
         ...(opts.json !== undefined ? { json: opts.json } : {}),
       });
       if (code !== 0) process.exit(code);

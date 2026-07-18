@@ -14,6 +14,7 @@ import {
   runTasksStart,
   runTasksActivate,
   runTasksEvidence,
+  runTasksSpec,
   runTasksComplete,
   runTasksList,
   runTasksShow,
@@ -215,12 +216,104 @@ describe('evidence refuses terminal tasks (round-48 P2)', () => {
 });
 
 describe('not-found handling', () => {
-  it('returns 1 for start/activate/evidence/complete/show on a missing id', () => {
+  it('returns 1 for start/activate/evidence/spec/complete/show on a missing id', () => {
     expect(runTasksStart(baseDir, 'T-9999')).toBe(1);
     expect(runTasksActivate(baseDir, 'T-9999')).toBe(1);
     expect(runTasksEvidence(baseDir, 'T-9999', { add: ['x'] })).toBe(1);
+    expect(runTasksSpec(baseDir, 'T-9999', { set: 'specs/x.md' })).toBe(1);
     expect(runTasksComplete(baseDir, 'T-9999')).toBe(1);
     expect(runTasksShow(baseDir, 'T-9999')).toBe(1);
+  });
+});
+
+describe('spec mutator (round-49 P2)', () => {
+  it('sets the spec path on a pending task and bumps updated_at', () => {
+    runTasksAdd(baseDir, { subject: 'needs a spec' });
+    const before = readTasks(baseDir)[0];
+    expect(before?.spec).toBeUndefined();
+    expect(runTasksSpec(baseDir, 'T-0001', { set: 'specs/plan.md' })).toBe(0);
+    const after = readTasks(baseDir)[0];
+    expect(after?.spec).toBe('specs/plan.md');
+    expect(after?.updated_at).not.toBe(before?.updated_at);
+    expect(after?.status).toBe('pending');
+  });
+
+  it('sets requires_spec true then false', () => {
+    runTasksAdd(baseDir, { subject: 'flag toggling' });
+    expect(runTasksSpec(baseDir, 'T-0001', { requiresSpec: true })).toBe(0);
+    expect(readTasks(baseDir)[0]?.requires_spec).toBe(true);
+    expect(runTasksSpec(baseDir, 'T-0001', { requiresSpec: false })).toBe(0);
+    expect(readTasks(baseDir)[0]?.requires_spec).toBe(false);
+  });
+
+  it('sets a spec on an in_progress task', () => {
+    runTasksAdd(baseDir, { subject: 'live' });
+    runTasksStart(baseDir, 'T-0001');
+    expect(runTasksSpec(baseDir, 'T-0001', { set: 'specs/live.md' })).toBe(0);
+    const t = readTasks(baseDir)[0];
+    expect(t?.status).toBe('in_progress');
+    expect(t?.spec).toBe('specs/live.md');
+  });
+
+  it('sets both --set and requires_spec in a single call', () => {
+    runTasksAdd(baseDir, { subject: 'both' });
+    expect(runTasksSpec(baseDir, 'T-0001', { set: 'specs/both.md', requiresSpec: true })).toBe(0);
+    const t = readTasks(baseDir)[0];
+    expect(t?.spec).toBe('specs/both.md');
+    expect(t?.requires_spec).toBe(true);
+  });
+
+  it('errors when no mutation flag is given (record unchanged)', () => {
+    runTasksAdd(baseDir, { subject: 'no flags' });
+    const before = readTasks(baseDir)[0];
+    expect(runTasksSpec(baseDir, 'T-0001', {})).toBe(1);
+    expect(errs.join('\n')).toMatch(/at least one of/i);
+    const after = readTasks(baseDir)[0];
+    expect(after?.spec).toBeUndefined();
+    expect(after?.updated_at).toBe(before?.updated_at);
+  });
+
+  it('rejects a blank --set path', () => {
+    runTasksAdd(baseDir, { subject: 'blank spec' });
+    expect(runTasksSpec(baseDir, 'T-0001', { set: '   ' })).toBe(1);
+    expect(errs.join('\n')).toMatch(/non-blank/i);
+    expect(readTasks(baseDir)[0]?.spec).toBeUndefined();
+  });
+
+  it('refuses a completed task (no write, record unchanged)', () => {
+    runTasksAdd(baseDir, { subject: 'done' });
+    runTasksEvidence(baseDir, 'T-0001', { add: ['docs/proof.md'] });
+    expect(runTasksComplete(baseDir, 'T-0001')).toBe(0);
+    const before = readTasks(baseDir)[0];
+    expect(runTasksSpec(baseDir, 'T-0001', { set: 'specs/x.md' })).toBe(1);
+    expect(errs.join('\n')).toMatch(/completed/i);
+    const after = readTasks(baseDir)[0];
+    expect(after?.spec).toBeUndefined();
+    expect(after?.updated_at).toBe(before?.updated_at);
+  });
+
+  it('refuses a cancelled task (no write, record unchanged)', () => {
+    runTasksAdd(baseDir, { subject: 'to cancel' });
+    updateTasks(baseDir, (tasks) => {
+      const t = tasks.find((x) => x.id === 'T-0001');
+      if (t === undefined) return [];
+      return [{ ...t, status: 'cancelled', active: false, updated_at: new Date().toISOString() }];
+    });
+    const before = readTasks(baseDir)[0];
+    expect(runTasksSpec(baseDir, 'T-0001', { requiresSpec: true })).toBe(1);
+    expect(errs.join('\n')).toMatch(/cancelled/i);
+    const after = readTasks(baseDir)[0];
+    expect(after?.requires_spec).toBe(before?.requires_spec);
+    expect(after?.updated_at).toBe(before?.updated_at);
+  });
+
+  it('--json emits the updated record', () => {
+    runTasksAdd(baseDir, { subject: 'json out' });
+    out.length = 0;
+    expect(runTasksSpec(baseDir, 'T-0001', { set: 'specs/j.md', json: true })).toBe(0);
+    const parsed = JSON.parse(out.join('')) as { id: string; spec: string };
+    expect(parsed.id).toBe('T-0001');
+    expect(parsed.spec).toBe('specs/j.md');
   });
 });
 
