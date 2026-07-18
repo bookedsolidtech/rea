@@ -220,7 +220,14 @@ export async function runGateSpecCheck(options: GateSpecCheckOptions = {}): Prom
     return { exitCode: 2, stderr, stdout };
   };
 
-  // Read the task store. An unreadable store is UNCERTAIN.
+  // Read the task store from the WORKING TREE (not the git index) — this is
+  // correct by design, not the round-28 P1 concern. `.rea/tasks.jsonl` is a
+  // managed `.gitignore` entry (rounds 15/16): it is LOCAL per-worktree working
+  // state and is NEVER staged, so there is no "staged task store" to read —
+  // `git cat-file :.rea/tasks.jsonl` would always be empty. The active-task
+  // pointer is intentionally local; the artifact G1 requires to be COMMITTED is
+  // the SPEC it references, which IS verified against the index below. An
+  // unreadable store is UNCERTAIN.
   let tasks: TaskRecord[];
   try {
     tasks = readTasks(localRoot);
@@ -294,23 +301,23 @@ export async function runGateSpecCheck(options: GateSpecCheckOptions = {}): Prom
     );
   }
   // `cat-file -t` returns the object type; require a `blob` (a FILE), not a
-  // `tree` (a directory). Accept the spec when it is a blob in the INDEX
-  // (`:${specPath}` — STAGED in the commit being made) OR at HEAD (committed
-  // in a prior commit). The index check is what unblocks the documented
-  // `rea tasks add --spec … --requires-spec` flow (round-27 P1): the very
-  // commit that INTRODUCES the spec has it staged but not yet at HEAD, so a
-  // HEAD-only check would deadlock — the only commit that could satisfy the
-  // gate would be the one it refuses. A directory is a `tree` in both and a
-  // path with no index/HEAD entry fails both, so both stay rejected.
+  // `tree` (a directory). Resolve against the INDEX (`:${specPath}`) — the
+  // state being committed — NOT the working tree or HEAD. The index covers
+  // BOTH cases in one check: a newly-staged spec (the commit that introduces
+  // it — round-27 P1: a HEAD-only check deadlocked this flow) AND an
+  // already-tracked unchanged spec (git keeps tracked files in the index). It
+  // deliberately does NOT fall back to HEAD (round-28 P2): a spec staged for
+  // REMOVAL (`git rm --cached`) is gone from the index but still at HEAD, so a
+  // HEAD fallback would wrongly pass a commit that deletes the required spec. A
+  // directory is a `tree`, and a path with no index entry fails, so both stay
+  // rejected.
   const stagedType = git(['cat-file', '-t', `:${specPath}`]);
-  const stagedAsFile = stagedType.status === 0 && stagedType.stdout.trim() === 'blob';
-  const headType = git(['cat-file', '-t', `HEAD:${specPath}`]);
-  const headAsFile = headType.status === 0 && headType.stdout.trim() === 'blob';
-  if (!stagedAsFile && !headAsFile) {
+  const committedAsFile = stagedType.status === 0 && stagedType.stdout.trim() === 'blob';
+  if (!committedAsFile) {
     return resolveVerdict(
       'spec not committed',
       metaCommon,
-      banner(`the spec ${specPath} is not committed as a file (staged or at HEAD)`),
+      banner(`the spec ${specPath} is not committed as a file (not staged in the index)`),
     );
   }
 

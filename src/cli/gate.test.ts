@@ -172,6 +172,23 @@ describe('runGateSpecCheck', () => {
     expect(r.exitCode).toBe(0);
   });
 
+  it('over threshold + spec staged for DELETION (git rm --cached) → enforce blocks (round-28 P2)', async () => {
+    // The spec is committed at HEAD but its removal is staged (gone from the
+    // index, still on disk). A HEAD fallback would wrongly pass a commit that
+    // deletes the required spec; the index-only check blocks it.
+    initRepo(root);
+    fs.mkdirSync(path.join(root, 'docs'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'docs', 'spec.md'), '# spec\n');
+    git(root, ['add', 'docs/spec.md']);
+    git(root, ['commit', '-q', '-m', 'add spec']);
+    git(root, ['rm', '--cached', '-q', 'docs/spec.md']); // stage removal, keep on disk
+    writePolicy(root, { mode: 'enforce', diffLines: 10, diffFiles: 2 });
+    writeTasks(root, [{ spec: 'docs/spec.md', requires_spec: true }]);
+    stageBigChange(root, 'big.txt', 50);
+    const r = await runGateSpecCheck({ reaRoot: root });
+    expect(r.exitCode).toBe(2);
+  });
+
   it('over threshold + spec is a committed DIRECTORY → enforce blocks (round-10 P2)', async () => {
     initRepo(root);
     // Commit a directory (not a spec document). Both existsSync('docs')
