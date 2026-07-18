@@ -65,7 +65,8 @@ import {
   pruneMatcherScopedHooks,
   readSettings,
   writeSettingsAtomic,
-  type MatcherScopedPruneSpec,
+  STALE_HOOK_COMMAND_TOKENS,
+  STALE_MATCHER_SCOPED_HOOKS,
 } from './install/settings-merge.js';
 import { validateSettings } from '../config/settings-schema.js';
 import { ensureReaGitignore } from './install/gitignore.js';
@@ -452,53 +453,11 @@ async function upgradeClaudeMdFragment(
   return { sha: newSha, action: 'written' };
 }
 
-/**
- * Hook commands deleted in 0.11.0. `upgradeSettings` prunes any entries
- * whose `command` string contains one of these tokens so consumer
- * `.claude/settings.json` files don't keep invoking missing scripts
- * (which would fail every matched tool call until the operator edited
- * settings by hand).
- *
- * 0.11.0 removals:
- *   - push-review-gate.sh        (replaced by husky stub → rea hook push-gate)
- *   - commit-review-gate.sh      (intentionally unregistered; source-of-truth deleted)
- *   - push-review-gate-git.sh    (native-git adapter; deleted)
- *
- * Add future removals here rather than baking the list into
- * `pruneHookCommands` itself — the removal list is release history,
- * not a static setting.
- */
-const STALE_HOOK_COMMAND_TOKENS: readonly string[] = [
-  'push-review-gate.sh',
-  'commit-review-gate.sh',
-  'push-review-gate-git.sh',
-];
-
-/**
- * Hooks that MOVED matchers between releases. `mergeSettings` is
- * additive-only, so without a matcher-scoped prune a repo upgrading from an
- * older release keeps its OLD-matcher registration AND gains the NEW one,
- * double-invoking the hook on every matched tool call. Unlike
- * `STALE_HOOK_COMMAND_TOKENS` (outright hook DELETIONS), these entries keep
- * the same command string under a new matcher, so the prune MUST be
- * matcher-scoped — a blanket command-substring prune would delete both the old
- * AND the new registration.
- *
- * Migration history:
- *   - `billing-cap-halt.sh`: `PostToolUse/Bash` → `PostToolUse/*` (round-24 —
- *     the turn counter must count EVERY tool call, not just Bash). Scoped to
- *     the rea-managed shape: event `PostToolUse`, matcher EXACTLY `Bash`,
- *     command `billing-cap-halt.sh`. Entry-level, so a consumer who chained
- *     other hooks onto their own `Bash` matcher keeps those siblings; only the
- *     stale rea entry is removed, and the group is dropped only if it becomes
- *     empty. The new `*` group (different matcher) is never touched.
- *
- * Add future matcher MOVES here rather than baking them into the prune helper
- * — the list is release history, not a static setting.
- */
-const STALE_MATCHER_SCOPED_HOOKS: readonly MatcherScopedPruneSpec[] = [
-  { event: 'PostToolUse', matcher: 'Bash', commandIncludes: 'billing-cap-halt.sh' },
-];
+// STALE_HOOK_COMMAND_TOKENS and STALE_MATCHER_SCOPED_HOOKS were relocated to
+// `./install/settings-merge.js` (their natural shared home, next to
+// `pruneHookCommands` / `pruneMatcherScopedHooks`) so `rea init` and
+// `rea upgrade` prune against ONE source of truth (codex round-47 P2). They are
+// imported at the top of this file; the values and call order are unchanged.
 
 async function upgradeSettings(
   baseDir: string,

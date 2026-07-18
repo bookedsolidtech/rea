@@ -12,8 +12,12 @@ import {
   canonicalSettingsSubsetHash,
   defaultDesiredHooks,
   mergeSettings,
+  pruneHookCommands,
+  pruneMatcherScopedHooks,
   readSettings,
   writeSettingsAtomic,
+  STALE_HOOK_COMMAND_TOKENS,
+  STALE_MATCHER_SCOPED_HOOKS,
 } from './install/settings-merge.js';
 import { EXPECTED_HOOKS } from './doctor.js';
 import { installCommitMsgHook } from './install/commit-msg.js';
@@ -1947,7 +1951,21 @@ export async function runInit(options: InitOptions): Promise<void> {
 
     const { settings, settingsPath } = readSettings(targetDir);
     const desired = defaultDesiredHooks();
-    mergeResult = mergeSettings(settings, desired);
+    // Mirror `rea upgrade`'s prune-before-merge sequence (upgrade.ts
+    // upgradeSettings). `mergeSettings` is additive-only, so re-running
+    // `rea init` over an already-installed repo whose registration predates a
+    // hook DELETION (STALE_HOOK_COMMAND_TOKENS) or a matcher MOVE
+    // (STALE_MATCHER_SCOPED_HOOKS — billing-cap-halt Bash→*) would leave BOTH
+    // the stale and the new entry, double-invoking the hook and breaking the
+    // "init twice = byte-identical" invariant (codex round-47 P2). Prune runs
+    // BEFORE the additive merge so the merge re-adds each hook under its NEW
+    // matcher against a clean baseline — exactly one registration remains.
+    // Idempotent + fresh-install-safe: on a repo with no stale registrations
+    // (including a fresh install with no settings.json), both prunes match
+    // nothing and the merged output is byte-identical to the pre-fix behavior.
+    const pruned = pruneHookCommands(settings, STALE_HOOK_COMMAND_TOKENS);
+    const movedPruned = pruneMatcherScopedHooks(pruned.merged, STALE_MATCHER_SCOPED_HOOKS);
+    mergeResult = mergeSettings(movedPruned.merged, desired);
     await writeSettingsAtomic(settingsPath, mergeResult.merged);
 
     commitMsgResult = await installCommitMsgHook(targetDir);
