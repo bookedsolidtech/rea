@@ -252,6 +252,14 @@ export async function runVerifyGateBashGate(
       reaRoot,
       commonRoot,
       siblingRoots,
+      // Round-57 P1: a Bash command run from a SUBDIRECTORY resolves a relative
+      // redirect against its OWN cwd, not the repo root. Thread the payload cwd
+      // so `> ../.rea/tasks.jsonl` from a subdir is resolved against that cwd
+      // (reaching the store) instead of joining repo-root-relative and landing
+      // outside the root — where the store-write would slip the scan. reaRoot
+      // stays a resolution base, so repo-root-relative + absolute writes are
+      // still caught unchanged.
+      cwd: payloadCwd,
       blockedPaths: [TASKS_RELATIVE],
       // A cross-root target (worktree → primary/sibling) is still the task
       // store of THAT stream — union with the same synthetic entry.

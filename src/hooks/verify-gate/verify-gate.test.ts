@@ -575,6 +575,31 @@ describe('runVerifyGate', () => {
     expect(r.exitCode).toBe(2); // caught against the repo store; not masked by the nested one
   });
 
+  it('round-57 P2: a relative file_path with NO payload cwd resolves against process.cwd() → caught', async () => {
+    // The payload OMITS `cwd`. reaRoot = root; the process runs in root/sub. A
+    // `../.rea/tasks.jsonl` write resolves (repo-root base) to the PARENT — a
+    // miss — but against process.cwd() (root/sub) it reaches the store. Without
+    // the process.cwd() fallback candidate the no-evidence completion slips the
+    // gate; with it, the write is recognized and refused.
+    writePolicy(root, 'enforce');
+    fs.writeFileSync(path.join(root, '.rea', 'tasks.jsonl'), taskLine({ status: 'in_progress' }) + '\n');
+    const sub = path.join(root, 'sub');
+    fs.mkdirSync(sub, { recursive: true });
+    const prevCwd = process.cwd();
+    process.chdir(sub);
+    try {
+      const payload = JSON.stringify({
+        tool_name: 'Write',
+        // deliberately NO `cwd` field — the client omitted it.
+        tool_input: { file_path: '../.rea/tasks.jsonl', content: COMPLETED_NO_EVIDENCE },
+      });
+      const r = await runVerifyGate({ reaRoot: root, stdinOverride: payload });
+      expect(r.exitCode).toBe(2);
+    } finally {
+      process.chdir(prevCwd);
+    }
+  });
+
   it('round-32: a `../`-relative path from a subdir reconstructs against the PARENT (repo) store', async () => {
     writePolicy(root, 'enforce');
     fs.writeFileSync(path.join(root, '.rea', 'tasks.jsonl'), taskLine({ status: 'in_progress' }) + '\n');

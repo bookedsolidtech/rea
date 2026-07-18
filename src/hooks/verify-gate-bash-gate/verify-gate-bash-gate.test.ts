@@ -268,6 +268,49 @@ describe('verify-gate-bash-gate (G2 Bash-tier)', () => {
     });
   });
 
+  // Round-57 P1 — a Bash command run from a SUBDIRECTORY resolves a relative
+  // redirect against its OWN cwd, not the repo root. The payload `cwd` must be
+  // threaded into the scan so a subdir-relative store write is still caught.
+  describe('P1 — subdirectory cwd-relative redirect (enforce)', () => {
+    beforeEach(() => writePolicy(root, 'enforce'));
+
+    it('`> ../../.rea/tasks.jsonl` from a subdir cwd → exit 2 (caught via payload cwd)', async () => {
+      const sub = path.join(root, 'packages', 'foo');
+      fs.mkdirSync(sub, { recursive: true });
+      // From packages/foo, `../../.rea/tasks.jsonl` reaches the repo store. Joined
+      // repo-root-relative it would land OUTSIDE the root (a miss); resolved
+      // against the payload cwd it hits the store.
+      const r = await runVerifyGateBashGate({
+        reaRoot: root,
+        stdinOverride: JSON.stringify({
+          tool_name: 'Bash',
+          cwd: sub,
+          tool_input: { command: 'echo x > ../../.rea/tasks.jsonl' },
+        }),
+      });
+      expect(r.exitCode).toBe(2);
+      expect(r.detected).toBe(true);
+      expect(r.stderr).toContain('rea tasks');
+    });
+
+    it('repo-root-relative `> .rea/tasks.jsonl` still caught when a differing cwd is present (no weakening)', async () => {
+      const sub = path.join(root, 'packages', 'foo');
+      fs.mkdirSync(sub, { recursive: true });
+      // The reaRoot base is ALWAYS tried (base[0]), so a target expressed
+      // repo-root-relative is still detected even with a differing cwd threaded.
+      const r = await runVerifyGateBashGate({
+        reaRoot: root,
+        stdinOverride: JSON.stringify({
+          tool_name: 'Bash',
+          cwd: sub,
+          tool_input: { command: 'echo x > .rea/tasks.jsonl' },
+        }),
+      });
+      expect(r.exitCode).toBe(2);
+      expect(r.detected).toBe(true);
+    });
+  });
+
   describe('shadow', () => {
     it('redirect to store → exit 0 but detected (would_block logged)', async () => {
       writePolicy(root, 'shadow');

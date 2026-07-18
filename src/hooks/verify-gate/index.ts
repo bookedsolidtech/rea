@@ -179,11 +179,21 @@ function resolveTasksJsonlTarget(
   }
   if (storeCanons.length === 0) return null;
 
+  // Round-57 P2: a RELATIVE `file_path` resolves against the working directory
+  // the write physically happens in. The payload's `cwd` names it when present;
+  // but the parser treats `cwd` as OPTIONAL, and a client that OMITS it lets a
+  // subdirectory session express a relative path that reaches the store yet
+  // matches neither `reaRoot` nor (absent) payload-cwd. When `cwd` is absent,
+  // `process.cwd()` is the operative base — add it so that path is still
+  // recognized. `reaRoot` remains a candidate unconditionally (an existing
+  // repo-root-relative match is never weakened).
   const candidates = path.isAbsolute(filePath)
     ? [filePath]
     : [
         path.resolve(reaRoot, filePath),
-        ...(payloadCwd.length > 0 ? [path.resolve(payloadCwd, filePath)] : []),
+        ...(payloadCwd.length > 0
+          ? [path.resolve(payloadCwd, filePath)]
+          : [path.resolve(process.cwd(), filePath)]),
       ];
   for (const cand of candidates) {
     const cc = canonicalizePath(cand);

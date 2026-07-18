@@ -36,6 +36,19 @@ export interface BlockedScanContext {
   commonRoot?: string;
   /** Round-10 P1: sibling worktree roots — see ProtectedScanContext. */
   siblingRoots?: readonly string[];
+  /**
+   * Round-57 P1: the working directory the command physically RUNS IN
+   * (the hook payload's `cwd`). A relative redirect target
+   * (`> ../.rea/tasks.jsonl`) resolves against the process cwd, NOT the
+   * repository root — a subdirectory session can otherwise express a
+   * store-write that lands OUTSIDE `reaRoot` when joined repo-root-relative
+   * and slips the scan. When provided (and different from `reaRoot`), each
+   * relative target is additionally resolved against this base. `reaRoot`
+   * remains a resolution base unconditionally, so an existing repo-root-
+   * relative or absolute match is never weakened. Absent → reaRoot-only
+   * (plain behavior; every existing caller that omits it is byte-identical).
+   */
+  cwd?: string;
   blockedPaths: readonly string[];
   /**
    * Round-11 P1: loader for ANOTHER root's blocked_paths. When a target
@@ -66,6 +79,7 @@ function normalizeTarget(
   form?: DetectedForm,
   commonRoot?: string,
   siblingRoots?: readonly string[],
+  relBase?: string,
 ): BlockedNormalized {
   let t = raw;
   if (t.length >= 2 && t.startsWith('"') && t.endsWith('"')) t = t.slice(1, -1);
@@ -132,7 +146,12 @@ function normalizeTarget(
 
   let abs = normalized;
   if (!abs.startsWith('/')) {
-    abs = path.join(reaRoot, abs);
+    // Round-57 P1: resolve a RELATIVE target against the caller-supplied base
+    // (the command's cwd) when given, else the repository root — the historical
+    // default. Membership + cross-root derivation below still key off reaRoot /
+    // commonRoot / siblings, so only the STARTING directory of a relative join
+    // changes; an absolute target never reaches here.
+    abs = path.join(relBase ?? reaRoot, abs);
   }
   let collapsed = collapseDotDot(abs);
   let effectiveRoot = reaRoot;
@@ -558,72 +577,113 @@ export function scanForBlockedViolations(
     }
     if (d.path.length === 0) continue;
 
-    const norm = normalizeTarget(ctx.reaRoot, d.path, d.form, ctx.commonRoot, ctx.siblingRoots);
-    if (norm.expansion) {
-      return blockVerdict({
-        reason: [
-          'BLOCKED PATH (bash): unresolved shell expansion in target.',
-          '',
-          `  Token:           ${norm.original}`,
-          `  Detected as:     ${d.form}`,
-        ].join('\n'),
-        hitPattern: '(dynamic target)',
-        detectedForm: d.form,
-        ...(d.position.line > 0 ? { sourcePosition: d.position } : {}),
-      });
+    // Round-57 P1: resolve a RELATIVE target against every candidate base and
+    // block on the FIRST that matches. `reaRoot` is always tried (the
+    // historical base — an existing repo-root-relative or absolute hit is
+    // never weakened); the payload `cwd` is added when the caller supplies it
+    // and it differs, so a subdirectory session's cwd-relative redirect that
+    // reaches the governed store (`> ../.rea/tasks.jsonl`) is caught instead of
+    // being dismissed as an outside-root miss. For an absolute target the base
+    // is irrelevant, so the second pass is a harmless duplicate.
+    const relBases: string[] = [ctx.reaRoot];
+    if (ctx.cwd !== undefined && ctx.cwd.length > 0 && ctx.cwd !== ctx.reaRoot) {
+      relBases.push(ctx.cwd);
     }
-    if (norm.outsideRoot) {
-      // blocked_paths is project-relative; outside-root paths can't
-      // match. Continue to the next detection.
-      continue;
-    }
-
-    const dirOptions = d.isDirTarget === true ? { forceDirSemantics: true } : undefined;
-    // Round-11 P1: cross-root targets match the UNION of the caller's
-    // list and the TARGET root's own blocked_paths.
-    const crossRootsHit = [
-      ...(norm.rootUsed !== undefined ? [norm.rootUsed] : []),
-      ...(norm.resolvedRootUsed !== undefined ? [norm.resolvedRootUsed] : []),
-    ];
-    const effectiveBlocked =
-      crossRootsHit.length > 0 && ctx.blockedPathsForRoot !== undefined
-        ? [
-            ...new Set([
-              ...ctx.blockedPaths,
-              ...crossRootsHit.flatMap((r) => [...(ctx.blockedPathsForRoot?.(r) ?? [])]),
-            ]),
-          ]
-        : ctx.blockedPaths;
-    const logicalHit = matchBlockedEntry(norm.pathLc, effectiveBlocked, dirOptions);
-    if (logicalHit !== null) {
-      return blockVerdict({
-        reason: buildBlockReason({
-          entry: logicalHit,
-          hitForm: norm.pathLc,
-          detectedForm: d.form,
-          originalToken: norm.original,
-        }),
-        hitPattern: logicalHit,
-        detectedForm: d.form,
-        ...(d.position.line > 0 ? { sourcePosition: d.position } : {}),
-      });
-    }
-    if (norm.resolvedLc !== null) {
-      const resolvedHit = matchBlockedEntry(norm.resolvedLc, effectiveBlocked, dirOptions);
-      if (resolvedHit !== null) {
+    let matched: Verdict | null = null;
+    for (const relBase of relBases) {
+      const norm = normalizeTarget(
+        ctx.reaRoot,
+        d.path,
+        d.form,
+        ctx.commonRoot,
+        ctx.siblingRoots,
+        relBase,
+      );
+      if (norm.expansion) {
+        // A dynamic target is base-independent — refuse on uncertainty exactly
+        // as before (reaRoot is base[0], so this fires on the first pass).
         return blockVerdict({
-          reason: buildBlockReason({
-            entry: resolvedHit,
-            hitForm: norm.resolvedLc,
-            detectedForm: d.form,
-            originalToken: norm.original,
-          }),
-          hitPattern: resolvedHit,
+          reason: [
+            'BLOCKED PATH (bash): unresolved shell expansion in target.',
+            '',
+            `  Token:           ${norm.original}`,
+            `  Detected as:     ${d.form}`,
+          ].join('\n'),
+          hitPattern: '(dynamic target)',
           detectedForm: d.form,
           ...(d.position.line > 0 ? { sourcePosition: d.position } : {}),
         });
       }
+      if (norm.outsideRoot) {
+        // blocked_paths is project-relative; an outside-root resolution can't
+        // match against THIS base — try the next candidate base before giving
+        // up on the detection.
+        continue;
+      }
+      matched = matchNormalizedTarget(ctx, norm, d);
+      if (matched !== null) break;
     }
+    if (matched !== null) return matched;
   }
   return allowVerdict();
+}
+
+/**
+ * Match a single normalized (in-root) target against the effective
+ * blocked_paths list, returning a block `Verdict` on the logical or the
+ * symlink-resolved form, or `null` for no match. Extracted (round-57 P1) so
+ * the same match logic runs unchanged across each relative-resolution base.
+ */
+function matchNormalizedTarget(
+  ctx: BlockedScanContext,
+  norm: BlockedNormalized,
+  d: DetectedWrite,
+): Verdict | null {
+  const dirOptions = d.isDirTarget === true ? { forceDirSemantics: true } : undefined;
+  // Round-11 P1: cross-root targets match the UNION of the caller's
+  // list and the TARGET root's own blocked_paths.
+  const crossRootsHit = [
+    ...(norm.rootUsed !== undefined ? [norm.rootUsed] : []),
+    ...(norm.resolvedRootUsed !== undefined ? [norm.resolvedRootUsed] : []),
+  ];
+  const effectiveBlocked =
+    crossRootsHit.length > 0 && ctx.blockedPathsForRoot !== undefined
+      ? [
+          ...new Set([
+            ...ctx.blockedPaths,
+            ...crossRootsHit.flatMap((r) => [...(ctx.blockedPathsForRoot?.(r) ?? [])]),
+          ]),
+        ]
+      : ctx.blockedPaths;
+  const logicalHit = matchBlockedEntry(norm.pathLc, effectiveBlocked, dirOptions);
+  if (logicalHit !== null) {
+    return blockVerdict({
+      reason: buildBlockReason({
+        entry: logicalHit,
+        hitForm: norm.pathLc,
+        detectedForm: d.form,
+        originalToken: norm.original,
+      }),
+      hitPattern: logicalHit,
+      detectedForm: d.form,
+      ...(d.position.line > 0 ? { sourcePosition: d.position } : {}),
+    });
+  }
+  if (norm.resolvedLc !== null) {
+    const resolvedHit = matchBlockedEntry(norm.resolvedLc, effectiveBlocked, dirOptions);
+    if (resolvedHit !== null) {
+      return blockVerdict({
+        reason: buildBlockReason({
+          entry: resolvedHit,
+          hitForm: norm.resolvedLc,
+          detectedForm: d.form,
+          originalToken: norm.original,
+        }),
+        hitPattern: resolvedHit,
+        detectedForm: d.form,
+        ...(d.position.line > 0 ? { sourcePosition: d.position } : {}),
+      });
+    }
+  }
+  return null;
 }
