@@ -155,7 +155,7 @@ async function withRegistryLock<T>(registryPath: string, fn: () => Promise<T>): 
  * checkout does not create a duplicate entry. Falls back to the lexical
  * resolve when the path does not exist yet.
  */
-function canonicalizeProjectPath(projectDir: string): string {
+export function canonicalizeProjectPath(projectDir: string): string {
   const resolved = path.resolve(projectDir);
   try {
     return fs.realpathSync(resolved);

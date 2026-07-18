@@ -39,8 +39,10 @@ import path from 'node:path';
 import type { Command } from 'commander';
 import { parse as parseYaml } from 'yaml';
 import { readTasks } from '../tasks/store.js';
+import { resolveLocalRoot } from '../lib/worktree-roots.js';
 import type { TaskRecord } from '../tasks/types.js';
 import {
+  canonicalizeProjectPath,
   defaultRegistryPath,
   loadRegistry,
   pruneMissing,
@@ -494,7 +496,12 @@ export async function runDash(opts: DashOptions = {}): Promise<number> {
 
   // Per-repo mode — single project, registry not required.
   if (opts.path !== undefined) {
-    const projectDir = path.resolve(opts.path);
+    // Round-9 P2: resolve to the checkout ROOT (git toplevel → nearest
+    // .rea walk → verbatim) and canonicalize, so `rea dash .` from a
+    // subdirectory (or a symlinked path) points at the project's real
+    // root — otherwise the registry lookup misses and the project is
+    // mis-reported as `deregistered`.
+    const projectDir = canonicalizeProjectPath(resolveLocalRoot(path.resolve(opts.path)));
     let entry: ProjectEntry | undefined;
     try {
       entry = loadRegistry(registryPath).projects[projectDir];
