@@ -94,6 +94,28 @@ describe('policy loader', () => {
       expect(() => loadPolicy(baseDir)).toThrow(/Invalid policy schema/);
     });
 
+    it('accepts review.codex_reasoning_effort: xhigh (codex-cli 0.142.x tier)', async () => {
+      const yaml = SAMPLE + '\nreview:\n  codex_reasoning_effort: xhigh\n';
+      await fs.writeFile(path.join(baseDir, '.rea', 'policy.yaml'), yaml, 'utf8');
+      const p = loadPolicy(baseDir);
+      expect(p.review?.codex_reasoning_effort).toBe('xhigh');
+    });
+
+    it('still accepts the low/medium/high reasoning tiers', async () => {
+      for (const level of ['low', 'medium', 'high'] as const) {
+        const yaml = SAMPLE + `\nreview:\n  codex_reasoning_effort: ${level}\n`;
+        await fs.writeFile(path.join(baseDir, '.rea', 'policy.yaml'), yaml, 'utf8');
+        invalidatePolicyCache();
+        expect(loadPolicy(baseDir).review?.codex_reasoning_effort).toBe(level);
+      }
+    });
+
+    it('rejects an unknown reasoning tier', async () => {
+      const yaml = SAMPLE + '\nreview:\n  codex_reasoning_effort: ultra\n';
+      await fs.writeFile(path.join(baseDir, '.rea', 'policy.yaml'), yaml, 'utf8');
+      expect(() => loadPolicy(baseDir)).toThrow(/Invalid policy schema/);
+    });
+
     it('leaves review undefined when not set (backwards compatible)', async () => {
       await fs.writeFile(path.join(baseDir, '.rea', 'policy.yaml'), SAMPLE, 'utf8');
       const p = loadPolicy(baseDir);

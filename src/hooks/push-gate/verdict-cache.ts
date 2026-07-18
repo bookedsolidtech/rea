@@ -83,7 +83,7 @@ export interface VerdictCacheEntry {
   finding_count: number;
   reviewed_at: string;
   model: string;
-  reasoning_effort: 'low' | 'medium' | 'high';
+  reasoning_effort: 'low' | 'medium' | 'high' | 'xhigh';
   ttl_ms: number;
   /**
    * 0.54.0 round-29 P2: the REDACTED findings + review text as written
