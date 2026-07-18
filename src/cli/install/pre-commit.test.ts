@@ -108,6 +108,22 @@ describe('pre-commit installer — active-hooks-path resolution (F1)', () => {
     expect(fssync.existsSync(path.join(dir, '.git', 'hooks', 'pre-commit'))).toBe(false);
   });
 
+  // Round-13 F1 — Husky 9's DEFAULT layout is `core.hooksPath=.husky/_`. git
+  // fires the generated stub `.husky/_/pre-commit`, which sources `.husky/_/h`
+  // and execs the USER hook `.husky/pre-commit`. The managed hook must land at
+  // the USER path, not the `_` stub dir (which husky regenerates + which the
+  // installer would classify foreign).
+  it('core.hooksPath=.husky/_ (Husky 9 default) installs at the USER path `.husky/pre-commit`', async () => {
+    await setHooksPath(dir, '.husky/_');
+    const resolved = await resolveTargetHookPath(dir);
+    expect(resolved.hookPath).toBe(path.join(dir, '.husky', 'pre-commit'));
+    const res = await installPreCommitHook({ targetDir: dir });
+    expect(res.decision.action).toBe('install');
+    expect(res.written).toBe(path.join(dir, '.husky', 'pre-commit'));
+    // Nothing written INTO the stub dir.
+    expect(fssync.existsSync(path.join(dir, '.husky', '_', 'pre-commit'))).toBe(false);
+  });
+
   it('installs then reclassifies as refresh (idempotent, byte-identical)', async () => {
     await setHooksPath(dir, '.husky');
     const first = await installPreCommitHook({ targetDir: dir });

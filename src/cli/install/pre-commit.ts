@@ -217,7 +217,17 @@ export async function resolveTargetHookPath(
 ): Promise<{ hookPath: string; hooksPathConfigured: boolean }> {
   const hooksInfo = await resolveHooksDir(targetDir);
   if (hooksInfo.configured && hooksInfo.dir !== null) {
-    return { hookPath: path.join(hooksInfo.dir, 'pre-commit'), hooksPathConfigured: true };
+    let dir = hooksInfo.dir;
+    // Round-13 F1 — Husky 9 default layout: `core.hooksPath=.husky/_` points
+    // at the GENERATED stub dir. git fires `.husky/_/pre-commit` (a stub that
+    // sources `.husky/_/h`, which execs the USER hook `.husky/pre-commit`).
+    // Writing a managed hook INTO `_/` would be (a) classified foreign and
+    // skipped, and (b) clobbered by husky's stub regeneration. Install at the
+    // USER hook path — the parent of the `_` stub dir — which the stub sources.
+    if (path.basename(dir) === '_' && path.basename(path.dirname(dir)) === '.husky') {
+      dir = path.dirname(dir);
+    }
+    return { hookPath: path.join(dir, 'pre-commit'), hooksPathConfigured: true };
   }
   const gitHookPath = await resolveGitHookPath(targetDir);
   if (gitHookPath !== null) {

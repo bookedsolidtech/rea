@@ -29,6 +29,16 @@
  * inherits all of it without re-parsing redirects. A `block` verdict means
  * "this command writes to `.rea/tasks.jsonl`".
  *
+ * ## Relevance (round-13 F3): mode, not keywords
+ *
+ * The gate keys on POLICY MODE, not command keywords. `off` (default) →
+ * byte-identical no-op (no scan, no audit). shadow/enforce → the scanner runs
+ * on every non-empty Bash command; a `block` verdict counts ONLY when it is a
+ * STATIC match on the store (`hit_pattern === .rea/tasks.jsonl`), which the
+ * scanner produces for a symlink ALIAS (`tee tasklog`) after resolving it. The
+ * pre-0.13 `tasks`+`jsonl` substring pre-filter was unsound — an alias names
+ * neither token — and has been removed here AND in the shim relevance gate.
+ *
  * ## Out of scope (documented residuals)
  *
  *   - `python -c "open('.rea/tasks.jsonl','w')"` and other interpreter-
@@ -36,10 +46,12 @@
  *     interpreter does with its argv. The editor gate + `rea tasks` CLI
  *     remain the primary enforcement; this gate closes the shell-redirect
  *     class only.
- *   - A fully-dynamic target whose command never names the store
- *     (`F=$(...); echo x > "$F"` with the assignment in a PRIOR command):
- *     the relevance pre-gate skips it, matching the editor gate's
- *     file-path scoping and the shim's relevance filter.
+ *   - A FULLY-DYNAMIC write target that never names the store statically
+ *     (`F=$(...); echo x > "$F"`): the scanner refuses on uncertainty with a
+ *     dynamic `hit_pattern`, which this gate deliberately does NOT treat as a
+ *     store hit (to avoid over-refusing unrelated dynamic writes under
+ *     enforce). Symlink aliases are NOT in this class — they resolve
+ *     statically.
  *
  * ## Order of operations
  *
@@ -92,18 +104,6 @@ export interface VerifyGateBashGateResult {
   mode: GateMode;
   /** True when a write to `.rea/tasks.jsonl` was detected (test seam). */
   detected: boolean;
-}
-
-/**
- * Relevance pre-gate. The scanner only needs to run when the command
- * plausibly names the task store — the filename `tasks.jsonl` cannot be
- * obfuscated away (the file IS named that), so requiring BOTH substrings is
- * robust to quoting/backslash tricks on the path prefix while still bounding
- * the scan (and the refuse-on-uncertainty posture) to plausibly-relevant
- * commands. Case-insensitive for defence-in-depth.
- */
-function commandReferencesTaskStore(cmd: string): boolean {
-  return /tasks/i.test(cmd) && /jsonl/i.test(cmd);
 }
 
 function refusalBanner(): string {
@@ -240,16 +240,12 @@ export async function runVerifyGateBashGate(
     return { exitCode: 0, stderr, mode, detected: false };
   }
 
-  // Relevance pre-gate: skip the scan (and its refuse-on-uncertainty posture)
-  // for commands that do not name the task store.
-  if (!commandReferencesTaskStore(cmd)) {
-    return { exitCode: 0, stderr, mode, detected: false };
-  }
-
-  // Detect a shell write to `.rea/tasks.jsonl` by reusing the AST-backed
-  // blocked-scan with a single synthetic entry. A `block` verdict = a write
-  // (static match) OR an unresolvable target on a store-naming command
-  // (refuse-on-uncertainty) — both are G2 hits.
+  // Round-13 F3: NO keyword pre-filter. The previous `tasks`+`jsonl` substring
+  // relevance was UNSOUND for symlink aliases (`tee tasklog` names neither),
+  // so it short-circuited before the scanner could resolve the alias. Mode
+  // already gated `off` above (byte-identical, no scan); when opted-in we scan
+  // EVERY non-empty Bash command and let the AST scanner's write-target
+  // detection — which canonicalizes/follows symlinks — decide.
   const siblingRoots = listSiblingWorktreeRoots(commonRoot, reaRoot);
   const verdict = runBlockedScan(
     {
@@ -264,7 +260,14 @@ export async function runVerifyGateBashGate(
     cmd,
   );
 
-  if (verdict.verdict !== 'block') {
+  // A `block` verdict is a G2 hit ONLY when it is a STATIC match on the task
+  // store (`hit_pattern === TASKS_RELATIVE`) — which INCLUDES a symlink ALIAS
+  // the scanner resolved (`tee tasklog` → `.rea/tasks.jsonl`). A dynamic /
+  // refuse-on-uncertainty block (unresolvable `> "$VAR"`) is NOT necessarily
+  // the store; a default-off defence-in-depth gate must not over-refuse
+  // unrelated dynamic writes. Fully-dynamic store writes that never name it
+  // statically remain a documented residual (see the module header).
+  if (verdict.verdict !== 'block' || verdict.hit_pattern !== TASKS_RELATIVE) {
     return { exitCode: 0, stderr, mode, detected: false };
   }
 

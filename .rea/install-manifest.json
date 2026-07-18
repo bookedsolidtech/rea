@@ -151,12 +151,12 @@
     },
     {
       "path": ".claude/hooks/verify-gate-bash-gate.sh",
-      "sha256": "5845a1cadf3942c8838dc8f678b20b26c2cd25152acfe1c117d393e91aed04d2",
+      "sha256": "165813401d6b2b8d023e945d40fefbfaa94e388f35d66bdb7544063884adaf56",
       "source": "hook"
     },
     {
       "path": ".claude/hooks/verify-gate.sh",
-      "sha256": "e982a3ecb6eac77e95e0e48483265ad00fcdc350137d9bd1c2eb056855823548",
+      "sha256": "f214c5391583ff6f23de282592deef7a7835b38d8c1ec81888a972c4a688a9f1",
       "source": "hook"
     },
     {

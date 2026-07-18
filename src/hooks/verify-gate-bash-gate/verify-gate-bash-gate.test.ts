@@ -205,6 +205,69 @@ describe('verify-gate-bash-gate (G2 Bash-tier)', () => {
     });
   });
 
+  // Round-13 F3 — symlink ALIAS coverage (the keyword pre-filter's blind spot)
+  // and the dynamic-target guard (no over-refusal of unrelated dynamic writes).
+  describe('F3 — alias resolution + dynamic-target guard (enforce)', () => {
+    beforeEach(() => writePolicy(root, 'enforce'));
+
+    it.skipIf(process.platform === 'win32')(
+      '`tee tasklog` where tasklog -> .rea/tasks.jsonl is blocked (no keyword)',
+      async () => {
+        const store = path.join(root, '.rea', 'tasks.jsonl');
+        fs.writeFileSync(store, '');
+        fs.symlinkSync(store, path.join(root, 'tasklog'));
+        const r = await runVerifyGateBashGate({
+          reaRoot: root,
+          // Command text contains neither `tasks` nor `jsonl` — the old
+          // keyword pre-filter would have skipped it entirely.
+          stdinOverride: payload('echo x | tee tasklog'),
+        });
+        expect(r.exitCode).toBe(2);
+        expect(r.detected).toBe(true);
+        expect(r.stderr).toContain('rea tasks');
+      },
+    );
+
+    it.skipIf(process.platform === 'win32')(
+      '`cp foo tasklog` alias is blocked',
+      async () => {
+        const store = path.join(root, '.rea', 'tasks.jsonl');
+        fs.writeFileSync(store, '');
+        fs.symlinkSync(store, path.join(root, 'tasklog'));
+        fs.writeFileSync(path.join(root, 'foo'), 'x');
+        const r = await runVerifyGateBashGate({
+          reaRoot: root,
+          stdinOverride: payload('cp foo tasklog'),
+        });
+        expect(r.exitCode).toBe(2);
+      },
+    );
+
+    it('a dynamic write target is NOT over-refused (unrelated `> $VAR`)', async () => {
+      const r = await runVerifyGateBashGate({
+        reaRoot: root,
+        // The scanner refuses-on-uncertainty for blocked_paths, but this gate
+        // only treats a STATIC store match as a hit — so an unrelated dynamic
+        // redirect is allowed, not blocked with a spurious "use rea tasks".
+        stdinOverride: payload('echo x > "$SOME_UNSET_VAR"'),
+      });
+      expect(r.exitCode).toBe(0);
+      expect(r.detected).toBe(false);
+    });
+
+    it('a symlink alias to an UNRELATED file is allowed', async () => {
+      const other = path.join(root, 'other.log');
+      fs.writeFileSync(other, '');
+      fs.symlinkSync(other, path.join(root, 'tasklog'));
+      const r = await runVerifyGateBashGate({
+        reaRoot: root,
+        stdinOverride: payload('echo x > tasklog'),
+      });
+      expect(r.exitCode).toBe(0);
+      expect(r.detected).toBe(false);
+    });
+  });
+
   describe('shadow', () => {
     it('redirect to store → exit 0 but detected (would_block logged)', async () => {
       writePolicy(root, 'shadow');
@@ -217,5 +280,21 @@ describe('verify-gate-bash-gate (G2 Bash-tier)', () => {
       // Shadow never emits the operator banner.
       expect(r.stderr).toBe('');
     });
+
+    it.skipIf(process.platform === 'win32')(
+      'alias `tee tasklog` under shadow → exit 0 but detected',
+      async () => {
+        writePolicy(root, 'shadow');
+        const store = path.join(root, '.rea', 'tasks.jsonl');
+        fs.writeFileSync(store, '');
+        fs.symlinkSync(store, path.join(root, 'tasklog'));
+        const r = await runVerifyGateBashGate({
+          reaRoot: root,
+          stdinOverride: payload('echo x | tee tasklog'),
+        });
+        expect(r.exitCode).toBe(0);
+        expect(r.detected).toBe(true);
+      },
+    );
   });
 });
