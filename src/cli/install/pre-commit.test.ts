@@ -8,7 +8,7 @@
  *     linked worktree resolves the primary checkout's CLI (F2).
  */
 
-import { execFile } from 'node:child_process';
+import { execFile, spawnSync } from 'node:child_process';
 import fs from 'node:fs/promises';
 import fssync from 'node:fs';
 import os from 'node:os';
@@ -76,9 +76,80 @@ describe('pre-commit installer — content + markers', () => {
     it('same-repository verification guards a foreign nested checkout', () => {
       expect(body).toContain('_rea_same_repo');
     });
-    it('still fails OPEN (exit 0) when no CLI resolves (default-off gate)', () => {
-      expect(body).toMatch(/else\n\s+# CLI unreachable — fail OPEN[\s\S]*exit 0\nfi/);
+    it('still fails OPEN (exit 0) when no in-project CLI resolves (default-off gate)', () => {
+      expect(body).toMatch(/else\n\s+# No resolvable in-project CLI — fail OPEN[\s\S]*exit 0\nfi/);
     });
+    // Round-15 P1 — the PATH-`rea` and `npx --no-install` fallbacks propagated
+    // a hard non-zero when the CLI was absent/too-old (npx exits non-zero on a
+    // cache miss), bricking every commit on a fresh clone. They MUST be gone:
+    // the only non-zero exit is a resolved CLI's own `gate spec-check` refusal.
+    it('has NO npx fallback (round-15 P1 fail-open)', () => {
+      expect(body).not.toContain('npx');
+    });
+    it('has NO PATH `rea` fallback (round-15 P1 fail-open)', () => {
+      expect(body).not.toMatch(/command -v rea\b/);
+      expect(body).not.toMatch(/\n\s*rea gate spec-check/);
+    });
+  });
+});
+
+// Round-15 P1 — behavioural proof that the installed hook FAILS OPEN. The body
+// is run as a real shell script in a temp git repo; the ONLY non-zero exit is a
+// resolved in-project CLI whose `gate spec-check` refuses.
+describe('pre-commit body — fail-open behaviour (round-15 P1)', () => {
+  let dir: string;
+  beforeEach(async () => {
+    dir = await makeRepo();
+    // Install the managed hook so we run the EXACT bytes the installer writes.
+    await installPreCommitHook({ targetDir: dir });
+  });
+  afterEach(() => rm(dir));
+
+  function runHook(): { status: number; stdout: string; stderr: string } {
+    const hookPath = path.join(dir, '.git', 'hooks', 'pre-commit');
+    const res = spawnSync('bash', [hookPath], {
+      cwd: dir,
+      env: { PATH: process.env['PATH'] ?? '', HOME: process.env['HOME'] ?? '/tmp' },
+      encoding: 'utf8',
+      timeout: 20_000,
+    });
+    return { status: res.status ?? -1, stdout: res.stdout ?? '', stderr: res.stderr ?? '' };
+  }
+
+  it('exits 0 when NO in-project CLI resolves (fresh clone, pre-`pnpm install`)', () => {
+    if (spawnSync('bash', ['--version']).status !== 0) return;
+    // No node_modules/.bin/rea and no dist/ in the temp repo.
+    expect(runHook().status).toBe(0);
+  });
+
+  it('exits 0 even when `rea` exists on PATH but is not in-project (too-old/foreign)', () => {
+    if (spawnSync('bash', ['--version']).status !== 0) return;
+    // A hostile/too-old `rea` on PATH that would exit non-zero must NOT be
+    // invoked — the body only dispatches the in-project tiers.
+    const binDir = path.join(dir, 'fakebin');
+    fssync.mkdirSync(binDir, { recursive: true });
+    const fakeRea = path.join(binDir, 'rea');
+    fssync.writeFileSync(fakeRea, '#!/bin/sh\necho "too old" >&2\nexit 3\n', { mode: 0o755 });
+    fssync.chmodSync(fakeRea, 0o755);
+    const res = spawnSync('bash', [path.join(dir, '.git', 'hooks', 'pre-commit')], {
+      cwd: dir,
+      env: { PATH: `${binDir}:${process.env['PATH'] ?? ''}`, HOME: process.env['HOME'] ?? '/tmp' },
+      encoding: 'utf8',
+      timeout: 20_000,
+    });
+    expect(res.status ?? -1).toBe(0);
+  });
+
+  it('propagates a RESOLVED in-project CLI refusal (node_modules/.bin/rea exit 2)', () => {
+    if (spawnSync('bash', ['--version']).status !== 0) return;
+    // A resolvable in-project CLI that refuses (exit 2) MUST block the commit —
+    // this is the one legitimate non-zero path.
+    const binDir = path.join(dir, 'node_modules', '.bin');
+    fssync.mkdirSync(binDir, { recursive: true });
+    const rea = path.join(binDir, 'rea');
+    fssync.writeFileSync(rea, '#!/bin/sh\n# args: "$@"\nexit 2\n', { mode: 0o755 });
+    fssync.chmodSync(rea, 0o755);
+    expect(runHook().status).toBe(2);
   });
 });
 

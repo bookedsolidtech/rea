@@ -306,7 +306,7 @@
     },
     {
       "path": ".husky/pre-commit",
-      "sha256": "009a7630428a5509e996be5a6b9c34ff59e40ff5f0720bec88bb46f8160f73c1",
+      "sha256": "a47e73a0778e36d7c9f7dbd1879b3bf37acb736d2417efa8b47ed0326f85e3ee",
       "source": "husky"
     },
     {

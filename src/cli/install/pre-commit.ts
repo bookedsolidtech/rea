@@ -77,7 +77,9 @@ export const PRE_COMMIT_BODY_MARKER = '# rea:pre-commit-body-v1';
  * `REA_CLI_ROOT` seam the body would fall straight through to the fail-open
  * `exit 0` and the spec gate would silently never run in a worktree. Mirrors
  * `pre-push.ts`'s v6 body: resolve the CLI from the worktree first, then the
- * primary checkout (verified same-repository), then PATH/npx.
+ * primary checkout (verified same-repository). Unlike pre-push, there is no
+ * PATH/npx tier — this gate FAILS OPEN (round-15 P1), so an unresolved CLI is
+ * `exit 0`, never a blocked commit.
  */
 const BODY_TEMPLATE = `set -eu
 
@@ -96,7 +98,7 @@ REA_ROOT=\$(git rev-parse --show-toplevel 2>/dev/null || pwd)
 # frequently has no local install (node_modules/dist live only in the
 # PRIMARY checkout). Resolve the CLI from ONE seam: the worktree first, then
 # the primary checkout (.git-file discriminator, verified same-repository),
-# then the PATH/npx tiers below unchanged. REA_ROOT itself stays the worktree
+# then the in-project dist tier below. REA_ROOT itself stays the worktree
 # — HALT and policy resolve against it inside \`rea gate spec-check\`; only CLI
 # dispatch follows REA_CLI_ROOT.
 REA_CLI_ROOT="\$REA_ROOT"
@@ -141,17 +143,24 @@ if [ ! -x "\${REA_ROOT}/node_modules/.bin/rea" ] && [ ! -f "\${REA_ROOT}/dist/cl
   fi
 fi
 
+# Round-15 P1 — FAIL OPEN. The ONLY way this hook exits non-zero is a
+# resolved, valid rea CLI actually running \`gate spec-check\` and G1
+# refusing. A missing CLI, a too-old CLI, or an uncached network-install miss
+# must NEVER block a commit — the gate is DEFAULT-OFF and must be invisible
+# until a repo opts in. So we dispatch ONLY the two IN-PROJECT tiers (a
+# self-pinned node_modules bin, or a name-guarded dogfood dist), and if
+# neither resolves we \`exit 0\`. The pre-0.15 on-PATH and network-install
+# fallbacks propagated a hard non-zero when the CLI was absent/too-old (a
+# package runner exits non-zero on a cache miss), bricking every commit on a
+# fresh clone; they are removed. The dist tier is guarded by the package.json
+# name grep so a foreign \`dist/cli/index.js\` can never be invoked.
 if [ -x "\${REA_CLI_ROOT}/node_modules/.bin/rea" ]; then
   "\${REA_CLI_ROOT}/node_modules/.bin/rea" gate spec-check
 elif [ -f "\${REA_CLI_ROOT}/dist/cli/index.js" ] && [ -f "\${REA_CLI_ROOT}/package.json" ] \\
      && grep -q '"name": *"@bookedsolid/rea"' "\${REA_CLI_ROOT}/package.json" 2>/dev/null; then
   node "\${REA_CLI_ROOT}/dist/cli/index.js" gate spec-check
-elif command -v rea >/dev/null 2>&1; then
-  rea gate spec-check
-elif command -v npx >/dev/null 2>&1; then
-  npx --no-install @bookedsolid/rea gate spec-check
 else
-  # CLI unreachable — fail OPEN (the gate is default-off).
+  # No resolvable in-project CLI — fail OPEN (the gate is default-off).
   exit 0
 fi
 `;
