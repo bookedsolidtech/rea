@@ -156,7 +156,7 @@
     },
     {
       "path": ".claude/hooks/verify-gate.sh",
-      "sha256": "26285b11b62a07d7d1e615e0563de5ebf17bf965ac7f99c4ac04ef8df5fb5cd3",
+      "sha256": "bc1e5425304251667effcd31ae86ae904bcb521c61b4a36d217aaf20df7e7ec7",
       "source": "hook"
     },
     {

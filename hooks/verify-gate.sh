@@ -9,7 +9,7 @@
 # a missing/unbuilt CLI must NOT block task-store writes in a repo that
 # never opted in. Full logic in `src/hooks/verify-gate/index.ts`.
 #
-# # Relevance pre-gate (round-13 F2 + round-17 F1)
+# # Relevance pre-gate (round-13 F2 + round-17 F1 + round-36 F1)
 #
 # Scan `tool_input.file_path` ONLY (not the raw payload), so a Write to some
 # other file whose CONTENT mentions `.rea/tasks.jsonl` does not trip the shim.
@@ -89,25 +89,44 @@ shim_is_relevant() {
   case "$fp" in
     *.rea/tasks.jsonl) return 0 ;;
   esac
-  # round-17 F1: resolve the store for BOTH the local (worktree) root AND the
-  # common (primary-checkout) root, and resolve file_path against BOTH the
-  # payload cwd AND REA_ROOT — mirrors the node gate's
-  # resolvesToTasksJsonl(local, common, cwd, fp). A subdir- or sibling-worktree-
-  # relative path that lands on either store is relevant.
-  local common rs_local rs_common rp base
-  rs_local=$(_vg_resolve ".rea/tasks.jsonl" "$REA_ROOT")
+  # Build the set of governed store canonicals for THIS repo: the LOCAL
+  # (worktree) root, the COMMON (primary-checkout) root, and — round-36 F1 —
+  # every SIBLING worktree root. Mirrors the node gate's
+  # resolvesToTasksJsonl(local, common, siblings, cwd, fp): a file_path (or a
+  # symlink alias) that resolves to ANY of these stores is relevant and must
+  # reach the core, else a no-evidence completion into another stream's store
+  # slips past G2 in a linked-worktree setup. file_path is resolved against BOTH
+  # the payload cwd AND REA_ROOT (round-17 F1). FAIL OPEN throughout: an
+  # unresolvable path is simply skipped, never silently dropped.
+  local common rp base store _wt
+  local _vg_stores=()
+  store=$(_vg_resolve ".rea/tasks.jsonl" "$REA_ROOT"); [ -n "$store" ] && _vg_stores+=("$store")
   common=$(rea_common_root "$REA_ROOT" 2>/dev/null || true)
   if [ -n "$common" ] && [ "$common" != "$REA_ROOT" ]; then
-    rs_common=$(_vg_resolve ".rea/tasks.jsonl" "$common")
-  else
-    rs_common=""
+    store=$(_vg_resolve ".rea/tasks.jsonl" "$common"); [ -n "$store" ] && _vg_stores+=("$store")
+  fi
+  # Sibling worktrees. Spawn `git worktree list` ONLY when worktrees can exist
+  # — a linked worktree (`.git` is a FILE) or a primary with a `.git/worktrees/`
+  # dir; a plain checkout matches NEITHER and pays ~nothing (no git subprocess).
+  # Every `worktree ` line except the local root and the primary (already
+  # covered above); resolve each sibling's store with `_vg_resolve`.
+  if [ -f "${REA_ROOT}/.git" ] || [ -d "${REA_ROOT}/.git/worktrees" ]; then
+    while IFS= read -r _wt; do
+      [ -n "$_wt" ] || continue
+      [ "$_wt" = "$REA_ROOT" ] && continue
+      { [ -n "$common" ] && [ "$_wt" = "$common" ]; } && continue
+      store=$(_vg_resolve ".rea/tasks.jsonl" "$_wt"); [ -n "$store" ] && _vg_stores+=("$store")
+    done < <(git -C "$REA_ROOT" worktree list --porcelain 2>/dev/null | sed -n 's/^worktree //p')
   fi
   for base in "$cwd" "$REA_ROOT"; do
     [ -n "$base" ] || continue
     rp=$(_vg_resolve "$fp" "$base") || continue
     [ -n "$rp" ] || continue
-    if [ -n "$rs_local" ] && [ "$rp" = "$rs_local" ]; then return 0; fi
-    if [ -n "$rs_common" ] && [ "$rp" = "$rs_common" ]; then return 0; fi
+    if [ "${#_vg_stores[@]}" -gt 0 ]; then
+      for store in "${_vg_stores[@]}"; do
+        [ "$rp" = "$store" ] && return 0
+      done
+    fi
   done
   return 1
 }

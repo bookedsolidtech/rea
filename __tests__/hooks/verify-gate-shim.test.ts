@@ -87,6 +87,39 @@ function runShim(shim: string, payload: string): number {
   return res.status ?? -1;
 }
 
+/** Run the editor shim with an explicit project dir + cwd (worktree tests). */
+function runEditorShimAt(projectDir: string, cwd: string, payload: string): number {
+  const res = spawnSync('bash', [EDITOR_SHIM], {
+    cwd,
+    env: {
+      PATH: process.env['PATH'] ?? '',
+      CLAUDE_PROJECT_DIR: projectDir,
+      HOME: process.env['HOME'] ?? '/tmp',
+    },
+    input: payload,
+    encoding: 'utf8',
+    timeout: 30_000,
+  });
+  return res.status ?? -1;
+}
+
+function g2PolicyText(mode: 'off' | 'shadow' | 'enforce'): string {
+  return [
+    'version: "0.54.0"',
+    'profile: bst-internal',
+    'installed_by: test',
+    'installed_at: "2026-01-01T00:00:00Z"',
+    'autonomy_level: L1',
+    'max_autonomy_level: L2',
+    'promotion_requires_human_approval: true',
+    'blocked_paths: []',
+    'artifact_gates:',
+    '  g2_verify:',
+    `    mode: ${mode}`,
+    '',
+  ].join('\n');
+}
+
 const COMPLETED_NO_EVIDENCE = JSON.stringify({
   id: 'T-0001',
   subject: 's',
@@ -225,5 +258,68 @@ describe.skipIf(!ENABLED)('verify-gate shims — end-to-end through the shim', (
       tool_input: { file_path: link, content: COMPLETED_NO_EVIDENCE },
     });
     expect(runShim(EDITOR_SHIM, payload)).toBe(2);
+  });
+
+  // Round-36 F1 — the shim's relevance pre-gate must also match SIBLING
+  // worktree stores, or a no-evidence completion into another stream slips
+  // past G2. Cross-repo isolation (a truly foreign repo) must still hold.
+  it('editor: from worktree A, a Write to an alias resolving to SIBLING worktree B store → exit 2', () => {
+    const git = (cwd: string, ...args: string[]): void => {
+      spawnSync('git', args, { cwd, stdio: 'ignore' });
+    };
+    const primary = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'rea-vgwt-')));
+    const wtA = `${primary}-A`;
+    const wtB = `${primary}-B`;
+    const foreign = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'rea-vgforeign-')));
+    try {
+      spawnSync('git', ['init', '-q', primary], { stdio: 'ignore' });
+      git(primary, 'config', 'user.email', 't@t');
+      git(primary, 'config', 'user.name', 't');
+      git(primary, 'config', 'commit.gpgsign', 'false');
+      git(primary, 'commit', '-q', '--allow-empty', '-m', 'init');
+      git(primary, 'worktree', 'add', '-q', wtA, '-b', 'stream-a');
+      git(primary, 'worktree', 'add', '-q', wtB, '-b', 'stream-b');
+      // Stage a sandboxed CLI INSIDE worktree A (= CLAUDE_PROJECT_DIR).
+      fs.writeFileSync(
+        path.join(wtA, 'package.json'),
+        JSON.stringify({ name: '@bookedsolid/rea', version: '0.51.0', type: 'module' }),
+      );
+      fs.cpSync(path.join(REPO_ROOT, 'dist'), path.join(wtA, 'dist'), { recursive: true });
+      fs.symlinkSync(path.join(REPO_ROOT, 'node_modules'), path.join(wtA, 'node_modules'), 'dir');
+      // A enforces G2; B has its own store; foreign is a SEPARATE repo.
+      fs.mkdirSync(path.join(wtA, '.rea'), { recursive: true });
+      fs.writeFileSync(path.join(wtA, '.rea', 'policy.yaml'), g2PolicyText('enforce'));
+      fs.mkdirSync(path.join(wtB, '.rea'), { recursive: true });
+      fs.writeFileSync(path.join(wtB, '.rea', 'tasks.jsonl'), '');
+      spawnSync('git', ['init', '-q', foreign], { stdio: 'ignore' });
+      fs.mkdirSync(path.join(foreign, '.rea'), { recursive: true });
+      fs.writeFileSync(path.join(foreign, '.rea', 'tasks.jsonl'), '');
+
+      // (a) Alias in A → SIBLING B's store. Completed-no-evidence → BLOCKED.
+      const aliasB = path.join(wtA, 'tasklog');
+      fs.symlinkSync(path.join(wtB, '.rea', 'tasks.jsonl'), aliasB);
+      const payloadB = JSON.stringify({
+        tool_name: 'Write',
+        cwd: wtA,
+        tool_input: { file_path: aliasB, content: COMPLETED_NO_EVIDENCE },
+      });
+      expect(runEditorShimAt(wtA, wtA, payloadB)).toBe(2); // sibling governed
+
+      // (b) Alias in A → FOREIGN repo's store (not a worktree of primary) →
+      //     NOT governed; the shim's sibling enumeration lists only THIS
+      //     repo's worktrees, so cross-repo isolation holds.
+      const aliasF = path.join(wtA, 'foreignlog');
+      fs.symlinkSync(path.join(foreign, '.rea', 'tasks.jsonl'), aliasF);
+      const payloadF = JSON.stringify({
+        tool_name: 'Write',
+        cwd: wtA,
+        tool_input: { file_path: aliasF, content: COMPLETED_NO_EVIDENCE },
+      });
+      expect(runEditorShimAt(wtA, wtA, payloadF)).toBe(0); // foreign isolated
+    } finally {
+      for (const d of [wtA, wtB, primary, foreign]) {
+        fs.rmSync(d, { recursive: true, force: true });
+      }
+    }
   });
 });
