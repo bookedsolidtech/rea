@@ -15,12 +15,16 @@
  *   - separate sessions keep independent counters
  */
 
+import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { parseTurnBudget, runTurnBudget } from './turn-budget.js';
+import { parseTurnBudget, runTurnBudget, updateCounter } from './turn-budget.js';
 import { runBillingCapHalt } from './index.js';
+
+const HERE = path.dirname(fileURLToPath(import.meta.url));
 
 function makeRoot(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'rea-turnbudget-'));
@@ -88,6 +92,16 @@ function editPayload(stderr = ''): string {
     // Even if a (nonsensical) stderr with a billing phrase is present on a
     // non-Bash tool, the billing scan must NOT run — it is Bash-only.
     tool_response: { filePath: '/x/y.ts', ...(stderr ? { stderr, is_error: true } : {}) },
+  });
+}
+/** A READ PostToolUse payload — a read-only tool (no command/stderr). The
+ *  turn counter must still advance (F1: the budget counts ALL tool calls,
+ *  else it is bypassable via read/search tools). */
+function readPayload(): string {
+  return JSON.stringify({
+    tool_name: 'Read',
+    tool_input: { file_path: '/x/y.ts' },
+    tool_response: { type: 'text', file: { filePath: '/x/y.ts', numLines: 3 } },
   });
 }
 
@@ -231,6 +245,85 @@ describe('runTurnBudget', () => {
     await runTurnBudget({ localRoot: root, commonRoot: root, config: cfg, sessionId: undefined, stderrWrite: sink.write });
     expect(fs.existsSync(path.join(root, '.rea', 'turn-count.json'))).toBe(true);
   });
+
+  it('F2: response halt with an unwritable commonRoot still returns action=halt (haltWritten=false) + degraded banner', async () => {
+    // commonRoot points at a FILE, so writeHaltFile's mkdir(.rea) throws
+    // ENOTDIR deterministically (root-safe — no chmod). The hard stop must
+    // NOT silently downgrade: action stays 'halt', the banner is the honest
+    // DEGRADED variant (not "session frozen"), and the counter still advanced.
+    const commonFile = path.join(root, 'not-a-dir');
+    fs.writeFileSync(commonFile, 'x');
+    const sink = stderrSink();
+    const r = await runTurnBudget({
+      localRoot: root,
+      commonRoot: commonFile,
+      config: { warnTurns: 1, haltTurns: 1, response: 'halt' },
+      sessionId: 'wf',
+      stderrWrite: sink.write,
+    });
+    expect(r.action).toBe('halt');
+    expect(r.haltWritten).toBe(false);
+    expect(sink.text()).toContain('DEGRADED');
+    expect(sink.text()).not.toContain('session frozen');
+    // Counter (LOCAL root) still incremented despite the HALT-write failure.
+    expect(JSON.parse(fs.readFileSync(path.join(root, '.rea', 'turn-count.wf.json'), 'utf8')).count).toBe(1);
+  });
+});
+
+describe('updateCounter — F3 serialization', () => {
+  let root: string;
+  beforeEach(() => {
+    root = makeRoot();
+    fs.mkdirSync(path.join(root, '.rea'), { recursive: true });
+  });
+  afterEach(() => rm(root));
+
+  const cfg = { warnTurns: 1_000_000, haltTurns: 1_000_000, response: 'warn' as const };
+
+  it('sequential increments never lose a count', () => {
+    const file = path.join(root, '.rea', 'turn-count.s.json');
+    for (let i = 1; i <= 50; i++) {
+      expect(updateCounter(file, cfg).count).toBe(i);
+    }
+    expect(JSON.parse(fs.readFileSync(file, 'utf8')).count).toBe(50);
+  });
+
+  it('crossedWarn/crossedHalt fire exactly once across increments', () => {
+    const file = path.join(root, '.rea', 'turn-count.c.json');
+    const c2 = { warnTurns: 2, haltTurns: 3, response: 'warn' as const };
+    const results = [1, 2, 3, 4].map(() => updateCounter(file, c2));
+    expect(results.map((r) => r.crossedWarn)).toEqual([false, true, false, false]);
+    expect(results.map((r) => r.crossedHalt)).toEqual([false, false, true, false]);
+  });
+
+  it('concurrent cross-process increments do NOT lose a count (proper-lockfile)', () => {
+    // The real race the lock addresses is CROSS-PROCESS (each PostToolUse hook
+    // is a separate node process). Spawn N processes that each call the built
+    // updateCounter once against the SAME counter file, in parallel; with the
+    // lock the final count is exactly N (a lost read-modify-write would drop
+    // one). Uses the compiled dist (build runs before tests in CI).
+    const distModule = path.resolve(HERE, '../../../dist/hooks/billing-cap-halt/turn-budget.js');
+    if (!fs.existsSync(distModule)) {
+      // Build not present in this run — skip rather than fail spuriously.
+      return;
+    }
+    const file = path.join(root, '.rea', 'turn-count.p.json');
+    const worker = path.join(root, 'worker.mjs');
+    fs.writeFileSync(
+      worker,
+      `import { updateCounter } from ${JSON.stringify(distModule)};\n` +
+        `updateCounter(process.argv[2], { warnTurns: 1e9, haltTurns: 1e9, response: 'warn' });\n`,
+    );
+    // Launch all N workers in parallel through one `sh -c '… & … & wait'`,
+    // maximizing overlap so an UNLOCKED read-modify-write would actually
+    // collide and drop increments. With the lock, the final count is exactly N.
+    const N = 12;
+    const nodeBin = process.execPath;
+    const one = `${JSON.stringify(nodeBin)} ${JSON.stringify(worker)} ${JSON.stringify(file)} &`;
+    const cmd = `${Array.from({ length: N }, () => one).join(' ')} wait`;
+    execFileSync('sh', ['-c', cmd], { stdio: 'ignore' });
+    expect(JSON.parse(fs.readFileSync(file, 'utf8')).count).toBe(N);
+  });
 });
 
 describe('runBillingCapHalt — turn-budget integration', () => {
@@ -325,6 +418,44 @@ describe('runBillingCapHalt — turn-budget integration', () => {
     // No billing audit; counter did increment (turn accounting is tool-agnostic).
     expect(readAudit(root).filter((e) => e.tool_name === 'rea.spend_governance.billing')).toHaveLength(0);
     expect(JSON.parse(fs.readFileSync(path.join(root, '.rea', 'turn-count.e.json'), 'utf8')).count).toBe(1);
+  });
+
+  it('F1: a READ PostToolUse (read-only tool) increments the counter', async () => {
+    // The budget counts ALL tool calls — a session in Read/LS/Glob/Grep must
+    // still advance toward warn_turns/halt_turns (else the budget is bypassable
+    // by using read/search tools). Read has no command/stderr; only the counter
+    // runs, never the billing scan.
+    writePolicy(root, { warn: 2, halt: 100, response: 'warn' });
+    const runRead = async (): Promise<number> =>
+      (await runBillingCapHalt({ reaRoot: root, stdinOverride: readPayload(), sessionId: 'r', stderrWrite: () => {} }))
+        .exitCode;
+    expect(await runRead()).toBe(0); // turn 1
+    expect(await runRead()).toBe(0); // turn 2 — warn crossing on a Read call
+    expect(JSON.parse(fs.readFileSync(path.join(root, '.rea', 'turn-count.r.json'), 'utf8')).count).toBe(2);
+    expect(readAudit(root).filter((e) => e.tool_name === 'rea.spend.turn_budget_warn')).toHaveLength(1);
+  });
+
+  it('F2: halt hard-stop exits 2 even when .rea/HALT cannot be written', async () => {
+    // Force writeHaltFile to fail by making `.rea` read-only, WITHOUT
+    // pre-creating .rea/HALT (which would trip the halt short-circuit instead).
+    // The configured hard stop must still block the call (exit 2). Root-safe:
+    // under an euid that ignores mode bits the write succeeds and we still get
+    // exit 2 (haltWritten true) — either way the call is blocked.
+    writePolicy(root, { warn: 1, halt: 1, response: 'halt' });
+    const reaDir = path.join(root, '.rea');
+    fs.chmodSync(reaDir, 0o500);
+    try {
+      const r = await runBillingCapHalt({
+        reaRoot: root,
+        stdinOverride: readPayload(),
+        sessionId: 'hf',
+        stderrWrite: () => {},
+      });
+      expect(r.exitCode).toBe(2);
+      expect(r.action).toBe('halt');
+    } finally {
+      fs.chmodSync(reaDir, 0o700);
+    }
   });
 
   it('exactly one increment per invocation (no double-count)', async () => {

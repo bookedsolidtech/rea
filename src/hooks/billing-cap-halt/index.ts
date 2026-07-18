@@ -478,8 +478,14 @@ export async function runBillingCapHalt(
       ...(sessionId !== undefined ? { sessionId } : {}),
       stderrWrite: writeStderr,
     });
-    if (tb.haltWritten) {
-      return { exitCode: 2, stderr, action: 'halt', matched: null, haltWritten: true };
+    // A configured hard stop must block the current call REGARDLESS of whether
+    // `.rea/HALT` could be persisted (codex round-24 F2): if the write failed
+    // (read-only checkout / perms), exiting 0 here would let this call succeed
+    // and later calls continue while the banner says frozen. Exit 2 on any
+    // halt-threshold crossing under `response: halt`; the degraded banner +
+    // audit already record that HALT could not be written.
+    if (tb.action === 'halt') {
+      return { exitCode: 2, stderr, action: 'halt', matched: null, haltWritten: tb.haltWritten };
     }
   }
 

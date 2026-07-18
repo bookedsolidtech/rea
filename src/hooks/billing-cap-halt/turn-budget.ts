@@ -49,6 +49,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import properLockfile from 'proper-lockfile';
 import { appendAuditRecord } from '../../audit/append.js';
 import { writeHaltFile, sanitizeHaltReason } from '../../cli/freeze.js';
 import { InvocationStatus, Tier } from '../../policy/types.js';
@@ -179,6 +180,99 @@ function writeState(file: string, state: TurnCountState): void {
   }
 }
 
+/**
+ * Lock envelope for the per-session counter, mirroring the task store
+ * (`src/tasks/store.ts`) and audit store: stale reclaim at 10s, `realpath:
+ * false` so a not-yet-created counter file is a valid lock target. The lock
+ * sidecar is `<counter>.lock` (gitignored via the `.rea/turn-count*` globs).
+ */
+const COUNTER_LOCK_OPTIONS: Parameters<typeof properLockfile.lockSync>[1] = {
+  stale: 10_000,
+  realpath: false,
+};
+
+/** Synchronous sleep without a CPU-burning spin — parks the thread for `ms`. */
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/**
+ * Acquire the per-session counter lock synchronously, retrying briefly when a
+ * concurrent tool invocation holds it. FAIL-SAFE by design (unlike the task
+ * store, which throws): the turn counter must NEVER break a tool call, so on
+ * ANY failure — lock held past the retry budget, or a lockfile error — this
+ * returns `null` and the caller degrades to a best-effort UNLOCKED increment.
+ * A rare lost increment under contention-plus-lock-failure is acceptable; a
+ * thrown error out of a PostToolUse hook is not.
+ */
+function acquireCounterLock(file: string): (() => void) | null {
+  // Ensure `.rea/` exists so `<file>.lock` can be created alongside a
+  // not-yet-written counter file.
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+  } catch {
+    /* if the dir cannot be created the RMW's own writes will no-op too */
+  }
+  const maxAttempts = 40;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    try {
+      return properLockfile.lockSync(file, COUNTER_LOCK_OPTIONS);
+    } catch (e) {
+      const code = (e as NodeJS.ErrnoException).code;
+      const held = code === 'ELOCKED' || /lock/i.test((e as Error).message ?? '');
+      if (!held || attempt === maxAttempts - 1) return null; // degrade to unlocked
+      sleepSync(20);
+    }
+  }
+  return null;
+}
+
+/** Result of a single locked counter increment. */
+export interface CounterUpdate {
+  /** The counter value AFTER incrementing. */
+  count: number;
+  /** True when this increment first crossed `warn_turns`. */
+  crossedWarn: boolean;
+  /** True when this increment first crossed `halt_turns`. */
+  crossedHalt: boolean;
+}
+
+/**
+ * Serialized read→increment→write of the per-session counter. The lock scope is
+ * TIGHT — only the counter file's RMW — so the (slower) audit append + HALT
+ * write happen OUTSIDE the lock. Two tool invocations finishing close together
+ * (the parallel-tool scenario the budget exists to police) each observe the
+ * other's write instead of both reading N and writing N+1.
+ *
+ * The `*_emitted` flags are persisted here (under the lock) so a threshold
+ * crossing is computed and recorded atomically with the increment — a crossing
+ * fires exactly once even under concurrency.
+ */
+export function updateCounter(file: string, config: TurnBudgetConfig): CounterUpdate {
+  const release = acquireCounterLock(file);
+  try {
+    const state = readState(file);
+    state.count += 1;
+    const count = state.count;
+    const crossedWarn = count >= config.warnTurns && !state.warn_emitted;
+    const crossedHalt = count >= config.haltTurns && !state.halt_emitted;
+    // Persist the incremented counter + updated emitted flags BEFORE the caller
+    // acts, so a crash mid-action does not re-fire the same crossing next turn.
+    if (crossedWarn) state.warn_emitted = true;
+    if (crossedHalt) state.halt_emitted = true;
+    writeState(file, state);
+    return { count, crossedWarn, crossedHalt };
+  } finally {
+    if (release !== null) {
+      try {
+        release();
+      } catch {
+        /* releasing a best-effort lock must never throw out of the hook */
+      }
+    }
+  }
+}
+
 async function recordTurnBudgetAudit(
   commonRoot: string,
   kind: 'warn' | 'halt',
@@ -231,6 +325,26 @@ function buildHaltBanner(count: number, threshold: number): string {
 }
 
 /**
+ * Degraded banner for `response: halt` when `.rea/HALT` could NOT be written
+ * (read-only checkout / perms / broken `.rea`). Must NOT claim the session is
+ * frozen (it isn't). The hard stop still BLOCKS the current tool call (the
+ * caller exits 2 regardless of the write outcome — a configured hard stop must
+ * at minimum stop the call it fired on), but the freeze must be applied
+ * manually so later calls are also blocked.
+ */
+function buildHaltWriteFailedBanner(count: number, threshold: number): string {
+  return [
+    'TURN BUDGET HALT (DEGRADED): tool-call budget exhausted but .rea/HALT could NOT be written\n',
+    '\n',
+    `  Session tool-calls: ${count} (halt threshold ${threshold}).\n`,
+    '\n',
+    '  This tool call is BLOCKED, but the session is NOT frozen (the HALT file\n',
+    '  could not be created). Run `rea freeze` manually, or fix the filesystem\n',
+    '  permissions so the budget reflex can write .rea/HALT.\n',
+  ].join('');
+}
+
+/**
  * Increment the per-session turn counter and emit any threshold-crossing
  * events. Assumes the caller has already confirmed the session is NOT already
  * halted (the billing hook's HALT short-circuit runs first). A no-op when
@@ -242,21 +356,11 @@ export async function runTurnBudget(options: TurnBudgetOptions): Promise<TurnBud
     return { action: 'noop', count: null, haltWritten: false };
   }
 
+  // Serialized read→increment→write (the lock keeps the parallel-tool case
+  // from losing an increment). Threshold crossings are computed atomically with
+  // the increment; the audit/HALT side effects below run OUTSIDE the lock.
   const file = counterPath(localRoot, sessionId);
-  const state = readState(file);
-  state.count += 1;
-  const count = state.count;
-
-  // Determine crossings on THIS turn. Each fires at most once (guarded by the
-  // *_emitted flags persisted in the counter file).
-  const crossedWarn = count >= config.warnTurns && !state.warn_emitted;
-  const crossedHalt = count >= config.haltTurns && !state.halt_emitted;
-
-  // Persist the incremented counter + updated emitted flags BEFORE acting, so a
-  // crash mid-action does not re-fire the same crossing next turn.
-  if (crossedWarn) state.warn_emitted = true;
-  if (crossedHalt) state.halt_emitted = true;
-  writeState(file, state);
+  const { count, crossedWarn, crossedHalt } = updateCounter(file, config);
 
   // The halt-threshold crossing supersedes the warn-threshold crossing when
   // both land on the same turn (e.g. warn_turns === halt_turns): the `response`
@@ -274,9 +378,17 @@ export async function runTurnBudget(options: TurnBudgetOptions): Promise<TurnBud
         haltWritten = true;
       } catch {
         /* HALT could not be written (read-only FS / permissions). Still audit +
-         * banner so the reflex does not vanish silently. */
+         * banner + exit 2 (via the caller) so the hard stop does not silently
+         * downgrade to advisory. */
       }
-      stderrWrite(buildHaltBanner(count, config.haltTurns));
+      // Honest banner: only claim "frozen / HALT written" when the write
+      // actually succeeded; otherwise the degraded banner (the call is still
+      // blocked, but the operator must freeze manually).
+      stderrWrite(
+        haltWritten
+          ? buildHaltBanner(count, config.haltTurns)
+          : buildHaltWriteFailedBanner(count, config.haltTurns),
+      );
       await recordTurnBudgetAudit(commonRoot, 'halt', {
         count,
         warnTurns: config.warnTurns,

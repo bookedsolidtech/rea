@@ -459,25 +459,29 @@ export function defaultDesiredHooks(): DesiredHookGroup[] {
       // quota — TERMINAL, distinct from a retryable 429), Bash-only; and
       // (2) a per-session TOOL-CALL counter (Artifact Gates §5) that emits
       // audited warn/refuse events at `spend_governance.turn_budget`
-      // thresholds. The counter must count EVERY tool call, so the matcher
-      // is `Bash|Edit|Write|MultiEdit|NotebookEdit` — the SAME string
-      // delegation-advisory uses, which mergeSettings collapses into ONE
-      // group `[billing-cap-halt.sh, delegation-advisory.sh]` (one hook
-      // invocation per tool call → exactly one increment, no double-count).
-      // The billing SCAN inside the body stays Bash-only (a non-Bash tool
-      // has no command/stderr); only the turn counter runs for the editor
-      // tools. OPT-OUT (billing): `enabled` defaults true, seed default
-      // `warn`. OPT-IN (turn budget): absent `turn_budget` block = off. The
-      // shim's relevance pre-gate proceeds to the CLI whenever a
-      // `turn_budget` is configured (so the counter runs) OR a billing
-      // keyword is present; with neither, ordinary output never spawns the
-      // CLI.
+      // thresholds.
       //
-      // ORDER: this group is declared BEFORE the delegation-advisory group
-      // (same matcher) so the merge places billing-cap-halt.sh first in the
-      // collapsed group — keep them in this order.
+      // The counter must count EVERY tool call — a per-session TOOL-CALL
+      // budget that only saw write-class tools would be trivially bypassed by
+      // a session spending its turns in Read/LS/Glob/Grep (codex round-24
+      // F1). So the matcher is the documented all-tools value `"*"` (Claude
+      // Code treats `"*"` / `""` / omitted as "match all", NOT as a regex).
+      // This is a DIFFERENT matcher from delegation-advisory's write-class
+      // group below, so mergeSettings keeps them SEPARATE with NO chaining
+      // warning (the self-chain warning only fires for two rea-desired groups
+      // sharing ONE matcher). One tool call fires this group exactly once →
+      // exactly one increment, no double-count.
+      //
+      // The billing SCAN inside the body stays Bash-only (a non-Bash tool has
+      // no command/stderr); only the turn counter runs for the other tools.
+      // OPT-OUT (billing): `enabled` defaults true, seed default `warn`.
+      // OPT-IN (turn budget): absent `turn_budget` block = off. The shim's
+      // relevance pre-gate proceeds to the CLI whenever a `turn_budget` is
+      // configured (so the counter runs) OR a billing keyword is present;
+      // with neither (the default), all-tools registration is still a cheap
+      // no-op — the shim exits before spawning the CLI.
       event: 'PostToolUse',
-      matcher: 'Bash|Edit|Write|MultiEdit|NotebookEdit',
+      matcher: '*',
       hooks: [
         {
           type: 'command',
@@ -485,21 +489,22 @@ export function defaultDesiredHooks(): DesiredHookGroup[] {
           timeout: 10000,
           statusMessage: 'Checking for billing-class spend errors...',
         },
+      ],
+    },
+    {
+      // 0.31.0 delegation-telemetry completion — the *nudge*. Write-class
+      // matcher `Bash|Edit|Write|MultiEdit|NotebookEdit` (distinct from the
+      // billing-cap-halt all-tools `"*"` group above, so no shared-matcher
+      // self-chain). The hook maintains a per-session counter and emits a
+      // one-time stderr advisory when a session crosses
+      // `policy.delegation_advisory.threshold` without dispatching a curated
+      // specialist. Advisory only — never blocks; `delegation_advisory`
+      // defaults disabled (only `bst-internal*` profiles pin `enabled:
+      // true`), so a vanilla install sees a silent no-op.
+      event: 'PostToolUse',
+      matcher: 'Bash|Edit|Write|MultiEdit|NotebookEdit',
+      hooks: [
         {
-          // 0.31.0 delegation-telemetry completion — the *nudge*. Shares
-          // THIS PostToolUse group (same `Bash|Edit|Write|MultiEdit|
-          // NotebookEdit` matcher) as a SECOND hook rather than a separate
-          // same-matcher group: two rea-desired groups on one matcher make
-          // the second warn "chained onto existing" on a FRESH install
-          // (the merge sees the group the first just created) — a spurious
-          // self-chain. One group, ordered [billing-cap-halt,
-          // delegation-advisory], avoids it. The hook maintains a
-          // per-session counter and emits a one-time stderr advisory when a
-          // session crosses `policy.delegation_advisory.threshold` without
-          // dispatching a curated specialist. Advisory only — never blocks;
-          // `delegation_advisory` defaults disabled (only `bst-internal*`
-          // profiles pin `enabled: true`), so a vanilla install sees a
-          // silent no-op.
           type: 'command',
           command: `${base}/delegation-advisory.sh`,
           timeout: 10000,

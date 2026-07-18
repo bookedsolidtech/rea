@@ -63,6 +63,7 @@ coverage/
 .rea/tasks.jsonl.lock
 .rea/turn-count.json
 .rea/turn-count.*.json
+.rea/turn-count*.lock
 .rea/review-parity.json
 .rea/parity-dataset/
 .rea/*.tmp
