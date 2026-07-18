@@ -88,6 +88,12 @@ describe('detectBadCompletions', () => {
   it('flags a completed record with no evidence', () => {
     expect(detectBadCompletions(COMPLETED_NO_EVIDENCE)).toEqual(['T-0001']);
   });
+
+  it('flags a completed record whose evidence entries are all blank (round-10 P2)', () => {
+    expect(detectBadCompletions(taskLine({ status: 'completed', evidence: ['  ', ''] }))).toEqual([
+      'T-0001',
+    ]);
+  });
   it('allows a completed record with evidence', () => {
     expect(detectBadCompletions(COMPLETED_WITH_EVIDENCE)).toEqual([]);
   });
@@ -126,6 +132,33 @@ describe('runVerifyGate', () => {
     expect(r.exitCode).toBe(0);
     expect(auditContains(root, G2_TOOL_NAME)).toBe(false);
     expect(auditContains(root, G2_SHADOW_TOOL_NAME)).toBe(false);
+  });
+
+  it('does NOT deadlock on a pre-existing bad row — only NEW completions block (round-10 P2)', async () => {
+    writePolicy(root, 'enforce');
+    // Prior store already carries a historical completed-without-evidence
+    // row (e.g. from before opting into G2).
+    const historical = COMPLETED_NO_EVIDENCE + '\n';
+    fs.writeFileSync(path.join(root, '.rea', 'tasks.jsonl'), historical);
+    // An UNRELATED write (add a fresh pending task) must pass — the
+    // historical bad row is not a new transition introduced here.
+    const unrelated =
+      historical +
+      taskLine({ id: 'T-0002', status: 'pending' }) +
+      '\n';
+    const r = await runVerifyGate({
+      reaRoot: root,
+      stdinOverride: writePayload({ filePath: '.rea/tasks.jsonl', content: unrelated }),
+    });
+    expect(r.exitCode).toBe(0);
+    // …but NEWLY completing T-0002 without evidence still blocks.
+    const newBad =
+      historical + taskLine({ id: 'T-0002', status: 'completed' }) + '\n';
+    const r2 = await runVerifyGate({
+      reaRoot: root,
+      stdinOverride: writePayload({ filePath: '.rea/tasks.jsonl', content: newBad }),
+    });
+    expect(r2.exitCode).toBe(2);
   });
 
   it('absent artifact_gates block → treated as off (exit 0)', async () => {

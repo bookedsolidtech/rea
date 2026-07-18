@@ -157,6 +157,22 @@ describe('runGateSpecCheck', () => {
     expect(r.exitCode).toBe(0);
   });
 
+  it('over threshold + spec is a committed DIRECTORY → enforce blocks (round-10 P2)', async () => {
+    initRepo(root);
+    // Commit a directory (not a spec document). Both existsSync('docs')
+    // and `git cat-file -e HEAD:docs` (a tree) succeed — the gate must
+    // still reject it as not a file.
+    fs.mkdirSync(path.join(root, 'docs'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'docs', '.keep'), 'x');
+    git(root, ['add', 'docs/.keep']);
+    git(root, ['commit', '-q', '-m', 'add docs dir']);
+    writePolicy(root, { mode: 'enforce', diffLines: 10, diffFiles: 2 });
+    writeTasks(root, [{ spec: 'docs', requires_spec: true }]);
+    stageBigChange(root, 'big.txt', 50);
+    const r = await runGateSpecCheck({ reaRoot: root });
+    expect(r.exitCode).toBe(2);
+  });
+
   it('over threshold + spec on disk but NOT committed → enforce blocks (exit 2)', async () => {
     initRepo(root);
     // Spec exists on disk but is never committed at HEAD.

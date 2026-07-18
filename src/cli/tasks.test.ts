@@ -102,6 +102,15 @@ describe('complete refuses without evidence', () => {
     expect(errs.join('\n')).toMatch(/no evidence/i);
     expect(readTasks(baseDir)[0]?.status).toBe('pending');
   });
+
+  it('rejects BLANK evidence — `--add ""` is not usable evidence (round-10 P2)', () => {
+    runTasksAdd(baseDir, { subject: 'blank' });
+    // A blank/whitespace --add is rejected outright.
+    expect(runTasksEvidence(baseDir, 'T-0001', { add: ['', '   '] })).toBe(1);
+    // And complete still refuses because no usable evidence was recorded.
+    expect(runTasksComplete(baseDir, 'T-0001')).toBe(1);
+    expect(readTasks(baseDir)[0]?.status).toBe('pending');
+  });
 });
 
 describe('activate flips others inactive', () => {

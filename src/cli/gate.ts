@@ -272,20 +272,32 @@ export async function runGateSpecCheck(options: GateSpecCheckOptions = {}): Prom
       banner(`the active task ${active.id} references no spec`),
     );
   }
-  const specExistsOnDisk = fs.existsSync(path.join(localRoot, specPath));
-  if (!specExistsOnDisk) {
+  // Round-10 P2: the spec must resolve to a FILE, not a directory. Both
+  // `existsSync('docs')` and `git cat-file -e HEAD:docs` (a tree object)
+  // succeed for a directory, which would let a non-trivial diff pass G1
+  // with no spec document at all.
+  let specIsFileOnDisk = false;
+  try {
+    specIsFileOnDisk = fs.statSync(path.join(localRoot, specPath)).isFile();
+  } catch {
+    specIsFileOnDisk = false;
+  }
+  if (!specIsFileOnDisk) {
     return resolveVerdict(
       'spec missing on disk',
       metaCommon,
-      banner(`the spec ${specPath} does not exist on disk`),
+      banner(`the spec ${specPath} does not exist on disk as a file`),
     );
   }
-  const committed = git(['cat-file', '-e', `HEAD:${specPath}`]).status === 0;
-  if (!committed) {
+  // `cat-file -t` returns the object type; require a `blob` (a committed
+  // FILE), not a `tree` (a committed directory).
+  const committedType = git(['cat-file', '-t', `HEAD:${specPath}`]);
+  const committedAsFile = committedType.status === 0 && committedType.stdout.trim() === 'blob';
+  if (!committedAsFile) {
     return resolveVerdict(
       'spec not committed at HEAD',
       metaCommon,
-      banner(`the spec ${specPath} is not committed at HEAD`),
+      banner(`the spec ${specPath} is not committed at HEAD as a file`),
     );
   }
 

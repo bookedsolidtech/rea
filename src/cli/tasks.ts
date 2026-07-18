@@ -133,8 +133,11 @@ export interface TasksEvidenceOptions {
 }
 
 export function runTasksEvidence(baseDir: string, id: string, opts: TasksEvidenceOptions): number {
-  if (opts.add.length === 0) {
-    err('evidence requires at least one --add <path>');
+  // Round-10 P2: reject blank/whitespace evidence entries — `--add ''`
+  // is not a usable artifact path and must not satisfy the G2 invariant.
+  const additions = opts.add.filter((e) => e.trim().length > 0);
+  if (additions.length === 0) {
+    err('evidence requires at least one non-blank --add <path>');
     return 1;
   }
   let updated: TaskRecord | undefined;
@@ -142,7 +145,7 @@ export function runTasksEvidence(baseDir: string, id: string, opts: TasksEvidenc
   updateTasks(baseDir, (tasks) => {
     const t = findTask(tasks, id);
     if (t === undefined) return [];
-    merged = [...(t.evidence ?? []), ...opts.add];
+    merged = [...(t.evidence ?? []), ...additions];
     updated = { ...t, evidence: merged, updated_at: nowIso() };
     return [updated];
   });
@@ -164,9 +167,10 @@ export function runTasksComplete(baseDir: string, id: string, opts: TasksIdOptio
       return [];
     }
     // G2 verification invariant at the CLI tier: a task cannot be
-    // completed without recorded evidence — checked against the LOCKED
-    // snapshot so a concurrent evidence add is honored.
-    if ((t.evidence ?? []).length === 0) {
+    // completed without USABLE (non-blank) recorded evidence — checked
+    // against the LOCKED snapshot so a concurrent evidence add is
+    // honored. Round-10 P2: a blank/whitespace entry is not evidence.
+    if (!(t.evidence ?? []).some((e) => e.trim().length > 0)) {
       outcome = 'no-evidence';
       return [];
     }

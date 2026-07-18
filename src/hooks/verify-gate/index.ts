@@ -128,8 +128,11 @@ export function detectBadCompletions(content: string): string[] {
       anonymous.push(rec);
     }
   }
+  // Round-10 P2: a usable evidence array needs at least one NON-BLANK
+  // string path — `evidence: [""]` / whitespace is not evidence.
   const hasEvidence = (rec: LooseTaskRecord): boolean =>
-    Array.isArray(rec.evidence) && rec.evidence.length > 0;
+    Array.isArray(rec.evidence) &&
+    rec.evidence.some((e) => typeof e === 'string' && e.trim().length > 0);
   const isBad = (rec: LooseTaskRecord): boolean => rec.status === 'completed' && !hasEvidence(rec);
   const bad: string[] = [];
   for (const [id, rec] of folded) {
@@ -139,6 +142,25 @@ export function detectBadCompletions(content: string): string[] {
     if (isBad(rec)) bad.push('(unknown)');
   }
   return bad;
+}
+
+/**
+ * Multiset difference `after \ before` (round-10 P2). Each element of
+ * `after` is kept unless matched one-for-one by an element of `before`,
+ * so a bad-completion id already present in the prior store is not
+ * re-flagged, while a genuinely new one (or an extra anonymous bad row)
+ * still surfaces.
+ */
+function multisetDiff(after: string[], before: string[]): string[] {
+  const counts = new Map<string, number>();
+  for (const b of before) counts.set(b, (counts.get(b) ?? 0) + 1);
+  const out: string[] = [];
+  for (const a of after) {
+    const c = counts.get(a) ?? 0;
+    if (c > 0) counts.set(a, c - 1);
+    else out.push(a);
+  }
+  return out;
 }
 
 /**
@@ -378,7 +400,12 @@ export async function runVerifyGate(options: VerifyGateOptions = {}): Promise<Ve
     });
   }
 
-  const badIds = detectBadCompletions(resulting);
+  // Round-10 P2: block only completions NEWLY introduced by THIS write —
+  // a pre-existing historical `completed`-without-evidence row (e.g.
+  // from before opting into G2) must not deadlock every later write.
+  // Multiset diff of bad-completion ids: resulting minus prior.
+  const priorContent = readCurrentFile(reaRoot, payloadCwd, filePath) ?? '';
+  const badIds = multisetDiff(detectBadCompletions(resulting), detectBadCompletions(priorContent));
   if (badIds.length === 0) {
     return { exitCode: 0, stderr, stdout };
   }
