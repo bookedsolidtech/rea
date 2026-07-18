@@ -346,10 +346,21 @@ export async function runSettingsProtection(
   // §5b. Extension-surface allow-list (.husky/{commit-msg,pre-push,
   //      pre-commit,prepare-commit-msg}.d/*).
   if (isExtensionSurface(normalized)) {
+    // Round-52 P2: probe the filesystem against the ACCEPTED worktree
+    // root, exactly as checkProtectedSymlinkResolution() does. In a
+    // linked-worktree session the hook process cwd may be pinned to the
+    // primary checkout while `reaRoot` (from payload.cwd) is the
+    // worktree — a RELATIVE fragment like `.husky/pre-push.d/foo` must be
+    // resolved in the worktree, not cwd, or a symlinked fragment (or
+    // symlinked parent) in the worktree BYPASSES these §5b refusals. An
+    // already-absolute filePath is used verbatim (no double-join).
+    const surfaceProbePath = path.isAbsolute(filePath)
+      ? filePath
+      : path.resolve(reaRoot, filePath);
     // (a) Final-component symlink refusal.
     let isFinalSymlink = false;
     try {
-      const st = fs.lstatSync(filePath);
+      const st = fs.lstatSync(surfaceProbePath);
       isFinalSymlink = st.isSymbolicLink();
     } catch {
       /* file doesn't exist — fine */
@@ -370,7 +381,7 @@ export async function runSettingsProtection(
       };
     }
     // (b) Intermediate-directory symlink resolution.
-    const parentDir = path.dirname(filePath);
+    const parentDir = path.dirname(surfaceProbePath);
     let parentIsDir = false;
     try {
       parentIsDir = fs.statSync(parentDir).isDirectory();

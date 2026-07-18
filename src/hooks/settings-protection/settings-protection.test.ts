@@ -226,6 +226,69 @@ describe('settings-protection (Node-binary port)', () => {
     });
   });
 
+  describe('§5b extension-surface — reaRoot-relative probing (round-52 P2)', () => {
+    // In a linked-worktree session the accepted `reaRoot` differs from the
+    // process cwd. A RELATIVE fragment edit must have its symlink probes
+    // resolved against reaRoot, not cwd — otherwise a symlinked fragment
+    // (or symlinked parent) under the worktree bypasses the §5b refusals.
+    // These tests pass a RELATIVE file_path; the process cwd is the repo
+    // root (NOT reaRoot), so before the fix the probes resolved against the
+    // wrong tree and the symlinks went unseen (exit 0). The reaRoot option
+    // is the same injection the other tests use.
+
+    it('(i) refuses a symlinked fragment UNDER reaRoot via relative path', async () => {
+      fs.mkdirSync(path.join(reaRoot, '.husky', 'pre-push.d'), { recursive: true });
+      // Pre-existing pre-push body the attacker wants to overwrite.
+      fs.writeFileSync(path.join(reaRoot, '.husky', 'pre-push'), '# body\n');
+      // Symlinked final component lives under reaRoot, but the edit is
+      // expressed as a RELATIVE path (as a worktree session would).
+      fs.symlinkSync(
+        '../pre-push',
+        path.join(reaRoot, '.husky', 'pre-push.d', 'evil'),
+      );
+      const r = await runSettingsProtection({
+        reaRoot,
+        stdinOverride: writePayload('.husky/pre-push.d/evil'),
+      });
+      expect(r.exitCode).toBe(2);
+      expect(r.surfaceSymlinkRefused).toBe(true);
+      expect(r.matched).toBe('__surface_symlink__');
+      expect(r.stderr).toContain('symlink in extension surface refused');
+    });
+
+    it('(ii) catches a symlinked parent UNDER reaRoot via relative path', async () => {
+      fs.mkdirSync(path.join(reaRoot, '.husky', 'pre-push.d'), { recursive: true });
+      fs.mkdirSync(path.join(reaRoot, 'elsewhere'), { recursive: true });
+      // Intermediate directory of the fragment path is a symlink that
+      // leaves the surface — resolved relative to reaRoot.
+      fs.symlinkSync(
+        path.join(reaRoot, 'elsewhere'),
+        path.join(reaRoot, '.husky', 'pre-push.d', 'linkdir'),
+      );
+      const r = await runSettingsProtection({
+        reaRoot,
+        stdinOverride: writePayload('.husky/pre-push.d/linkdir/fragment'),
+      });
+      expect(r.exitCode).toBe(2);
+      expect(r.surfaceSymlinkRefused).toBe(true);
+      expect(r.matched).toBe('__surface_parent_symlink__');
+      expect(r.stderr).toContain('resolves outside surface');
+    });
+
+    it('degenerate (reaRoot == cwd surrogate): plain relative fragment allowed', async () => {
+      // No symlink present under reaRoot → the reaRoot-relative probes find
+      // a regular (nonexistent) fragment and the surface allows it. Confirms
+      // the reaRoot resolution does not over-refuse in the ordinary case.
+      fs.mkdirSync(path.join(reaRoot, '.husky', 'pre-push.d'), { recursive: true });
+      const r = await runSettingsProtection({
+        reaRoot,
+        stdinOverride: writePayload('.husky/pre-push.d/00-act-ci'),
+      });
+      expect(r.exitCode).toBe(0);
+      expect(r.surfaceSymlinkRefused).toBe(false);
+    });
+  });
+
   describe('§6 hard-protected list', () => {
     it('blocks .claude/settings.json', async () => {
       const r = await runSettingsProtection({
