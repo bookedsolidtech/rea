@@ -34,6 +34,7 @@ context_protection:
     - pnpm run lint
   max_bash_output_lines: 100
 review:
+  concerns_blocks: true
   codex_required: false
   # 0.16.1+: pin the rea repo to the iron-gate codex defaults so any P1
   # in the canonical hooks gets caught against this repo at the SAME

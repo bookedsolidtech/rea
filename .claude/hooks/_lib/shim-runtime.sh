@@ -158,6 +158,16 @@ _shim_apply_defaults() {
   : "${SHIM_REFUSAL_NOUN:=protection}"
   : "${SHIM_NODE_MISSING_NOUN:=$SHIM_REFUSAL_NOUN}"
   : "${SHIM_SKIP_VERSION_PROBE:=0}"
+  # round-53 P1 — opt-in "fail CLOSED when the gate is active" posture. A shim
+  # that is FAIL-OPEN by default (SHIM_FAIL_OPEN=1) but guards a policy gate
+  # sets SHIM_FAIL_CLOSED_WHEN_RELEVANT=1 + SHIM_ACTIVE_GATE_KEY=<gate-key>
+  # (e.g. g2_verify). When the CLI cannot run the gate (node-missing /
+  # cli-missing / version-skew) AND that gate is ACTIVE (shadow|enforce), the
+  # shim FAILS CLOSED instead of open — a configured gate that cannot run is a
+  # config error, not a silent pass. Default 0 / "" leaves every existing shim
+  # byte-for-byte unchanged.
+  : "${SHIM_FAIL_CLOSED_WHEN_RELEVANT:=0}"
+  : "${SHIM_ACTIVE_GATE_KEY:=}"
 }
 
 # -----------------------------------------------------------------------------
@@ -672,6 +682,85 @@ shim_emit_version_skew_banner_blocking() {
 shim_emit_version_skew_banner_advisory() {
   printf 'rea: this shim requires the `rea hook %s` subcommand (introduced in %s).\n' "$SHIM_NAME" "$SHIM_INTRODUCED_IN" >&2
   printf 'Run `pnpm install` (or `npm install`) to sync the CLI; falling through silently.\n' >&2
+}
+
+# round-53/54 — gate-MODE detector for the "CLI cannot run the gate" posture
+# (see SHIM_FAIL_CLOSED_WHEN_RELEVANT in _shim_apply_defaults). ECHOES the mode
+# configured for SHIM_ACTIVE_GATE_KEY in THIS repo's LOCAL policy at
+# ${REA_ROOT}/.rea/policy.yaml — `enforce`, `shadow`, or `off`. Detection mirrors
+# the pre-push / pre-commit gate-mode awk EXACTLY (ONE rule across all gates):
+# mode in block form OR inline flow map at ANY nesting depth
+# (`artifact_gates: { g2_verify: { mode: enforce } }`, `g2_verify:{mode:enforce}`).
+# Value matching strips non-alpha so `enforce`, `"enforce"`, `'enforce'` match.
+# SELF-CONTAINED awk scan (not the tiered policy-reader) so it stays inline-robust
+# in the CLI-missing branch where Tier 1 is unavailable. Dispositions (round-54
+# tri-state — shadow is OBSERVE-ONLY): no key configured / policy ABSENT / no
+# gate mode → `off`; shadow → `shadow`; enforce → `enforce`; policy present but
+# awk unavailable → `enforce` (bias fail-closed). bash-3.2 / BSD-safe.
+_shim_gate_mode() {
+  [ -n "${SHIM_ACTIVE_GATE_KEY:-}" ] || { printf 'off'; return 0; }
+  local _pol="${REA_ROOT}/.rea/policy.yaml"
+  [ -f "$_pol" ] || { printf 'off'; return 0; }
+  command -v awk >/dev/null 2>&1 || { printf 'enforce'; return 0; }
+  local _m
+  _m=$(awk -v key="$SHIM_ACTIVE_GATE_KEY" '
+    function ind(str,   n){ n=0; while (substr(str,n+1,1)==" ") n++; return n }
+    function modeval(str,   v){
+      if (str !~ /mode:/) return ""
+      v=str; sub(/.*mode:/,"",v); gsub(/[^A-Za-z]/,"",v)
+      if (v ~ /^enforce/) return "enforce"
+      if (v ~ /^shadow/) return "shadow"
+      return ""
+    }
+    function bump(m){ if (m=="enforce") best=2; else if (m=="shadow" && best<1) best=1 }
+    BEGIN { best=0; inlinep=key "[^A-Za-z_].*mode:"; opener="^" key ":" }
+    {
+      s=$0; sub(/^[ \t]*/,"",s)
+      if (s=="" || substr(s,1,1)=="#") next
+      if (s ~ inlinep) bump(modeval(s))
+      i=ind($0)
+      if (s ~ opener) { bump(modeval(s)); blk=1; bi=i; next }
+      if (blk) {
+        if (i <= bi) blk=0
+        else if (s ~ /^mode:/) bump(modeval(s))
+      }
+    }
+    END { if (best==2) print "enforce"; else if (best==1) print "shadow" }
+  ' "$_pol" 2>/dev/null)
+  case "$_m" in
+    enforce) printf 'enforce' ;;
+    shadow) printf 'shadow' ;;
+    *) printf 'off' ;;
+  esac
+}
+
+# round-54 — tri-state "the CLI could not run the gate" disposition. $1 = cause.
+# enforce → CONFIG-ERROR + exit 2; shadow → one-line WARN + exit 0 (observe-only
+# never blocks); off/absent → fall through (return 1) to the caller's existing
+# fail-open path (silent allow). Bias enforce on an unparseable governed policy.
+_shim_gate_cannot_run() {
+  local cause="$1"
+  case "$(_shim_gate_mode)" in
+    enforce)
+      shim_emit_gate_config_error_banner "$cause"
+      exit 2 ;;
+    shadow)
+      printf 'rea: WARN — %s (shadow gate %s) could not run: %s; not blocking.\n' \
+        "$SHIM_NAME" "$SHIM_ACTIVE_GATE_KEY" "$cause" >&2
+      exit 0 ;;
+    *)
+      return 1 ;;
+  esac
+}
+
+# round-53 P1 — the fail-closed CONFIG-ERROR banner (ENFORCE only). $1 = cause.
+shim_emit_gate_config_error_banner() {
+  local cause="$1"
+  printf 'rea: CONFIG-ERROR — %s blocked (fail-closed).\n' "$SHIM_NAME" >&2
+  printf '  %s, but this repo has an ENFORCE gate (%s = enforce).\n' "$cause" "$SHIM_ACTIVE_GATE_KEY" >&2
+  printf '  Refusing the operation without the gate check. Fix one:\n' >&2
+  printf '    - build/install rea so the CLI can run (`pnpm install && pnpm build`, or `npm i -g @bookedsolid/rea`), or\n' >&2
+  printf '    - set that gate mode to `off` in .rea/policy.yaml.\n' >&2
 }
 
 # -----------------------------------------------------------------------------
@@ -1293,6 +1382,12 @@ shim_run() {
   #     did NOT exit us out above. Emits the dedicated node-missing
   #     banner for blocking-tier; advisory-tier exits 0 silently.
   if [ "$node_missing" -eq 1 ]; then
+    # round-53/54: a FAIL-OPEN shim guarding a policy gate resolves the gate MODE
+    # (tri-state): enforce → CONFIG-ERROR + exit 2; shadow → WARN + exit 0;
+    # off/absent → fall through to the existing fail-open path below.
+    if [ "$SHIM_FAIL_CLOSED_WHEN_RELEVANT" -eq 1 ]; then
+      _shim_gate_cannot_run '`node` is not on PATH so the rea CLI cannot run'
+    fi
     if [ "$SHIM_FAIL_OPEN" -eq 1 ]; then
       exit 0
     fi
@@ -1338,6 +1433,13 @@ shim_run() {
     if [ -n "${_SHIM_GLOBAL_BAD_REASON:-}" ]; then
       shim_emit_global_tier_banner "$_SHIM_GLOBAL_BAD_REASON"
     fi
+    # round-53/54: a FAIL-OPEN shim guarding a policy gate resolves the gate MODE
+    # rather than dropping the gate — direct writes must not bypass an opted-in
+    # gate just because the CLI is missing/unbuilt. enforce → CONFIG-ERROR + exit
+    # 2; shadow → WARN + exit 0; off/absent → fall through to the fail-open path.
+    if [ "$SHIM_FAIL_CLOSED_WHEN_RELEVANT" -eq 1 ]; then
+      _shim_gate_cannot_run 'the rea CLI is not built or installed in this checkout'
+    fi
     if [ "$SHIM_FAIL_OPEN" -eq 1 ]; then
       # Advisory tier — drop the gate. Any global-bad advisory was already
       # emitted; advisory hooks are nudges, not security claims.
@@ -1362,6 +1464,13 @@ shim_run() {
     probe_out=$("${REA_ARGV[@]}" hook "$SHIM_NAME" --help 2>&1)
     probe_status=$?
     if [ "$probe_status" -ne 0 ] || ! printf '%s' "$probe_out" | grep -q -e "$SHIM_NAME"; then
+      # round-53/54: a FAIL-OPEN shim guarding a policy gate resolves the gate
+      # MODE when the resolved CLI is too old to implement this shim's
+      # subcommand. enforce → CONFIG-ERROR + exit 2; shadow → WARN + exit 0;
+      # off/absent → fall through to the version-skew advisory / fail-open path.
+      if [ "$SHIM_FAIL_CLOSED_WHEN_RELEVANT" -eq 1 ]; then
+        _shim_gate_cannot_run "the resolved rea CLI lacks the \`rea hook $SHIM_NAME\` subcommand"
+      fi
       if [ "$SHIM_FAIL_OPEN" -eq 1 ]; then
         shim_emit_version_skew_banner_advisory
         exit 0

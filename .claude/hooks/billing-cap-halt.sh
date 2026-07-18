@@ -97,6 +97,26 @@ _billing_kw_strict() {
   [[ "$1" =~ $re ]]
 }
 
+# Coarse JSON `tool_name` value extraction for the NO-NODE fail-closed path
+# (no interpreter to JSON-parse robustly). PostToolUse payloads carry
+# `"tool_name":"Bash"` / `"tool_name": "Write"` (whitespace optional around
+# the colon). Prints the FIRST such value (a payload has one top-level
+# tool_name) to stdout, or nothing when none is present/parseable.
+# BSD+GNU-portable: `grep -Eo` (POSIX ERE, no GNU-only `-P`) + `sed -E`
+# (never `sed -r`). Line-oriented: `[^"]*` cannot cross the closing quote,
+# and grep matches within a line, so a multi-line payload still yields the
+# intended field. LIMIT (documented, accepted): if untrusted stderr text
+# literally embeds `"tool_name":"…"` BEFORE the real field, `head -n 1`
+# could pick the wrong one — but JSON.stringify emits keys in insertion
+# order (tool_name first), so the real field precedes any tool_response
+# content. This coarseness only affects the no-node AND no-CLI window.
+_coarse_tool_name() {
+  printf '%s' "$INPUT" \
+    | grep -Eo '"tool_name"[[:space:]]*:[[:space:]]*"[^"]*"' 2>/dev/null \
+    | head -n 1 \
+    | sed -E 's/.*:[[:space:]]*"([^"]*)"$/\1/'
+}
+
 # Artifact Gates §5 — the per-session TURN COUNTER lives in the CLI body and
 # must run on EVERY tool call when a turn budget is configured. So this hook
 # proceeds to the CLI whenever `spend_governance.turn_budget` is present,
@@ -155,6 +175,26 @@ shim_is_relevant() {
 # in a doubly-degraded no-node-no-CLI environment).
 shim_cli_missing_relevant() {
   if ! command -v node >/dev/null 2>&1; then
+    # Bash-ONLY scoping WITHOUT a JSON parser (mirrors the node path above
+    # and the TS hook's `payloadToolName !== "Bash"` skip). Coarsely detect
+    # the tool_name: a PROVABLY non-Bash tool has no shell stderr to bill on,
+    # so it must NEVER fail closed — this is the codex round-52 P2 fix for
+    # the widened PostToolUse/* matcher. EXACT value check (`!= "Bash"`), not
+    # a substring, so a hypothetical `BashOutput` is not treated as Bash.
+    local tname=""
+    tname=$(_coarse_tool_name)
+    if [ -n "$tname" ] && [ "$tname" != "Bash" ]; then
+      # Determinable AND not Bash → NOT billing-relevant → no block.
+      return 1
+    fi
+    # tname == "Bash"            → proceed with the coarse strict scan.
+    # tname == "" (undeterminable — truly malformed / no top-level
+    #             tool_name, no node) → KEEP today's doubly-degraded
+    #             fail-closed coarse scan. That no-node-AND-no-CLI-AND-
+    #             unparseable environment is out of scope to relax: a spend
+    #             guard must not silently vanish there. Only the PROVABLY
+    #             non-Bash case (above) becomes a skip; "can't tell" stays
+    #             fail-closed.
     local lower=""
     lower=$(printf '%s' "$INPUT" | tr '[:upper:]' '[:lower:]' 2>/dev/null || printf '%s' "$INPUT")
     _billing_kw_strict "$lower"
@@ -166,6 +206,18 @@ shim_cli_missing_relevant() {
     process.stdin.on("data",c=>d+=c).on("end",()=>{
       let p; try { p = JSON.parse(d); } catch { process.exit(0); }
       if (!p || typeof p !== "object" || Array.isArray(p)) process.exit(0);
+      // Bash-ONLY billing scan — mirrors the TS hook payloadToolName
+      // !== "Bash" skip (src/hooks/billing-cap-halt/index.ts step 2b). A
+      // non-Bash tool (Write/Edit/Read/…) has no shell command/stderr to
+      // bill on, so it is NEVER billing-relevant: emit nothing → the strict
+      // scan below sees empty input → not relevant → no fail-closed block.
+      // EXACT value (not a substring) so a hypothetical `BashOutput` tool is
+      // NOT treated as Bash. This is the CLI-missing parity for the widened
+      // PostToolUse/* matcher (the turn COUNTER needs every tool; the
+      // billing SCAN stays Bash-only) — without it a FAILING non-Bash tool
+      // whose stderr merely contains a billing phrase would hard-block only
+      // when the CLI is unavailable (codex round-52 P2).
+      if (p.tool_name !== "Bash") process.exit(0);
       const tr = p.tool_response;
       // STDERR of a FAILED command only — mirrors the TS hook (round-4 +
       // round-7 P1/P3). Emit nothing on success so a passing command that

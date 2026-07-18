@@ -2,7 +2,7 @@
   "version": "0.51.0",
   "profile": "bst-internal",
   "installed_at": "2026-04-18T21:31:41.169Z",
-  "upgraded_at": "2026-07-18T16:10:28.802Z",
+  "upgraded_at": "2026-07-18T22:43:47.631Z",
   "files": [
     {
       "path": ".claude/hooks/_lib/bootstrap-allowlist.sh",
@@ -61,7 +61,7 @@
     },
     {
       "path": ".claude/hooks/_lib/shim-runtime.sh",
-      "sha256": "ba3b292c8df044744771d6e11eabf9e408f59687b19cb12764ee0cfb89acee57",
+      "sha256": "a440f503b8d898e2cdb44480bcd0e14df09fecc7515e4a3306a680c46e9e5bb7",
       "source": "hook"
     },
     {
@@ -76,7 +76,7 @@
     },
     {
       "path": ".claude/hooks/billing-cap-halt.sh",
-      "sha256": "64428a73e1d36b63f5e965d9f27def9143171b74df96bd89984824172d42ae97",
+      "sha256": "fc0bbb205c4c05b2dae1796c218ac188ca3c3739fc05a37b1a8d179d851a55d1",
       "source": "hook"
     },
     {
@@ -151,12 +151,12 @@
     },
     {
       "path": ".claude/hooks/verify-gate-bash-gate.sh",
-      "sha256": "165813401d6b2b8d023e945d40fefbfaa94e388f35d66bdb7544063884adaf56",
+      "sha256": "13ecb3134e6482ace16fcd6d2b646ab868aa4946ad057d6fd113daac86bd6fe5",
       "source": "hook"
     },
     {
       "path": ".claude/hooks/verify-gate.sh",
-      "sha256": "bc1e5425304251667effcd31ae86ae904bcb521c61b4a36d217aaf20df7e7ec7",
+      "sha256": "1d3dbbdfa45359fe0659c2f7e5ed7fd2df943f60a747035f51c606290daab9f9",
       "source": "hook"
     },
     {
