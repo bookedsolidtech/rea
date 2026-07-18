@@ -111,6 +111,13 @@ describe('activeTask', () => {
     const tasks = [make('T-0001', { active: true, status: 'completed', evidence: ['e'] })];
     expect(activeTask(tasks)).toBeNull();
   });
+
+  it('ignores an active task that is cancelled (round-21 P2)', () => {
+    // A cancelled+active row (e.g. from a raw tasks.jsonl edit) must not be
+    // resolved as the active ticket — G1 would otherwise gate on it.
+    const tasks = [make('T-0001', { active: true, status: 'cancelled' })];
+    expect(activeTask(tasks)).toBeNull();
+  });
 });
 
 describe('nextTaskId', () => {

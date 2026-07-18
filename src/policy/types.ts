@@ -817,6 +817,13 @@ export interface Policy {
    */
   artifact_gates?: ArtifactGatesPolicy;
   /**
+   * `rea dash` sensitive-project visibility. `false` renders the project
+   * as an opaque item-count in the global dashboard (no task titles).
+   * Absent → visible. Accepted by the strict loader so a repo enabling the
+   * feature doesn't break every other loadPolicy() caller.
+   */
+  dashboard_visible?: boolean;
+  /**
    * Architecture-review patterns (0.20.1+). When set, the
    * `architecture-review-gate.sh` hook fires an advisory when a
    * Write/Edit/MultiEdit/NotebookEdit lands on a path matching one

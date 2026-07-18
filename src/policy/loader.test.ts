@@ -62,6 +62,13 @@ describe('policy loader', () => {
     expect(() => loadPolicy(baseDir)).toThrow(/Invalid policy schema/);
   });
 
+  it('accepts dashboard_visible so enabling rea dash visibility does not break loadPolicy (round-21 P1)', async () => {
+    const yaml = SAMPLE + '\ndashboard_visible: false\n';
+    await fs.writeFile(path.join(baseDir, '.rea', 'policy.yaml'), yaml, 'utf8');
+    const p = loadPolicy(baseDir);
+    expect(p.dashboard_visible).toBe(false);
+  });
+
   it('throws when policy file is missing', () => {
     expect(() => loadPolicy(baseDir)).toThrow(/Policy file not found/);
   });

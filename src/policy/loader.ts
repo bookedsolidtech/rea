@@ -777,6 +777,14 @@ const PolicySchema = z
     // absent block is a total no-op (all modes default `off` when the
     // block IS present). See `ArtifactGatesPolicySchema`.
     artifact_gates: ArtifactGatesPolicySchema.optional(),
+    // `rea dash` sensitive-project visibility. When `false`, the global
+    // dashboard renders this project as an opaque item-count (no task
+    // titles). `rea dash` itself reads this via a tolerant raw-YAML parse,
+    // but the strict loader must ALSO accept the key — otherwise a repo
+    // that sets it to use the feature breaks EVERY other loadPolicy()
+    // caller (hooks/commands) at policy-load time (codex round-21 P1).
+    // Absent → visible (the default).
+    dashboard_visible: z.boolean().optional(),
   })
   .strict();
 

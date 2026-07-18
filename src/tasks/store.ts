@@ -196,14 +196,17 @@ export function updateTasks(
 }
 
 /**
- * Resolve the single active, non-completed task from a folded task list, or
- * `null`. Enforces the read side of the "at most one active non-completed
+ * Resolve the single active, non-terminal task from a folded task list, or
+ * `null`. Enforces the read side of the "at most one active non-terminal
  * task per project" invariant — if the store somehow holds more than one, the
- * first in iteration order wins.
+ * first in iteration order wins. Both terminal states (`completed` AND
+ * `cancelled`) are excluded: a `cancelled` record with `active: true` (from a
+ * raw `.rea/tasks.jsonl` edit) must not be treated as the active ticket by
+ * `rea tasks list` or the G1 spec gate (codex round-21 P2).
  */
 export function activeTask(tasks: TaskRecord[]): TaskRecord | null {
   for (const t of tasks) {
-    if (t.active && t.status !== 'completed') return t;
+    if (t.active && t.status !== 'completed' && t.status !== 'cancelled') return t;
   }
   return null;
 }
