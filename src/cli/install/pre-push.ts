@@ -297,17 +297,71 @@ done
 #   - REA_SKIP_LOCAL_REVIEW="<reason>"      → bypass + audit
 # We resolve the rea binary the same way the dispatch below does.
 #
-# 0.26.0 preflight COMPAT (round-32 F1). The \`--operation\` flag is NEW in
-# this release. A RESOLVED but OLDER rea CLI — a repo pinned below this
-# release, or a stale PATH/global fallback — does not know it, and commander
-# exits \`unknown option '--operation'\`, which would HARD-BLOCK every push
-# before the gate runs. \`_rea_preflight\` tries the current invocation; on an
-# unknown-option/unknown-command error it RETRIES the pre-0.26
-# \`preflight --strict\` form so the gate STILL RUNS on the older CLI; if even
-# that is unknown (a CLI too old to have \`preflight\` at all) it FAILS OPEN —
-# a flag/subcommand incompatibility must never block a push (the push-gate
-# below is the second layer). A GENUINE refusal (exit 2, no unknown-* marker)
-# propagates unchanged. \$@ is the resolved CLI prefix.
+# 0.26.0 preflight COMPAT (round-32 F1 / round-50 P1). The \`--operation\` flag
+# is NEW in this release. A RESOLVED but OLDER rea CLI — a repo pinned below
+# this release, or a stale PATH/global fallback — does not know it, and
+# commander exits \`unknown option '--operation'\`, which would HARD-BLOCK every
+# push before the gate runs. \`_rea_preflight\` tries the current invocation; on
+# an unknown-option/unknown-command error it RETRIES the pre-0.26
+# \`preflight --strict\` form so the gate STILL RUNS on the older CLI.
+#
+# When even the retry is \`unknown command\` (a CLI too old to have \`preflight\`
+# at ALL), the disposition is MODE-AWARE (round-50 P1 — off means off):
+#   - review gate ACTIVE (review.local_review.mode OR artifact_gates.g3_review.mode
+#     is shadow/enforce) → FAIL CLOSED (exit 2 + CONFIG-ERROR). Silently
+#     disabling a configured git-side review gate because the resolved rea is
+#     old is a security fail-open.
+#   - review gate OFF / unconfigured → FAIL OPEN (rc 0) — an off-gate repo must
+#     not be blocked just because the resolved rea is old.
+# An \`unknown option\` at the retry stage (a pure flag mismatch on an otherwise
+# preflight-capable CLI) ALWAYS fails open — it must never block a push. A
+# GENUINE refusal (exit 2, no unknown-* marker) propagates unchanged. \$@ is
+# the resolved CLI prefix.
+#
+# _rea_review_gate_active: 0 (success) iff THIS repo's LOCAL policy at
+# \${REA_ROOT}/.rea/policy.yaml configures an active review-gate mode. REA_ROOT
+# is the local worktree root resolved above; policy is per-branch/worktree, so
+# the LOCAL policy is the one that governs. Dependency-free (awk only),
+# BSD/GNU/bash-3.2 safe, cheap (single pass). Dispositions:
+#   - policy ABSENT                       → 1 (no gate → fail OPEN)
+#   - policy present, no shadow/enforce   → 1 (gate off → fail OPEN)
+#   - policy present, mode shadow/enforce → 0 (gate active → fail CLOSED)
+#   - policy present but awk unavailable  → 0 (cannot parse a governed policy →
+#                                              bias fail-CLOSED)
+# Parse: track \`local_review:\`/\`g3_review:\` blocks by indentation and match a
+# \`mode:\` value of shadow/enforce inside them; inline maps
+# (\`local_review: { mode: enforce }\`) are handled too. Value matching strips
+# non-alpha before comparing, so \`enforce\`, \`"enforce"\`, \`'enforce'\`, and
+# \`enforce # note\` all match. Known limit: no full YAML parse — a structurally
+# broken policy that our line scan reads as no-active-mode fails OPEN.
+_rea_review_gate_active() {
+  _rea_pol="\${REA_ROOT}/.rea/policy.yaml"
+  [ -f "\$_rea_pol" ] || return 1
+  command -v awk >/dev/null 2>&1 || return 0
+  awk '
+    function ind(str,   n){ n=0; while (substr(str,n+1,1)==" ") n++; return n }
+    function has_active(str,   v){
+      if (str !~ /mode:/) return 0
+      v=str; sub(/.*mode:/,"",v); gsub(/[^A-Za-z]/,"",v)
+      return (v ~ /^(shadow|enforce)/)
+    }
+    {
+      s=\$0; sub(/^[ \\t]*/,"",s)
+      if (s=="" || substr(s,1,1)=="#") next
+      i=ind(\$0)
+      if (s ~ /^local_review:/ || s ~ /^g3_review:/) {
+        if (has_active(s)) { f=1; exit }
+        blk=1; bi=i; next
+      }
+      if (blk) {
+        if (i <= bi) blk=0
+        else if (s ~ /^mode:/ && has_active(s)) { f=1; exit }
+      }
+    }
+    END { exit (f?0:1) }
+  ' "\$_rea_pol" 2>/dev/null && return 0
+  return 1
+}
 _rea_preflight() {
   _pf_out=\$("\$@" preflight --strict --operation push 2>&1) && _pf_rc=0 || _pf_rc=\$?
   if [ "\$_pf_rc" -ne 0 ]; then
@@ -315,7 +369,25 @@ _rea_preflight() {
       *"unknown option"* | *"unknown command"*)
         _pf_out=\$("\$@" preflight --strict 2>&1) && _pf_rc=0 || _pf_rc=\$?
         case "\$_pf_out" in
-          *"unknown option"* | *"unknown command"*) _pf_out=""; _pf_rc=0 ;;
+          *"unknown command"*)
+            # CLI lacks \`preflight\` entirely. Fail CLOSED only when the repo's
+            # review gate is actually active; otherwise preserve fail-open.
+            if _rea_review_gate_active; then
+              printf 'rea: CONFIG-ERROR — pre-push blocked (fail-closed).\\n' >&2
+              printf '  The resolved rea CLI has no \`preflight\` command, but this repo has an\\n' >&2
+              printf '  ACTIVE review gate (review.local_review.mode or artifact_gates.g3_review.mode\\n' >&2
+              printf '  = shadow/enforce). Refusing to push without a coverage check. Fix one:\\n' >&2
+              printf '    - upgrade rea (e.g. \`npm i -g @bookedsolid/rea\`), or\\n' >&2
+              printf '    - set the gate mode to \`off\` in .rea/policy.yaml, or\\n' >&2
+              printf '    - bypass this one push with REA_SKIP_LOCAL_REVIEW="<reason>".\\n' >&2
+              _pf_out=""; _pf_rc=2
+            else
+              _pf_out=""; _pf_rc=0
+            fi
+            ;;
+          *"unknown option"*)
+            # Pure flag incompatibility on a preflight-capable CLI — never block.
+            _pf_out=""; _pf_rc=0 ;;
         esac
         ;;
     esac
