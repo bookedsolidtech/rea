@@ -202,13 +202,13 @@ describe('BODY_TEMPLATE — path-with-spaces portability (Fix A / 0.12.0)', () =
 });
 
 describe('marker bumps (0.26.0 — v5 markers + v4/v3/v2 legacy detection)', () => {
-  it('FALLBACK_MARKER is the v5 marker', () => {
-    expect(FALLBACK_MARKER).toBe('# rea:pre-push-fallback v5');
+  it('FALLBACK_MARKER is the v6 marker', () => {
+    expect(FALLBACK_MARKER).toBe('# rea:pre-push-fallback v6');
   });
 
-  it('HUSKY_GATE_MARKER and HUSKY_GATE_BODY_MARKER are v5', () => {
-    expect(HUSKY_GATE_MARKER).toBe('# rea:husky-pre-push-gate v5');
-    expect(HUSKY_GATE_BODY_MARKER).toBe('# rea:gate-body-v5');
+  it('HUSKY_GATE_MARKER and HUSKY_GATE_BODY_MARKER are v6', () => {
+    expect(HUSKY_GATE_MARKER).toBe('# rea:husky-pre-push-gate v6');
+    expect(HUSKY_GATE_BODY_MARKER).toBe('# rea:gate-body-v6');
   });
 
   it('isLegacyReaManagedFallback recognizes 0.13–0.25.x v4 markers (refresh-on-upgrade)', () => {

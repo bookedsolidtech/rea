@@ -409,14 +409,28 @@ function reconstructEditResult(
     if (typeof rec.old_string !== 'string') return null;
     const oldStr = rec.old_string;
     const newStr = typeof rec.new_string === 'string' ? rec.new_string : '';
-    // Round-1 P2: a cwd-relative path (e.g. `../.changeset/foo.md` from a
-    // subdirectory session) resolves against the TOOL's cwd, not the
-    // repo root — resolving against reaRoot read the wrong file, returned
-    // null, and silently skipped validation. Fall back to reaRoot only
-    // when the payload carried no cwd.
-    const base = payloadCwd.length > 0 ? payloadCwd : reaRoot;
-    const abs = path.isAbsolute(filePath) ? filePath : path.resolve(base, filePath);
-    const current = fs.readFileSync(abs, 'utf8');
+    // Relative `file_path` can follow EITHER convention: Claude usually
+    // sends a repo-root-relative path (`.changeset/foo.md`) even from a
+    // subdirectory session (round-5 P2), but a cwd-relative form
+    // (`../.changeset/foo.md`) also occurs (round-1 P2). Try the repo
+    // root first, then the payload cwd, and read whichever exists —
+    // never silently skip validation by guessing one base.
+    let current: string | null = null;
+    const candidates = path.isAbsolute(filePath)
+      ? [filePath]
+      : [
+          path.resolve(reaRoot, filePath),
+          ...(payloadCwd.length > 0 ? [path.resolve(payloadCwd, filePath)] : []),
+        ];
+    for (const cand of candidates) {
+      try {
+        current = fs.readFileSync(cand, 'utf8');
+        break;
+      } catch {
+        /* try the next base */
+      }
+    }
+    if (current === null) return null;
     if (oldStr.length === 0 || !current.includes(oldStr)) return null;
     if (rec.replace_all === true) return current.split(oldStr).join(newStr);
     const idx = current.indexOf(oldStr);

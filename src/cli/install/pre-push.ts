@@ -69,6 +69,11 @@ const execFileAsync = promisify(execFile);
  * classification. Bump the version suffix whenever the body semantics
  * change so upgrades can migrate old installs cleanly.
  *
+ * v6 — 0.54.0 worktree-aware body: the CLI resolves via a REA_CLI_ROOT
+ *      fallback (worktree without its own install → primary checkout,
+ *      cross-repo verified) and preflight runs `--operation push`. The
+ *      body semantics changed, so the marker bumps to force `rea
+ *      upgrade` to rewrite v5 installs.
  * v5 — 0.26.0 local-first enforcement: body runs `rea preflight --strict --operation push`
  *      BEFORE the push-gate dispatch. `rea preflight` refuses the push
  *      when no recent `rea.local_review` audit entry covers HEAD; the
@@ -84,7 +89,10 @@ const execFileAsync = promisify(execFile);
  * v2 — 0.11.0 stateless push-gate body (no bash core, no audit grep).
  * v1 — 0.10.x and prior, delegated to `.claude/hooks/push-review-gate.sh`.
  */
-export const FALLBACK_MARKER = '# rea:pre-push-fallback v5';
+export const FALLBACK_MARKER = '# rea:pre-push-fallback v6';
+
+/** Legacy v5 marker (0.26.x – 0.53.x bodies). Refresh-on-upgrade. */
+export const LEGACY_FALLBACK_MARKER_V5 = '# rea:pre-push-fallback v5';
 
 /** Legacy v4 marker (0.13.x – 0.25.x bodies). Refresh-on-upgrade. */
 export const LEGACY_FALLBACK_MARKER_V4 = '# rea:pre-push-fallback v4';
@@ -108,7 +116,10 @@ export const LEGACY_FALLBACK_MARKER_V1 = '# rea:pre-push-fallback v1';
  * detects it to refresh in-place. Bump the suffix whenever the body
  * changes; pre-0.13 markers live in `LEGACY_HUSKY_GATE_MARKER_V{1,2,3}`.
  */
-export const HUSKY_GATE_MARKER = '# rea:husky-pre-push-gate v5';
+export const HUSKY_GATE_MARKER = '# rea:husky-pre-push-gate v6';
+
+/** Legacy v5 husky-gate marker (0.26.x – 0.53.x). Refresh-on-upgrade. */
+export const LEGACY_HUSKY_GATE_MARKER_V5 = '# rea:husky-pre-push-gate v5';
 
 /** Legacy v4 husky marker (0.13.x – 0.25.x bodies). Refresh-on-upgrade. */
 export const LEGACY_HUSKY_GATE_MARKER_V4 = '# rea:husky-pre-push-gate v4';
@@ -127,7 +138,10 @@ export const LEGACY_HUSKY_GATE_MARKER_V1 = '# rea:husky-pre-push-gate v1';
  * empty body (stubbed out by a consumer) is NOT classified as rea-managed.
  * A real rea hook always carries both markers.
  */
-export const HUSKY_GATE_BODY_MARKER = '# rea:gate-body-v5';
+export const HUSKY_GATE_BODY_MARKER = '# rea:gate-body-v6';
+
+/** Legacy v5 gate-body marker (0.26.x – 0.53.x). Refresh-on-upgrade. */
+export const LEGACY_HUSKY_GATE_BODY_MARKER_V5 = '# rea:gate-body-v5';
 
 /** Legacy v4 body marker (0.13.x – 0.25.x bodies). Refresh-on-upgrade. */
 export const LEGACY_HUSKY_GATE_BODY_MARKER_V4 = '# rea:gate-body-v4';
@@ -407,6 +421,7 @@ export function isLegacyReaManagedFallback(content: string): boolean {
   if (secondLineEnd < 0) return false;
   const secondLine = content.slice(10, secondLineEnd);
   return (
+    secondLine === LEGACY_FALLBACK_MARKER_V5 ||
     secondLine === LEGACY_FALLBACK_MARKER_V4 ||
     secondLine === LEGACY_FALLBACK_MARKER_V3 ||
     secondLine === LEGACY_FALLBACK_MARKER_V2 ||
@@ -437,6 +452,7 @@ export function isReaManagedHuskyGate(content: string): boolean {
  */
 export function isLegacyReaManagedHuskyGate(content: string): boolean {
   return (
+    hasHeaderMarkers(content, LEGACY_HUSKY_GATE_MARKER_V5, LEGACY_HUSKY_GATE_BODY_MARKER_V5) ||
     hasHeaderMarkers(content, LEGACY_HUSKY_GATE_MARKER_V4, LEGACY_HUSKY_GATE_BODY_MARKER_V4) ||
     hasHeaderMarkers(content, LEGACY_HUSKY_GATE_MARKER_V3, LEGACY_HUSKY_GATE_BODY_MARKER_V3) ||
     hasHeaderMarkers(content, LEGACY_HUSKY_GATE_MARKER_V2, LEGACY_HUSKY_GATE_BODY_MARKER_V2) ||

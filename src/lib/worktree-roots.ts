@@ -181,7 +181,18 @@ export function resolveCommonRoot(
   const candidateCommon = path.isAbsolute(candidateCommonRaw)
     ? candidateCommonRaw
     : path.join(candidate, candidateCommonRaw);
-  if (path.resolve(candidateCommon) !== path.resolve(commonDir)) return degenerate;
+  // Round-5 P2: canonicalize before comparing — the same git dir reached
+  // through a symlinked spelling (/var↔/private/var, symlinked checkout)
+  // must compare EQUAL, else a valid shared repo falsely degrades to
+  // per-worktree. Both are existing directories, so realpath resolves.
+  const canonDir = (p: string): string => {
+    try {
+      return fs.realpathSync(p);
+    } catch {
+      return path.resolve(p);
+    }
+  };
+  if (canonDir(candidateCommon) !== canonDir(commonDir)) return degenerate;
   return { commonRoot: candidate, isLinkedWorktree: true };
 }
 
