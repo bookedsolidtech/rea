@@ -17,8 +17,9 @@
  * merely mention a broad keyword do not.
  */
 
-import { spawnSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { BILLING_RE } from '../../src/hooks/billing-cap-halt/index.js';
@@ -360,4 +361,139 @@ describe('billing-cap-halt matcher parity — shim strict set ⇔ CLI BILLING_RE
       expect(r.status).toBe(0);
     });
   }
+});
+
+/**
+ * codex round-25 F1 — the shim's PRE-CLI policy reads must follow the
+ * POST-HANDOFF `REA_ROOT` (the payload worktree), NOT `CLAUDE_PROJECT_DIR`
+ * (the primary checkout). `shim_run` runs `shim_worktree_handoff` (step 2b)
+ * BEFORE both the `shim_is_relevant` gate (`_turn_budget_configured`, step 3)
+ * and the CLI-missing `shim_policy_short_circuit` (billing opt-out) read —
+ * so in a linked-worktree session those reads must hit the worktree's own
+ * `.rea/policy.yaml`, matching where the node hook's `readSpendGovernance`
+ * resolves (payload cwd → worktree).
+ *
+ * OBSERVABILITY NOTE: only the billing opt-out read is DISTINGUISHABLE in the
+ * CLI-missing harness. `_turn_budget_configured`'s sole effect is to force the
+ * relevance gate to PROCEED to the CLI; with no billing keyword + no CLI, both
+ * "proceed" and "skip" terminate at exit 0, so its root choice is not
+ * independently observable here. It uses the IDENTICAL `${REA_ROOT}` read
+ * under the same handoff-then-read ordering, so this test (which proves the
+ * ordering + REA_ROOT selection via the billing read) stands in for both.
+ * A fully observable turn-budget-counts assertion needs a CLI-PRESENT
+ * worktree e2e, out of scope for this CLI-missing shim harness.
+ */
+function gitExists(): boolean {
+  return spawnSync('git', ['--version'], { encoding: 'utf8' }).status === 0;
+}
+
+/** Run the shim inside a REAL linked git worktree whose `.rea/policy.yaml`
+ *  differs from the primary checkout's. CLI is missing (tmp tree has no dist /
+ *  node_modules), so the CLI-missing path exercises the pre-CLI policy read. */
+function runShimInWorktree(opts: {
+  primaryPolicy: string | null;
+  worktreePolicy: string | null;
+  payloadStderr: string;
+}): ShimResult {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'bch-wt-'));
+  const primary = path.join(base, 'primary');
+  const worktree = path.join(base, 'wt');
+  const git = (args: string[]): void => {
+    execFileSync('git', args, { stdio: 'ignore' });
+  };
+  try {
+    fs.mkdirSync(primary, { recursive: true });
+    git(['init', '-q', primary]);
+    git(['-C', primary, 'config', 'user.email', 't@t']);
+    git(['-C', primary, 'config', 'user.name', 't']);
+    git(['-C', primary, 'config', 'commit.gpgsign', 'false']);
+    fs.writeFileSync(path.join(primary, 'seed'), 'x');
+    git(['-C', primary, 'add', '.']);
+    git(['-C', primary, 'commit', '-qm', 'init']);
+    fs.mkdirSync(path.join(primary, '.rea'), { recursive: true });
+    if (opts.primaryPolicy !== null) {
+      fs.writeFileSync(path.join(primary, '.rea', 'policy.yaml'), opts.primaryPolicy);
+    }
+    // Linked worktree of `primary` (shares its git common dir → the handoff's
+    // same-repo guard is satisfied and REA_ROOT hands over to the worktree).
+    git(['-C', primary, 'worktree', 'add', '-q', worktree]);
+    fs.mkdirSync(path.join(worktree, '.rea'), { recursive: true });
+    if (opts.worktreePolicy !== null) {
+      fs.writeFileSync(path.join(worktree, '.rea', 'policy.yaml'), opts.worktreePolicy);
+    }
+    const payload = JSON.stringify({
+      tool_name: 'Bash',
+      tool_input: { command: 'node metered-call.mjs' },
+      tool_response: { stdout: '', stderr: opts.payloadStderr, exit_code: 1 },
+      // Top-level cwd = the linked worktree → drives shim_worktree_handoff.
+      cwd: worktree,
+    });
+    const res = spawnSync('bash', [SHIM], {
+      cwd: worktree,
+      env: {
+        PATH: process.env.PATH ?? '',
+        CLAUDE_PROJECT_DIR: primary,
+        HOME: process.env.HOME ?? '/tmp',
+      },
+      input: payload,
+      encoding: 'utf8',
+      timeout: 20_000,
+    });
+    return { status: res.status ?? -1, stdout: res.stdout ?? '', stderr: res.stderr ?? '' };
+  } finally {
+    // `git worktree add` leaves an administrative link; rm -rf the whole base.
+    fs.rmSync(base, { recursive: true, force: true });
+  }
+}
+
+describe('hooks/billing-cap-halt.sh — worktree handoff pre-CLI policy read (round-25 F1)', () => {
+  const HALT_POLICY = [
+    'version: "1"',
+    'profile: "test"',
+    'installed_by: "t"',
+    'blocked_paths: []',
+    'spend_governance:',
+    '  enabled: true',
+    '  billing_error_response: halt',
+    '',
+  ].join('\n');
+  const OPT_OUT = [
+    'version: "1"',
+    'profile: "test"',
+    'installed_by: "t"',
+    'blocked_paths: []',
+    'spend_governance:',
+    '  enabled: false',
+    '',
+  ].join('\n');
+
+  it.skipIf(!bashExists() || !gitExists())(
+    'reads the WORKTREE policy (fail-closed halt) even when the PRIMARY has NO policy — proves REA_ROOT, not CLAUDE_PROJECT_DIR',
+    () => {
+      // Before the fix the existence check probed CLAUDE_PROJECT_DIR (primary,
+      // no policy.yaml) → treated as disabled → exit 0. After the fix it probes
+      // the post-handoff REA_ROOT (worktree, halt policy) → reader reads halt →
+      // fail-closed on the billing wall → exit 2.
+      const r = runShimInWorktree({
+        primaryPolicy: null,
+        worktreePolicy: HALT_POLICY,
+        payloadStderr: 'Error: spending cap exceeded',
+      });
+      expect(r.status).toBe(2);
+    },
+  );
+
+  it.skipIf(!bashExists() || !gitExists())(
+    'honors a WORKTREE opt-out (enabled:false) even when the PRIMARY policy would fail closed',
+    () => {
+      // The worktree explicitly opted out; a billing wall must NOT fail closed,
+      // regardless of the primary checkout's stricter policy.
+      const r = runShimInWorktree({
+        primaryPolicy: HALT_POLICY,
+        worktreePolicy: OPT_OUT,
+        payloadStderr: 'Error: spending cap exceeded',
+      });
+      expect(r.status).toBe(0);
+    },
+  );
 });

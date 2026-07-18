@@ -106,8 +106,16 @@ _billing_kw_strict() {
 # billing-keyword perf gate below decides — byte-identical to pre-feature, so
 # ordinary output still never spawns the CLI. Over-trigger (a comment that
 # merely says "turn_budget:") just spawns the CLI, which then no-ops — cheap.
+#
+# WORKTREE (codex round-25 F1): reads the POST-HANDOFF `REA_ROOT`, NOT
+# `CLAUDE_PROJECT_DIR`. `shim_run` calls `shim_worktree_handoff` (step 2b)
+# BEFORE the `shim_is_relevant` gate (step 3) that invokes this, so in a
+# linked-worktree session `REA_ROOT` is the payload worktree — the SAME root
+# the node hook's `readSpendGovernance` resolves from (payload cwd). Reading
+# `CLAUDE_PROJECT_DIR` (the PRIMARY checkout) would skip turn-budget counting
+# for a worktree that enables it only in its own `.rea/policy.yaml`.
 _turn_budget_configured() {
-  local pf="${CLAUDE_PROJECT_DIR:-$REA_ROOT}/.rea/policy.yaml"
+  local pf="${REA_ROOT}/.rea/policy.yaml"
   [ -f "$pf" ] || return 1
   grep -qE 'turn_budget[[:space:]]*:' "$pf" 2>/dev/null
 }
@@ -189,10 +197,17 @@ shim_policy_short_circuit() {
   # MISSING policy file → disabled, matching readSpendGovernance
   # (ENOENT → no rea config → no-op). Without this the CLI-missing path
   # would fail closed on a checkout that has the hook registered but no
-  # policy file, diverging from the built hook (codex round-10 P3). Base
-  # dir mirrors readSpendGovernance's reaRoot (CLAUDE_PROJECT_DIR else the
-  # resolved REA_ROOT).
-  local proj_dir="${CLAUDE_PROJECT_DIR:-$REA_ROOT}"
+  # policy file, diverging from the built hook (codex round-10 P3).
+  #
+  # WORKTREE (codex round-25 F1): use the POST-HANDOFF `REA_ROOT`, NOT
+  # `CLAUDE_PROJECT_DIR`. This runs well after `shim_worktree_handoff`, so
+  # `REA_ROOT` is the payload worktree — and it MUST match `policy_reader_get`
+  # below, whose `_pr_policy_path` already resolves off `REA_ROOT`. Using
+  # `CLAUDE_PROJECT_DIR` here was a split brain: the existence check probed
+  # the PRIMARY checkout while the actual reads hit the worktree, so a
+  # worktree that opts out (`enabled: false` / `off`) could still fail closed,
+  # and a worktree-only policy could be misread as absent.
+  local proj_dir="$REA_ROOT"
   if [ ! -e "$proj_dir/.rea/policy.yaml" ]; then
     return 0
   fi
