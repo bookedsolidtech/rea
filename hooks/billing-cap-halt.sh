@@ -126,6 +126,13 @@ _turn_budget_configured() {
 # BILLING_RE and no-ops on benign input. Never misses a real signal. Also
 # proceeds unconditionally when a turn budget is configured (see
 # `_turn_budget_configured`) so the CLI-body turn counter runs every call.
+#
+# This gate runs at shim-runtime STEP 3, BEFORE CLI resolution (step 4), so it
+# cannot know whether `rea` is reachable. The turn-budget force therefore
+# FAILS OPEN downstream: `shim_policy_short_circuit` (step 6, post-resolution)
+# exits 0 for a turn-budget-forced payload with no billing keyword when the CLI
+# is unavailable, so an opt-in counter never bricks a no-CLI session (round-30
+# F2). A real billing keyword keeps the fail-closed posture.
 shim_is_relevant() {
   if _turn_budget_configured; then
     return 0
@@ -194,6 +201,30 @@ shim_cli_missing_relevant() {
 # default, so we return 1 and let the fail-closed relevance decision run —
 # a spend guard must not vanish just because the value was unreadable.
 shim_policy_short_circuit() {
+  # ── F2 (codex round-30): turn-budget no-CLI FAIL-OPEN ──────────────────
+  # An OPT-IN turn counter must NEVER brick a session. `shim_is_relevant`
+  # forces the payload past the step-3 gate whenever a `turn_budget` is
+  # configured — which, on a worktree / fresh clone that can't resolve `rea`
+  # (REA_ARGV empty: unbuilt, node missing, or a sandbox refusal), would
+  # otherwise fall through to the SHARED no-CLI refusal that runs AFTER this
+  # callback (shim-runtime step 6b node-missing / step 7 sandbox-failed —
+  # both exit 2 BEFORE the channel-accurate `shim_cli_missing_relevant`
+  # billing check). With no CLI there is nothing to count, so a turn-budget-
+  # forced payload that carries NO billing keyword must exit 0 HERE. Uses the
+  # SAME coarse superset as `shim_is_relevant` (`_billing_kw_match`): its
+  # absence means there is definitely no spend signal, so failing open is
+  # safe; if a keyword IS present we fall through and the existing billing
+  # posture decides (the BILLING path is unchanged — a real wall on no-CLI
+  # still fails closed via the opt-out check + step-7 terminal). No node
+  # spawn — grep + tr/case only.
+  if [ "${#REA_ARGV[@]}" -eq 0 ] && _turn_budget_configured; then
+    local _tb_lower=""
+    _tb_lower=$(printf '%s' "$INPUT" | tr '[:upper:]' '[:lower:]' 2>/dev/null || printf '%s' "$INPUT")
+    if ! _billing_kw_match "$_tb_lower"; then
+      return 0
+    fi
+  fi
+
   # MISSING policy file → disabled, matching readSpendGovernance
   # (ENOENT → no rea config → no-op). Without this the CLI-missing path
   # would fail closed on a checkout that has the hook registered but no
@@ -225,12 +256,27 @@ shim_policy_short_circuit() {
   # freeze) until the CLI is built and the TS hook takes over. Silently
   # disabling the refuse because a halt operator's mode line was unreadable
   # is the exact degraded window this path exists to protect.
+  #
+  # F1 (codex round-30): the billing opt-out must NOT silently kill the turn
+  # counter. `runBillingCapHalt` runs the counter INDEPENDENT of billing mode
+  # (and scopes the billing scan Bash-only), so when a `turn_budget` is
+  # configured AND the CLI is resolvable (REA_ARGV populated → there is
+  # something to forward to), we PROCEED (return 1) so the counter still runs
+  # even though billing is off. We short-circuit (exit 0) only when BOTH the
+  # billing reflex AND the turn budget are off — OR when the CLI is
+  # unavailable (nothing to count; and billing is off, so no refuse either).
   sg_enabled=$(policy_reader_get spend_governance.enabled 2>/dev/null || true)
   if [ "$sg_enabled" = "false" ]; then
+    if _turn_budget_configured && [ "${#REA_ARGV[@]}" -gt 0 ]; then
+      return 1
+    fi
     return 0
   fi
   sg_mode=$(policy_reader_get spend_governance.billing_error_response 2>/dev/null || true)
   if [ "$sg_mode" = "off" ]; then
+    if _turn_budget_configured && [ "${#REA_ARGV[@]}" -gt 0 ]; then
+      return 1
+    fi
     return 0
   fi
   return 1

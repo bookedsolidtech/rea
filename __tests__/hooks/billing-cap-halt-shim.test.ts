@@ -497,3 +497,179 @@ describe('hooks/billing-cap-halt.sh — worktree handoff pre-CLI policy read (ro
     },
   );
 });
+
+/**
+ * codex round-30 — turn-budget shim wiring. Two P1s:
+ *   F1: turn-budget must not go silently dead when billing is opted out — the
+ *       billing opt-out short-circuit must NOT fire when a `turn_budget` is
+ *       configured AND the CLI is resolvable (proceed → the TS hook counts).
+ *   F2: an OPT-IN counter must never BRICK a no-CLI session — the turn-budget
+ *       relevance-force fails OPEN (exit 0) when `rea` can't be resolved, while
+ *       a real billing keyword keeps its fail-closed posture.
+ */
+const TB_HALT_POLICY = (billingEnabled: boolean, mode = 'warn'): string =>
+  [
+    'version: "1"',
+    'profile: "test"',
+    'installed_by: "t"',
+    'blocked_paths: []',
+    'spend_governance:',
+    `  enabled: ${billingEnabled ? 'true' : 'false'}`,
+    `  billing_error_response: ${mode}`,
+    '  turn_budget:',
+    '    warn_turns: 5',
+    '    halt_turns: 10',
+    '',
+  ].join('\n');
+const NO_TB_OPTOUT_POLICY = [
+  'version: "1"',
+  'profile: "test"',
+  'installed_by: "t"',
+  'blocked_paths: []',
+  'spend_governance:',
+  '  enabled: false',
+  '',
+].join('\n');
+
+/**
+ * F1 harness — CLI PRESENT via a FAKE `dist/cli/index.js` that records the
+ * forward (writes $MARKER when invoked as `hook billing-cap-halt`) and answers
+ * the `--help` version probe. An ancestor package.json named `@bookedsolid/rea`
+ * + a real (non-symlink) CLI file passes the shim sandbox. `forwarded === true`
+ * means the shim PROCEEDED to the CLI (did not short-circuit). Policy reads are
+ * pinned to Tier-3 awk so the fake CLI is only ever hit for the probe + forward.
+ */
+function runShimFakeCli(policy: string, payload: string): { status: number; forwarded: boolean } {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bch-cli-'));
+  try {
+    fs.mkdirSync(path.join(dir, '.rea'), { recursive: true });
+    fs.mkdirSync(path.join(dir, 'dist', 'cli'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'package.json'), '{"name":"@bookedsolid/rea"}\n');
+    fs.writeFileSync(path.join(dir, '.rea', 'policy.yaml'), policy);
+    const fake =
+      [
+        '#!/usr/bin/env node',
+        'const fs=require("fs");const a=process.argv.slice(2);',
+        'if(a.includes("--help")){process.stdout.write("billing-cap-halt\\n");process.exit(0);}',
+        'if(a[0]==="hook"&&a[1]==="billing-cap-halt"){if(process.env.MARKER)fs.writeFileSync(process.env.MARKER,"x");process.exit(0);}',
+        'process.exit(0);',
+      ].join('\n') + '\n';
+    const cli = path.join(dir, 'dist', 'cli', 'index.js');
+    fs.writeFileSync(cli, fake);
+    fs.chmodSync(cli, 0o755);
+    const marker = path.join(dir, 'FORWARDED');
+    const res = spawnSync('bash', [SHIM], {
+      cwd: dir,
+      env: {
+        PATH: process.env.PATH ?? '',
+        CLAUDE_PROJECT_DIR: dir,
+        HOME: process.env.HOME ?? '/tmp',
+        MARKER: marker,
+        POLICY_READER_FORCE_TIER: 'awk',
+      },
+      input: payload,
+      encoding: 'utf8',
+      timeout: 20_000,
+    });
+    return { status: res.status ?? -1, forwarded: fs.existsSync(marker) };
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+/**
+ * F2 harness — the CLI RESOLVES but FAILS the sandbox (a `dist/cli/index.js`
+ * symlink escaping the project), which clears REA_ARGV + sets sandbox_failed.
+ * This is a genuine no-CLI BRICK path: shim-runtime step 7 exits 2 on
+ * sandbox_failed BEFORE the billing relevance check, so a turn-budget-forced
+ * benign payload would lock out without the F2 fail-open.
+ */
+function runShimSandboxEscape(policy: string, payload: string): number {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bch-esc-'));
+  try {
+    fs.mkdirSync(path.join(dir, '.rea'), { recursive: true });
+    fs.mkdirSync(path.join(dir, 'dist', 'cli'), { recursive: true });
+    fs.writeFileSync(path.join(dir, '.rea', 'policy.yaml'), policy);
+    fs.symlinkSync('/etc/hostname', path.join(dir, 'dist', 'cli', 'index.js'));
+    const res = spawnSync('bash', [SHIM], {
+      cwd: dir,
+      env: {
+        PATH: process.env.PATH ?? '',
+        CLAUDE_PROJECT_DIR: dir,
+        HOME: process.env.HOME ?? '/tmp',
+      },
+      input: payload,
+      encoding: 'utf8',
+      timeout: 20_000,
+    });
+    return res.status ?? -1;
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+const BENIGN_READ = JSON.stringify({
+  tool_name: 'Read',
+  tool_input: { file_path: '/x' },
+  tool_response: { type: 'text' },
+});
+
+describe('hooks/billing-cap-halt.sh — turn-budget shim wiring (round-30 F1/F2)', () => {
+  it.skipIf(!bashExists())(
+    'F1: billing enabled:false + turn_budget + CLI present → PROCEEDS to the CLI (counter runs, not short-circuited)',
+    () => {
+      const r = runShimFakeCli(TB_HALT_POLICY(false), BENIGN_READ);
+      expect(r.forwarded).toBe(true);
+    },
+  );
+
+  it.skipIf(!bashExists())(
+    'F1: billing_error_response:off + turn_budget + CLI present → PROCEEDS to the CLI',
+    () => {
+      const r = runShimFakeCli(TB_HALT_POLICY(true, 'off'), BENIGN_READ);
+      expect(r.forwarded).toBe(true);
+    },
+  );
+
+  it.skipIf(!bashExists())(
+    'F1 control: billing opted out + NO turn_budget → short-circuits (does NOT forward to the CLI)',
+    () => {
+      const wall = failedPayload('meter', 'Error: spending cap exceeded');
+      const r = runShimFakeCli(NO_TB_OPTOUT_POLICY, wall);
+      expect(r.forwarded).toBe(false);
+    },
+  );
+
+  it.skipIf(!bashExists())(
+    'F2: turn_budget + CLI missing (unbuilt) + benign → exit 0 (fail open, no lockout on the first call)',
+    () => {
+      const r = runShimInUnbuiltDir(BENIGN_READ, TB_HALT_POLICY(true));
+      expect(r.status).toBe(0);
+    },
+  );
+
+  it.skipIf(!bashExists())(
+    'F2: turn_budget + CLI sandbox-FAILS + benign → exit 0 (fail open on the brick path, not the step-7 refusal)',
+    () => {
+      expect(runShimSandboxEscape(TB_HALT_POLICY(true), BENIGN_READ)).toBe(0);
+    },
+  );
+
+  it.skipIf(!bashExists())(
+    'F2 billing path UNCHANGED: a real billing wall + turn_budget + no CLI still fails closed (exit 2)',
+    () => {
+      const wall = failedPayload('meter', 'Error: spending cap exceeded');
+      // Even with a turn_budget configured, a genuine wall keeps the
+      // fail-closed posture — the fail-open only covers turn-budget-ONLY force.
+      expect(runShimSandboxEscape(TB_HALT_POLICY(true, 'halt'), wall)).toBe(2);
+    },
+  );
+
+  it.skipIf(!bashExists())(
+    'F2 billing path UNCHANGED: a real billing wall + no turn_budget + no CLI still fails closed (exit 2)',
+    () => {
+      const wall = failedPayload('meter', 'Error: spending cap exceeded');
+      expect(runShimSandboxEscape(NO_TB_OPTOUT_POLICY.replace('enabled: false', 'enabled: true\n  billing_error_response: halt'), wall)).toBe(2);
+    },
+  );
+});
