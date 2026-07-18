@@ -46,6 +46,7 @@ import { runHookAttributionAdvisory } from '../hooks/attribution-advisory/index.
 import { runHookEnvFileProtection } from '../hooks/env-file-protection/index.js';
 import { runHookDependencyAuditGate } from '../hooks/dependency-audit-gate/index.js';
 import { runHookChangesetSecurityGate } from '../hooks/changeset-security-gate/index.js';
+import { runHookVerifyGate } from '../hooks/verify-gate/index.js';
 import { runHookArchitectureReviewGate } from '../hooks/architecture-review-gate/index.js';
 import { runHookDangerousBashInterceptor } from '../hooks/dangerous-bash-interceptor/index.js';
 import { runHookLocalReviewGate } from '../hooks/local-review-gate/index.js';
@@ -1549,6 +1550,15 @@ export function registerHookCommand(program: Command): void {
     )
     .action(async () => {
       await runHookChangesetSecurityGate();
+    });
+
+  hook
+    .command('verify-gate')
+    .description(
+      'G2 verification-gate (Artifact Gates, 0.54.0+). PreToolUse Write/Edit/MultiEdit/NotebookEdit gate over `.rea/tasks.jsonl`. Refuses a write whose resulting content transitions ANY task to `status: completed` with empty/absent evidence — defence-in-depth with the `rea tasks complete` CLI invariant. Governed by `policy.artifact_gates.g2_verify.mode`: off → exit 0 (silent); shadow → audit `rea.gate.g2.shadow` (would_block) + exit 0; enforce → audit `rea.gate.g2` (deny) + exit 2 with a banner (NO prompt). UNCERTAIN (malformed payload / unreconstructable Edit) refuses at enforce, logs+allows at shadow.',
+    )
+    .action(async () => {
+      await runHookVerifyGate();
     });
 
   hook
