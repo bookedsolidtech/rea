@@ -186,11 +186,16 @@ interface LocalReviewPolicy {
   refuseAt: 'push' | 'commit' | 'both';
   bypassEnvVar: string;
   /**
-   * G3 tri-state from `artifact_gates.g3_review.mode`. `undefined` when
-   * the block (or a valid `mode`) is absent — the precedence signal that
-   * the LEGACY `review.local_review.mode` path applies unchanged.
+   * G3 tri-state from `artifact_gates.g3_review.mode`, plus two sentinels:
+   *   - `undefined`   — the `g3_review` block is ABSENT; the LEGACY
+   *     `review.local_review.mode` path applies unchanged (byte-identical
+   *     pre-G3 invariant).
+   *   - `'malformed'` — the block is PRESENT with an INVALID `mode`; the
+   *     shared resolver maps this to `enforce`, matching how the strict
+   *     `loadPolicy` (used by `computePreflight`) fails the whole policy
+   *     to the enforced default (codex round-38 P2).
    */
-  g3Mode: GateMode | undefined;
+  g3Mode: GateMode | 'malformed' | undefined;
 }
 
 const DEFAULT_BYPASS_VAR = 'REA_SKIP_LOCAL_REVIEW';
@@ -290,15 +295,22 @@ function loadLocalReviewPolicy(reaRoot: string): LocalReviewPolicy {
  *
  * A present block with a MISSING `mode` key → `off` (the strict schema
  * `.default('off')`s it, so `g3_review: {}` validates as off). But a present
- * `mode` with a MALFORMED value (typo, wrong type) → `undefined` (legacy),
- * NOT `off` (round-26 P2): the strict `loadPolicy` REJECTS such a value, so
- * `rea preflight` (which strict-loads) falls back to the legacy enforced path.
- * Returning `off` here would make THIS Bash hook silently allow while
- * preflight/pre-push enforce — the exact cross-path disagreement the shared
- * resolver was built to prevent. Matching preflight's strict-fail-to-legacy
- * keeps all three paths consistent on a malformed policy.
+ * `mode` with a MALFORMED value (typo, wrong type) → `'malformed'`, NOT `off`
+ * and NOT `undefined` (codex round-38 P2, superseding round-26). The strict
+ * `loadPolicy` REJECTS such a value and fails the ENTIRE policy, so
+ * `computePreflight` sees `policy === undefined` and resolves to the enforced
+ * DEFAULT — NOT to the legacy `local_review.mode` (which was lost with the
+ * rejected policy). The shared resolver maps `'malformed' → enforce` to match.
+ *
+ * Returning `undefined` (legacy) here was the round-26 bug: with legacy
+ * `local_review.mode: off` the gate short-circuited to `off` and ALLOWED,
+ * while preflight/pre-push strict-failed to enforced and REFUSED — a
+ * commit/push bypass of the review gate through the Bash tool. Signalling
+ * `'malformed'` makes the gate DELEGATE to `computePreflight` (which refuses),
+ * keeping all three paths consistent on a malformed policy regardless of the
+ * legacy mode.
  */
-function extractG3Mode(root: Record<string, unknown>): GateMode | undefined {
+function extractG3Mode(root: Record<string, unknown>): GateMode | 'malformed' | undefined {
   const ag = root['artifact_gates'];
   if (ag === null || typeof ag !== 'object' || Array.isArray(ag)) return undefined;
   const g3 = (ag as Record<string, unknown>)['g3_review'];
@@ -308,9 +320,11 @@ function extractG3Mode(root: Record<string, unknown>): GateMode | undefined {
   if (m === 'off' || m === 'shadow' || m === 'enforce') return m;
   // Mode key entirely absent (`g3_review: {}`) → schema default `off`.
   if (!Object.prototype.hasOwnProperty.call(g3obj, 'mode')) return 'off';
-  // Mode present but malformed → strict schema rejects → legacy (undefined),
-  // consistent with preflight's strict-load-fails-to-legacy behavior.
-  return undefined;
+  // Mode present but malformed → strict schema rejects the whole policy →
+  // preflight resolves to the enforced default. Signal `'malformed'` so the
+  // shared resolver converges on `enforce` and the gate delegates rather than
+  // short-circuiting to `off`.
+  return 'malformed';
 }
 
 /**

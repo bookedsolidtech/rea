@@ -678,19 +678,20 @@ artifact_gates:
     expect(r.decision).toBe('mode-off');
   });
 
-  it('MALFORMED g3_review.mode → legacy path (not off), matching preflight (round-26 P2)', async () => {
-    // A typo'd mode is REJECTED by the strict schema, so `rea preflight`
-    // strict-loads-fails → legacy enforced. This Bash hook must agree: fall to
-    // legacy (enforced → refuse), NOT silently allow via `off`.
-    const body = `review:
+  const malformedBody = (localReviewMode: 'enforced' | 'off'): string => `review:
   local_review:
-    mode: enforced
+    mode: ${localReviewMode}
     refuse_at: push
 artifact_gates:
   g3_review:
     mode: bogus
 `;
-    writePolicy(root, body);
+
+  it('MALFORMED g3_review.mode + legacy enforced → refuses, matching preflight (round-26 P2)', async () => {
+    // A typo'd mode is REJECTED by the strict schema, so `rea preflight`
+    // strict-load-fails → enforced default. This Bash hook must agree and
+    // delegate (→ refuse), NOT silently allow via `off`.
+    writePolicy(root, malformedBody('enforced'));
     const r = await runLocalReviewGate({
       reaRoot: root,
       stdinOverride: PAYLOAD('git push origin main'),
@@ -699,6 +700,40 @@ artifact_gates:
     });
     expect(r.exitCode).toBe(2);
     expect(r.decision).toBe('preflight-refuse');
+  });
+
+  it('MALFORMED g3_review.mode + legacy OFF → does NOT short-circuit allow; delegates → refuse (round-38 P2)', async () => {
+    // The divergence codex round-38 caught: malformed → `extractG3Mode` used to
+    // return undefined → legacy off → gate short-circuited to `mode-off` and
+    // ALLOWED, while `computePreflight` strict-fails the WHOLE policy to the
+    // enforced default and REFUSES. The fix signals `'malformed' → enforce` so
+    // the gate delegates. `preflight-refuse` (NOT `mode-off`) proves no
+    // off short-circuit fired.
+    writePolicy(root, malformedBody('off'));
+    const r = await runLocalReviewGate({
+      reaRoot: root,
+      stdinOverride: PAYLOAD('git push origin main'),
+      envOverride: {},
+      preflightImpl: refusePreflight,
+    });
+    expect(r.exitCode).toBe(2);
+    expect(r.decision).toBe('preflight-refuse');
+  });
+
+  it('MALFORMED g3_review.mode + legacy OFF → reaches the probe (proves no mode-off short-circuit)', async () => {
+    // Same policy, but with an ALLOW stub: if the gate wrongly short-circuited
+    // to `off` it would return decision `mode-off`; delegating yields
+    // `preflight-allow`. Distinguishes "short-circuited" from "delegated".
+    writePolicy(root, malformedBody('off'));
+    const r = await runLocalReviewGate({
+      reaRoot: root,
+      stdinOverride: PAYLOAD('git push origin main'),
+      envOverride: {},
+      preflightImpl: allowPreflight,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(r.decision).toBe('preflight-allow');
+    expect(r.decision).not.toBe('mode-off');
   });
 
   it('g3 shadow does NOT short-circuit off — gate proceeds to the probe', async () => {

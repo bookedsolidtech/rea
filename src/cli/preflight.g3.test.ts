@@ -178,3 +178,47 @@ describe('computePreflight G3 effective-mode', () => {
     expect(auditHas('rea.gate.g3')).toBe(false);
   });
 });
+
+describe('computePreflight G3 malformed policy (strict-fail-to-enforced)', () => {
+  function writeMalformedPolicy(localReviewMode: 'enforced' | 'off'): void {
+    const lines = [
+      'version: "0.54.0"',
+      'profile: open-source-no-codex',
+      'installed_by: t',
+      'installed_at: "2026-07-18T00:00:00Z"',
+      'autonomy_level: L1',
+      'max_autonomy_level: L2',
+      'promotion_requires_human_approval: true',
+      'block_ai_attribution: true',
+      'blocked_paths: []',
+      'protected_paths_relax: []',
+      'notification_channel: ""',
+      'review:',
+      '  local_review:',
+      `    mode: ${localReviewMode}`,
+      '    refuse_at: push',
+      'artifact_gates:',
+      '  g3_review:',
+      '    mode: bogus',
+      '',
+    ];
+    fs.mkdirSync(path.join(tmpDir, '.rea'), { recursive: true });
+    fs.writeFileSync(path.join(tmpDir, '.rea', 'policy.yaml'), lines.join('\n'));
+    invalidatePolicyCache(tmpDir);
+    invalidatePolicyCache();
+  }
+
+  it('malformed g3_review.mode + legacy enforced → REFUSE (strict load fails to enforced)', async () => {
+    writeMalformedPolicy('enforced');
+    const { outcome } = await computePreflight(tmpDir, { operation: 'push' });
+    expect(outcome.exitCode).toBe(2);
+  });
+
+  it('malformed g3_review.mode + legacy OFF → still REFUSE — the whole policy is rejected, so the legacy off-switch is lost (round-38 P2 convergence)', async () => {
+    writeMalformedPolicy('off');
+    const { outcome } = await computePreflight(tmpDir, { operation: 'push' });
+    // This is what the tolerant Bash gate must MATCH: strict load fails the
+    // entire policy, so `legacyMode` is undefined too → enforced default.
+    expect(outcome.exitCode).toBe(2);
+  });
+});

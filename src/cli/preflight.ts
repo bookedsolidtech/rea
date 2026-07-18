@@ -84,11 +84,26 @@ export const G3_SERVER_NAME = 'rea' as const;
  * `refuse_at` / `bypass_env_var` are NOT part of the tier and continue to
  * come from `review.local_review` — this helper governs ONLY off/shadow/
  * enforce.
+ *
+ * ## The `'malformed'` third state (codex round-38 P2)
+ *
+ * `g3Mode` accepts a `'malformed'` sentinel modelling a `g3_review` block
+ * that is PRESENT but carries an INVALID `mode` (typo / wrong type). It
+ * resolves to `enforce` — the SAME outcome `computePreflight` reaches
+ * indirectly: the strict `loadPolicy` REJECTS the malformed policy, so
+ * preflight sees `policy === undefined` and calls this with
+ * `(undefined, undefined)` → `enforce`. The TOLERANT `local-review-gate`
+ * Bash reader does NOT strict-load, so it passes `'malformed'` EXPLICITLY
+ * to converge on the same `enforce`. Without it, a malformed policy paired
+ * with legacy `local_review.mode: off` would let the Bash path
+ * short-circuit to `off` while the pre-push/CLI path enforces — a
+ * commit/push bypass of the review gate through the Bash tool.
  */
 export function resolveEffectiveReviewMode(
-  g3Mode: GateMode | undefined,
+  g3Mode: GateMode | 'malformed' | undefined,
   legacyMode: 'enforced' | 'off' | undefined,
 ): GateMode {
+  if (g3Mode === 'malformed') return 'enforce';
   if (g3Mode !== undefined) return g3Mode;
   return legacyMode === 'off' ? 'off' : 'enforce';
 }
