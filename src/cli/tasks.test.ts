@@ -126,6 +126,21 @@ describe('activate flips others inactive', () => {
   });
 });
 
+describe('activate refuses terminal tasks (round-16 P2)', () => {
+  it('a completed task cannot be re-activated (no contradictory active:true row)', () => {
+    runTasksAdd(baseDir, { subject: 'done' });
+    runTasksEvidence(baseDir, 'T-0001', { add: ['docs/proof.md'] });
+    expect(runTasksComplete(baseDir, 'T-0001')).toBe(0);
+    // Activating a completed task must refuse, not append active:true.
+    expect(runTasksActivate(baseDir, 'T-0001')).toBe(1);
+    expect(errs.join('\n')).toMatch(/completed/i);
+    const tasks = readTasks(baseDir);
+    expect(tasks[0]?.status).toBe('completed');
+    expect(tasks[0]?.active).toBe(false);
+    expect(activeTask(tasks)).toBeFalsy();
+  });
+});
+
 describe('not-found handling', () => {
   it('returns 1 for start/activate/evidence/complete/show on a missing id', () => {
     expect(runTasksStart(baseDir, 'T-9999')).toBe(1);

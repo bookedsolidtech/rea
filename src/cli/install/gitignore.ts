@@ -118,6 +118,7 @@ export const REA_GITIGNORE_ENTRIES: readonly string[] = [
   // commit by accident (codex round-15 P2).
   '.rea/tasks.jsonl',
   '.rea/tasks.jsonl.lock',
+  '.rea/turn-count.json',
   '.rea/turn-count.*.json',
   // 0.50.x — `provider: both` writes a side-by-side parity report on EVERY run;
   // a consumer enabling the openrouter parity lane would otherwise have a dirty

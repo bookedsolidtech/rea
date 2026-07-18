@@ -103,9 +103,19 @@ export function runTasksStart(baseDir: string, id: string, opts: TasksIdOptions 
 
 export function runTasksActivate(baseDir: string, id: string, opts: TasksIdOptions = {}): number {
   let updated: TaskRecord | undefined;
+  let terminal: string | undefined;
   updateTasks(baseDir, (tasks) => {
     const t = findTask(tasks, id);
     if (t === undefined) return [];
+    // Round-16 P2: refuse activating a terminal task. Appending
+    // `active: true` to a completed/cancelled record produces a
+    // contradictory row that `activeTask()` ignores — the command would
+    // report "Activated" while `tasks list` shows no active task and G1
+    // sees no active ticket. Leave the store untouched and error instead.
+    if (t.status === 'completed' || t.status === 'cancelled') {
+      terminal = t.status;
+      return [];
+    }
     const now = nowIso();
     // Flip every OTHER currently-active task off, then activate this one —
     // all appended atomically under one lock.
@@ -119,6 +129,10 @@ export function runTasksActivate(baseDir: string, id: string, opts: TasksIdOptio
     out.push(updated);
     return out;
   });
+  if (terminal !== undefined) {
+    err(`Cannot activate ${clean(id)}: task is ${terminal}. Only pending/in_progress tasks can be activated.`);
+    return 1;
+  }
   if (updated === undefined) {
     err(`No such task: ${clean(id)}`);
     return 1;
