@@ -80,8 +80,11 @@ describe('pre-commit installer — content + markers', () => {
     it('same-repository verification guards a foreign nested checkout', () => {
       expect(body).toContain('_rea_same_repo');
     });
-    it('still fails OPEN (exit 0) when no CLI resolves anywhere (default-off gate)', () => {
-      expect(body).toMatch(/else\n\s+# No rea CLI anywhere — fail OPEN[\s\S]*exit 0\nfi/);
+    it('still fails OPEN when no CLI resolves anywhere (default-off gate)', () => {
+      // Round-23 F2: the no-CLI branch no longer `exit 0`s — it is a no-op
+      // (`:`) that falls through to the fragment chain; the final `exit 0` is
+      // at the end of the body.
+      expect(body).toMatch(/else\n\s+# No rea CLI anywhere → the spec gate FAILS OPEN[\s\S]*:\nfi/);
     });
     // Round-15 P1 kept: `npx --no-install` (a network auto-install that exits
     // non-zero on a cache miss) is NEVER reintroduced.
@@ -97,13 +100,23 @@ describe('pre-commit installer — content + markers', () => {
       expect(body).toContain('_rea_spec_gate()');
       expect(body).toMatch(/command -v rea >\/dev\/null 2>&1; then/);
       expect(body).toMatch(/_rea_spec_gate rea\b/);
-      // The discipline: block only on exit 2, else exit 0.
+      // The discipline: block only on exit 2; a pass / non-2 RETURNS 0 (round-23
+      // F2 — so control falls through to the fragment chain, not `exit 0`).
       expect(body).toMatch(/\[ "\$_rc" -eq 2 \] && exit 2/);
-      expect(body).toMatch(/_rc=\$\?[\s\S]*exit 0/);
+      expect(body).toMatch(/_rc=\$\?[\s\S]*return 0/);
     });
     it('F2: in-project tiers also run through _rea_spec_gate', () => {
       expect(body).toMatch(/_rea_spec_gate "\$\{REA_CLI_ROOT\}\/node_modules\/\.bin\/rea"/);
       expect(body).toMatch(/_rea_spec_gate node "\$\{REA_CLI_ROOT\}\/dist\/cli\/index\.js"/);
+    });
+    // Round-23 F2 — pre-commit.d fragment chaining (mirrors pre-push's
+    // `.husky/pre-push.d/`): iterate the dir in glob (POSIX-sorted) order,
+    // run executable regular files, missing dir = no-op.
+    it('F2: chains `.husky/pre-commit.d/*` fragments after the spec gate', () => {
+      expect(body).toContain('${REA_ROOT}/.husky/pre-commit.d');
+      expect(body).toMatch(/for frag in "\$ext_dir"\/\*; do/);
+      expect(body).toMatch(/\[ -x "\$frag" \] \|\| continue/);
+      expect(body).toMatch(/"\$frag"\n\s*done/);
     });
   });
 });
@@ -206,6 +219,70 @@ describe('pre-commit body — fail-open behaviour (round-15 P1 + round-17 F2)', 
     // No .rea/HALT anywhere → the HALT block falls through to the fail-open
     // ladder (round-15 fresh-clone proof still holds).
     expect(run()).toBe(0);
+  });
+
+  // ── Round-23 F2 — `.husky/pre-commit.d/*` fragment chaining ──────────────
+  /** Write an executable fragment `<name>` under `.husky/pre-commit.d/`. */
+  function fragment(name: string, sh: string): void {
+    const d = path.join(dir, '.husky', 'pre-commit.d');
+    fssync.mkdirSync(d, { recursive: true });
+    const p = path.join(d, name);
+    fssync.writeFileSync(p, `#!/bin/sh\n${sh}\n`, { mode: 0o755 });
+    fssync.chmodSync(p, 0o755);
+  }
+  const marker = (n: string): string => path.join(dir, n);
+  const ran = (n: string): boolean => fssync.existsSync(marker(n));
+
+  it('F2: a fragment RUNS after a passing spec-gate (in-project rea exit 0 → fragment → 0)', () => {
+    if (!bashOk()) return;
+    inProjectRea(0); // spec gate PASSES
+    fragment('10-check', ': > "$(git rev-parse --show-toplevel)/frag-ran"');
+    expect(run()).toBe(0);
+    expect(ran('frag-ran')).toBe(true);
+  });
+
+  it('F2: a fragment RUNS with NO CLI at all (fail-open spec-gate still chains)', () => {
+    if (!bashOk()) return;
+    fragment('10-check', ': > "$(git rev-parse --show-toplevel)/frag-ran"');
+    expect(run()).toBe(0);
+    expect(ran('frag-ran')).toBe(true);
+  });
+
+  it("F2: a fragment's non-zero exit BLOCKS the commit (mirrors pre-push)", () => {
+    if (!bashOk()) return;
+    inProjectRea(0); // spec gate passes, then the fragment fails
+    fragment('10-fail', ': > "$(git rev-parse --show-toplevel)/frag-ran"\nexit 1');
+    expect(run()).toBe(1);
+    expect(ran('frag-ran')).toBe(true); // it DID run
+  });
+
+  it('F2: a spec-gate REFUSAL (exit 2) exits WITHOUT running fragments', () => {
+    if (!bashOk()) return;
+    inProjectRea(2); // genuine G1 refusal
+    fragment('10-check', ': > "$(git rev-parse --show-toplevel)/frag-ran"');
+    expect(run()).toBe(2);
+    expect(ran('frag-ran')).toBe(false); // blocked commit never ran the fragment
+  });
+
+  it('F2: fragments run in POSIX-sorted order', () => {
+    if (!bashOk()) return;
+    inProjectRea(0);
+    // Each fragment appends its name; order must be 05 then 10 then 20.
+    fragment('20-c', 'printf c >> "$(git rev-parse --show-toplevel)/order"');
+    fragment('05-a', 'printf a >> "$(git rev-parse --show-toplevel)/order"');
+    fragment('10-b', 'printf b >> "$(git rev-parse --show-toplevel)/order"');
+    expect(run()).toBe(0);
+    expect(fssync.readFileSync(marker('order'), 'utf8')).toBe('abc');
+  });
+
+  it('F2: a NON-executable file in pre-commit.d is inert (not run)', () => {
+    if (!bashOk()) return;
+    inProjectRea(0);
+    const d = path.join(dir, '.husky', 'pre-commit.d');
+    fssync.mkdirSync(d, { recursive: true });
+    fssync.writeFileSync(path.join(d, 'README.md'), 'not a hook\n', { mode: 0o644 });
+    fssync.chmodSync(path.join(d, 'README.md'), 0o644);
+    expect(run()).toBe(0); // no crash, README ignored
   });
 });
 

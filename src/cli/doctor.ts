@@ -1548,6 +1548,101 @@ export function checkCodexBinaryOnPath(): CheckResult {
 }
 
 /**
+ * Resolve a global `rea` binary on PATH. Mirrors `resolveCodexBinary` (POSIX
+ * exec-bit + Windows PATHEXT). Best-effort; never throws. `env` is injectable
+ * so tests can drive the no-global-CLI case deterministically.
+ */
+function resolveReaBinaryOnPath(env: NodeJS.ProcessEnv = process.env): string | null {
+  const isWindows = process.platform === 'win32';
+  const pathEnv = env.PATH ?? env.Path ?? '';
+  if (pathEnv.length === 0) return null;
+  const sep = isWindows ? ';' : ':';
+  const entries = pathEnv.split(sep).filter((p) => p.length > 0);
+  if (isWindows) {
+    const pathExt = (env.PATHEXT ?? '.COM;.EXE;.BAT;.CMD').split(';');
+    for (const dir of entries) {
+      for (const ext of pathExt) {
+        const candidate = path.join(dir, `rea${ext}`);
+        try {
+          if (fs.statSync(candidate).isFile()) return candidate;
+        } catch {
+          /* not present — keep walking */
+        }
+      }
+      const bare = path.join(dir, 'rea');
+      try {
+        if (fs.statSync(bare).isFile()) return bare;
+      } catch {
+        /* not present — keep walking */
+      }
+    }
+    return null;
+  }
+  for (const dir of entries) {
+    const candidate = path.join(dir, 'rea');
+    try {
+      const st = fs.statSync(candidate);
+      if (st.isFile() && (st.mode & 0o111) !== 0) return candidate;
+    } catch {
+      /* not present — keep walking */
+    }
+  }
+  return null;
+}
+
+/**
+ * Round-23 F1 — ADVISORY. Warn when `artifact_gates.g1_spec.mode` is
+ * enforce/shadow but NO rea CLI resolves via the tiers the pre-commit body
+ * uses (in-project `node_modules/.bin/rea`, name-guarded `dist/cli/index.js`,
+ * or a global `rea` on PATH).
+ *
+ * WHY here and not in the hook: the hot commit path FAILS OPEN by design
+ * (round-15 P1 — failing CLOSED there bricks EVERY commit on a fresh clone /
+ * pre-`pnpm install` repo). Codex flagged that enforce-without-CLI silently
+ * doesn't gate; the correct place to surface it is this diagnostic surface,
+ * NEVER as a hard fail (status is `warn`, never `fail`, so `rea doctor`'s exit
+ * code is unaffected).
+ *
+ * Returns `null` (no row emitted) when the gate is off/absent — zero noise for
+ * the default config. `warn` when opted-in but no CLI resolves; `pass` when
+ * opted-in and a CLI resolves (the gate is actually live).
+ */
+export function checkG1SpecGateCli(
+  baseDir: string,
+  env: NodeJS.ProcessEnv = process.env,
+): CheckResult | null {
+  let mode: 'off' | 'shadow' | 'enforce' = 'off';
+  try {
+    const policy = loadPolicy(baseDir);
+    mode = policy.artifact_gates?.g1_spec.mode ?? 'off';
+  } catch {
+    return null; // policy unreadable — checkPolicyParses already reports it
+  }
+  if (mode !== 'enforce' && mode !== 'shadow') return null;
+
+  const inProjectBin = fs.existsSync(path.join(baseDir, 'node_modules', '.bin', 'rea'));
+  const localPkgOrDist = resolveLocalCliVersion(baseDir) !== null;
+  const globalRea = resolveReaBinaryOnPath(env) !== null;
+  if (inProjectBin || localPkgOrDist || globalRea) {
+    return {
+      label: 'G1 spec-gate CLI available',
+      status: 'pass',
+      detail: `g1_spec.mode: ${mode} — a rea CLI resolves; the pre-commit gate is active`,
+    };
+  }
+  return {
+    label: 'G1 spec-gate CLI available',
+    status: 'warn',
+    detail:
+      `g1_spec.mode: ${mode} but no rea CLI resolves (in-project node_modules/.bin/rea, ` +
+      `name-guarded dist/cli/index.js, or global \`rea\` on PATH). The pre-commit G1 gate ` +
+      `FAILS OPEN — commits are NOT gated — until \`@bookedsolid/rea\` is installed locally ` +
+      `(\`pnpm add -D @bookedsolid/rea\`) or globally. This is deliberate: the hot commit ` +
+      `path never bricks a fresh clone.`,
+  };
+}
+
+/**
  * 0.50.x — openrouter review-provider availability.
  *
  * SECURITY (security-architect, binding): reports the KEY PRESENCE (a bool)
@@ -3681,6 +3776,12 @@ export function collectChecks(
         ]
       : []),
   ];
+
+  // Round-23 F1 — advisory when g1_spec.mode is enforce/shadow but no rea CLI
+  // resolves (the pre-commit gate would fail open). Mode-gated: emits NOTHING
+  // for the default `off`, so no noise for consumers who never opt in.
+  const g1SpecGateCli = checkG1SpecGateCli(baseDir);
+  if (g1SpecGateCli !== null) checks.push(g1SpecGateCli);
 
   // Non-git escape hatch: when `.git/` is absent, both git-hook checks are
   // meaningless (commit-msg + pre-push can't be invoked without git). Emit

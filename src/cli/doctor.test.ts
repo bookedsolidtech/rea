@@ -17,6 +17,7 @@ import {
   checkCodexBinaryOnPath,
   checkDelegationRoundTrip,
   checkFingerprintStore,
+  checkG1SpecGateCli,
   checkPolicyReaderJq,
   checkPolicyReaderTier1,
   checkPolicyReaderTier2,
@@ -2658,5 +2659,87 @@ describe('rea doctor — checkTokenEconomy (D5 advisory budget)', () => {
     const skillsDir = path.join(dir, '.claude', 'skills');
     for (let i = 0; i < 20; i++) await writeSkill(skillsDir, `s${i}`, 'z'.repeat(500));
     expect(checkTokenEconomy(dir).status).not.toBe('fail');
+  });
+});
+
+// ── Round-23 F1 — G1 spec-gate CLI advisory ──────────────────────────────
+// The hot commit path FAILS OPEN (round-15); doctor surfaces enforce-without-
+// CLI as an advisory WARN (never a hard fail).
+describe('rea doctor — checkG1SpecGateCli (round-23 F1)', () => {
+  const dirs: string[] = [];
+  afterEach(async () => {
+    for (const d of dirs.splice(0)) await fs.rm(d, { recursive: true, force: true });
+  });
+
+  async function repoWithG1(mode: 'off' | 'shadow' | 'enforce' | 'absent'): Promise<string> {
+    const dir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-g1cli-')));
+    dirs.push(dir);
+    await fs.mkdir(path.join(dir, '.rea'), { recursive: true });
+    const gates =
+      mode === 'absent' ? '' : `artifact_gates:\n  g1_spec:\n    mode: ${mode}\n`;
+    await fs.writeFile(
+      path.join(dir, '.rea', 'policy.yaml'),
+      [
+        'version: "0.54.0"',
+        'profile: bst-internal',
+        'installed_by: test',
+        'installed_at: "2026-01-01T00:00:00Z"',
+        'autonomy_level: L1',
+        'max_autonomy_level: L2',
+        'promotion_requires_human_approval: true',
+        'blocked_paths: []',
+        gates,
+      ].join('\n'),
+    );
+    return dir;
+  }
+
+  // An env whose PATH contains no `rea` binary (deterministic no-global-CLI).
+  const noReaEnv: NodeJS.ProcessEnv = { PATH: path.join(os.tmpdir(), 'rea-empty-nonexistent-bin') };
+
+  it('mode off → no row emitted (null; zero noise for the default)', async () => {
+    const dir = await repoWithG1('off');
+    expect(checkG1SpecGateCli(dir, noReaEnv)).toBeNull();
+  });
+
+  it('absent artifact_gates → null', async () => {
+    const dir = await repoWithG1('absent');
+    expect(checkG1SpecGateCli(dir, noReaEnv)).toBeNull();
+  });
+
+  it('mode enforce + NO CLI anywhere → WARN (never fail)', async () => {
+    const dir = await repoWithG1('enforce');
+    const r = checkG1SpecGateCli(dir, noReaEnv);
+    expect(r?.status).toBe('warn');
+    expect(r?.detail).toMatch(/FAILS OPEN/);
+    expect(r?.detail).toMatch(/g1_spec\.mode: enforce/);
+  });
+
+  it('mode shadow + NO CLI → WARN', async () => {
+    const dir = await repoWithG1('shadow');
+    expect(checkG1SpecGateCli(dir, noReaEnv)?.status).toBe('warn');
+  });
+
+  it('mode enforce + in-project node_modules/.bin/rea → PASS (gate is live)', async () => {
+    const dir = await repoWithG1('enforce');
+    const bin = path.join(dir, 'node_modules', '.bin');
+    await fs.mkdir(bin, { recursive: true });
+    await fs.writeFile(path.join(bin, 'rea'), '#!/bin/sh\n', { mode: 0o755 });
+    const r = checkG1SpecGateCli(dir, noReaEnv);
+    expect(r?.status).toBe('pass');
+  });
+
+  it('mode enforce + global rea on PATH → PASS', async () => {
+    const dir = await repoWithG1('enforce');
+    const bin = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-gbin-')));
+    dirs.push(bin);
+    await fs.writeFile(path.join(bin, 'rea'), '#!/bin/sh\n', { mode: 0o755 });
+    const r = checkG1SpecGateCli(dir, { PATH: bin });
+    expect(r?.status).toBe('pass');
+  });
+
+  it('never emits a `fail` (advisory only)', async () => {
+    const dir = await repoWithG1('enforce');
+    expect(checkG1SpecGateCli(dir, noReaEnv)?.status).not.toBe('fail');
   });
 });

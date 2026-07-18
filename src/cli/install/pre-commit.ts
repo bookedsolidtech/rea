@@ -196,13 +196,17 @@ fi
 # auto-fetched); only an ALREADY-INSTALLED global \`rea\` is reached, and only
 # its genuine exit-2 refusal blocks. The dist tier stays guarded by the
 # package.json name grep so a foreign \`dist/cli/index.js\` can never be invoked.
+# Round-23 F2: a spec-gate PASS must FALL THROUGH to the pre-commit.d fragment
+# chain below (not \`exit 0\` before it). So \`_rea_spec_gate\` RETURNS 0 on a
+# pass OR any "CLI can't run this" (non-2) result, and only \`exit 2\`s on a
+# GENUINE G1 refusal — a blocked commit must not run the consumer's fragments.
 _rea_spec_gate() {
   if "\$@" gate spec-check; then
-    exit 0
+    return 0
   else
     _rc=\$?
     [ "\$_rc" -eq 2 ] && exit 2
-    exit 0
+    return 0
   fi
 }
 
@@ -217,9 +221,36 @@ elif command -v rea >/dev/null 2>&1; then
   # global CLI fails OPEN; only a genuine G1 refusal (exit 2) blocks.
   _rea_spec_gate rea
 else
-  # No rea CLI anywhere — fail OPEN (the gate is default-off).
-  exit 0
+  # No rea CLI anywhere → the spec gate FAILS OPEN (does not run). DELIBERATE
+  # (round-15 P1): failing CLOSED here would brick EVERY commit on a fresh
+  # clone / pre-\`pnpm install\` repo where the CLI is not yet built. \`rea
+  # doctor\` warns when g1_spec.mode is enforce/shadow but no CLI resolves, so
+  # the enforce-without-CLI gap is surfaced at the diagnostic surface instead.
+  # Fall through to the fragment chain regardless.
+  :
 fi
+
+# Extension-hook chaining (round-23 F2, mirrors pre-push's \`.husky/pre-push.d/\`
+# v4 / 0.13.0). Run every executable file under \`.husky/pre-commit.d/\` in
+# POSIX-sorted lexical order (shell glob order). A missing directory is a no-op
+# (backward compatible). A fragment's non-zero exit BLOCKS the commit (\`set -e\`
+# propagates it) — same posture as pre-push. Reached only when the spec gate
+# PASSED or failed open; a spec-gate refusal already \`exit 2\`'d above, so a
+# blocked commit never runs fragments. Git passes no arguments to pre-commit,
+# so fragments are invoked bare.
+ext_dir="\${REA_ROOT}/.husky/pre-commit.d"
+if [ -d "\$ext_dir" ]; then
+  for frag in "\$ext_dir"/*; do
+    # Glob expands to itself when the dir is empty — guard with -e.
+    [ -e "\$frag" ] || continue
+    # Only executable regular files are fragments; a non-exec README is inert.
+    [ -f "\$frag" ] || continue
+    [ -x "\$frag" ] || continue
+    "\$frag"
+  done
+fi
+
+exit 0
 `;
 
 /** The full pre-commit hook file content. */
