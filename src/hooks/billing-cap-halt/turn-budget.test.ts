@@ -296,6 +296,50 @@ describe('updateCounter — F3 serialization', () => {
     expect(results.map((r) => r.crossedHalt)).toEqual([false, false, true, false]);
   });
 
+  it('round-42 F2: SUPPRESSES a crossing whose state did not persist, then fires it EXACTLY ONCE once writable', () => {
+    // Force a deterministic, root-safe write failure: make the counter PATH a
+    // directory, so writeState's writeFileSync fails with EISDIR (fails even as
+    // root — not mode-bit dependent).
+    const file = path.join(root, '.rea', 'turn-count.wf.json');
+    fs.mkdirSync(file, { recursive: true });
+    const c = { warnTurns: 1, haltTurns: 1, response: 'halt' as const };
+
+    // Increment crosses the threshold in memory, but the write is LOST →
+    // the crossing must be SUPPRESSED (reporting it now would re-fire next call
+    // since the emitted flags were never saved).
+    const failed = updateCounter(file, c);
+    expect(failed.crossedWarn).toBe(false);
+    expect(failed.crossedHalt).toBe(false);
+    // Nothing persisted — the path is still the (empty) directory, no JSON file.
+    expect(fs.statSync(file).isDirectory()).toBe(true);
+
+    // Path becomes writable (remove the blocking directory).
+    fs.rmdirSync(file);
+
+    // Next call: the write succeeds → the crossing fires ONCE.
+    const fires = updateCounter(file, c);
+    expect(fires.crossedHalt).toBe(true);
+    expect(JSON.parse(fs.readFileSync(file, 'utf8')).halt_emitted).toBe(true);
+
+    // And a subsequent call does NOT re-fire (persisted halt_emitted holds).
+    const again = updateCounter(file, c);
+    expect(again.crossedHalt).toBe(false);
+  });
+
+  it('round-42 F2: a persistence failure NEVER throws (fail-safe degrade to no-accounting)', () => {
+    const file = path.join(root, '.rea', 'turn-count.nothrow.json');
+    fs.mkdirSync(file, { recursive: true }); // unwritable path (EISDIR on write)
+    const c = { warnTurns: 1, haltTurns: 2, response: 'warn' as const };
+    expect(() => updateCounter(file, c)).not.toThrow();
+    // Repeated calls under a persistent failure keep suppressing, never throw,
+    // and never fire a crossing they can't record.
+    for (let i = 0; i < 3; i++) {
+      const r = updateCounter(file, c);
+      expect(r.crossedWarn).toBe(false);
+      expect(r.crossedHalt).toBe(false);
+    }
+  });
+
   it('resets IMPOSSIBLE persisted state instead of trusting it (round-31 P2)', () => {
     const file = path.join(root, '.rea', 'turn-count.imp.json');
     const c = { warnTurns: 1, haltTurns: 2, response: 'warn' as const };
@@ -450,27 +494,27 @@ describe('runBillingCapHalt — turn-budget integration', () => {
     expect(readAudit(root).filter((e) => e.tool_name === 'rea.spend.turn_budget_warn')).toHaveLength(1);
   });
 
-  it('F2: halt hard-stop exits 2 even when .rea/HALT cannot be written', async () => {
-    // Force writeHaltFile to fail by making `.rea` read-only, WITHOUT
-    // pre-creating .rea/HALT (which would trip the halt short-circuit instead).
-    // The configured hard stop must still block the call (exit 2). Root-safe:
-    // under an euid that ignores mode bits the write succeeds and we still get
-    // exit 2 (haltWritten true) — either way the call is blocked.
+  it('F2 (round-42): an unpersistable counter SUPPRESSES the halt crossing → exit 0 (fail-safe, no HALT)', async () => {
+    // When the per-session counter cannot persist, the crossing must NOT be
+    // reported — reporting it would re-fire on EVERY subsequent call (the
+    // emitted flags were never saved), a repeated block. So a halt crossing
+    // whose state was lost degrades to a no-op (exit 0), no HALT written.
+    // Deterministic + root-safe write failure: make the counter file path a
+    // DIRECTORY, so writeState's writeFileSync fails with EISDIR regardless of
+    // euid. (The complementary case — counter PERSISTS but the .rea/HALT file
+    // write fails → still action:halt / exit 2 — is covered by the runTurnBudget
+    // unit test with an unwritable commonRoot.)
     writePolicy(root, { warn: 1, halt: 1, response: 'halt' });
-    const reaDir = path.join(root, '.rea');
-    fs.chmodSync(reaDir, 0o500);
-    try {
-      const r = await runBillingCapHalt({
-        reaRoot: root,
-        stdinOverride: readPayload(),
-        sessionId: 'hf',
-        stderrWrite: () => {},
-      });
-      expect(r.exitCode).toBe(2);
-      expect(r.action).toBe('halt');
-    } finally {
-      fs.chmodSync(reaDir, 0o700);
-    }
+    fs.mkdirSync(path.join(root, '.rea', 'turn-count.hf.json'), { recursive: true });
+    const r = await runBillingCapHalt({
+      reaRoot: root,
+      stdinOverride: readPayload(),
+      sessionId: 'hf',
+      stderrWrite: () => {},
+    });
+    expect(r.exitCode).toBe(0);
+    expect(r.action).toBe('noop');
+    expect(fs.existsSync(haltPath(root))).toBe(false);
   });
 
   it('exactly one increment per invocation (no double-count)', async () => {

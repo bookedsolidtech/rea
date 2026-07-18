@@ -177,13 +177,23 @@ function readState(file: string): TurnCountState {
   return { count, warn_emitted, halt_emitted };
 }
 
-function writeState(file: string, state: TurnCountState): void {
+/**
+ * Persist the counter state. Returns `true` when the new state (count +
+ * emitted flags) actually reached disk, `false` on any failure. FAIL-SAFE:
+ * never throws — a counter that cannot persist degrades to no-accounting, never
+ * a broken PostToolUse call. The boolean lets `updateCounter` suppress a
+ * threshold crossing it could not record: without the persisted
+ * `warn_emitted`/`halt_emitted` flags, the next call would re-read the stale
+ * state and re-fire the SAME crossing (a repeated halt/banner under
+ * `response: halt`).
+ */
+function writeState(file: string, state: TurnCountState): boolean {
   try {
     fs.mkdirSync(path.dirname(file), { recursive: true });
     fs.writeFileSync(file, `${JSON.stringify(state)}\n`, 'utf8');
+    return true;
   } catch {
-    /* best-effort: a counter that cannot persist degrades to no-accounting,
-     * never a broken PostToolUse call. */
+    return false;
   }
 }
 
@@ -267,8 +277,22 @@ export function updateCounter(file: string, config: TurnBudgetConfig): CounterUp
     // acts, so a crash mid-action does not re-fire the same crossing next turn.
     if (crossedWarn) state.warn_emitted = true;
     if (crossedHalt) state.halt_emitted = true;
-    writeState(file, state);
-    return { count, crossedWarn, crossedHalt };
+    // A crossing may only be REPORTED if the new state (with its emitted flags)
+    // actually PERSISTED. If the write is lost (read-only checkout / perms /
+    // transient FS error), the on-disk state does NOT advance — so the next
+    // call re-reads the stale state and recomputes the SAME crossing. Reporting
+    // it now would therefore GUARANTEE a duplicate (a repeated halt/banner in
+    // `response: halt`), defeating the once-per-crossing design. Suppress the
+    // crossing on a failed persist; it fires exactly once on the first call
+    // whose write succeeds. FAIL-SAFE: `writeState` never throws, so a
+    // persistence failure degrades this call to no-accounting, never a broken
+    // tool call.
+    const persisted = writeState(file, state);
+    return {
+      count,
+      crossedWarn: persisted && crossedWarn,
+      crossedHalt: persisted && crossedHalt,
+    };
   } finally {
     if (release !== null) {
       try {
