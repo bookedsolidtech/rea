@@ -41,6 +41,15 @@ SHIM_NAME="verify-gate"
 SHIM_INTRODUCED_IN="0.54.0"
 SHIM_FAIL_OPEN=1
 SHIM_REFUSAL_NOUN="task-completion verification"
+# round-53 P1: FAIL-OPEN by default, but when the repo has OPTED IN —
+# artifact_gates.g2_verify.mode ∈ {shadow, enforce} — a missing/unbuilt/too-old
+# CLI must NOT silently drop the gate. Fail CLOSED so a Write/Edit that
+# transitions a task to completed without evidence cannot bypass an active G2
+# just because the CLI is unavailable in this checkout. _shim_gate_active reads
+# the mode itself (self-contained awk over .rea/policy.yaml), so this editor-tier
+# shim needs no extra policy-reader wiring beyond REA_ROOT.
+SHIM_FAIL_CLOSED_WHEN_RELEVANT=1
+SHIM_ACTIVE_GATE_KEY="g2_verify"
 
 # Canonicalize $1: follow symlinks, tolerate a missing leaf. A relative path
 # resolves against $2 (its base). Depth-guarded against symlink cycles. Echoes

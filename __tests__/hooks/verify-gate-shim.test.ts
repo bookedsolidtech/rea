@@ -323,3 +323,129 @@ describe.skipIf(!ENABLED)('verify-gate shims — end-to-end through the shim', (
     }
   });
 });
+
+// ── round-53 P1 — CLI-MISSING fail posture is mode-aware (off means off) ─────
+// These deliberately DO NOT stage a dist copy: the shim resolves no in-project
+// CLI (cli-missing branch), and shim-runtime omits PATH + the temp repo is not
+// registry-blessed, so no global CLI resolves either. A FAIL-OPEN shim guarding
+// an ACTIVE g2_verify gate must now FAIL CLOSED so a raw write cannot bypass an
+// opted-in gate just because the CLI is unbuilt in this checkout.
+const CLI_MISSING_ENABLED = !IS_WIN && bashOk();
+describe.skipIf(!CLI_MISSING_ENABLED)('verify-gate shims — round-53 P1 CLI-missing fail-closed', () => {
+  function mkRepo(policy: string | null): string {
+    const d = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'rea-vg53-')));
+    spawnSync('git', ['init', '-q', d], { stdio: 'ignore' });
+    fs.mkdirSync(path.join(d, '.rea'), { recursive: true });
+    if (policy !== null) fs.writeFileSync(path.join(d, '.rea', 'policy.yaml'), policy);
+    return d;
+  }
+  function runFull(shim: string, repoDir: string, payload: string): { status: number; stderr: string } {
+    const res = spawnSync('bash', [shim], {
+      cwd: repoDir,
+      env: { PATH: process.env['PATH'] ?? '', CLAUDE_PROJECT_DIR: repoDir, HOME: repoDir },
+      input: payload,
+      encoding: 'utf8',
+      timeout: 30_000,
+    });
+    return { status: res.status ?? -1, stderr: res.stderr ?? '' };
+  }
+  const bashPayload = (repoDir: string): string =>
+    JSON.stringify({ tool_name: 'Bash', cwd: repoDir, tool_input: { command: 'echo x > .rea/tasks.jsonl' } });
+  const storeWrite = (repoDir: string): string =>
+    JSON.stringify({
+      tool_name: 'Write',
+      cwd: repoDir,
+      tool_input: { file_path: path.join(repoDir, '.rea', 'tasks.jsonl'), content: 'x' },
+    });
+  const nonStoreWrite = (repoDir: string): string =>
+    JSON.stringify({
+      tool_name: 'Write',
+      cwd: repoDir,
+      tool_input: { file_path: path.join(repoDir, 'src', 'foo.ts'), content: 'x' },
+    });
+
+  it('bash-gate: enforce + no CLI → FAIL CLOSED (exit 2 + CONFIG-ERROR)', () => {
+    const d = mkRepo(g2PolicyText('enforce'));
+    try {
+      const r = runFull(BASH_SHIM, d, bashPayload(d));
+      expect(r.status).toBe(2);
+      expect(r.stderr).toContain('CONFIG-ERROR');
+    } finally {
+      fs.rmSync(d, { recursive: true, force: true });
+    }
+  });
+
+  it('bash-gate: shadow + no CLI → FAIL CLOSED (exit 2)', () => {
+    const d = mkRepo(g2PolicyText('shadow'));
+    try {
+      expect(runFull(BASH_SHIM, d, bashPayload(d)).status).toBe(2);
+    } finally {
+      fs.rmSync(d, { recursive: true, force: true });
+    }
+  });
+
+  it('bash-gate: nested-inline `artifact_gates: { g2_verify: { mode: enforce } }` + no CLI → FAIL CLOSED', () => {
+    const d = mkRepo('artifact_gates: { g2_verify: { mode: enforce } }\n');
+    try {
+      expect(runFull(BASH_SHIM, d, bashPayload(d)).status).toBe(2);
+    } finally {
+      fs.rmSync(d, { recursive: true, force: true });
+    }
+  });
+
+  it('bash-gate: off + no CLI → FAIL OPEN (exit 0)', () => {
+    const d = mkRepo(g2PolicyText('off'));
+    try {
+      expect(runFull(BASH_SHIM, d, bashPayload(d)).status).toBe(0);
+    } finally {
+      fs.rmSync(d, { recursive: true, force: true });
+    }
+  });
+
+  it('bash-gate: absent policy + no CLI → FAIL OPEN (exit 0)', () => {
+    const d = mkRepo(null);
+    try {
+      expect(runFull(BASH_SHIM, d, bashPayload(d)).status).toBe(0);
+    } finally {
+      fs.rmSync(d, { recursive: true, force: true });
+    }
+  });
+
+  it('editor: enforce + store write + no CLI → FAIL CLOSED (exit 2 + CONFIG-ERROR)', () => {
+    const d = mkRepo(g2PolicyText('enforce'));
+    try {
+      const r = runFull(EDITOR_SHIM, d, storeWrite(d));
+      expect(r.status).toBe(2);
+      expect(r.stderr).toContain('CONFIG-ERROR');
+    } finally {
+      fs.rmSync(d, { recursive: true, force: true });
+    }
+  });
+
+  it('editor: nested-inline enforce + store write + no CLI → FAIL CLOSED (exit 2)', () => {
+    const d = mkRepo('artifact_gates: { g2_verify: { mode: enforce } }\n');
+    try {
+      expect(runFull(EDITOR_SHIM, d, storeWrite(d)).status).toBe(2);
+    } finally {
+      fs.rmSync(d, { recursive: true, force: true });
+    }
+  });
+
+  it('editor: off + store write + no CLI → FAIL OPEN (exit 0)', () => {
+    const d = mkRepo(g2PolicyText('off'));
+    try {
+      expect(runFull(EDITOR_SHIM, d, storeWrite(d)).status).toBe(0);
+    } finally {
+      fs.rmSync(d, { recursive: true, force: true });
+    }
+  });
+
+  it('editor: enforce + NON-store write + no CLI → FAIL OPEN (not relevant, exit 0)', () => {
+    const d = mkRepo(g2PolicyText('enforce'));
+    try {
+      expect(runFull(EDITOR_SHIM, d, nonStoreWrite(d)).status).toBe(0);
+    } finally {
+      fs.rmSync(d, { recursive: true, force: true });
+    }
+  });
+});

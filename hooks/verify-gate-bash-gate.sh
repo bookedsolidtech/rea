@@ -40,6 +40,12 @@ SHIM_NAME="verify-gate-bash-gate"
 SHIM_INTRODUCED_IN="0.54.0"
 SHIM_FAIL_OPEN=1
 SHIM_REFUSAL_NOUN="task-store write verification"
+# round-53 P1: FAIL-OPEN by default (default-off gate), but when the repo has
+# OPTED IN — artifact_gates.g2_verify.mode ∈ {shadow, enforce} — a
+# missing/unbuilt/too-old CLI must NOT silently drop the gate. Fail CLOSED in
+# that case so a raw Bash write to the task store cannot bypass an active G2.
+SHIM_FAIL_CLOSED_WHEN_RELEVANT=1
+SHIM_ACTIVE_GATE_KEY="g2_verify"
 
 shim_is_relevant() {
   # Cheapest sound gate: policy MODE. `off`/absent/unreadable → not relevant
@@ -48,8 +54,16 @@ shim_is_relevant() {
   mode=$(policy_reader_get artifact_gates.g2_verify.mode 2>/dev/null || true)
   case "$mode" in
     shadow | enforce) return 0 ;;
-    *) return 1 ;;
   esac
+  # round-53 P1: policy_reader's awk tier (used when no CLI/python3 is present —
+  # exactly the CLI-missing scenario this shim now fails CLOSED on) is BLOCK-FORM
+  # ONLY, so a nested inline flow map (`artifact_gates: { g2_verify: { mode:
+  # enforce } }`) would read as `off` and short-circuit here before the
+  # fail-closed logic ever runs. Fall back to the shared robust gate-active
+  # detector (block + inline at any depth, fail-closed bias on an unparseable
+  # governed policy) so an opted-in inline gate is never missed. `_shim_gate_active`
+  # is defined by shim-runtime.sh (sourced below) and resolved at call time.
+  _shim_gate_active
 }
 
 # shellcheck source=_lib/shim-runtime.sh
