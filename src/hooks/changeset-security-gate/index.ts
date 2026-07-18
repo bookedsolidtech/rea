@@ -336,7 +336,7 @@ export async function runChangesetSecurityGate(
   //      the original Write). The disclosure scan above still ran.
   let docToValidate: string | null;
   if (toolName === 'Edit') {
-    docToValidate = reconstructEditResult(reaRoot, filePath, stdinRaw);
+    docToValidate = reconstructEditResult(reaRoot, payloadCwd, filePath, stdinRaw);
   } else if (toolName === 'MultiEdit') {
     docToValidate = null;
   } else {
@@ -394,6 +394,7 @@ export async function runChangesetSecurityGate(
  */
 function reconstructEditResult(
   reaRoot: string,
+  payloadCwd: string,
   filePath: string,
   stdinRaw: string | Buffer,
 ): string | null {
@@ -408,7 +409,13 @@ function reconstructEditResult(
     if (typeof rec.old_string !== 'string') return null;
     const oldStr = rec.old_string;
     const newStr = typeof rec.new_string === 'string' ? rec.new_string : '';
-    const abs = path.isAbsolute(filePath) ? filePath : path.join(reaRoot, filePath);
+    // Round-1 P2: a cwd-relative path (e.g. `../.changeset/foo.md` from a
+    // subdirectory session) resolves against the TOOL's cwd, not the
+    // repo root — resolving against reaRoot read the wrong file, returned
+    // null, and silently skipped validation. Fall back to reaRoot only
+    // when the payload carried no cwd.
+    const base = payloadCwd.length > 0 ? payloadCwd : reaRoot;
+    const abs = path.isAbsolute(filePath) ? filePath : path.resolve(base, filePath);
     const current = fs.readFileSync(abs, 'utf8');
     if (oldStr.length === 0 || !current.includes(oldStr)) return null;
     if (rec.replace_all === true) return current.split(oldStr).join(newStr);

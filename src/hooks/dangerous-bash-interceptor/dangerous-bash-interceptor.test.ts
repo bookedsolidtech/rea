@@ -729,6 +729,24 @@ describe('dangerous-bash-interceptor: H17 sanction + runner normalization (bug H
     }
   });
 
+  it('tracks sanction PER SEGMENT — a sanctioned segment does not excuse an unsanctioned one (round-1 P1)', async () => {
+    // policy delegates both `pnpm run test` and `pnpm run build`.
+    fs.writeFileSync(
+      path.join(root, '.rea', 'policy.yaml'),
+      `context_protection:\n  delegate_to_subagent:\n    - pnpm run test\n    - pnpm run build\n`,
+    );
+    // `pnpm test` (unsanctioned) && REA_DELEGATED_RUN=1 pnpm build (sanctioned)
+    const mixed = await run('pnpm test && REA_DELEGATED_RUN=1 pnpm build', root);
+    expect(mixed.exitCode).toBe(2);
+    expect(mixed.ids).toContain('H17');
+    // Both sanctioned → allow.
+    const both = await run(
+      'REA_DELEGATED_RUN=1 pnpm test && REA_DELEGATED_RUN=1 pnpm build',
+      root,
+    );
+    expect(both.exitCode).toBe(0);
+  });
+
   it('does NOT write a sanctioned-run audit record when another rule blocks (round-1 P3)', async () => {
     const r = await run('REA_DELEGATED_RUN=1 pnpm test && rm -rf /', root);
     expect(r.exitCode).toBe(2); // H11 (rm -rf) blocks

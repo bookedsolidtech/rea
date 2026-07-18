@@ -239,6 +239,30 @@ describe('runChangesetSecurityGate', () => {
       expect(r.exitCode).toBe(2);
     });
 
+    it('resolves a cwd-relative Edit path against the payload cwd, not reaRoot (round-1 P2)', async () => {
+      // File lives at <root>/.changeset/x.md; the tool call comes from a
+      // subdirectory and addresses it cwd-relative. Resolving against
+      // reaRoot would miss the file, skip validation, and let a
+      // frontmatter-damaging edit through.
+      writeChangeset('.changeset/x.md', VALID_CHANGESET);
+      const subdir = path.join(root, 'packages', 'x');
+      fs.mkdirSync(subdir, { recursive: true });
+      const r = await runChangesetSecurityGate({
+        reaRoot: root,
+        stdinOverride: JSON.stringify({
+          tool_name: 'Edit',
+          tool_input: {
+            file_path: '../../.changeset/x.md',
+            old_string: "'@bookedsolid/rea': patch\n",
+            new_string: '',
+          },
+          cwd: subdir,
+        }),
+      });
+      expect(r.exitCode).toBe(2); // reconstruct found the file → bump removal caught
+      expect(r.stderr).toContain('valid package bump entry');
+    });
+
     it('honors replace_all when reconstructing', async () => {
       writeChangeset(
         '.changeset/x.md',

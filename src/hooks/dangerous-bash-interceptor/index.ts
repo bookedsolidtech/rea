@@ -114,8 +114,8 @@ interface RuleContext {
   cmdIsRebaseSafe: boolean;
   cmdIsCleanDry: boolean;
   delegatePatterns: string[];
-  /** H17: the command carries the sanctioned delegated-run marker. */
-  delegatedRunSanctioned: boolean;
+  /** H17: per-segment delegate-pattern hits with per-segment sanction. */
+  delegateHits: DelegateSegmentHit[];
 }
 
 interface Rule {
@@ -158,19 +158,22 @@ const DELEGATED_RUN_MARKER = 'REA_DELEGATED_RUN';
  * tool calls, so an inline leading assignment is the only marker a
  * PreToolUse hook can see for the command it is gating.
  */
-function detectDelegatedRunSanction(cmd: string): boolean {
+/** True when the process env carries a non-empty marker (a GLOBAL sanction). */
+function envMarkerSet(): boolean {
   const env = process.env[DELEGATED_RUN_MARKER];
-  if (typeof env === 'string' && env.length > 0) return true;
-  // Leading env-assignment block that includes REA_DELEGATED_RUN=<val>.
-  // Tolerates other simple leading assigns and quoted values.
-  const re = new RegExp(
-    `^\\s*(?:[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|\\S*)\\s+)*` +
-      `${DELEGATED_RUN_MARKER}=(?:"[^"]*"|'[^']*'|\\S+)`,
-  );
-  for (const seg of splitSegments(cmd)) {
-    if (re.test(seg.raw)) return true;
-  }
-  return false;
+  return typeof env === 'string' && env.length > 0;
+}
+
+// Leading env-assignment block that includes REA_DELEGATED_RUN=<val>.
+// Tolerates other simple leading assigns and quoted values.
+const SEGMENT_MARKER_RE = new RegExp(
+  `^\\s*(?:[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|\\S*)\\s+)*` +
+    `${DELEGATED_RUN_MARKER}=(?:"[^"]*"|'[^']*'|\\S+)`,
+);
+
+/** True when THIS segment's raw text carries a leading marker assignment. */
+function segmentHasMarker(rawSegment: string): boolean {
+  return SEGMENT_MARKER_RE.test(rawSegment);
 }
 
 /**
@@ -235,22 +238,60 @@ function expandRunnerEquivalents(pattern: string): string[] {
 }
 
 /**
- * Return the delegate pattern that matches `cmd` (whitespace-normalized,
- * across every runner-equivalent form), or null. Head-anchored with a
- * trailing `(\s|$)` so a listed `pnpm vitest run` catches every runner
- * form while `pnpm vitest-foo` does not. Empty patterns are skipped.
+ * Return the delegate pattern matching a single segment head
+ * (whitespace-normalized, across every runner-equivalent form), or null.
+ * Head-anchored with a trailing `(\s|$)` so a listed `pnpm vitest run`
+ * catches every runner form while `pnpm vitest-foo` does not.
  */
-function matchDelegatePattern(cmd: string, patterns: readonly string[]): string | null {
-  const heads = splitSegments(cmd).map((seg) => seg.head.trim().replace(/\s+/g, ' '));
+function matchSegmentHead(head: string, patterns: readonly string[]): string | null {
   for (const pattern of patterns) {
     if (pattern.trim().length === 0) continue;
     for (const variant of expandRunnerEquivalents(pattern)) {
       if (variant.length === 0) continue;
       const re = new RegExp(`^${escapeERE(variant)}(\\s|$)`, 'i');
-      if (heads.some((h) => re.test(h))) return pattern;
+      if (re.test(head)) return pattern;
     }
   }
   return null;
+}
+
+interface DelegateSegmentHit {
+  /** The delegate pattern this segment matched. */
+  pattern: string;
+  /** True when THIS segment is sanctioned (env marker set, or its own
+   *  leading `REA_DELEGATED_RUN=` assignment). */
+  sanctioned: boolean;
+  /** Where the sanction came from (only when `sanctioned`). */
+  source?: 'env' | 'command_marker';
+}
+
+/**
+ * Per-segment delegate analysis (round-1 P1). Sanction is tracked PER
+ * SEGMENT, not per whole command: `pnpm test && REA_DELEGATED_RUN=1 pnpm
+ * lint` must still block the unsanctioned `pnpm test` even though the
+ * `pnpm lint` segment is sanctioned. The process-env marker is a global
+ * sanction (applies to every segment); the command marker is scoped to
+ * the segment that carries it.
+ */
+function analyzeDelegateSegments(
+  cmd: string,
+  patterns: readonly string[],
+): DelegateSegmentHit[] {
+  const envSanctioned = envMarkerSet();
+  const hits: DelegateSegmentHit[] = [];
+  for (const seg of splitSegments(cmd)) {
+    const head = seg.head.trim().replace(/\s+/g, ' ');
+    const pattern = matchSegmentHead(head, patterns);
+    if (pattern === null) continue;
+    if (envSanctioned) {
+      hits.push({ pattern, sanctioned: true, source: 'env' });
+    } else if (segmentHasMarker(seg.raw)) {
+      hits.push({ pattern, sanctioned: true, source: 'command_marker' });
+    } else {
+      hits.push({ pattern, sanctioned: false });
+    }
+  }
+  return hits;
 }
 
 // ── Rule catalog ────────────────────────────────────────────────────
@@ -656,12 +697,14 @@ const RULES: ReadonlyArray<Rule> = [
     id: 'H17',
     severity: 'HIGH',
     run: (ctx) => {
-      // Sanctioned delegated runs pass (and are audited by the caller).
-      // The coordinator — no marker — is still blocked, but with copy
-      // that names an ACTUALLY TRAVERSABLE path (bug H17).
-      if (ctx.delegatedRunSanctioned) return [];
-      const hit = matchDelegatePattern(ctx.cmd, ctx.delegatePatterns);
-      if (hit === null) return [];
+      // Round-1 P1: block when ANY matching segment is UNSANCTIONED —
+      // a sanctioned segment elsewhere in a compound command does not
+      // excuse an unsanctioned delegate-listed segment running in the
+      // coordinator. Sanctioned segments pass (and are audited by the
+      // caller). The block copy names an actually-traversable path.
+      const unsanctioned = ctx.delegateHits.find((h) => !h.sanctioned);
+      if (unsanctioned === undefined) return [];
+      const hit = unsanctioned.pattern;
       return [
         {
           severity: 'HIGH',
@@ -858,7 +901,7 @@ export async function runDangerousBashInterceptor(
 
   // 6. Delegate patterns + sanctioned-run detection (bug H17).
   const delegatePatterns = loadDelegatePatterns(reaRoot);
-  const delegatedRunSanctioned = detectDelegatedRunSanction(cmd);
+  const delegateHits = analyzeDelegateSegments(cmd, delegatePatterns);
 
   // 7. Run every rule.
   const ctx: RuleContext = {
@@ -866,7 +909,7 @@ export async function runDangerousBashInterceptor(
     cmdIsRebaseSafe,
     cmdIsCleanDry,
     delegatePatterns,
-    delegatedRunSanctioned,
+    delegateHits,
   };
   const violations: Violation[] = [];
   for (const rule of RULES) {
@@ -879,12 +922,15 @@ export async function runDangerousBashInterceptor(
   // hatch (like REA_SKIP_*), so a coordinator forging it leaves a trail
   // on the hash chain. Round-1 P3: the record is written ONLY when the
   // invocation is actually ALLOWED (no HIGH violation) — a sanctioned
-  // command that another rule (H1/H11/…) still blocks never ran, so an
-  // `Allowed` audit line for it would be a false record. Audit keys off
-  // the COMMON (repository) root.
-  if (delegatedRunSanctioned && highs.length === 0) {
-    const sanctionedHit = matchDelegatePattern(cmd, delegatePatterns);
-    if (sanctionedHit !== null) {
+  // command another rule (H1/H11/…) still blocks never ran, so an
+  // `Allowed` audit line for it would be a false record. Round-1 P1:
+  // one record per unique sanctioned pattern (per-segment analysis).
+  // Audit keys off the COMMON (repository) root.
+  if (highs.length === 0) {
+    const seen = new Set<string>();
+    for (const hit of delegateHits) {
+      if (!hit.sanctioned || seen.has(hit.pattern)) continue;
+      seen.add(hit.pattern);
       try {
         await appendAuditRecord(commonRoot, {
           tool_name: 'rea.context_protection',
@@ -893,12 +939,8 @@ export async function runDangerousBashInterceptor(
           status: InvocationStatus.Allowed,
           metadata: {
             event: 'delegated_run_sanctioned',
-            pattern: sanctionedHit,
-            sanction_source:
-              typeof process.env[DELEGATED_RUN_MARKER] === 'string' &&
-              (process.env[DELEGATED_RUN_MARKER] ?? '').length > 0
-                ? 'env'
-                : 'command_marker',
+            pattern: hit.pattern,
+            sanction_source: hit.source ?? 'command_marker',
             command_preview: cmd.slice(0, 256),
           },
         });
