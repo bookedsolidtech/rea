@@ -137,20 +137,36 @@ function canonicalizePath(abs: string, depth = 0): string | null {
  * `file_path` does not literally name it. Mirrors the bash-tier gate's
  * symlink canonicalization (`bash-scanner` resolves redirect/cp/mv targets).
  */
-function resolvesToTasksJsonl(
+/**
+ * Round-43 fix — acceptance AND reconstruction must read the SAME file.
+ *
+ * Decide whether `filePath` targets THIS repo's governed `.rea/tasks.jsonl`
+ * and, when it does, RETURN THE EXACT canonical store path it matched — so the
+ * caller reconstructs against that same file instead of running an independent
+ * base-order guess. Previously acceptance tried `[reaRoot, cwd]` while
+ * `readCurrentFile` tried `[cwd, reaRoot]`; a subdir session emitting a
+ * repo-root-relative `.rea/tasks.jsonl` (while the subdir also has a nested
+ * one) would ACCEPT via the repo root but READ the nested cwd store — a
+ * different document, so it validated/refused the wrong file. Threading the
+ * accepted path dissolves the round-32 (cwd-first) ↔ round-43 (reaRoot-first)
+ * oscillation: whatever base wins the match IS the reconstruction target.
+ *
+ * The governed store set spans the LOCAL worktree, the COMMON (primary
+ * checkout) root, AND every SIBLING worktree (round-27 P1 — same enumeration
+ * as the bash gate / path guards). Cross-repo isolation (round-26) holds: a
+ * FOREIGN repo is not a sibling and never enters the set. Fail-safe: an
+ * unresolvable path yields `null` (no match), never a crash.
+ *
+ * Returns the resolved absolute store path (the canonical realpath the match
+ * was made against), or `null` when `filePath` does not target the store.
+ */
+function resolveTasksJsonlTarget(
   reaRoot: string,
   commonRoot: string,
   payloadCwd: string,
   filePath: string,
-): boolean {
-  if (filePath.length === 0) return false;
-  // Round-27 P1: the store set spans the LOCAL worktree, the COMMON (primary
-  // checkout) root, AND every SIBLING worktree of the same repository — the
-  // same enumeration the bash-tier G2 gate and the path guards use
-  // (`listSiblingWorktreeRoots(commonRoot, reaRoot)`). Without siblings, a
-  // Write to another stream's `<sibling>/.rea/tasks.jsonl` skipped G2 entirely.
-  // Siblings are worktrees of THIS repo's commonRoot, so cross-repo isolation
-  // (round-26) holds: a FOREIGN repo is not a sibling and never enters the set.
+): string | null {
+  if (filePath.length === 0) return null;
   const roots = [
     reaRoot,
     ...(commonRoot.length > 0 && commonRoot !== reaRoot ? [commonRoot] : []),
@@ -158,11 +174,10 @@ function resolvesToTasksJsonl(
   ];
   const storeCanons: string[] = [];
   for (const root of roots) {
-    // Fail-safe: a sibling that can't be resolved yields null and is skipped.
     const c = canonicalizePath(path.resolve(root, TASKS_RELATIVE));
     if (c !== null) storeCanons.push(c);
   }
-  if (storeCanons.length === 0) return false;
+  if (storeCanons.length === 0) return null;
 
   const candidates = path.isAbsolute(filePath)
     ? [filePath]
@@ -172,9 +187,9 @@ function resolvesToTasksJsonl(
       ];
   for (const cand of candidates) {
     const cc = canonicalizePath(cand);
-    if (cc !== null && storeCanons.includes(cc)) return true;
+    if (cc !== null && storeCanons.includes(cc)) return cc; // the matched store path
   }
-  return false;
+  return null;
 }
 
 interface LooseTaskRecord {
@@ -263,9 +278,7 @@ function multisetDiff(after: string[], before: string[]): string[] {
  * locatable) — the caller treats `null` as UNCERTAIN.
  */
 function reconstructResult(
-  reaRoot: string,
-  payloadCwd: string,
-  filePath: string,
+  targetPath: string,
   toolName: string,
   content: string,
   stdinRaw: string | Buffer,
@@ -273,7 +286,9 @@ function reconstructResult(
   if (toolName !== 'Edit' && toolName !== 'MultiEdit') {
     return content;
   }
-  const current = readCurrentFile(reaRoot, payloadCwd, filePath);
+  // Round-43: read the EXACT file acceptance matched (the accepted store path),
+  // never an independent base-order guess.
+  const current = readFileAt(targetPath);
   if (current === null) return null;
 
   let parsed: unknown;
@@ -320,28 +335,18 @@ function applyEdit(current: string, oldStr: string, newStr: string, replaceAll: 
   return current.slice(0, idx) + newStr + current.slice(idx + oldStr.length);
 }
 
-/** Read the current on-disk `.rea/tasks.jsonl`, trying the payload cwd then repo root. */
-function readCurrentFile(reaRoot: string, payloadCwd: string, filePath: string): string | null {
-  // Round-32 P2: resolve a relative path against the payload cwd FIRST — the
-  // directory the Edit was launched from — so `../.rea/tasks.jsonl` reconstructs
-  // against the file Claude is actually editing. A repo-root-first order would,
-  // in a nested repo whose PARENT also has `.rea/tasks.jsonl`, reconstruct
-  // against the parent store (miss a new no-evidence completion, or block a
-  // valid edit). Repo root is the fallback.
-  const candidates = path.isAbsolute(filePath)
-    ? [filePath]
-    : [
-        ...(payloadCwd.length > 0 ? [path.resolve(payloadCwd, filePath)] : []),
-        path.resolve(reaRoot, filePath),
-      ];
-  for (const cand of candidates) {
-    try {
-      return fs.readFileSync(cand, 'utf8');
-    } catch {
-      /* try the next base */
-    }
+/**
+ * Read `targetPath` (the ACCEPTED store path from `resolveTasksJsonlTarget`),
+ * or `null` when it does not exist / is unreadable. Round-43: there is no base
+ * candidate order here anymore — acceptance already resolved the exact file, so
+ * reconstruction reads precisely that one and cannot diverge from the match.
+ */
+function readFileAt(targetPath: string): string | null {
+  try {
+    return fs.readFileSync(targetPath, 'utf8');
+  } catch {
+    return null;
   }
-  return null;
 }
 
 function banner(taskIds: string[]): string {
@@ -470,22 +475,17 @@ export async function runVerifyGate(options: VerifyGateOptions = {}): Promise<Ve
   }
 
   // Only act on THIS repo's `.rea/tasks.jsonl` (round-26 P2 — cross-repo
-  // isolation). The match is REPO-SCOPED via `resolvesToTasksJsonl`, which
-  // canonicalizes `file_path` (+ its parent, following symlinks) and compares
-  // it to the resolved store of the LOCAL and COMMON roots. The pre-round-26
-  // `isTasksJsonl(filePath)` fast-path was a suffix-only check (`*/.rea/
-  // tasks.jsonl`) that matched ANY repo's store — so a Write from repo A to
-  // `<repoB>/.rea/tasks.jsonl` was governed by repo A's policy and audited into
-  // repo A's chain. Dropping it closes that leak while `resolvesToTasksJsonl`
-  // still covers every in-repo case the fast-path used to (absolute
-  // `<reaRoot>/.rea/tasks.jsonl`, relative resolved against cwd/reaRoot, the
-  // common-root store in a linked worktree, symlink aliases, dangling links).
-  // Fail-safe: an unresolvable path yields no match, never a crash.
-  if (!resolvesToTasksJsonl(reaRoot, commonRoot, payloadCwd, filePath)) {
+  // isolation), REPO-SCOPED across the local, common, and sibling-worktree
+  // stores (round-27). `resolveTasksJsonlTarget` returns the EXACT canonical
+  // store path it matched (or null); reconstruction + the prior read both use
+  // THAT path, so acceptance and reconstruction can never diverge (round-43).
+  // Fail-safe: an unresolvable path yields null (no match), never a crash.
+  const targetPath = resolveTasksJsonlTarget(reaRoot, commonRoot, payloadCwd, filePath);
+  if (targetPath === null) {
     return { exitCode: 0, stderr, stdout };
   }
 
-  const resulting = reconstructResult(reaRoot, payloadCwd, filePath, toolName, content, stdinRaw);
+  const resulting = reconstructResult(targetPath, toolName, content, stdinRaw);
   if (resulting === null) {
     // UNCERTAIN: an Edit/MultiEdit whose result can't be reconstructed.
     return resolveVerdict({
@@ -505,7 +505,7 @@ export async function runVerifyGate(options: VerifyGateOptions = {}): Promise<Ve
   // a pre-existing historical `completed`-without-evidence row (e.g.
   // from before opting into G2) must not deadlock every later write.
   // Multiset diff of bad-completion ids: resulting minus prior.
-  const priorContent = readCurrentFile(reaRoot, payloadCwd, filePath) ?? '';
+  const priorContent = readFileAt(targetPath) ?? '';
   const badIds = multisetDiff(detectBadCompletions(resulting), detectBadCompletions(priorContent));
   if (badIds.length === 0) {
     return { exitCode: 0, stderr, stdout };

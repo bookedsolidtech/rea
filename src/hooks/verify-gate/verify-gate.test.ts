@@ -549,4 +549,46 @@ describe('runVerifyGate', () => {
       fs.rmSync(foreign, { recursive: true, force: true });
     }
   });
+
+  // ── Round-43 — acceptance and reconstruction read the SAME file ──────────
+  // The bug: acceptance matched one base, reconstruction read another. These
+  // pin that the ACCEPTED store path is the reconstruction target.
+  it('round-43: a REPO-ROOT-relative path from a subdir (whose nested store would MASK it) reconstructs against the repo store', async () => {
+    writePolicy(root, 'enforce');
+    // Repo store: T-0001 in_progress (clean — a NEW completion here is a hit).
+    fs.writeFileSync(path.join(root, '.rea', 'tasks.jsonl'), taskLine({ status: 'in_progress' }) + '\n');
+    // A subdir with its OWN nested store where T-0001 is ALREADY completed-no-
+    // evidence. If the gate read THIS (cwd-first, the pre-fix reconstruction),
+    // the multiset diff would MASK the new completion and MISS it (exit 0).
+    const sub = path.join(root, 'packages', 'foo');
+    fs.mkdirSync(path.join(sub, '.rea'), { recursive: true });
+    fs.writeFileSync(path.join(sub, '.rea', 'tasks.jsonl'), taskLine({ status: 'completed' }) + '\n');
+    // Write a REPO-ROOT-relative file_path FROM the subdir cwd, completing
+    // T-0001 without evidence. Acceptance matches via the repo root; the gate
+    // must reconstruct against the repo store, not the nested cwd one.
+    const payload = JSON.stringify({
+      tool_name: 'Write',
+      cwd: sub,
+      tool_input: { file_path: '.rea/tasks.jsonl', content: COMPLETED_NO_EVIDENCE },
+    });
+    const r = await runVerifyGate({ reaRoot: root, stdinOverride: payload });
+    expect(r.exitCode).toBe(2); // caught against the repo store; not masked by the nested one
+  });
+
+  it('round-32: a `../`-relative path from a subdir reconstructs against the PARENT (repo) store', async () => {
+    writePolicy(root, 'enforce');
+    fs.writeFileSync(path.join(root, '.rea', 'tasks.jsonl'), taskLine({ status: 'in_progress' }) + '\n');
+    const sub = path.join(root, 'foo');
+    fs.mkdirSync(sub, { recursive: true });
+    // From `foo/`, `../.rea/tasks.jsonl` targets the repo store — acceptance
+    // matches via the CWD base (the repo-root base resolves outside the repo),
+    // and reconstruction reads that same accepted store.
+    const payload = JSON.stringify({
+      tool_name: 'Write',
+      cwd: sub,
+      tool_input: { file_path: '../.rea/tasks.jsonl', content: COMPLETED_NO_EVIDENCE },
+    });
+    const r = await runVerifyGate({ reaRoot: root, stdinOverride: payload });
+    expect(r.exitCode).toBe(2);
+  });
 });

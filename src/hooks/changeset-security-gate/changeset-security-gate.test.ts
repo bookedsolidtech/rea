@@ -263,6 +263,38 @@ describe('runChangesetSecurityGate', () => {
       expect(r.stderr).toContain('valid package bump entry');
     });
 
+    it('round-43: a REPO-ROOT-relative Edit from a subdir (with a NESTED decoy changeset) reconstructs against the repo-root changeset', async () => {
+      // The real governed changeset at <root>/.changeset/x.md carries a bump.
+      writeChangeset('.changeset/x.md', VALID_CHANGESET);
+      // A NESTED decoy at <root>/packages/x/.changeset/x.md — a DIFFERENT file,
+      // valid on its own, whose content lacks the edit's old_string. If the gate
+      // read THIS (the pre-fix cwd-first order), the old_string would be absent →
+      // reconstruct null → skip → the bump removal on the REAL file is MISSED.
+      const subdir = path.join(root, 'packages', 'x');
+      fs.mkdirSync(path.join(subdir, '.changeset'), { recursive: true });
+      fs.writeFileSync(
+        path.join(subdir, '.changeset', 'x.md'),
+        `---\n'@bookedsolid/other': patch\n---\n\nunrelated decoy\n`,
+      );
+      // Edit the REPO-ROOT changeset via a repo-root-relative path FROM the
+      // subdir cwd, DELETING the bump. Acceptance resolves the repo-root
+      // changeset; reconstruction must read THAT, not the nested decoy.
+      const r = await runChangesetSecurityGate({
+        reaRoot: root,
+        stdinOverride: JSON.stringify({
+          tool_name: 'Edit',
+          tool_input: {
+            file_path: '.changeset/x.md',
+            old_string: "'@bookedsolid/rea': patch\n",
+            new_string: '',
+          },
+          cwd: subdir,
+        }),
+      });
+      expect(r.exitCode).toBe(2); // reconstructed against the repo-root file → bump removal caught
+      expect(r.stderr).toContain('valid package bump entry');
+    });
+
     it('honors replace_all when reconstructing', async () => {
       writeChangeset(
         '.changeset/x.md',

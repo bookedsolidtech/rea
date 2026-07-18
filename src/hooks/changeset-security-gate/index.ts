@@ -50,7 +50,7 @@ import type { Buffer } from 'node:buffer';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { checkHaltRoots, formatHaltBanner } from '../_lib/halt-check.js';
-import { resolveHookRoots } from '../../lib/worktree-roots.js';
+import { resolveHookRoots, listSiblingWorktreeRoots } from '../../lib/worktree-roots.js';
 import {
   parseWriteHookPayload,
   MalformedPayloadError,
@@ -336,7 +336,7 @@ export async function runChangesetSecurityGate(
   //      the original Write). The disclosure scan above still ran.
   let docToValidate: string | null;
   if (toolName === 'Edit') {
-    docToValidate = reconstructEditResult(reaRoot, payloadCwd, filePath, stdinRaw);
+    docToValidate = reconstructEditResult(reaRoot, commonRoot, payloadCwd, filePath, stdinRaw);
   } else if (toolName === 'MultiEdit') {
     docToValidate = null;
   } else {
@@ -392,8 +392,67 @@ export async function runChangesetSecurityGate(
  * so a legitimate body edit is never falsely refused. The disclosure
  * (GHSA/CVE) scan already ran on the fragment upstream.
  */
+/**
+ * Round-43 — resolve the EXACT governed `.changeset/<name>.md` file the write
+ * targets, so reconstruction reads the same file the write actually edits (not
+ * an independent base-order guess). The governed changeset dirs are
+ * `<root>/.changeset` for the LOCAL worktree, the COMMON (primary checkout)
+ * root, and every SIBLING worktree — a NESTED subdir `.changeset/` (a decoy
+ * inside the repo) is NOT one of them, and neither is a foreign repo's
+ * (cross-repo isolation, mirrors verify-gate round-26/27). Try the candidate
+ * bases (repo-root-relative then cwd-relative, or the absolute path) and return
+ * the first whose realpath sits DIRECTLY under a governed `.changeset/`. Returns
+ * `null` (skip, never block) when none does. Fail-safe: fs errors → `null`.
+ */
+function realpathTolerant(p: string): string | null {
+  try {
+    return fs.realpathSync(p);
+  } catch {
+    try {
+      return path.join(fs.realpathSync(path.dirname(p)), path.basename(p));
+    } catch {
+      return null;
+    }
+  }
+}
+
+function resolveChangesetTarget(
+  reaRoot: string,
+  commonRoot: string,
+  payloadCwd: string,
+  filePath: string,
+): string | null {
+  const roots = [
+    reaRoot,
+    ...(commonRoot.length > 0 && commonRoot !== reaRoot ? [commonRoot] : []),
+    ...(commonRoot.length > 0 ? listSiblingWorktreeRoots(commonRoot, reaRoot) : []),
+  ];
+  const govChangesetDirs: string[] = [];
+  for (const root of roots) {
+    const c = realpathTolerant(path.join(root, '.changeset'));
+    if (c !== null) govChangesetDirs.push(c);
+  }
+  if (govChangesetDirs.length === 0) return null;
+
+  const candidates = path.isAbsolute(filePath)
+    ? [filePath]
+    : [
+        path.resolve(reaRoot, filePath),
+        ...(payloadCwd.length > 0 ? [path.resolve(payloadCwd, filePath)] : []),
+      ];
+  for (const cand of candidates) {
+    const cc = realpathTolerant(cand);
+    if (cc === null) continue;
+    const base = path.basename(cc);
+    if (base === 'README.md' || !/\.md$/.test(base)) continue;
+    if (govChangesetDirs.includes(path.dirname(cc))) return cc; // directly under a governed .changeset/
+  }
+  return null;
+}
+
 function reconstructEditResult(
   reaRoot: string,
+  commonRoot: string,
   payloadCwd: string,
   filePath: string,
   stdinRaw: string | Buffer,
@@ -409,34 +468,24 @@ function reconstructEditResult(
     if (typeof rec.old_string !== 'string') return null;
     const oldStr = rec.old_string;
     const newStr = typeof rec.new_string === 'string' ? rec.new_string : '';
-    // Relative `file_path` can follow EITHER convention: Claude usually
-    // sends a repo-root-relative path (`.changeset/foo.md`) even from a
-    // subdirectory session (round-5 P2), but a cwd-relative form
-    // (`../.changeset/foo.md`) also occurs (round-1 P2). Try the repo
-    // root first, then the payload cwd, and read whichever exists —
-    // never silently skip validation by guessing one base.
-    let current: string | null = null;
-    // Round-32 P2: resolve a relative path against the payload cwd FIRST — that
-    // is the directory the Edit was actually launched from, so `../.changeset/
-    // foo.md` targets the intended file. In a nested repo/monorepo where the
-    // PARENT also has `.changeset/foo.md`, a repo-root-first order would
-    // reconstruct against the wrong file (block a valid edit, or pass an edit
-    // that removes THIS repo's bump). Repo-root is the fallback.
-    const candidates = path.isAbsolute(filePath)
-      ? [filePath]
-      : [
-          ...(payloadCwd.length > 0 ? [path.resolve(payloadCwd, filePath)] : []),
-          path.resolve(reaRoot, filePath),
-        ];
-    for (const cand of candidates) {
-      try {
-        current = fs.readFileSync(cand, 'utf8');
-        break;
-      } catch {
-        /* try the next base */
-      }
+    // Round-43: acceptance and reconstruction must read the SAME file.
+    // `resolveChangesetTarget` returns the EXACT changeset file the write
+    // targets — the candidate (repo-root-relative OR cwd-relative) that lands
+    // under a GOVERNED `.changeset/` dir (this repo's local / common / sibling
+    // roots) — and we read THAT. This dissolves the round-32↔round-43
+    // oscillation: whatever base resolves to the governed changeset IS the
+    // reconstruction target, so a subdir session emitting a repo-root-relative
+    // `.changeset/foo.md` no longer reconstructs against a NESTED decoy (the
+    // pre-fix cwd-first read), and a `../`-relative path still targets the
+    // parent. No governed changeset resolved → skip (null), never a false block.
+    const targetPath = resolveChangesetTarget(reaRoot, commonRoot, payloadCwd, filePath);
+    if (targetPath === null) return null;
+    let current: string;
+    try {
+      current = fs.readFileSync(targetPath, 'utf8');
+    } catch {
+      return null;
     }
-    if (current === null) return null;
     if (oldStr.length === 0 || !current.includes(oldStr)) return null;
     if (rec.replace_all === true) return current.split(oldStr).join(newStr);
     const idx = current.indexOf(oldStr);
