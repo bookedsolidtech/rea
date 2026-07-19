@@ -101,6 +101,21 @@ export interface SelfPinResult {
    *                                          preview even when the
    *                                          symlink would block the
    *                                          live run.
+   *   - `'skipped-global-default'` — 0.53.0 GLOBAL-FIRST default. No existing
+   *                                   pin AND `--pin` was NOT passed. `rea init`
+   *                                   / `rea upgrade` no longer self-pin by
+   *                                   default: the global rea CLI tier governs,
+   *                                   so no local dep is written. This is the
+   *                                   ordinary healthy state, not a problem.
+   *   - `'skipped-global-tier-trusted'` — 0.53.0. Same "no pin written"
+   *                                        outcome as `skipped-global-default`,
+   *                                        but the caller additionally CONFIRMED
+   *                                        the checkout is trusted in the
+   *                                        global-tier registry
+   *                                        (`options.trustedGlobalTier`). Purely
+   *                                        a messaging distinction — the print
+   *                                        ladder can say "trusted" rather than
+   *                                        the generic default line.
    */
   action:
     | 'wrote'
@@ -110,7 +125,9 @@ export interface SelfPinResult {
     | 'skipped-dogfood'
     | 'skipped-no-package-json'
     | 'skipped-malformed-package-json'
-    | 'skipped-symlink-package-json';
+    | 'skipped-symlink-package-json'
+    | 'skipped-global-default'
+    | 'skipped-global-tier-trusted';
   /** Absolute path to the package.json we resolved (or null when none found). */
   packageJsonPath: string | null;
   /** Caret-pinned version range we wrote (e.g. `^0.49.0`). Empty when no write happened. */
@@ -196,6 +213,37 @@ export interface SelfPinOptions {
    * call sites should pass `mode: 'upgrade'` explicitly.
    */
   mode?: 'init' | 'upgrade';
+  /**
+   * 0.53.0 GLOBAL-FIRST — OPT-IN to a hermetic local pin. When `true` AND
+   * there is NO existing pin, `selfPinRea` writes `^<cliVersion>` into
+   * `devDependencies` (the pre-0.53.0 behavior). When `false`/omitted (the
+   * DEFAULT), no pin is written — the global rea CLI tier governs and a local
+   * dep is neither needed nor recommended.
+   *
+   * `--pin` on `rea init` / `rea upgrade` sets this. NARROWNESS: `pin` only
+   * affects the no-existing-pin branch (write vs skip). An existing pin is
+   * still operator-owned and handled by the skip-same / managed-caret-bump /
+   * skip-different branches above regardless of this flag. Default: `false`.
+   */
+  pin?: boolean;
+  /**
+   * 0.53.0 — the CALLER determined this is a TRUSTED global-tier checkout:
+   * `realpath(cwd)` is a member of `<home>/.rea/trusted-projects`, the global
+   * rea CLI tier resolves, and `runtime.allow_global_cli` is not vetoed by
+   * policy. (The caller computes this via the shared `resolveGlobalCliTier`
+   * predicate — the SAME one `rea doctor` renders — so the scaffolders and
+   * doctor never disagree about what "trusted global-tier" means.)
+   *
+   * Under global-first this is PURELY a messaging signal: on the no-pin
+   * default branch it selects `skipped-global-tier-trusted` (confirmed
+   * trusted) over the generic `skipped-global-default`. It does NOT gate
+   * whether a pin is written — the `pin` flag does that. Kept as a separate
+   * signal so `rea doctor` and the install summary can report trust status.
+   *
+   * The trust/home I/O is kept in the caller so this module stays pure and
+   * injectable — no `~/.rea` reads happen here. Default: `false`.
+   */
+  trustedGlobalTier?: boolean;
 }
 
 interface FileShape {
@@ -987,7 +1035,50 @@ export async function selfPinRea(options: SelfPinOptions): Promise<SelfPinResult
     };
   }
 
-  // No existing pin — write a new one into devDependencies.
+  // No existing pin.
+  //
+  // 0.53.0 GLOBAL-FIRST (Jake's foundational call): `rea init` / `rea upgrade`
+  // NEVER self-pin by default. A no-pin checkout is the NORMAL healthy state
+  // — the resolved CLI is the GLOBAL tier (`<home>/.rea/cli`), not a local
+  // node_modules copy.
+  //
+  // WHY THIS IS SAFE — brick-prevention reasoning (load-bearing):
+  //   self-pin (0.49.0) existed to stop the hooks-newer-than-local-CLI brick:
+  //   `rea init` wrote shims that resolved `@bookedsolid/rea` from
+  //   node_modules, so a fresh clone + `pnpm install` without the dep found
+  //   NO CLI and every Bash gate refused. Global-first removes the local CLI
+  //   from the equation entirely — there is no node_modules copy to be stale.
+  //   The guard against a too-old resolved CLI is now the 0.52.0 version-skew
+  //   handling in the shim (fail-closed under enforce / warn under shadow when
+  //   the resolved global CLI predates the installed hooks), NOT a package.json
+  //   pin. So no pin is needed for correctness — omitting it is the point.
+  //
+  // `--pin` (options.pin === true) is the explicit OPT-IN for teams that want
+  // a hermetic local install (the pre-0.53.0 behavior). Only then do we write.
+  if (options.pin !== true) {
+    if (options.trustedGlobalTier === true) {
+      // Trusted checkout — additionally CONFIRMED in the global-tier registry.
+      return {
+        action: 'skipped-global-tier-trusted',
+        packageJsonPath: pkgPath,
+        pinnedRange,
+        message:
+          'self-pin skipped — checkout is trusted in the global-tier registry; ' +
+          'refreshing hooks/spine without re-adding the dep',
+      };
+    }
+    // Ordinary global-first default — no pin, no local dep. Healthy.
+    return {
+      action: 'skipped-global-default',
+      packageJsonPath: pkgPath,
+      pinnedRange,
+      message:
+        `self-pin skipped — global-first (default): the global rea CLI tier governs, ` +
+        `no local ${REA_PACKAGE_NAME} pin needed. Pass --pin for a hermetic local install.`,
+    };
+  }
+
+  // `--pin` opt-in — write a new pin into devDependencies (pre-0.53.0 behavior).
   const result = await writePin(pkgPath, pkg, 'devDependencies', pinnedRange, deps, devDeps, dryRun);
   if (result.newRaw === pkg.raw) {
     return {
@@ -1046,6 +1137,163 @@ async function writePin(
     await fs.writeFile(pkgPath, newRaw, 'utf8');
   }
   return { newRaw };
+}
+
+// ---------------------------------------------------------------------------
+// 0.53.0 — `rea migrate --to-global` (assisted removal of the local pin)
+// ---------------------------------------------------------------------------
+
+export interface MigrateToGlobalOptions {
+  /** Starting directory for the (non-walking) `package.json` lookup. */
+  cwd: string;
+  /** Read + decide but do not write. Default: false. */
+  dryRun?: boolean;
+}
+
+export interface MigrateToGlobalResult {
+  action:
+    /** Dep stripped from one or both blocks; package.json rewritten. */
+    | 'removed'
+    /** No `@bookedsolid/rea` dep present — already global-first, nothing to do. */
+    | 'skipped-already-global'
+    /** `pkg.name === @bookedsolid/rea` — dogfood, never mutate. */
+    | 'skipped-dogfood'
+    | 'skipped-no-package-json'
+    | 'skipped-malformed-package-json'
+    | 'skipped-symlink-package-json';
+  packageJsonPath: string | null;
+  /** Blocks the dep was removed from (empty unless `action === 'removed'`). */
+  removedFrom: Array<'dependencies' | 'devDependencies'>;
+  message: string;
+}
+
+/**
+ * Remove one key from a dep block, PRESERVING the surrounding key order
+ * (unlike `writePin`, which re-sorts). Byte-minimal: only the removed line
+ * disappears; every other entry keeps its original position.
+ */
+function removeKeyPreservingOrder(
+  block: Record<string, unknown>,
+  key: string,
+): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const k of Object.keys(block)) {
+    if (k === key) continue;
+    out[k] = block[k];
+  }
+  return out;
+}
+
+/**
+ * `rea migrate --to-global` — strip the local `@bookedsolid/rea` dep from
+ * `dependencies` AND `devDependencies` so the checkout resolves the global
+ * rea CLI tier instead of a vendored node_modules copy. This is the
+ * assisted-removal half of Jake's global-first call: `doctor` flags a local
+ * dep as non-recommended, and this command performs the byte-minimal edit.
+ *
+ * Reuses the same read/shape/symlink/dogfood posture as {@link selfPinRea} so
+ * the two operations agree on what a mutable `package.json` is. Idempotent
+ * (no dep → `skipped-already-global`) and dogfood-safe (never touches the
+ * rea repo's own manifest). Empties a dep block entirely rather than leaving
+ * a dangling `"devDependencies": {}` when rea was its only entry.
+ *
+ * The caller (`rea migrate`) prints the lockfile follow-up (`pnpm install` /
+ * `npm install` to prune node_modules) — this function only edits the
+ * manifest.
+ */
+export async function migrateToGlobal(
+  options: MigrateToGlobalOptions,
+): Promise<MigrateToGlobalResult> {
+  const dryRun = options.dryRun ?? false;
+  const pkgPath = findPackageJson(options.cwd);
+  if (pkgPath === null) {
+    return {
+      action: 'skipped-no-package-json',
+      packageJsonPath: null,
+      removedFrom: [],
+      message:
+        `migrate skipped — no package.json in the target directory ${options.cwd}. ` +
+        `Run \`rea migrate --to-global\` from the workspace root.`,
+    };
+  }
+
+  // Symlink refusal mirrors selfPinRea: live mode THROWS, dry-run returns the
+  // skip-shape so a preview can complete.
+  if ((await checkPackageJsonShape(pkgPath)) === 'symlink') {
+    const message = buildSymlinkRefusalMessage(pkgPath);
+    if (dryRun) {
+      return {
+        action: 'skipped-symlink-package-json',
+        packageJsonPath: pkgPath,
+        removedFrom: [],
+        message,
+      };
+    }
+    throw new Error(message);
+  }
+
+  const pkg = await readPackageJson(pkgPath);
+  if (pkg === null) {
+    return {
+      action: 'skipped-malformed-package-json',
+      packageJsonPath: pkgPath,
+      removedFrom: [],
+      message: `migrate skipped — ${pkgPath} is missing or not a valid JSON object`,
+    };
+  }
+
+  if (pkg.parsed['name'] === REA_PACKAGE_NAME) {
+    return {
+      action: 'skipped-dogfood',
+      packageJsonPath: pkgPath,
+      removedFrom: [],
+      message: `migrate skipped — this IS ${REA_PACKAGE_NAME} (dogfood); nothing to strip`,
+    };
+  }
+
+  const deps = isPlainObject(pkg.parsed['dependencies']) ? pkg.parsed['dependencies'] : null;
+  const devDeps = isPlainObject(pkg.parsed['devDependencies'])
+    ? pkg.parsed['devDependencies']
+    : null;
+  const inDeps = deps !== null && REA_PACKAGE_NAME in deps;
+  const inDevDeps = devDeps !== null && REA_PACKAGE_NAME in devDeps;
+
+  if (!inDeps && !inDevDeps) {
+    return {
+      action: 'skipped-already-global',
+      packageJsonPath: pkgPath,
+      removedFrom: [],
+      message: `already global-first — no local ${REA_PACKAGE_NAME} dep in ${pkgPath}, nothing to do`,
+    };
+  }
+
+  // Rebuild the top-level object preserving key order; drop the rea entry from
+  // each block it appears in, and drop a block entirely if it becomes empty.
+  const removedFrom: Array<'dependencies' | 'devDependencies'> = [];
+  const out: Record<string, unknown> = {};
+  for (const k of Object.keys(pkg.parsed)) {
+    if ((k === 'dependencies' && inDeps) || (k === 'devDependencies' && inDevDeps)) {
+      const block = pkg.parsed[k] as Record<string, unknown>;
+      const pruned = removeKeyPreservingOrder(block, REA_PACKAGE_NAME);
+      removedFrom.push(k as 'dependencies' | 'devDependencies');
+      if (Object.keys(pruned).length === 0) continue; // drop now-empty block
+      out[k] = pruned;
+    } else {
+      out[k] = pkg.parsed[k];
+    }
+  }
+
+  const newRaw = serialize(out, pkg.shape);
+  if (!dryRun && newRaw !== pkg.raw) {
+    await fs.writeFile(pkgPath, newRaw, 'utf8');
+  }
+  const verb = dryRun ? 'would remove' : 'removed';
+  return {
+    action: 'removed',
+    packageJsonPath: pkgPath,
+    removedFrom,
+    message: `migrate: ${verb} ${REA_PACKAGE_NAME} from ${removedFrom.join(' + ')} in ${pkgPath}`,
+  };
 }
 
 /**

@@ -15,6 +15,7 @@ import { runStatus } from './status.js';
 import { runTofuAccept, runTofuList } from './tofu.js';
 import { runUpgrade } from './upgrade.js';
 import { runUpgradeCheck } from './upgrade-check.js';
+import { runMigrate } from './migrate.js';
 import { registerAuditSummaryCommand } from './audit-summary.js';
 import { registerAuditByToolCommand } from './audit-by-tool.js';
 import { registerAuditTimelineCommand } from './audit-timeline.js';
@@ -58,6 +59,12 @@ async function main(): Promise<void> {
     // profile name.
     .option('--codex', 'require Codex adversarial review (writes review.codex_required: true)')
     .option('--no-codex', 'disable Codex adversarial review (writes review.codex_required: false)')
+    // 0.53.0 GLOBAL-FIRST: `rea init` no longer pins by default. `--pin` opts
+    // in to a hermetic local install (adds @bookedsolid/rea to devDependencies).
+    .option(
+      '--pin',
+      'opt in to a hermetic local install (add @bookedsolid/rea to devDependencies); default is global-first (no pin)',
+    )
     .action(
       async (opts: {
         yes?: boolean;
@@ -66,6 +73,7 @@ async function main(): Promise<void> {
         force?: boolean;
         acceptDroppedFields?: boolean;
         codex?: boolean;
+        pin?: boolean;
       }) => {
         await runInit({
           yes: opts.yes,
@@ -74,6 +82,7 @@ async function main(): Promise<void> {
           force: opts.force,
           acceptDroppedFields: opts.acceptDroppedFields,
           codex: opts.codex,
+          pin: opts.pin,
         });
       },
     );
@@ -81,7 +90,7 @@ async function main(): Promise<void> {
   program
     .command('upgrade')
     .description(
-      'Sync .claude/, .husky/, and managed fragments with this rea version. Prompts on drift; auto-updates unmodified files.',
+      'Sync .claude/, .husky/, and managed fragments with this rea version. Applies all managed changes (prompt-free); operator-modified files are reported and kept. --interactive to review per file, --force to overwrite drift, --dry-run to preview.',
     )
     .option('--dry-run', 'show what would change; write nothing')
     .option('-y, --yes', 'non-interactive — keep drifted files, skip removed-upstream')
@@ -96,6 +105,20 @@ async function main(): Promise<void> {
     .option('--check', '0.41.0 — preview-only mode: classify files, emit unified diffs, exit 0')
     .option('--json', '(with --check) emit a single JSON document instead of the text summary')
     .option('--no-diff', '(with --check) omit unified-diff bodies (counts + paths only)')
+    // 0.53.0 GLOBAL-FIRST: `rea upgrade` no longer pins by default. `--pin`
+    // opts in to a hermetic local install.
+    .option(
+      '--pin',
+      'opt in to a hermetic local install (add @bookedsolid/rea to devDependencies); default is global-first (no pin)',
+    )
+    // 0.53.0 UX INVERSION: default applies all rea-managed changes
+    // non-interactively (drifted files are reported, not clobbered).
+    // `--interactive` restores the per-file keep/overwrite prompts and the
+    // post-upgrade "strip the local dep?" offer.
+    .option(
+      '--interactive',
+      'restore per-file keep/overwrite prompts for drifted files (default: apply all managed changes, report drift)',
+    )
     .action(
       async (opts: {
         dryRun?: boolean;
@@ -104,6 +127,8 @@ async function main(): Promise<void> {
         check?: boolean;
         json?: boolean;
         diff?: boolean;
+        pin?: boolean;
+        interactive?: boolean;
       }) => {
         if (opts.check === true) {
           await runUpgradeCheck({
@@ -126,9 +151,22 @@ async function main(): Promise<void> {
           dryRun: opts.dryRun,
           yes: opts.yes,
           force: opts.force,
+          pin: opts.pin,
+          interactive: opts.interactive,
         });
       },
     );
+
+  program
+    .command('migrate')
+    .description(
+      '0.53.0 — adopt the global-first model: strip the local @bookedsolid/rea dep so the global rea CLI tier governs.',
+    )
+    .requiredOption('--to-global', 'remove the local @bookedsolid/rea dep from package.json')
+    .option('--dry-run', 'show what would change; write nothing')
+    .action(async (opts: { toGlobal?: boolean; dryRun?: boolean }) => {
+      await runMigrate({ toGlobal: opts.toGlobal, dryRun: opts.dryRun });
+    });
 
   program
     .command('serve')

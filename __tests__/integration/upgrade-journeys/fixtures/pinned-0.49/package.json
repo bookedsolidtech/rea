@@ -1,0 +1,13 @@
+{
+  "name": "consumer-pinned-0-49",
+  "version": "1.2.3",
+  "private": true,
+  "description": "Prior-install shape: a consumer who ran `rea init` on the 0.49 line. The rea dep is a managed caret in devDependencies. `rea upgrade` must managed-caret-bump it to the current minor (no brick).",
+  "scripts": {
+    "test": "echo test"
+  },
+  "devDependencies": {
+    "@bookedsolid/rea": "^0.49.0",
+    "typescript": "^5.4.0"
+  }
+}

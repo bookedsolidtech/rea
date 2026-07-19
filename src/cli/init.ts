@@ -19,7 +19,7 @@ import {
   STALE_HOOK_COMMAND_TOKENS,
   STALE_MATCHER_SCOPED_HOOKS,
 } from './install/settings-merge.js';
-import { EXPECTED_HOOKS } from './doctor.js';
+import { EXPECTED_HOOKS, GLOBAL_CLI_INSTALL_HINT, isTrustedGlobalTierCheckout } from './doctor.js';
 import { installCommitMsgHook } from './install/commit-msg.js';
 import { installPrepareCommitMsgHook } from './install/prepare-commit-msg.js';
 import { installPrePushFallback } from './install/pre-push.js';
@@ -68,6 +68,21 @@ export interface InitOptions {
    * initial value (but still prompts for a final answer).
    */
   codex?: boolean | undefined;
+  /**
+   * 0.53.0 GLOBAL-FIRST — `--pin` opt-in. `rea init` no longer self-pins by
+   * default (the global rea CLI tier governs). When `true`, restore the
+   * pre-0.53.0 behavior and add `@bookedsolid/rea` to `devDependencies` for a
+   * hermetic local install. Default (undefined/false) = NO pin. Only affects
+   * the no-existing-pin branch; an existing pin is untouched either way.
+   */
+  pin?: boolean | undefined;
+  /**
+   * Test seam (0.53.0) — override the trusted-global-tier predicate so the
+   * self-pin skip can be exercised without a real `~/.rea`. Production NEVER
+   * sets this; the default consults `isTrustedGlobalTierCheckout` (which reads
+   * the passwd-derived home, env-immune by design). NO CLI flag exposes it.
+   */
+  trustedGlobalTierProbe?: ((baseDir: string) => boolean) | undefined;
 }
 
 type ProfileName =
@@ -2022,10 +2037,23 @@ export async function runInit(options: InitOptions): Promise<void> {
     // with `^0.49.0` + CLI 0.50.0 wrote new hooks/policy but left
     // the pin behind — recreating the hook/CLI skew the preflight
     // was supposed to prevent.
+    // 0.53.0 GLOBAL-FIRST — `rea init` no longer self-pins by default. The
+    // global rea CLI tier governs; a local dep is neither needed nor
+    // recommended (see selfPinRea's brick-prevention note). `--pin`
+    // (`options.pin === true`) opts back in to a hermetic local install.
+    // `trustedGlobalTier` is computed HERE (trust/home I/O stays in the
+    // caller; `selfPinRea` stays pure) via the SAME `resolveGlobalCliTier`
+    // predicate `rea doctor` renders — under global-first it only selects
+    // which "skipped" line the summary prints (trusted vs generic default).
+    const trustedGlobalTier = (options.trustedGlobalTierProbe ?? isTrustedGlobalTierCheckout)(
+      targetDir,
+    );
     selfPinResult = await selfPinRea({
       cwd: targetDir,
       cliVersion: getPkgVersion(),
       mode: 'upgrade',
+      trustedGlobalTier,
+      pin: options.pin === true,
     });
 
     // G12 — record the install manifest. SHAs are of the files actually on disk
@@ -2137,6 +2165,21 @@ export async function runInit(options: InitOptions): Promise<void> {
     );
   } else if (selfPinResult.action === 'skipped-different') {
     warn(selfPinResult.message);
+  } else if (selfPinResult.action === 'skipped-global-tier-trusted') {
+    // 0.53.0 global-first — trusted global-tier checkout; no local pin.
+    console.log(
+      `  · package.json (global-first: no local pin — trusted in the global-tier registry)`,
+    );
+  } else if (selfPinResult.action === 'skipped-global-default') {
+    // 0.53.0 SAFETY LAYER — `skipped-global-default` fires exactly when the
+    // caller found NO usable global tier (trustedGlobalTier === false). Skipping
+    // the pin here (global-first is forced — we never fall back to pinning) would
+    // leave the hooks unable to resolve ANY CLI. Warn LOUDLY + actionably. We do
+    // NOT block init (migrate + doctor carry the hard gate); this is the nudge.
+    warn(
+      'global-first: no local pin written, but no usable global rea CLI was found — ' +
+        `the hooks won't run until you ${GLOBAL_CLI_INSTALL_HINT}, or re-run with \`--pin\` for a local install.`,
+    );
   } else if (selfPinResult.action === 'skipped-dogfood') {
     // Silent — dogfood install, expected.
   } else if (selfPinResult.action === 'skipped-no-package-json') {

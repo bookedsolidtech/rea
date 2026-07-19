@@ -100,7 +100,7 @@ describe('runDash classification', () => {
       task('T-0004', { status: 'in_progress' }), // in flight
       task('T-0005', { status: 'pending' }), // plain backlog — ready to start
     ]);
-    await registerProject(proj, { name: 'acme', reaVersion: '0.51.0' }, registryPath);
+    await registerProject(proj, { name: 'acme', reaVersion: getPkgVersion() }, registryPath);
 
     const dash = await runJson({});
     expect(dash.groups.awaiting.map((i) => i.task_id).sort()).toEqual(['T-0001', 'T-0002']);
@@ -116,7 +116,7 @@ describe('runDash classification', () => {
 
   it('surfaces a plain pending task as ready-to-start, not idle (round-40 P2)', async () => {
     const proj = makeProject('backlog', [task('T-0001', { status: 'pending' })]); // plain backlog
-    await registerProject(proj, { name: 'backlog', reaVersion: '0.51.0' }, registryPath);
+    await registerProject(proj, { name: 'backlog', reaVersion: getPkgVersion() }, registryPath);
     const dash = await runJson({});
     // The "next thing to start" is visible, not swallowed by idle.
     expect(dash.groups.ready.map((i) => i.task_id)).toEqual(['T-0001']);
@@ -126,7 +126,7 @@ describe('runDash classification', () => {
 
   it('keeps a blocked pending task in awaiting, never double-counted in ready', async () => {
     const proj = makeProject('parked', [task('T-0001', { status: 'pending', blocked_by: ['T-9999'] })]);
-    await registerProject(proj, { name: 'parked', reaVersion: '0.51.0' }, registryPath);
+    await registerProject(proj, { name: 'parked', reaVersion: getPkgVersion() }, registryPath);
     const dash = await runJson({});
     expect(dash.groups.awaiting.map((i) => i.task_id)).toEqual(['T-0001']);
     // A pending-AND-blocked task lands in exactly one group — awaiting, not ready.
@@ -140,7 +140,7 @@ describe('runDash classification', () => {
     const proj = makeProject('quiet', [
       task('T-0001', { status: 'completed', evidence: ['x'], updated_at: '2026-06-01T00:00:00.000Z' }),
     ]);
-    await registerProject(proj, { name: 'quiet', reaVersion: '0.51.0' }, registryPath);
+    await registerProject(proj, { name: 'quiet', reaVersion: getPkgVersion() }, registryPath);
     const dash = await runJson({});
     expect(dash.groups.idle.map((p) => p.project)).toEqual(['quiet']);
     expect(dash.groups.ready).toHaveLength(0);
@@ -150,7 +150,7 @@ describe('runDash classification', () => {
   it('flags a legacy .reagent/ directory as health debt', async () => {
     const proj = makeProject('legacy', []);
     fs.mkdirSync(path.join(proj, '.reagent'), { recursive: true });
-    await registerProject(proj, { name: 'legacy', reaVersion: '0.51.0' }, registryPath);
+    await registerProject(proj, { name: 'legacy', reaVersion: getPkgVersion() }, registryPath);
     const dash = await runJson({});
     const flags = dash.groups.health_flags.filter((h) => h.project === 'legacy');
     expect(flags.some((h) => h.flag === 'reagent_dir')).toBe(true);
@@ -167,7 +167,7 @@ describe('runDash classification', () => {
 
   it('surfaces a vanished registered path as missing (never dropped)', async () => {
     const proj = makeProject('here', []);
-    await registerProject(proj, { name: 'here', reaVersion: '0.51.0' }, registryPath);
+    await registerProject(proj, { name: 'here', reaVersion: getPkgVersion() }, registryPath);
     fs.rmSync(proj, { recursive: true, force: true });
     const dash = await runJson({});
     expect(dash.missing.map((m) => m.project)).toEqual(['here']);
@@ -175,7 +175,7 @@ describe('runDash classification', () => {
 
   it('surfaces a directory with no .rea/ as deregistered', async () => {
     const proj = makeProject('rm-rea', []);
-    await registerProject(proj, { name: 'rm-rea', reaVersion: '0.51.0' }, registryPath);
+    await registerProject(proj, { name: 'rm-rea', reaVersion: getPkgVersion() }, registryPath);
     fs.rmSync(path.join(proj, '.rea'), { recursive: true, force: true });
     const dash = await runJson({});
     expect(dash.deregistered.map((d) => d.project)).toEqual(['rm-rea']);
@@ -192,8 +192,8 @@ describe('runDash task-store isolation (F1)', () => {
     const badDir = path.join(tmp, 'bad');
     fs.mkdirSync(path.join(badDir, '.rea', 'tasks.jsonl'), { recursive: true });
     const bad = fs.realpathSync(badDir);
-    await registerProject(good, { name: 'good', reaVersion: '0.51.0' }, registryPath);
-    await registerProject(bad, { name: 'bad', reaVersion: '0.51.0' }, registryPath);
+    await registerProject(good, { name: 'good', reaVersion: getPkgVersion() }, registryPath);
+    await registerProject(bad, { name: 'bad', reaVersion: getPkgVersion() }, registryPath);
 
     const dash = await runJson({});
     // The other project still renders — one bad store does not abort the view.
@@ -230,7 +230,7 @@ describe('readProjectVersion manifest precedence (F2)', () => {
 
   it('still flags stale_version when the on-disk manifest itself is old', async () => {
     const proj = makeProject('reallystale', []);
-    await registerProject(proj, { name: 'reallystale', reaVersion: '0.51.0' }, registryPath);
+    await registerProject(proj, { name: 'reallystale', reaVersion: getPkgVersion() }, registryPath);
     fs.writeFileSync(
       path.join(proj, '.rea', 'install-manifest.json'),
       JSON.stringify({ version: '0.1.0' }),
@@ -301,7 +301,7 @@ describe('runDash review-queue ageing', () => {
         updated_at: '2026-07-10T00:00:00.000Z', // 8 days old — just outside
       }),
     ]);
-    await registerProject(proj, { name: 'shipped', reaVersion: '0.51.0' }, registryPath);
+    await registerProject(proj, { name: 'shipped', reaVersion: getPkgVersion() }, registryPath);
 
     vi.useFakeTimers();
     vi.setSystemTime(new Date(NOW));
@@ -319,7 +319,7 @@ describe('runDash review-queue ageing', () => {
         updated_at: '2026-07-17T00:00:00.000Z', // 1 day old — inside the window
       }),
     ]);
-    await registerProject(proj, { name: 'fresh', reaVersion: '0.51.0' }, registryPath);
+    await registerProject(proj, { name: 'fresh', reaVersion: getPkgVersion() }, registryPath);
 
     vi.useFakeTimers();
     vi.setSystemTime(new Date(NOW));
@@ -337,7 +337,7 @@ describe('runDash review-queue ageing', () => {
         updated_at: '2026-07-17T23:00:00.000Z', // fresh but terminal-abandoned
       }),
     ]);
-    await registerProject(proj, { name: 'abandoned', reaVersion: '0.51.0' }, registryPath);
+    await registerProject(proj, { name: 'abandoned', reaVersion: getPkgVersion() }, registryPath);
 
     vi.useFakeTimers();
     vi.setSystemTime(new Date(NOW));
@@ -359,7 +359,7 @@ describe('runDash visibility', () => {
       [task('T-0001', { status: 'completed', evidence: ['x'] }), task('T-0002', { status: 'in_progress' })],
       { policyVisible: false },
     );
-    await registerProject(proj, { name: 'secret', reaVersion: '0.51.0' }, registryPath);
+    await registerProject(proj, { name: 'secret', reaVersion: getPkgVersion() }, registryPath);
     const dash = await runJson({});
     expect(dash.groups.review_queue).toHaveLength(0);
     expect(dash.groups.in_flight).toHaveLength(0);
@@ -368,7 +368,7 @@ describe('runDash visibility', () => {
 
   it('withholds when the registry entry sets dashboard_visible:false', async () => {
     const proj = makeProject('reg-hidden', [task('T-0001', { status: 'in_progress' })]);
-    await registerProject(proj, { name: 'reg-hidden', reaVersion: '0.51.0' }, registryPath);
+    await registerProject(proj, { name: 'reg-hidden', reaVersion: getPkgVersion() }, registryPath);
     const reg = loadRegistry(registryPath);
     reg.projects[proj]!.dashboard_visible = false;
     fs.writeFileSync(registryPath, JSON.stringify(reg, null, 2) + '\n', 'utf8');
@@ -382,7 +382,7 @@ describe('runDash visibility', () => {
     const proj = makeProject('secret', [task('T-0001', { status: 'in_progress' })], {
       policyVisible: false,
     });
-    await registerProject(proj, { name: 'secret', reaVersion: '0.51.0' }, registryPath);
+    await registerProject(proj, { name: 'secret', reaVersion: getPkgVersion() }, registryPath);
     const dash = await runJson({ all: true });
     expect(dash.hidden).toHaveLength(0);
     expect(dash.groups.in_flight.map((i) => i.task_id)).toEqual(['T-0001']);
@@ -392,7 +392,7 @@ describe('runDash visibility', () => {
 describe('runDash quiet + json shape', () => {
   it('renders a quiet system in a few calm lines (no attention items)', async () => {
     const proj = makeProject('calm', []);
-    await registerProject(proj, { name: 'calm', reaVersion: '0.51.0' }, registryPath);
+    await registerProject(proj, { name: 'calm', reaVersion: getPkgVersion() }, registryPath);
     const logs: string[] = [];
     const logSpy = vi.spyOn(console, 'log').mockImplementation((m?: unknown) => {
       logs.push(String(m));

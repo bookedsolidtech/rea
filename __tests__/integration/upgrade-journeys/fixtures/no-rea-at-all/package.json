@@ -1,0 +1,12 @@
+{
+  "name": "consumer-no-rea",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Prior-install shape: a bare project with NO rea install and NO @bookedsolid/rea dependency. `rea init` must produce a complete, doctor-clean install (dep pinned + hooks registered).",
+  "scripts": {
+    "build": "echo build"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0"
+  }
+}
