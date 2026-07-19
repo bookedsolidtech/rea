@@ -62,6 +62,13 @@ describe('policy loader', () => {
     expect(() => loadPolicy(baseDir)).toThrow(/Invalid policy schema/);
   });
 
+  it('accepts dashboard_visible so enabling rea dash visibility does not break loadPolicy (round-21 P1)', async () => {
+    const yaml = SAMPLE + '\ndashboard_visible: false\n';
+    await fs.writeFile(path.join(baseDir, '.rea', 'policy.yaml'), yaml, 'utf8');
+    const p = loadPolicy(baseDir);
+    expect(p.dashboard_visible).toBe(false);
+  });
+
   it('throws when policy file is missing', () => {
     expect(() => loadPolicy(baseDir)).toThrow(/Policy file not found/);
   });
@@ -90,6 +97,62 @@ describe('policy loader', () => {
 
     it('rejects non-positive timeout_ms', async () => {
       const yaml = SAMPLE + '\nreview:\n  timeout_ms: 0\n';
+      await fs.writeFile(path.join(baseDir, '.rea', 'policy.yaml'), yaml, 'utf8');
+      expect(() => loadPolicy(baseDir)).toThrow(/Invalid policy schema/);
+    });
+
+    it('accepts review.codex_reasoning_effort: xhigh (codex-cli 0.142.x tier)', async () => {
+      const yaml = SAMPLE + '\nreview:\n  codex_reasoning_effort: xhigh\n';
+      await fs.writeFile(path.join(baseDir, '.rea', 'policy.yaml'), yaml, 'utf8');
+      const p = loadPolicy(baseDir);
+      expect(p.review?.codex_reasoning_effort).toBe('xhigh');
+    });
+
+    it('still accepts the low/medium/high reasoning tiers', async () => {
+      for (const level of ['low', 'medium', 'high'] as const) {
+        const yaml = SAMPLE + `\nreview:\n  codex_reasoning_effort: ${level}\n`;
+        await fs.writeFile(path.join(baseDir, '.rea', 'policy.yaml'), yaml, 'utf8');
+        invalidatePolicyCache();
+        expect(loadPolicy(baseDir).review?.codex_reasoning_effort).toBe(level);
+      }
+    });
+
+    it('accepts artifact_gates with default modes (off)', async () => {
+      const yaml = SAMPLE + '\nartifact_gates:\n  g1_spec: {}\n  g2_verify: {}\n  g3_review: {}\n';
+      await fs.writeFile(path.join(baseDir, '.rea', 'policy.yaml'), yaml, 'utf8');
+      const p2 = loadPolicy(baseDir);
+      expect(p2.artifact_gates?.g1_spec.mode).toBe('off');
+      expect(p2.artifact_gates?.g1_spec.diff_lines).toBe(150);
+      expect(p2.artifact_gates?.g1_spec.diff_files).toBe(5);
+      expect(p2.artifact_gates?.g2_verify.mode).toBe('off');
+      expect(p2.artifact_gates?.g3_review.mode).toBe('off');
+    });
+
+    it('accepts artifact_gates shadow/enforce modes + custom thresholds', async () => {
+      const yaml =
+        SAMPLE +
+        '\nartifact_gates:\n  g1_spec: { mode: shadow, diff_lines: 40, diff_files: 3 }\n  g2_verify: { mode: enforce }\n  g3_review: { mode: shadow }\n';
+      await fs.writeFile(path.join(baseDir, '.rea', 'policy.yaml'), yaml, 'utf8');
+      const p2 = loadPolicy(baseDir);
+      expect(p2.artifact_gates?.g1_spec.mode).toBe('shadow');
+      expect(p2.artifact_gates?.g1_spec.diff_lines).toBe(40);
+      expect(p2.artifact_gates?.g2_verify.mode).toBe('enforce');
+      expect(p2.artifact_gates?.g3_review.mode).toBe('shadow');
+    });
+
+    it('leaves artifact_gates undefined when the block is absent (no-op)', async () => {
+      await fs.writeFile(path.join(baseDir, '.rea', 'policy.yaml'), SAMPLE, 'utf8');
+      expect(loadPolicy(baseDir).artifact_gates).toBeUndefined();
+    });
+
+    it('rejects an unknown artifact_gates mode', async () => {
+      const yaml = SAMPLE + '\nartifact_gates:\n  g1_spec: { mode: block }\n';
+      await fs.writeFile(path.join(baseDir, '.rea', 'policy.yaml'), yaml, 'utf8');
+      expect(() => loadPolicy(baseDir)).toThrow(/Invalid policy schema/);
+    });
+
+    it('rejects an unknown reasoning tier', async () => {
+      const yaml = SAMPLE + '\nreview:\n  codex_reasoning_effort: ultra\n';
       await fs.writeFile(path.join(baseDir, '.rea', 'policy.yaml'), yaml, 'utf8');
       expect(() => loadPolicy(baseDir)).toThrow(/Invalid policy schema/);
     });
@@ -478,6 +541,106 @@ blocked_paths: []
 
   it('rejects a non-boolean enabled', async () => {
     await write(BASE + 'spend_governance:\n  enabled: "yes"\n');
+    expect(() => loadPolicy(baseDir)).toThrow(/Invalid policy schema/);
+  });
+});
+
+describe('spend_governance.turn_budget policy (Artifact Gates §5)', () => {
+  let baseDir: string;
+
+  const BASE = `version: "1"
+profile: "minimal"
+installed_by: "tester"
+installed_at: "2026-07-04T00:00:00Z"
+autonomy_level: L1
+max_autonomy_level: L2
+promotion_requires_human_approval: true
+block_ai_attribution: true
+blocked_paths: []
+`;
+
+  beforeEach(async () => {
+    baseDir = await fs.mkdtemp(path.join(os.tmpdir(), 'rea-turnbudget-'));
+    await fs.mkdir(path.join(baseDir, '.rea'), { recursive: true });
+    invalidatePolicyCache();
+  });
+  afterEach(async () => {
+    await fs.rm(baseDir, { recursive: true, force: true });
+  });
+
+  async function write(body: string): Promise<void> {
+    await fs.writeFile(path.join(baseDir, '.rea', 'policy.yaml'), body, 'utf8');
+  }
+
+  it('absent turn_budget = feature off (undefined, no change to a pre-existing policy)', async () => {
+    await write(BASE + 'spend_governance:\n  enabled: true\n');
+    const p = loadPolicy(baseDir);
+    expect(p.spend_governance?.turn_budget).toBeUndefined();
+  });
+
+  it('accepts a valid turn_budget and defaults response to warn', async () => {
+    await write(
+      BASE + 'spend_governance:\n  enabled: true\n  turn_budget:\n    warn_turns: 50\n    halt_turns: 100\n',
+    );
+    const p = loadPolicy(baseDir);
+    expect(p.spend_governance?.turn_budget?.warn_turns).toBe(50);
+    expect(p.spend_governance?.turn_budget?.halt_turns).toBe(100);
+    expect(p.spend_governance?.turn_budget?.response).toBe('warn');
+  });
+
+  it('accepts each response enum value (warn|halt|off)', async () => {
+    for (const v of ['warn', 'halt', 'off'] as const) {
+      invalidatePolicyCache();
+      await write(
+        BASE +
+          `spend_governance:\n  enabled: true\n  turn_budget:\n    warn_turns: 10\n    halt_turns: 20\n    response: ${v}\n`,
+      );
+      const p = loadPolicy(baseDir);
+      expect(p.spend_governance?.turn_budget?.response).toBe(v);
+    }
+  });
+
+  it('accepts warn_turns === halt_turns (boundary)', async () => {
+    await write(
+      BASE + 'spend_governance:\n  enabled: true\n  turn_budget:\n    warn_turns: 30\n    halt_turns: 30\n',
+    );
+    const p = loadPolicy(baseDir);
+    expect(p.spend_governance?.turn_budget?.warn_turns).toBe(30);
+    expect(p.spend_governance?.turn_budget?.halt_turns).toBe(30);
+  });
+
+  it('rejects warn_turns > halt_turns (refine)', async () => {
+    await write(
+      BASE + 'spend_governance:\n  enabled: true\n  turn_budget:\n    warn_turns: 100\n    halt_turns: 50\n',
+    );
+    expect(() => loadPolicy(baseDir)).toThrow(/Invalid policy schema/);
+  });
+
+  it('rejects a non-positive / non-integer threshold', async () => {
+    await write(
+      BASE + 'spend_governance:\n  enabled: true\n  turn_budget:\n    warn_turns: 0\n    halt_turns: 10\n',
+    );
+    expect(() => loadPolicy(baseDir)).toThrow(/Invalid policy schema/);
+    invalidatePolicyCache();
+    await write(
+      BASE + 'spend_governance:\n  enabled: true\n  turn_budget:\n    warn_turns: 1.5\n    halt_turns: 10\n',
+    );
+    expect(() => loadPolicy(baseDir)).toThrow(/Invalid policy schema/);
+  });
+
+  it('rejects an unknown sub-field (strict block)', async () => {
+    await write(
+      BASE +
+        'spend_governance:\n  enabled: true\n  turn_budget:\n    warn_turns: 10\n    halt_turns: 20\n    reset_on: session\n',
+    );
+    expect(() => loadPolicy(baseDir)).toThrow(/Invalid policy schema/);
+  });
+
+  it('rejects an unknown response enum value', async () => {
+    await write(
+      BASE +
+        'spend_governance:\n  enabled: true\n  turn_budget:\n    warn_turns: 10\n    halt_turns: 20\n    response: freeze\n',
+    );
     expect(() => loadPolicy(baseDir)).toThrow(/Invalid policy schema/);
   });
 });

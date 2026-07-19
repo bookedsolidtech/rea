@@ -25,18 +25,62 @@ import type { DetectedWrite } from './walker.js';
 
 export interface BlockedScanContext {
   reaRoot: string;
+  /**
+   * 0.54.0 worktree state: the COMMON (primary-checkout) root. An
+   * absolute or symlinked target outside the local worktree root that
+   * lands inside the common root normalizes common-relative so
+   * project-relative `blocked_paths` entries still match the primary
+   * checkout's files from a worktree session. Optional; absent or
+   * equal-to-reaRoot = plain-checkout behavior.
+   */
+  commonRoot?: string;
+  /** Round-10 P1: sibling worktree roots — see ProtectedScanContext. */
+  siblingRoots?: readonly string[];
+  /**
+   * Round-57 P1: the working directory the command physically RUNS IN
+   * (the hook payload's `cwd`). A relative redirect target
+   * (`> ../.rea/tasks.jsonl`) resolves against the process cwd, NOT the
+   * repository root — a subdirectory session can otherwise express a
+   * store-write that lands OUTSIDE `reaRoot` when joined repo-root-relative
+   * and slips the scan. When provided (and different from `reaRoot`), each
+   * relative target is additionally resolved against this base. `reaRoot`
+   * remains a resolution base unconditionally, so an existing repo-root-
+   * relative or absolute match is never weakened. Absent → reaRoot-only
+   * (plain behavior; every existing caller that omits it is byte-identical).
+   */
+  cwd?: string;
   blockedPaths: readonly string[];
+  /**
+   * Round-11 P1: loader for ANOTHER root's blocked_paths. When a target
+   * normalizes into the primary checkout or a sibling worktree, the
+   * match runs against the UNION of the caller's list and the TARGET
+   * stream's own policy — a looser branch must not write a path that
+   * the target's branch blocks. Absent → caller's list only (plain
+   * checkouts; behavior unchanged).
+   */
+  blockedPathsForRoot?: (root: string) => readonly string[];
 }
 
 interface BlockedNormalized {
   pathLc: string;
+  /** The root the relative form was derived against (cross-root cases). */
+  rootUsed?: string;
+  /** Root the SYMLINK-RESOLVED form crossed into, when different. */
+  resolvedRootUsed?: string;
   outsideRoot: boolean;
   expansion: boolean;
   original: string;
   resolvedLc: string | null;
 }
 
-function normalizeTarget(reaRoot: string, raw: string, form?: DetectedForm): BlockedNormalized {
+function normalizeTarget(
+  reaRoot: string,
+  raw: string,
+  form?: DetectedForm,
+  commonRoot?: string,
+  siblingRoots?: readonly string[],
+  relBase?: string,
+): BlockedNormalized {
   let t = raw;
   if (t.length >= 2 && t.startsWith('"') && t.endsWith('"')) t = t.slice(1, -1);
   if (t.length >= 2 && t.startsWith("'") && t.endsWith("'")) t = t.slice(1, -1);
@@ -102,22 +146,73 @@ function normalizeTarget(reaRoot: string, raw: string, form?: DetectedForm): Blo
 
   let abs = normalized;
   if (!abs.startsWith('/')) {
-    abs = path.join(reaRoot, abs);
+    // Round-57 P1: resolve a RELATIVE target against the caller-supplied base
+    // (the command's cwd) when given, else the repository root — the historical
+    // default. Membership + cross-root derivation below still key off reaRoot /
+    // commonRoot / siblings, so only the STARTING directory of a relative join
+    // changes; an absolute target never reaches here.
+    abs = path.join(relBase ?? reaRoot, abs);
   }
-  const collapsed = collapseDotDot(abs);
+  let collapsed = collapseDotDot(abs);
+  let effectiveRoot = reaRoot;
   if (!isInsideRoot(collapsed, reaRoot)) {
-    // blocked_paths is project-relative; an outside-root write can't
-    // match. Return a non-matching sentinel form that the matcher
-    // ignores — same posture as the bash hook's "outside root → exit 0".
-    return {
-      pathLc: `__outside_root_allowed:${collapsed.toLowerCase()}`,
-      outsideRoot: true,
-      expansion: false,
-      original: raw,
-      resolvedLc: null,
-    };
+    // 0.54.0 round-5 P1: a target outside the LOCAL root that lands
+    // inside the COMMON (primary-checkout) root matches blocked_paths
+    // common-relative — `> "$PRIMARY/package.json"` from a worktree is
+    // the same governed file.
+    const crossRoots = [
+      ...(commonRoot !== undefined && commonRoot !== reaRoot ? [commonRoot] : []),
+      ...(siblingRoots ?? []),
+    ];
+    // Round-3 P2 (parity with protected-scan round-45): a target
+    // reaching a cross root through an alias (macOS /var↔/private/var
+    // or a symlinked checkout path) won't match lexically, so
+    // canonicalize and test membership on the realpath'd form too —
+    // otherwise the write is treated as outside-root and blocked_paths
+    // is skipped for a file that actually lands in the governed repo.
+    const collapsedCanon = ((): string | null => {
+      const r = resolveSymlinksWalkUp(collapsed);
+      return r !== null && r !== SYMLINK_DYNAMIC_SENTINEL ? r : null;
+    })();
+    let crossHit: string | undefined;
+    let matchedCanon = false;
+    for (const r of crossRoots) {
+      if (r === reaRoot) continue;
+      if (isInsideRoot(collapsed, r)) {
+        crossHit = r;
+        break;
+      }
+      const rc = realpathSafe(r) ?? r;
+      if (collapsedCanon !== null && isInsideRoot(collapsedCanon, rc)) {
+        crossHit = r;
+        matchedCanon = true;
+        break;
+      }
+    }
+    if (crossHit !== undefined) {
+      if (matchedCanon) {
+        // Derive the relative form from the canonical pair so the
+        // downstream `collapsed.slice(effectiveRoot)` is coherent.
+        collapsed = collapsedCanon as string;
+        effectiveRoot = realpathSafe(crossHit) ?? crossHit;
+      } else {
+        effectiveRoot = crossHit;
+      }
+    } else {
+      // blocked_paths is project-relative; an outside-root write can't
+      // match. Return a non-matching sentinel form that the matcher
+      // ignores — same posture as the bash hook's "outside root → exit 0".
+      return {
+        pathLc: `__outside_root_allowed:${collapsed.toLowerCase()}`,
+        outsideRoot: true,
+        expansion: false,
+        original: raw,
+        resolvedLc: null,
+      };
+    }
   }
-  const projectRelative = collapsed === reaRoot ? '' : collapsed.slice(reaRoot.length + 1);
+  const projectRelative =
+    collapsed === effectiveRoot ? '' : collapsed.slice(effectiveRoot.length + 1);
   const inputHadTrailingSlash = normalized.endsWith('/');
   const pathLc = (
     inputHadTrailingSlash && projectRelative.length > 0 && !projectRelative.endsWith('/')
@@ -126,6 +221,7 @@ function normalizeTarget(reaRoot: string, raw: string, form?: DetectedForm): Blo
   ).toLowerCase();
 
   let resolvedLc: string | null = null;
+  let resolvedRootCross: string | null = null;
   try {
     const resolved = resolveSymlinksWalkUp(collapsed);
     if (resolved === SYMLINK_DYNAMIC_SENTINEL) {
@@ -139,13 +235,40 @@ function normalizeTarget(reaRoot: string, raw: string, form?: DetectedForm): Blo
       };
     }
     if (resolved !== null) {
-      const realRoot = realpathSafe(reaRoot) ?? reaRoot;
+      const realRoot = realpathSafe(effectiveRoot) ?? effectiveRoot;
       let resolvedRelative: string | null = null;
       if (resolved === realRoot) resolvedRelative = '';
       else if (resolved.startsWith(realRoot + '/'))
         resolvedRelative = resolved.slice(realRoot.length + 1);
-      else if (resolved.startsWith(reaRoot + '/'))
-        resolvedRelative = resolved.slice(reaRoot.length + 1);
+      else if (resolved.startsWith(effectiveRoot + '/'))
+        resolvedRelative = resolved.slice(effectiveRoot.length + 1);
+      else {
+        // Rounds 5+10: symlink resolved INTO the primary checkout or a
+        // sibling worktree — derive the cross-root-relative form.
+        // Round-17 P2: when the LEXICAL hit was cross-root
+        // (effectiveRoot !== reaRoot), a symlink there may bridge BACK
+        // into the local worktree — include the local root so
+        // `cp x <primary>/bridge/package.json` still matches a local
+        // `blocked_paths: ["package.json"]` via the resolved form.
+        const crossRootsSym = [
+          ...(effectiveRoot !== reaRoot ? [reaRoot] : []),
+          ...(commonRoot !== undefined && commonRoot !== effectiveRoot ? [commonRoot] : []),
+          ...(siblingRoots ?? []),
+        ];
+        for (const cross of crossRootsSym) {
+          if (cross === effectiveRoot) continue;
+          const realCross = realpathSafe(cross) ?? cross;
+          if (resolved === realCross) resolvedRelative = '';
+          else if (resolved.startsWith(realCross + '/'))
+            resolvedRelative = resolved.slice(realCross.length + 1);
+          else if (resolved.startsWith(cross + '/'))
+            resolvedRelative = resolved.slice(cross.length + 1);
+          if (resolvedRelative !== null) {
+            resolvedRootCross = cross;
+            break;
+          }
+        }
+      }
       if (resolvedRelative !== null) {
         const candidate = resolvedRelative.toLowerCase();
         if (candidate !== pathLc) resolvedLc = candidate;
@@ -155,7 +278,15 @@ function normalizeTarget(reaRoot: string, raw: string, form?: DetectedForm): Blo
     /* best-effort */
   }
 
-  return { pathLc, outsideRoot: false, expansion: false, original: raw, resolvedLc };
+  return {
+    pathLc,
+    outsideRoot: false,
+    expansion: false,
+    original: raw,
+    resolvedLc,
+    ...(effectiveRoot !== reaRoot ? { rootUsed: effectiveRoot } : {}),
+    ...(resolvedRootCross !== null ? { resolvedRootUsed: resolvedRootCross } : {}),
+  };
 }
 
 function collapseDotDot(absPath: string): string {
@@ -356,7 +487,15 @@ export function scanForBlockedViolations(
   ctx: BlockedScanContext,
   detections: readonly DetectedWrite[],
 ): Verdict {
-  if (ctx.blockedPaths.length === 0) return allowVerdict();
+  // Round-12 P1: the empty-caller-list early exit only applies when no
+  // CROSS root could contribute its own blocked_paths — a worktree with
+  // `blocked_paths: []` must still refuse writes into a sibling whose
+  // branch blocks the target. Plain checkouts keep the historical exit.
+  const crossLookupPossible =
+    ctx.blockedPathsForRoot !== undefined &&
+    ((ctx.commonRoot !== undefined && ctx.commonRoot !== ctx.reaRoot) ||
+      (ctx.siblingRoots !== undefined && ctx.siblingRoots.length > 0));
+  if (ctx.blockedPaths.length === 0 && !crossLookupPossible) return allowVerdict();
   if (detections.length === 0) return allowVerdict();
   for (const d of detections) {
     if (d.dynamic) {
@@ -438,57 +577,113 @@ export function scanForBlockedViolations(
     }
     if (d.path.length === 0) continue;
 
-    const norm = normalizeTarget(ctx.reaRoot, d.path, d.form);
-    if (norm.expansion) {
-      return blockVerdict({
-        reason: [
-          'BLOCKED PATH (bash): unresolved shell expansion in target.',
-          '',
-          `  Token:           ${norm.original}`,
-          `  Detected as:     ${d.form}`,
-        ].join('\n'),
-        hitPattern: '(dynamic target)',
-        detectedForm: d.form,
-        ...(d.position.line > 0 ? { sourcePosition: d.position } : {}),
-      });
+    // Round-57 P1: resolve a RELATIVE target against every candidate base and
+    // block on the FIRST that matches. `reaRoot` is always tried (the
+    // historical base — an existing repo-root-relative or absolute hit is
+    // never weakened); the payload `cwd` is added when the caller supplies it
+    // and it differs, so a subdirectory session's cwd-relative redirect that
+    // reaches the governed store (`> ../.rea/tasks.jsonl`) is caught instead of
+    // being dismissed as an outside-root miss. For an absolute target the base
+    // is irrelevant, so the second pass is a harmless duplicate.
+    const relBases: string[] = [ctx.reaRoot];
+    if (ctx.cwd !== undefined && ctx.cwd.length > 0 && ctx.cwd !== ctx.reaRoot) {
+      relBases.push(ctx.cwd);
     }
-    if (norm.outsideRoot) {
-      // blocked_paths is project-relative; outside-root paths can't
-      // match. Continue to the next detection.
-      continue;
-    }
-
-    const dirOptions = d.isDirTarget === true ? { forceDirSemantics: true } : undefined;
-    const logicalHit = matchBlockedEntry(norm.pathLc, ctx.blockedPaths, dirOptions);
-    if (logicalHit !== null) {
-      return blockVerdict({
-        reason: buildBlockReason({
-          entry: logicalHit,
-          hitForm: norm.pathLc,
-          detectedForm: d.form,
-          originalToken: norm.original,
-        }),
-        hitPattern: logicalHit,
-        detectedForm: d.form,
-        ...(d.position.line > 0 ? { sourcePosition: d.position } : {}),
-      });
-    }
-    if (norm.resolvedLc !== null) {
-      const resolvedHit = matchBlockedEntry(norm.resolvedLc, ctx.blockedPaths, dirOptions);
-      if (resolvedHit !== null) {
+    let matched: Verdict | null = null;
+    for (const relBase of relBases) {
+      const norm = normalizeTarget(
+        ctx.reaRoot,
+        d.path,
+        d.form,
+        ctx.commonRoot,
+        ctx.siblingRoots,
+        relBase,
+      );
+      if (norm.expansion) {
+        // A dynamic target is base-independent — refuse on uncertainty exactly
+        // as before (reaRoot is base[0], so this fires on the first pass).
         return blockVerdict({
-          reason: buildBlockReason({
-            entry: resolvedHit,
-            hitForm: norm.resolvedLc,
-            detectedForm: d.form,
-            originalToken: norm.original,
-          }),
-          hitPattern: resolvedHit,
+          reason: [
+            'BLOCKED PATH (bash): unresolved shell expansion in target.',
+            '',
+            `  Token:           ${norm.original}`,
+            `  Detected as:     ${d.form}`,
+          ].join('\n'),
+          hitPattern: '(dynamic target)',
           detectedForm: d.form,
           ...(d.position.line > 0 ? { sourcePosition: d.position } : {}),
         });
       }
+      if (norm.outsideRoot) {
+        // blocked_paths is project-relative; an outside-root resolution can't
+        // match against THIS base — try the next candidate base before giving
+        // up on the detection.
+        continue;
+      }
+      matched = matchNormalizedTarget(ctx, norm, d);
+      if (matched !== null) break;
     }
+    if (matched !== null) return matched;
   }
   return allowVerdict();
+}
+
+/**
+ * Match a single normalized (in-root) target against the effective
+ * blocked_paths list, returning a block `Verdict` on the logical or the
+ * symlink-resolved form, or `null` for no match. Extracted (round-57 P1) so
+ * the same match logic runs unchanged across each relative-resolution base.
+ */
+function matchNormalizedTarget(
+  ctx: BlockedScanContext,
+  norm: BlockedNormalized,
+  d: DetectedWrite,
+): Verdict | null {
+  const dirOptions = d.isDirTarget === true ? { forceDirSemantics: true } : undefined;
+  // Round-11 P1: cross-root targets match the UNION of the caller's
+  // list and the TARGET root's own blocked_paths.
+  const crossRootsHit = [
+    ...(norm.rootUsed !== undefined ? [norm.rootUsed] : []),
+    ...(norm.resolvedRootUsed !== undefined ? [norm.resolvedRootUsed] : []),
+  ];
+  const effectiveBlocked =
+    crossRootsHit.length > 0 && ctx.blockedPathsForRoot !== undefined
+      ? [
+          ...new Set([
+            ...ctx.blockedPaths,
+            ...crossRootsHit.flatMap((r) => [...(ctx.blockedPathsForRoot?.(r) ?? [])]),
+          ]),
+        ]
+      : ctx.blockedPaths;
+  const logicalHit = matchBlockedEntry(norm.pathLc, effectiveBlocked, dirOptions);
+  if (logicalHit !== null) {
+    return blockVerdict({
+      reason: buildBlockReason({
+        entry: logicalHit,
+        hitForm: norm.pathLc,
+        detectedForm: d.form,
+        originalToken: norm.original,
+      }),
+      hitPattern: logicalHit,
+      detectedForm: d.form,
+      ...(d.position.line > 0 ? { sourcePosition: d.position } : {}),
+    });
+  }
+  if (norm.resolvedLc !== null) {
+    const resolvedHit = matchBlockedEntry(norm.resolvedLc, effectiveBlocked, dirOptions);
+    if (resolvedHit !== null) {
+      return blockVerdict({
+        reason: buildBlockReason({
+          entry: resolvedHit,
+          hitForm: norm.resolvedLc,
+          detectedForm: d.form,
+          originalToken: norm.original,
+        }),
+        hitPattern: resolvedHit,
+        detectedForm: d.form,
+        ...(d.position.line > 0 ? { sourcePosition: d.position } : {}),
+      });
+    }
+  }
+  return null;
 }

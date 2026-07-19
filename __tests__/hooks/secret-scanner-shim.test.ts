@@ -24,6 +24,7 @@
  */
 
 import { spawnSync } from 'node:child_process';
+import os from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 
@@ -57,11 +58,7 @@ interface ShimResult {
 }
 
 function runShimInUnbuiltDir(payload: string): ShimResult {
-  const tmpdir = path.join(
-    REPO_ROOT,
-    '.claude',
-    'tmp',
-    `r7-ss-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+  const tmpdir = path.join(os.tmpdir(), `r7-ss-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
   );
   spawnSync('mkdir', ['-p', tmpdir]);
   try {

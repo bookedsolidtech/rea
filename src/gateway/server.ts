@@ -31,6 +31,7 @@
  */
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
+import { resolveCommonRoot } from '../lib/worktree-roots.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import fs from 'node:fs/promises';
@@ -191,14 +192,19 @@ interface ChainDeps {
 
 function buildMiddlewareChain(opts: GatewayOptions, deps: ChainDeps): Middleware[] {
   const { baseDir, policy, metrics } = opts;
+  // 0.54.0 worktree state: the audit chain and the kill switch are
+  // per-REPOSITORY — a gateway started from a linked worktree appends
+  // to the primary checkout's chain and honors a freeze issued from any
+  // stream. Policy/blocked-paths middlewares stay on the worktree root.
+  const commonRoot = resolveCommonRoot(baseDir, () => {}).commonRoot;
   const matchTimeoutMs = policy.redact?.match_timeout_ms ?? 100;
   const userPatterns = compileUserRedactPatterns(policy, matchTimeoutMs);
   return [
     // Metrics threaded through so `rea_audit_lines_appended_total` advances
     // on every durable audit append and `rea_seconds_since_last_halt_check`
     // reflects per-invocation cadence, not gateway uptime.
-    createAuditMiddleware(baseDir, policy, metrics),
-    createKillSwitchMiddleware(baseDir, metrics),
+    createAuditMiddleware(commonRoot, policy, metrics),
+    createKillSwitchMiddleware(baseDir, commonRoot, metrics),
     createTierMiddleware(),
     createPolicyMiddleware(policy, undefined, baseDir),
     createBlockedPathsMiddleware(policy, baseDir),
@@ -226,6 +232,7 @@ function buildMiddlewareChain(opts: GatewayOptions, deps: ChainDeps): Middleware
 
 export function createGateway(opts: GatewayOptions): GatewayHandle {
   const { registry, policy, baseDir } = opts;
+  const serverCommonRoot = resolveCommonRoot(baseDir, () => {}).commonRoot;
   const logger = opts.logger ?? createLogger({ base: { session_id: currentSessionId() } });
   const metrics = opts.metrics;
   const pool = new DownstreamPool(registry, logger);
@@ -241,7 +248,7 @@ export function createGateway(opts: GatewayOptions): GatewayHandle {
     logger,
     async (event: SessionBlockerEvent) => {
       try {
-        await appendAuditRecord(baseDir, {
+        await appendAuditRecord(serverCommonRoot, {
           tool_name: 'session_blocker',
           server_name: event.server_name,
           status: InvocationStatus.Error,
@@ -362,7 +369,17 @@ export function createGateway(opts: GatewayOptions): GatewayHandle {
   // thing that has to keep working when everything else is broken.
   async function readHalt(): Promise<{ halt: boolean; reason: string | null }> {
     try {
-      const contents = await fs.readFile(path.join(baseDir, '.rea', 'HALT'), 'utf8');
+      // 0.54.0: prefer the local worktree HALT, fall back to the common
+      // (repository) one — same order as the middleware probe.
+      const localHalt = path.join(baseDir, '.rea', 'HALT');
+      const commonHalt = path.join(serverCommonRoot, '.rea', 'HALT');
+      let haltFile = localHalt;
+      try {
+        await fs.access(localHalt);
+      } catch {
+        haltFile = commonHalt;
+      }
+      const contents = await fs.readFile(haltFile, 'utf8');
       const trimmed = contents.trim();
       // Hard-cap the raw read at the diagnostic string budget before it
       // enters the snapshot. An oversize HALT file (operator accident or
@@ -451,7 +468,7 @@ export function createGateway(opts: GatewayOptions): GatewayHandle {
       // caller from getting the health response — that would defeat the
       // whole point of a "works when everything else is broken" tool.
       try {
-        await appendAuditRecord(baseDir, {
+        await appendAuditRecord(serverCommonRoot, {
           tool_name: META_TOOL_NAME,
           server_name: META_SERVER_NAME,
           status: InvocationStatus.Allowed,

@@ -12,13 +12,18 @@ import {
   canonicalSettingsSubsetHash,
   defaultDesiredHooks,
   mergeSettings,
+  pruneHookCommands,
+  pruneMatcherScopedHooks,
   readSettings,
   writeSettingsAtomic,
+  STALE_HOOK_COMMAND_TOKENS,
+  STALE_MATCHER_SCOPED_HOOKS,
 } from './install/settings-merge.js';
 import { EXPECTED_HOOKS } from './doctor.js';
 import { installCommitMsgHook } from './install/commit-msg.js';
 import { installPrepareCommitMsgHook } from './install/prepare-commit-msg.js';
 import { installPrePushFallback } from './install/pre-push.js';
+import { installPreCommitHook } from './install/pre-commit.js';
 import { CodexProbe } from '../gateway/observability/codex-probe.js';
 import { buildFragment, writeClaudeMdFragment } from './install/claude-md.js';
 import {
@@ -34,6 +39,7 @@ import {
   ReagentDroppedFieldsError,
   translateReagentPolicy,
 } from './install/reagent.js';
+import { registerProject } from '../registry/projects.js';
 import {
   PKG_ROOT,
   POLICY_FILE,
@@ -1924,6 +1930,7 @@ export async function runInit(options: InitOptions): Promise<void> {
   let commitMsgResult: Awaited<ReturnType<typeof installCommitMsgHook>>;
   let prepareCommitMsgResult: Awaited<ReturnType<typeof installPrepareCommitMsgHook>>;
   let prePushResult: Awaited<ReturnType<typeof installPrePushFallback>>;
+  let preCommitResult: Awaited<ReturnType<typeof installPreCommitHook>>;
   let mdResult: Awaited<ReturnType<typeof writeClaudeMdFragment>>;
   let gitignoreResult: Awaited<ReturnType<typeof ensureReaGitignore>>;
   let selfPinResult: Awaited<ReturnType<typeof selfPinRea>>;
@@ -1944,7 +1951,21 @@ export async function runInit(options: InitOptions): Promise<void> {
 
     const { settings, settingsPath } = readSettings(targetDir);
     const desired = defaultDesiredHooks();
-    mergeResult = mergeSettings(settings, desired);
+    // Mirror `rea upgrade`'s prune-before-merge sequence (upgrade.ts
+    // upgradeSettings). `mergeSettings` is additive-only, so re-running
+    // `rea init` over an already-installed repo whose registration predates a
+    // hook DELETION (STALE_HOOK_COMMAND_TOKENS) or a matcher MOVE
+    // (STALE_MATCHER_SCOPED_HOOKS — billing-cap-halt Bash→*) would leave BOTH
+    // the stale and the new entry, double-invoking the hook and breaking the
+    // "init twice = byte-identical" invariant (codex round-47 P2). Prune runs
+    // BEFORE the additive merge so the merge re-adds each hook under its NEW
+    // matcher against a clean baseline — exactly one registration remains.
+    // Idempotent + fresh-install-safe: on a repo with no stale registrations
+    // (including a fresh install with no settings.json), both prunes match
+    // nothing and the merged output is byte-identical to the pre-fix behavior.
+    const pruned = pruneHookCommands(settings, STALE_HOOK_COMMAND_TOKENS);
+    const movedPruned = pruneMatcherScopedHooks(pruned.merged, STALE_MATCHER_SCOPED_HOOKS);
+    mergeResult = mergeSettings(movedPruned.merged, desired);
     await writeSettingsAtomic(settingsPath, mergeResult.merged);
 
     commitMsgResult = await installCommitMsgHook(targetDir);
@@ -1955,6 +1976,15 @@ export async function runInit(options: InitOptions): Promise<void> {
     // .rea/policy.yaml.
     prepareCommitMsgResult = await installPrepareCommitMsgHook(targetDir);
     prePushResult = await installPrePushFallback({ targetDir });
+    // G1 spec-gate (Artifact Gates). Lay down `.husky/pre-commit`
+    // unconditionally — like the pre-push fallback, the hook body is a
+    // no-op until `policy.artifact_gates.g1_spec.mode` is opted into
+    // shadow/enforce (`rea gate spec-check` is default-off), so a
+    // default install ships a harmless gate that activates the moment
+    // the operator flips the policy. The installer never overwrites a
+    // foreign `.husky/pre-commit` (marker-guarded, same posture as
+    // pre-push's foreign-hook handling).
+    preCommitResult = await installPreCommitHook({ targetDir });
 
     fragmentInput = {
       policyPath: `.${path.sep}rea${path.sep}policy.yaml`.replace(/\\/g, '/'),
@@ -2059,6 +2089,16 @@ export async function runInit(options: InitOptions): Promise<void> {
       `  = ${path.relative(targetDir, prePushResult.decision.hookPath)} (active pre-push already present — skipped fallback)`,
     );
   }
+  if (preCommitResult.written !== undefined) {
+    const verb = preCommitResult.decision.action === 'refresh' ? '~' : '+';
+    console.log(
+      `  ${verb} ${path.relative(targetDir, preCommitResult.written)} (G1 spec-gate; no-op until policy opt-in)`,
+    );
+  } else if (preCommitResult.decision.action === 'skip') {
+    console.log(
+      `  = ${path.relative(targetDir, preCommitResult.decision.hookPath)} (foreign pre-commit present — skipped G1 gate)`,
+    );
+  }
   console.log(
     `  ${mdResult.replaced ? '~' : '+'} ${path.relative(targetDir, mdResult.path)} (fragment ${mdResult.replaced ? 'replaced' : 'written'})`,
   );
@@ -2116,6 +2156,20 @@ export async function runInit(options: InitOptions): Promise<void> {
   for (const w of prepareCommitMsgResult.warnings) warn(w);
   for (const w of prePushResult.warnings) warn(w);
   for (const n of config.reagentNotices) warn(n);
+
+  // Self-register this project into the user-global dashboard registry
+  // (`~/.rea/registry.json`) so `rea dash` can discover it. BEST-EFFORT:
+  // a registry write failure must NEVER fail init — the registry lives
+  // OUTSIDE the project, so this does not affect the byte-identical
+  // re-init invariant. Idempotent (upsert keyed on the resolved path).
+  try {
+    await registerProject(targetDir, {
+      name: detectProjectName(targetDir),
+      reaVersion: getPkgVersion(),
+    });
+  } catch (e) {
+    warn(`could not update the global dashboard registry: ${e instanceof Error ? e.message : String(e)}`);
+  }
 
   // G6 + G11.4: Codex install-assist.
   //

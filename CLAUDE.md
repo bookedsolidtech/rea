@@ -209,6 +209,10 @@ Slash commands at `.claude/commands/`:
 - `/freeze` — write `.rea/HALT` with a reason
 - `/halt-check` — verify middleware + hooks respect HALT
 
+## Worktrees (multi-stream work)
+
+Linked `git worktree` checkouts are first-class (0.54.0+): per-stream state (`last-review.json`, parity, metrics, session counters) lives in each worktree's `.rea/`; per-repository ENFORCEMENT state (`audit.jsonl`, `HALT`, the verdict cache, TOFU fingerprints) lives in the PRIMARY checkout's `.rea/`. A review of a sha in one worktree covers it everywhere; `rea freeze` freezes every stream; `rea doctor` reports the topology and flags orphaned pre-0.54.0 local state. See THREAT_MODEL §10.
+
 ## Workflow
 
 - Work is LOCAL by default. Commit to a feature branch.
@@ -231,11 +235,20 @@ Slash commands at `.claude/commands/`:
 
 - **Policy**: `.rea/policy.yaml` — profile `bst-internal`
 - **Autonomy**: `L1` (ceiling `L2`)
-- **Blocked paths**: 4 entries — see the policy file
+- **Blocked paths**: 5 entries — see the policy file
 - **block_ai_attribution**: `true` (enforced by commit-msg hook)
 
 Protected-path changes (`src/gateway/middleware/`, `hooks/`, `src/policy/`,
 `.github/workflows/`) require a `/codex-review` audit entry before push.
+
+### Commit Discipline & Per-Commit Review
+
+Commit in **logical, connected, manageable units** — never `git add -A` a whole
+feature. A giant diff reviews poorly (any model or human) and overflows the cheap
+review lane. Stage deliberately with `git add <paths>`; each commit is one concern
+plus its test, sized to a focused review. **Review at the commit boundary** — run
+`rea review` per logical commit (the cheap routine floor). The deep, impartial
+whole-system audit is a separate clean-room pass run OUTSIDE rea, not this lane.
 
 Run `rea doctor` to verify the install. Run `rea check` to inspect state.
 

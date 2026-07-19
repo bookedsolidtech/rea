@@ -33,6 +33,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import type { Command } from 'commander';
 import { spawnSync } from 'node:child_process';
+import { resolveCommonRoot, resolveLocalRoot } from '../lib/worktree-roots.js';
 import { appendAuditRecord } from '../audit/append.js';
 import {
   LOCAL_REVIEW_TOOL_NAME,
@@ -44,7 +45,7 @@ import {
 import { CODEX_REVIEW_TOOL_NAME } from '../audit/codex-event.js';
 import { computeTreeToken, EMPTY_TREE_SHA } from '../audit/content-token.js';
 import { readHalt } from '../hooks/push-gate/halt.js';
-import { Tier, InvocationStatus, type Policy } from '../policy/types.js';
+import { Tier, InvocationStatus, type Policy, type GateMode } from '../policy/types.js';
 import { loadPolicyAsync } from '../policy/loader.js';
 import { err, log } from './utils.js';
 
@@ -55,6 +56,57 @@ export const DEFAULT_BYPASS_ENV_VAR = 'REA_SKIP_LOCAL_REVIEW';
 /** Default commit-hygiene thresholds. */
 export const DEFAULT_WARN_AT_COMMITS = 1;
 export const DEFAULT_REFUSE_AT_COMMITS = 5;
+
+/** Canonical audit tool name for an enforced G3 (review-gate) refusal. */
+export const G3_TOOL_NAME = 'rea.gate.g3' as const;
+/**
+ * Shadow audit tool name — a would-block event that never blocks. A
+ * distinct sibling name (like `rea.gate.g1.shadow` / `rea.gate.g2.shadow`)
+ * that no coverage accept-list consults.
+ */
+export const G3_SHADOW_TOOL_NAME = 'rea.gate.g3.shadow' as const;
+/** Server name stamped on G3 gate audit records (matches G1/G2). */
+export const G3_SERVER_NAME = 'rea' as const;
+
+/**
+ * THE single source of truth for the review-gate's EFFECTIVE mode (G3
+ * precedence). `artifact_gates.g3_review.mode`, when PRESENT, is
+ * authoritative and overrides the legacy `review.local_review.mode`;
+ * when ABSENT the legacy mode drives (`off` → off, anything else →
+ * enforce). This one helper is consumed by ALL THREE review-gate paths so
+ * they resolve the tier identically:
+ *
+ *   (a) `rea preflight` (this file — the coverage engine)
+ *   (b) the `.husky/pre-push` hook (runs `rea preflight --strict`)
+ *   (c) the `local-review-gate` Claude Code Bash hook
+ *       (`src/hooks/local-review-gate/index.ts` imports this function)
+ *
+ * `refuse_at` / `bypass_env_var` are NOT part of the tier and continue to
+ * come from `review.local_review` — this helper governs ONLY off/shadow/
+ * enforce.
+ *
+ * ## The `'malformed'` third state (codex round-38 P2)
+ *
+ * `g3Mode` accepts a `'malformed'` sentinel modelling a `g3_review` block
+ * that is PRESENT but carries an INVALID `mode` (typo / wrong type). It
+ * resolves to `enforce` — the SAME outcome `computePreflight` reaches
+ * indirectly: the strict `loadPolicy` REJECTS the malformed policy, so
+ * preflight sees `policy === undefined` and calls this with
+ * `(undefined, undefined)` → `enforce`. The TOLERANT `local-review-gate`
+ * Bash reader does NOT strict-load, so it passes `'malformed'` EXPLICITLY
+ * to converge on the same `enforce`. Without it, a malformed policy paired
+ * with legacy `local_review.mode: off` would let the Bash path
+ * short-circuit to `off` while the pre-push/CLI path enforces — a
+ * commit/push bypass of the review gate through the Bash tool.
+ */
+export function resolveEffectiveReviewMode(
+  g3Mode: GateMode | 'malformed' | undefined,
+  legacyMode: 'enforced' | 'off' | undefined,
+): GateMode {
+  if (g3Mode === 'malformed') return 'enforce';
+  if (g3Mode !== undefined) return g3Mode;
+  return legacyMode === 'off' ? 'off' : 'enforce';
+}
 
 export interface RunPreflightOptions {
   /**
@@ -71,6 +123,18 @@ export interface RunPreflightOptions {
   noReviewCheck?: boolean;
   /** Emit a single JSON line on stdout instead of pretty output. */
   json?: boolean;
+  /**
+   * 0.54.0 round-10 P1b — what the caller is gating. For `push`, the
+   * content that leaves the machine is the COMMIT, so a coverage entry
+   * whose content_token equals the PRISTINE tree of HEAD (a clean-tree
+   * review of exactly the pushed commit, possibly from another
+   * worktree) counts even when the caller's own working tree has
+   * unrelated WIP. For `commit` (and when unset — the strict default),
+   * the round-27 F3 semantics hold unchanged: a token mismatch is
+   * authoritative staleness, because the tree being committed IS the
+   * content under review.
+   */
+  operation?: 'push' | 'commit';
 }
 
 interface PreflightOutcome {
@@ -91,6 +155,13 @@ export async function computePreflight(
 ): Promise<{ outcome: PreflightOutcome; policy: Policy | undefined }> {
   const policy = await tryLoadPolicy(baseDir);
 
+  // 0.54.0 worktree state: policy + git resolution stay on the LOCAL
+  // (worktree) root the caller passed; the audit chain — both the
+  // coverage lookup and the skip-audit append — lives at the COMMON
+  // (repository) root, so a review run in any worktree covers the same
+  // sha pushed from another. Degenerate (plain checkout): identical.
+  const commonRoot = resolveCommonRoot(baseDir).commonRoot;
+
   // Round-27 F4 fix: HALT check BEFORE every other path. The Bash-tier
   // `local-review-gate.sh` and the canonical husky BODY_TEMPLATE both
   // honor `.rea/HALT`, but `rea preflight` itself was missing the check —
@@ -98,7 +169,8 @@ export async function computePreflight(
   // body bypassed the kill-switch entirely. The HALT check runs BEFORE
   // `mode === 'off'` so a halted repo cannot push even when local-review
   // enforcement is opted-out.
-  const halt = readHalt(baseDir);
+  const localHalt = readHalt(baseDir);
+  const halt = localHalt.halted ? localHalt : readHalt(commonRoot);
   if (halt.halted) {
     return {
       outcome: {
@@ -114,15 +186,26 @@ export async function computePreflight(
     };
   }
 
-  // Step 1: mode === 'off' → no-op clean exit.
-  const mode = policy?.review?.local_review?.mode ?? 'enforced';
-  if (mode === 'off') {
+  // Step 1: resolve the EFFECTIVE review-gate mode (G3 precedence).
+  // `artifact_gates.g3_review.mode`, when present, overrides the legacy
+  // `review.local_review.mode` via the SHARED resolver — the same
+  // function the local-review-gate Bash hook uses, so the CLI, husky
+  // pre-push, and the Claude Bash hook agree on the tier. `off` → clean
+  // no-op; `shadow` → probe logs but never refuses (handled at step 4);
+  // `enforce` → the historical refuse behavior.
+  const g3Mode = policy?.artifact_gates?.g3_review?.mode;
+  const legacyMode = policy?.review?.local_review?.mode;
+  const effectiveMode = resolveEffectiveReviewMode(g3Mode, legacyMode);
+  const g3Active = g3Mode !== undefined;
+  if (effectiveMode === 'off') {
     return {
       outcome: {
         status: 'clean',
-        reason: 'policy.review.local_review.mode is off',
+        reason: g3Active
+          ? 'artifact_gates.g3_review.mode is off'
+          : 'policy.review.local_review.mode is off',
         exitCode: 0,
-        details: { mode: 'off' },
+        details: { mode: 'off', ...(g3Active ? { g3_review_mode: 'off' } : {}) },
       },
       policy,
     };
@@ -145,7 +228,7 @@ export async function computePreflight(
       bypass_env_var: bypassEnvVar,
     };
     await safeAudit(
-      baseDir,
+      commonRoot,
       LOCAL_REVIEW_SKIPPED_OVERRIDE_TOOL_NAME,
       InvocationStatus.Allowed,
       meta as unknown as Record<string, unknown>,
@@ -164,10 +247,13 @@ export async function computePreflight(
 
   // Step 3: --no-review-check escape hatch (audit-logged).
   let reviewCheckSkipped = false;
+  // Set when G3 shadow observed absent coverage (logged, not refused) —
+  // used only to render an honest final clean-exit reason.
+  let reviewShadowed = false;
   if (options.noReviewCheck === true) {
     reviewCheckSkipped = true;
     await safeAudit(
-      baseDir,
+      commonRoot,
       LOCAL_REVIEW_PREFLIGHT_SKIPPED_TOOL_NAME,
       InvocationStatus.Allowed,
       { head_sha: headSha, reason: '--no-review-check flag' },
@@ -179,7 +265,20 @@ export async function computePreflight(
   const maxAgeSeconds =
     policy?.review?.local_review?.max_age_seconds ?? DEFAULT_MAX_AGE_SECONDS;
   if (!reviewCheckSkipped) {
-    const lookup = findRecentLocalReview(baseDir, headSha, maxAgeSeconds, new Date(), contentToken);
+    // Pristine token: only computed for PUSH gating (see the predicate's
+    // round-10 P1b branch) — one `git rev-parse HEAD^{tree}` spawn.
+    const pristineToken =
+      options.operation === 'push' && headSha.length > 0
+        ? resolveRef(baseDir, 'HEAD^{tree}')
+        : '';
+    const lookup = findRecentLocalReview(
+      commonRoot,
+      headSha,
+      maxAgeSeconds,
+      new Date(),
+      contentToken,
+      pristineToken,
+    );
     if (!lookup.found) {
       // 0.28.0 round-29 P3: when the most recent path-matching audit
       // entry was blocking/error, the operator HAS reviewed — they
@@ -192,27 +291,69 @@ export async function computePreflight(
           : lookup.last_blocking_verdict === 'error'
             ? 'your last local review errored — re-run `rea review` and address findings'
             : 'no recent local-review audit entry covers HEAD';
-      return {
-        outcome: {
-          status: 'refuse',
-          reason,
-          exitCode: 2,
-          details: {
+      // G3 shadow: coverage is absent (would block), but shadow NEVER
+      // refuses — log a `rea.gate.g3.shadow` would-block event and FALL
+      // THROUGH to the commit-hygiene check (a distinct gate). This is
+      // the trial tier that lets an operator watch what enforce WOULD
+      // block before flipping it on. UNCERTAIN parity: a non-git /
+      // token-less probe simply doesn't find coverage, so it lands here
+      // and shadow logs rather than refuses.
+      if (effectiveMode === 'shadow') {
+        await safeGateAudit(
+          commonRoot,
+          G3_SHADOW_TOOL_NAME,
+          InvocationStatus.Allowed,
+          {
+            would_block: true,
+            reason,
             head_sha: headSha,
             content_token: contentToken,
-            max_age_seconds: maxAgeSeconds,
-            bypass_env_var: bypassEnvVar,
-            policy_off_switch: 'policy.review.local_review.mode: off',
             ...(lookup.last_blocking_verdict !== undefined
-              ? {
-                  last_blocking_verdict: lookup.last_blocking_verdict,
-                  last_blocking_timestamp: lookup.last_blocking_timestamp,
-                }
+              ? { last_blocking_verdict: lookup.last_blocking_verdict }
               : {}),
           },
-        },
-        policy,
-      };
+          policy,
+        );
+        reviewShadowed = true;
+        // do NOT return — continue to the commit-count check below.
+      } else {
+        // enforce — the historical refuse. Emit a `rea.gate.g3` deny
+        // event ONLY when g3_review is the active driver, so the pure
+        // legacy `review.local_review` path stays byte-identical (no new
+        // audit records for repos that never opted into artifact gates).
+        if (g3Active) {
+          await safeGateAudit(
+            commonRoot,
+            G3_TOOL_NAME,
+            InvocationStatus.Denied,
+            { reason, head_sha: headSha, content_token: contentToken },
+            policy,
+          );
+        }
+        return {
+          outcome: {
+            status: 'refuse',
+            reason,
+            exitCode: 2,
+            details: {
+              head_sha: headSha,
+              content_token: contentToken,
+              max_age_seconds: maxAgeSeconds,
+              bypass_env_var: bypassEnvVar,
+              policy_off_switch: g3Active
+                ? 'artifact_gates.g3_review.mode: off (or review.local_review.mode: off)'
+                : 'policy.review.local_review.mode: off',
+              ...(lookup.last_blocking_verdict !== undefined
+                ? {
+                    last_blocking_verdict: lookup.last_blocking_verdict,
+                    last_blocking_timestamp: lookup.last_blocking_timestamp,
+                  }
+                : {}),
+            },
+          },
+          policy,
+        };
+      }
     }
   }
 
@@ -260,16 +401,26 @@ export async function computePreflight(
       status: 'clean',
       reason: reviewCheckSkipped
         ? 'review check skipped, commit-hygiene clean'
-        : 'recent local-review audit entry covers HEAD',
+        : reviewShadowed
+          ? 'g3_review shadow: coverage absent (logged, not blocking), commit-hygiene clean'
+          : 'recent local-review audit entry covers HEAD',
       exitCode: 0,
-      details: { head_sha: headSha, content_token: contentToken, commit_count: commitCount },
+      details: {
+        head_sha: headSha,
+        content_token: contentToken,
+        commit_count: commitCount,
+        ...(reviewShadowed ? { g3_review_shadowed: true } : {}),
+      },
     },
     policy,
   };
 }
 
 export async function runPreflight(options: RunPreflightOptions): Promise<void> {
-  const baseDir = process.cwd();
+  // Round-31 P3: normalize to the checkout root — `rea preflight` from
+  // a subdirectory of a linked worktree must read HALT/coverage from
+  // the worktree root and the shared common root, not `<subdir>/.rea`.
+  const baseDir = resolveLocalRoot(process.cwd());
   const { outcome } = await computePreflight(baseDir, options);
 
   if (options.json === true) {
@@ -506,6 +657,7 @@ export function findRecentLocalReview(
   maxAgeSeconds: number,
   now: Date = new Date(),
   contentToken: string = '',
+  pristineToken: string = '',
 ): LocalReviewLookupResult {
   // 0.26.0 helix-026 finding-1: callers can match by content_token,
   // head_sha, or both. We need at least ONE non-empty key — without
@@ -573,7 +725,24 @@ export function findRecentLocalReview(
     if (recordedToken.length > 0 && contentToken.length > 0) {
       // Both sides have a token — token comparison is AUTHORITATIVE.
       if (recordedToken === contentToken) matchKind = 'content_token';
-      // Token mismatch: this entry is stale. Do NOT fall back.
+      else if (
+        pristineToken.length > 0 &&
+        recordedToken === pristineToken &&
+        recordedSha.length > 0 &&
+        headSha.length > 0 &&
+        recordedSha === headSha
+      ) {
+        // 0.54.0 round-10 P1b (PUSH callers only — the caller supplies
+        // pristineToken exclusively for push gating): the entry reviewed
+        // the CLEAN tree of exactly this commit. The caller's own WIP
+        // is not part of what a push ships, so a clean-tree review of
+        // the pushed sha — typically written from another worktree —
+        // is coverage. The round-27 F3 defense is untouched: commit
+        // gating never passes a pristineToken, so a dirtied tree still
+        // refuses there.
+        matchKind = 'head_sha';
+      }
+      // Any other token mismatch: this entry is stale. Do NOT fall back.
     } else if (recordedSha.length > 0 && headSha.length > 0 && recordedSha === headSha) {
       // No token on this entry (or caller). Legacy / non-git fallback.
       matchKind = 'head_sha';
@@ -653,6 +822,39 @@ async function safeAudit(
 }
 
 /**
+ * Best-effort emit of a G3 gate audit record (`rea.gate.g3` /
+ * `rea.gate.g3.shadow`). Distinct from {@link safeAudit} in two ways: the
+ * server name is `rea` and the tier is `write`, matching the G1
+ * (`src/cli/gate.ts`) and G2 (`src/hooks/verify-gate`) sibling gates so
+ * the three artifact gates share one audit shape. An append failure NEVER
+ * changes the verdict — the caller's exit code is already decided.
+ */
+async function safeGateAudit(
+  baseDir: string,
+  toolName: string,
+  status: InvocationStatus,
+  metadata: Record<string, unknown>,
+  policy: Policy | undefined,
+): Promise<void> {
+  try {
+    const cleanMeta: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(metadata)) {
+      if (v !== undefined) cleanMeta[k] = v;
+    }
+    await appendAuditRecord(baseDir, {
+      tool_name: toolName,
+      server_name: G3_SERVER_NAME,
+      tier: Tier.Write,
+      status,
+      ...(Object.keys(cleanMeta).length > 0 ? { metadata: cleanMeta } : {}),
+      ...(policy !== undefined ? { policy } : {}),
+    });
+  } catch {
+    /* best-effort — an audit-write failure must not change the verdict */
+  }
+}
+
+/**
  * Attach `rea preflight` to a commander Program.
  */
 export function registerPreflightCommand(program: Command): void {
@@ -670,11 +872,18 @@ export function registerPreflightCommand(program: Command): void {
       'skip the audit-log lookup (still runs commit-hygiene). Audit-logged escape hatch — different from the per-invocation env-var override.',
     )
     .option('--json', 'emit a single-line JSON outcome instead of human-readable output')
-    .action(async (opts: { strict?: boolean; reviewCheck?: boolean; json?: boolean }) => {
+    .option(
+      '--operation <op>',
+      "what is being gated: 'push' enables the pristine-tree coverage fallback (a clean-tree review of exactly the pushed sha — typically from another worktree — counts even with local WIP); 'commit'/unset keeps token-authoritative staleness (round-27 F3). Husky pre-push passes 'push'.",
+    )
+    .action(async (opts: { strict?: boolean; reviewCheck?: boolean; json?: boolean; operation?: string }) => {
       // Commander negation: --no-review-check sets opts.reviewCheck = false.
       // We invert to noReviewCheck for clarity in the runner.
       const noReviewCheck = opts.reviewCheck === false;
+      const operation =
+        opts.operation === 'push' || opts.operation === 'commit' ? opts.operation : undefined;
       await runPreflight({
+        ...(operation !== undefined ? { operation } : {}),
         ...(opts.strict === true ? { strict: true } : {}),
         ...(noReviewCheck ? { noReviewCheck: true } : {}),
         ...(opts.json === true ? { json: true } : {}),

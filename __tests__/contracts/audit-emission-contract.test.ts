@@ -83,7 +83,7 @@ const SOURCES: readonly ContractSource[] = [
     file: 'src/hooks/push-gate/index.ts',
     signals: [
       /EVT_REVIEWED\s*=\s*['"]rea\.push_gate\.reviewed['"]/,
-      /safeAppend\(\s*appendAuditFn,\s*deps\.baseDir,\s*EVT_REVIEWED/,
+      /safeAppend\(\s*appendAuditFn,\s*commonDir,\s*EVT_REVIEWED/,
     ],
   },
 ];
@@ -158,7 +158,7 @@ describe('cross-file audit-emission contract (Class G)', () => {
     expect(summarizeIdx, 'summarizeReview call not found').toBeGreaterThan(-1);
     const tail = body.slice(summarizeIdx);
     expect(
-      /safeAppend\(\s*appendAuditFn,\s*deps\.baseDir,\s*EVT_REVIEWED/.test(tail),
+      /safeAppend\(\s*appendAuditFn,\s*commonDir,\s*EVT_REVIEWED/.test(tail),
       'EVT_REVIEWED safeAppend call not present in the post-summarize success path',
     ).toBe(true);
   });
@@ -181,11 +181,11 @@ describe('cross-file audit-emission contract (Class G)', () => {
     expect(branchEndIdx, 'cache-hit return not found').toBeGreaterThan(-1);
     const branchBody = body.slice(branchIdx, branchEndIdx);
     expect(
-      /safeAppend\(\s*appendAuditFn,\s*deps\.baseDir,\s*EVT_CACHE_HIT/.test(branchBody),
+      /safeAppend\(\s*appendAuditFn,\s*commonDir,\s*EVT_CACHE_HIT/.test(branchBody),
       'cache-hit branch missing EVT_CACHE_HIT emit',
     ).toBe(true);
     expect(
-      /safeAppend\(\s*appendAuditFn,\s*deps\.baseDir,\s*EVT_REVIEWED/.test(branchBody),
+      /safeAppend\(\s*appendAuditFn,\s*commonDir,\s*EVT_REVIEWED/.test(branchBody),
       'cache-hit branch missing EVT_REVIEWED emit (operators grep this for verdict-stability dashboards)',
     ).toBe(true);
     // The `cache_hit: true` field is the discriminator that lets

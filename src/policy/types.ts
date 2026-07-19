@@ -22,6 +22,24 @@ export interface ContextProtection {
   max_bash_output_lines?: number;
 }
 
+/** Three-state enforcement mode for an Artifact Gate. */
+export type GateMode = 'off' | 'shadow' | 'enforce';
+
+/**
+ * Artifact Gates policy (0.54.0+). Present-block fields are always
+ * populated (zod defaults); an ABSENT `artifact_gates` block means all
+ * gates `off`. `mode`: `off` (silent no-op), `shadow` (log would-block,
+ * never block), `enforce` (block into the review queue).
+ */
+export interface ArtifactGatesPolicy {
+  /** G1 spec-gate: non-trivial diff → active ticket must reference a committed spec. */
+  g1_spec: { mode: GateMode; diff_lines: number; diff_files: number };
+  /** G2 verification-gate: no evidence → a ticket cannot close. */
+  g2_verify: { mode: GateMode };
+  /** G3 review-gate: no fresh verdict → no push (tiered). */
+  g3_review: { mode: GateMode };
+}
+
 /**
  * Review policy knobs for the 0.11.0 stateless push-gate.
  *
@@ -162,7 +180,7 @@ export interface ReviewPolicy {
    * cost-bounded environments where consistency matters less than
    * throughput.
    */
-  codex_reasoning_effort?: 'low' | 'medium' | 'high';
+  codex_reasoning_effort?: 'low' | 'medium' | 'high' | 'xhigh';
   /**
    * Verdict cache TTL in milliseconds (0.18.1+ helixir #1, #4, #7, #8).
    * Default 86_400_000 (24 hours). When a push of `head_sha` produces a
@@ -613,6 +631,48 @@ export interface DelegationAdvisoryPolicy {
  */
 export type BillingErrorResponse = 'halt' | 'warn' | 'off';
 
+/**
+ * Artifact Gates §5 — response mode for the turn-budget reflex when the
+ * `halt_turns` threshold is crossed: `warn` (DEFAULT) audits + banners but does
+ * NOT freeze; `halt` writes `.rea/HALT` + audits `rea.spend.turn_budget_halt`;
+ * `off` is a silent no-op.
+ */
+export type TurnBudgetResponse = 'warn' | 'halt' | 'off';
+
+/**
+ * Artifact Gates §5 — turn-budget sub-block of `spend_governance`. Makes the
+ * turn-budget folklore real: the warn/halt thresholds that consuming CLAUDE.md
+ * files previously stated in PROSE now live in policy and produce AUDITED
+ * warn/refuse events through the `billing-cap-halt` PostToolUse path, rather
+ * than relying on the model remembering the numbers.
+ *
+ * OPT-IN, ABSENT=disabled (unlike the parent block's opt-out billing fields).
+ * When the sub-block is omitted the feature is entirely off — no per-session
+ * counter, no events. `[TEAM-CALL]` on the counting mechanics: the requirement
+ * is only that the numbers live here and produce audited events; the counter
+ * lives at `<localRoot>/.rea/turn-count.<session>.json`.
+ */
+export interface TurnBudgetPolicy {
+  /**
+   * Emit an audited `rea.spend.turn_budget_warn` at/after this many tool-calls
+   * in a session. Positive integer. Must be `<= halt_turns` (loader `.refine`).
+   * Fires ONCE per threshold-crossing, not on every subsequent turn.
+   */
+  warn_turns: number;
+  /**
+   * The `response` fires at/after this many tool-calls in a session. Positive
+   * integer, `>= warn_turns`.
+   */
+  halt_turns: number;
+  /**
+   * What happens when `halt_turns` is crossed. `warn` (DEFAULT) audits
+   * `rea.spend.turn_budget_warn` + banners without freezing; `halt` writes
+   * `.rea/HALT` + audits `rea.spend.turn_budget_halt` + banners; `off` is a
+   * silent no-op. Defaults to `warn` at the loader when omitted.
+   */
+  response?: TurnBudgetResponse;
+}
+
 export interface SpendGovernancePolicy {
   /**
    * Master switch. OPT-OUT: the `billing-cap-halt.sh` reflex is a no-op
@@ -634,6 +694,11 @@ export interface SpendGovernancePolicy {
    * rejects any value outside the enum at load time).
    */
   billing_error_response?: BillingErrorResponse;
+  /**
+   * Artifact Gates §5 — OPT-IN turn budget. Absent = off (no counter, no
+   * events). See {@link TurnBudgetPolicy}.
+   */
+  turn_budget?: TurnBudgetPolicy;
 }
 
 /**
@@ -745,6 +810,19 @@ export interface Policy {
   redact?: RedactPolicy;
   audit?: AuditPolicy;
   gateway?: GatewayPolicy;
+  /**
+   * Artifact Gates (0.54.0+) — three deterministic process gates.
+   * Absent block = all gates `off` (byte-identical no-op). Each `mode`
+   * is `off | shadow | enforce`; policy tightens but never loosens.
+   */
+  artifact_gates?: ArtifactGatesPolicy;
+  /**
+   * `rea dash` sensitive-project visibility. `false` renders the project
+   * as an opaque item-count in the global dashboard (no task titles).
+   * Absent → visible. Accepted by the strict loader so a repo enabling the
+   * feature doesn't break every other loadPolicy() caller.
+   */
+  dashboard_visible?: boolean;
   /**
    * Architecture-review patterns (0.20.1+). When set, the
    * `architecture-review-gate.sh` hook fires an advisory when a

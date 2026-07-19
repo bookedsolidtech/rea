@@ -16,7 +16,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { checkHalt, formatHaltBanner } from './halt-check.js';
+import { checkHalt, checkHaltRoots, formatHaltBanner } from './halt-check.js';
 
 function mkProjectRoot(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'rea-halt-check-test-'));
@@ -139,5 +139,36 @@ describe('formatHaltBanner', () => {
     expect(formatHaltBanner('Reason unknown')).toBe(
       'REA HALT: Reason unknown\nAll agent operations suspended. Run: rea unfreeze\n',
     );
+  });
+});
+
+describe('checkHaltRoots — worktree-aware kill switch (0.54.0)', () => {
+  it('local HALT still freezes (legacy per-worktree file)', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'rea-haltroots-'));
+    fs.mkdirSync(path.join(root, '.rea'), { recursive: true });
+    fs.writeFileSync(path.join(root, '.rea', 'HALT'), 'local freeze');
+    const r = checkHaltRoots(root);
+    expect(r.halted).toBe(true);
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('COMMON HALT freezes a caller that only passed the local root', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'rea-haltroots-'));
+    const common = fs.mkdtempSync(path.join(os.tmpdir(), 'rea-haltcommon-'));
+    fs.mkdirSync(path.join(root, '.rea'), { recursive: true });
+    fs.mkdirSync(path.join(common, '.rea'), { recursive: true });
+    fs.writeFileSync(path.join(common, '.rea', 'HALT'), 'repo-wide freeze');
+    const r = checkHaltRoots(root, common);
+    expect(r.halted).toBe(true);
+    if (r.halted) expect(r.reason).toBe('repo-wide freeze');
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(common, { recursive: true, force: true });
+  });
+
+  it('degenerate (common === local): single probe, clear → not halted', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'rea-haltroots-'));
+    fs.mkdirSync(path.join(root, '.rea'), { recursive: true });
+    expect(checkHaltRoots(root, root)).toEqual({ halted: false });
+    fs.rmSync(root, { recursive: true, force: true });
   });
 });

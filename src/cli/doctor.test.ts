@@ -7,7 +7,7 @@
  * on which checks are present and their status.
  */
 
-import { execFile } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -17,12 +17,15 @@ import {
   checkCodexBinaryOnPath,
   checkDelegationRoundTrip,
   checkFingerprintStore,
+  checkG1SpecGateCli,
   checkPolicyReaderJq,
   checkPolicyReaderTier1,
   checkPolicyReaderTier2,
   checkPolicyReaderTier3,
   checkPolicyReaderTierSummary,
   checkPrepareCommitMsgHook,
+  checkSpineInstalled,
+  checkTokenEconomy,
   checksFromProbeState,
   collectChecks,
   type CheckResult,
@@ -786,6 +789,9 @@ describe('rea doctor — EXPECTED_HOOKS coverage (round-25 P3)', () => {
       'secret-scanner.sh',
       'security-disclosure-gate.sh',
       'settings-protection.sh',
+      // 0.54.0 — Artifact Gate G2 verification-gate (editor + Bash tiers).
+      'verify-gate.sh',
+      'verify-gate-bash-gate.sh',
     ];
     for (const name of allCanonical) {
       const p = path.join(hooksDir, name);
@@ -795,10 +801,10 @@ describe('rea doctor — EXPECTED_HOOKS coverage (round-25 P3)', () => {
     const checks = collectChecks(repo.dir);
     const hooksCheck = findCheck(checks, 'hooks installed + executable');
     expect(hooksCheck?.status).toBe('pass');
-    // 0.51.0 — 17 shipped hooks (was 16 in 0.36.0 → 0.50.0).
-    // `billing-cap-halt.sh` (spend-governance E1 seed) joined
-    // EXPECTED_HOOKS this release.
-    expect(hooksCheck?.detail).toMatch(/17 hooks present/);
+    // 0.54.0 — 19 shipped hooks (was 17 in 0.51.0). `verify-gate.sh` and
+    // `verify-gate-bash-gate.sh` (Artifact Gate G2, editor + Bash tiers)
+    // joined EXPECTED_HOOKS this release.
+    expect(hooksCheck?.detail).toMatch(/19 hooks present/);
   });
 });
 
@@ -1711,6 +1717,56 @@ describe('rea doctor — checkDelegationRoundTrip drives the shell hook (0.31.0)
     expect(result.status).toBe('pass');
     expect(result.detail).toMatch(/delegation-capture\.sh shell hook/);
   });
+
+  // Round-34 F1 — from a LINKED WORKTREE, `delegation-capture.sh` appends the
+  // signal to the COMMON-root (primary checkout) audit chain. The probe must
+  // resolve `auditPath` against the common root, not the local worktree, or it
+  // falsely reports the hook broken.
+  it('F1: finds a common-root-chain signal when run from a linked worktree', async () => {
+    const distCli = path.join(REPO_ROOT, 'dist', 'cli', 'index.js');
+    try {
+      await fs.access(distCli);
+    } catch {
+      return; // build not present — CI builds before test
+    }
+    // Primary checkout (a real git repo) + a linked worktree.
+    const primary = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-deleg-wt-')));
+    cleanup.push(primary);
+    execFileSync('git', ['init', '-q', primary], { stdio: 'ignore' });
+    execFileSync('git', ['-C', primary, 'config', 'user.email', 't@t'], { stdio: 'ignore' });
+    execFileSync('git', ['-C', primary, 'config', 'user.name', 't'], { stdio: 'ignore' });
+    execFileSync('git', ['-C', primary, 'commit', '-q', '--allow-empty', '-m', 'init'], {
+      stdio: 'ignore',
+    });
+    const wt = `${primary}-wt`;
+    cleanup.push(wt);
+    execFileSync('git', ['-C', primary, 'worktree', 'add', '-q', wt, '-b', 'stream-a'], {
+      stdio: 'ignore',
+    });
+    // Stage a sandboxed dogfood CLI INSIDE the worktree (so the shim resolves a
+    // CLI whose realpath is under CLAUDE_PROJECT_DIR = the worktree). The CLI
+    // itself resolves the common root and appends the signal to
+    // <primary>/.rea/audit.jsonl.
+    await fs.cp(path.join(REPO_ROOT, 'hooks'), path.join(wt, '.claude', 'hooks'), {
+      recursive: true,
+    });
+    await fs.cp(path.join(REPO_ROOT, 'dist'), path.join(wt, 'dist'), { recursive: true });
+    await fs.symlink(path.join(REPO_ROOT, 'node_modules'), path.join(wt, 'node_modules'), 'dir');
+    await fs.writeFile(
+      path.join(wt, 'package.json'),
+      JSON.stringify({ name: '@bookedsolid/rea', version: '0.0.0-test' }),
+    );
+    await fs.mkdir(path.join(wt, '.rea'), { recursive: true });
+
+    const result = await checkDelegationRoundTrip(wt);
+    // The record landed in the COMMON-root chain; with the fix the probe polls
+    // <primary>/.rea/audit.jsonl and finds it → pass.
+    expect(result.status).toBe('pass');
+    // And the signal is physically in the PRIMARY's chain, not the worktree's
+    // (readFile throws if it never landed there).
+    const primaryAudit = path.join(primary, '.rea', 'audit.jsonl');
+    expect(await fs.readFile(primaryAudit, 'utf8')).toContain('rea.delegation_signal');
+  });
 });
 
 /**
@@ -2499,5 +2555,325 @@ describe('rea doctor — policy-reader tier checks (0.39.0)', () => {
       expect(findCheck(checks, 'policy-reader jq (JSON accelerator)')).toBeUndefined();
       expect(findCheck(checks, 'policy-reader effective floor')).toBeUndefined();
     });
+  });
+});
+
+// ── Spine distribution (spec §4): checkSpineInstalled ───────────────────────
+//
+// The process-spine skills payload (`spine/*.md` → `.claude/skills/rea/`) is
+// version-pinned to the rea release. checkSpineInstalled mirrors
+// checkAgentsPresent/checkHooksInstalled and adds the drift dimension the
+// spec requires — the refuse-and-report surface for locally-modified spine
+// files. Advisory: warn on absence/drift, never a hard fail.
+import { PKG_ROOT } from './utils.js';
+
+const SPINE_DIR = path.join(PKG_ROOT, 'spine');
+
+async function spinePayloadNames(): Promise<string[]> {
+  const names = (await fs.readdir(SPINE_DIR)).filter((n) => n.endsWith('.md'));
+  names.sort();
+  return names;
+}
+
+async function layDownSpine(baseDir: string): Promise<void> {
+  const dst = path.join(baseDir, '.claude', 'skills', 'rea');
+  await fs.mkdir(dst, { recursive: true });
+  for (const name of await spinePayloadNames()) {
+    await fs.copyFile(path.join(SPINE_DIR, name), path.join(dst, name));
+  }
+}
+
+describe('rea doctor — checkSpineInstalled (spec §4 spine distribution)', () => {
+  const cleanup: string[] = [];
+  afterEach(async () => {
+    await Promise.all(cleanup.splice(0).map((d) => fs.rm(d, { recursive: true, force: true })));
+  });
+
+  it('warns (not fails) when .claude/skills/rea/ is absent — upgrade-lag signal', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'rea-spine-'));
+    cleanup.push(dir);
+    const r = checkSpineInstalled(dir);
+    expect(r.status).toBe('warn');
+    // Names the inspected path (the rea-owned subdir) AND the next step.
+    expect(r.detail).toContain(path.join(dir, '.claude', 'skills', 'rea'));
+    expect(r.detail).toMatch(/rea upgrade/);
+  });
+
+  it('passes when every payload file is present and byte-identical', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'rea-spine-'));
+    cleanup.push(dir);
+    await layDownSpine(dir);
+    const r = checkSpineInstalled(dir);
+    expect(r.status).toBe('pass');
+    const count = (await spinePayloadNames()).length;
+    expect(r.detail).toContain(`${count} spine skills present`);
+  });
+
+  it('warns and names the drifted file when an installed spine file is locally modified', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'rea-spine-'));
+    cleanup.push(dir);
+    await layDownSpine(dir);
+    const names = await spinePayloadNames();
+    const victim = names.find((n) => n === 'grill.md') ?? names[0]!;
+    await fs.writeFile(path.join(dir, '.claude', 'skills', 'rea', victim), '# local edit\n', 'utf8');
+    const r = checkSpineInstalled(dir);
+    expect(r.status).toBe('warn');
+    expect(r.detail).toContain(victim);
+    expect(r.detail).toMatch(/locally modified/);
+    expect(r.detail).toMatch(/rea upgrade/);
+  });
+
+  it('warns and names the missing file when a payload file is absent on disk', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'rea-spine-'));
+    cleanup.push(dir);
+    await layDownSpine(dir);
+    const names = await spinePayloadNames();
+    const victim = names[0]!;
+    await fs.rm(path.join(dir, '.claude', 'skills', 'rea', victim));
+    const r = checkSpineInstalled(dir);
+    expect(r.status).toBe('warn');
+    expect(r.detail).toContain(victim);
+    expect(r.detail).toMatch(/missing/);
+  });
+
+  it('never returns fail (advisory only — must not block install/CI)', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'rea-spine-'));
+    cleanup.push(dir);
+    // absent case
+    expect(checkSpineInstalled(dir).status).not.toBe('fail');
+    await layDownSpine(dir);
+    expect(checkSpineInstalled(dir).status).not.toBe('fail');
+  });
+});
+
+// ── D5 token-economy lint: checkTokenEconomy (advisory-only) ────────────────
+describe('rea doctor — checkTokenEconomy (D5 advisory budget)', () => {
+  const cleanup: string[] = [];
+  afterEach(async () => {
+    await Promise.all(cleanup.splice(0).map((d) => fs.rm(d, { recursive: true, force: true })));
+  });
+
+  async function writeSkill(dir: string, name: string, description: string): Promise<void> {
+    await fs.mkdir(dir, { recursive: true });
+    const body = `---\nname: ${name}\ndescription: "${description}"\n---\n\nbody\n`;
+    await fs.writeFile(path.join(dir, `${name}.md`), body, 'utf8');
+  }
+
+  it('info + counts skills across BOTH .claude/skills and .claude/commands', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'rea-tok-'));
+    cleanup.push(dir);
+    await writeSkill(path.join(dir, '.claude', 'skills'), 'a', 'x');
+    await writeSkill(path.join(dir, '.claude', 'skills'), 'b', 'x');
+    await writeSkill(path.join(dir, '.claude', 'commands'), 'c', 'x');
+    const r = checkTokenEconomy(dir);
+    expect(r.status).toBe('info');
+    expect(r.detail).toContain('3/15 user-invoked skills');
+  });
+
+  it('counts rea-owned spine skills in .claude/skills/rea without double-counting the bare root', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'rea-tok-'));
+    cleanup.push(dir);
+    // One user skill at the shared bare root, two spine skills in the
+    // rea-owned subdir. The bare-root read is non-recursive, so the `rea/`
+    // subdir must contribute exactly its own two files (no double count).
+    await writeSkill(path.join(dir, '.claude', 'skills'), 'user', 'x');
+    await writeSkill(path.join(dir, '.claude', 'skills', 'rea'), 'grill', 'x');
+    await writeSkill(path.join(dir, '.claude', 'skills', 'rea'), 'implement', 'x');
+    const r = checkTokenEconomy(dir);
+    expect(r.status).toBe('info');
+    expect(r.detail).toContain('3/15 user-invoked skills');
+  });
+
+  it('does NOT count files without a description front-matter (e.g. README)', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'rea-tok-'));
+    cleanup.push(dir);
+    const skillsDir = path.join(dir, '.claude', 'skills');
+    await writeSkill(skillsDir, 'real', 'x');
+    await fs.writeFile(path.join(skillsDir, 'README.md'), '# index\n\nno front-matter\n', 'utf8');
+    const r = checkTokenEconomy(dir);
+    expect(r.detail).toContain('1/15 user-invoked skills');
+  });
+
+  it('warns and flags the prune ritual when the skill count exceeds 15', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'rea-tok-'));
+    cleanup.push(dir);
+    const skillsDir = path.join(dir, '.claude', 'skills');
+    for (let i = 0; i < 16; i++) await writeSkill(skillsDir, `s${i}`, 'x');
+    const r = checkTokenEconomy(dir);
+    expect(r.status).toBe('warn');
+    expect(r.detail).toMatch(/16 skills \(cap 15\)/);
+    expect(r.detail).toMatch(/quarterly prune ritual/);
+  });
+
+  it('warns when description tokens exceed 1000 (estimate = chars ÷ 4)', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'rea-tok-'));
+    cleanup.push(dir);
+    const skillsDir = path.join(dir, '.claude', 'skills');
+    // 5 skills × 900 chars = 4500 chars → ~1125 tokens > 1000, but only 5 skills.
+    const longDesc = 'z'.repeat(900);
+    for (let i = 0; i < 5; i++) await writeSkill(skillsDir, `s${i}`, longDesc);
+    const r = checkTokenEconomy(dir);
+    expect(r.status).toBe('warn');
+    expect(r.detail).toMatch(/description tokens \(cap 1000\)/);
+  });
+
+  it('never returns fail (advisory only — must not affect exit code)', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'rea-tok-'));
+    cleanup.push(dir);
+    const skillsDir = path.join(dir, '.claude', 'skills');
+    for (let i = 0; i < 20; i++) await writeSkill(skillsDir, `s${i}`, 'z'.repeat(500));
+    expect(checkTokenEconomy(dir).status).not.toBe('fail');
+  });
+});
+
+// ── Round-23 F1 — G1 spec-gate CLI advisory ──────────────────────────────
+// The hot commit path FAILS OPEN (round-15); doctor surfaces enforce-without-
+// CLI as an advisory WARN (never a hard fail).
+describe('rea doctor — checkG1SpecGateCli (round-23 F1)', () => {
+  const dirs: string[] = [];
+  afterEach(async () => {
+    for (const d of dirs.splice(0)) await fs.rm(d, { recursive: true, force: true });
+  });
+
+  async function repoWithG1(mode: 'off' | 'shadow' | 'enforce' | 'absent'): Promise<string> {
+    const dir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-g1cli-')));
+    dirs.push(dir);
+    await fs.mkdir(path.join(dir, '.rea'), { recursive: true });
+    const gates =
+      mode === 'absent' ? '' : `artifact_gates:\n  g1_spec:\n    mode: ${mode}\n`;
+    await fs.writeFile(
+      path.join(dir, '.rea', 'policy.yaml'),
+      [
+        'version: "0.54.0"',
+        'profile: bst-internal',
+        'installed_by: test',
+        'installed_at: "2026-01-01T00:00:00Z"',
+        'autonomy_level: L1',
+        'max_autonomy_level: L2',
+        'promotion_requires_human_approval: true',
+        'blocked_paths: []',
+        gates,
+      ].join('\n'),
+    );
+    return dir;
+  }
+
+  // An env whose PATH contains no `rea` binary (deterministic no-global-CLI).
+  const noReaEnv: NodeJS.ProcessEnv = { PATH: path.join(os.tmpdir(), 'rea-empty-nonexistent-bin') };
+
+  it('mode off → no row emitted (null; zero noise for the default)', async () => {
+    const dir = await repoWithG1('off');
+    expect(checkG1SpecGateCli(dir, noReaEnv)).toBeNull();
+  });
+
+  it('absent artifact_gates → null', async () => {
+    const dir = await repoWithG1('absent');
+    expect(checkG1SpecGateCli(dir, noReaEnv)).toBeNull();
+  });
+
+  it('mode enforce + NO CLI anywhere → WARN (never fail)', async () => {
+    const dir = await repoWithG1('enforce');
+    const r = checkG1SpecGateCli(dir, noReaEnv);
+    expect(r?.status).toBe('warn');
+    expect(r?.detail).toMatch(/FAILS OPEN/);
+    expect(r?.detail).toMatch(/g1_spec\.mode: enforce/);
+  });
+
+  it('mode shadow + NO CLI → WARN', async () => {
+    const dir = await repoWithG1('shadow');
+    expect(checkG1SpecGateCli(dir, noReaEnv)?.status).toBe('warn');
+  });
+
+  // Round-32 F2: a `rea` that IMPLEMENTS `gate spec-check` (exits 0 on the
+  // `gate spec-check --help` capability probe).
+  const HAS_GATE = '#!/bin/sh\ncase "$1 $2" in "gate spec-check") exit 0 ;; esac\nexit 1\n';
+  // A pre-0.54 `rea` that LACKS `gate` (commander unknown-command → exit 1).
+  const LACKS_GATE = "#!/bin/sh\necho \"error: unknown command 'gate'\" >&2\nexit 1\n";
+
+  it('mode enforce + in-project node_modules/.bin/rea (implements gate) → PASS', async () => {
+    const dir = await repoWithG1('enforce');
+    const bin = path.join(dir, 'node_modules', '.bin');
+    await fs.mkdir(bin, { recursive: true });
+    await fs.writeFile(path.join(bin, 'rea'), HAS_GATE, { mode: 0o755 });
+    const r = checkG1SpecGateCli(dir, noReaEnv);
+    expect(r?.status).toBe('pass');
+    expect(r?.detail).toMatch(/implementing `gate spec-check`/);
+  });
+
+  it('mode enforce + global rea on PATH (implements gate) → PASS', async () => {
+    const dir = await repoWithG1('enforce');
+    const bin = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-gbin-')));
+    dirs.push(bin);
+    await fs.writeFile(path.join(bin, 'rea'), HAS_GATE, { mode: 0o755 });
+    const r = checkG1SpecGateCli(dir, { PATH: bin });
+    expect(r?.status).toBe('pass');
+  });
+
+  // Round-32 F2 — the false-reassurance case this check exists to prevent.
+  it('F2: a resolved CLI that LACKS `gate spec-check` (pre-0.54) → WARN, not PASS', async () => {
+    const dir = await repoWithG1('enforce');
+    const bin = path.join(dir, 'node_modules', '.bin');
+    await fs.mkdir(bin, { recursive: true });
+    await fs.writeFile(path.join(bin, 'rea'), LACKS_GATE, { mode: 0o755 });
+    const r = checkG1SpecGateCli(dir, noReaEnv);
+    expect(r?.status).toBe('warn');
+    expect(r?.status).not.toBe('pass');
+    expect(r?.detail).toMatch(/does NOT implement `gate spec-check`/);
+    expect(r?.detail).toMatch(/FAILS OPEN/);
+  });
+
+  it('F2: a global rea on PATH that LACKS gate → WARN', async () => {
+    const dir = await repoWithG1('enforce');
+    const bin = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-gbin-old-')));
+    dirs.push(bin);
+    await fs.writeFile(path.join(bin, 'rea'), LACKS_GATE, { mode: 0o755 });
+    expect(checkG1SpecGateCli(dir, { PATH: bin })?.status).toBe('warn');
+  });
+
+  it('never emits a `fail` (advisory only)', async () => {
+    const dir = await repoWithG1('enforce');
+    expect(checkG1SpecGateCli(dir, noReaEnv)?.status).not.toBe('fail');
+  });
+
+  it('resolves the PRIMARY checkout CLI from a linked worktree → PASS (round-25 P3)', async () => {
+    // A linked worktree with g1 enforce but NO local install must PASS: the
+    // pre-commit body falls back to the primary checkout's CLI, so doctor must
+    // not falsely warn "fails open".
+    const git = (args: string[], cwd: string): void => {
+      execFileSync('git', args, { cwd, stdio: 'pipe' });
+    };
+    const primary = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-g1wt-')));
+    dirs.push(primary);
+    git(['init', '-q'], primary);
+    git(['config', 'user.email', 't@t'], primary);
+    git(['config', 'user.name', 't'], primary);
+    git(['config', 'commit.gpgsign', 'false'], primary);
+    await fs.writeFile(path.join(primary, 'seed'), 'x');
+    git(['add', '-A'], primary);
+    git(['commit', '-qm', 'init'], primary);
+    // Primary holds the in-project CLI.
+    const bin = path.join(primary, 'node_modules', '.bin');
+    await fs.mkdir(bin, { recursive: true });
+    await fs.writeFile(path.join(bin, 'rea'), '#!/bin/sh\n', { mode: 0o755 });
+    // Linked worktree: g1 enforce, no local node_modules.
+    const wt = `${primary}-wt`;
+    dirs.push(wt);
+    git(['worktree', 'add', '-q', wt, '-b', 'b1'], primary);
+    await fs.mkdir(path.join(wt, '.rea'), { recursive: true });
+    await fs.writeFile(
+      path.join(wt, '.rea', 'policy.yaml'),
+      [
+        'version: "0.54.0"',
+        'profile: bst-internal',
+        'installed_by: test',
+        'installed_at: "2026-01-01T00:00:00Z"',
+        'autonomy_level: L1',
+        'max_autonomy_level: L2',
+        'promotion_requires_human_approval: true',
+        'blocked_paths: []',
+        'artifact_gates:\n  g1_spec:\n    mode: enforce\n',
+      ].join('\n'),
+    );
+    expect(checkG1SpecGateCli(wt, noReaEnv)?.status).toBe('pass');
   });
 });

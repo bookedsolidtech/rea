@@ -129,8 +129,8 @@ describe('BODY_TEMPLATE — path-with-spaces portability (Fix A / 0.12.0)', () =
     // post-body extension-fragment chaining; 0.13.2 wraps the dispatch in
     // a subshell `(...)` so the `set --` rewrite of $@ does NOT bleed into
     // the parent shell where the fragment loop runs.
-    expect(body).toMatch(/set -- "\$\{REA_ROOT\}\/node_modules\/\.bin\/rea" hook push-gate "\$@"/);
-    expect(body).toMatch(/set -- node "\$\{REA_ROOT\}\/dist\/cli\/index\.js" hook push-gate "\$@"/);
+    expect(body).toMatch(/set -- "\$\{REA_CLI_ROOT\}\/node_modules\/\.bin\/rea" hook push-gate "\$@"/);
+    expect(body).toMatch(/set -- node "\$\{REA_CLI_ROOT\}\/dist\/cli\/index\.js" hook push-gate "\$@"/);
     // 0.13.2: rea body invoked via `exec "$@"` inside a subshell, with
     // status captured via `$?` after the subshell exits. The $@ rewrite
     // is scoped to the subshell so the fragment loop's `"$@"` still
@@ -149,8 +149,8 @@ describe('BODY_TEMPLATE — path-with-spaces portability (Fix A / 0.12.0)', () =
     const body = fallbackHookContent();
     // `${REA_ROOT}/...` paths inside `set --` arms must be quoted (positional
     // arg integrity when the path contains spaces).
-    expect(body).toMatch(/"\$\{REA_ROOT\}\/node_modules\/\.bin\/rea"/);
-    expect(body).toMatch(/"\$\{REA_ROOT\}\/dist\/cli\/index\.js"/);
+    expect(body).toMatch(/"\$\{REA_CLI_ROOT\}\/node_modules\/\.bin\/rea"/);
+    expect(body).toMatch(/"\$\{REA_CLI_ROOT\}\/dist\/cli\/index\.js"/);
     // The HALT-detection branch already used quoted expansion; keep it.
     expect(body).toMatch(/"\$\{REA_ROOT\}\/\.rea\/HALT"/);
   });
@@ -162,15 +162,15 @@ describe('BODY_TEMPLATE — path-with-spaces portability (Fix A / 0.12.0)', () =
     // consumer's unrelated app with `hook push-gate` instead of REA. The
     // dogfood arm must require a rea-specific package.json signal too.
     const body = fallbackHookContent();
-    expect(body).toMatch(/grep -q '"name": \*"@bookedsolid\/rea"' "\$\{REA_ROOT\}\/package\.json"/);
+    expect(body).toMatch(/grep -q '"name": \*"@bookedsolid\/rea"' "\$\{REA_CLI_ROOT\}\/package\.json"/);
     expect(body).toMatch(
-      /\[ -f "\$\{REA_ROOT\}\/dist\/cli\/index\.js" \] && \[ -f "\$\{REA_ROOT\}\/package\.json" \]/,
+      /\[ -f "\$\{REA_CLI_ROOT\}\/dist\/cli\/index\.js" \] && \[ -f "\$\{REA_CLI_ROOT\}\/package\.json" \]/,
     );
   });
 
   it('shipped husky body delegates via `set --` arms identically to the fallback', () => {
     const husky = huskyHookContent();
-    expect(husky).toMatch(/set -- "\$\{REA_ROOT\}\/node_modules\/\.bin\/rea" hook push-gate "\$@"/);
+    expect(husky).toMatch(/set -- "\$\{REA_CLI_ROOT\}\/node_modules\/\.bin\/rea" hook push-gate "\$@"/);
     // 0.13.2: rea body invoked via `exec "$@"` inside a subshell so post-body
     // extension-fragment chaining sees git's original argv.
     expect(husky).toMatch(/exec\s+"\$@"/);
@@ -178,6 +178,46 @@ describe('BODY_TEMPLATE — path-with-spaces portability (Fix A / 0.12.0)', () =
     const huskyLines = husky.split('\n');
     const executableHuskyLines = huskyLines.filter((l) => !/^\s*#/.test(l));
     expect(executableHuskyLines.some((l) => /exec\s+\$REA_BIN/.test(l))).toBe(false);
+  });
+
+  it('carries the round-54 tri-state no-preflight split (mode detector + enforce/shadow/off branches)', () => {
+    const body = fallbackHookContent();
+    // The gate-MODE helper exists and reads the LOCAL policy via REA_ROOT.
+    expect(body).toMatch(/_rea_review_gate_mode\(\) \{/);
+    expect(body).toMatch(/_rea_pol="\$\{REA_ROOT\}\/\.rea\/policy\.yaml"/);
+    // Absent policy → off (allow); no awk → enforce (bias closed).
+    expect(body).toMatch(/\[ -f "\$_rea_pol" \] \|\| \{ printf 'off'; return 0; \}/);
+    expect(body).toMatch(/command -v awk >\/dev\/null 2>&1 \|\| \{ printf 'enforce'; return 0; \}/);
+    // round-55: presence/precedence detection — g3_review present is
+    // authoritative; local_review only consulted when g3 is absent.
+    expect(body).toMatch(/if \(s ~ \/g3_review\[\^A-Za-z_\]\.\*mode:\/\) \{ g3p=1; g3v=classify\(s\) \}/);
+    expect(body).toMatch(/else if \(s ~ \/local_review\[\^A-Za-z_\]\.\*mode:\/\) \{ lgp=1; lgv=classify\(s\) \}/);
+    expect(body).toMatch(/if \(g3p\) print \(g3v=="" \? "enforce" : g3v\)/);
+    expect(body).toMatch(/else if \(lgp\) print \(lgv=="off" \? "off" : "enforce"\)/);
+    expect(body).toMatch(/else print "off"/);
+    // Tri-state: enforce → CONFIG-ERROR + rc 2; shadow → WARN + rc 0; off → rc 0.
+    expect(body).toMatch(/case "\$\(_rea_review_gate_mode\)" in/);
+    expect(body).toMatch(/enforce\)/);
+    expect(body).toMatch(/_pf_out=""; _pf_rc=2/);
+    expect(body).toMatch(/CONFIG-ERROR/);
+    expect(body).toMatch(/WARN — review gate \(shadow\) could not run/);
+    expect(body).toMatch(/REA_SKIP_LOCAL_REVIEW/);
+    // The pure `unknown option` arm still allows unconditionally (any mode).
+    expect(body).toMatch(/# Pure flag incompatibility on a preflight-capable CLI/);
+    // Structural: within the inner (retry) case, the unknown-command arm
+    // precedes the unknown-option arm so a missing command is matched first.
+    const innerCmd = body.indexOf('*"unknown command"*)');
+    const innerOpt = body.lastIndexOf('*"unknown option"*)');
+    expect(innerCmd).toBeGreaterThan(-1);
+    expect(innerOpt).toBeGreaterThan(innerCmd);
+  });
+
+  it('husky body carries the identical round-54 tri-state split', () => {
+    const husky = huskyHookContent();
+    expect(husky).toMatch(/_rea_review_gate_mode\(\) \{/);
+    expect(husky).toMatch(/case "\$\(_rea_review_gate_mode\)" in/);
+    expect(husky).toMatch(/CONFIG-ERROR/);
+    expect(husky).toMatch(/WARN — review gate \(shadow\) could not run/);
   });
 
   it('runs end-to-end against a path containing a space (real shell exec)', async () => {
@@ -202,13 +242,29 @@ describe('BODY_TEMPLATE — path-with-spaces portability (Fix A / 0.12.0)', () =
 });
 
 describe('marker bumps (0.26.0 — v5 markers + v4/v3/v2 legacy detection)', () => {
-  it('FALLBACK_MARKER is the v5 marker', () => {
-    expect(FALLBACK_MARKER).toBe('# rea:pre-push-fallback v5');
+  it('FALLBACK_MARKER is the v7 marker (round-50/51/54/55 mode-aware body)', () => {
+    expect(FALLBACK_MARKER).toBe('# rea:pre-push-fallback v7');
   });
 
-  it('HUSKY_GATE_MARKER and HUSKY_GATE_BODY_MARKER are v5', () => {
-    expect(HUSKY_GATE_MARKER).toBe('# rea:husky-pre-push-gate v5');
-    expect(HUSKY_GATE_BODY_MARKER).toBe('# rea:gate-body-v5');
+  // Round-55 P1 follow-up: the v6 fallback body predates the mode-aware G3 fix.
+  // A stale v6 install must be classified LEGACY (not current, not foreign) so
+  // `rea init` / `rea upgrade` refresh it in place to the v7 body.
+  it('isLegacyReaManagedFallback recognizes the now-legacy v6 marker (refresh-on-upgrade)', () => {
+    const v6Body = `#!/bin/sh\n# rea:pre-push-fallback v6\n# rea:gate-body-v6\nset -eu\nexec "$@"\n`;
+    expect(isLegacyReaManagedFallback(v6Body)).toBe(true);
+    // and it is NOT mistaken for the current (v7) managed body.
+    expect(isReaManagedFallback(v6Body)).toBe(false);
+  });
+
+  it('the freshly generated fallback body carries the v7 marker + the mode-aware detector', () => {
+    const body = fallbackHookContent();
+    expect(body.split('\n')[1]).toBe('# rea:pre-push-fallback v7');
+    expect(body).toContain('_rea_review_gate_mode');
+  });
+
+  it('HUSKY_GATE_MARKER and HUSKY_GATE_BODY_MARKER are v6', () => {
+    expect(HUSKY_GATE_MARKER).toBe('# rea:husky-pre-push-gate v6');
+    expect(HUSKY_GATE_BODY_MARKER).toBe('# rea:gate-body-v6');
   });
 
   it('isLegacyReaManagedFallback recognizes 0.13–0.25.x v4 markers (refresh-on-upgrade)', () => {
@@ -583,6 +639,27 @@ describe('classifyPrePushInstall — decision tree', () => {
     expect(d.action).toBe('refresh');
   });
 
+  // Round-55 P1 follow-up — the exact regression: a stale v6 fallback body
+  // (pre mode-aware G3 fix) must be classified LEGACY and REFRESHED to v7, not
+  // seen as "already current" and left stale.
+  it('refresh when a now-legacy v6 fallback is present, replacing it with the v7 body', async () => {
+    const hp = path.join(repo, '.git/hooks/pre-push');
+    await writeHook(
+      hp,
+      `#!/bin/sh\n# rea:pre-push-fallback v6\n# rea:gate-body-v6\nset -eu\nexec "$@"\n`,
+    );
+    const classified = await classifyExistingHook(hp);
+    expect(classified.kind).toBe('rea-managed-legacy-v1');
+    const d = await classifyPrePushInstall(repo);
+    expect(d.action).toBe('refresh');
+    // Run the install and confirm the body was replaced with the current v7.
+    const res = await installPrePushFallback({ targetDir: repo });
+    expect(res.decision.action).toBe('refresh');
+    const written = await fs.readFile(hp, 'utf8');
+    expect(written.split('\n')[1]).toBe('# rea:pre-push-fallback v7');
+    expect(written).toContain('_rea_review_gate_mode');
+  });
+
   it('skip + active-pre-push-present when a canonical husky gate lives under hooksPath', async () => {
     await setHooksPath(repo, '.husky');
     const hp = path.join(repo, '.husky', 'pre-push');
@@ -928,6 +1005,398 @@ describe('extension-hook chaining (Fix H / 0.13.0) — `.husky/pre-push.d/*`', (
     }
   });
 
+  // ── Round-32 F1 — preflight `--operation` compat against an OLD rea CLI ──
+  // Helper: run the fallback hook against a stub `rea` in a temp git repo.
+  async function runPrePushWithStub(stub: string): Promise<{ code: number; stderr: string }> {
+    const repoDir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-pp-compat-')));
+    try {
+      await execFileAsync('git', ['-C', repoDir, 'init', '-q']);
+      const stubBin = path.join(repoDir, 'node_modules', '.bin', 'rea');
+      await fs.mkdir(path.dirname(stubBin), { recursive: true });
+      await fs.writeFile(stubBin, stub, { mode: 0o755 });
+      const hookPath = path.join(repoDir, '.git', 'hooks', 'pre-push');
+      await fs.writeFile(hookPath, fallbackHookContent(), { encoding: 'utf8', mode: 0o755 });
+      const r = await execFileAsync(hookPath, ['origin', 'git@example:r.git'], {
+        cwd: repoDir,
+      }).catch((e: { code?: number; stderr?: string }) => e);
+      return { code: (r as { code?: number }).code ?? 0, stderr: (r as { stderr?: string }).stderr ?? '' };
+    } finally {
+      await fs.rm(repoDir, { recursive: true, force: true });
+    }
+  }
+
+  it('F1: an OLD CLI that rejects `--operation` does NOT block — retries `preflight --strict`', async () => {
+    // Stub: `preflight` WITH `--operation` → commander unknown-option (exit 1);
+    // `preflight` WITHOUT it (the retry) → 0; `hook push-gate` → 0.
+    const stub = [
+      '#!/bin/sh',
+      'op=0; for a in "$@"; do [ "$a" = "--operation" ] && op=1; done',
+      'case "$1" in',
+      '  preflight)',
+      '    if [ "$op" = "1" ]; then echo "error: unknown option \'--operation\'" >&2; exit 1; fi',
+      '    exit 0 ;;',
+      '  hook) exit 0 ;;',
+      'esac',
+      'exit 0',
+      '',
+    ].join('\n');
+    const r = await runPrePushWithStub(stub);
+    expect(r.code).toBe(0); // push NOT blocked
+    expect(r.stderr).not.toContain('unknown option'); // the flag error was swallowed
+  });
+
+  it('F1: a CLI too old to have `preflight` at all → FAIL OPEN (push not blocked)', async () => {
+    // Both invocations → unknown command 'preflight'. The gate can't run; the
+    // push-gate second layer still does and the push proceeds.
+    const stub = [
+      '#!/bin/sh',
+      'case "$1" in',
+      '  preflight) echo "error: unknown command \'preflight\'" >&2; exit 1 ;;',
+      '  hook) exit 0 ;;',
+      'esac',
+      'exit 0',
+      '',
+    ].join('\n');
+    const r = await runPrePushWithStub(stub);
+    expect(r.code).toBe(0);
+    expect(r.stderr).not.toContain('unknown command');
+  });
+
+  it('F1: a GENUINE preflight refusal (exit 2, no unknown-* marker) STILL blocks the push', async () => {
+    // `preflight` refuses with a real banner + exit 2 → must propagate (block).
+    const stub = [
+      '#!/bin/sh',
+      'case "$1" in',
+      '  preflight) echo "REA preflight: no recent local review covers HEAD" >&2; exit 2 ;;',
+      '  hook) exit 0 ;;',
+      'esac',
+      'exit 0',
+      '',
+    ].join('\n');
+    const r = await runPrePushWithStub(stub);
+    expect(r.code).toBe(2); // blocked
+    expect(r.stderr).toContain('no recent local review');
+  });
+
+  // ── Round-50 P1 — no-preflight compat is MODE-AWARE (off means off) ────────
+  // A CLI too old to have `preflight` at all previously ALWAYS failed open,
+  // silently disabling a configured git-side review gate. Now the disposition
+  // depends on whether the LOCAL policy has an active review-gate mode.
+  // `TOO_OLD_NO_PREFLIGHT` emits `unknown command 'preflight'` for BOTH the
+  // `--operation` form and the bare-retry form (the retry is what tier 3 sees).
+  const TOO_OLD_NO_PREFLIGHT = [
+    '#!/bin/sh',
+    "case \"$1\" in",
+    "  preflight) echo \"error: unknown command 'preflight'\" >&2; exit 1 ;;",
+    '  hook) exit 0 ;;',
+    'esac',
+    'exit 0',
+    '',
+  ].join('\n');
+
+  async function runPrePushWithStubPolicy(
+    stub: string,
+    policy: string | null,
+  ): Promise<{ code: number; stderr: string }> {
+    const repoDir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-pp-p50-')));
+    try {
+      await execFileAsync('git', ['-C', repoDir, 'init', '-q']);
+      const stubBin = path.join(repoDir, 'node_modules', '.bin', 'rea');
+      await fs.mkdir(path.dirname(stubBin), { recursive: true });
+      await fs.writeFile(stubBin, stub, { mode: 0o755 });
+      if (policy !== null) {
+        await fs.mkdir(path.join(repoDir, '.rea'), { recursive: true });
+        await fs.writeFile(path.join(repoDir, '.rea', 'policy.yaml'), policy);
+      }
+      const hookPath = path.join(repoDir, '.git', 'hooks', 'pre-push');
+      await fs.writeFile(hookPath, fallbackHookContent(), { encoding: 'utf8', mode: 0o755 });
+      const r = await execFileAsync(hookPath, ['origin', 'git@example:r.git'], {
+        cwd: repoDir,
+      }).catch((e: { code?: number; stderr?: string }) => e);
+      return {
+        code: (r as { code?: number }).code ?? 0,
+        stderr: (r as { stderr?: string }).stderr ?? '',
+      };
+    } finally {
+      await fs.rm(repoDir, { recursive: true, force: true });
+    }
+  }
+
+  it('P1: no-preflight CLI + `local_review.mode: enforce` → FAIL CLOSED (exit 2 + CONFIG-ERROR)', async () => {
+    const r = await runPrePushWithStubPolicy(
+      TOO_OLD_NO_PREFLIGHT,
+      'review:\n  local_review:\n    mode: enforce\n',
+    );
+    expect(r.code).toBe(2);
+    expect(r.stderr).toContain('CONFIG-ERROR');
+    expect(r.stderr).toContain('REA_SKIP_LOCAL_REVIEW');
+  });
+
+  // round-55: legacy `local_review` speaks only `off`/`enforced`. A non-`off`
+  // legacy value (here the g3-only `shadow`) resolves to ENFORCE, mirroring
+  // resolveEffectiveReviewMode (`legacyMode === 'off' ? 'off' : 'enforce'`).
+  it('round-55: no-preflight CLI + `local_review.mode: shadow` (invalid legacy vocab) → ENFORCE → FAIL CLOSED (exit 2)', async () => {
+    const r = await runPrePushWithStubPolicy(
+      TOO_OLD_NO_PREFLIGHT,
+      'review:\n  local_review:\n    mode: shadow\n',
+    );
+    expect(r.code).toBe(2);
+    expect(r.stderr).toContain('CONFIG-ERROR');
+  });
+
+  // ── round-55 P1 — PRESENCE/PRECEDENCE (mirrors resolveEffectiveReviewMode),
+  // NOT strongest-wins. A PRESENT g3_review.mode is authoritative over legacy.
+  it('round-55: g3_review.mode: off + stale legacy local_review.mode: enforced → OFF → ALLOW (exit 0)', async () => {
+    // The exact finding: a repo migrated to g3 off but still carrying a stale
+    // legacy enforce must NOT fail closed on the old-CLI path.
+    const r = await runPrePushWithStubPolicy(
+      TOO_OLD_NO_PREFLIGHT,
+      'artifact_gates:\n  g3_review:\n    mode: off\nreview:\n  local_review:\n    mode: enforced\n',
+    );
+    expect(r.code).toBe(0);
+    expect(r.stderr).not.toContain('CONFIG-ERROR');
+  });
+
+  it('round-55: g3_review.mode: shadow + legacy enforced → SHADOW (g3 authoritative) → WARN + ALLOW (exit 0)', async () => {
+    const r = await runPrePushWithStubPolicy(
+      TOO_OLD_NO_PREFLIGHT,
+      'artifact_gates:\n  g3_review:\n    mode: shadow\nreview:\n  local_review:\n    mode: enforced\n',
+    );
+    expect(r.code).toBe(0);
+    expect(r.stderr).toContain('WARN — review gate (shadow) could not run');
+    expect(r.stderr).not.toContain('CONFIG-ERROR');
+  });
+
+  it('round-55: g3_review.mode: enforce + legacy off → ENFORCE (g3 authoritative) → FAIL CLOSED (exit 2)', async () => {
+    const r = await runPrePushWithStubPolicy(
+      TOO_OLD_NO_PREFLIGHT,
+      'artifact_gates:\n  g3_review:\n    mode: enforce\nreview:\n  local_review:\n    mode: off\n',
+    );
+    expect(r.code).toBe(2);
+    expect(r.stderr).toContain('CONFIG-ERROR');
+  });
+
+  it('round-55: g3 ABSENT + legacy enforced → ENFORCE → FAIL CLOSED (exit 2)', async () => {
+    const r = await runPrePushWithStubPolicy(
+      TOO_OLD_NO_PREFLIGHT,
+      'review:\n  local_review:\n    mode: enforced\n',
+    );
+    expect(r.code).toBe(2);
+    expect(r.stderr).toContain('CONFIG-ERROR');
+  });
+
+  it('round-55: g3 ABSENT + legacy off → OFF → ALLOW (exit 0)', async () => {
+    const r = await runPrePushWithStubPolicy(
+      TOO_OLD_NO_PREFLIGHT,
+      'review:\n  local_review:\n    mode: off\n',
+    );
+    expect(r.code).toBe(0);
+    expect(r.stderr).not.toContain('WARN');
+  });
+
+  it('round-55: BOTH keys absent → OFF → ALLOW (documented divergence, fresh-clone protection)', async () => {
+    const r = await runPrePushWithStubPolicy(
+      TOO_OLD_NO_PREFLIGHT,
+      'version: "0.54.0"\nprofile: bst-internal\n',
+    );
+    expect(r.code).toBe(0);
+    expect(r.stderr).not.toContain('WARN');
+  });
+
+  it('round-55: nested-inline g3 off + legacy enforced → OFF → ALLOW (exit 0)', async () => {
+    const r = await runPrePushWithStubPolicy(
+      TOO_OLD_NO_PREFLIGHT,
+      'artifact_gates: { g3_review: { mode: off } }\nreview:\n  local_review:\n    mode: enforced\n',
+    );
+    expect(r.code).toBe(0);
+    expect(r.stderr).not.toContain('CONFIG-ERROR');
+  });
+
+  // round-54 tri-state: shadow is OBSERVE-ONLY and must NEVER block.
+  it('P1/round-54: no-preflight CLI + `g3_review.mode: shadow` → WARN + ALLOW (exit 0)', async () => {
+    const r = await runPrePushWithStubPolicy(
+      TOO_OLD_NO_PREFLIGHT,
+      'artifact_gates:\n  g3_review:\n    mode: shadow\n',
+    );
+    expect(r.code).toBe(0);
+    expect(r.stderr).toContain('WARN — review gate (shadow) could not run');
+    expect(r.stderr).not.toContain('CONFIG-ERROR');
+  });
+
+  it('P1: no-preflight CLI + inline `local_review: { mode: enforce }` → FAIL CLOSED (exit 2)', async () => {
+    const r = await runPrePushWithStubPolicy(
+      TOO_OLD_NO_PREFLIGHT,
+      'review:\n  local_review: { mode: enforce }\n',
+    );
+    expect(r.code).toBe(2);
+  });
+
+  // Round-51 F2 — DEEPLY NESTED inline flow maps must not read as "gate off".
+  it('P1/F2: no-preflight CLI + nested inline `review: { local_review: { mode: enforce } }` → FAIL CLOSED', async () => {
+    const r = await runPrePushWithStubPolicy(
+      TOO_OLD_NO_PREFLIGHT,
+      'review: { local_review: { mode: enforce } }\n',
+    );
+    expect(r.code).toBe(2);
+  });
+
+  it('P1/F2/round-54: no-preflight CLI + nested inline `artifact_gates: { g3_review: { mode: shadow } }` → WARN + ALLOW (exit 0)', async () => {
+    const r = await runPrePushWithStubPolicy(
+      TOO_OLD_NO_PREFLIGHT,
+      'artifact_gates: { g3_review: { mode: shadow } }\n',
+    );
+    expect(r.code).toBe(0);
+    expect(r.stderr).toContain('WARN — review gate (shadow) could not run');
+  });
+
+  it('P1/F2: no-preflight CLI + tight inline `local_review:{mode:enforce}` → FAIL CLOSED', async () => {
+    const r = await runPrePushWithStubPolicy(
+      TOO_OLD_NO_PREFLIGHT,
+      'review:\n  local_review:{mode:enforce}\n',
+    );
+    expect(r.code).toBe(2);
+  });
+
+  it('P1/F2: no-preflight CLI + inline `local_review: { mode: off }` → FAIL OPEN (off means off)', async () => {
+    const r = await runPrePushWithStubPolicy(
+      TOO_OLD_NO_PREFLIGHT,
+      'review:\n  local_review: { mode: off }\n',
+    );
+    expect(r.code).toBe(0);
+  });
+
+  it('P1: no-preflight CLI + `local_review.mode: off` → FAIL OPEN (exit 0)', async () => {
+    const r = await runPrePushWithStubPolicy(
+      TOO_OLD_NO_PREFLIGHT,
+      'review:\n  local_review:\n    mode: off\n',
+    );
+    expect(r.code).toBe(0);
+  });
+
+  it('P1: no-preflight CLI + policy ABSENT → FAIL OPEN (exit 0)', async () => {
+    const r = await runPrePushWithStubPolicy(TOO_OLD_NO_PREFLIGHT, null);
+    expect(r.code).toBe(0);
+  });
+
+  it('P1: no-preflight CLI + unrelated sibling `mode: enforce` does NOT trip the gate → FAIL OPEN (exit 0)', async () => {
+    // Indentation-tracked block detection: a `mode: enforce` under a NON-target
+    // sibling key must not be read as an active local_review/g3_review gate.
+    const r = await runPrePushWithStubPolicy(
+      TOO_OLD_NO_PREFLIGHT,
+      'review:\n  local_review:\n    enabled: false\n  other_thing:\n    mode: enforce\n',
+    );
+    expect(r.code).toBe(0);
+  });
+
+  it('P1: pure `unknown option` at tier 3 + active gate → FAIL OPEN (flag mismatch never blocks)', async () => {
+    // A CLI that rejects EVERY option form with `unknown option` (never
+    // `unknown command`) is preflight-capable; a flag incompatibility must
+    // never block a push even in a gate-active repo.
+    const alwaysUnknownOption = [
+      '#!/bin/sh',
+      "case \"$1\" in",
+      '  preflight) echo "error: unknown option" >&2; exit 1 ;;',
+      '  hook) exit 0 ;;',
+      'esac',
+      'exit 0',
+      '',
+    ].join('\n');
+    const r = await runPrePushWithStubPolicy(
+      alwaysUnknownOption,
+      'review:\n  local_review:\n    mode: enforce\n',
+    );
+    expect(r.code).toBe(0);
+  });
+
+  // ── Round-33 P1 — HALT freeze covers BOTH roots, zero CLI dependency ──────
+  // Run the fallback hook in a repo with a given HALT layout and (optional) stub.
+  async function runPrePush(opts: {
+    haltLocal?: string; // write .rea/HALT in the pushed repo
+    stub?: string; // node_modules/.bin/rea contents (omit → no CLI at all)
+  }): Promise<{ code: number; stderr: string }> {
+    const repoDir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-pp-halt-')));
+    try {
+      await execFileAsync('git', ['-C', repoDir, 'init', '-q']);
+      if (opts.stub !== undefined) {
+        const stubBin = path.join(repoDir, 'node_modules', '.bin', 'rea');
+        await fs.mkdir(path.dirname(stubBin), { recursive: true });
+        await fs.writeFile(stubBin, opts.stub, { mode: 0o755 });
+      }
+      if (opts.haltLocal !== undefined) {
+        await fs.mkdir(path.join(repoDir, '.rea'), { recursive: true });
+        await fs.writeFile(path.join(repoDir, '.rea', 'HALT'), opts.haltLocal);
+      }
+      const hookPath = path.join(repoDir, '.git', 'hooks', 'pre-push');
+      await fs.writeFile(hookPath, fallbackHookContent(), { encoding: 'utf8', mode: 0o755 });
+      const r = await execFileAsync(hookPath, ['origin', 'git@example:r.git'], {
+        cwd: repoDir,
+      }).catch((e: { code?: number; stderr?: string }) => e);
+      return { code: (r as { code?: number }).code ?? 0, stderr: (r as { stderr?: string }).stderr ?? '' };
+    } finally {
+      await fs.rm(repoDir, { recursive: true, force: true });
+    }
+  }
+
+  const OK_STUB = '#!/bin/sh\nexit 0\n'; // preflight + push-gate both pass
+  const TOO_OLD_STUB = [
+    '#!/bin/sh',
+    "case \"$1\" in preflight) echo \"error: unknown command 'preflight'\" >&2; exit 1 ;; hook) exit 0 ;; esac",
+    'exit 0',
+    '',
+  ].join('\n');
+
+  it('P1: `.rea/HALT` + NO CLI at all → push blocked (exit 2), before the CLI ladder', async () => {
+    const r = await runPrePush({ haltLocal: 'frozen\n' }); // no stub
+    expect(r.code).toBe(2);
+    expect(r.stderr).toContain('REA HALT');
+  });
+
+  it('P1: HALT WINS even when the CLI would fail-open (too-old preflight stub)', async () => {
+    const r = await runPrePush({ haltLocal: 'frozen mid-push\n', stub: TOO_OLD_STUB });
+    expect(r.code).toBe(2);
+    expect(r.stderr).toContain('REA HALT');
+  });
+
+  it('P1 control: NO HALT + too-old preflight stub → round-32 fail-open still holds (exit 0)', async () => {
+    const r = await runPrePush({ stub: TOO_OLD_STUB });
+    expect(r.code).toBe(0);
+  });
+
+  it('P1 control: NO HALT + OK stub → push proceeds (exit 0)', async () => {
+    const r = await runPrePush({ stub: OK_STUB });
+    expect(r.code).toBe(0);
+  });
+
+  it('P1: common-root (sibling worktree) HALT → push from the worktree is blocked (exit 2)', async () => {
+    const primary = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-pp-wt-')));
+    const wtA = `${primary}-A`;
+    try {
+      await execFileAsync('git', ['-C', primary, 'init', '-q']);
+      await execFileAsync('git', ['-C', primary, 'config', 'user.email', 't@t']);
+      await execFileAsync('git', ['-C', primary, 'config', 'user.name', 't']);
+      await execFileAsync('git', ['-C', primary, 'commit', '-q', '--allow-empty', '-m', 'init']);
+      await execFileAsync('git', ['-C', primary, 'worktree', 'add', '-q', wtA, '-b', 'stream-a']);
+      // Freeze the PRIMARY (common root); worktree A has NO local HALT + no CLI.
+      await fs.mkdir(path.join(primary, '.rea'), { recursive: true });
+      await fs.writeFile(path.join(primary, '.rea', 'HALT'), 'repo-wide freeze\n');
+      // Resolve + write the hook git fires for the worktree, then run FROM wtA.
+      const hookPath = (
+        await execFileAsync('git', ['-C', wtA, 'rev-parse', '--git-path', 'hooks/pre-push'])
+      ).stdout.trim();
+      const abs = path.isAbsolute(hookPath) ? hookPath : path.join(wtA, hookPath);
+      await fs.mkdir(path.dirname(abs), { recursive: true });
+      await fs.writeFile(abs, fallbackHookContent(), { encoding: 'utf8', mode: 0o755 });
+      const r = await execFileAsync(abs, ['origin', 'git@example:r.git'], { cwd: wtA }).catch(
+        (e: { code?: number; stderr?: string }) => e,
+      );
+      expect((r as { code?: number }).code).toBe(2);
+      expect((r as { stderr?: string }).stderr ?? '').toContain('REA HALT');
+    } finally {
+      await fs.rm(wtA, { recursive: true, force: true });
+      await fs.rm(primary, { recursive: true, force: true });
+    }
+  });
+
   it('non-executable files in `.husky/pre-push.d/` are silently skipped', async () => {
     const repoDir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-pp-skip-')));
     try {
@@ -1066,5 +1535,87 @@ describe('extension-hook chaining (Fix H / 0.13.0) — `.husky/pre-push.d/*`', (
     } finally {
       await fs.rm(repoDir, { recursive: true, force: true });
     }
+  });
+});
+
+// ── Round-34 F2 — templates/pre-push.local-first.sh `--operation` compat ─────
+// This minimal reference template must carry the SAME compat-fallback as the
+// canonical BODY_TEMPLATE (round-32 F1): an older resolved `rea` that rejects
+// `--operation` must not hard-block the push.
+describe('templates/pre-push.local-first.sh — --operation compat-fallback (round-34 F2)', () => {
+  const TEMPLATE = path.resolve(__dirname, '..', '..', '..', 'templates', 'pre-push.local-first.sh');
+
+  async function runTemplate(stub: string): Promise<{ code: number; stderr: string }> {
+    const repoDir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-tmpl-')));
+    try {
+      await execFileAsync('git', ['-C', repoDir, 'init', '-q']);
+      const stubBin = path.join(repoDir, 'node_modules', '.bin', 'rea');
+      await fs.mkdir(path.dirname(stubBin), { recursive: true });
+      await fs.writeFile(stubBin, stub, { mode: 0o755 });
+      const tmpl = await fs.readFile(TEMPLATE, 'utf8');
+      const hookPath = path.join(repoDir, 'pp.sh');
+      await fs.writeFile(hookPath, tmpl, { mode: 0o755 });
+      const r = await execFileAsync('bash', [hookPath], { cwd: repoDir }).catch(
+        (e: { code?: number; stderr?: string }) => e,
+      );
+      return {
+        code: (r as { code?: number }).code ?? 0,
+        stderr: (r as { stderr?: string }).stderr ?? '',
+      };
+    } finally {
+      await fs.rm(repoDir, { recursive: true, force: true });
+    }
+  }
+
+  it('bash -n parses (template is syntactically valid)', async () => {
+    const tmpl = await fs.readFile(TEMPLATE, 'utf8');
+    const dir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'rea-tmpl-n-')));
+    try {
+      const p = path.join(dir, 'pp.sh');
+      await fs.writeFile(p, tmpl);
+      const r = await execFileAsync('bash', ['-n', p]).catch((e: { code?: number }) => e);
+      expect((r as { code?: number }).code ?? 0).toBe(0);
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('F2: an OLD CLI rejecting `--operation` → retries `--strict`, push NOT blocked (exit 0)', async () => {
+    const stub = [
+      '#!/bin/sh',
+      'op=0; for a in "$@"; do [ "$a" = "--operation" ] && op=1; done',
+      'case "$1" in',
+      '  preflight)',
+      '    if [ "$op" = "1" ]; then echo "error: unknown option \'--operation\'" >&2; exit 1; fi',
+      '    exit 0 ;;',
+      'esac',
+      'exit 0',
+      '',
+    ].join('\n');
+    const r = await runTemplate(stub);
+    expect(r.code).toBe(0);
+    expect(r.stderr).not.toContain('unknown option');
+  });
+
+  it('F2: a CLI with no `preflight` at all → FAIL OPEN (exit 0)', async () => {
+    const stub = [
+      '#!/bin/sh',
+      "case \"$1\" in preflight) echo \"error: unknown command 'preflight'\" >&2; exit 1 ;; esac",
+      'exit 0',
+      '',
+    ].join('\n');
+    expect((await runTemplate(stub)).code).toBe(0);
+  });
+
+  it('F2: a GENUINE refusal (exit 2) STILL blocks the push', async () => {
+    const stub = [
+      '#!/bin/sh',
+      'case "$1" in preflight) echo "no recent local review covers HEAD" >&2; exit 2 ;; esac',
+      'exit 0',
+      '',
+    ].join('\n');
+    const r = await runTemplate(stub);
+    expect(r.code).toBe(2);
+    expect(r.stderr).toContain('no recent local review');
   });
 });

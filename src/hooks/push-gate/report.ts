@@ -87,6 +87,11 @@ export function writeLastReview(input: WriteLastReviewInput): LastReviewPayload 
     duration_seconds: Number.isFinite(durationSeconds) ? durationSeconds : 0,
   };
 
+  persistLastReview(baseDir, payload);
+  return payload;
+}
+
+function persistLastReview(baseDir: string, payload: LastReviewPayload): void {
   const reaDir = path.join(baseDir, '.rea');
   ensureDir(reaDir);
   const finalPath = path.join(reaDir, LAST_REVIEW_FILENAME);
@@ -99,7 +104,72 @@ export function writeLastReview(input: WriteLastReviewInput): LastReviewPayload 
     fs.closeSync(fd);
   }
   fs.renameSync(tmpPath, finalPath);
+}
+
+/**
+ * 0.54.0 round-27 P2: refresh THIS stream's `.rea/last-review.json`
+ * when a push is satisfied from the SHARED verdict cache populated by
+ * another worktree. The cache entry carries no findings/review text —
+ * the payload says so explicitly rather than faking an empty review.
+ * Callers must gate on staleness (absent file or different head_sha):
+ * in a plain checkout a cache hit already has the richer full snapshot
+ * on disk and MUST NOT be overwritten with this thinner shape.
+ */
+export function writeLastReviewFromCache(input: {
+  baseDir: string;
+  verdict: LastReviewPayload['verdict'];
+  findingCount: number;
+  baseRef: string;
+  headSha: string;
+  cachedReviewedAt: string;
+  /** Redacted findings carried in the cache entry (0.54.0+ writers). */
+  findings?: readonly { severity: string; title: string; body: string; file?: string; line?: number }[];
+  /** Redacted review text carried in the cache entry (0.54.0+ writers). */
+  reviewText?: string;
+  now?: Date;
+}): LastReviewPayload {
+  const now = input.now ?? new Date();
+  const provenance =
+    `(served from the shared verdict cache — reviewed at ${input.cachedReviewedAt} ` +
+    `in another stream)`;
+  const payload: LastReviewPayload = {
+    schema_version: 1,
+    generated_at: now.toISOString(),
+    verdict: input.verdict,
+    base_ref: input.baseRef,
+    head_sha: input.headSha,
+    finding_count: input.findingCount,
+    // Round-29 P2: 0.54.0 cache entries carry the redacted findings +
+    // review text, so a cached blocking/concerns verdict stays
+    // actionable from the hitting stream. Pre-0.54.0 entries degrade
+    // to the counts-only shape with an explicit pointer.
+    findings: input.findings !== undefined ? input.findings.map((f) => toFinding(f)) : [],
+    review_text:
+      input.reviewText !== undefined
+        ? `${provenance}\n\n${input.reviewText}`
+        : `${provenance.slice(0, -1)}; findings are recorded in the reviewing worktree's ` +
+          `last-review.json and the repository audit chain)`,
+    event_count: 0,
+    duration_seconds: 0,
+  };
+  persistLastReview(input.baseDir, payload);
   return payload;
+}
+
+function toFinding(f: {
+  severity: string;
+  title: string;
+  body: string;
+  file?: string;
+  line?: number;
+}): Finding {
+  return {
+    severity: f.severity as Finding['severity'],
+    title: f.title,
+    body: f.body,
+    ...(f.file !== undefined ? { file: f.file } : {}),
+    ...(f.line !== undefined ? { line: f.line } : {}),
+  };
 }
 
 function redactFinding(f: Finding, patterns: CompiledSecretPattern[]): Finding {

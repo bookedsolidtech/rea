@@ -50,6 +50,9 @@ describe('ensureReaGitignore — BUG-010 scaffolding', () => {
     expect(content).toContain(GITIGNORE_BLOCK_END);
     expect(content).toContain('.rea/fingerprints.json');
     expect(content).toContain('.rea/audit.jsonl');
+    // Artifact-gates runtime state must be ignored (round-15 P2).
+    expect(content).toContain('.rea/tasks.jsonl');
+    expect(content).toContain('.rea/turn-count.*.json');
     expect(content.endsWith('\n')).toBe(true);
   });
 

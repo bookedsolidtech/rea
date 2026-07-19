@@ -1,6 +1,6 @@
 #!/bin/sh
-# rea:husky-pre-push-gate v4
-# rea:gate-body-v4
+# rea:husky-pre-push-gate v6
+# rea:gate-body-v6
 #
 # Husky pre-push hook installed by `rea init` / `rea upgrade`. Do NOT
 # edit by hand — the file is refreshed on every rea upgrade.
@@ -24,12 +24,88 @@ set -eu
 # then fall back to npx so the gate runs in every documented setup.
 
 REA_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
-if [ -f "${REA_ROOT}/.rea/HALT" ]; then
-  reason=$(awk 'NR==1 { print; exit }' "${REA_ROOT}/.rea/HALT" 2>/dev/null || printf 'unknown')
-  [ -z "${reason:-}" ] && reason='unknown'
-  printf 'REA HALT: %s\nAll push operations suspended. Run: rea unfreeze\n' "$reason" >&2
-  exit 1
+
+# 0.54.0 round-35 P1: a linked worktree frequently has no local install
+# (node_modules/dist live only in the PRIMARY checkout). Resolve the
+# CLI from ONE seam: the worktree first, then the primary checkout
+# (.git-file discriminator), then the PATH/npx tiers below unchanged.
+# REA_ROOT itself stays the worktree — HALT and policy are resolved
+# against it; only CLI dispatch follows REA_CLI_ROOT.
+REA_CLI_ROOT="$REA_ROOT"
+if [ ! -x "${REA_ROOT}/node_modules/.bin/rea" ] && [ ! -f "${REA_ROOT}/dist/cli/index.js" ] \
+   && [ -f "${REA_ROOT}/.git" ]; then
+  _rea_common_dir=$(git -C "$REA_ROOT" rev-parse --git-common-dir 2>/dev/null || true)
+  case "$_rea_common_dir" in
+    "") : ;;
+    /*) : ;;
+    *) _rea_common_dir="${REA_ROOT}/${_rea_common_dir}" ;;
+  esac
+  if [ -n "$_rea_common_dir" ]; then
+    _rea_common=$(dirname "$_rea_common_dir")
+    # Round-3 P2: verify the dirname candidate is the SAME repository
+    # (its git-common-dir resolves to ours) — a bare/separate-git-dir
+    # layout nesting metadata under an UNRELATED checkout must not have
+    # its CLI executed against this repo's push.
+    _rea_same_repo=0
+    if [ -d "${_rea_common}/.rea" ] || [ -e "${_rea_common}/.git" ]; then
+      _cc=$(git -C "$_rea_common" rev-parse --git-common-dir 2>/dev/null || true)
+      case "$_cc" in "") : ;; /*) : ;; *) _cc="${_rea_common}/${_cc}" ;; esac
+      if [ -n "$_cc" ]; then
+        _x=$(cd "$_cc" 2>/dev/null && pwd -P) || _x="$_cc"
+        _y=$(cd "$_rea_common_dir" 2>/dev/null && pwd -P) || _y="$_rea_common_dir"
+        [ "$_x" = "$_y" ] && _rea_same_repo=1
+      fi
+    fi
+    # Round-36 P2: a foreign nested checkout (verification failed) OR a
+    # --separate-git-dir primary whose metadata is external — fall back
+    # to git's first listed worktree (THIS repo's main one).
+    if [ "$_rea_same_repo" = "0" ]; then
+      _rea_common=$(git -C "$REA_ROOT" worktree list --porcelain 2>/dev/null \
+        | sed -n 's/^worktree //p' | head -n 1)
+    fi
+    if [ -n "$_rea_common" ] && [ "$_rea_common" != "$REA_ROOT" ] \
+       && { [ -d "${_rea_common}/.rea" ] || [ -e "${_rea_common}/.git" ]; } \
+       && { [ -x "${_rea_common}/node_modules/.bin/rea" ] \
+            || { [ -f "${_rea_common}/dist/cli/index.js" ] && [ -f "${_rea_common}/package.json" ] \
+                 && grep -q '"name": *"@bookedsolid/rea"' "${_rea_common}/package.json" 2>/dev/null; }; }; then
+      REA_CLI_ROOT="$_rea_common"
+    fi
+  fi
 fi
+# HALT freeze contract (round-33 P1). A frozen repo (`.rea/HALT` present) must
+# refuse the push with ZERO CLI dependency — the freeze has to hold even when
+# the CLI ladder below falls back to an older/global rea or hits the
+# no-preflight compat path (round-32 F1). Mirrors the pre-commit HALT probe
+# (round-18 F2 / round-19 F1) and `hooks/_lib/halt-check.sh`, which this
+# standalone git hook cannot source: probe the LOCAL worktree root AND the
+# COMMON (primary-checkout) root, so a sibling-worktree push cannot bypass a
+# repo-wide freeze. The `.git`-is-a-FILE test is the cheap gate for "is this
+# even a linked worktree" (plain checkouts pay only the -f test, zero git
+# subprocesses). The common root is `git worktree list --porcelain`'s FIRST
+# `worktree ` line (the main working tree) — robust under `--separate-git-dir`
+# / absorbed-submodule gitfiles where dirname(git-common-dir) is EXTERNAL
+# metadata, and it never false-freezes on a foreign repo's HALT (git lists only
+# THIS repo's worktrees). Every git call is `|| true`-guarded → a broken/absent
+# git degrades to a LOCAL-only probe. ABSENCE at both roots = fall through to
+# the CLI/preflight ladder; this check never hard-fails a push on its own.
+# bash-3.2/BSD-safe.
+_rea_halt_common="$REA_ROOT"
+if [ -f "${REA_ROOT}/.git" ]; then
+  _rea_main=$(git -C "$REA_ROOT" worktree list --porcelain 2>/dev/null \
+    | sed -n 's/^worktree //p' | head -n 1 || true)
+  if [ -n "$_rea_main" ] && [ "$_rea_main" != "$REA_ROOT" ] \
+     && { [ -d "${_rea_main}/.rea" ] || [ -e "${_rea_main}/.git" ]; }; then
+    _rea_halt_common="$_rea_main"
+  fi
+fi
+for _rea_hf in "${REA_ROOT}/.rea/HALT" "${_rea_halt_common}/.rea/HALT"; do
+  if [ -f "$_rea_hf" ]; then
+    printf 'REA HALT: %s\nAll push operations suspended. Run: rea unfreeze\n' \
+      "$(head -c 1024 "$_rea_hf" 2>/dev/null || echo 'Reason unknown')" >&2
+    exit 2
+  fi
+  [ "$REA_ROOT" = "$_rea_halt_common" ] && break
+done
 
 # Dispatch the rea CLI as a positional-args list rather than a string
 # (the 0.11.x `exec $REA_BIN ...` pattern broke when REA_ROOT contained
@@ -50,17 +126,75 @@ fi
 # the subshell sees those as its initial $@, appends them inside each
 # `set --` arm, and the parent's $@ is preserved.
 
+# 0.26.0 local-first enforcement (CTO directive 2026-05-05). Run
+# `rea preflight --strict --operation push` BEFORE the push-gate dispatch. Preflight
+# refuses (exit 2) when no recent `rea.local_review` audit entry
+# covers HEAD, when commit-hygiene thresholds are exceeded, or when
+# the kill-switch is active. The legacy push-gate then runs as the
+# SECOND layer (codex on the diff). Honors:
+#   - policy.review.local_review.mode: off  → preflight is no-op
+#   - REA_SKIP_LOCAL_REVIEW="<reason>"      → bypass + audit
+# We resolve the rea binary the same way the dispatch below does.
+#
+# 0.26.0 preflight COMPAT (round-32 F1). The `--operation` flag is NEW in
+# this release. A RESOLVED but OLDER rea CLI — a repo pinned below this
+# release, or a stale PATH/global fallback — does not know it, and commander
+# exits `unknown option '--operation'`, which would HARD-BLOCK every push
+# before the gate runs. `_rea_preflight` tries the current invocation; on an
+# unknown-option/unknown-command error it RETRIES the pre-0.26
+# `preflight --strict` form so the gate STILL RUNS on the older CLI; if even
+# that is unknown (a CLI too old to have `preflight` at all) it FAILS OPEN —
+# a flag/subcommand incompatibility must never block a push (the push-gate
+# below is the second layer). A GENUINE refusal (exit 2, no unknown-* marker)
+# propagates unchanged. $@ is the resolved CLI prefix.
+_rea_preflight() {
+  _pf_out=$("$@" preflight --strict --operation push 2>&1) && _pf_rc=0 || _pf_rc=$?
+  if [ "$_pf_rc" -ne 0 ]; then
+    case "$_pf_out" in
+      *"unknown option"* | *"unknown command"*)
+        _pf_out=$("$@" preflight --strict 2>&1) && _pf_rc=0 || _pf_rc=$?
+        case "$_pf_out" in
+          *"unknown option"* | *"unknown command"*) _pf_out=""; _pf_rc=0 ;;
+        esac
+        ;;
+    esac
+  fi
+  if [ -n "$_pf_out" ]; then printf '%s\n' "$_pf_out" >&2; fi
+  return "$_pf_rc"
+}
 if (
-  if [ -x "${REA_ROOT}/node_modules/.bin/rea" ]; then
-    set -- "${REA_ROOT}/node_modules/.bin/rea" hook push-gate "$@"
-  elif [ -f "${REA_ROOT}/dist/cli/index.js" ] && [ -f "${REA_ROOT}/package.json" ] && grep -q '"name": *"@bookedsolid/rea"' "${REA_ROOT}/package.json" 2>/dev/null; then
+  if [ -x "${REA_CLI_ROOT}/node_modules/.bin/rea" ]; then
+    _rea_preflight "${REA_CLI_ROOT}/node_modules/.bin/rea"
+  elif [ -f "${REA_CLI_ROOT}/dist/cli/index.js" ] && [ -f "${REA_CLI_ROOT}/package.json" ] && grep -q '"name": *"@bookedsolid/rea"' "${REA_CLI_ROOT}/package.json" 2>/dev/null; then
+    _rea_preflight node "${REA_CLI_ROOT}/dist/cli/index.js"
+  elif command -v rea >/dev/null 2>&1; then
+    _rea_preflight rea
+  elif command -v npx >/dev/null 2>&1; then
+    _rea_preflight npx --no-install @bookedsolid/rea
+  else
+    printf 'rea: cannot locate the rea CLI for preflight. Install locally (`pnpm add -D @bookedsolid/rea`) or set policy.review.local_review.mode=off.\n' >&2
+    exit 2
+  fi
+); then
+  preflight_status=0
+else
+  preflight_status=$?
+fi
+if [ "$preflight_status" -ne 0 ]; then
+  exit "$preflight_status"
+fi
+
+if (
+  if [ -x "${REA_CLI_ROOT}/node_modules/.bin/rea" ]; then
+    set -- "${REA_CLI_ROOT}/node_modules/.bin/rea" hook push-gate "$@"
+  elif [ -f "${REA_CLI_ROOT}/dist/cli/index.js" ] && [ -f "${REA_CLI_ROOT}/package.json" ] && grep -q '"name": *"@bookedsolid/rea"' "${REA_CLI_ROOT}/package.json" 2>/dev/null; then
     # rea's own repo (dogfood) — the package is not installed under
     # node_modules here because we ARE the package. The built CLI
     # entry point lives at dist/cli/index.js; node runs it directly.
     # Gate this branch on `package.json` declaring `@bookedsolid/rea` so a
     # consumer repo that happens to ship its own `dist/cli/index.js` does
     # not get this hook executing the consumer's unrelated build.
-    set -- node "${REA_ROOT}/dist/cli/index.js" hook push-gate "$@"
+    set -- node "${REA_CLI_ROOT}/dist/cli/index.js" hook push-gate "$@"
   elif command -v rea >/dev/null 2>&1; then
     set -- rea hook push-gate "$@"
   elif command -v npx >/dev/null 2>&1; then

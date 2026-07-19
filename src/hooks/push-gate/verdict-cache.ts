@@ -83,8 +83,26 @@ export interface VerdictCacheEntry {
   finding_count: number;
   reviewed_at: string;
   model: string;
-  reasoning_effort: 'low' | 'medium' | 'high';
+  reasoning_effort: 'low' | 'medium' | 'high' | 'xhigh';
   ttl_ms: number;
+  /**
+   * 0.54.0 round-29 P2: the REDACTED findings + review text as written
+   * to the reviewing stream's last-review.json. Carried so a cache hit
+   * from ANOTHER worktree can materialize an actionable local snapshot
+   * (a cached blocking verdict without bodies leaves the stream unable
+   * to see what to fix). Optional — pre-0.54.0 entries lack them and
+   * hits degrade to the counts-only snapshot.
+   */
+  findings?: readonly CachedFinding[];
+  review_text?: string;
+}
+
+export interface CachedFinding {
+  severity: string;
+  title: string;
+  body: string;
+  file?: string;
+  line?: number;
 }
 
 interface VerdictCacheFile {

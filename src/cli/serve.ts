@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import { resolveCommonRoot } from '../lib/worktree-roots.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import { loadPolicy } from '../policy/loader.js';
@@ -318,7 +319,13 @@ export async function runServe(): Promise<void> {
   });
 
   // ── HALT acknowledgement at startup (G5) ─────────────────────────────────
-  const haltPath = reaPath(baseDir, HALT_FILE);
+  // 0.54.0: the startup acknowledgement probes both roots (the freeze
+  // may have been issued from another worktree). The middleware chain
+  // enforces per-invocation regardless.
+  const localHaltPath = reaPath(baseDir, HALT_FILE);
+  const haltPath = fs.existsSync(localHaltPath)
+    ? localHaltPath
+    : reaPath(resolveCommonRoot(baseDir, () => {}).commonRoot, HALT_FILE);
   if (fs.existsSync(haltPath)) {
     logger.info({
       event: 'halt.acknowledged_at_startup',

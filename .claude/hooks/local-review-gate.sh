@@ -51,6 +51,14 @@ _shim_apply_defaults
 # 2. Read stdin once.
 INPUT=$(cat)
 
+# 2a. Worktree payload-root handoff (round-23 P1): this shim bypasses
+#     shim_run, so it must apply the same guarded ladder itself —
+#     otherwise review.local_review.* policy reads (mode, refuse_at,
+#     bypass var) keep coming from the PRIMARY checkout while the
+#     session works in a linked worktree. May rewrite REA_ROOT/proj and
+#     exits 2 on a HALT discovered at the accepted root.
+shim_worktree_handoff
+
 # 2b. Early default-bypass-env-var short-circuit. We can only check the
 #     DEFAULT var name (REA_SKIP_LOCAL_REVIEW) this early because the
 #     policy-renamed var requires a policy read. The policy-aware
@@ -108,7 +116,10 @@ fi
 # it with bad:cli-escapes-project and wrongly refuse the push.
 SANDBOX_EARLY_FAILURE=""
 if [ "${#REA_ARGV[@]}" -gt 0 ] && [ "${TRUST_TIER:-project}" = "project" ] && command -v node >/dev/null 2>&1; then
-  sandbox_check_early=$(shim_sandbox_check "$RESOLVED_CLI_PATH" "$proj" "$SHIM_ENFORCE_CLI_SHAPE")
+  # Round-24 P1: containment runs against the root the CLI actually
+  # resolved from (a worktree-local install must not be rejected as
+  # cli-escapes-project just because proj pins the primary checkout).
+  sandbox_check_early=$(shim_sandbox_check "$RESOLVED_CLI_PATH" "${CLI_RESOLVE_ROOT:-$proj}" "$SHIM_ENFORCE_CLI_SHAPE")
   # TOCTOU precursor: shim_sandbox_check now echoes `ok:<realpath>` on
   # success (was bare `ok`). Branch on the `ok:` prefix. This hook is
   # the documented shim_run exception, so it keeps executing the literal

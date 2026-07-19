@@ -25,7 +25,8 @@
 import type { RegistryServer } from './types.js';
 import { Tier, InvocationStatus } from '../policy/types.js';
 import { appendAuditRecord } from '../audit/append.js';
-import { loadFingerprintStore, saveFingerprintStore } from './fingerprints-store.js';
+import { resolveCommonRoot } from '../lib/worktree-roots.js';
+import { updateFingerprintStore } from './fingerprints-store.js';
 import { classifyServers, updateStore, type TofuClassification } from './tofu.js';
 import { createLogger, type Logger } from '../gateway/log.js';
 
@@ -68,27 +69,50 @@ export async function applyTofuGate(
   logger?: Logger,
 ): Promise<TofuGateResult> {
   const log = logger ?? createLogger();
-  const store = await loadFingerprintStore(baseDir);
   const acceptDrift = process.env.REA_ACCEPT_DRIFT;
-  const classifications = classifyServers(
-    servers,
-    store,
-    acceptDrift !== undefined ? { acceptDrift } : {},
-  );
+
+  // Rounds 14+26: classify AND write inside the store lock against the
+  // FRESH read. Round-14 P1 moved the write under the lock so a
+  // concurrent `rea tofu accept` from another worktree merges instead
+  // of last-writer-wins; round-26 P2 moves classification there too —
+  // deciding against a pre-lock snapshot could emit drift/first-seen
+  // side effects and drop a server that a racing accept had already
+  // trusted in the shared store.
+  let classifications: TofuClassification[] = [];
+  const { lockError } = await updateFingerprintStore(baseDir, async (fresh) => {
+    classifications = classifyServers(
+      servers,
+      fresh,
+      acceptDrift !== undefined ? { acceptDrift } : {},
+    );
+    // Round-32 P2: side effects fire BEFORE the store persists — a
+    // crash/SIGTERM after persisting but before the first-seen/drift
+    // banner + audit record would make the next boot classify the
+    // fingerprint as `unchanged` and permanently swallow exactly the
+    // trust decision TOFU exists to surface. Emitting first means a
+    // crash in this window re-emits on the next boot (duplicate
+    // banner) instead of going silent. Lock ordering stays acyclic:
+    // store lock → audit lock here; no path takes them in reverse.
+    for (const c of classifications) {
+      await emitSideEffects(baseDir, c, log);
+    }
+    return updateStore(fresh, classifications);
+  });
+  if (lockError !== undefined) {
+    log.warn({
+      event: 'tofu.store_lock_degraded',
+      message: `fingerprint-store lock degraded (${lockError}) — write skipped, will re-persist next run`,
+    });
+  }
 
   const byName = new Map(servers.map((s) => [s.name, s]));
   const accepted: RegistryServer[] = [];
-
   for (const c of classifications) {
     const server = byName.get(c.server);
     if (server === undefined) continue; // defensive — classifyServers preserves order
-    await emitSideEffects(baseDir, c, log);
     if (c.verdict === 'drifted' && !c.bypassed) continue;
     accepted.push(server);
   }
-
-  const nextStore = updateStore(store, classifications);
-  await saveFingerprintStore(baseDir, nextStore);
 
   return { accepted, classifications };
 }
@@ -220,7 +244,10 @@ async function safeAudit(
       metadata: entry.metadata,
       ...(entry.error !== undefined ? { error: entry.error } : {}),
     };
-    await appendAuditRecord(baseDir, input);
+    // 0.54.0 round-8 P2: TOFU events join the repository chain — the
+    // fingerprint store already resolves the common root, and a record
+    // written to a per-worktree audit file would fork the chain.
+    await appendAuditRecord(resolveCommonRoot(baseDir, () => {}).commonRoot, input);
   } catch (err) {
     log.error({
       event: 'registry.tofu.audit_failed',

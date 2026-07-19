@@ -42,6 +42,8 @@ import fsPromises from 'node:fs/promises';
 import path from 'node:path';
 import * as p from '@clack/prompts';
 import { loadPolicy } from '../policy/loader.js';
+import { registerProject } from '../registry/projects.js';
+import { deriveProjectName } from './dash.js';
 import {
   CLAUDE_MD_MANIFEST_PATH,
   SETTINGS_MANIFEST_PATH,
@@ -60,12 +62,17 @@ import {
   defaultDesiredHooks,
   mergeSettings,
   pruneHookCommands,
+  pruneMatcherScopedHooks,
   readSettings,
   writeSettingsAtomic,
+  STALE_HOOK_COMMAND_TOKENS,
+  STALE_MATCHER_SCOPED_HOOKS,
 } from './install/settings-merge.js';
 import { validateSettings } from '../config/settings-schema.js';
 import { ensureReaGitignore } from './install/gitignore.js';
 import { installPrepareCommitMsgHook } from './install/prepare-commit-msg.js';
+import { installPreCommitHook } from './install/pre-commit.js';
+import { installPrePushFallback } from './install/pre-push.js';
 import { checkUpgradeBlockingPin, selfPinRea } from './install/self-pin.js';
 import { manifestExists, readManifest, writeManifestAtomic } from './install/manifest-io.js';
 import { type InstallManifest, type ManifestEntry } from './install/manifest-schema.js';
@@ -447,27 +454,11 @@ async function upgradeClaudeMdFragment(
   return { sha: newSha, action: 'written' };
 }
 
-/**
- * Hook commands deleted in 0.11.0. `upgradeSettings` prunes any entries
- * whose `command` string contains one of these tokens so consumer
- * `.claude/settings.json` files don't keep invoking missing scripts
- * (which would fail every matched tool call until the operator edited
- * settings by hand).
- *
- * 0.11.0 removals:
- *   - push-review-gate.sh        (replaced by husky stub → rea hook push-gate)
- *   - commit-review-gate.sh      (intentionally unregistered; source-of-truth deleted)
- *   - push-review-gate-git.sh    (native-git adapter; deleted)
- *
- * Add future removals here rather than baking the list into
- * `pruneHookCommands` itself — the removal list is release history,
- * not a static setting.
- */
-const STALE_HOOK_COMMAND_TOKENS: readonly string[] = [
-  'push-review-gate.sh',
-  'commit-review-gate.sh',
-  'push-review-gate-git.sh',
-];
+// STALE_HOOK_COMMAND_TOKENS and STALE_MATCHER_SCOPED_HOOKS were relocated to
+// `./install/settings-merge.js` (their natural shared home, next to
+// `pruneHookCommands` / `pruneMatcherScopedHooks`) so `rea init` and
+// `rea upgrade` prune against ONE source of truth (codex round-47 P2). They are
+// imported at the top of this file; the values and call order are unchanged.
 
 async function upgradeSettings(
   baseDir: string,
@@ -487,7 +478,13 @@ async function upgradeSettings(
   // stale entry only to have the prune re-delete it on the next line —
   // pointless work. Pruning first means the merge sees a clean baseline.
   const pruned = pruneHookCommands(settings, STALE_HOOK_COMMAND_TOKENS);
-  const mergeResult = mergeSettings(pruned.merged, desired);
+  // Matcher-scoped prune for hooks that MOVED matchers (round-24
+  // billing-cap-halt Bash→*). Runs AFTER the command-token prune and BEFORE
+  // the additive merge, so the merge re-adds the hook under its NEW matcher
+  // against a baseline with the stale old-matcher registration already gone —
+  // exactly one registration remains, no double-invocation.
+  const movedPruned = pruneMatcherScopedHooks(pruned.merged, STALE_MATCHER_SCOPED_HOOKS);
+  const mergeResult = mergeSettings(movedPruned.merged, desired);
   // 0.30.0 Class M — validate the merged result with the non-strict
   // schema before writing. If the merged output would fail zod parse,
   // refuse the write and leave the consumer settings untouched. This
@@ -512,11 +509,18 @@ async function upgradeSettings(
       } from .claude/settings.json (removed in 0.11.0)`,
     );
   }
+  if (movedPruned.removedCount > 0) {
+    warnings.push(
+      `pruned ${movedPruned.removedCount} stale matcher-scoped hook registration${
+        movedPruned.removedCount === 1 ? '' : 's'
+      } from .claude/settings.json (billing-cap-halt.sh moved PostToolUse/Bash → PostToolUse/*)`,
+    );
+  }
   return {
     sha,
     addedCount: mergeResult.addedCount,
     skippedCount: mergeResult.skippedCount,
-    removedCount: pruned.removedCount,
+    removedCount: pruned.removedCount + movedPruned.removedCount,
     warnings,
   };
 }
@@ -582,7 +586,8 @@ export async function runUpgrade(options: UpgradeOptions = {}): Promise<void> {
     const desired = defaultDesiredHooks();
     const { settings: existingSettings } = readSettings(resolvedRoot);
     const pruned = pruneHookCommands(existingSettings, STALE_HOOK_COMMAND_TOKENS);
-    const mergeResult = mergeSettings(pruned.merged, desired);
+    const movedPruned = pruneMatcherScopedHooks(pruned.merged, STALE_MATCHER_SCOPED_HOOKS);
+    const mergeResult = mergeSettings(movedPruned.merged, desired);
     const validation = validateSettings(mergeResult.merged);
     if (!validation.parsed) {
       throw new Error(
@@ -842,6 +847,49 @@ export async function runUpgrade(options: UpgradeOptions = {}): Promise<void> {
       console.log(`  ${marker} ${target} (attribution augmenter)`);
     }
     for (const w of pcmResult.warnings) warn(w);
+
+    // 0.54.0 — G1 spec-gate (Artifact Gates). Lay down `.husky/pre-commit`
+    // on upgrade too (consumers upgrading from a pre-G1 install would not
+    // get the gate unless they re-ran `rea init`). Same shape as the
+    // prepare-commit-msg augmenter above: the hook body is a no-op until
+    // `policy.artifact_gates.g1_spec.mode` is opted into shadow/enforce, so
+    // installing unconditionally is safe; the installer refuses to overwrite
+    // a foreign `.husky/pre-commit` (marker-guarded). `.husky/pre-commit`
+    // is also a canonical file, so the reconcile loop above SHA-tracks it in
+    // the manifest — this call handles the foreign-hook guard + fresh-install
+    // case the reconcile loop's enumerate cannot (mirrors installPrePushFallback).
+    const preCommitResult = await installPreCommitHook({ targetDir: resolvedRoot });
+    if (preCommitResult.written !== undefined) {
+      const marker = preCommitResult.decision.action === 'refresh' ? '~' : '+';
+      console.log(
+        `  ${marker} ${path.relative(resolvedRoot, preCommitResult.written)} (G1 spec-gate; no-op until policy opt-in)`,
+      );
+    } else if (preCommitResult.decision.action === 'skip') {
+      warn(`  · .husky/pre-commit (kept; foreign hook detected — see MIGRATING.md)`);
+    }
+
+    // Round-55 P1 follow-up — refresh the `.git/hooks/pre-push` FALLBACK on
+    // upgrade too. Unlike `.husky/pre-push` (a canonical file the reconcile
+    // loop above SHA-tracks + refreshes), the vanilla-git fallback lives
+    // OUTSIDE `.claude/`/`.husky/`, so the reconcile loop never sees it — and
+    // before this call `rea upgrade` left a stale rea-managed fallback body in
+    // place (the mode-aware G3 fix reached only re-`rea init` runs). The
+    // installer is marker-classified: it REFRESHES a rea-managed body (incl.
+    // the now-legacy v6) to the current v7 and refuses to touch foreign hooks.
+    // Same shape + reporting as the pre-commit block above.
+    const prePushResult = await installPrePushFallback({ targetDir: resolvedRoot });
+    if (prePushResult.written !== undefined) {
+      const marker = prePushResult.decision.action === 'refresh' ? '~' : '+';
+      console.log(
+        `  ${marker} ${path.relative(resolvedRoot, prePushResult.written)} (pre-push fallback)`,
+      );
+    } else if (
+      prePushResult.decision.action === 'skip' &&
+      prePushResult.decision.reason === 'foreign-pre-push'
+    ) {
+      warn(`  · ${path.relative(resolvedRoot, prePushResult.decision.hookPath)} (kept; foreign pre-push detected — see MIGRATING.md)`);
+    }
+    for (const w of prePushResult.warnings) warn(w);
   }
 
   // 0.49.0 — self-heal legacy installs that pre-date `rea init`'s
@@ -993,6 +1041,20 @@ export async function runUpgrade(options: UpgradeOptions = {}): Promise<void> {
     console.log('Bootstrap mode: existing files were recorded as-is. The next `rea upgrade`');
     console.log('will compare against the canonical set and surface any legitimate drift.');
   }
+
+  // Refresh this project's entry in the user-global dashboard registry
+  // (`~/.rea/registry.json`) with the just-upgraded rea version. BEST-EFFORT:
+  // a registry write failure must NEVER fail the upgrade — the registry lives
+  // OUTSIDE the project. Idempotent (upsert keyed on the resolved root).
+  try {
+    await registerProject(resolvedRoot, {
+      name: deriveProjectName(resolvedRoot),
+      reaVersion: getPkgVersion(),
+    });
+  } catch (e) {
+    warn(`could not update the global dashboard registry: ${e instanceof Error ? e.message : String(e)}`);
+  }
+
   console.log('');
 }
 

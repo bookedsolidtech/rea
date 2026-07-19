@@ -34,6 +34,8 @@
  */
 
 import fs from 'node:fs/promises';
+import { resolveCommonRoot } from '../lib/worktree-roots.js';
+import properLockfile from 'proper-lockfile';
 import path from 'node:path';
 import { z } from 'zod';
 
@@ -53,8 +55,86 @@ const FingerprintStoreSchema = z
 
 export type FingerprintStore = z.infer<typeof FingerprintStoreSchema>;
 
+/**
+ * 0.54.0 worktree state: TOFU trust is per-REPOSITORY — the store path
+ * resolves to the COMMON (primary-checkout) root regardless of which
+ * worktree the caller passed, so `rea tofu accept` in one stream is
+ * honored by `rea serve` started from another. Single seam: every
+ * caller (tofu CLI, gateway tofu-gate, upgrade) goes through here.
+ * Degenerate in plain checkouts.
+ */
+/**
+ * Round-14 P1: the shared (common-root) store makes concurrent
+ * read-modify-write across worktrees a lost-update hazard. Every
+ * mutation goes through this helper: a proper-lockfile lock on the
+ * STORE PATH (its own `<store>.lock` sidecar — deliberately NOT the
+ * `.rea/` directory, which is the audit chain's lock target; both TOFU
+ * mutation sites also append audit records, so sharing that target
+ * would deadlock). Generous bounded acquisition (retry + stale-steal),
+ * so contention always serializes; on a genuine lock-infrastructure
+ * failure the mutate still runs (fail-loud side effects) but the write
+ * is SKIPPED rather than performed unlocked — the caller sees
+ * `lockError` and the record re-persists on the next run (round-44 P2).
+ */
+const STORE_LOCK_OPTIONS: Parameters<typeof properLockfile.lock>[1] = {
+  stale: 5_000,
+  retries: { retries: 20, factor: 1.4, minTimeout: 10, maxTimeout: 200, randomize: true },
+  realpath: false,
+};
+
+export async function updateFingerprintStore(
+  baseDir: string,
+  mutate: (store: FingerprintStore) => FingerprintStore | Promise<FingerprintStore>,
+): Promise<{ store: FingerprintStore; lockError?: string }> {
+  const filePath = storePathFor(baseDir);
+  let release: (() => Promise<void>) | null = null;
+  let lockError: string | undefined;
+  try {
+    // Round-20 P2 (cold start): `realpath: false` already lets the lock
+    // target be a not-yet-written fingerprints.json, but the sidecar
+    // mkdir still ENOENTs when `.rea/` itself is absent (fresh clone
+    // before any store write) — which would silently degrade every
+    // first-write to the unlocked fallback and reopen the concurrent
+    // cold-start lost-update this lock exists to close.
+    await fs.mkdir(path.dirname(filePath), { recursive: true });
+    release = await properLockfile.lock(filePath, STORE_LOCK_OPTIONS);
+  } catch (e) {
+    lockError = e instanceof Error ? e.message : String(e);
+  }
+  try {
+    const store = await loadFingerprintStore(baseDir);
+    const next = await mutate(store);
+    // Round-44 P2: NEVER persist the shared common-root store unlocked.
+    // The `mutate` still ran (its side effects — TOFU first-seen/drift
+    // banners + audit records — fire fail-loud per round-32), but on a
+    // lock-acquisition failure we SKIP the write rather than clobber a
+    // concurrent locked writer's read-modify-write. With the generous
+    // retry budget + stale-steal above, contention always serializes;
+    // this path is reached only on a genuine lock-infrastructure
+    // failure, where the record is simply re-emitted and re-persisted
+    // on the next run (a re-prompt, never a silent trust downgrade).
+    if (lockError !== undefined) {
+      return { store: next, lockError };
+    }
+    await saveFingerprintStore(baseDir, next);
+    return { store: next };
+  } finally {
+    if (release !== null) {
+      try {
+        await release();
+      } catch {
+        /* stale-cleaned — work already durable */
+      }
+    }
+  }
+}
+
+function storeRootFor(baseDir: string): string {
+  return resolveCommonRoot(baseDir, () => {}).commonRoot;
+}
+
 function storePathFor(baseDir: string): string {
-  return path.join(baseDir, REA_DIR, FINGERPRINTS_FILE);
+  return path.join(storeRootFor(baseDir), REA_DIR, FINGERPRINTS_FILE);
 }
 
 /**
@@ -106,7 +186,7 @@ export async function saveFingerprintStore(
 ): Promise<void> {
   const filePath = storePathFor(baseDir);
   const tmpPath = `${filePath}.new`;
-  await fs.mkdir(path.join(baseDir, REA_DIR), { recursive: true });
+  await fs.mkdir(path.join(storeRootFor(baseDir), REA_DIR), { recursive: true });
 
   // Validate before write — a malformed in-memory store should never be
   // persisted. The parse is cheap and catches bugs in the classify layer.

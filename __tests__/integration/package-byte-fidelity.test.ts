@@ -240,6 +240,7 @@ describe.runIf(PACK_TESTS_ENABLED)('package byte-fidelity', () => {
       'hooks/',
       'commands/',
       'agents/',
+      'spine/',
       'profiles/',
       'templates/',
     ];

@@ -44,7 +44,8 @@ import type { Buffer } from 'node:buffer';
 import fs from 'node:fs';
 import path from 'node:path';
 import { parse as parseYaml } from 'yaml';
-import { checkHalt, formatHaltBanner } from '../_lib/halt-check.js';
+import { checkHaltRoots, formatHaltBanner } from '../_lib/halt-check.js';
+import { resolveHookRoots } from '../../lib/worktree-roots.js';
 import {
   parseWriteHookPayload,
   MalformedPayloadError,
@@ -204,48 +205,59 @@ function isAdvisoryDisabled(reaRoot: string): boolean {
 export async function runArchitectureReviewGate(
   options: ArchitectureReviewGateOptions = {},
 ): Promise<ArchitectureReviewGateResult> {
-  const reaRoot =
-    options.reaRoot ?? process.env['CLAUDE_PROJECT_DIR'] ?? process.cwd();
   let stderr = '';
   const writeStderr = (s: string): void => {
     stderr += s;
     if (options.stderrWrite) options.stderrWrite(s);
   };
 
-  // 1. HALT.
-  const halt = checkHalt(reaRoot);
-  if (halt.halted) {
-    writeStderr(formatHaltBanner(halt.reason));
-    return { exitCode: 2, stderr, matched: null };
-  }
-
-  // 2. Disabled?
-  if (isAdvisoryDisabled(reaRoot)) {
-    return { exitCode: 0, stderr, matched: null };
-  }
-
-  // 3. Stdin.
+  // 1. Stdin FIRST (0.54.0 worktree state): the payload's `cwd` feeds
+  //    root resolution, so parsing precedes the HALT/disabled checks —
+  //    a deliberate reorder.
   const stdinRaw =
     options.stdinOverride !== undefined
       ? options.stdinOverride
       : await readStdinWithTimeout(5_000);
 
   let filePath = '';
+  let payloadCwd = '';
   try {
     const payload = parseWriteHookPayload(stdinRaw);
     filePath = payload.filePath;
+    payloadCwd = payload.cwd;
   } catch (err) {
     if (err instanceof MalformedPayloadError || err instanceof TypePayloadError) {
-      // Advisory tier: silently exit 0 on malformed payload. The bash
-      // hook used `jq -r '.tool_input.file_path // empty'` which
-      // coerces malformed JSON to empty stdout, then exits 0. Mirror
-      // that — never refuse on a parse error in the advisory path.
+      // Advisory tier: exit 0 on malformed payload (the bash hook's
+      // `jq -r ... // empty` posture) — but round-21 P3: an ACTIVE
+      // freeze still denies first, matching the pre-0.54.0 order where
+      // the HALT probe preceded parsing. Roots come from the env
+      // ladder (no payload cwd is available on this path).
+      const frozen = resolveHookRoots(undefined, options.reaRoot);
+      const frozenHalt = checkHaltRoots(frozen.localRoot, frozen.commonRoot);
+      if (frozenHalt.halted) {
+        writeStderr(formatHaltBanner(frozenHalt.reason));
+        return { exitCode: 2, stderr, matched: null };
+      }
       return { exitCode: 0, stderr, matched: null };
     }
     throw err;
   }
 
+  // 2. Roots + HALT + disabled. Policy keys off the LOCAL root; the
+  //    kill switch probes both roots (repo-wide HALT, 0.54.0). The
+  //    empty-file_path no-op comes AFTER the probe so a frozen repo
+  //    denies unconditionally (round-21 P3).
+  const { localRoot: reaRoot, commonRoot } = resolveHookRoots(payloadCwd, options.reaRoot);
+  const halt = checkHaltRoots(reaRoot, commonRoot);
+  if (halt.halted) {
+    writeStderr(formatHaltBanner(halt.reason));
+    return { exitCode: 2, stderr, matched: null };
+  }
+
   if (filePath.length === 0) {
+    return { exitCode: 0, stderr, matched: null };
+  }
+  if (isAdvisoryDisabled(reaRoot)) {
     return { exitCode: 0, stderr, matched: null };
   }
 

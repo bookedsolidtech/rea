@@ -61,7 +61,7 @@ export interface ResolvedReviewPolicy {
    * `-c model_reasoning_effort="<value>"`. `undefined` falls back to
    * codex's own default (currently `medium`).
    */
-  codex_reasoning_effort: 'low' | 'medium' | 'high' | undefined;
+  codex_reasoning_effort: 'low' | 'medium' | 'high' | 'xhigh' | undefined;
   /**
    * Verdict cache TTL in milliseconds (0.18.1+). `0` disables caching;
    * positive values enable the same-SHA short-circuit. Default 86_400_000
@@ -129,7 +129,7 @@ export const PUSH_GATE_DEFAULT_CODEX_MODEL = 'gpt-5.5';
  * `policy.review.codex_reasoning_effort: medium | low` in
  * `.rea/policy.yaml` for cost-bounded environments.
  */
-export const PUSH_GATE_DEFAULT_CODEX_REASONING_EFFORT: 'low' | 'medium' | 'high' = 'high';
+export const PUSH_GATE_DEFAULT_CODEX_REASONING_EFFORT: 'low' | 'medium' | 'high' | 'xhigh' = 'high';
 /**
  * Default verdict-cache TTL in milliseconds (0.18.1+). 24 hours: long
  * enough to amortize multi-push iteration of the same SHA (push, push

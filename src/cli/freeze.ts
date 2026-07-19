@@ -1,7 +1,10 @@
 import fs from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import path from 'node:path';
 import * as p from '@clack/prompts';
 import { HALT_FILE, REA_DIR, err, log, reaPath } from './utils.js';
+import {
+  listSiblingWorktreeRoots, resolveReaRoots } from '../lib/worktree-roots.js';
 
 export interface FreezeOptions {
   reason?: string | undefined;
@@ -55,8 +58,12 @@ export function runFreeze(options: FreezeOptions): void {
     process.exit(1);
   }
 
-  const targetDir = process.cwd();
-  writeHaltFile(targetDir, reason);
+  // 0.54.0 worktree state: the kill switch is REPO-WIDE — one HALT per
+  // repository, written to the COMMON (primary-checkout) root so a
+  // freeze issued from any worktree stops every stream. In a plain
+  // checkout common === cwd-root and nothing changes.
+  const roots = resolveReaRoots(process.cwd());
+  writeHaltFile(roots.commonRoot, reason);
 
   console.log('');
   log('REA FROZEN');
@@ -69,13 +76,54 @@ export function runFreeze(options: FreezeOptions): void {
 }
 
 export async function runUnfreeze(options: UnfreezeOptions): Promise<void> {
-  const targetDir = process.cwd();
-  const haltFile = reaPath(targetDir, HALT_FILE);
+  // Unfreeze clears BOTH roots (0.54.0): the common root (where freeze
+  // writes from this release on) AND the local worktree root (a legacy
+  // per-worktree HALT from an older release, or one written by a
+  // pre-upgrade hook, must not keep this stream frozen after the
+  // operator unfroze). In a plain checkout the two coincide.
+  const roots = resolveReaRoots(process.cwd());
+  // Sweep EVERY worktree of the repository (round-9 P2): a legacy
+  // pre-0.54.0 local HALT in a sibling stream must not keep that stream
+  // frozen after the operator unfroze the repo. `git worktree list` is
+  // authoritative; failure degrades to common+current (best effort).
+  //
+  // Round-14 P2: the sweep ONLY applies where the repo actually shares
+  // a kill switch — a linked worktree of a proper primary, or a primary
+  // with linked worktrees. Bare-repo worktrees degrade to per-worktree
+  // isolation at resolution time (commonRoot === localRoot with a .git
+  // FILE), and unfreezing one such stream must not resume its siblings.
+  // Round-37 P3: primary detection goes through the gitfile-aware
+  // sibling enumerator — a primary created with --separate-git-dir has
+  // a .git FILE whose real git dir still carries worktrees/, and its
+  // sweep must run. A bare-degenerate worktree (commonRoot === its own
+  // root, gitfile pointing INTO <meta>/worktrees/<name>) enumerates no
+  // siblings and stays per-stream, preserving round-14 P2.
+  const sharedKillSwitch =
+    roots.isLinkedWorktree ||
+    listSiblingWorktreeRoots(roots.commonRoot, roots.localRoot).length > 0;
+  const worktreeRoots = new Set<string>([roots.commonRoot, roots.localRoot]);
+  if (sharedKillSwitch) {
+    try {
+    const out = execFileSync('git', ['-C', roots.commonRoot, 'worktree', 'list', '--porcelain'], {
+      encoding: 'utf8',
+      timeout: 5_000,
+    });
+    for (const line of out.split('\n')) {
+      if (line.startsWith('worktree ')) worktreeRoots.add(line.slice('worktree '.length).trim());
+    }
+    } catch {
+      /* best effort — common + current still clear below */
+    }
+  }
+  const haltFiles = [...worktreeRoots]
+    .map((r) => reaPath(r, HALT_FILE))
+    .filter((f) => fs.existsSync(f));
 
-  if (!fs.existsSync(haltFile)) {
+  if (haltFiles.length === 0) {
     log('Not frozen — no .rea/HALT file found.');
     return;
   }
+  const haltFile = haltFiles[0]!;
 
   const existingReason = fs.readFileSync(haltFile, 'utf8').trim();
 
@@ -91,7 +139,9 @@ export async function runUnfreeze(options: UnfreezeOptions): Promise<void> {
     }
   }
 
-  fs.unlinkSync(haltFile);
+  for (const f of haltFiles) {
+    fs.unlinkSync(f);
+  }
   console.log('');
   log('REA UNFROZEN');
   console.log('       .rea/HALT removed — agent operations resumed.');

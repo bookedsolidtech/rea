@@ -39,6 +39,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import type { Policy } from '../../policy/types.js';
 import type { DetectedWrite } from './walker.js';
+import { CROSS_ROOT_SHARED_STATE_PATTERNS } from '../_lib/protected-paths.js';
 import { allowVerdict, blockVerdict, type DetectedForm, type Verdict } from './verdict.js';
 
 /**
@@ -67,6 +68,20 @@ const HISTORICAL_DEFAULT_PROTECTED_PATTERNS: readonly string[] = [
 ];
 
 /**
+ * Round-11 P2: the pattern set for CROSS-ROOT targets (writes landing in
+ * the primary checkout or a sibling worktree). Defaults ∪ kill-switch
+ * invariants, deliberately IGNORING the caller's `protected_writes`
+ * override and `protected_paths_relax` — another stream's protection is
+ * not the caller's to loosen.
+ */
+const STRICT_CROSS_ROOT_PATTERNS: readonly string[] = [
+  ...HISTORICAL_DEFAULT_PROTECTED_PATTERNS,
+  // Round-23 P1: repo-wide shared enforcement state (the audit hash
+  // chain + TOFU anchors) — cross-root writes must not forge them.
+  ...CROSS_ROOT_SHARED_STATE_PATTERNS,
+];
+
+/**
  * Kill-switch invariants — never relaxable. These represent the
  * integrity of the governance layer; if a consumer could relax them
  * an agent could disable rea entirely.
@@ -86,6 +101,36 @@ const KILL_SWITCH_INVARIANTS: readonly string[] = [
  */
 export interface ProtectedScanContext {
   reaRoot: string;
+  /**
+   * 0.54.0 worktree state: the COMMON (primary-checkout) root. When a
+   * write target resolves OUTSIDE the local worktree root but INSIDE
+   * the common root, it is normalized common-relative and matched
+   * against the protected list too — otherwise an absolute-path write
+   * from a worktree into `<main>/.rea/audit.jsonl` or `<main>/.rea/HALT`
+   * would bypass protection exactly when those files became the
+   * load-bearing shared state. Optional; absent/equal-to-reaRoot means
+   * plain-checkout behavior.
+   */
+  commonRoot?: string;
+  /**
+   * Round-10 P1: SIBLING worktree roots of the same repository. A write
+   * target landing inside any of these normalizes sibling-relative and
+   * matches the protected list — another stream's `.rea/`/`.claude/`
+   * state is governable, not out-of-scope. Callers compute via
+   * `listSiblingWorktreeRoots` (zero-cost in plain repos).
+   */
+  siblingRoots?: readonly string[];
+  /**
+   * Round-12 P2: resolver for a TARGET root's own protected pattern set
+   * (its policy's protected_writes ∪ invariants, its relax applied to
+   * ITS OWN entries). Cross-root matches run against the union of the
+   * strict defaults and this set, so a branch-specific protected_writes
+   * entry in the destination stream is honored from any caller.
+   */
+  protectedPatternsForRoot?: (root: string) => {
+    patterns: readonly string[];
+    overridePatterns: readonly string[];
+  };
   policy: Pick<Policy, 'protected_writes' | 'protected_paths_relax'>;
   /**
    * Stderr sink for advisory messages (e.g. "kill-switch invariant in
@@ -181,6 +226,25 @@ export function computeEffectivePatterns(ctx: ProtectedScanContext): EffectivePa
       const wLc = w.toLowerCase();
       if (!validRelax.some((r) => r.toLowerCase() === wLc)) {
         override.push(w);
+      }
+    }
+  }
+
+  // Round-44 P1: repository-wide SHARED enforcement state (the audit
+  // hash chain, TOFU anchors, and their lock sidecars, at the COMMON
+  // root) must be protected on SAME-ROOT writes too once the repo has
+  // linked worktrees — a session in the primary checkout takes the
+  // same-root path, and without this it could forge/wipe the chain for
+  // every stream. Appended AFTER relax so it is un-relaxable (these are
+  // integrity invariants when shared), and ONLY when worktrees exist,
+  // so a plain checkout stays byte-identical to pre-0.54.0.
+  const hasWorktrees =
+    (ctx.commonRoot !== undefined && ctx.commonRoot !== ctx.reaRoot) ||
+    (ctx.siblingRoots?.length ?? 0) > 0;
+  if (hasWorktrees) {
+    for (const pat of CROSS_ROOT_SHARED_STATE_PATTERNS) {
+      if (!effective.some((e) => e.toLowerCase() === pat.toLowerCase())) {
+        effective.push(pat);
       }
     }
   }
@@ -325,6 +389,16 @@ function checkPathProtected(
 }
 
 interface NormalizedTarget {
+  /**
+   * Round-11 P2: true when the relative form was derived against the
+   * COMMON root or a SIBLING worktree. Cross-root matches use the
+   * UN-RELAXED default pattern set — the caller's protected_writes
+   * override and protected_paths_relax describe ITS OWN stream and must
+   * not loosen another stream's protection.
+   */
+  crossRoot?: boolean;
+  /** The cross root the relative form was derived against. */
+  crossRootPath?: string;
   /** The lowercase project-relative path, OR a sentinel string. */
   pathLc: string;
   /**
@@ -339,6 +413,15 @@ interface NormalizedTarget {
   original: string;
   /** The fully-resolved (symlink-walked) project-relative path, when different. */
   resolvedLc: string | null;
+  /**
+   * Round-17 P2: the root `resolvedLc` was derived against when it is
+   * NOT the same root as `pathLc` — a symlink inside the primary
+   * checkout may bridge BACK into the local worktree (or a sibling),
+   * and the resolved form must be matched with the pattern set of the
+   * root it actually lives in (the LOCAL root's own effective set, or
+   * the strict cross-root union for another stream).
+   */
+  resolvedRootPath?: string;
 }
 
 /**
@@ -356,6 +439,8 @@ function normalizeTarget(
   raw: string,
   form?: DetectedForm,
   passwdHome?: string,
+  commonRoot?: string,
+  siblingRoots?: readonly string[],
 ): NormalizedTarget {
   // 1. Strip surrounding matching quotes (the parser already strips
   //    them for SglQuoted/DblQuoted, but a literal node can still hold
@@ -524,6 +609,92 @@ function normalizeTarget(
   //    against it (the protected list is project-relative). The bash
   //    gate pre-0.23.0 had the same behavior.
   if (!isInsideRoot(collapsed, reaRoot)) {
+    // 0.54.0 worktree state: a target outside the LOCAL root that lands
+    // INSIDE the COMMON root is normalized common-relative so the
+    // protected list (`.rea/HALT`, `.rea/audit.jsonl`, …) matches the
+    // shared enforcement state — an absolute path into the primary
+    // checkout must not be a bypass just because the session runs in a
+    // linked worktree.
+    const crossRoots = [
+      ...(commonRoot !== undefined && commonRoot !== reaRoot ? [commonRoot] : []),
+      ...(siblingRoots ?? []),
+    ];
+    // Round-45 P1: alias-safe cross-root detection. `isInsideRoot`
+    // realpaths the ROOT, but a payload TARGET reached through a
+    // symlink or /var↔/private/var alias won't lexically match — so
+    // compute the realpath-canonicalized target once and test
+    // membership with it too. Without this, an aliased
+    // `<primary>/.rea/HALT` slips past into the plain-outside-root
+    // allow path.
+    const collapsedCanon = ((): string | null => {
+      const r = resolveSymlinksWalkUp(collapsed);
+      return r !== null && r !== SYMLINK_DYNAMIC_SENTINEL ? r : null;
+    })();
+    for (const cross of crossRoots) {
+      if (cross === reaRoot) continue;
+      const crossCanon = realpathSafe(cross) ?? cross;
+      const insideLex = isInsideRoot(collapsed, cross);
+      const insideCanon =
+        collapsedCanon !== null && isInsideRoot(collapsedCanon, crossCanon);
+      if (!insideLex && !insideCanon) continue;
+      const baseRoot = insideLex ? cross : crossCanon;
+      const tgt = insideLex ? collapsed : (collapsedCanon as string);
+      const crossRelative = tgt === baseRoot ? '' : tgt.slice(baseRoot.length + 1);
+      const trailing = normalized.endsWith('/');
+      const crossPathLc = (
+        trailing && crossRelative.length > 0 && !crossRelative.endsWith('/')
+          ? crossRelative + '/'
+          : crossRelative
+      ).toLowerCase();
+      // Round-17 P2: a path INSIDE the primary checkout (or a sibling)
+      // may itself be a symlink bridging BACK into the local worktree —
+      // `cp x <primary>/bridge/file` where `bridge` → `<local>/.rea`.
+      // The early return here used to skip the symlink walk entirely,
+      // so only the logical `bridge/file` form was ever matched.
+      // Resolve now, deriving the relative form against the hit cross
+      // root FIRST, then the local root, then the remaining roots.
+      let crossResolvedLc: string | null = null;
+      let crossResolvedRoot: string | undefined;
+      try {
+        const resolved = resolveSymlinksWalkUp(collapsed);
+        if (resolved === SYMLINK_DYNAMIC_SENTINEL) {
+          return {
+            pathLc: '__rea_unresolved_expansion__',
+            sentinel: 'expansion',
+            original: raw,
+            resolvedLc: null,
+          };
+        }
+        if (resolved !== null) {
+          const candidates = [cross, reaRoot, ...crossRoots.filter((r) => r !== cross)];
+          for (const candRoot of candidates) {
+            const realCand = realpathSafe(candRoot) ?? candRoot;
+            let rel: string | null = null;
+            if (resolved === realCand) rel = '';
+            else if (resolved.startsWith(realCand + '/')) rel = resolved.slice(realCand.length + 1);
+            else if (resolved.startsWith(candRoot + '/')) rel = resolved.slice(candRoot.length + 1);
+            if (rel === null) continue;
+            const candidateLc = rel.toLowerCase();
+            if (candRoot !== cross || candidateLc !== crossPathLc) {
+              crossResolvedLc = candidateLc;
+              crossResolvedRoot = candRoot;
+            }
+            break;
+          }
+        }
+      } catch {
+        // Best-effort — the logical cross-relative form is still checked.
+      }
+      return {
+        pathLc: crossPathLc,
+        sentinel: null,
+        original: raw,
+        resolvedLc: crossResolvedLc,
+        crossRoot: true,
+        crossRootPath: cross,
+        ...(crossResolvedRoot !== undefined ? { resolvedRootPath: crossResolvedRoot } : {}),
+      };
+    }
     if (hadDotDot) {
       return {
         pathLc: '__rea_outside_root__',
@@ -566,6 +737,8 @@ function normalizeTarget(
   //    resolver returns SYMLINK_DYNAMIC_SENTINEL, treat the target as
   //    dynamic — refuse on uncertainty via the `expansion` sentinel.
   let resolvedLc: string | null = null;
+  let resolvedIsCrossRoot = false;
+  let resolvedCrossRootPath: string | undefined;
   try {
     const resolved = resolveSymlinksWalkUp(collapsed);
     if (resolved === SYMLINK_DYNAMIC_SENTINEL) {
@@ -588,6 +761,31 @@ function normalizeTarget(
         resolvedRelative = resolved.slice(realRoot.length + 1);
       } else if (resolved.startsWith(reaRoot + '/')) {
         resolvedRelative = resolved.slice(reaRoot.length + 1);
+      } else {
+        // 0.54.0 rounds 5+10: a worktree-local symlink pointed at the
+        // PRIMARY checkout or a SIBLING worktree resolves outside the
+        // local root — derive the cross-root-relative form so the
+        // protected list still matches governed state in other streams.
+        const crossRoots = [
+          ...(commonRoot !== undefined && commonRoot !== reaRoot ? [commonRoot] : []),
+          ...(siblingRoots ?? []),
+        ];
+        for (const cross of crossRoots) {
+          if (cross === reaRoot) continue;
+          const realCross = realpathSafe(cross) ?? cross;
+          if (resolved === realCross) {
+            resolvedRelative = '';
+          } else if (resolved.startsWith(realCross + '/')) {
+            resolvedRelative = resolved.slice(realCross.length + 1);
+          } else if (resolved.startsWith(cross + '/')) {
+            resolvedRelative = resolved.slice(cross.length + 1);
+          }
+          if (resolvedRelative !== null) {
+            resolvedIsCrossRoot = true;
+            resolvedCrossRootPath = cross;
+            break;
+          }
+        }
       }
       if (resolvedRelative !== null) {
         const candidate = resolvedRelative.toLowerCase();
@@ -601,7 +799,16 @@ function normalizeTarget(
     // is still checked.
   }
 
-  return { pathLc, sentinel: null, original: raw, resolvedLc };
+  return {
+    pathLc,
+    sentinel: null,
+    original: raw,
+    resolvedLc,
+    ...(resolvedIsCrossRoot ? { crossRoot: true } : {}),
+    ...(resolvedIsCrossRoot && resolvedCrossRootPath !== undefined
+      ? { crossRootPath: resolvedCrossRootPath }
+      : {}),
+  };
 }
 
 /**
@@ -1025,7 +1232,7 @@ export function scanForProtectedViolations(
     }
     if (d.path.length === 0) continue;
 
-    const norm = normalizeTarget(ctx.reaRoot, d.path, d.form, ctx.passwdHome);
+    const norm = normalizeTarget(ctx.reaRoot, d.path, d.form, ctx.passwdHome, ctx.commonRoot, ctx.siblingRoots);
     if (norm.sentinel === 'global_root') {
       return blockVerdict({
         reason: [
@@ -1089,7 +1296,25 @@ export function scanForProtectedViolations(
     if (d.isDirTarget === true) matchOptions.forceDirSemantics = true;
     if (d.isDestructive === true) matchOptions.isDestructive = true;
     const dirOptions = Object.keys(matchOptions).length > 0 ? matchOptions : undefined;
-    const logicalHit = checkPathProtected(norm.pathLc, effective, dirOptions);
+    // Round-11 P2: cross-root targets match the UN-RELAXED default set
+    // (defaults ∪ kill-switch invariants) — the caller's relax/override
+    // describe its own stream, never another's.
+    const patternsFor = (norm2: NormalizedTarget): EffectivePatterns => {
+      if (norm2.crossRoot !== true) return effective;
+      const target =
+        norm2.crossRootPath !== undefined && ctx.protectedPatternsForRoot !== undefined
+          ? ctx.protectedPatternsForRoot(norm2.crossRootPath)
+          : { patterns: [] as readonly string[], overridePatterns: [] as readonly string[] };
+      // Round-28 P2: the TARGET stream's overridePatterns retain their
+      // precedence over the husky `.d` extension-surface allow-list —
+      // a branch that explicitly protects a husky fragment keeps that
+      // protection against cross-root writes.
+      return {
+        full: [...new Set([...STRICT_CROSS_ROOT_PATTERNS, ...target.patterns])],
+        override: [...target.overridePatterns],
+      };
+    };
+    const logicalHit = checkPathProtected(norm.pathLc, patternsFor(norm), dirOptions);
     if (logicalHit !== null) {
       return blockVerdict({
         reason: buildBlockReason({
@@ -1103,9 +1328,29 @@ export function scanForProtectedViolations(
         ...(d.position.line > 0 ? { sourcePosition: d.position } : {}),
       });
     }
-    // Symlink-resolved-form match.
+    // Symlink-resolved-form match. Round-17 P2: when the resolved form
+    // lives in a DIFFERENT root than the logical form, match it with
+    // that root's pattern set — the caller's own effective set when the
+    // bridge lands back in the local worktree, the strict cross-root
+    // union otherwise.
+    const resolvedPatterns: EffectivePatterns =
+      norm.resolvedRootPath === undefined
+        ? patternsFor(norm)
+        : norm.resolvedRootPath === ctx.reaRoot
+          ? effective
+          : {
+              full: [
+                ...new Set([
+                  ...STRICT_CROSS_ROOT_PATTERNS,
+                  ...(ctx.protectedPatternsForRoot?.(norm.resolvedRootPath).patterns ?? []),
+                ]),
+              ],
+              override: [
+                ...(ctx.protectedPatternsForRoot?.(norm.resolvedRootPath).overridePatterns ?? []),
+              ],
+            };
     if (norm.resolvedLc !== null) {
-      const resolvedHit = checkPathProtected(norm.resolvedLc, effective, dirOptions);
+      const resolvedHit = checkPathProtected(norm.resolvedLc, resolvedPatterns, dirOptions);
       if (resolvedHit !== null) {
         return blockVerdict({
           reason: buildBlockReason({

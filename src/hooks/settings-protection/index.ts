@@ -54,7 +54,8 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { execSync } from 'node:child_process';
 import { parse as parseYaml } from 'yaml';
-import { checkHalt, formatHaltBanner } from '../_lib/halt-check.js';
+import { checkHaltRoots, formatHaltBanner } from '../_lib/halt-check.js';
+import { resolveHookRoots, listSiblingWorktreeRoots } from '../../lib/worktree-roots.js';
 import {
   parseWriteHookPayload,
   MalformedPayloadError,
@@ -73,6 +74,9 @@ import {
   matchAny,
   isExtensionSurface,
   PATCH_SESSION_PATTERNS,
+  CROSS_ROOT_SHARED_STATE_PATTERNS,
+  PROTECTED_PATTERNS_FULL,
+  KILL_SWITCH_INVARIANTS,
   sanitizeForStderr,
 } from '../_lib/protected-paths.js';
 import { appendAuditRecord, InvocationStatus, Tier } from '../../audit/append.js';
@@ -165,29 +169,38 @@ function gitConfig(reaRoot: string, key: string): string {
   }
 }
 
+/**
+ * Realpath-canonicalize an absolute path whose leaf may not exist yet
+ * (a create target). Walks up to the nearest existing ancestor,
+ * realpaths THAT (resolving /var↔/private/var and symlinked checkout
+ * roots for the whole subtree), then re-appends the unresolved tail.
+ * Falls back to the lexical input on any error. (Round-45 P1.)
+ */
+function canonicalizeExisting(abs: string): string {
+  let dir = abs;
+  const tail: string[] = [];
+  for (let i = 0; i < 64; i++) {
+    try {
+      const real = fs.realpathSync(dir);
+      return tail.length > 0 ? path.join(real, ...tail.slice().reverse()) : real;
+    } catch {
+      const parent = path.dirname(dir);
+      if (parent === dir) return abs;
+      tail.push(path.basename(dir));
+      dir = parent;
+    }
+  }
+  return abs;
+}
+
 export async function runSettingsProtection(
   options: SettingsProtectionOptions = {},
 ): Promise<SettingsProtectionResult> {
-  const reaRoot =
-    options.reaRoot ?? process.env['CLAUDE_PROJECT_DIR'] ?? process.cwd();
   let stderr = '';
   const writeStderr = (s: string): void => {
     stderr += s;
     if (options.stderrWrite) options.stderrWrite(s);
   };
-
-  // 1. HALT check.
-  const halt = checkHalt(reaRoot);
-  if (halt.halted) {
-    writeStderr(formatHaltBanner(halt.reason));
-    return {
-      exitCode: 2,
-      stderr,
-      matched: null,
-      surfaceSymlinkRefused: false,
-      patchSessionAllowed: false,
-    };
-  }
 
   // 2. Read + parse stdin.
   const stdinRaw =
@@ -196,8 +209,10 @@ export async function runSettingsProtection(
       : await readStdinWithTimeout(5_000);
 
   let filePath = '';
+  let payloadCwd = '';
   try {
     const payload = parseWriteHookPayload(stdinRaw);
+    payloadCwd = payload.cwd;
     filePath = payload.filePath;
   } catch (err) {
     if (err instanceof MalformedPayloadError || err instanceof TypePayloadError) {
@@ -214,6 +229,27 @@ export async function runSettingsProtection(
     }
     throw err;
   }
+
+  // Roots + HALT (0.54.0 worktree state): the payload's `cwd` feeds the
+  // resolution ladder, so stdin is parsed FIRST — a deliberate reorder.
+  // Policy/path checks key off the LOCAL (worktree) root; audit and the
+  // kill switch key off the COMMON (repository) root.
+  const { localRoot: reaRoot, commonRoot } = resolveHookRoots(payloadCwd, options.reaRoot);
+  // Round-10 P1: sibling worktrees' governed state is in scope too;
+  // zero-cost in plain repos (stat-gated on .git/worktrees).
+  const siblingRoots = listSiblingWorktreeRoots(commonRoot, reaRoot);
+  // 1. HALT check.
+  const halt = checkHaltRoots(reaRoot, commonRoot);
+  if (halt.halted) {
+    writeStderr(formatHaltBanner(halt.reason));
+    return {
+      exitCode: 2,
+      stderr,
+      matched: null,
+      surfaceSymlinkRefused: false,
+      patchSessionAllowed: false,
+    };
+  }
   if (filePath.length === 0) {
     return {
       exitCode: 0,
@@ -225,7 +261,49 @@ export async function runSettingsProtection(
   }
 
   // 3. Normalize.
-  const normalized = normalizePath(filePath, reaRoot);
+  let normalized = normalizePath(filePath, reaRoot);
+  let crossRootTarget = false;
+  let crossRootUsedPath: string | null = null;
+  // 0.54.0 worktree state (review round-4): an absolute target that
+  // normalizePath left ABSOLUTE (outside the local root) but that lands
+  // INSIDE the COMMON root re-normalizes common-relative, so the
+  // protected/blocked patterns match the primary checkout's shared
+  // enforcement state from a worktree session. Symlink checks below
+  // keep using the raw (absolute) filePath — only pattern matching
+  // consumes the relative form.
+  if (commonRoot !== reaRoot || siblingRoots.length > 0) {
+    const crossRoots = [
+      ...(commonRoot !== reaRoot ? [commonRoot] : []),
+      ...siblingRoots,
+    ];
+    if (path.isAbsolute(normalized)) {
+      const resolvedNorm = path.resolve(normalized);
+      // Round-45 P1: alias-safe detection — a Write/Edit target reached
+      // through a symlink or /var↔/private/var alias must still be seen
+      // as cross-root. Compare the realpath-canonicalized target and
+      // root alongside the lexical forms; when only the canonical forms
+      // match, derive the relative path from THEM.
+      const canonNorm = canonicalizeExisting(resolvedNorm);
+      for (const cross of crossRoots) {
+        const crossResolved = path.resolve(cross);
+        const insideLex =
+          resolvedNorm === crossResolved || resolvedNorm.startsWith(crossResolved + path.sep);
+        if (insideLex) {
+          normalized = normalizePath(filePath, cross);
+          crossRootTarget = true;
+          crossRootUsedPath = cross;
+          break;
+        }
+        const crossCanon = canonicalizeExisting(crossResolved);
+        if (canonNorm === crossCanon || canonNorm.startsWith(crossCanon + path.sep)) {
+          normalized = normalizePath(canonNorm, crossCanon);
+          crossRootTarget = true;
+          crossRootUsedPath = cross;
+          break;
+        }
+      }
+    }
+  }
   const lowerNorm = normalized.toLowerCase();
   const safeFilePath = sanitizeForStderr(filePath);
   const safeNormalized = sanitizeForStderr(normalized);
@@ -268,10 +346,21 @@ export async function runSettingsProtection(
   // §5b. Extension-surface allow-list (.husky/{commit-msg,pre-push,
   //      pre-commit,prepare-commit-msg}.d/*).
   if (isExtensionSurface(normalized)) {
+    // Round-52 P2: probe the filesystem against the ACCEPTED worktree
+    // root, exactly as checkProtectedSymlinkResolution() does. In a
+    // linked-worktree session the hook process cwd may be pinned to the
+    // primary checkout while `reaRoot` (from payload.cwd) is the
+    // worktree — a RELATIVE fragment like `.husky/pre-push.d/foo` must be
+    // resolved in the worktree, not cwd, or a symlinked fragment (or
+    // symlinked parent) in the worktree BYPASSES these §5b refusals. An
+    // already-absolute filePath is used verbatim (no double-join).
+    const surfaceProbePath = path.isAbsolute(filePath)
+      ? filePath
+      : path.resolve(reaRoot, filePath);
     // (a) Final-component symlink refusal.
     let isFinalSymlink = false;
     try {
-      const st = fs.lstatSync(filePath);
+      const st = fs.lstatSync(surfaceProbePath);
       isFinalSymlink = st.isSymbolicLink();
     } catch {
       /* file doesn't exist — fine */
@@ -292,7 +381,7 @@ export async function runSettingsProtection(
       };
     }
     // (b) Intermediate-directory symlink resolution.
-    const parentDir = path.dirname(filePath);
+    const parentDir = path.dirname(surfaceProbePath);
     let parentIsDir = false;
     try {
       parentIsDir = fs.statSync(parentDir).isDirectory();
@@ -349,14 +438,33 @@ export async function runSettingsProtection(
         }
       }
     }
-    // Documented extension surface — allow.
-    return {
-      exitCode: 0,
-      stderr,
-      matched: null,
-      surfaceSymlinkRefused: false,
-      patchSessionAllowed: false,
-    };
+    // Round-41 P2: a CROSS-ROOT fragment write only rides the allow
+    // when the DESTINATION stream's own protected_writes do not name
+    // it — the extension surface is the local consumer's to use, not a
+    // lane into a sibling's explicitly protected hook fragments. On a
+    // hit we fall through to §6, where the cross-root pattern union
+    // (strict ∪ target) blocks it.
+    let crossProtectedFragment = false;
+    if (crossRootTarget && crossRootUsedPath !== null) {
+      const targetPolicy = loadPolicyPermissive(crossRootUsedPath);
+      const targetResolution = resolveProtectedPatterns({
+        ...(targetPolicy.protectedWrites !== undefined
+          ? { protectedWrites: targetPolicy.protectedWrites }
+          : {}),
+        protectedPathsRelax: targetPolicy.protectedRelax,
+      });
+      crossProtectedFragment = matchAny(lowerNorm, targetResolution.overridePatterns) !== null;
+    }
+    if (!crossProtectedFragment) {
+      // Documented extension surface — allow.
+      return {
+        exitCode: 0,
+        stderr,
+        matched: null,
+        surfaceSymlinkRefused: false,
+        patchSessionAllowed: false,
+      };
+    }
   }
 
   // §6. Default-protected list resolution.
@@ -370,7 +478,37 @@ export async function runSettingsProtection(
   for (const adv of resolution.advisories) writeStderr(adv);
 
   // §6 match (case-insensitive — matchAny lowercases the pattern side).
-  const directHit = matchAny(lowerNorm, resolution.patterns);
+  // Round-11 P2: a CROSS-ROOT target (primary checkout / sibling
+  // worktree) matches the UN-RELAXED default set — the caller's
+  // protected_writes override and relax describe its own stream and
+  // must not loosen another's protection.
+  const matchPatterns = crossRootTarget
+    ? [
+        ...new Set([
+          ...PROTECTED_PATTERNS_FULL,
+          ...KILL_SWITCH_INVARIANTS,
+          ...CROSS_ROOT_SHARED_STATE_PATTERNS,
+          ...(crossRootUsedPath !== null
+            ? ((): readonly string[] => {
+                const targetPolicy = loadPolicyPermissive(crossRootUsedPath);
+                return resolveProtectedPatterns({
+                  ...(targetPolicy.protectedWrites !== undefined
+                    ? { protectedWrites: targetPolicy.protectedWrites }
+                    : {}),
+                  protectedPathsRelax: targetPolicy.protectedRelax,
+                }).patterns;
+              })()
+            : []),
+        ]),
+      ]
+    : // Round-44 P1: same-root writes protect the repo-wide shared
+      // state (audit chain / TOFU anchors / lock sidecars) too, but
+      // ONLY when the repo has linked worktrees — otherwise a plain
+      // checkout stays byte-identical.
+      commonRoot !== reaRoot || siblingRoots.length > 0
+      ? [...new Set([...resolution.patterns, ...CROSS_ROOT_SHARED_STATE_PATTERNS])]
+      : resolution.patterns;
+  const directHit = matchAny(lowerNorm, matchPatterns);
   if (directHit !== null) {
     writeStderr('SETTINGS PROTECTION: Modification blocked\n');
     writeStderr('\n');
@@ -388,10 +526,30 @@ export async function runSettingsProtection(
   }
 
   // §6c. Intermediate-symlink resolution against the hard-protected list.
+  // Round-11 P1: the symlink path must also carry the repo-wide shared
+  // state patterns (audit chain / TOFU anchors / lock sidecars) when the
+  // repo has linked worktrees — otherwise a pre-existing symlink like
+  // `logs -> .rea` lets `Write/Edit` reach `logs/audit.jsonl` and bypass
+  // the same-root shared-state protection that `directHit` already has.
+  const symlinkPatterns =
+    commonRoot !== reaRoot || siblingRoots.length > 0
+      ? [...new Set([...resolution.patterns, ...CROSS_ROOT_SHARED_STATE_PATTERNS])]
+      : resolution.patterns;
   const symRefused = checkProtectedSymlinkResolution(
     filePath,
-    resolution.patterns,
+    symlinkPatterns,
     reaRoot,
+    commonRoot,
+    siblingRoots,
+    (root) => {
+      const targetPolicy = loadPolicyPermissive(root);
+      return resolveProtectedPatterns({
+        ...(targetPolicy.protectedWrites !== undefined
+          ? { protectedWrites: targetPolicy.protectedWrites }
+          : {}),
+        protectedPathsRelax: targetPolicy.protectedRelax,
+      }).patterns;
+    },
   );
   if (symRefused !== null) {
     writeStderr('SETTINGS PROTECTION: intermediate-symlink resolution blocked\n');
@@ -424,7 +582,7 @@ export async function runSettingsProtection(
       const sessionId =
         options.sessionIdOverride ?? process.env['CLAUDE_SESSION_ID'] ?? 'external';
       try {
-        await appendAuditRecord(reaRoot, {
+        await appendAuditRecord(commonRoot, {
           session_id: sessionId,
           tool_name: 'hooks.patch.session',
           server_name: 'rea',
@@ -502,17 +660,28 @@ export async function runSettingsProtection(
  */
 function checkProtectedSymlinkResolution(
   filePath: string,
-  patterns: readonly string[],
+  patternsIn: readonly string[],
   reaRoot: string,
+  commonRoot?: string,
+  siblingRoots?: readonly string[],
+  patternsForCrossRoot?: (root: string) => readonly string[],
 ): { pattern: string; resolvedTarget: string } | null {
+  let patterns: readonly string[] = patternsIn;
+  // Round-6 P1: probe the filesystem against the ACCEPTED worktree root.
+  // In a linked-worktree session the hook process cwd may be pinned to
+  // the primary checkout while `reaRoot` (from payload.cwd) is the
+  // worktree — a RELATIVE target like `shared/HALT` must be resolved in
+  // the worktree, not the primary, or the symlink protections probe the
+  // wrong tree and miss a symlink into protected state.
+  const probePath = path.isAbsolute(filePath) ? filePath : path.resolve(reaRoot, filePath);
   // Only attempt resolution if the target exists OR its parent dir exists.
   let targetExists = false;
   try {
-    targetExists = fs.existsSync(filePath);
+    targetExists = fs.existsSync(probePath);
   } catch {
     /* fall through */
   }
-  const parentDir = path.dirname(filePath);
+  const parentDir = path.dirname(probePath);
   let parentExists = false;
   try {
     parentExists = fs.statSync(parentDir).isDirectory();
@@ -522,12 +691,46 @@ function checkProtectedSymlinkResolution(
   if (!targetExists && !parentExists) return null;
   if (!parentExists) return null;
 
-  const resolvedParent = resolveParentRealpath(filePath);
+  const resolvedParent = resolveParentRealpath(probePath);
   if (resolvedParent.length === 0) return null;
 
-  const canonRoot = resolveCanonRoot(reaRoot);
+  // 0.54.0 round-5 P1: a worktree-local symlink pointed at the PRIMARY
+  // checkout resolves outside the local canon root — fall through to
+  // the COMMON canon root so `shared -> <primary>/.rea` writes still
+  // match the protected patterns for the repo-wide shared state.
+  let canonRoot = resolveCanonRoot(reaRoot);
   if (resolvedParent !== canonRoot && !resolvedParent.startsWith(canonRoot + '/')) {
-    return null;
+    const crossRoots = [
+      ...(commonRoot !== undefined && commonRoot !== reaRoot ? [commonRoot] : []),
+      ...(siblingRoots ?? []),
+    ];
+    let matched: string | null = null;
+    let matchedOriginal: string | null = null;
+    for (const cross of crossRoots) {
+      const canonCross = resolveCanonRoot(cross);
+      if (resolvedParent === canonCross || resolvedParent.startsWith(canonCross + '/')) {
+        matched = canonCross;
+        matchedOriginal = cross;
+        break;
+      }
+    }
+    if (matched === null) return null;
+    canonRoot = matched;
+    // Round-12 P2: a cross-root symlink target matches the UN-RELAXED
+    // strict set UNIONed with the TARGET stream's own resolved
+    // protected patterns — the caller's relax never loosens another
+    // stream, and the destination's branch-specific protected_writes
+    // are honored.
+    patterns = [
+      ...new Set([
+        ...PROTECTED_PATTERNS_FULL,
+        ...KILL_SWITCH_INVARIANTS,
+        ...CROSS_ROOT_SHARED_STATE_PATTERNS,
+        ...(matchedOriginal !== null && patternsForCrossRoot !== undefined
+          ? patternsForCrossRoot(matchedOriginal)
+          : []),
+      ]),
+    ];
   }
   const relativeResolved =
     resolvedParent === canonRoot ? '' : resolvedParent.slice(canonRoot.length + 1);

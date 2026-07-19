@@ -93,6 +93,77 @@ function keyFor(matcher: string, command: string): string {
  * `.claude/settings.json` would keep executing stale commands that
  * point at files we just deleted from `.claude/hooks/`.
  */
+/**
+ * A single matcher-scoped prune target. Removes hook ENTRIES whose `command`
+ * contains `commandIncludes` from ONLY the group(s) under `event` whose
+ * matcher is EXACTLY `matcher`. Used for hooks that MOVED matchers between
+ * releases, where a blanket `pruneHookCommands` (command-substring across ALL
+ * matchers) would wrongly delete the NEW registration too because the old and
+ * new entries share the same command string.
+ */
+export interface MatcherScopedPruneSpec {
+  event: string;
+  matcher: string;
+  commandIncludes: string;
+}
+
+/**
+ * Remove hook entries that MOVED matchers in a release, scoped so the NEW
+ * registration survives. For each spec, within `event` groups whose matcher is
+ * EXACTLY `spec.matcher`, drop any hook whose `command` includes
+ * `spec.commandIncludes`; a group left with no hooks is dropped, and an event
+ * left with no groups is deleted. Groups under a DIFFERENT matcher (e.g. the
+ * new `*` group, or a consumer's own matcher) are never touched.
+ *
+ * Removal is ENTRY-LEVEL, not group-level: if a consumer chained other hooks
+ * onto the same `Bash` matcher, those siblings are preserved — only the stale
+ * rea-managed entry is pruned. This is the additive-merge counterpart for a
+ * matcher MOVE (vs `pruneHookCommands` for an outright hook DELETION): without
+ * it, `mergeSettings` (additive-only) would leave a repo upgrading from an
+ * older release with BOTH the old-matcher and new-matcher registrations of the
+ * same command, double-invoking the hook on every matched tool call.
+ *
+ * Idempotent: a fresh install that already has only the new-matcher group
+ * matches nothing here (removedCount 0); running twice is a no-op.
+ */
+export function pruneMatcherScopedHooks(
+  existing: Record<string, unknown>,
+  specs: readonly MatcherScopedPruneSpec[],
+): { merged: Record<string, unknown>; removedCount: number } {
+  const merged = deepClone(existing);
+  const hooks = ensureHooksShape(merged);
+  let removedCount = 0;
+  for (const spec of specs) {
+    const groups = hooks[spec.event];
+    if (!Array.isArray(groups)) continue;
+    for (const group of groups) {
+      if (group.matcher !== spec.matcher) continue;
+      const entries = group.hooks ?? [];
+      if (!Array.isArray(entries)) continue;
+      const kept: typeof entries = [];
+      for (const entry of entries) {
+        const cmd = typeof entry.command === 'string' ? entry.command : '';
+        if (cmd.includes(spec.commandIncludes)) {
+          removedCount += 1;
+          continue;
+        }
+        kept.push(entry);
+      }
+      group.hooks = kept;
+    }
+    // Drop now-empty groups under this event.
+    hooks[spec.event] = groups.filter((g) => Array.isArray(g.hooks) && g.hooks.length > 0);
+  }
+  // Drop events whose group list is now empty.
+  for (const event of Object.keys(hooks)) {
+    const groups = hooks[event];
+    if (Array.isArray(groups) && groups.length === 0) {
+      delete hooks[event];
+    }
+  }
+  return { merged, removedCount };
+}
+
 export function pruneHookCommands(
   existing: Record<string, unknown>,
   staleSubstrings: readonly string[],
@@ -129,6 +200,61 @@ export function pruneHookCommands(
   }
   return { merged, removedCount };
 }
+
+/**
+ * Hook commands deleted in 0.11.0. `rea upgrade` and `rea init` prune any
+ * entries whose `command` string contains one of these tokens so consumer
+ * `.claude/settings.json` files don't keep invoking missing scripts
+ * (which would fail every matched tool call until the operator edited
+ * settings by hand).
+ *
+ * 0.11.0 removals:
+ *   - push-review-gate.sh        (replaced by husky stub → rea hook push-gate)
+ *   - commit-review-gate.sh      (intentionally unregistered; source-of-truth deleted)
+ *   - push-review-gate-git.sh    (native-git adapter; deleted)
+ *
+ * Add future removals here rather than baking the list into
+ * `pruneHookCommands` itself — the removal list is release history,
+ * not a static setting. Lives here (next to `pruneHookCommands`) rather
+ * than in `upgrade.ts` so BOTH `rea init` and `rea upgrade` share one
+ * source of truth: the install layer is the shared home; init/upgrade
+ * both depend on it, not on each other.
+ */
+export const STALE_HOOK_COMMAND_TOKENS: readonly string[] = [
+  'push-review-gate.sh',
+  'commit-review-gate.sh',
+  'push-review-gate-git.sh',
+];
+
+/**
+ * Hooks that MOVED matchers between releases. `mergeSettings` is
+ * additive-only, so without a matcher-scoped prune a repo upgrading from an
+ * older release keeps its OLD-matcher registration AND gains the NEW one,
+ * double-invoking the hook on every matched tool call. Unlike
+ * `STALE_HOOK_COMMAND_TOKENS` (outright hook DELETIONS), these entries keep
+ * the same command string under a new matcher, so the prune MUST be
+ * matcher-scoped — a blanket command-substring prune would delete both the old
+ * AND the new registration.
+ *
+ * Migration history:
+ *   - `billing-cap-halt.sh`: `PostToolUse/Bash` → `PostToolUse/*` (round-24 —
+ *     the turn counter must count EVERY tool call, not just Bash). Scoped to
+ *     the rea-managed shape: event `PostToolUse`, matcher EXACTLY `Bash`,
+ *     command `billing-cap-halt.sh`. Entry-level, so a consumer who chained
+ *     other hooks onto their own `Bash` matcher keeps those siblings; only the
+ *     stale rea entry is removed, and the group is dropped only if it becomes
+ *     empty. The new `*` group (different matcher) is never touched.
+ *
+ * Add future matcher MOVES here rather than baking them into the prune helper
+ * — the list is release history, not a static setting. Lives here (next to
+ * `pruneMatcherScopedHooks`) so BOTH `rea init` and `rea upgrade` share one
+ * source of truth (codex round-47 P2: `rea init` was missing this prune, so
+ * re-running init over a stale `Bash` registration double-registered the
+ * moved hook).
+ */
+export const STALE_MATCHER_SCOPED_HOOKS: readonly MatcherScopedPruneSpec[] = [
+  { event: 'PostToolUse', matcher: 'Bash', commandIncludes: 'billing-cap-halt.sh' },
+];
 
 export function mergeSettings(
   existing: Record<string, unknown>,
@@ -334,6 +460,16 @@ export function defaultDesiredHooks(): DesiredHookGroup[] {
           timeout: 5000,
           statusMessage: 'Checking for shell-redirect to policy-blocked paths...',
         },
+        // 0.54.0 — Artifact Gate G2 (verification), Bash-tier. Refuses a
+        // shell write/redirect to `.rea/tasks.jsonl` under
+        // policy.artifact_gates.g2_verify.mode shadow/enforce (default-off),
+        // closing the Bash-redirect bypass of the editor-tier verify-gate.
+        {
+          type: 'command',
+          command: `${base}/verify-gate-bash-gate.sh`,
+          timeout: 5000,
+          statusMessage: 'Checking for shell-write to the task store (G2)...',
+        },
         {
           type: 'command',
           command: `${base}/dependency-audit-gate.sh`,
@@ -421,6 +557,12 @@ export function defaultDesiredHooks(): DesiredHookGroup[] {
           timeout: 5000,
           statusMessage: 'Checking changeset for security leaks...',
         },
+        {
+          type: 'command',
+          command: `${base}/verify-gate.sh`,
+          timeout: 5000,
+          statusMessage: 'Checking task-completion evidence (G2)...',
+        },
       ],
     },
     {
@@ -437,21 +579,35 @@ export function defaultDesiredHooks(): DesiredHookGroup[] {
     },
     {
       // 0.51.0 spend-governance E1 seed (INCIDENT-2026-07-04,
-      // denial-of-wallet). Matcher is `Bash` (NOT chained onto the
-      // architecture-review or delegation-advisory groups — the matcher
-      // differs from both). The hook scans a just-run command's output
-      // for a BILLING-CLASS signature (spending cap / prepayment credits
-      // depleted / insufficient_quota — TERMINAL, distinct from a retryable
-      // 429) and, per `policy.spend_governance.billing_error_response`,
-      // acts. OPT-OUT: `enabled` defaults true, so a policy with NO
-      // `spend_governance` block still runs the reflex at the SEED default
-      // `warn` (banner + audit, no freeze — a phrase-only global halt is
-      // unsafe without endpoint scoping; codex round-12). `halt` is an
-      // explicit opt-in; opting out entirely is `enabled: false` /
-      // `billing_error_response: off`. The shim's coarse relevance pre-gate
-      // means ordinary Bash output never spawns the CLI.
+      // denial-of-wallet) + Artifact Gates §5 turn budget. The hook does TWO
+      // jobs: (1) the billing-signature scan of a just-run command's failed
+      // stderr (spending cap / prepayment credits depleted / insufficient_
+      // quota — TERMINAL, distinct from a retryable 429), Bash-only; and
+      // (2) a per-session TOOL-CALL counter (Artifact Gates §5) that emits
+      // audited warn/refuse events at `spend_governance.turn_budget`
+      // thresholds.
+      //
+      // The counter must count EVERY tool call — a per-session TOOL-CALL
+      // budget that only saw write-class tools would be trivially bypassed by
+      // a session spending its turns in Read/LS/Glob/Grep (codex round-24
+      // F1). So the matcher is the documented all-tools value `"*"` (Claude
+      // Code treats `"*"` / `""` / omitted as "match all", NOT as a regex).
+      // This is a DIFFERENT matcher from delegation-advisory's write-class
+      // group below, so mergeSettings keeps them SEPARATE with NO chaining
+      // warning (the self-chain warning only fires for two rea-desired groups
+      // sharing ONE matcher). One tool call fires this group exactly once →
+      // exactly one increment, no double-count.
+      //
+      // The billing SCAN inside the body stays Bash-only (a non-Bash tool has
+      // no command/stderr); only the turn counter runs for the other tools.
+      // OPT-OUT (billing): `enabled` defaults true, seed default `warn`.
+      // OPT-IN (turn budget): absent `turn_budget` block = off. The shim's
+      // relevance pre-gate proceeds to the CLI whenever a `turn_budget` is
+      // configured (so the counter runs) OR a billing keyword is present;
+      // with neither (the default), all-tools registration is still a cheap
+      // no-op — the shim exits before spawning the CLI.
       event: 'PostToolUse',
-      matcher: 'Bash',
+      matcher: '*',
       hooks: [
         {
           type: 'command',
@@ -462,19 +618,15 @@ export function defaultDesiredHooks(): DesiredHookGroup[] {
       ],
     },
     {
-      // 0.31.0 delegation-telemetry completion — the *nudge*. The
-      // matcher is `Bash|Edit|Write|MultiEdit|NotebookEdit`: every
-      // write-class tool call (note this group INCLUDES Bash, unlike
-      // the architecture-review group above). The hook maintains a
-      // per-session counter and emits a one-time stderr advisory when
-      // a session crosses `policy.delegation_advisory.threshold`
-      // without dispatching a curated specialist. Advisory only — it
-      // never blocks a tool call, and `policy.delegation_advisory`
-      // defaults to disabled (only `bst-internal*` profiles pin
-      // `enabled: true`), so a vanilla install sees the hook as a
-      // silent no-op. Kept as its own matcher group rather than
-      // chained onto the architecture-review group because the
-      // matcher string differs (Bash is in this one, not that one).
+      // 0.31.0 delegation-telemetry completion — the *nudge*. Write-class
+      // matcher `Bash|Edit|Write|MultiEdit|NotebookEdit` (distinct from the
+      // billing-cap-halt all-tools `"*"` group above, so no shared-matcher
+      // self-chain). The hook maintains a per-session counter and emits a
+      // one-time stderr advisory when a session crosses
+      // `policy.delegation_advisory.threshold` without dispatching a curated
+      // specialist. Advisory only — never blocks; `delegation_advisory`
+      // defaults disabled (only `bst-internal*` profiles pin `enabled:
+      // true`), so a vanilla install sees a silent no-op.
       event: 'PostToolUse',
       matcher: 'Bash|Edit|Write|MultiEdit|NotebookEdit',
       hooks: [

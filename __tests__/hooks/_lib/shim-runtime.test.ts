@@ -401,6 +401,104 @@ ${STD_BODY}
   });
 });
 
+// round-53/54 — SHIM_FAIL_CLOSED_WHEN_RELEVANT: a FAIL-OPEN shim guarding a
+// policy gate resolves the gate MODE when the CLI cannot run. Detection
+// (`_shim_gate_mode`) is the shared robust awk: block + inline-flow-map at any
+// depth, enforce-bias on an unparseable governed policy. Tri-state: enforce →
+// FAIL CLOSED (exit 2 + CONFIG-ERROR); shadow → WARN + ALLOW (exit 0);
+// off/absent → ALLOW.
+describe('hooks/_lib/shim-runtime.sh — SHIM_FAIL_CLOSED_WHEN_RELEVANT (round-53/54)', () => {
+  let projectDir: string;
+  beforeEach(() => {
+    projectDir = makeProjectDir();
+  });
+  afterEach(() => {
+    fs.rmSync(projectDir, { recursive: true, force: true });
+  });
+
+  const GATED_BODY = `
+SHIM_FAIL_OPEN=1
+SHIM_FAIL_CLOSED_WHEN_RELEVANT=1
+SHIM_ACTIVE_GATE_KEY="g2_verify"
+${STD_BODY}
+`;
+  function withPolicy(yaml: string | null): void {
+    fs.mkdirSync(path.join(projectDir, '.rea'), { recursive: true });
+    if (yaml !== null) fs.writeFileSync(path.join(projectDir, '.rea', 'policy.yaml'), yaml);
+  }
+  const runGated = (): ShimResult =>
+    runShim({ shimBody: GATED_BODY, payload: '{}', projectDir });
+
+  it('CLI-missing + gate enforce (block) → FAIL CLOSED (exit 2 + CONFIG-ERROR)', () => {
+    if (!bashExists()) return;
+    withPolicy('artifact_gates:\n  g2_verify:\n    mode: enforce\n');
+    const r = runGated();
+    expect(r.status).toBe(2);
+    expect(r.stderr).toContain('CONFIG-ERROR');
+    expect(r.stderr).toContain('g2_verify');
+  });
+
+  // round-54 tri-state: shadow is OBSERVE-ONLY → WARN + ALLOW, never blocks.
+  it('CLI-missing + gate shadow → WARN + ALLOW (exit 0)', () => {
+    if (!bashExists()) return;
+    withPolicy('artifact_gates:\n  g2_verify:\n    mode: shadow\n');
+    const r = runGated();
+    expect(r.status).toBe(0);
+    expect(r.stderr).toContain('WARN');
+    expect(r.stderr).not.toContain('CONFIG-ERROR');
+  });
+
+  it('CLI-missing + nested-inline `artifact_gates: { g2_verify: { mode: enforce } }` → FAIL CLOSED (exit 2)', () => {
+    if (!bashExists()) return;
+    withPolicy('artifact_gates: { g2_verify: { mode: enforce } }\n');
+    expect(runGated().status).toBe(2);
+  });
+
+  it('CLI-missing + nested-inline shadow → WARN + ALLOW (exit 0)', () => {
+    if (!bashExists()) return;
+    withPolicy('artifact_gates: { g2_verify: { mode: shadow } }\n');
+    const r = runGated();
+    expect(r.status).toBe(0);
+    expect(r.stderr).toContain('WARN');
+  });
+
+  it('CLI-missing + gate off → FAIL OPEN (exit 0)', () => {
+    if (!bashExists()) return;
+    withPolicy('artifact_gates:\n  g2_verify:\n    mode: off\n');
+    expect(runGated().status).toBe(0);
+  });
+
+  it('CLI-missing + policy absent → FAIL OPEN (exit 0)', () => {
+    if (!bashExists()) return;
+    withPolicy(null);
+    expect(runGated().status).toBe(0);
+  });
+
+  it('CLI-missing + flag set but SHIM_ACTIVE_GATE_KEY empty → FAIL OPEN (no key → not active)', () => {
+    if (!bashExists()) return;
+    withPolicy('artifact_gates:\n  g2_verify:\n    mode: enforce\n');
+    const body = `
+SHIM_FAIL_OPEN=1
+SHIM_FAIL_CLOSED_WHEN_RELEVANT=1
+${STD_BODY}
+`;
+    const r = runShim({ shimBody: body, payload: '{}', projectDir });
+    expect(r.status).toBe(0);
+  });
+
+  it('default (flag unset) leaves a FAIL-OPEN shim fail-open even with an active gate', () => {
+    if (!bashExists()) return;
+    withPolicy('artifact_gates:\n  g2_verify:\n    mode: enforce\n');
+    const body = `
+SHIM_FAIL_OPEN=1
+${STD_BODY}
+`;
+    const r = runShim({ shimBody: body, payload: '{}', projectDir });
+    expect(r.status).toBe(0);
+    expect(r.stderr).toBe('');
+  });
+});
+
 describe('hooks/_lib/shim-runtime.sh — sandbox check', () => {
   let projectDir: string;
   beforeEach(() => {

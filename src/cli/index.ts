@@ -21,6 +21,9 @@ import { registerAuditTimelineCommand } from './audit-timeline.js';
 import { registerAuditTopBlocksCommand } from './audit-top-blocks.js';
 import { registerVerifyClaimCommand } from './verify-claim.js';
 import { registerConfigCommand } from './config-key.js';
+import { registerTasksCommand } from './tasks.js';
+import { registerGateCommand } from './gate.js';
+import { registerDashCommand } from './dash.js';
 import { registerTrustCommands } from './trust.js';
 import { registerInstallCommand } from './install/global.js';
 import { err, getPkgVersion } from './utils.js';
@@ -247,6 +250,21 @@ async function main(): Promise<void> {
   // would re-open the N3 surface the tier closes.
   registerTrustCommands(program);
   registerInstallCommand(program);
+
+  // `.rea/tasks.jsonl` task store — the shared keystone for Artifact Gates
+  // and `rea dash`. Append-only JSONL; the reader folds to latest-per-id.
+  registerTasksCommand(program);
+
+  // Artifact Gates (0.54.0+) — `rea gate spec-check` is the G1 spec-gate
+  // commit-time entry point (invoked by the `.husky/pre-commit` fragment).
+  // Deterministic, model-judgment-free; governed by
+  // `policy.artifact_gates.g1_spec` (off | shadow | enforce).
+  registerGateCommand(program);
+
+  // `rea dash` — global, read-only "needs-you-first" dashboard across every
+  // rea-aware project discovered via the user-global registry. Strictly
+  // non-load-bearing: no gate/hook/spine depends on it.
+  registerDashCommand(program);
 
   const tofu = program
     .command('tofu')

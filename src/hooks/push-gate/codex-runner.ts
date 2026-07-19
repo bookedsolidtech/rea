@@ -61,7 +61,7 @@ export const IRON_GATE_DEFAULT_MODEL = IRON_GATE_MODEL_LADDER[0]!;
  * verdict stability — the helixir 2026-04-26 thrashing came from the
  * lower-reasoning default.
  */
-export const IRON_GATE_DEFAULT_REASONING: 'low' | 'medium' | 'high' = 'high';
+export const IRON_GATE_DEFAULT_REASONING: 'low' | 'medium' | 'high' | 'xhigh' = 'high';
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -266,7 +266,7 @@ export interface CodexRunOptions {
    * with a reasoning-capable model (gpt-5.4, gpt-5.3-codex). Codex's
    * own default is `medium`.
    */
-  reasoningEffort?: 'low' | 'medium' | 'high';
+  reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh';
   /**
    * Env passthrough. Tests inject a clean env to prevent ambient overrides.
    * Production passes `process.env`.

@@ -521,7 +521,14 @@ describe('dangerous-bash-interceptor: H16 (alias/function with bypass)', () => {
 
 describe('dangerous-bash-interceptor: H17 (context-protection delegate)', () => {
   let root: string;
+  let savedMarker: string | undefined;
   beforeEach(() => {
+    // Scrub the ambient global env marker so the baseline is UNSANCTIONED
+    // regardless of invocation environment (a delegated runner invokes the
+    // suite with REA_DELEGATED_RUN=1 set, which would globally sanction every
+    // segment and stop H17 from ever firing on these unsanctioned commands).
+    savedMarker = process.env.REA_DELEGATED_RUN;
+    delete process.env.REA_DELEGATED_RUN;
     root = mkRoot();
     fs.mkdirSync(path.join(root, '.rea'), { recursive: true });
     fs.writeFileSync(
@@ -544,6 +551,8 @@ context_protection:
   });
   afterEach(() => {
     fs.rmSync(root, { recursive: true, force: true });
+    if (savedMarker === undefined) delete process.env.REA_DELEGATED_RUN;
+    else process.env.REA_DELEGATED_RUN = savedMarker;
   });
 
   it('blocks a configured delegate prefix', async () => {
@@ -630,6 +639,208 @@ some_legacy_top_level_key:
     const r = await run('pnpm test', root);
     expect(r.exitCode).toBe(2);
     expect(r.ids).toContain('H17');
+  });
+});
+
+describe('dangerous-bash-interceptor: H17 sanction + runner normalization (bug H17)', () => {
+  let root: string;
+  let savedMarker: string | undefined;
+  beforeEach(() => {
+    // Scrub the ambient global env marker so the baseline is UNSANCTIONED —
+    // the command-marker tests use the inline `REA_DELEGATED_RUN=1 <cmd>`
+    // form (parsed from the command STRING) and are unaffected by this.
+    savedMarker = process.env.REA_DELEGATED_RUN;
+    delete process.env.REA_DELEGATED_RUN;
+    root = mkRoot();
+    fs.mkdirSync(path.join(root, '.rea'), { recursive: true });
+    fs.writeFileSync(
+      path.join(root, '.rea', 'policy.yaml'),
+      `context_protection:
+  delegate_to_subagent:
+    - pnpm run test
+    - pnpm run build
+`,
+    );
+  });
+  afterEach(() => {
+    fs.rmSync(root, { recursive: true, force: true });
+    if (savedMarker === undefined) delete process.env.REA_DELEGATED_RUN;
+    else process.env.REA_DELEGATED_RUN = savedMarker;
+  });
+
+  it('the sanctioned marker makes the mandated path traversable (allow, no H17)', async () => {
+    const r = await run('REA_DELEGATED_RUN=1 pnpm test', root);
+    expect(r.exitCode).toBe(0);
+    expect(r.ids).not.toContain('H17');
+  });
+
+  it('a sanctioned run is RECORDED on the audit chain', async () => {
+    await run('REA_DELEGATED_RUN=1 pnpm run test', root);
+    const auditPath = path.join(root, '.rea', 'audit.jsonl');
+    expect(fs.existsSync(auditPath)).toBe(true);
+    const records = fs
+      .readFileSync(auditPath, 'utf8')
+      .split('\n')
+      .filter((l) => l.length > 0)
+      .map((l) => JSON.parse(l) as { tool_name?: string; metadata?: Record<string, unknown> });
+    const rec = records.find((x) => x.tool_name === 'rea.context_protection');
+    expect(rec).toBeDefined();
+    expect(rec?.metadata?.['event']).toBe('delegated_run_sanctioned');
+    expect(rec?.metadata?.['sanction_source']).toBe('command_marker');
+  });
+
+  it('the GLOBAL env marker sanctions an unmarked delegate command (source: env)', async () => {
+    // The delegated-runner branch: when REA_DELEGATED_RUN is set in the
+    // PROCESS ENV, every delegate-listed segment is globally sanctioned even
+    // without an inline `REA_DELEGATED_RUN=1` command prefix. This is the
+    // exact code path (envMarkerSet() → source:'env') that has no other
+    // coverage. The block's afterEach restores env, keeping this isolated.
+    process.env.REA_DELEGATED_RUN = '1';
+    try {
+      // `pnpm test` is the shorthand of the delegated `pnpm run test` and
+      // carries NO inline marker — only the ambient env marker sanctions it.
+      const r = await run('pnpm test', root);
+      expect(r.exitCode).toBe(0);
+      expect(r.ids).not.toContain('H17');
+      const auditPath = path.join(root, '.rea', 'audit.jsonl');
+      expect(fs.existsSync(auditPath)).toBe(true);
+      const records = fs
+        .readFileSync(auditPath, 'utf8')
+        .split('\n')
+        .filter((l) => l.length > 0)
+        .map(
+          (l) =>
+            JSON.parse(l) as {
+              tool_name?: string;
+              metadata?: Record<string, unknown>;
+            },
+        );
+      const rec = records.find((x) => x.tool_name === 'rea.context_protection');
+      expect(rec).toBeDefined();
+      expect(rec?.metadata?.['event']).toBe('delegated_run_sanctioned');
+      expect(rec?.metadata?.['sanction_source']).toBe('env');
+    } finally {
+      // Belt-and-suspenders: the afterEach also restores, but never let the
+      // set var leak to a sibling test if an assertion throws mid-body.
+      delete process.env.REA_DELEGATED_RUN;
+    }
+  });
+
+  it('the coordinator (no marker) is still blocked — shorthand equivalent too', async () => {
+    // `pnpm test` is the shorthand of the listed `pnpm run test`.
+    const r = await run('pnpm test', root);
+    expect(r.exitCode).toBe(2);
+    expect(r.ids).toContain('H17');
+  });
+
+  it('closes the under-block leak: every LOCAL runner-equivalent form now blocks', async () => {
+    fs.writeFileSync(
+      path.join(root, '.rea', 'policy.yaml'),
+      `context_protection:\n  delegate_to_subagent:\n    - pnpm vitest run\n`,
+    );
+    for (const cmd of [
+      './node_modules/.bin/vitest run', // the bypass an agent found in the field
+      'node_modules/.bin/vitest run',
+      'pnpm exec vitest run',
+      'pnpm vitest run',
+    ]) {
+      const r = await run(cmd, root);
+      expect(r.exitCode, cmd).toBe(2);
+      expect(r.ids, cmd).toContain('H17');
+    }
+  });
+
+  it('collapses whitespace so `pnpm  run  test` (extra spaces) still blocks', async () => {
+    const r = await run('pnpm  run  test', root);
+    expect(r.exitCode).toBe(2);
+  });
+
+  it('does NOT over-block: the `test` shell builtin is unaffected by a `pnpm test` delegate', async () => {
+    // Stripping the pattern down to a bare `test` would catch these —
+    // the expansion approach deliberately does not.
+    for (const cmd of ['test -f foo && echo hi', 'test "$x" = y', 'pnpm testfoo', 'pnpm test-utils run']) {
+      const r = await run(cmd, root);
+      expect(r.exitCode, cmd).toBe(0);
+    }
+  });
+
+  it('covers the script-runner forms of a `pnpm run <script>` entry (round-1 P2 + round-2 P1 npm)', async () => {
+    // `pnpm run test` is listed; node --run / yarn run / npm run / npm
+    // (lifecycle shorthand) are equivalent ways to invoke the same
+    // package script and were leaking — including the Node default `npm`.
+    for (const cmd of ['node --run test', 'yarn run test', 'pnpm run test', 'npm run test', 'npm test']) {
+      const r = await run(cmd, root);
+      expect(r.exitCode, cmd).toBe(2);
+      expect(r.ids, cmd).toContain('H17');
+    }
+  });
+
+  it('does NOT over-block npm non-script commands or the download form (round-2 P1)', async () => {
+    // `npm install` / `npm ci` are not the delegated script; `npm exec`
+    // is npx (download-arbitrary) — deliberately excluded like npx/dlx.
+    for (const cmd of ['npm install', 'npm ci', 'npm exec vitest', 'npm test-utils run']) {
+      const r = await run(cmd, root);
+      expect(r.exitCode, cmd).toBe(0);
+    }
+  });
+
+  it('does NOT over-block `npm build` — npm built-in ≠ the `run build` script (round-29 P2)', async () => {
+    fs.writeFileSync(
+      path.join(root, '.rea', 'policy.yaml'),
+      `context_protection:\n  delegate_to_subagent:\n    - pnpm run build\n`,
+    );
+    // Explicit `npm run build` IS the delegated script → blocked.
+    expect((await run('npm run build', root)).exitCode).toBe(2);
+    // Bare `npm build` is npm's own built-in (NOT `npm run build`) → allowed;
+    // `build` is not one of npm's four lifecycle names.
+    expect((await run('npm build', root)).exitCode).toBe(0);
+    // …but a lifecycle name still expands: `pnpm run test` → `npm test` blocks.
+    fs.writeFileSync(
+      path.join(root, '.rea', 'policy.yaml'),
+      `context_protection:\n  delegate_to_subagent:\n    - pnpm run test\n`,
+    );
+    expect((await run('npm test', root)).exitCode).toBe(2);
+  });
+
+  it('does NOT treat dlx / bare npx as equivalent (they download arbitrary pkgs) (round-1 P2)', async () => {
+    // `npx test` / `pnpm dlx test` fetch and run an unrelated package —
+    // not the delegated local script — so they must NOT be over-blocked.
+    for (const cmd of ['pnpm dlx test', 'yarn dlx test', 'npx test']) {
+      const r = await run(cmd, root);
+      expect(r.exitCode, cmd).toBe(0);
+    }
+  });
+
+  it('tracks sanction PER SEGMENT — a sanctioned segment does not excuse an unsanctioned one (round-1 P1)', async () => {
+    // policy delegates both `pnpm run test` and `pnpm run build`.
+    fs.writeFileSync(
+      path.join(root, '.rea', 'policy.yaml'),
+      `context_protection:\n  delegate_to_subagent:\n    - pnpm run test\n    - pnpm run build\n`,
+    );
+    // `pnpm test` (unsanctioned) && REA_DELEGATED_RUN=1 pnpm build (sanctioned)
+    const mixed = await run('pnpm test && REA_DELEGATED_RUN=1 pnpm build', root);
+    expect(mixed.exitCode).toBe(2);
+    expect(mixed.ids).toContain('H17');
+    // Both sanctioned → allow.
+    const both = await run(
+      'REA_DELEGATED_RUN=1 pnpm test && REA_DELEGATED_RUN=1 pnpm build',
+      root,
+    );
+    expect(both.exitCode).toBe(0);
+  });
+
+  it('does NOT write a sanctioned-run audit record when another rule blocks (round-1 P3)', async () => {
+    const r = await run('REA_DELEGATED_RUN=1 pnpm test && rm -rf /', root);
+    expect(r.exitCode).toBe(2); // H11 (rm -rf) blocks
+    const auditPath = path.join(root, '.rea', 'audit.jsonl');
+    const hasCtx =
+      fs.existsSync(auditPath) &&
+      fs
+        .readFileSync(auditPath, 'utf8')
+        .split('\n')
+        .filter((l) => l.length > 0)
+        .some((l) => (JSON.parse(l) as { tool_name?: string }).tool_name === 'rea.context_protection');
+    expect(hasCtx).toBe(false);
   });
 });
 

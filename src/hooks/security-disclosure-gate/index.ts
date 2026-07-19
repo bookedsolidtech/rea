@@ -63,7 +63,8 @@
 import { Buffer } from 'node:buffer';
 import fs from 'node:fs';
 import path from 'node:path';
-import { checkHalt, formatHaltBanner } from '../_lib/halt-check.js';
+import { checkHaltRoots, formatHaltBanner } from '../_lib/halt-check.js';
+import { resolveHookRoots } from '../../lib/worktree-roots.js';
 import {
   parseHookPayload,
   MalformedPayloadError,
@@ -447,8 +448,6 @@ security patterns, then retry.`;
 export async function runSecurityDisclosureGate(
   options: SecurityDisclosureGateOptions = {},
 ): Promise<SecurityDisclosureGateResult> {
-  const reaRoot =
-    options.reaRoot ?? process.env['CLAUDE_PROJECT_DIR'] ?? process.cwd();
   const cwd = options.cwdOverride ?? process.cwd();
   let stderr = '';
   let stdout = '';
@@ -461,20 +460,12 @@ export async function runSecurityDisclosureGate(
     if (options.stdoutWrite) options.stdoutWrite(s);
   };
 
-  // 1. HALT check.
-  const halt = checkHalt(reaRoot);
-  if (halt.halted) {
-    writeStderr(formatHaltBanner(halt.reason));
-    return { exitCode: 2, stderr, stdout };
-  }
-
-  // 2. Disclosure mode.
+  // 2. Disclosure mode. (Round-21 P2: the disabled-mode early return
+  // moved BELOW the HALT probe — a frozen repository denies this hook
+  // regardless of REA_DISCLOSURE_MODE, matching the pre-0.54.0 order.)
   const rawMode =
     options.disclosureModeOverride ?? process.env['REA_DISCLOSURE_MODE'];
   const mode = normalizeDisclosureMode(rawMode);
-  if (mode === 'disabled') {
-    return { exitCode: 0, stderr, stdout };
-  }
 
   // 3. Stdin.
   const stdinRaw =
@@ -484,8 +475,10 @@ export async function runSecurityDisclosureGate(
 
   let toolName = '';
   let cmd = '';
+  let payloadCwd = '';
   try {
     const payload = parseHookPayload(stdinRaw);
+    payloadCwd = payload.cwd;
     toolName = payload.toolName;
     cmd = payload.command;
   } catch (err) {
@@ -496,6 +489,22 @@ export async function runSecurityDisclosureGate(
       return { exitCode: 2, stderr, stdout };
     }
     throw err;
+  }
+
+  // Roots + HALT (0.54.0 worktree state): the payload's `cwd` feeds the
+  // resolution ladder, so stdin is parsed FIRST — a deliberate reorder.
+  // Policy/path checks key off the LOCAL (worktree) root; audit and the
+  // kill switch key off the COMMON (repository) root.
+  const { localRoot: reaRoot, commonRoot } = resolveHookRoots(payloadCwd, options.reaRoot);
+  // 1. HALT check.
+  const halt = checkHaltRoots(reaRoot, commonRoot);
+  if (halt.halted) {
+    writeStderr(formatHaltBanner(halt.reason));
+    return { exitCode: 2, stderr, stdout };
+  }
+
+  if (mode === 'disabled') {
+    return { exitCode: 0, stderr, stdout };
   }
 
   if (toolName !== '' && toolName !== 'Bash') {

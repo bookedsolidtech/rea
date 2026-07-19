@@ -37,13 +37,17 @@ import type { Command } from 'commander';
 import { parse as parseYaml } from 'yaml';
 import { parsePrePushStdin, runPushGate } from '../hooks/push-gate/index.js';
 import { runBlockedScan, runProtectedScan, type Verdict } from '../hooks/bash-scanner/index.js';
-import { checkHalt, formatHaltBanner } from '../hooks/_lib/halt-check.js';
+import { checkHaltRoots, formatHaltBanner } from '../hooks/_lib/halt-check.js';
+import { resolveHookRoots, resolveReaRoots, resolveCommonRoot, resolveLocalRoot, listSiblingWorktreeRoots } from '../lib/worktree-roots.js';
+import { resolveProtectedPatterns } from '../hooks/_lib/protected-paths.js';
 import { runHookPrIssueLinkGate } from '../hooks/pr-issue-link-gate/index.js';
 import { runHookSecurityDisclosureGate } from '../hooks/security-disclosure-gate/index.js';
 import { runHookAttributionAdvisory } from '../hooks/attribution-advisory/index.js';
 import { runHookEnvFileProtection } from '../hooks/env-file-protection/index.js';
 import { runHookDependencyAuditGate } from '../hooks/dependency-audit-gate/index.js';
 import { runHookChangesetSecurityGate } from '../hooks/changeset-security-gate/index.js';
+import { runHookVerifyGate } from '../hooks/verify-gate/index.js';
+import { runHookVerifyGateBashGate } from '../hooks/verify-gate-bash-gate/index.js';
 import { runHookArchitectureReviewGate } from '../hooks/architecture-review-gate/index.js';
 import { runHookDangerousBashInterceptor } from '../hooks/dangerous-bash-interceptor/index.js';
 import { runHookLocalReviewGate } from '../hooks/local-review-gate/index.js';
@@ -109,7 +113,11 @@ export interface HookPushGateOptions {
  * behavior consistent prevents commander from inferring its own default.
  */
 export async function runHookPushGate(options: HookPushGateOptions): Promise<void> {
-  const baseDir = process.cwd();
+  // 0.54.0 worktree state: the gate runs where git invoked the pre-push
+  // hook (the worktree). Policy/diff/last-review.json stay here; audit,
+  // the verdict cache, and the HALT probe follow `commonDir` to the
+  // primary checkout so coverage and verdict reuse span worktrees.
+  const { localRoot: baseDir, commonRoot: commonDir } = resolveReaRoots(process.cwd());
   const stderr = (line: string): void => {
     process.stderr.write(line);
   };
@@ -122,6 +130,7 @@ export async function runHookPushGate(options: HookPushGateOptions): Promise<voi
   try {
     const result = await runPushGate({
       baseDir,
+      commonDir,
       env: process.env,
       stderr,
       refspecs,
@@ -222,6 +231,7 @@ export interface HookScanBashOptions {
 }
 
 interface ScanBashStdinPayload {
+  cwd?: unknown;
   tool_input?: {
     command?: unknown;
   };
@@ -233,27 +243,12 @@ interface ScanBashStdinPayload {
  * writes the verdict JSON, exits with the appropriate code.
  */
 export async function runHookScanBash(options: HookScanBashOptions): Promise<void> {
-  const reaRoot = options.reaRoot ?? process.env['CLAUDE_PROJECT_DIR'] ?? process.cwd();
-
-  // HALT check — uniform with the bash hooks. We exit 2 (block) so
-  // the shim refuses the command in the same way settings-protection
-  // and the bash gates do.
-  // 0.32.0: shared via `src/hooks/_lib/halt-check.ts` so the Phase 1
-  // pilots and the codex-review hook below all emit the same banner
-  // byte-for-byte and apply the same fail-closed read posture.
-  const halt = checkHalt(reaRoot);
-  if (halt.halted) {
-    process.stderr.write(formatHaltBanner(halt.reason));
-    const haltVerdict: Verdict = {
-      verdict: 'block',
-      reason: 'rea HALT active',
-    };
-    process.stdout.write(JSON.stringify(haltVerdict) + '\n');
-    process.exit(2);
-  }
-
+  // 0.54.0 worktree state: stdin is read BEFORE the HALT check — the
+  // payload's `cwd` feeds root resolution (deliberate reorder; a
+  // malformed payload still fails closed below before any verdict).
   const stdinRaw = process.stdin.isTTY ? '' : await readStdinWithTimeout(5_000);
   let cmd = '';
+  let payloadCwd = '';
   if (stdinRaw.length > 0) {
     try {
       const parsed: ScanBashStdinPayload = JSON.parse(stdinRaw);
@@ -273,6 +268,7 @@ export async function runHookScanBash(options: HookScanBashOptions): Promise<voi
         process.exit(2);
       }
       if (typeof c === 'string') cmd = c;
+      if (typeof parsed.cwd === 'string') payloadCwd = parsed.cwd;
     } catch {
       // Malformed JSON on stdin → fail closed. The bash shim only
       // forwards what Claude Code sends, so this should never happen
@@ -286,6 +282,21 @@ export async function runHookScanBash(options: HookScanBashOptions): Promise<voi
       process.exit(2);
     }
   }
+  // Roots + HALT — uniform with the bash hooks; exit 2 (block) so the
+  // shim refuses like settings-protection does. Policy keys off the
+  // LOCAL root; the kill switch probes BOTH roots (repo-wide, 0.54.0).
+  const { localRoot: reaRoot, commonRoot } = resolveHookRoots(payloadCwd, options.reaRoot);
+  const halt = checkHaltRoots(reaRoot, commonRoot);
+  if (halt.halted) {
+    process.stderr.write(formatHaltBanner(halt.reason));
+    const haltVerdict: Verdict = {
+      verdict: 'block',
+      reason: 'rea HALT active',
+    };
+    process.stdout.write(JSON.stringify(haltVerdict) + '\n');
+    process.exit(2);
+  }
+
   // Empty command → allow. Matches the bash gates' `[[ -z "$CMD" ]] && exit 0`.
   if (cmd.length === 0) {
     process.stdout.write(JSON.stringify({ verdict: 'allow' }) + '\n');
@@ -308,6 +319,19 @@ export async function runHookScanBash(options: HookScanBashOptions): Promise<voi
     // Policy missing or invalid. Continue with defaults — the historical
     // protected list is hardcoded; blocked_paths becomes an empty no-op.
   }
+  // Round-11 P1: permissive per-root blocked_paths loader for cross-root
+  // targets (the TARGET stream's own list joins the match via union).
+  const loadPolicyBlockedPathsPermissive = (root: string): readonly string[] => {
+    try {
+      const parsed = parseYaml(fs.readFileSync(path.join(root, '.rea', 'policy.yaml'), 'utf8'));
+      if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return [];
+      const bp = (parsed as Record<string, unknown>)['blocked_paths'];
+      if (!Array.isArray(bp)) return [];
+      return bp.filter((e): e is string => typeof e === 'string' && e.length > 0);
+    } catch {
+      return [];
+    }
+  };
 
   // Passwd-derived home for the `~/.rea` global-root gate (safe-global-
   // CLI). Never `$HOME` / `$XDG_*` — an agent can move those in-process.
@@ -321,6 +345,41 @@ export async function runHookScanBash(options: HookScanBashOptions): Promise<voi
       verdict = runProtectedScan(
         {
           reaRoot,
+          commonRoot,
+          siblingRoots: listSiblingWorktreeRoots(commonRoot, reaRoot),
+          protectedPatternsForRoot: (
+            root: string,
+          ): { patterns: readonly string[]; overridePatterns: readonly string[] } => {
+            try {
+              const parsed = parseYaml(
+                fs.readFileSync(path.join(root, '.rea', 'policy.yaml'), 'utf8'),
+              );
+              if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+                return { patterns: [], overridePatterns: [] };
+              }
+              const rec = parsed as Record<string, unknown>;
+              const writes = Array.isArray(rec['protected_writes'])
+                ? (rec['protected_writes'] as unknown[]).filter(
+                    (e): e is string => typeof e === 'string' && e.length > 0,
+                  )
+                : undefined;
+              const relaxT = Array.isArray(rec['protected_paths_relax'])
+                ? (rec['protected_paths_relax'] as unknown[]).filter(
+                    (e): e is string => typeof e === 'string' && e.length > 0,
+                  )
+                : [];
+              const resolved = resolveProtectedPatterns({
+                ...(writes !== undefined ? { protectedWrites: writes } : {}),
+                protectedPathsRelax: relaxT,
+              });
+              // Round-28 P2: the target's overridePatterns keep their
+              // precedence over the husky .d extension-surface
+              // allow-list even when the write arrives cross-root.
+              return { patterns: resolved.patterns, overridePatterns: resolved.overridePatterns };
+            } catch {
+              return { patterns: [], overridePatterns: [] };
+            }
+          },
           policy: {
             ...(protectedWrites !== undefined ? { protected_writes: protectedWrites } : {}),
             protected_paths_relax: protectedRelax,
@@ -331,7 +390,7 @@ export async function runHookScanBash(options: HookScanBashOptions): Promise<voi
         cmd,
       );
     } else {
-      verdict = runBlockedScan({ reaRoot, blockedPaths }, cmd);
+      verdict = runBlockedScan({ reaRoot, commonRoot, siblingRoots: listSiblingWorktreeRoots(commonRoot, reaRoot), blockedPaths, blockedPathsForRoot: loadPolicyBlockedPathsPermissive }, cmd);
     }
   } catch (e) {
     // Any exception in the scanner is a bug; fail closed.
@@ -346,7 +405,7 @@ export async function runHookScanBash(options: HookScanBashOptions): Promise<voi
   // captures every scan-bash invocation. Best-effort — failure to
   // write an audit entry must NOT change the verdict.
   try {
-    await appendAuditRecord(reaRoot, {
+    await appendAuditRecord(commonRoot, {
       tool_name: 'rea.hook.scan-bash',
       server_name: 'rea',
       tier: Tier.Read,
@@ -430,7 +489,21 @@ export async function runHookPolicyGet(options: HookPolicyGetOptions): Promise<v
     process.exit(1);
   }
 
-  const reaRoot = options.reaRoot ?? process.env['CLAUDE_PROJECT_DIR'] ?? process.cwd();
+  // 0.54.0 worktree state: the bash shims export the payload-derived
+  // REA_ROOT before invoking this subcommand (shim-runtime.sh §2b), so a
+  // worktree session reads the WORKTREE's policy. Falls back to the
+  // historical resolution when unset. Guarded like the shim: the value
+  // must actually carry `.rea/` or it is ignored.
+  const envReaRoot = process.env['REA_ROOT'];
+  const reaRoot =
+    options.reaRoot ??
+    (envReaRoot !== undefined &&
+    envReaRoot.length > 0 &&
+    fs.existsSync(path.join(envReaRoot, '.rea'))
+      ? envReaRoot
+      : undefined) ??
+    process.env['CLAUDE_PROJECT_DIR'] ??
+    process.cwd();
   const policyPath = path.join(reaRoot, '.rea', 'policy.yaml');
   const finishMissing = (): void => {
     if (options.json === true) process.stdout.write('null');
@@ -550,11 +623,19 @@ export interface HookCodexReviewOptions {
 }
 
 export async function runHookCodexReview(options: HookCodexReviewOptions): Promise<void> {
-  const baseDir = options.reaRoot ?? process.cwd();
+  // Round-31 P2: normalize a nested-cwd invocation to the checkout
+  // ROOT — /codex-review launched from a subdirectory of a linked
+  // worktree must probe <worktree>/.rea/HALT (and the shared common
+  // HALT) and land its codex.review audit entries on the repository
+  // chain, not under <subdir>/.rea/. The explicit test seam stays
+  // verbatim.
+  const baseDir = options.reaRoot ?? resolveLocalRoot(process.cwd());
 
-  // HALT check — uniform with the rest of the hook tree.
-  // 0.32.0: shared via `src/hooks/_lib/halt-check.ts`.
-  const halt = checkHalt(baseDir);
+  // HALT check — uniform with the rest of the hook tree; probes BOTH
+  // roots (0.54.0: the kill switch is repo-wide, and a freeze written at
+  // the primary checkout must stop a /codex-review invoked from any
+  // linked worktree).
+  const halt = checkHaltRoots(baseDir);
   if (halt.halted) {
     process.stderr.write(formatHaltBanner(halt.reason));
     process.exit(2);
@@ -761,7 +842,9 @@ export async function runHookCodexReview(options: HookCodexReviewOptions): Promi
                 : 'unknown';
     let auditHash = '';
     try {
-      const record = await appendAuditRecord(baseDir, {
+      // 0.54.0: codex.review coverage lands on the REPOSITORY chain so
+      // preflight in any worktree sees it.
+      const record = await appendAuditRecord(resolveCommonRoot(baseDir).commonRoot, {
         tool_name: CODEX_REVIEW_TOOL_NAME,
         server_name: CODEX_REVIEW_SERVER_NAME,
         status: InvocationStatus.Error,
@@ -829,7 +912,7 @@ export async function runHookCodexReview(options: HookCodexReviewOptions): Promi
 
   let auditHash = '';
   try {
-    const record = await appendAuditRecord(baseDir, {
+    const record = await appendAuditRecord(resolveCommonRoot(baseDir).commonRoot, {
       tool_name: CODEX_REVIEW_TOOL_NAME,
       server_name: CODEX_REVIEW_SERVER_NAME,
       status: verdict === 'blocking' ? InvocationStatus.Denied : InvocationStatus.Allowed,
@@ -898,6 +981,7 @@ export async function runHookCodexReview(options: HookCodexReviewOptions): Promi
  */
 interface DelegationSignalStdinPayload {
   tool_name?: unknown;
+  cwd?: unknown;
   session_id?: unknown;
   hook_event_timestamp?: unknown;
   tool_input?: {
@@ -1059,8 +1143,6 @@ async function writeDelegationSignal(
 export async function runHookDelegationSignal(
   options: HookDelegationSignalOptions,
 ): Promise<void> {
-  const baseDir =
-    options.reaRoot ?? process.env['CLAUDE_PROJECT_DIR'] ?? process.cwd();
   const lockTimeoutMs = options.lockTimeoutMs ?? 2000;
 
   // Read stdin. TTY → empty (no harness payload available, nothing to
@@ -1085,6 +1167,16 @@ export async function runHookDelegationSignal(
     );
     process.exit(0);
   }
+
+  // 0.54.0 worktree state: the delegation signal is part of the audit
+  // CHAIN, which is per-repository — resolve roots from the payload cwd
+  // and write to the COMMON root so signals from every worktree land in
+  // one chain (the advisory's "did this session delegate" scan reads
+  // the same chain).
+  const { localRoot: signalLocalRoot, commonRoot: baseDir } = resolveHookRoots(
+    typeof payload.cwd === 'string' ? payload.cwd : undefined,
+    options.reaRoot,
+  );
 
   // Resolve which delegation tool fired. Anything else is a misfire at
   // the matcher layer (Claude Code routed a non-delegation tool to us)
@@ -1172,6 +1264,8 @@ export async function runHookDelegationSignal(
     session_id_observed: sessionIdObserved,
     parent_subagent_type: parentValue,
     invocation_description_sha256: descriptionHash,
+    // Round-27 P3: stream scoping for the advisory predicate.
+    local_root: signalLocalRoot,
     ...(hookEventTimestamp !== undefined ? { hook_event_timestamp: hookEventTimestamp } : {}),
   };
 
@@ -1457,6 +1551,24 @@ export function registerHookCommand(program: Command): void {
     )
     .action(async () => {
       await runHookChangesetSecurityGate();
+    });
+
+  hook
+    .command('verify-gate')
+    .description(
+      'G2 verification-gate (Artifact Gates, 0.54.0+). PreToolUse Write/Edit/MultiEdit/NotebookEdit gate over `.rea/tasks.jsonl`. Refuses a write whose resulting content transitions ANY task to `status: completed` with empty/absent evidence — defence-in-depth with the `rea tasks complete` CLI invariant. Governed by `policy.artifact_gates.g2_verify.mode`: off → exit 0 (silent); shadow → audit `rea.gate.g2.shadow` (would_block) + exit 0; enforce → audit `rea.gate.g2` (deny) + exit 2 with a banner (NO prompt). UNCERTAIN (malformed payload / unreconstructable Edit) refuses at enforce, logs+allows at shadow.',
+    )
+    .action(async () => {
+      await runHookVerifyGate();
+    });
+
+  hook
+    .command('verify-gate-bash-gate')
+    .description(
+      'G2 verification-gate, Bash-tier (Artifact Gates, 0.54.0+). PreToolUse Bash gate refusing a shell WRITE/REDIRECT to `.rea/tasks.jsonl` (the editor-tier verify-gate only guards Write/Edit; a raw `echo ... > .rea/tasks.jsonl` / tee / cp / mv bypasses it). Write-target detection reuses the AST-backed `runBlockedScan` with a single synthetic entry — no hand-rolled redirect parsing. Governed by `policy.artifact_gates.g2_verify.mode`: off → exit 0 (byte-identical, no scan); shadow → audit `rea.gate.g2.shadow` (would_block, bash source) + exit 0; enforce → audit `rea.gate.g2` (deny) + exit 2 with a banner pointing to `rea tasks`. Fail-OPEN (default-off) when the CLI is missing. Out of scope: interpreter-internal writes (`python -c ... open(...,"w")`).',
+    )
+    .action(async () => {
+      await runHookVerifyGateBashGate();
     });
 
   hook

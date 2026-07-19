@@ -110,6 +110,20 @@ export const REA_GITIGNORE_ENTRIES: readonly string[] = [
   '.rea/serve.state.json',
   '.rea/fingerprints.json',
   '.rea/last-review.json',
+  // Artifact-gates release — the `rea tasks` tracker store and its
+  // proper-lockfile sidecar, plus the spend-governance per-session turn
+  // counters. All are LOCAL mutable runtime state (task state is intended to
+  // stay per-checkout); without these a repo gets a dirty tree the moment
+  // `rea tasks add` or a turn-budget tick runs, and the store is easy to
+  // commit by accident (codex round-15 P2).
+  '.rea/tasks.jsonl',
+  '.rea/tasks.jsonl.lock',
+  '.rea/turn-count.json',
+  '.rea/turn-count.*.json',
+  // proper-lockfile sidecar for the per-session counters (round-33 P3): an
+  // interrupted hook / stale lock leaves `.rea/turn-count.<session>.json.lock`
+  // untracked otherwise — the dirty-tree regression this block prevents.
+  '.rea/turn-count*.lock',
   // 0.50.x — `provider: both` writes a side-by-side parity report on EVERY run;
   // a consumer enabling the openrouter parity lane would otherwise have a dirty
   // tree after the first review (codex round-16 P2). The per-commit parity

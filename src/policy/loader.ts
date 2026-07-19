@@ -182,7 +182,7 @@ const ReviewPolicySchema = z
      * own default. `low` for cost-bounded environments where consistency
      * matters less than throughput.
      */
-    codex_reasoning_effort: z.enum(['low', 'medium', 'high']).optional(),
+    codex_reasoning_effort: z.enum(['low', 'medium', 'high', 'xhigh']).optional(),
     /**
      * Verdict cache TTL in milliseconds (0.18.1+ helixir #1, #4, #7, #8).
      * Default 86_400_000 (24 hours). When a push of `head_sha` produces
@@ -486,6 +486,43 @@ const DelegationAdvisoryPolicySchema = z
  * the protective `'halt'`. Every shipped profile still pins the block
  * explicitly for documentation, but absence no longer means disabled.
  */
+/**
+ * Artifact Gates §5 — turn-budget sub-block of `spend_governance`. Makes the
+ * "turn budget" folklore real: the warn/halt turn thresholds that consuming
+ * CLAUDE.md files previously stated in PROSE (relying on the model to remember
+ * and self-enforce) now live in policy and drive AUDITED warn/refuse events
+ * through the `billing-cap-halt` PostToolUse path.
+ *
+ * OPT-IN, ABSENT=disabled (unlike the parent `spend_governance` block, which
+ * is opt-OUT). The sub-block is `.optional()` — a policy that predates this
+ * feature, or simply omits `turn_budget:`, sees NO behavior change: no counter
+ * file, no events. Consumers turn it on by declaring the thresholds.
+ *
+ *   - `warn_turns` — emit an audited `rea.spend.turn_budget_warn` at/after
+ *     this many tool-calls in a session. Once per threshold-crossing, not
+ *     every turn after.
+ *   - `halt_turns` — the `response` fires at/after this many tool-calls.
+ *   - `response` — `warn` (DEFAULT) audits + banners but does NOT freeze;
+ *     `halt` writes `.rea/HALT` (the existing kill-switch) + audits
+ *     `rea.spend.turn_budget_halt` + banners; `off` is a silent no-op.
+ *
+ * `.strict()` so a typo (`warn_turn`, `halt`) fails loudly at load. The
+ * `.refine` rejects `warn_turns > halt_turns` — a warn threshold ABOVE the
+ * halt threshold could never fire (the session freezes/refuses first), so it
+ * is a policy authoring error, caught at load rather than silently dead.
+ */
+const TurnBudgetPolicySchema = z
+  .object({
+    warn_turns: z.number().int().positive(),
+    halt_turns: z.number().int().positive(),
+    response: z.enum(['warn', 'halt', 'off']).default('warn'),
+  })
+  .strict()
+  .refine((v) => v.warn_turns <= v.halt_turns, {
+    message:
+      'spend_governance.turn_budget.warn_turns must be <= halt_turns (a warn threshold above the halt threshold can never fire)',
+  });
+
 const SpendGovernancePolicySchema = z
   .object({
     enabled: z.boolean().default(true),
@@ -498,6 +535,10 @@ const SpendGovernancePolicySchema = z
     // PR2's endpoint registry supplies the provider discriminator that
     // makes freezing safe.
     billing_error_response: z.enum(['halt', 'warn', 'off']).default('warn'),
+    // Artifact Gates §5 turn-budget. OPT-IN: `.optional()` (absent = off),
+    // distinct from the opt-out billing fields above. See
+    // `TurnBudgetPolicySchema`.
+    turn_budget: TurnBudgetPolicySchema.optional(),
   })
   .strict();
 
@@ -600,6 +641,40 @@ const RuntimePolicySchema = z
   })
   .strict();
 
+/**
+ * Artifact Gates (0.54.0+). Three deterministic, model-judgment-free
+ * process gates — G1 spec-gate, G2 verification-gate, G3 review-gate —
+ * each with a three-state `mode`: `off` (silent no-op — the default, so
+ * an absent block is byte-identical to prior behavior), `shadow` (log
+ * would-block to the audit chain, never block), `enforce` (block into
+ * the review queue, never an interactive prompt). Policy can TIGHTEN
+ * but never loosen the floor. See THREAT_MODEL §11 and the gates spec.
+ */
+const GateModeSchema = z.enum(['off', 'shadow', 'enforce']);
+const ArtifactGatesPolicySchema = z
+  .object({
+    g1_spec: z
+      .object({
+        mode: GateModeSchema.default('off'),
+        // Non-trivial-work thresholds — the gate is SILENT below these
+        // (unless the active ticket is `requires_spec`), preserving the
+        // "just do it" branch for single-smart-zone work.
+        diff_lines: z.number().int().positive().default(150),
+        diff_files: z.number().int().positive().default(5),
+      })
+      .strict()
+      .default({}),
+    g2_verify: z
+      .object({ mode: GateModeSchema.default('off') })
+      .strict()
+      .default({}),
+    g3_review: z
+      .object({ mode: GateModeSchema.default('off') })
+      .strict()
+      .default({}),
+  })
+  .strict();
+
 const PolicySchema = z
   .object({
     version: z.string(),
@@ -698,6 +773,18 @@ const PolicySchema = z
     // tri-state contract and the registry-primary / policy-secondary
     // asymmetry.
     runtime: RuntimePolicySchema.optional(),
+    // 0.54.0 Artifact Gates — G1/G2/G3 process gates. `.optional()` so an
+    // absent block is a total no-op (all modes default `off` when the
+    // block IS present). See `ArtifactGatesPolicySchema`.
+    artifact_gates: ArtifactGatesPolicySchema.optional(),
+    // `rea dash` sensitive-project visibility. When `false`, the global
+    // dashboard renders this project as an opaque item-count (no task
+    // titles). `rea dash` itself reads this via a tolerant raw-YAML parse,
+    // but the strict loader must ALSO accept the key — otherwise a repo
+    // that sets it to use the feature breaks EVERY other loadPolicy()
+    // caller (hooks/commands) at policy-load time (codex round-21 P1).
+    // Absent → visible (the default).
+    dashboard_visible: z.boolean().optional(),
   })
   .strict();
 

@@ -4,6 +4,8 @@ import fs from 'node:fs';
 import fsPromises from 'node:fs/promises';
 import path from 'node:path';
 import { loadPolicy } from '../policy/loader.js';
+import {
+  listSiblingWorktreeRoots, resolveReaRoots } from '../lib/worktree-roots.js';
 import { loadRegistry } from '../registry/loader.js';
 import { loadFingerprintStore } from '../registry/fingerprints-store.js';
 import { fingerprintServer } from '../registry/fingerprint.js';
@@ -46,7 +48,7 @@ import {
   type GlobalCandidateFail,
   type SafetyFail,
 } from './global-cli.js';
-import { POLICY_FILE, REA_DIR, REGISTRY_FILE, getPkgVersion, log, reaPath } from './utils.js';
+import { PKG_ROOT, POLICY_FILE, REA_DIR, REGISTRY_FILE, getPkgVersion, log, reaPath } from './utils.js';
 import { resolveOpenRouterKey } from './openrouter-key-source.js';
 
 export interface CheckResult {
@@ -252,6 +254,25 @@ export const EXPECTED_HOOKS = [
   'secret-scanner.sh',
   'security-disclosure-gate.sh',
   'settings-protection.sh',
+  // 0.54.0 — Artifact Gate G2 (verification-gate). A PreToolUse hook on
+  // Write/Edit to `.rea/tasks.jsonl`; policy-driven and DEFAULT-OFF
+  // (off|shadow|enforce). Added to EXPECTED_HOOKS at ship time (the
+  // three-way canonical invariant requires this list to mirror
+  // `hooks/`); the shim is FAIL-OPEN so a pre-upgrade install is never
+  // BROKEN by its absence — doctor merely flags it missing until the
+  // consumer runs `rea upgrade`, the same upgrade-lag signal
+  // `billing-cap-halt.sh` accepts.
+  'verify-gate.sh',
+  // 0.54.0 — Artifact Gate G2 (verification), Bash-tier. Refuses a raw
+  // shell write/redirect to `.rea/tasks.jsonl` (the editor-tier
+  // `verify-gate.sh` only guards Write/Edit; a Bash redirect bypasses it).
+  // Policy-driven and DEFAULT-OFF (off|shadow|enforce). Added to
+  // EXPECTED_HOOKS at ship time — the three-way canonical invariant
+  // requires this list to mirror `hooks/`; the shim is FAIL-OPEN so a
+  // pre-upgrade install is never BROKEN by its absence, only flagged
+  // missing until `rea upgrade` — the same upgrade-lag signal
+  // `verify-gate.sh` and `billing-cap-halt.sh` accept.
+  'verify-gate-bash-gate.sh',
 ];
 
 function checkAgentsPresent(baseDir: string): CheckResult {
@@ -302,6 +323,222 @@ function checkHooksInstalled(baseDir: string): CheckResult {
     };
   }
   return { label: 'hooks installed + executable', status: 'fail', detail: issues.join('; ') };
+}
+
+/**
+ * List the packaged spine payload (`PKG_ROOT/spine/*.md`). The spine ships
+ * as flat markdown, so a single non-recursive read is sufficient. Returns
+ * `null` when the payload directory is unreadable (a broken/partial rea
+ * install — the caller renders an `info` line rather than a false failure).
+ */
+function readSpinePayloadFiles(): string[] | null {
+  const payloadDir = path.join(PKG_ROOT, 'spine');
+  try {
+    return fs
+      .readdirSync(payloadDir)
+      .filter((name) => name.endsWith('.md'))
+      .sort();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Spine (process-spine skills) install + drift check.
+ *
+ * The spine payload (`spine/*.md` → `.claude/skills/rea/`) ships with every
+ * `rea init`/`rea upgrade`, version-pinned to the rea release. This mirrors
+ * `checkAgentsPresent`/`checkHooksInstalled` for the skills payload and adds
+ * the drift dimension the spec (§4) requires: it reports when an installed
+ * spine file diverges from the release payload — the refuse-and-report
+ * surface for locally-modified spine files (`rea upgrade` never silently
+ * overwrites them; it prompts keep/overwrite, and `--yes` keeps).
+ *
+ * Statuses are ADVISORY — never a hard fail — so a fresh install and an
+ * upgrade-lagged (pre-spine) install both keep `rea doctor` green; the
+ * actionable signal is a warn row naming the inspected path + `rea upgrade`.
+ * Every branch names the path inspected and a concrete next step.
+ *
+ *   - info  — payload dir unreadable (broken rea install; nothing to compare).
+ *   - warn  — `.claude/skills/rea/` absent (pre-spine install — run `rea upgrade`).
+ *   - warn  — one+ payload files missing on disk (partial install).
+ *   - warn  — one+ installed files drift from the release payload
+ *             (locally modified — `rea upgrade` restores canonical, or keep
+ *             your edits).
+ *   - pass  — every payload file present and byte-identical to the pinned
+ *             release payload.
+ */
+export function checkSpineInstalled(baseDir: string): CheckResult {
+  const label = 'spine skills installed';
+  const version = getPkgVersion();
+  const payload = readSpinePayloadFiles();
+  if (payload === null || payload.length === 0) {
+    return {
+      label,
+      status: 'info',
+      detail: `spine payload not found at ${path.join(PKG_ROOT, 'spine')} — cannot verify skills install`,
+    };
+  }
+  const skillsDir = path.join(baseDir, '.claude', 'skills', 'rea');
+  if (!fs.existsSync(skillsDir)) {
+    return {
+      label,
+      status: 'warn',
+      detail:
+        `not installed (expected at ${skillsDir}) — run \`rea upgrade\` to install the ` +
+        `process spine (${payload.length} skills, rea v${version})`,
+    };
+  }
+  const payloadDir = path.join(PKG_ROOT, 'spine');
+  const missing: string[] = [];
+  const drifted: string[] = [];
+  for (const name of payload) {
+    const installed = path.join(skillsDir, name);
+    if (!fs.existsSync(installed)) {
+      missing.push(name);
+      continue;
+    }
+    try {
+      const a = fs.readFileSync(installed);
+      const b = fs.readFileSync(path.join(payloadDir, name));
+      if (!a.equals(b)) drifted.push(name);
+    } catch {
+      // Unreadable installed file — treat as the partial-install shape.
+      missing.push(name);
+    }
+  }
+  if (missing.length > 0) {
+    return {
+      label,
+      status: 'warn',
+      detail:
+        `${missing.length} spine file(s) missing at ${skillsDir}: ${missing.join(', ')} — ` +
+        `run \`rea upgrade\` to install the rea v${version} spine payload`,
+    };
+  }
+  if (drifted.length > 0) {
+    return {
+      label,
+      status: 'warn',
+      detail:
+        `${drifted.length} spine file(s) locally modified at ${skillsDir}: ${drifted.join(', ')} — ` +
+        `\`rea upgrade\` restores the rea v${version} canonical (kept by default under --yes; ` +
+        `overwrite to discard your edits)`,
+    };
+  }
+  return {
+    label,
+    status: 'pass',
+    detail: `${payload.length} spine skills present (rea v${version}, pinned)`,
+  };
+}
+
+/**
+ * D5 token-economy lint — ADVISORY ONLY. This check NEVER returns `fail`
+ * and therefore never contributes to the `rea doctor` exit code (it must
+ * not block install or CI). It surfaces the ratified budget from the spec
+ * (§4 / owner decision D5):
+ *
+ *   - ≤ 15 user-invoked skills per repo, and
+ *   - ≤ 1,000 tokens total across their `description:` front-matter.
+ *
+ * When either cap is exceeded it warns and flags the quarterly prune ritual.
+ *
+ * Counting: a "user-invoked skill" is any `.md` file — under the shared
+ * `.claude/skills/` root (user skills), the rea-owned `.claude/skills/rea/`
+ * subdir (the process spine), and `.claude/commands/` (all are
+ * `/name`-invocable) — that carries a `description:` field in its YAML
+ * front-matter. The two skills dirs are read non-recursively, so the
+ * `rea/` subdir is not double-counted from the bare-root read. Files
+ * without front-matter (e.g. the spine `README.md` index) are not skills
+ * and are not counted.
+ *
+ * Token estimate: `ceil(totalDescriptionChars / 4)` — the standard
+ * ~4-chars-per-token heuristic. Documented here and in the emitted detail
+ * so operators know how the number was derived; it is an estimate, not an
+ * exact tokenizer count.
+ */
+export function checkTokenEconomy(baseDir: string): CheckResult {
+  const label = 'skill token-economy budget (advisory)';
+  const SKILL_CAP = 15;
+  const TOKEN_CAP = 1000;
+  const dirs = [
+    path.join(baseDir, '.claude', 'skills'),
+    path.join(baseDir, '.claude', 'skills', 'rea'),
+    path.join(baseDir, '.claude', 'commands'),
+  ];
+  let skillCount = 0;
+  let descriptionChars = 0;
+  for (const dir of dirs) {
+    let entries: string[];
+    try {
+      entries = fs.readdirSync(dir).filter((n) => n.endsWith('.md'));
+    } catch {
+      continue; // dir absent — nothing to count from this source
+    }
+    for (const name of entries) {
+      let content: string;
+      try {
+        content = fs.readFileSync(path.join(dir, name), 'utf8');
+      } catch {
+        continue;
+      }
+      const description = extractFrontMatterDescription(content);
+      if (description === null) continue; // not a skill (no description)
+      skillCount += 1;
+      descriptionChars += description.length;
+    }
+  }
+  const tokenEstimate = Math.ceil(descriptionChars / 4);
+  const overSkills = skillCount > SKILL_CAP;
+  const overTokens = tokenEstimate > TOKEN_CAP;
+  if (overSkills || overTokens) {
+    const breaches: string[] = [];
+    if (overSkills) breaches.push(`${skillCount} skills (cap ${SKILL_CAP})`);
+    if (overTokens) breaches.push(`~${tokenEstimate} description tokens (cap ${TOKEN_CAP})`);
+    return {
+      label,
+      status: 'warn',
+      detail:
+        `over budget: ${breaches.join(', ')} across .claude/skills + .claude/commands — ` +
+        `run the quarterly prune ritual (retire unused skills) to stay within the ratified ` +
+        `budget. [token estimate = description chars ÷ 4]`,
+    };
+  }
+  return {
+    label,
+    status: 'info',
+    detail:
+      `${skillCount}/${SKILL_CAP} user-invoked skills, ~${tokenEstimate}/${TOKEN_CAP} description ` +
+      `tokens across .claude/skills + .claude/commands (estimate = chars ÷ 4)`,
+  };
+}
+
+/**
+ * Extract the `description:` scalar from a markdown file's leading YAML
+ * front-matter block. Returns the trimmed value (surrounding quotes
+ * stripped) or `null` when the file has no front-matter or no
+ * `description:` key. Intentionally simple — a single-line scalar reader,
+ * sufficient for the house command-doc convention (`name` + `description`
+ * front-matter). Used by the token-economy lint to identify user-invoked
+ * skills and measure their description budget.
+ */
+function extractFrontMatterDescription(content: string): string | null {
+  if (!content.startsWith('---')) return null;
+  const closeIdx = content.indexOf('\n---', 3);
+  if (closeIdx < 0) return null;
+  const frontMatter = content.slice(3, closeIdx);
+  const match = /^description:[ \t]*(.*)$/m.exec(frontMatter);
+  if (match === null) return null;
+  let value = (match[1] ?? '').trim();
+  if (
+    value.length >= 2 &&
+    ((value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'")))
+  ) {
+    value = value.slice(1, -1);
+  }
+  return value;
 }
 
 /**
@@ -1311,6 +1548,185 @@ export function checkCodexBinaryOnPath(): CheckResult {
       'codex not found on PATH. policy.review.codex_required: true requires the codex binary. ' +
       'Install: https://github.com/openai/codex (e.g. `npm i -g @openai/codex`). ' +
       'To disable the push-gate instead, set policy.review.codex_required: false in .rea/policy.yaml.',
+  };
+}
+
+/**
+ * Resolve a global `rea` binary on PATH. Mirrors `resolveCodexBinary` (POSIX
+ * exec-bit + Windows PATHEXT). Best-effort; never throws. `env` is injectable
+ * so tests can drive the no-global-CLI case deterministically.
+ */
+function resolveReaBinaryOnPath(env: NodeJS.ProcessEnv = process.env): string | null {
+  const isWindows = process.platform === 'win32';
+  const pathEnv = env.PATH ?? env.Path ?? '';
+  if (pathEnv.length === 0) return null;
+  const sep = isWindows ? ';' : ':';
+  const entries = pathEnv.split(sep).filter((p) => p.length > 0);
+  if (isWindows) {
+    const pathExt = (env.PATHEXT ?? '.COM;.EXE;.BAT;.CMD').split(';');
+    for (const dir of entries) {
+      for (const ext of pathExt) {
+        const candidate = path.join(dir, `rea${ext}`);
+        try {
+          if (fs.statSync(candidate).isFile()) return candidate;
+        } catch {
+          /* not present — keep walking */
+        }
+      }
+      const bare = path.join(dir, 'rea');
+      try {
+        if (fs.statSync(bare).isFile()) return bare;
+      } catch {
+        /* not present — keep walking */
+      }
+    }
+    return null;
+  }
+  for (const dir of entries) {
+    const candidate = path.join(dir, 'rea');
+    try {
+      const st = fs.statSync(candidate);
+      if (st.isFile() && (st.mode & 0o111) !== 0) return candidate;
+    } catch {
+      /* not present — keep walking */
+    }
+  }
+  return null;
+}
+
+/**
+ * Round-23 F1 — ADVISORY. Warn when `artifact_gates.g1_spec.mode` is
+ * enforce/shadow but NO rea CLI resolves via the tiers the pre-commit body
+ * uses (in-project `node_modules/.bin/rea`, name-guarded `dist/cli/index.js`,
+ * or a global `rea` on PATH).
+ *
+ * WHY here and not in the hook: the hot commit path FAILS OPEN by design
+ * (round-15 P1 — failing CLOSED there bricks EVERY commit on a fresh clone /
+ * pre-`pnpm install` repo). Codex flagged that enforce-without-CLI silently
+ * doesn't gate; the correct place to surface it is this diagnostic surface,
+ * NEVER as a hard fail (status is `warn`, never `fail`, so `rea doctor`'s exit
+ * code is unaffected).
+ *
+ * Returns `null` (no row emitted) when the gate is off/absent — zero noise for
+ * the default config. `warn` when opted-in but no CLI resolves; `pass` when
+ * opted-in and a CLI resolves (the gate is actually live).
+ */
+/**
+ * Resolve the rea CLI INVOCATION for a single root, mirroring the pre-commit
+ * body's per-root tiers: (1) `<root>/node_modules/.bin/rea`, (2) name-guarded
+ * `<root>/dist/cli/index.js` (run via `node`). Returns `null` when neither
+ * resolves. Best-effort; never throws.
+ */
+function reaCliInvocationForRoot(root: string): { cmd: string; args: string[] } | null {
+  const bin = path.join(root, 'node_modules', '.bin', 'rea');
+  if (fs.existsSync(bin)) return { cmd: bin, args: [] };
+  const distCli = path.join(root, 'dist', 'cli', 'index.js');
+  if (fs.existsSync(distCli)) {
+    try {
+      const raw = stripUtf8Bom(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
+      const pkg = JSON.parse(raw) as { name?: unknown };
+      if (pkg && pkg.name === REA_PACKAGE_NAME) {
+        return { cmd: process.execPath, args: [distCli] };
+      }
+    } catch {
+      /* unreadable/foreign package.json — dist tier does not resolve */
+    }
+  }
+  return null;
+}
+
+/**
+ * Resolve the rea CLI the pre-commit hook would actually invoke, in the body's
+ * tier order: local root → common (primary checkout) root → global PATH `rea`.
+ * Returns `null` when nothing resolves.
+ */
+function resolveG1SpecGateCli(
+  baseDir: string,
+  env: NodeJS.ProcessEnv,
+): { cmd: string; args: string[] } | null {
+  const local = reaCliInvocationForRoot(baseDir);
+  if (local !== null) return local;
+  // Round-25 P3: a linked worktree with no local install resolves the PRIMARY
+  // checkout's CLI (REA_CLI_ROOT / git-common-dir).
+  try {
+    const { commonRoot } = resolveReaRoots(baseDir, () => {});
+    if (commonRoot && commonRoot !== baseDir) {
+      const common = reaCliInvocationForRoot(commonRoot);
+      if (common !== null) return common;
+    }
+  } catch {
+    /* best-effort — no common-root CLI */
+  }
+  const globalRea = resolveReaBinaryOnPath(env);
+  if (globalRea !== null) return { cmd: globalRea, args: [] };
+  return null;
+}
+
+/**
+ * Round-32 F2 — CAPABILITY probe. Existence of a `rea` binary is NOT enough:
+ * a pre-0.54 install exits `unknown command 'gate'` and the pre-commit hook
+ * fails OPEN, so "a CLI resolves" would be false reassurance. Verify the
+ * resolved CLI actually implements `gate spec-check` by probing
+ * `<cli> gate spec-check --help` (commander exits 0 when the subcommand
+ * exists, non-zero on unknown-command). Best-effort; a spawn failure → false
+ * (treated as "does not implement it" → warn, never a crash).
+ */
+function g1CliImplementsGate(inv: { cmd: string; args: string[] }): boolean {
+  try {
+    const res = spawnSync(inv.cmd, [...inv.args, 'gate', 'spec-check', '--help'], {
+      timeout: 10_000,
+      stdio: 'ignore',
+    });
+    return res.status === 0;
+  } catch {
+    return false;
+  }
+}
+
+const G1_FAILS_OPEN_SUFFIX =
+  'The pre-commit G1 gate FAILS OPEN — commits are NOT gated — until a rea CLI that ' +
+  'implements `gate spec-check` is installed locally (`pnpm add -D @bookedsolid/rea`) or ' +
+  'globally. This is deliberate: the hot commit path never bricks a fresh clone.';
+
+export function checkG1SpecGateCli(
+  baseDir: string,
+  env: NodeJS.ProcessEnv = process.env,
+): CheckResult | null {
+  let mode: 'off' | 'shadow' | 'enforce' = 'off';
+  try {
+    const policy = loadPolicy(baseDir);
+    mode = policy.artifact_gates?.g1_spec.mode ?? 'off';
+  } catch {
+    return null; // policy unreadable — checkPolicyParses already reports it
+  }
+  if (mode !== 'enforce' && mode !== 'shadow') return null;
+
+  const inv = resolveG1SpecGateCli(baseDir, env);
+  if (inv === null) {
+    return {
+      label: 'G1 spec-gate CLI available',
+      status: 'warn',
+      detail:
+        `g1_spec.mode: ${mode} but no rea CLI resolves (in-project node_modules/.bin/rea, ` +
+        `name-guarded dist/cli/index.js, common-checkout CLI, or global \`rea\` on PATH). ` +
+        G1_FAILS_OPEN_SUFFIX,
+    };
+  }
+  // Round-32 F2: a binary resolved — but does it implement `gate spec-check`?
+  if (!g1CliImplementsGate(inv)) {
+    return {
+      label: 'G1 spec-gate CLI available',
+      status: 'warn',
+      detail:
+        `g1_spec.mode: ${mode} but the resolved rea CLI does NOT implement \`gate spec-check\` ` +
+        `(a pre-0.54 install — \`unknown command 'gate'\`). ` +
+        G1_FAILS_OPEN_SUFFIX,
+    };
+  }
+  return {
+    label: 'G1 spec-gate CLI available',
+    status: 'pass',
+    detail: `g1_spec.mode: ${mode} — a rea CLI implementing \`gate spec-check\` resolves; the pre-commit gate is active`,
   };
 }
 
@@ -2698,7 +3114,20 @@ export async function checkDelegationRoundTrip(baseDir: string): Promise<CheckRe
       description: probeDescription,
     },
   });
-  const auditPath = path.join(baseDir, '.rea', 'audit.jsonl');
+  // Round-34 F1: audit is per-repo COMMON-root state (worktree model).
+  // `delegation-capture.sh` → `rea hook delegation-signal` appends the
+  // `rea.delegation_signal` record to `<commonRoot>/.rea/audit.jsonl`, NOT the
+  // local worktree's chain. Resolve the audit path against the COMMON root (the
+  // same resolver the gates/hooks use) so the probe finds the signal when
+  // `rea doctor` runs from a linked worktree. Plain checkouts are unchanged
+  // (commonRoot === baseDir). Best-effort: fall back to the local root.
+  let auditRoot = baseDir;
+  try {
+    auditRoot = resolveReaRoots(baseDir, () => {}).commonRoot;
+  } catch {
+    /* fall back to the local root */
+  }
+  const auditPath = path.join(auditRoot, '.rea', 'audit.jsonl');
 
   // Drive the REAL shell hook. `delegation-capture.sh` reads the
   // payload on stdin, resolves + sandbox-checks the rea CLI, then
@@ -3301,6 +3730,68 @@ export function checkGlobalCli(
  *
  * `activeForeign` always yields `fail` — a foreign hook bypassing the gate is a hard governance gap.
  */
+/**
+ * 0.54.0 — worktree topology check. In a LINKED worktree, report the
+ * local/common split and warn about ORPHANED pre-0.54.0 state: a local
+ * `audit.jsonl` / `HALT` / `last-review.cache.json` written by an older
+ * release is invisible to the shared enforcement paths (coverage,
+ * verdict reuse, repo-wide freeze) — the operator re-reviews once and
+ * removes the stale files. No auto-migration by design (merging two
+ * hash chains is not meaningfully possible). Plain checkouts emit a
+ * single info line.
+ */
+function checkWorktreeTopology(baseDir: string): CheckResult {
+  const roots = resolveReaRoots(baseDir, () => {});
+  const ORPHAN_FILES = ['audit.jsonl', 'HALT', 'last-review.cache.json', 'fingerprints.json'];
+  if (!roots.isLinkedWorktree) {
+    // Round-25 P3: the PRIMARY checkout inspects its linked siblings
+    // too — stale pre-0.54.0 per-worktree state is exactly what an
+    // operator running doctor from the main worktree needs surfaced.
+    const siblingOrphans: string[] = [];
+    for (const sibling of listSiblingWorktreeRoots(roots.commonRoot, roots.localRoot)) {
+      for (const f of ORPHAN_FILES) {
+        if (fs.existsSync(path.join(sibling, REA_DIR, f))) {
+          siblingOrphans.push(`${sibling}: ${f}`);
+        }
+      }
+    }
+    if (siblingOrphans.length > 0) {
+      return {
+        label: 'worktree topology',
+        status: 'warn',
+        detail:
+          `primary checkout — ORPHANED pre-0.54.0 state in linked worktree(s): ` +
+          `${siblingOrphans.join('; ')}. Shared enforcement reads this root; re-run ` +
+          `\`rea review\` in the affected stream(s) and remove the stale files.`,
+      };
+    }
+    return {
+      label: 'worktree topology',
+      status: 'info',
+      detail: 'primary checkout — local and common .rea/ state coincide',
+    };
+  }
+  const orphans: string[] = [];
+  for (const f of ORPHAN_FILES) {
+    if (fs.existsSync(path.join(roots.localRoot, REA_DIR, f))) orphans.push(f);
+  }
+  if (orphans.length > 0) {
+    return {
+      label: 'worktree topology',
+      status: 'warn',
+      detail:
+        `linked worktree of ${roots.commonRoot} — ORPHANED pre-0.54.0 local state: ` +
+        `${orphans.join(', ')}. Shared enforcement reads the common root; re-run ` +
+        `\`rea review\` once and remove the stale local files.`,
+    };
+  }
+  return {
+    label: 'worktree topology',
+    status: 'pass',
+    detail: `linked worktree — shared state at ${roots.commonRoot}, per-stream state here`,
+  };
+}
+
 export function collectChecks(
   baseDir: string,
   codexProbeState?: CodexProbeState,
@@ -3324,6 +3815,19 @@ export function collectChecks(
     checkRegistryParses(baseDir, registryPath),
     checkAgentsPresent(baseDir),
     checkHooksInstalled(baseDir),
+    // Spine distribution (spec §4): the process-spine skills payload
+    // (`spine/*.md` → `.claude/skills/rea/`), version-pinned to the rea
+    // release. Advisory (warn on absence/drift, never a hard fail) so a
+    // fresh install passes and an upgrade-lagged install is nudged, not
+    // reddened. Reports drift = the refuse-and-report surface for
+    // locally-modified spine files.
+    checkSpineInstalled(baseDir),
+    // D5 token-economy lint — ADVISORY ONLY (warn/info, never fail).
+    // Counts user-invoked skills across .claude/skills, .claude/skills/rea
+    // (the process spine), and .claude/commands and flags the ratified
+    // budget (≤15 skills, ≤1000 description tokens).
+    checkTokenEconomy(baseDir),
+    checkWorktreeTopology(baseDir),
     // 0.49.0 brick-state detector. Hook shims installed without a
     // self-pin in package.json is the exact scenario the bash-gate
     // bootstrap allowlist (paired fix) recovers from. Doctor surfaces
@@ -3374,6 +3878,12 @@ export function collectChecks(
         ]
       : []),
   ];
+
+  // Round-23 F1 — advisory when g1_spec.mode is enforce/shadow but no rea CLI
+  // resolves (the pre-commit gate would fail open). Mode-gated: emits NOTHING
+  // for the default `off`, so no noise for consumers who never opt in.
+  const g1SpecGateCli = checkG1SpecGateCli(baseDir);
+  if (g1SpecGateCli !== null) checks.push(g1SpecGateCli);
 
   // Non-git escape hatch: when `.git/` is absent, both git-hook checks are
   // meaningless (commit-msg + pre-push can't be invoked without git). Emit

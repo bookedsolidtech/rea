@@ -15,24 +15,26 @@ import { describe, it, expect } from 'vitest';
 import {
   parseHookPayload,
   parseWriteHookPayload,
+  parsePostToolUsePayload,
   MalformedPayloadError,
   TypePayloadError,
 } from './payload.js';
 
 describe('parseHookPayload', () => {
   it('returns blank payload for empty string', () => {
-    expect(parseHookPayload('')).toEqual({ toolName: '', command: '' });
+    expect(parseHookPayload('')).toEqual({ toolName: '', command: '', cwd: '' });
   });
 
   it('returns blank payload for whitespace-only string', () => {
     expect(parseHookPayload('   \n\t  \n')).toEqual({
       toolName: '',
       command: '',
+      cwd: '',
     });
   });
 
   it('returns blank payload for top-level null', () => {
-    expect(parseHookPayload('null')).toEqual({ toolName: '', command: '' });
+    expect(parseHookPayload('null')).toEqual({ toolName: '', command: '', cwd: '' });
   });
 
   it('throws MalformedPayloadError for top-level number', () => {
@@ -59,6 +61,7 @@ describe('parseHookPayload', () => {
     expect(parseHookPayload(payload)).toEqual({
       toolName: 'Bash',
       command: 'gh pr create --title foo',
+      cwd: '',
     });
   });
 
@@ -67,6 +70,7 @@ describe('parseHookPayload', () => {
     expect(parseHookPayload(payload)).toEqual({
       toolName: 'Bash',
       command: '',
+      cwd: '',
     });
   });
 
@@ -75,6 +79,7 @@ describe('parseHookPayload', () => {
     expect(parseHookPayload(payload)).toEqual({
       toolName: 'Bash',
       command: '',
+      cwd: '',
     });
   });
 
@@ -86,6 +91,7 @@ describe('parseHookPayload', () => {
     expect(parseHookPayload(payload)).toEqual({
       toolName: 'Bash',
       command: '',
+      cwd: '',
     });
   });
 
@@ -94,6 +100,7 @@ describe('parseHookPayload', () => {
     expect(parseHookPayload(payload)).toEqual({
       toolName: '',
       command: 'foo',
+      cwd: '',
     });
   });
 
@@ -108,6 +115,7 @@ describe('parseHookPayload', () => {
     expect(parseHookPayload(payload)).toEqual({
       toolName: '',
       command: 'foo',
+      cwd: '',
     });
   });
 
@@ -154,6 +162,7 @@ describe('parseHookPayload', () => {
     expect(parseHookPayload(payload)).toEqual({
       toolName: 'Bash',
       command: 'echo hi',
+      cwd: '',
     });
   });
 
@@ -173,6 +182,7 @@ describe('parseWriteHookPayload', () => {
       toolName: '',
       filePath: '',
       content: '',
+      cwd: '',
     });
   });
 
@@ -187,7 +197,7 @@ describe('parseWriteHookPayload', () => {
         tool_input: { file_path: '/a/b.md', content: 'hello' },
       }),
     );
-    expect(r).toEqual({ toolName: 'Write', filePath: '/a/b.md', content: 'hello' });
+    expect(r).toEqual({ toolName: 'Write', filePath: '/a/b.md', content: 'hello', cwd: '' });
   });
 
   it('extracts Edit new_string', () => {
@@ -227,6 +237,7 @@ describe('parseWriteHookPayload', () => {
       toolName: 'NotebookEdit',
       filePath: '/a/n.ipynb',
       content: 'cell body',
+      cwd: '',
     });
   });
 
@@ -269,5 +280,36 @@ describe('parseWriteHookPayload', () => {
     // Non-string fragments collapse to '' rather than throwing —
     // matches bash payload-read.sh `// "" | tostring`.
     expect(r.content).toBe('ok\n\nfine');
+  });
+});
+
+describe('payload cwd extraction (0.54.0 worktree roots)', () => {
+  it('parseHookPayload extracts a string cwd and defaults to empty', () => {
+    expect(
+      parseHookPayload(JSON.stringify({ tool_name: 'Bash', cwd: '/w/t', tool_input: {} })).cwd,
+    ).toBe('/w/t');
+    expect(parseHookPayload(JSON.stringify({ tool_name: 'Bash' })).cwd).toBe('');
+  });
+
+  it('non-string cwd is LENIENT (never throws) and collapses to empty', () => {
+    expect(
+      parseHookPayload(JSON.stringify({ tool_name: 'Bash', cwd: 42 })).cwd,
+    ).toBe('');
+    expect(
+      parseHookPayload(JSON.stringify({ tool_name: 'Bash', cwd: { evil: true } })).cwd,
+    ).toBe('');
+  });
+
+  it('parseWriteHookPayload and parsePostToolUsePayload carry cwd too', () => {
+    expect(
+      parseWriteHookPayload(
+        JSON.stringify({ tool_name: 'Write', cwd: '/w/t', tool_input: { file_path: 'a' } }),
+      ).cwd,
+    ).toBe('/w/t');
+    expect(
+      parsePostToolUsePayload(
+        JSON.stringify({ tool_name: 'Bash', cwd: '/w/t', tool_input: { command: 'x' } }),
+      ).cwd,
+    ).toBe('/w/t');
   });
 });

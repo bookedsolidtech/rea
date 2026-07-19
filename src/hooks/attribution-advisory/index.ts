@@ -48,7 +48,8 @@
 import type { Buffer } from 'node:buffer';
 import fs from 'node:fs';
 import path from 'node:path';
-import { checkHalt, formatHaltBanner } from '../_lib/halt-check.js';
+import { checkHaltRoots, formatHaltBanner } from '../_lib/halt-check.js';
+import { resolveHookRoots } from '../../lib/worktree-roots.js';
 import {
   parseHookPayload,
   MalformedPayloadError,
@@ -184,20 +185,11 @@ function isAttributionBlockingEnabled(reaRoot: string): boolean {
 export async function runAttributionAdvisory(
   options: AttributionAdvisoryOptions = {},
 ): Promise<AttributionAdvisoryResult> {
-  const reaRoot =
-    options.reaRoot ?? process.env['CLAUDE_PROJECT_DIR'] ?? process.cwd();
   let stderr = '';
   const writeStderr = (s: string): void => {
     stderr += s;
     if (options.stderrWrite) options.stderrWrite(s);
   };
-
-  // 1. HALT check.
-  const halt = checkHalt(reaRoot);
-  if (halt.halted) {
-    writeStderr(formatHaltBanner(halt.reason));
-    return { exitCode: 2, stderr };
-  }
 
   // 2. Read stdin.
   const stdinRaw =
@@ -206,8 +198,10 @@ export async function runAttributionAdvisory(
       : await readStdinWithTimeout(5_000);
 
   let cmd = '';
+  let payloadCwd = '';
   try {
     const payload = parseHookPayload(stdinRaw);
+    payloadCwd = payload.cwd;
     cmd = payload.command;
   } catch (err) {
     if (err instanceof MalformedPayloadError || err instanceof TypePayloadError) {
@@ -215,6 +209,18 @@ export async function runAttributionAdvisory(
       return { exitCode: 2, stderr };
     }
     throw err;
+  }
+
+  // Roots + HALT (0.54.0 worktree state): the payload's `cwd` feeds the
+  // resolution ladder, so stdin is parsed FIRST — a deliberate reorder.
+  // Policy/path checks key off the LOCAL (worktree) root; audit and the
+  // kill switch key off the COMMON (repository) root.
+  const { localRoot: reaRoot, commonRoot } = resolveHookRoots(payloadCwd, options.reaRoot);
+  // 1. HALT check.
+  const halt = checkHaltRoots(reaRoot, commonRoot);
+  if (halt.halted) {
+    writeStderr(formatHaltBanner(halt.reason));
+    return { exitCode: 2, stderr };
   }
 
   if (cmd.length === 0) {

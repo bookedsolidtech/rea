@@ -328,6 +328,73 @@ describe('rea init — G11.4 codex flags', () => {
     expect(secondStamp).toBe(firstStamp);
   });
 
+  // ── codex round-47 P2: `rea init` prunes MOVED-matcher hooks before merge ──
+  //
+  // `rea upgrade` prunes hooks that moved matchers before its additive merge,
+  // but `rea init` did NOT. A repo installed at 0.50.x (billing-cap-halt under
+  // PostToolUse/Bash) that later re-runs `rea init` at 0.51.x+ kept the stale
+  // `Bash` registration AND gained the new `*` registration — so the hook fired
+  // TWICE per Bash tool call (double-incrementing the turn-budget counter) and
+  // the "init twice = byte-identical" invariant broke. The fix mirrors
+  // upgrade.ts's prune-before-merge at the init merge site.
+  it('round-47 P2: re-running rea init over a stale Bash billing-cap-halt registration collapses to exactly one `*` entry', async () => {
+    const dir = await makeScratch();
+    cleanup.push(dir);
+    process.chdir(dir);
+
+    // Seed a 0.50.x-shaped settings.json: billing-cap-halt registered under
+    // the OLD PostToolUse/Bash matcher (pre round-24 move to `*`).
+    await fs.mkdir(path.join(dir, '.claude'), { recursive: true });
+    const stale = {
+      hooks: {
+        PostToolUse: [
+          {
+            matcher: 'Bash',
+            hooks: [
+              {
+                type: 'command',
+                command: '"$CLAUDE_PROJECT_DIR"/.claude/hooks/billing-cap-halt.sh',
+                timeout: 10000,
+                statusMessage: 'Checking for billing-class spend errors...',
+              },
+            ],
+          },
+        ],
+      },
+    };
+    await fs.writeFile(
+      path.join(dir, '.claude', 'settings.json'),
+      JSON.stringify(stale, null, 2) + '\n',
+      'utf8',
+    );
+
+    await runInit({ yes: true, profile: 'minimal', codex: false });
+
+    const parsed = JSON.parse(
+      await fs.readFile(path.join(dir, '.claude', 'settings.json'), 'utf8'),
+    ) as {
+      hooks: { PostToolUse?: { matcher?: string; hooks?: { command?: string }[] }[] };
+    };
+    const postGroups = parsed.hooks.PostToolUse ?? [];
+    const billingEntries = postGroups.flatMap((g) =>
+      (g.hooks ?? [])
+        .filter((h) => typeof h.command === 'string' && h.command.includes('billing-cap-halt.sh'))
+        .map((h) => ({ matcher: g.matcher, command: h.command })),
+    );
+    // Exactly ONE billing-cap-halt registration…
+    expect(billingEntries).toHaveLength(1);
+    // …and it is under the NEW `*` matcher, with ZERO under `Bash`.
+    expect(billingEntries[0]?.matcher).toBe('*');
+    expect(billingEntries.filter((e) => e.matcher === 'Bash')).toHaveLength(0);
+
+    // A second `rea init` is a no-op — byte-identical settings.json.
+    const afterFirst = await fs.readFile(path.join(dir, '.claude', 'settings.json'), 'utf8');
+    await new Promise((r) => setTimeout(r, 20));
+    await runInit({ yes: true, profile: 'minimal', codex: false });
+    const afterSecond = await fs.readFile(path.join(dir, '.claude', 'settings.json'), 'utf8');
+    expect(afterSecond).toBe(afterFirst);
+  });
+
   // ── round-27 F6: re-run preserves 0.26.0 local_review + commit_hygiene ──
   //
   // 0.21.1 made the older user-mutable knobs survive re-runs of `rea init`.

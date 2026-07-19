@@ -69,7 +69,20 @@ const execFileAsync = promisify(execFile);
  * classification. Bump the version suffix whenever the body semantics
  * change so upgrades can migrate old installs cleanly.
  *
- * v5 — 0.26.0 local-first enforcement: body runs `rea preflight --strict`
+ * v7 — round-50/51/54/55 mode-aware fail-closed body: the preflight
+ *      old-CLI compat path is no longer a blanket fail-OPEN. When the
+ *      resolved rea lacks `preflight`, `_rea_review_gate_mode` resolves the
+ *      EFFECTIVE review-gate mode (g3_review authoritative over legacy
+ *      local_review, mirroring resolveEffectiveReviewMode) and the tri-state
+ *      contract applies: enforce → fail CLOSED (exit 2 + CONFIG-ERROR),
+ *      shadow → WARN + allow, off/absent → allow. The body semantics changed,
+ *      so the marker bumps to force `rea init` to rewrite stale v6 installs.
+ * v6 — 0.54.0 worktree-aware body: the CLI resolves via a REA_CLI_ROOT
+ *      fallback (worktree without its own install → primary checkout,
+ *      cross-repo verified) and preflight runs `--operation push`. The
+ *      body semantics changed, so the marker bumps to force `rea
+ *      upgrade` to rewrite v5 installs.
+ * v5 — 0.26.0 local-first enforcement: body runs `rea preflight --strict --operation push`
  *      BEFORE the push-gate dispatch. `rea preflight` refuses the push
  *      when no recent `rea.local_review` audit entry covers HEAD; the
  *      legacy push-gate then runs as the second layer (codex on push).
@@ -84,7 +97,13 @@ const execFileAsync = promisify(execFile);
  * v2 — 0.11.0 stateless push-gate body (no bash core, no audit grep).
  * v1 — 0.10.x and prior, delegated to `.claude/hooks/push-review-gate.sh`.
  */
-export const FALLBACK_MARKER = '# rea:pre-push-fallback v5';
+export const FALLBACK_MARKER = '# rea:pre-push-fallback v7';
+
+/** Legacy v6 marker (0.54.x – pre-mode-aware bodies). Refresh-on-upgrade. */
+export const LEGACY_FALLBACK_MARKER_V6 = '# rea:pre-push-fallback v6';
+
+/** Legacy v5 marker (0.26.x – 0.53.x bodies). Refresh-on-upgrade. */
+export const LEGACY_FALLBACK_MARKER_V5 = '# rea:pre-push-fallback v5';
 
 /** Legacy v4 marker (0.13.x – 0.25.x bodies). Refresh-on-upgrade. */
 export const LEGACY_FALLBACK_MARKER_V4 = '# rea:pre-push-fallback v4';
@@ -108,7 +127,10 @@ export const LEGACY_FALLBACK_MARKER_V1 = '# rea:pre-push-fallback v1';
  * detects it to refresh in-place. Bump the suffix whenever the body
  * changes; pre-0.13 markers live in `LEGACY_HUSKY_GATE_MARKER_V{1,2,3}`.
  */
-export const HUSKY_GATE_MARKER = '# rea:husky-pre-push-gate v5';
+export const HUSKY_GATE_MARKER = '# rea:husky-pre-push-gate v6';
+
+/** Legacy v5 husky-gate marker (0.26.x – 0.53.x). Refresh-on-upgrade. */
+export const LEGACY_HUSKY_GATE_MARKER_V5 = '# rea:husky-pre-push-gate v5';
 
 /** Legacy v4 husky marker (0.13.x – 0.25.x bodies). Refresh-on-upgrade. */
 export const LEGACY_HUSKY_GATE_MARKER_V4 = '# rea:husky-pre-push-gate v4';
@@ -127,7 +149,10 @@ export const LEGACY_HUSKY_GATE_MARKER_V1 = '# rea:husky-pre-push-gate v1';
  * empty body (stubbed out by a consumer) is NOT classified as rea-managed.
  * A real rea hook always carries both markers.
  */
-export const HUSKY_GATE_BODY_MARKER = '# rea:gate-body-v5';
+export const HUSKY_GATE_BODY_MARKER = '# rea:gate-body-v6';
+
+/** Legacy v5 gate-body marker (0.26.x – 0.53.x). Refresh-on-upgrade. */
+export const LEGACY_HUSKY_GATE_BODY_MARKER_V5 = '# rea:gate-body-v5';
 
 /** Legacy v4 body marker (0.13.x – 0.25.x bodies). Refresh-on-upgrade. */
 export const LEGACY_HUSKY_GATE_BODY_MARKER_V4 = '# rea:gate-body-v4';
@@ -171,12 +196,88 @@ const BODY_TEMPLATE = `set -eu
 # then fall back to npx so the gate runs in every documented setup.
 
 REA_ROOT=\$(git rev-parse --show-toplevel 2>/dev/null || pwd)
-if [ -f "\${REA_ROOT}/.rea/HALT" ]; then
-  reason=\$(awk 'NR==1 { print; exit }' "\${REA_ROOT}/.rea/HALT" 2>/dev/null || printf 'unknown')
-  [ -z "\${reason:-}" ] && reason='unknown'
-  printf 'REA HALT: %s\\nAll push operations suspended. Run: rea unfreeze\\n' "\$reason" >&2
-  exit 1
+
+# 0.54.0 round-35 P1: a linked worktree frequently has no local install
+# (node_modules/dist live only in the PRIMARY checkout). Resolve the
+# CLI from ONE seam: the worktree first, then the primary checkout
+# (.git-file discriminator), then the PATH/npx tiers below unchanged.
+# REA_ROOT itself stays the worktree — HALT and policy are resolved
+# against it; only CLI dispatch follows REA_CLI_ROOT.
+REA_CLI_ROOT="\$REA_ROOT"
+if [ ! -x "\${REA_ROOT}/node_modules/.bin/rea" ] && [ ! -f "\${REA_ROOT}/dist/cli/index.js" ] \\
+   && [ -f "\${REA_ROOT}/.git" ]; then
+  _rea_common_dir=\$(git -C "\$REA_ROOT" rev-parse --git-common-dir 2>/dev/null || true)
+  case "\$_rea_common_dir" in
+    "") : ;;
+    /*) : ;;
+    *) _rea_common_dir="\${REA_ROOT}/\${_rea_common_dir}" ;;
+  esac
+  if [ -n "\$_rea_common_dir" ]; then
+    _rea_common=\$(dirname "\$_rea_common_dir")
+    # Round-3 P2: verify the dirname candidate is the SAME repository
+    # (its git-common-dir resolves to ours) — a bare/separate-git-dir
+    # layout nesting metadata under an UNRELATED checkout must not have
+    # its CLI executed against this repo's push.
+    _rea_same_repo=0
+    if [ -d "\${_rea_common}/.rea" ] || [ -e "\${_rea_common}/.git" ]; then
+      _cc=\$(git -C "\$_rea_common" rev-parse --git-common-dir 2>/dev/null || true)
+      case "\$_cc" in "") : ;; /*) : ;; *) _cc="\${_rea_common}/\${_cc}" ;; esac
+      if [ -n "\$_cc" ]; then
+        _x=\$(cd "\$_cc" 2>/dev/null && pwd -P) || _x="\$_cc"
+        _y=\$(cd "\$_rea_common_dir" 2>/dev/null && pwd -P) || _y="\$_rea_common_dir"
+        [ "\$_x" = "\$_y" ] && _rea_same_repo=1
+      fi
+    fi
+    # Round-36 P2: a foreign nested checkout (verification failed) OR a
+    # --separate-git-dir primary whose metadata is external — fall back
+    # to git's first listed worktree (THIS repo's main one).
+    if [ "\$_rea_same_repo" = "0" ]; then
+      _rea_common=\$(git -C "\$REA_ROOT" worktree list --porcelain 2>/dev/null \\
+        | sed -n 's/^worktree //p' | head -n 1)
+    fi
+    if [ -n "\$_rea_common" ] && [ "\$_rea_common" != "\$REA_ROOT" ] \\
+       && { [ -d "\${_rea_common}/.rea" ] || [ -e "\${_rea_common}/.git" ]; } \\
+       && { [ -x "\${_rea_common}/node_modules/.bin/rea" ] \\
+            || { [ -f "\${_rea_common}/dist/cli/index.js" ] && [ -f "\${_rea_common}/package.json" ] \\
+                 && grep -q '"name": *"@bookedsolid/rea"' "\${_rea_common}/package.json" 2>/dev/null; }; }; then
+      REA_CLI_ROOT="\$_rea_common"
+    fi
+  fi
 fi
+# HALT freeze contract (round-33 P1). A frozen repo (\`.rea/HALT\` present) must
+# refuse the push with ZERO CLI dependency — the freeze has to hold even when
+# the CLI ladder below falls back to an older/global rea or hits the
+# no-preflight compat path (round-32 F1). Mirrors the pre-commit HALT probe
+# (round-18 F2 / round-19 F1) and \`hooks/_lib/halt-check.sh\`, which this
+# standalone git hook cannot source: probe the LOCAL worktree root AND the
+# COMMON (primary-checkout) root, so a sibling-worktree push cannot bypass a
+# repo-wide freeze. The \`.git\`-is-a-FILE test is the cheap gate for "is this
+# even a linked worktree" (plain checkouts pay only the -f test, zero git
+# subprocesses). The common root is \`git worktree list --porcelain\`'s FIRST
+# \`worktree \` line (the main working tree) — robust under \`--separate-git-dir\`
+# / absorbed-submodule gitfiles where dirname(git-common-dir) is EXTERNAL
+# metadata, and it never false-freezes on a foreign repo's HALT (git lists only
+# THIS repo's worktrees). Every git call is \`|| true\`-guarded → a broken/absent
+# git degrades to a LOCAL-only probe. ABSENCE at both roots = fall through to
+# the CLI/preflight ladder; this check never hard-fails a push on its own.
+# bash-3.2/BSD-safe.
+_rea_halt_common="\$REA_ROOT"
+if [ -f "\${REA_ROOT}/.git" ]; then
+  _rea_main=\$(git -C "\$REA_ROOT" worktree list --porcelain 2>/dev/null \\
+    | sed -n 's/^worktree //p' | head -n 1 || true)
+  if [ -n "\$_rea_main" ] && [ "\$_rea_main" != "\$REA_ROOT" ] \\
+     && { [ -d "\${_rea_main}/.rea" ] || [ -e "\${_rea_main}/.git" ]; }; then
+    _rea_halt_common="\$_rea_main"
+  fi
+fi
+for _rea_hf in "\${REA_ROOT}/.rea/HALT" "\${_rea_halt_common}/.rea/HALT"; do
+  if [ -f "\$_rea_hf" ]; then
+    printf 'REA HALT: %s\\nAll push operations suspended. Run: rea unfreeze\\n' \\
+      "\$(head -c 1024 "\$_rea_hf" 2>/dev/null || echo 'Reason unknown')" >&2
+    exit 2
+  fi
+  [ "\$REA_ROOT" = "\$_rea_halt_common" ] && break
+done
 
 # Dispatch the rea CLI as a positional-args list rather than a string
 # (the 0.11.x \`exec \$REA_BIN ...\` pattern broke when REA_ROOT contained
@@ -198,7 +299,7 @@ fi
 # \`set --\` arm, and the parent's \$@ is preserved.
 
 # 0.26.0 local-first enforcement (CTO directive 2026-05-05). Run
-# \`rea preflight --strict\` BEFORE the push-gate dispatch. Preflight
+# \`rea preflight --strict --operation push\` BEFORE the push-gate dispatch. Preflight
 # refuses (exit 2) when no recent \`rea.local_review\` audit entry
 # covers HEAD, when commit-hygiene thresholds are exceeded, or when
 # the kill-switch is active. The legacy push-gate then runs as the
@@ -206,15 +307,141 @@ fi
 #   - policy.review.local_review.mode: off  → preflight is no-op
 #   - REA_SKIP_LOCAL_REVIEW="<reason>"      → bypass + audit
 # We resolve the rea binary the same way the dispatch below does.
+#
+# 0.26.0 preflight COMPAT (round-32 F1 / round-50 P1). The \`--operation\` flag
+# is NEW in this release. A RESOLVED but OLDER rea CLI — a repo pinned below
+# this release, or a stale PATH/global fallback — does not know it, and
+# commander exits \`unknown option '--operation'\`, which would HARD-BLOCK every
+# push before the gate runs. \`_rea_preflight\` tries the current invocation; on
+# an unknown-option/unknown-command error it RETRIES the pre-0.26
+# \`preflight --strict\` form so the gate STILL RUNS on the older CLI.
+#
+# When even the retry is \`unknown command\` (a CLI too old to have \`preflight\`
+# at ALL), the disposition is MODE-AWARE (round-50 P1 — off means off):
+#   - review gate ACTIVE (review.local_review.mode OR artifact_gates.g3_review.mode
+#     is shadow/enforce) → FAIL CLOSED (exit 2 + CONFIG-ERROR). Silently
+#     disabling a configured git-side review gate because the resolved rea is
+#     old is a security fail-open.
+#   - review gate OFF / unconfigured → FAIL OPEN (rc 0) — an off-gate repo must
+#     not be blocked just because the resolved rea is old.
+# An \`unknown option\` at the retry stage (a pure flag mismatch on an otherwise
+# preflight-capable CLI) ALWAYS fails open — it must never block a push. A
+# GENUINE refusal (exit 2, no unknown-* marker) propagates unchanged. \$@ is
+# the resolved CLI prefix.
+#
+# _rea_review_gate_mode: ECHOES the EFFECTIVE review-gate mode from THIS repo's
+# LOCAL policy at \${REA_ROOT}/.rea/policy.yaml — \`enforce\`, \`shadow\`, or \`off\`.
+# Mirrors the canonical resolveEffectiveReviewMode (src/cli/preflight.ts) by
+# PRESENCE + PRECEDENCE, NOT strongest-wins (round-55 P1):
+#   1. artifact_gates.g3_review.mode PRESENT (any value) → that value wins, even
+#      when legacy says enforce (garbage/unrecognized g3 value → \`enforce\`).
+#   2. else review.local_review.mode PRESENT → legacy vocab \`off\`/\`enforced\`:
+#      \`off\` → off, ANY other value → \`enforce\`.
+#   3. else BOTH keys ABSENT → \`off\`. DELIBERATE, DOCUMENTED DIVERGENCE from
+#      resolveEffectiveReviewMode (which returns \`enforce\` for all-absent as its
+#      CLI-present local-first default): on THIS degraded "CLI cannot run
+#      preflight" compat path an all-unconfigured repo must FAIL OPEN, not brick
+#      every fresh clone / old-global-CLI push (round-15 P1 fresh-clone
+#      protection). Any EXPLICIT opt-in (either key present) is honored; only the
+#      fully-unconfigured case defaults to allow.
+# REA_ROOT is the local worktree root resolved above; policy is per-worktree, so
+# the LOCAL policy governs. Dependency-free (awk only), BSD/GNU/bash-3.2 safe,
+# single pass. Detection recognizes each key's mode in (a) block form — the key
+# on its own line with a \`mode:\` value on an indented line inside its block
+# (indentation-disarmed so a sibling block's \`mode:\` cannot false-trip); OR (b)
+# inline flow map on a SINGLE logical line at ANY nesting depth
+# (\`g3_review: { mode: off }\`, \`artifact_gates: { g3_review: { mode: off } }\`).
+# Value matching strips non-alpha so \`off\`, \`"off"\`, \`enforced # note\` all match.
+# Wrapper dispositions: policy ABSENT → \`off\` (ALLOW); awk unavailable → \`enforce\`
+# (cannot parse a governed policy → bias fail-CLOSED).
+_rea_review_gate_mode() {
+  _rea_pol="\${REA_ROOT}/.rea/policy.yaml"
+  [ -f "\$_rea_pol" ] || { printf 'off'; return 0; }
+  command -v awk >/dev/null 2>&1 || { printf 'enforce'; return 0; }
+  _rea_m=\$(awk '
+    function ind(str,   n){ n=0; while (substr(str,n+1,1)==" ") n++; return n }
+    function classify(str,   v){
+      v=str; sub(/.*mode:/,"",v); gsub(/[^A-Za-z]/,"",v)
+      if (v ~ /^enforce/) return "enforce"
+      if (v ~ /^shadow/) return "shadow"
+      if (v ~ /^off/) return "off"
+      return ""
+    }
+    BEGIN { g3p=0; g3v=""; lgp=0; lgv=""; curblk=""; bi=0 }
+    {
+      s=\$0; sub(/^[ \\t]*/,"",s)
+      if (s=="" || substr(s,1,1)=="#") next
+      i=ind(\$0)
+      if (s ~ /g3_review[^A-Za-z_].*mode:/) { g3p=1; g3v=classify(s) }
+      else if (s ~ /local_review[^A-Za-z_].*mode:/) { lgp=1; lgv=classify(s) }
+      if (s ~ /^g3_review:/) { curblk="g3"; bi=i; next }
+      if (s ~ /^local_review:/) { curblk="legacy"; bi=i; next }
+      if (curblk != "" && i <= bi && s ~ /:/) curblk=""
+      if (curblk != "" && i > bi && s ~ /^mode:/) {
+        if (curblk == "g3") { g3p=1; g3v=classify(s) }
+        else { lgp=1; lgv=classify(s) }
+      }
+    }
+    END {
+      if (g3p) print (g3v=="" ? "enforce" : g3v)
+      else if (lgp) print (lgv=="off" ? "off" : "enforce")
+      else print "off"
+    }
+  ' "\$_rea_pol" 2>/dev/null)
+  case "\$_rea_m" in
+    enforce) printf 'enforce' ;;
+    shadow) printf 'shadow' ;;
+    *) printf 'off' ;;
+  esac
+}
+_rea_preflight() {
+  _pf_out=\$("\$@" preflight --strict --operation push 2>&1) && _pf_rc=0 || _pf_rc=\$?
+  if [ "\$_pf_rc" -ne 0 ]; then
+    case "\$_pf_out" in
+      *"unknown option"* | *"unknown command"*)
+        _pf_out=\$("\$@" preflight --strict 2>&1) && _pf_rc=0 || _pf_rc=\$?
+        case "\$_pf_out" in
+          *"unknown command"*)
+            # CLI lacks \`preflight\` entirely. Round-54 tri-state:
+            #   enforce → FAIL CLOSED (config error); shadow → WARN + ALLOW
+            #   (observe-only never blocks); off/absent → ALLOW silently.
+            case "\$(_rea_review_gate_mode)" in
+              enforce)
+                printf 'rea: CONFIG-ERROR — pre-push blocked (fail-closed).\\n' >&2
+                printf '  The resolved rea CLI has no \`preflight\` command, but this repo has an\\n' >&2
+                printf '  ENFORCE review gate (review.local_review.mode or artifact_gates.g3_review.mode\\n' >&2
+                printf '  = enforce). Refusing to push without a coverage check. Fix one:\\n' >&2
+                printf '    - upgrade rea (e.g. \`npm i -g @bookedsolid/rea\`), or\\n' >&2
+                printf '    - set the gate mode to \`off\` in .rea/policy.yaml, or\\n' >&2
+                printf '    - bypass this one push with REA_SKIP_LOCAL_REVIEW="<reason>".\\n' >&2
+                _pf_out=""; _pf_rc=2 ;;
+              shadow)
+                printf 'rea: WARN — review gate (shadow) could not run: resolved rea CLI has no \`preflight\` command; not blocking.\\n' >&2
+                _pf_out=""; _pf_rc=0 ;;
+              *)
+                _pf_out=""; _pf_rc=0 ;;
+            esac
+            ;;
+          *"unknown option"*)
+            # Pure flag incompatibility on a preflight-capable CLI — never block
+            # (any mode). A flag mismatch is not a "gate could not run" signal.
+            _pf_out=""; _pf_rc=0 ;;
+        esac
+        ;;
+    esac
+  fi
+  if [ -n "\$_pf_out" ]; then printf '%s\\n' "\$_pf_out" >&2; fi
+  return "\$_pf_rc"
+}
 if (
-  if [ -x "\${REA_ROOT}/node_modules/.bin/rea" ]; then
-    "\${REA_ROOT}/node_modules/.bin/rea" preflight --strict
-  elif [ -f "\${REA_ROOT}/dist/cli/index.js" ] && [ -f "\${REA_ROOT}/package.json" ] && grep -q '"name": *"@bookedsolid/rea"' "\${REA_ROOT}/package.json" 2>/dev/null; then
-    node "\${REA_ROOT}/dist/cli/index.js" preflight --strict
+  if [ -x "\${REA_CLI_ROOT}/node_modules/.bin/rea" ]; then
+    _rea_preflight "\${REA_CLI_ROOT}/node_modules/.bin/rea"
+  elif [ -f "\${REA_CLI_ROOT}/dist/cli/index.js" ] && [ -f "\${REA_CLI_ROOT}/package.json" ] && grep -q '"name": *"@bookedsolid/rea"' "\${REA_CLI_ROOT}/package.json" 2>/dev/null; then
+    _rea_preflight node "\${REA_CLI_ROOT}/dist/cli/index.js"
   elif command -v rea >/dev/null 2>&1; then
-    rea preflight --strict
+    _rea_preflight rea
   elif command -v npx >/dev/null 2>&1; then
-    npx --no-install @bookedsolid/rea preflight --strict
+    _rea_preflight npx --no-install @bookedsolid/rea
   else
     printf 'rea: cannot locate the rea CLI for preflight. Install locally (\`pnpm add -D @bookedsolid/rea\`) or set policy.review.local_review.mode=off.\\n' >&2
     exit 2
@@ -229,16 +456,16 @@ if [ "\$preflight_status" -ne 0 ]; then
 fi
 
 if (
-  if [ -x "\${REA_ROOT}/node_modules/.bin/rea" ]; then
-    set -- "\${REA_ROOT}/node_modules/.bin/rea" hook push-gate "\$@"
-  elif [ -f "\${REA_ROOT}/dist/cli/index.js" ] && [ -f "\${REA_ROOT}/package.json" ] && grep -q '"name": *"@bookedsolid/rea"' "\${REA_ROOT}/package.json" 2>/dev/null; then
+  if [ -x "\${REA_CLI_ROOT}/node_modules/.bin/rea" ]; then
+    set -- "\${REA_CLI_ROOT}/node_modules/.bin/rea" hook push-gate "\$@"
+  elif [ -f "\${REA_CLI_ROOT}/dist/cli/index.js" ] && [ -f "\${REA_CLI_ROOT}/package.json" ] && grep -q '"name": *"@bookedsolid/rea"' "\${REA_CLI_ROOT}/package.json" 2>/dev/null; then
     # rea's own repo (dogfood) — the package is not installed under
     # node_modules here because we ARE the package. The built CLI
     # entry point lives at dist/cli/index.js; node runs it directly.
     # Gate this branch on \`package.json\` declaring \`@bookedsolid/rea\` so a
     # consumer repo that happens to ship its own \`dist/cli/index.js\` does
     # not get this hook executing the consumer's unrelated build.
-    set -- node "\${REA_ROOT}/dist/cli/index.js" hook push-gate "\$@"
+    set -- node "\${REA_CLI_ROOT}/dist/cli/index.js" hook push-gate "\$@"
   elif command -v rea >/dev/null 2>&1; then
     set -- rea hook push-gate "\$@"
   elif command -v npx >/dev/null 2>&1; then
@@ -359,6 +586,8 @@ export function isLegacyReaManagedFallback(content: string): boolean {
   if (secondLineEnd < 0) return false;
   const secondLine = content.slice(10, secondLineEnd);
   return (
+    secondLine === LEGACY_FALLBACK_MARKER_V6 ||
+    secondLine === LEGACY_FALLBACK_MARKER_V5 ||
     secondLine === LEGACY_FALLBACK_MARKER_V4 ||
     secondLine === LEGACY_FALLBACK_MARKER_V3 ||
     secondLine === LEGACY_FALLBACK_MARKER_V2 ||
@@ -389,6 +618,7 @@ export function isReaManagedHuskyGate(content: string): boolean {
  */
 export function isLegacyReaManagedHuskyGate(content: string): boolean {
   return (
+    hasHeaderMarkers(content, LEGACY_HUSKY_GATE_MARKER_V5, LEGACY_HUSKY_GATE_BODY_MARKER_V5) ||
     hasHeaderMarkers(content, LEGACY_HUSKY_GATE_MARKER_V4, LEGACY_HUSKY_GATE_BODY_MARKER_V4) ||
     hasHeaderMarkers(content, LEGACY_HUSKY_GATE_MARKER_V3, LEGACY_HUSKY_GATE_BODY_MARKER_V3) ||
     hasHeaderMarkers(content, LEGACY_HUSKY_GATE_MARKER_V2, LEGACY_HUSKY_GATE_BODY_MARKER_V2) ||
@@ -818,6 +1048,7 @@ async function cleanupStaleTempFiles(dst: string): Promise<void> {
       if (
         !body.includes(FALLBACK_MARKER) &&
         !body.includes(HUSKY_GATE_MARKER) &&
+        !body.includes(LEGACY_FALLBACK_MARKER_V6) &&
         !body.includes(LEGACY_FALLBACK_MARKER_V4) &&
         !body.includes(LEGACY_HUSKY_GATE_MARKER_V4) &&
         !body.includes(LEGACY_FALLBACK_MARKER_V3) &&

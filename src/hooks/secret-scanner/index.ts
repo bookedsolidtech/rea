@@ -54,7 +54,8 @@
 
 import type { Buffer } from 'node:buffer';
 import path from 'node:path';
-import { checkHalt, formatHaltBanner } from '../_lib/halt-check.js';
+import { checkHaltRoots, formatHaltBanner } from '../_lib/halt-check.js';
+import { resolveHookRoots } from '../../lib/worktree-roots.js';
 import {
   parseWriteHookPayload,
   MalformedPayloadError,
@@ -431,20 +432,11 @@ function buildAdvisoryBanner(filePath: string, matches: ScannerMatch[]): string 
 export async function runSecretScanner(
   options: SecretScannerOptions = {},
 ): Promise<SecretScannerResult> {
-  const reaRoot =
-    options.reaRoot ?? process.env['CLAUDE_PROJECT_DIR'] ?? process.cwd();
   let stderr = '';
   const writeStderr = (s: string): void => {
     stderr += s;
     if (options.stderrWrite) options.stderrWrite(s);
   };
-
-  // 1. HALT check — fail-closed (exit 2).
-  const halt = checkHalt(reaRoot);
-  if (halt.halted) {
-    writeStderr(formatHaltBanner(halt.reason));
-    return { exitCode: 2, stderr, matches: [] };
-  }
 
   // 2. Read + parse stdin via the write-tier payload helper.
   const stdinRaw =
@@ -454,8 +446,10 @@ export async function runSecretScanner(
 
   let filePath = '';
   let content = '';
+  let payloadCwd = '';
   try {
     const payload = parseWriteHookPayload(stdinRaw);
+    payloadCwd = payload.cwd;
     filePath = payload.filePath;
     content = payload.content;
   } catch (err) {
@@ -469,6 +463,18 @@ export async function runSecretScanner(
       return { exitCode: 2, stderr, matches: [] };
     }
     throw err;
+  }
+
+  // Roots + HALT (0.54.0 worktree state): the payload's `cwd` feeds the
+  // resolution ladder, so stdin is parsed FIRST — a deliberate reorder.
+  // Policy/path checks key off the LOCAL (worktree) root; audit and the
+  // kill switch key off the COMMON (repository) root.
+  const { localRoot: reaRoot, commonRoot } = resolveHookRoots(payloadCwd, options.reaRoot);
+  // 1. HALT check — fail-closed (exit 2).
+  const halt = checkHaltRoots(reaRoot, commonRoot);
+  if (halt.halted) {
+    writeStderr(formatHaltBanner(halt.reason));
+    return { exitCode: 2, stderr, matches: [] };
   }
 
   // 3. Empty content → exit 0.

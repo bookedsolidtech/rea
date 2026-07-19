@@ -42,9 +42,10 @@ import { fingerprintServer } from '../registry/fingerprint.js';
 import {
   FINGERPRINT_STORE_VERSION,
   loadFingerprintStore,
-  saveFingerprintStore,
+  updateFingerprintStore,
 } from '../registry/fingerprints-store.js';
 import { loadRegistry } from '../registry/loader.js';
+import { resolveReaRoots } from '../lib/worktree-roots.js';
 import type { RegistryServer } from '../registry/types.js';
 import { err, log } from './utils.js';
 
@@ -82,9 +83,12 @@ export interface RunTofuListOptions {
 }
 
 export async function runTofuList(options: RunTofuListOptions = {}): Promise<void> {
-  const baseDir = process.cwd();
+  // 0.54.0 worktree state: registry.yaml is CHECKED IN (per-worktree);
+  // the TOFU fingerprint store is per-REPOSITORY trust and lives at the
+  // common root. Degenerate in plain checkouts.
+  const { localRoot: baseDir, commonRoot } = resolveReaRoots(process.cwd());
   const registry = loadRegistry(baseDir);
-  const store = await loadFingerprintStore(baseDir);
+  const store = await loadFingerprintStore(commonRoot);
   const rows = classifyRows(registry.servers, store.servers);
 
   if (options.json === true) {
@@ -122,7 +126,7 @@ export interface RunTofuAcceptOptions {
 }
 
 export async function runTofuAccept(options: RunTofuAcceptOptions): Promise<void> {
-  const baseDir = process.cwd();
+  const { localRoot: baseDir, commonRoot } = resolveReaRoots(process.cwd());
   const registry = loadRegistry(baseDir);
   const server = registry.servers.find((s) => s.name === options.name);
   if (server === undefined) {
@@ -133,9 +137,21 @@ export async function runTofuAccept(options: RunTofuAcceptOptions): Promise<void
   }
 
   const current = fingerprintServer(server);
-  const store = await loadFingerprintStore(baseDir);
-  const stored = store.servers[server.name];
 
+  // Rounds 14+40: BOTH the no-op decision and the audit metadata derive
+  // from the fresh read taken UNDER the store lock — a concurrent
+  // accept/serve from another worktree could otherwise make this call
+  // log a stale stored_fingerprint (or the wrong event type), or
+  // report "already matches" against an out-of-date snapshot.
+  let stored: string | undefined;
+  const { lockError } = await updateFingerprintStore(commonRoot, (fresh) => {
+    stored = fresh.servers[server.name];
+    if (stored === current) return fresh; // no-op — write back unchanged
+    return {
+      version: FINGERPRINT_STORE_VERSION as typeof FINGERPRINT_STORE_VERSION,
+      servers: { ...fresh.servers, [server.name]: current },
+    };
+  });
   if (stored === current) {
     log(
       `tofu: "${server.name}" already matches stored fingerprint (${current.slice(0, 12)}…) — no change written.`,
@@ -143,16 +159,23 @@ export async function runTofuAccept(options: RunTofuAcceptOptions): Promise<void
     return;
   }
 
-  const nextStore = {
-    version: FINGERPRINT_STORE_VERSION as typeof FINGERPRINT_STORE_VERSION,
-    servers: { ...store.servers, [server.name]: current },
-  };
-  await saveFingerprintStore(baseDir, nextStore);
+  // Round-44 P2: on a lock-acquisition failure the store was NOT
+  // persisted (the helper no longer writes unlocked). Report the accept
+  // as unapplied and exit non-zero — do NOT emit a `tofu.*_accepted`
+  // audit record claiming a durable change that did not land. The
+  // operator retries once the lock clears (stale-steal makes this rare).
+  if (lockError !== undefined) {
+    err(
+      `tofu: could not acquire the fingerprint-store lock (${lockError}) — "${server.name}" was NOT accepted. ` +
+        `Retry \`rea tofu accept ${server.name}\`; if it persists, ensure no stuck \`.rea/fingerprints.json.lock\`.`,
+    );
+    process.exit(2);
+  }
 
   const event =
     stored === undefined ? 'tofu.first_seen_accepted_by_cli' : 'tofu.drift_accepted_by_cli';
   try {
-    await appendAuditRecord(baseDir, {
+    await appendAuditRecord(commonRoot, {
       tool_name: 'rea.tofu',
       server_name: 'rea',
       tier: Tier.Write,

@@ -30,7 +30,9 @@ import path from 'node:path';
 import fs from 'node:fs';
 import os from 'node:os';
 import { parse as parseYaml } from 'yaml';
-import { checkHalt, formatHaltBanner } from '../_lib/halt-check.js';
+import { checkHaltRoots, formatHaltBanner } from '../_lib/halt-check.js';
+import { resolveHookRoots, listSiblingWorktreeRoots } from '../../lib/worktree-roots.js';
+import { resolveProtectedPatterns } from '../_lib/protected-paths.js';
 import {
   parseHookPayload,
   MalformedPayloadError,
@@ -118,20 +120,11 @@ function loadPolicyPermissive(reaRoot: string): PermissivePolicy {
 export async function runProtectedPathsBashGate(
   options: ProtectedPathsBashGateOptions = {},
 ): Promise<ProtectedPathsBashGateResult> {
-  const reaRoot =
-    options.reaRoot ?? process.env['CLAUDE_PROJECT_DIR'] ?? process.cwd();
   let stderr = '';
   const writeStderr = (s: string): void => {
     stderr += s;
     if (options.stderrWrite) options.stderrWrite(s);
   };
-
-  // 1. HALT check.
-  const halt = checkHalt(reaRoot);
-  if (halt.halted) {
-    writeStderr(formatHaltBanner(halt.reason));
-    return { exitCode: 2, stderr, verdict: { verdict: 'block', reason: 'rea HALT active' } };
-  }
 
   // 2. Read + parse stdin.
   const stdinRaw =
@@ -141,8 +134,10 @@ export async function runProtectedPathsBashGate(
 
   let toolName = '';
   let cmd = '';
+  let payloadCwd = '';
   try {
     const payload = parseHookPayload(stdinRaw);
+    payloadCwd = payload.cwd;
     toolName = payload.toolName;
     cmd = payload.command;
   } catch (err) {
@@ -153,6 +148,18 @@ export async function runProtectedPathsBashGate(
       return { exitCode: 2, stderr, verdict: { verdict: 'block', reason: err.message } };
     }
     throw err;
+  }
+
+  // Roots + HALT (0.54.0 worktree state): the payload's `cwd` feeds the
+  // resolution ladder, so stdin is parsed FIRST — a deliberate reorder.
+  // Policy/path checks key off the LOCAL (worktree) root; audit and the
+  // kill switch key off the COMMON (repository) root.
+  const { localRoot: reaRoot, commonRoot } = resolveHookRoots(payloadCwd, options.reaRoot);
+  // 1. HALT check.
+  const halt = checkHaltRoots(reaRoot, commonRoot);
+  if (halt.halted) {
+    writeStderr(formatHaltBanner(halt.reason));
+    return { exitCode: 2, stderr, verdict: { verdict: 'block', reason: 'rea HALT active' } };
   }
 
   // 3. Non-Bash tool calls bypass.
@@ -187,6 +194,13 @@ export async function runProtectedPathsBashGate(
   const verdict = runProtectedScan(
     {
       reaRoot,
+      // 0.54.0: absolute writes into the primary checkout's shared
+      // `.rea/` state — or a sibling worktree's governed state
+      // (round-10 P1) — match the protected list via cross-root
+      // normalization.
+      commonRoot,
+      siblingRoots: listSiblingWorktreeRoots(commonRoot, reaRoot),
+      protectedPatternsForRoot: protectedPatternsForRootPermissive,
       policy: {
         ...(policy.protectedWrites !== undefined
           ? { protected_writes: policy.protectedWrites }
@@ -201,7 +215,7 @@ export async function runProtectedPathsBashGate(
 
   // 8. Audit.
   try {
-    await appendAuditRecord(reaRoot, {
+    await appendAuditRecord(commonRoot, {
       tool_name: 'rea.hook.protected-paths-bash-gate',
       server_name: 'rea',
       tier: Tier.Read,
@@ -225,6 +239,43 @@ export async function runProtectedPathsBashGate(
     return { exitCode: 2, stderr, verdict };
   }
   return { exitCode: 0, stderr, verdict };
+}
+
+
+// Round-12 P2: resolve a TARGET root's own protected pattern set (its
+// protected_writes | invariants, its relax applied). Permissive read —
+// a broken target policy degrades to [] (the strict defaults still
+// apply via the union in the scanner).
+function protectedPatternsForRootPermissive(root: string): {
+  patterns: readonly string[];
+  overridePatterns: readonly string[];
+} {
+  try {
+    const parsed = parseYaml(fs.readFileSync(path.join(root, '.rea', 'policy.yaml'), 'utf8'));
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return { patterns: [], overridePatterns: [] };
+    }
+    const rec = parsed as Record<string, unknown>;
+    const writes = Array.isArray(rec['protected_writes'])
+      ? (rec['protected_writes'] as unknown[]).filter(
+          (e): e is string => typeof e === 'string' && e.length > 0,
+        )
+      : undefined;
+    const relax = Array.isArray(rec['protected_paths_relax'])
+      ? (rec['protected_paths_relax'] as unknown[]).filter(
+          (e): e is string => typeof e === 'string' && e.length > 0,
+        )
+      : [];
+    const resolved = resolveProtectedPatterns({
+      ...(writes !== undefined ? { protectedWrites: writes } : {}),
+      protectedPathsRelax: relax,
+    });
+    // Round-28 P2: overridePatterns keep their precedence over the
+    // husky .d extension allow-list on cross-root writes.
+    return { patterns: resolved.patterns, overridePatterns: resolved.overridePatterns };
+  } catch {
+    return { patterns: [], overridePatterns: [] };
+  }
 }
 
 export async function runHookProtectedPathsBashGate(

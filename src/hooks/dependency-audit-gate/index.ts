@@ -50,7 +50,8 @@
 
 import type { Buffer } from 'node:buffer';
 import { spawn } from 'node:child_process';
-import { checkHalt, formatHaltBanner } from '../_lib/halt-check.js';
+import { checkHaltRoots, formatHaltBanner } from '../_lib/halt-check.js';
+import { resolveHookRoots } from '../../lib/worktree-roots.js';
 import {
   parseHookPayload,
   MalformedPayloadError,
@@ -259,8 +260,6 @@ function buildFailureBanner(failed: string[]): string {
 export async function runDependencyAuditGate(
   options: DependencyAuditGateOptions = {},
 ): Promise<DependencyAuditGateResult> {
-  const reaRoot =
-    options.reaRoot ?? process.env['CLAUDE_PROJECT_DIR'] ?? process.cwd();
   let stderr = '';
   const writeStderr = (s: string): void => {
     stderr += s;
@@ -268,13 +267,6 @@ export async function runDependencyAuditGate(
   };
   const checkedPackages: string[] = [];
   const failedPackages: string[] = [];
-
-  // 1. HALT.
-  const halt = checkHalt(reaRoot);
-  if (halt.halted) {
-    writeStderr(formatHaltBanner(halt.reason));
-    return { exitCode: 2, stderr, checkedPackages, failedPackages };
-  }
 
   // 2. Stdin.
   const stdinRaw =
@@ -284,8 +276,10 @@ export async function runDependencyAuditGate(
 
   let toolName = '';
   let cmd = '';
+  let payloadCwd = '';
   try {
     const payload = parseHookPayload(stdinRaw);
+    payloadCwd = payload.cwd;
     toolName = payload.toolName;
     cmd = payload.command;
   } catch (err) {
@@ -296,6 +290,18 @@ export async function runDependencyAuditGate(
       return { exitCode: 2, stderr, checkedPackages, failedPackages };
     }
     throw err;
+  }
+
+  // Roots + HALT (0.54.0 worktree state): the payload's `cwd` feeds the
+  // resolution ladder, so stdin is parsed FIRST — a deliberate reorder.
+  // Policy/path checks key off the LOCAL (worktree) root; audit and the
+  // kill switch key off the COMMON (repository) root.
+  const { localRoot: reaRoot, commonRoot } = resolveHookRoots(payloadCwd, options.reaRoot);
+  // 1. HALT.
+  const halt = checkHaltRoots(reaRoot, commonRoot);
+  if (halt.halted) {
+    writeStderr(formatHaltBanner(halt.reason));
+    return { exitCode: 2, stderr, checkedPackages, failedPackages };
   }
 
   if (toolName !== '' && toolName !== 'Bash') {

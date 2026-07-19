@@ -97,11 +97,66 @@ _billing_kw_strict() {
   [[ "$1" =~ $re ]]
 }
 
+# Coarse JSON `tool_name` value extraction for the NO-NODE fail-closed path
+# (no interpreter to JSON-parse robustly). PostToolUse payloads carry
+# `"tool_name":"Bash"` / `"tool_name": "Write"` (whitespace optional around
+# the colon). Prints the FIRST such value (a payload has one top-level
+# tool_name) to stdout, or nothing when none is present/parseable.
+# BSD+GNU-portable: `grep -Eo` (POSIX ERE, no GNU-only `-P`) + `sed -E`
+# (never `sed -r`). Line-oriented: `[^"]*` cannot cross the closing quote,
+# and grep matches within a line, so a multi-line payload still yields the
+# intended field. LIMIT (documented, accepted): if untrusted stderr text
+# literally embeds `"tool_name":"…"` BEFORE the real field, `head -n 1`
+# could pick the wrong one — but JSON.stringify emits keys in insertion
+# order (tool_name first), so the real field precedes any tool_response
+# content. This coarseness only affects the no-node AND no-CLI window.
+_coarse_tool_name() {
+  printf '%s' "$INPUT" \
+    | grep -Eo '"tool_name"[[:space:]]*:[[:space:]]*"[^"]*"' 2>/dev/null \
+    | head -n 1 \
+    | sed -E 's/.*:[[:space:]]*"([^"]*)"$/\1/'
+}
+
+# Artifact Gates §5 — the per-session TURN COUNTER lives in the CLI body and
+# must run on EVERY tool call when a turn budget is configured. So this hook
+# proceeds to the CLI whenever `spend_governance.turn_budget` is present,
+# regardless of billing keywords. A single cheap grep (NO interpreter spawn);
+# the CLI does the authoritative parse and no-ops if the block is malformed.
+# When no turn_budget is configured (the common case) this returns 1 and the
+# billing-keyword perf gate below decides — byte-identical to pre-feature, so
+# ordinary output still never spawns the CLI. Over-trigger (a comment that
+# merely says "turn_budget:") just spawns the CLI, which then no-ops — cheap.
+#
+# WORKTREE (codex round-25 F1): reads the POST-HANDOFF `REA_ROOT`, NOT
+# `CLAUDE_PROJECT_DIR`. `shim_run` calls `shim_worktree_handoff` (step 2b)
+# BEFORE the `shim_is_relevant` gate (step 3) that invokes this, so in a
+# linked-worktree session `REA_ROOT` is the payload worktree — the SAME root
+# the node hook's `readSpendGovernance` resolves from (payload cwd). Reading
+# `CLAUDE_PROJECT_DIR` (the PRIMARY checkout) would skip turn-budget counting
+# for a worktree that enables it only in its own `.rea/policy.yaml`.
+_turn_budget_configured() {
+  local pf="${REA_ROOT}/.rea/policy.yaml"
+  [ -f "$pf" ] || return 1
+  grep -qE 'turn_budget[[:space:]]*:' "$pf" 2>/dev/null
+}
+
 # Relevance pre-gate for the CLI-PRESENT path — a pure PERF optimization.
 # Scans the whole lower-cased payload (a cheap superset); an over-trigger
 # just spawns the CLI, which then applies the precise, channel-restricted
-# BILLING_RE and no-ops on benign input. Never misses a real signal.
+# BILLING_RE and no-ops on benign input. Never misses a real signal. Also
+# proceeds unconditionally when a turn budget is configured (see
+# `_turn_budget_configured`) so the CLI-body turn counter runs every call.
+#
+# This gate runs at shim-runtime STEP 3, BEFORE CLI resolution (step 4), so it
+# cannot know whether `rea` is reachable. The turn-budget force therefore
+# FAILS OPEN downstream: `shim_policy_short_circuit` (step 6, post-resolution)
+# exits 0 for a turn-budget-forced payload with no billing keyword when the CLI
+# is unavailable, so an opt-in counter never bricks a no-CLI session (round-30
+# F2). A real billing keyword keeps the fail-closed posture.
 shim_is_relevant() {
+  if _turn_budget_configured; then
+    return 0
+  fi
   local lower=""
   lower=$(printf '%s' "$INPUT" | tr '[:upper:]' '[:lower:]' 2>/dev/null || printf '%s' "$INPUT")
   _billing_kw_match "$lower"
@@ -120,6 +175,26 @@ shim_is_relevant() {
 # in a doubly-degraded no-node-no-CLI environment).
 shim_cli_missing_relevant() {
   if ! command -v node >/dev/null 2>&1; then
+    # Bash-ONLY scoping WITHOUT a JSON parser (mirrors the node path above
+    # and the TS hook's `payloadToolName !== "Bash"` skip). Coarsely detect
+    # the tool_name: a PROVABLY non-Bash tool has no shell stderr to bill on,
+    # so it must NEVER fail closed — this is the codex round-52 P2 fix for
+    # the widened PostToolUse/* matcher. EXACT value check (`!= "Bash"`), not
+    # a substring, so a hypothetical `BashOutput` is not treated as Bash.
+    local tname=""
+    tname=$(_coarse_tool_name)
+    if [ -n "$tname" ] && [ "$tname" != "Bash" ]; then
+      # Determinable AND not Bash → NOT billing-relevant → no block.
+      return 1
+    fi
+    # tname == "Bash"            → proceed with the coarse strict scan.
+    # tname == "" (undeterminable — truly malformed / no top-level
+    #             tool_name, no node) → KEEP today's doubly-degraded
+    #             fail-closed coarse scan. That no-node-AND-no-CLI-AND-
+    #             unparseable environment is out of scope to relax: a spend
+    #             guard must not silently vanish there. Only the PROVABLY
+    #             non-Bash case (above) becomes a skip; "can't tell" stays
+    #             fail-closed.
     local lower=""
     lower=$(printf '%s' "$INPUT" | tr '[:upper:]' '[:lower:]' 2>/dev/null || printf '%s' "$INPUT")
     _billing_kw_strict "$lower"
@@ -131,6 +206,18 @@ shim_cli_missing_relevant() {
     process.stdin.on("data",c=>d+=c).on("end",()=>{
       let p; try { p = JSON.parse(d); } catch { process.exit(0); }
       if (!p || typeof p !== "object" || Array.isArray(p)) process.exit(0);
+      // Bash-ONLY billing scan — mirrors the TS hook payloadToolName
+      // !== "Bash" skip (src/hooks/billing-cap-halt/index.ts step 2b). A
+      // non-Bash tool (Write/Edit/Read/…) has no shell command/stderr to
+      // bill on, so it is NEVER billing-relevant: emit nothing → the strict
+      // scan below sees empty input → not relevant → no fail-closed block.
+      // EXACT value (not a substring) so a hypothetical `BashOutput` tool is
+      // NOT treated as Bash. This is the CLI-missing parity for the widened
+      // PostToolUse/* matcher (the turn COUNTER needs every tool; the
+      // billing SCAN stays Bash-only) — without it a FAILING non-Bash tool
+      // whose stderr merely contains a billing phrase would hard-block only
+      // when the CLI is unavailable (codex round-52 P2).
+      if (p.tool_name !== "Bash") process.exit(0);
       const tr = p.tool_response;
       // STDERR of a FAILED command only — mirrors the TS hook (round-4 +
       // round-7 P1/P3). Emit nothing on success so a passing command that
@@ -166,13 +253,44 @@ shim_cli_missing_relevant() {
 # default, so we return 1 and let the fail-closed relevance decision run —
 # a spend guard must not vanish just because the value was unreadable.
 shim_policy_short_circuit() {
+  # ── F2 (codex round-30): turn-budget no-CLI FAIL-OPEN ──────────────────
+  # An OPT-IN turn counter must NEVER brick a session. `shim_is_relevant`
+  # forces the payload past the step-3 gate whenever a `turn_budget` is
+  # configured — which, on a worktree / fresh clone that can't resolve `rea`
+  # (REA_ARGV empty: unbuilt, node missing, or a sandbox refusal), would
+  # otherwise fall through to the SHARED no-CLI refusal that runs AFTER this
+  # callback (shim-runtime step 6b node-missing / step 7 sandbox-failed —
+  # both exit 2 BEFORE the channel-accurate `shim_cli_missing_relevant`
+  # billing check). With no CLI there is nothing to count, so a turn-budget-
+  # forced payload that carries NO billing keyword must exit 0 HERE. Uses the
+  # SAME coarse superset as `shim_is_relevant` (`_billing_kw_match`): its
+  # absence means there is definitely no spend signal, so failing open is
+  # safe; if a keyword IS present we fall through and the existing billing
+  # posture decides (the BILLING path is unchanged — a real wall on no-CLI
+  # still fails closed via the opt-out check + step-7 terminal). No node
+  # spawn — grep + tr/case only.
+  if [ "${#REA_ARGV[@]}" -eq 0 ] && _turn_budget_configured; then
+    local _tb_lower=""
+    _tb_lower=$(printf '%s' "$INPUT" | tr '[:upper:]' '[:lower:]' 2>/dev/null || printf '%s' "$INPUT")
+    if ! _billing_kw_match "$_tb_lower"; then
+      return 0
+    fi
+  fi
+
   # MISSING policy file → disabled, matching readSpendGovernance
   # (ENOENT → no rea config → no-op). Without this the CLI-missing path
   # would fail closed on a checkout that has the hook registered but no
-  # policy file, diverging from the built hook (codex round-10 P3). Base
-  # dir mirrors readSpendGovernance's reaRoot (CLAUDE_PROJECT_DIR else the
-  # resolved REA_ROOT).
-  local proj_dir="${CLAUDE_PROJECT_DIR:-$REA_ROOT}"
+  # policy file, diverging from the built hook (codex round-10 P3).
+  #
+  # WORKTREE (codex round-25 F1): use the POST-HANDOFF `REA_ROOT`, NOT
+  # `CLAUDE_PROJECT_DIR`. This runs well after `shim_worktree_handoff`, so
+  # `REA_ROOT` is the payload worktree — and it MUST match `policy_reader_get`
+  # below, whose `_pr_policy_path` already resolves off `REA_ROOT`. Using
+  # `CLAUDE_PROJECT_DIR` here was a split brain: the existence check probed
+  # the PRIMARY checkout while the actual reads hit the worktree, so a
+  # worktree that opts out (`enabled: false` / `off`) could still fail closed,
+  # and a worktree-only policy could be misread as absent.
+  local proj_dir="$REA_ROOT"
   if [ ! -e "$proj_dir/.rea/policy.yaml" ]; then
     return 0
   fi
@@ -190,12 +308,27 @@ shim_policy_short_circuit() {
   # freeze) until the CLI is built and the TS hook takes over. Silently
   # disabling the refuse because a halt operator's mode line was unreadable
   # is the exact degraded window this path exists to protect.
+  #
+  # F1 (codex round-30): the billing opt-out must NOT silently kill the turn
+  # counter. `runBillingCapHalt` runs the counter INDEPENDENT of billing mode
+  # (and scopes the billing scan Bash-only), so when a `turn_budget` is
+  # configured AND the CLI is resolvable (REA_ARGV populated → there is
+  # something to forward to), we PROCEED (return 1) so the counter still runs
+  # even though billing is off. We short-circuit (exit 0) only when BOTH the
+  # billing reflex AND the turn budget are off — OR when the CLI is
+  # unavailable (nothing to count; and billing is off, so no refuse either).
   sg_enabled=$(policy_reader_get spend_governance.enabled 2>/dev/null || true)
   if [ "$sg_enabled" = "false" ]; then
+    if _turn_budget_configured && [ "${#REA_ARGV[@]}" -gt 0 ]; then
+      return 1
+    fi
     return 0
   fi
   sg_mode=$(policy_reader_get spend_governance.billing_error_response 2>/dev/null || true)
   if [ "$sg_mode" = "off" ]; then
+    if _turn_budget_configured && [ "${#REA_ARGV[@]}" -gt 0 ]; then
+      return 1
+    fi
     return 0
   fi
   return 1

@@ -42,6 +42,14 @@ export interface HookPayload {
   toolName: string;
   /** `tool_input.command` from the payload, or `''` when absent. */
   command: string;
+  /**
+   * Top-level `cwd` from the payload, or `''` when absent/non-string.
+   * LENIENT by design (never throws): the field feeds worktree root
+   * resolution (`resolveHookRoots`), which has its own guarded fallback
+   * ladder — a missing/odd cwd must degrade to the historical
+   * CLAUDE_PROJECT_DIR ?? process.cwd() behavior, not brick the gate.
+   */
+  cwd: string;
 }
 
 /**
@@ -70,6 +78,7 @@ export class TypePayloadError extends Error {
 
 interface RawPayload {
   tool_name?: unknown;
+  cwd?: unknown;
   tool_input?: {
     command?: unknown;
   } | null;
@@ -88,7 +97,7 @@ interface RawPayload {
 export function parseHookPayload(raw: string | Buffer): HookPayload {
   const text = typeof raw === 'string' ? raw : raw.toString('utf8');
   if (text.trim().length === 0) {
-    return { toolName: '', command: '' };
+    return { toolName: '', command: '', cwd: '' };
   }
   let parsed: RawPayload;
   try {
@@ -102,7 +111,7 @@ export function parseHookPayload(raw: string | Buffer): HookPayload {
   if (parsed === null) {
     // Top-level `null` mirrors `jq -r '.tool_name // ""'` returning ``
     // — the bash hooks treated this as "no tool, allow on empty cmd".
-    return { toolName: '', command: '' };
+    return { toolName: '', command: '', cwd: '' };
   }
   if (typeof parsed !== 'object' || Array.isArray(parsed)) {
     // Top-level primitives (number, string, boolean) and arrays are
@@ -129,7 +138,8 @@ export function parseHookPayload(raw: string | Buffer): HookPayload {
     }
     if (typeof c === 'string') command = c;
   }
-  return { toolName, command };
+  const cwd = typeof parsed.cwd === 'string' ? parsed.cwd : '';
+  return { toolName, command, cwd };
 }
 
 /**
@@ -160,10 +170,13 @@ export interface WriteHookPayload {
    * type-guard branches added in 0.16.0.
    */
   content: string;
+  /** Top-level `cwd`, or `''` — lenient, see `HookPayload.cwd`. */
+  cwd: string;
 }
 
 interface RawWritePayload {
   tool_name?: unknown;
+  cwd?: unknown;
   tool_input?: {
     file_path?: unknown;
     notebook_path?: unknown;
@@ -185,7 +198,7 @@ interface RawWritePayload {
 export function parseWriteHookPayload(raw: string | Buffer): WriteHookPayload {
   const text = typeof raw === 'string' ? raw : raw.toString('utf8');
   if (text.trim().length === 0) {
-    return { toolName: '', filePath: '', content: '' };
+    return { toolName: '', filePath: '', content: '', cwd: '' };
   }
   let parsed: RawWritePayload;
   try {
@@ -197,7 +210,7 @@ export function parseWriteHookPayload(raw: string | Buffer): WriteHookPayload {
     );
   }
   if (parsed === null) {
-    return { toolName: '', filePath: '', content: '' };
+    return { toolName: '', filePath: '', content: '', cwd: '' };
   }
   if (typeof parsed !== 'object' || Array.isArray(parsed)) {
     throw new MalformedPayloadError(
@@ -254,7 +267,8 @@ export function parseWriteHookPayload(raw: string | Buffer): WriteHookPayload {
       content = ti.new_source;
     }
   }
-  return { toolName, filePath, content };
+  const cwd = typeof parsed.cwd === 'string' ? parsed.cwd : '';
+  return { toolName, filePath, content, cwd };
 }
 
 /**
@@ -307,10 +321,13 @@ export interface PostToolUsePayload {
    * command (round-7). Absent/unknown shapes → `false`.
    */
   errored: boolean;
+  /** Top-level `cwd`, or `''` — lenient, see `HookPayload.cwd`. */
+  cwd: string;
 }
 
 interface RawPostToolUsePayload {
   tool_name?: unknown;
+  cwd?: unknown;
   tool_input?: {
     command?: unknown;
   } | null;
@@ -372,6 +389,7 @@ export function parsePostToolUsePayload(raw: string | Buffer): PostToolUsePayloa
     stderr: '',
     stdout: '',
     errored: false,
+    cwd: '',
   };
   if (text.trim().length === 0) {
     return empty;
@@ -432,7 +450,8 @@ export function parsePostToolUsePayload(raw: string | Buffer): PostToolUsePayloa
     errored = toolResponseErrored(rec);
   }
 
-  return { toolName, command, stderr, stdout, errored };
+  const cwd = typeof parsed.cwd === 'string' ? parsed.cwd : '';
+  return { toolName, command, stderr, stdout, errored, cwd };
 }
 
 /**

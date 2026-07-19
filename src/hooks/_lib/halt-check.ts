@@ -42,6 +42,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import { resolveCommonRoot } from '../../lib/worktree-roots.js';
 
 /**
  * Result of a HALT probe.
@@ -117,4 +118,28 @@ export function checkHalt(reaRoot: string): HaltState {
  */
 export function formatHaltBanner(reason: string): string {
   return `REA HALT: ${reason}\nAll agent operations suspended. Run: rea unfreeze\n`;
+}
+
+/**
+ * Worktree-aware HALT probe (0.54.0): one kill switch per REPOSITORY.
+ *
+ * Tests the LOCAL root first (a legacy per-worktree HALT written before
+ * this release must keep freezing that stream), then the COMMON root
+ * (the primary checkout — where `rea freeze` and the automated reflexes
+ * write from 0.54.0 on, so a freeze in one worktree stops every
+ * stream). In a plain checkout the two roots coincide and the second
+ * probe never runs — the degenerate path is byte-identical to
+ * `checkHalt`.
+ *
+ * Callers that already resolved both roots pass `commonRoot` to skip
+ * re-resolution; hook bodies that only carry a single root can call
+ * with just `localRoot` and let this helper derive the common one.
+ */
+export function checkHaltRoots(localRoot: string, commonRoot?: string): HaltState {
+  const local = checkHalt(localRoot);
+  if (local.halted) return local;
+  const common =
+    commonRoot ?? resolveCommonRoot(localRoot, () => {}).commonRoot;
+  if (path.resolve(common) === path.resolve(localRoot)) return local;
+  return checkHalt(common);
 }

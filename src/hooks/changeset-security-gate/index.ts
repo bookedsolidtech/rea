@@ -47,7 +47,10 @@
  */
 
 import type { Buffer } from 'node:buffer';
-import { checkHalt, formatHaltBanner } from '../_lib/halt-check.js';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import { checkHaltRoots, formatHaltBanner } from '../_lib/halt-check.js';
+import { resolveHookRoots, listSiblingWorktreeRoots } from '../../lib/worktree-roots.js';
 import {
   parseWriteHookPayload,
   MalformedPayloadError,
@@ -249,8 +252,6 @@ the event loop under concurrency. Closes #34.`;
 export async function runChangesetSecurityGate(
   options: ChangesetSecurityGateOptions = {},
 ): Promise<ChangesetSecurityGateResult> {
-  const reaRoot =
-    options.reaRoot ?? process.env['CLAUDE_PROJECT_DIR'] ?? process.cwd();
   let stderr = '';
   let stdout = '';
   const writeStderr = (s: string): void => {
@@ -262,13 +263,6 @@ export async function runChangesetSecurityGate(
     if (options.stdoutWrite) options.stdoutWrite(s);
   };
 
-  // 1. HALT.
-  const halt = checkHalt(reaRoot);
-  if (halt.halted) {
-    writeStderr(formatHaltBanner(halt.reason));
-    return { exitCode: 2, stderr, stdout };
-  }
-
   // 2. Stdin.
   const stdinRaw =
     options.stdinOverride !== undefined
@@ -278,8 +272,10 @@ export async function runChangesetSecurityGate(
   let toolName = '';
   let filePath = '';
   let content = '';
+  let payloadCwd = '';
   try {
     const payload = parseWriteHookPayload(stdinRaw);
+    payloadCwd = payload.cwd;
     toolName = payload.toolName;
     filePath = payload.filePath;
     content = payload.content;
@@ -291,6 +287,18 @@ export async function runChangesetSecurityGate(
       return { exitCode: 2, stderr, stdout };
     }
     throw err;
+  }
+
+  // Roots + HALT (0.54.0 worktree state): the payload's `cwd` feeds the
+  // resolution ladder, so stdin is parsed FIRST — a deliberate reorder.
+  // Policy/path checks key off the LOCAL (worktree) root; audit and the
+  // kill switch key off the COMMON (repository) root.
+  const { localRoot: reaRoot, commonRoot } = resolveHookRoots(payloadCwd, options.reaRoot);
+  // 1. HALT.
+  const halt = checkHaltRoots(reaRoot, commonRoot);
+  if (halt.halted) {
+    writeStderr(formatHaltBanner(halt.reason));
+    return { exitCode: 2, stderr, stdout };
   }
 
   // 3. Tool filter.
@@ -312,15 +320,34 @@ export async function runChangesetSecurityGate(
     return { exitCode: 2, stderr, stdout };
   }
 
-  // 6. MultiEdit short-circuit for frontmatter validation. The bash
-  //    hook exits 0 here — the disclosure scan above is the only
-  //    enforcement for fragment-style writes.
-  if (toolName === 'MultiEdit') {
+  // 6. Determine the DOCUMENT to validate for frontmatter completeness
+  //    (bug: the Edit fragment, not the file). `content` is the whole
+  //    file only for Write; for Edit it is the `new_string` FRAGMENT,
+  //    which naturally has no frontmatter — so a body-only edit to an
+  //    already-valid changeset was falsely blocked, training agents to
+  //    route around the gate with a full-file rewrite.
+  //    - Write (or unknown): `content` IS the resulting file.
+  //    - Edit: reconstruct the resulting file (apply old→new to the
+  //      current content) and validate THAT — so an edit that damages
+  //      the frontmatter is still caught, while a body edit passes.
+  //      If the result can't be reconstructed (missing file, old_string
+  //      not located), skip rather than false-block.
+  //    - MultiEdit: skip (fragment list; frontmatter was validated at
+  //      the original Write). The disclosure scan above still ran.
+  let docToValidate: string | null;
+  if (toolName === 'Edit') {
+    docToValidate = reconstructEditResult(reaRoot, commonRoot, payloadCwd, filePath, stdinRaw);
+  } else if (toolName === 'MultiEdit') {
+    docToValidate = null;
+  } else {
+    docToValidate = content;
+  }
+  if (docToValidate === null) {
     return { exitCode: 0, stderr, stdout };
   }
 
   // 7. Frontmatter validation.
-  const firstLine = content.split('\n', 1)[0] ?? '';
+  const firstLine = docToValidate.split('\n', 1)[0] ?? '';
   if (!/^---/.test(firstLine)) {
     const out = emitJsonBlock(MISSING_FRONTMATTER_BANNER);
     writeStdout(out.json);
@@ -328,7 +355,7 @@ export async function runChangesetSecurityGate(
     return { exitCode: 2, stderr, stdout };
   }
 
-  const frontmatter = extractFrontmatter(content);
+  const frontmatter = extractFrontmatter(docToValidate);
   let hasBump = false;
   for (const line of frontmatter.split('\n')) {
     if (FRONTMATTER_BUMP_PATTERN.test(line)) {
@@ -343,7 +370,7 @@ export async function runChangesetSecurityGate(
     return { exitCode: 2, stderr, stdout };
   }
 
-  const description = extractDescription(content);
+  const description = extractDescription(docToValidate);
   if (description.length === 0) {
     const out = emitJsonBlock(MISSING_DESCRIPTION_BANNER);
     writeStdout(out.json);
@@ -352,6 +379,120 @@ export async function runChangesetSecurityGate(
   }
 
   return { exitCode: 0, stderr, stdout };
+}
+
+/**
+ * Reconstruct the RESULTING changeset document for a single `Edit`, so
+ * the frontmatter-completeness check validates the post-edit file
+ * rather than the `new_string` fragment. Reads the current file and
+ * applies `old_string` → `new_string` (honoring `replace_all`). Returns
+ * the resulting content, or `null` when it cannot be reconstructed
+ * (unreadable/missing file, absent or non-locatable `old_string`) — the
+ * caller treats `null` as "skip the frontmatter check", never a block,
+ * so a legitimate body edit is never falsely refused. The disclosure
+ * (GHSA/CVE) scan already ran on the fragment upstream.
+ */
+/**
+ * Round-43 — resolve the EXACT governed `.changeset/<name>.md` file the write
+ * targets, so reconstruction reads the same file the write actually edits (not
+ * an independent base-order guess). The governed changeset dirs are
+ * `<root>/.changeset` for the LOCAL worktree, the COMMON (primary checkout)
+ * root, and every SIBLING worktree — a NESTED subdir `.changeset/` (a decoy
+ * inside the repo) is NOT one of them, and neither is a foreign repo's
+ * (cross-repo isolation, mirrors verify-gate round-26/27). Try the candidate
+ * bases (repo-root-relative then cwd-relative, or the absolute path) and return
+ * the first whose realpath sits DIRECTLY under a governed `.changeset/`. Returns
+ * `null` (skip, never block) when none does. Fail-safe: fs errors → `null`.
+ */
+function realpathTolerant(p: string): string | null {
+  try {
+    return fs.realpathSync(p);
+  } catch {
+    try {
+      return path.join(fs.realpathSync(path.dirname(p)), path.basename(p));
+    } catch {
+      return null;
+    }
+  }
+}
+
+function resolveChangesetTarget(
+  reaRoot: string,
+  commonRoot: string,
+  payloadCwd: string,
+  filePath: string,
+): string | null {
+  const roots = [
+    reaRoot,
+    ...(commonRoot.length > 0 && commonRoot !== reaRoot ? [commonRoot] : []),
+    ...(commonRoot.length > 0 ? listSiblingWorktreeRoots(commonRoot, reaRoot) : []),
+  ];
+  const govChangesetDirs: string[] = [];
+  for (const root of roots) {
+    const c = realpathTolerant(path.join(root, '.changeset'));
+    if (c !== null) govChangesetDirs.push(c);
+  }
+  if (govChangesetDirs.length === 0) return null;
+
+  const candidates = path.isAbsolute(filePath)
+    ? [filePath]
+    : [
+        path.resolve(reaRoot, filePath),
+        ...(payloadCwd.length > 0 ? [path.resolve(payloadCwd, filePath)] : []),
+      ];
+  for (const cand of candidates) {
+    const cc = realpathTolerant(cand);
+    if (cc === null) continue;
+    const base = path.basename(cc);
+    if (base === 'README.md' || !/\.md$/.test(base)) continue;
+    if (govChangesetDirs.includes(path.dirname(cc))) return cc; // directly under a governed .changeset/
+  }
+  return null;
+}
+
+function reconstructEditResult(
+  reaRoot: string,
+  commonRoot: string,
+  payloadCwd: string,
+  filePath: string,
+  stdinRaw: string | Buffer,
+): string | null {
+  try {
+    const parsed: unknown = JSON.parse(
+      typeof stdinRaw === 'string' ? stdinRaw : stdinRaw.toString('utf8'),
+    );
+    if (parsed === null || typeof parsed !== 'object') return null;
+    const ti = (parsed as { tool_input?: unknown }).tool_input;
+    if (ti === null || typeof ti !== 'object') return null;
+    const rec = ti as { old_string?: unknown; new_string?: unknown; replace_all?: unknown };
+    if (typeof rec.old_string !== 'string') return null;
+    const oldStr = rec.old_string;
+    const newStr = typeof rec.new_string === 'string' ? rec.new_string : '';
+    // Round-43: acceptance and reconstruction must read the SAME file.
+    // `resolveChangesetTarget` returns the EXACT changeset file the write
+    // targets — the candidate (repo-root-relative OR cwd-relative) that lands
+    // under a GOVERNED `.changeset/` dir (this repo's local / common / sibling
+    // roots) — and we read THAT. This dissolves the round-32↔round-43
+    // oscillation: whatever base resolves to the governed changeset IS the
+    // reconstruction target, so a subdir session emitting a repo-root-relative
+    // `.changeset/foo.md` no longer reconstructs against a NESTED decoy (the
+    // pre-fix cwd-first read), and a `../`-relative path still targets the
+    // parent. No governed changeset resolved → skip (null), never a false block.
+    const targetPath = resolveChangesetTarget(reaRoot, commonRoot, payloadCwd, filePath);
+    if (targetPath === null) return null;
+    let current: string;
+    try {
+      current = fs.readFileSync(targetPath, 'utf8');
+    } catch {
+      return null;
+    }
+    if (oldStr.length === 0 || !current.includes(oldStr)) return null;
+    if (rec.replace_all === true) return current.split(oldStr).join(newStr);
+    const idx = current.indexOf(oldStr);
+    return current.slice(0, idx) + newStr + current.slice(idx + oldStr.length);
+  } catch {
+    return null;
+  }
 }
 
 /**

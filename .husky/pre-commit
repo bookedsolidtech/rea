@@ -1,0 +1,277 @@
+#!/bin/sh
+# rea:pre-commit-spec-gate v1
+# rea:pre-commit-body-v1
+#
+# Pre-commit hook installed by rea for the G1 spec-gate. Do NOT edit by
+# hand — re-run the installer to refresh. See src/cli/gate.ts.
+
+set -eu
+
+# REA spec-gate (G1, Artifact Gates). The gate logic — staged-diff sizing,
+# active-task + committed-spec resolution, off/shadow/enforce dispatch, and
+# audit — lives in `src/cli/gate.ts` and is invoked via
+# `rea gate spec-check`. This stub only resolves the rea CLI and dispatches.
+#
+# The gate is DEFAULT-OFF (policy.artifact_gates.g1_spec.mode defaults to
+# off), so a missing CLI fails OPEN (exit 0) rather than blocking every
+# commit on a repo whose CLI is not built.
+
+REA_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+
+# HALT freeze contract (round-18 F2). A frozen repo (`.rea/HALT` present) must
+# refuse the commit with ZERO CLI dependency — the freeze has to hold even when
+# the spec-gate ladder below fails OPEN (missing / too-old / foreign rea, fresh
+# clone, unbuilt worktree). This mirrors `hooks/_lib/halt-check.sh`, which this
+# standalone git hook cannot source: probe the LOCAL worktree root AND the
+# COMMON (primary-checkout) root. The `.git`-is-a-FILE test is the cheap gate
+# for "is this even a linked worktree" (plain checkouts pay only the -f test,
+# zero git subprocesses). For the common root we use `git worktree list
+# --porcelain` — its FIRST `worktree ` line is the MAIN working tree. This is
+# robust under `--separate-git-dir` / absorbed-submodule gitfiles, where
+# `dirname(git-common-dir)` points at EXTERNAL metadata rather than the
+# checkout (round-19 F1); it is the same fallback the pre-push REA_CLI_ROOT
+# resolution uses. Every git call is `|| true`-guarded, so a broken/absent git
+# degrades to a LOCAL-only probe. ABSENCE at both roots = fall through to the
+# CLI ladder; this check never hard-fails a commit on its own. bash-3.2/BSD-safe.
+_rea_halt_common="$REA_ROOT"
+if [ -f "${REA_ROOT}/.git" ]; then
+  _rea_main=$(git -C "$REA_ROOT" worktree list --porcelain 2>/dev/null \
+    | sed -n 's/^worktree //p' | head -n 1 || true)
+  if [ -n "$_rea_main" ] && [ "$_rea_main" != "$REA_ROOT" ] \
+     && { [ -d "${_rea_main}/.rea" ] || [ -e "${_rea_main}/.git" ]; }; then
+    _rea_halt_common="$_rea_main"
+  fi
+fi
+for _rea_hf in "${REA_ROOT}/.rea/HALT" "${_rea_halt_common}/.rea/HALT"; do
+  if [ -f "$_rea_hf" ]; then
+    printf 'REA HALT: %s\nAll commit operations suspended. Run: rea unfreeze\n' \
+      "$(head -c 1024 "$_rea_hf" 2>/dev/null || echo 'Reason unknown')" >&2
+    exit 2
+  fi
+  [ "$REA_ROOT" = "$_rea_halt_common" ] && break
+done
+
+# Round-12 F2 (worktree fallback, mirrors pre-push v6): a linked worktree
+# frequently has no local install (node_modules/dist live only in the
+# PRIMARY checkout). Resolve the CLI from ONE seam: the worktree first, then
+# the primary checkout (.git-file discriminator, verified same-repository),
+# then the in-project dist / global tier below. REA_ROOT itself stays the worktree
+# — HALT and policy resolve against it inside `rea gate spec-check`; only CLI
+# dispatch follows REA_CLI_ROOT.
+REA_CLI_ROOT="$REA_ROOT"
+if [ ! -x "${REA_ROOT}/node_modules/.bin/rea" ] && [ ! -f "${REA_ROOT}/dist/cli/index.js" ] \
+   && [ -f "${REA_ROOT}/.git" ]; then
+  _rea_common_dir=$(git -C "$REA_ROOT" rev-parse --git-common-dir 2>/dev/null || true)
+  case "$_rea_common_dir" in
+    "") : ;;
+    /*) : ;;
+    *) _rea_common_dir="${REA_ROOT}/${_rea_common_dir}" ;;
+  esac
+  if [ -n "$_rea_common_dir" ]; then
+    _rea_common=$(dirname "$_rea_common_dir")
+    # Verify the dirname candidate is the SAME repository (its git-common-dir
+    # resolves to ours) — a bare/separate-git-dir layout nesting metadata
+    # under an UNRELATED checkout must not have its CLI executed against this
+    # repo's commit.
+    _rea_same_repo=0
+    if [ -d "${_rea_common}/.rea" ] || [ -e "${_rea_common}/.git" ]; then
+      _cc=$(git -C "$_rea_common" rev-parse --git-common-dir 2>/dev/null || true)
+      case "$_cc" in "") : ;; /*) : ;; *) _cc="${_rea_common}/${_cc}" ;; esac
+      if [ -n "$_cc" ]; then
+        _x=$(cd "$_cc" 2>/dev/null && pwd -P) || _x="$_cc"
+        _y=$(cd "$_rea_common_dir" 2>/dev/null && pwd -P) || _y="$_rea_common_dir"
+        [ "$_x" = "$_y" ] && _rea_same_repo=1
+      fi
+    fi
+    # A foreign nested checkout (verification failed) OR a --separate-git-dir
+    # primary whose metadata is external — fall back to git's first listed
+    # worktree (THIS repo's main one).
+    if [ "$_rea_same_repo" = "0" ]; then
+      _rea_common=$(git -C "$REA_ROOT" worktree list --porcelain 2>/dev/null \
+        | sed -n 's/^worktree //p' | head -n 1)
+    fi
+    if [ -n "$_rea_common" ] && [ "$_rea_common" != "$REA_ROOT" ] \
+       && { [ -d "${_rea_common}/.rea" ] || [ -e "${_rea_common}/.git" ]; } \
+       && { [ -x "${_rea_common}/node_modules/.bin/rea" ] \
+            || { [ -f "${_rea_common}/dist/cli/index.js" ] && [ -f "${_rea_common}/package.json" ] \
+                 && grep -q '"name": *"@bookedsolid/rea"' "${_rea_common}/package.json" 2>/dev/null; }; }; then
+      REA_CLI_ROOT="$_rea_common"
+    fi
+  fi
+fi
+
+# FAIL OPEN (round-15 P1 + round-17 F2). The ONLY non-zero hook exit is a
+# WORKING rea CLI — in-project OR global — actually running `gate spec-check`
+# and G1 genuinely REFUSING, which the CLI signals with exit code 2 (see
+# src/cli/gate.ts: enforce-block / UNCERTAIN-at-enforce → exitCode 2; off /
+# shadow / pass → 0). Every "CLI missing / too-old / broken" path is exit 0 —
+# the gate is DEFAULT-OFF and must be invisible until a repo opts in.
+#
+# `_rea_spec_gate` enforces that discipline uniformly across tiers: run the
+# resolved CLI and block ONLY on exit 2. A too-old CLI without the `gate`
+# subcommand errors with a NON-2 code (commander unknown-command → 1), so it
+# fails OPEN. That exit-code discipline is exactly what lets the global/PATH
+# tier be reintroduced here: round-15 removed the old on-PATH and
+# network-auto-install fallbacks because they propagated a HARD non-zero on a
+# fresh clone / too-old / cache-miss, bricking every commit. The
+# network-auto-install fallback is NOT reintroduced (nothing is ever
+# auto-fetched); only an ALREADY-INSTALLED global `rea` is reached, and only
+# its genuine exit-2 refusal blocks. The dist tier stays guarded by the
+# package.json name grep so a foreign `dist/cli/index.js` can never be invoked.
+# Round-23 F2: a spec-gate PASS must FALL THROUGH to the pre-commit.d fragment
+# chain below (not `exit 0` before it). So `_rea_spec_gate` RETURNS 0 on a
+# pass OR any "CLI can't run this" (non-2) result, and only `exit 2`s on a
+# GENUINE G1 refusal — a blocked commit must not run the consumer's fragments.
+# round-53 P1 — gate-active detector for the "CLI cannot run G1" fail posture.
+# Returns 0 (success) iff THIS repo's LOCAL policy at ${REA_ROOT}/.rea/policy.yaml
+# configures an ACTIVE G1 gate (`artifact_gates.g1_spec.mode` shadow|enforce).
+# Detection mirrors the pre-push gate-active awk EXACTLY (ONE rule across gates):
+# an active mode in block form OR inline flow map at ANY nesting depth
+# (`artifact_gates: { g1_spec: { mode: enforce } }`, `g1_spec:{mode:enforce}`).
+# Value matching strips non-alpha so `enforce`, `"enforce"`, `'enforce'` match.
+# Dispositions: policy ABSENT → 1 (no gate → keep fail-OPEN); active mode → 0
+# (fail CLOSED); policy present but awk unavailable → 0 (cannot parse a governed
+# policy → bias fail-CLOSED). bash-3.2 / BSD-safe, single pass.
+# round-54 tri-state — gate-MODE detector for the "CLI cannot run G1" posture.
+# ECHOES the G1 gate mode from THIS repo's LOCAL policy at
+# ${REA_ROOT}/.rea/policy.yaml — `enforce`, `shadow`, or `off`
+# (artifact_gates.g1_spec.mode). Same block+inline-flow-map awk as the pre-push
+# review-gate detector (ONE rule across gates): mode in block form OR inline
+# flow map at ANY nesting depth (`artifact_gates: { g1_spec: { mode: enforce } }`,
+# `g1_spec:{mode:enforce}`); value strips non-alpha so `enforce`, `"enforce"`,
+# `'enforce'` match. Dispositions (shadow is OBSERVE-ONLY, never blocks):
+#   policy ABSENT / no g1_spec mode → `off`; shadow → `shadow`; enforce →
+#   `enforce`; policy present but awk unavailable → `enforce` (cannot parse a
+#   governed policy → bias fail-CLOSED). bash-3.2 / BSD-safe, single pass.
+_rea_spec_gate_mode() {
+  _rea_pol="${REA_ROOT}/.rea/policy.yaml"
+  [ -f "$_rea_pol" ] || { printf 'off'; return 0; }
+  command -v awk >/dev/null 2>&1 || { printf 'enforce'; return 0; }
+  _rea_m=$(awk '
+    function ind(str,   n){ n=0; while (substr(str,n+1,1)==" ") n++; return n }
+    function modeval(str,   v){
+      if (str !~ /mode:/) return ""
+      v=str; sub(/.*mode:/,"",v); gsub(/[^A-Za-z]/,"",v)
+      if (v ~ /^enforce/) return "enforce"
+      if (v ~ /^shadow/) return "shadow"
+      return ""
+    }
+    function bump(m){ if (m=="enforce") best=2; else if (m=="shadow" && best<1) best=1 }
+    BEGIN { best=0; inlinep="g1_spec[^A-Za-z_].*mode:"; opener="^g1_spec:" }
+    {
+      s=$0; sub(/^[ \t]*/,"",s)
+      if (s=="" || substr(s,1,1)=="#") next
+      if (s ~ inlinep) bump(modeval(s))
+      i=ind($0)
+      if (s ~ opener) { bump(modeval(s)); blk=1; bi=i; next }
+      if (blk) {
+        if (i <= bi) blk=0
+        else if (s ~ /^mode:/) bump(modeval(s))
+      }
+    }
+    END { if (best==2) print "enforce"; else if (best==1) print "shadow" }
+  ' "$_rea_pol" 2>/dev/null)
+  case "$_rea_m" in
+    enforce) printf 'enforce' ;;
+    shadow) printf 'shadow' ;;
+    *) printf 'off' ;;
+  esac
+}
+
+# Emit the G1 fail-closed CONFIG-ERROR (ENFORCE only). $1 = the cause clause.
+_rea_spec_config_error() {
+  printf 'rea: CONFIG-ERROR — G1 spec gate blocked (fail-closed).\n' >&2
+  printf '  %s, but this repo has an ENFORCE G1 gate\n' "$1" >&2
+  printf '  (artifact_gates.g1_spec.mode = enforce). Refusing the commit without a\n' >&2
+  printf '  spec check. Fix one:\n' >&2
+  printf '    - install/build rea (`pnpm install && pnpm build`, or `npm i -g @bookedsolid/rea`), or\n' >&2
+  printf '    - set the gate mode to `off` in .rea/policy.yaml.\n' >&2
+}
+
+# round-54 tri-state "the CLI could not run G1" disposition. $1 = cause clause.
+#   enforce → CONFIG-ERROR + exit 2 (block the commit).
+#   shadow  → one-line WARN + return 0 (OBSERVE-ONLY never blocks).
+#   off / absent → return 0 silently.
+# Bias enforce on an unparseable governed policy (see _rea_spec_gate_mode).
+_rea_spec_cannot_run() {
+  case "$(_rea_spec_gate_mode)" in
+    enforce) _rea_spec_config_error "$1"; exit 2 ;;
+    shadow) printf 'rea: WARN — G1 spec gate (shadow) could not run: %s; not blocking.\n' "$1" >&2; return 0 ;;
+    *) return 0 ;;
+  esac
+}
+
+# round-53/54. A genuine G1 refusal is exit 2 → block. Every "CLI can't run the
+# gate" outcome routes through _rea_spec_cannot_run (mode-aware tri-state):
+#   - `unknown command` (CLI too old to have `gate spec-check`);
+#   - `unknown option` (flag mismatch on a gate-capable CLI) → ALWAYS return 0
+#     (a flag incompat is not a "gate could not run" signal — never block);
+#   - the `*)` catch-all (round-54 P2 finding 2): any OTHER non-2 error — node
+#     missing for the dist path, a corrupted install, the command crashing
+#     before it returns its own code — previously fail-open, silently disabling
+#     an ENFORCE gate; now routed through the same mode logic.
+# A pass / shadow-warn / off RETURNS 0 so control falls through to the fragment
+# chain (round-23 F2); only a genuine refusal / enforce config-error `exit 2`s.
+_rea_spec_gate() {
+  _sg_out=$("$@" gate spec-check 2>&1) && _rc=0 || _rc=$?
+  if [ "$_rc" -eq 0 ]; then
+    [ -n "$_sg_out" ] && printf '%s\n' "$_sg_out"
+    return 0
+  fi
+  if [ "$_rc" -eq 2 ]; then
+    [ -n "$_sg_out" ] && printf '%s\n' "$_sg_out" >&2
+    exit 2
+  fi
+  case "$_sg_out" in
+    *"unknown command"*)
+      _rea_spec_cannot_run 'the resolved rea CLI has no `gate spec-check` command' ;;
+    *"unknown option"*)
+      return 0 ;;
+    *)
+      [ -n "$_sg_out" ] && printf '%s\n' "$_sg_out" >&2
+      _rea_spec_cannot_run 'rea gate spec-check failed to run (unexpected error)' ;;
+  esac
+}
+
+if [ -x "${REA_CLI_ROOT}/node_modules/.bin/rea" ]; then
+  _rea_spec_gate "${REA_CLI_ROOT}/node_modules/.bin/rea"
+elif [ -f "${REA_CLI_ROOT}/dist/cli/index.js" ] && [ -f "${REA_CLI_ROOT}/package.json" ] \
+     && grep -q '"name": *"@bookedsolid/rea"' "${REA_CLI_ROOT}/package.json" 2>/dev/null; then
+  _rea_spec_gate node "${REA_CLI_ROOT}/dist/cli/index.js"
+elif command -v rea >/dev/null 2>&1; then
+  # Global / PATH rea (e.g. `rea install --global`). Reached only when no
+  # in-project CLI resolved. Same exit-2-only discipline: a too-old or broken
+  # global CLI fails OPEN; only a genuine G1 refusal (exit 2) blocks.
+  _rea_spec_gate rea
+else
+  # No rea CLI anywhere. round-54 tri-state (mode-aware): enforce → FAIL CLOSED
+  # (CONFIG-ERROR + exit 2); shadow → one-line WARN + ALLOW (observe-only never
+  # blocks); off / absent → ALLOW silently. This PRESERVES round-15's fresh-clone
+  # protection for the common default-off case (a missing CLI never bricks an
+  # un-opted-in repo) while closing the opted-in ENFORCE fail-open. `rea doctor`
+  # also warns. _rea_spec_cannot_run RETURNS 0 for shadow/off so control falls
+  # through to the fragment chain.
+  _rea_spec_cannot_run 'no rea CLI is installed or built'
+fi
+
+# Extension-hook chaining (round-23 F2, mirrors pre-push's `.husky/pre-push.d/`
+# v4 / 0.13.0). Run every executable file under `.husky/pre-commit.d/` in
+# POSIX-sorted lexical order (shell glob order). A missing directory is a no-op
+# (backward compatible). A fragment's non-zero exit BLOCKS the commit (`set -e`
+# propagates it) — same posture as pre-push. Reached only when the spec gate
+# PASSED or failed open; a spec-gate refusal already `exit 2`'d above, so a
+# blocked commit never runs fragments. Git passes no arguments to pre-commit,
+# so fragments are invoked bare.
+ext_dir="${REA_ROOT}/.husky/pre-commit.d"
+if [ -d "$ext_dir" ]; then
+  for frag in "$ext_dir"/*; do
+    # Glob expands to itself when the dir is empty — guard with -e.
+    [ -e "$frag" ] || continue
+    # Only executable regular files are fragments; a non-exec README is inert.
+    [ -f "$frag" ] || continue
+    [ -x "$frag" ] || continue
+    "$frag"
+  done
+fi
+
+exit 0

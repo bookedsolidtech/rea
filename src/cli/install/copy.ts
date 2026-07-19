@@ -88,10 +88,37 @@ export interface CopyResult {
   overwritten: string[];
 }
 
-/** Subdirectory names under `.claude/` that we manage. */
-const COPY_DIRS = ['hooks', 'commands', 'agents'] as const;
+/**
+ * Payload directories `rea init` copies into `.claude/`. Each mapping names
+ * a source directory under `PKG_ROOT` and its install target subdirectory
+ * under `.claude/`. The two names are usually identical (`hooks` → `hooks`),
+ * but the spine payload deliberately diverges — `spine/` installs to the
+ * rea-owned subdir `.claude/skills/rea/` (NOT the bare, shared
+ * `.claude/skills/` root) so it carries its own version-pin + drift scope
+ * and never collides with a user's own skills. Mirrors the DirMapping
+ * set in `install/canonical.ts` (which drives the manifest + upgrade +
+ * doctor-drift surfaces).
+ */
+interface CopyMapping {
+  /** Source directory name under `PKG_ROOT`. */
+  src: string;
+  /** Install target subdirectory name under `.claude/`. */
+  dst: string;
+  /** Files get the 0o755 exec bit (hooks); everything else 0o644. */
+  executable: boolean;
+}
 
-type CopyDir = (typeof COPY_DIRS)[number];
+const COPY_DIRS: readonly CopyMapping[] = [
+  { src: 'hooks', dst: 'hooks', executable: true },
+  { src: 'commands', dst: 'commands', executable: false },
+  { src: 'agents', dst: 'agents', executable: false },
+  // Process-spine skills — `spine/` → `.claude/skills/rea/` (rea-owned
+  // subdir, not the shared `.claude/skills/` root). Same copy/skip/
+  // overwrite conflict policy as the other payloads, so re-running `rea
+  // init` under `--yes` skips existing spine files (never a silent
+  // overwrite of a consumer edit) and byte-identical output is preserved.
+  { src: 'spine', dst: 'skills/rea', executable: false },
+];
 
 /**
  * Thrown when a destination path is a symlink, escapes the install root, or a
@@ -428,16 +455,16 @@ async function writeFileExclusiveNoFollow(srcPath: string, dstPath: string): Pro
 async function walkAndCopy(
   sourceRoot: string,
   destRoot: string,
-  dirName: CopyDir,
+  mapping: CopyMapping,
   targetDir: string,
   options: CopyOptions,
   result: CopyResult,
   ctx: WalkContext,
 ): Promise<void> {
-  const src = path.join(sourceRoot, dirName);
-  const dst = path.join(destRoot, dirName);
+  const src = path.join(sourceRoot, mapping.src);
+  const dst = path.join(destRoot, mapping.dst);
   if (!fs.existsSync(src)) {
-    warn(`packaged directory missing: ${src} — skipping ${dirName} copy`);
+    warn(`packaged directory missing: ${src} — skipping ${mapping.src} copy`);
     return;
   }
   await assertSafeDirectory(ctx.resolvedRoot, dst);
@@ -463,11 +490,11 @@ async function walkAndCopy(
           warn(`nested directory beyond depth 2 ignored: ${subSrc}`);
           continue;
         }
-        await copyOne(subSrc, subDst, relClaude(targetDir, subDst), dirName, options, result, ctx);
+        await copyOne(subSrc, subDst, relClaude(targetDir, subDst), mapping, options, result, ctx);
       }
       continue;
     }
-    await copyOne(srcPath, dstPath, relPath, dirName, options, result, ctx);
+    await copyOne(srcPath, dstPath, relPath, mapping, options, result, ctx);
   }
 }
 
@@ -475,7 +502,7 @@ async function copyOne(
   srcPath: string,
   dstPath: string,
   relPath: string,
-  dirName: CopyDir,
+  mapping: CopyMapping,
   options: CopyOptions,
   result: CopyResult,
   ctx: WalkContext,
@@ -504,7 +531,7 @@ async function copyOne(
     await fsPromises.unlink(dstPath);
     await verifyAncestorsUnchanged(ancestorSnapshot);
     await writeFileExclusiveNoFollow(srcPath, dstPath);
-    if (dirName === 'hooks') await fsPromises.chmod(dstPath, 0o755);
+    if (mapping.executable) await fsPromises.chmod(dstPath, 0o755);
     result.overwritten.push(relPath);
     return;
   }
@@ -514,7 +541,7 @@ async function copyOne(
   // we fail if the leaf is a symlink.
   await verifyAncestorsUnchanged(ancestorSnapshot);
   await writeFileExclusiveNoFollow(srcPath, dstPath);
-  if (dirName === 'hooks') await fsPromises.chmod(dstPath, 0o755);
+  if (mapping.executable) await fsPromises.chmod(dstPath, 0o755);
   result.copied.push(relPath);
 }
 

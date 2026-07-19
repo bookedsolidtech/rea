@@ -40,7 +40,8 @@ import type { Buffer } from 'node:buffer';
 import path from 'node:path';
 import fs from 'node:fs';
 import { parse as parseYaml } from 'yaml';
-import { checkHalt, formatHaltBanner } from '../_lib/halt-check.js';
+import { checkHaltRoots, formatHaltBanner } from '../_lib/halt-check.js';
+import { resolveHookRoots, listSiblingWorktreeRoots } from '../../lib/worktree-roots.js';
 import {
   parseWriteHookPayload,
   MalformedPayloadError,
@@ -95,6 +96,31 @@ function matchBlockedEntry(pathLc: string, blockedEntry: string): boolean {
   return pathLc === entryLc;
 }
 
+/**
+ * Realpath-canonicalize an absolute path whose leaf may not exist yet
+ * (a create target). Walks up to the nearest existing ancestor,
+ * realpaths THAT (resolving /var↔/private/var and symlinked checkout
+ * roots for the whole subtree), then re-appends the unresolved tail.
+ * Falls back to the lexical input on any error. Mirrors the helper in
+ * settings-protection (round-45). (Round-4 P1.)
+ */
+function canonicalizeExisting(abs: string): string {
+  let dir = abs;
+  const tail: string[] = [];
+  for (let i = 0; i < 64; i += 1) {
+    try {
+      const real = fs.realpathSync(dir);
+      return tail.length > 0 ? path.join(real, ...tail.slice().reverse()) : real;
+    } catch {
+      const parent = path.dirname(dir);
+      if (parent === dir) return abs;
+      tail.push(path.basename(dir));
+      dir = parent;
+    }
+  }
+  return abs;
+}
+
 function loadBlockedPathsPermissive(reaRoot: string): string[] {
   const policyPath = path.join(reaRoot, '.rea', 'policy.yaml');
   if (!fs.existsSync(policyPath)) return [];
@@ -126,20 +152,11 @@ function loadBlockedPathsPermissive(reaRoot: string): string[] {
 export async function runBlockedPathsEnforcer(
   options: BlockedPathsEnforcerOptions = {},
 ): Promise<BlockedPathsEnforcerResult> {
-  const reaRoot =
-    options.reaRoot ?? process.env['CLAUDE_PROJECT_DIR'] ?? process.cwd();
   let stderr = '';
   const writeStderr = (s: string): void => {
     stderr += s;
     if (options.stderrWrite) options.stderrWrite(s);
   };
-
-  // 1. HALT check.
-  const halt = checkHalt(reaRoot);
-  if (halt.halted) {
-    writeStderr(formatHaltBanner(halt.reason));
-    return { exitCode: 2, stderr, matched: null };
-  }
 
   // 2. Read + parse stdin.
   const stdinRaw =
@@ -148,8 +165,10 @@ export async function runBlockedPathsEnforcer(
       : await readStdinWithTimeout(5_000);
 
   let filePath = '';
+  let payloadCwd = '';
   try {
     const payload = parseWriteHookPayload(stdinRaw);
+    payloadCwd = payload.cwd;
     filePath = payload.filePath;
   } catch (err) {
     if (err instanceof MalformedPayloadError || err instanceof TypePayloadError) {
@@ -160,18 +179,75 @@ export async function runBlockedPathsEnforcer(
     }
     throw err;
   }
+
+  // Roots + HALT (0.54.0 worktree state): the payload's `cwd` feeds the
+  // resolution ladder, so stdin is parsed FIRST — a deliberate reorder.
+  // Policy/path checks key off the LOCAL (worktree) root; audit and the
+  // kill switch key off the COMMON (repository) root.
+  const { localRoot: reaRoot, commonRoot } = resolveHookRoots(payloadCwd, options.reaRoot);
+  // Round-10 P1: sibling worktrees' governed state is in scope too;
+  // zero-cost in plain repos (stat-gated on .git/worktrees).
+  const siblingRoots = listSiblingWorktreeRoots(commonRoot, reaRoot);
+  // 1. HALT check.
+  const halt = checkHaltRoots(reaRoot, commonRoot);
+  if (halt.halted) {
+    writeStderr(formatHaltBanner(halt.reason));
+    return { exitCode: 2, stderr, matched: null };
+  }
   if (filePath.length === 0) {
     return { exitCode: 0, stderr, matched: null };
   }
 
-  // 3. Load policy permissively.
-  const blockedPaths = loadBlockedPathsPermissive(reaRoot);
-  if (blockedPaths.length === 0) {
+  // 3. Load policy permissively. Round-11 P1: a CROSS-ROOT target also
+  //    honors the TARGET stream's own blocked_paths (union — a looser
+  //    branch cannot write a path the target's branch blocks).
+  const callerBlocked = loadBlockedPathsPermissive(reaRoot);
+  // Preserve the historical empty-policy no-op — but only when there is
+  // no cross root whose own list could still match (plain checkouts:
+  // byte-identical early exit).
+  if (callerBlocked.length === 0 && commonRoot === reaRoot && siblingRoots.length === 0) {
     return { exitCode: 0, stderr, matched: null };
   }
 
   // 4. Normalize.
-  const normalized = normalizePath(filePath, reaRoot);
+  let normalized = normalizePath(filePath, reaRoot);
+  // 0.54.0 worktree state (review round-4): an absolute target that
+  // normalizePath left ABSOLUTE (outside the local root) but that lands
+  // INSIDE the COMMON root re-normalizes common-relative, so the
+  // protected/blocked patterns match the primary checkout's shared
+  // enforcement state from a worktree session. Symlink checks below
+  // keep using the raw (absolute) filePath — only pattern matching
+  // consumes the relative form.
+  let crossRootUsed: string | null = null;
+  if (commonRoot !== reaRoot || siblingRoots.length > 0) {
+    const crossRoots = [
+      ...(commonRoot !== reaRoot ? [commonRoot] : []),
+      ...siblingRoots,
+    ];
+    if (path.isAbsolute(normalized)) {
+      const resolvedNorm = path.resolve(normalized);
+      // Round-4 P1 (parity with settings-protection round-45 +
+      // blocked-scan round-3): an aliased target (/var↔/private/var,
+      // symlinked checkout) won't match a cross root lexically — compare
+      // the realpath-canonicalized forms too, else Write/Edit to the
+      // aliased absolute path skips the target root's blocked_paths.
+      const canonNorm = canonicalizeExisting(resolvedNorm);
+      for (const cross of crossRoots) {
+        const crossResolved = path.resolve(cross);
+        if (resolvedNorm === crossResolved || resolvedNorm.startsWith(crossResolved + path.sep)) {
+          normalized = normalizePath(filePath, cross);
+          crossRootUsed = cross;
+          break;
+        }
+        const crossCanon = canonicalizeExisting(crossResolved);
+        if (canonNorm === crossCanon || canonNorm.startsWith(crossCanon + path.sep)) {
+          normalized = normalizePath(canonNorm, crossCanon);
+          crossRootUsed = cross;
+          break;
+        }
+      }
+    }
+  }
   const lowerNorm = normalized.toLowerCase();
 
   // 5. §5a path-traversal rejection. Both raw + normalized.
@@ -206,7 +282,15 @@ export async function runBlockedPathsEnforcer(
     }
   }
 
-  // 8. Match against blocked_paths.
+  // 8. Match against blocked_paths — the caller's list, UNIONed with
+  //    the TARGET stream's own list when the write crossed roots.
+  const blockedPaths =
+    crossRootUsed !== null
+      ? [...new Set([...callerBlocked, ...loadBlockedPathsPermissive(crossRootUsed)])]
+      : callerBlocked;
+  if (blockedPaths.length === 0) {
+    return { exitCode: 0, stderr, matched: null };
+  }
   let matched: string | null = null;
   for (const blocked of blockedPaths) {
     if (matchBlockedEntry(lowerNorm, blocked)) {
@@ -226,12 +310,19 @@ export async function runBlockedPathsEnforcer(
       writeStderr('  This path is protected by policy. To modify it, a human must\n');
       writeStderr('  either update blocked_paths in policy.yaml or edit the file directly.\n');
     }
-    await maybeAudit(reaRoot, 'denied', matched, filePath);
+    await maybeAudit(commonRoot, 'denied', matched, filePath);
     return { exitCode: 2, stderr, matched };
   }
 
   // 9. §H.2 intermediate-symlink resolution.
-  const symMatched = checkSymlinkResolution(filePath, blockedPaths, reaRoot);
+  const symMatched = checkSymlinkResolution(
+    filePath,
+    blockedPaths,
+    reaRoot,
+    commonRoot,
+    siblingRoots,
+    loadBlockedPathsPermissive,
+  );
   if (symMatched !== null) {
     writeStderr('BLOCKED PATH: intermediate-symlink resolution blocked\n');
     writeStderr('\n');
@@ -242,11 +333,11 @@ export async function runBlockedPathsEnforcer(
     writeStderr('\n');
     writeStderr('  Rule: an intermediate directory of the path is a symlink\n');
     writeStderr('        whose target falls inside a blocked policy entry.\n');
-    await maybeAudit(reaRoot, 'denied', symMatched.entry, filePath);
+    await maybeAudit(commonRoot, 'denied', symMatched.entry, filePath);
     return { exitCode: 2, stderr, matched: symMatched.entry };
   }
 
-  await maybeAudit(reaRoot, 'allowed', null, filePath);
+  await maybeAudit(commonRoot, 'allowed', null, filePath);
   return { exitCode: 0, stderr, matched: null };
 }
 
@@ -256,18 +347,29 @@ export async function runBlockedPathsEnforcer(
  */
 function checkSymlinkResolution(
   filePath: string,
-  blockedPaths: readonly string[],
+  blockedPathsIn: readonly string[],
   reaRoot: string,
+  commonRoot?: string,
+  siblingRoots?: readonly string[],
+  blockedPathsForRoot?: (root: string) => string[],
 ): { entry: string; resolvedTarget: string } | null {
+  let blockedPaths: readonly string[] = blockedPathsIn;
+  // Round-6 P2: probe against the ACCEPTED worktree root — in a
+  // linked-worktree session the hook process cwd may be the primary
+  // checkout while `reaRoot` (from payload.cwd) is the worktree, so a
+  // RELATIVE target like `bridge/package.json` must be resolved in the
+  // worktree, not the primary, or the cross-root symlink enforcement
+  // probes the wrong tree.
+  const probePath = path.isAbsolute(filePath) ? filePath : path.resolve(reaRoot, filePath);
   // Only attempt resolution if the target exists or its parent dir
   // exists — matches the bash `if [[ -e "$FILE_PATH" || -d ... ]]`.
   let targetExists = false;
   try {
-    targetExists = fs.existsSync(filePath);
+    targetExists = fs.existsSync(probePath);
   } catch {
     /* fall through */
   }
-  const parentDir = path.dirname(filePath);
+  const parentDir = path.dirname(probePath);
   let parentExists = false;
   try {
     parentExists = fs.statSync(parentDir).isDirectory();
@@ -277,15 +379,36 @@ function checkSymlinkResolution(
   if (!targetExists && !parentExists) return null;
   if (!parentExists) return null;
 
-  const resolvedParent = resolveParentRealpath(filePath);
+  const resolvedParent = resolveParentRealpath(probePath);
   if (resolvedParent.length === 0) return null;
 
-  const canonRoot = resolveCanonRoot(reaRoot);
-  // Resolved parent must be inside REA_ROOT for the check to be
-  // meaningful — external paths are out of scope (the logical-path
-  // matchers handle them).
+  // Resolved parent must be inside the LOCAL root — or, 0.54.0 round-5
+  // P2, inside the COMMON (primary-checkout) root: a worktree-local
+  // symlink pointed at the primary must not bypass blocked_paths for
+  // the same governed files. Other external paths stay out of scope
+  // (the logical-path matchers handle them).
+  let canonRoot = resolveCanonRoot(reaRoot);
   if (resolvedParent !== canonRoot && !resolvedParent.startsWith(canonRoot + '/')) {
-    return null;
+    const crossRoots = [
+      ...(commonRoot !== undefined && commonRoot !== reaRoot ? [commonRoot] : []),
+      ...(siblingRoots ?? []),
+    ];
+    let matched: string | null = null;
+    let matchedOriginal: string | null = null;
+    for (const cross of crossRoots) {
+      const canonCross = resolveCanonRoot(cross);
+      if (resolvedParent === canonCross || resolvedParent.startsWith(canonCross + '/')) {
+        matched = canonCross;
+        matchedOriginal = cross;
+        break;
+      }
+    }
+    if (matched === null) return null;
+    canonRoot = matched;
+    // Round-11 P1: the TARGET stream's own blocked_paths join the match.
+    if (matchedOriginal !== null && blockedPathsForRoot !== undefined) {
+      blockedPaths = [...new Set([...blockedPaths, ...blockedPathsForRoot(matchedOriginal)])];
+    }
   }
   const relativeResolved =
     resolvedParent === canonRoot ? '' : resolvedParent.slice(canonRoot.length + 1);
@@ -302,13 +425,13 @@ function checkSymlinkResolution(
 }
 
 async function maybeAudit(
-  reaRoot: string,
+  auditRoot: string,
   status: 'allowed' | 'denied',
   matched: string | null,
   filePath: string,
 ): Promise<void> {
   try {
-    await appendAuditRecord(reaRoot, {
+    await appendAuditRecord(auditRoot, {
       tool_name: 'rea.hook.blocked-paths-enforcer',
       server_name: 'rea',
       tier: Tier.Write,

@@ -38,6 +38,12 @@ const PAIRS = [
   { canonical: 'hooks', dogfood: '.claude/hooks' },
   { canonical: 'agents', dogfood: '.claude/agents' },
   { canonical: 'commands', dogfood: '.claude/commands' },
+  // Process-spine skills payload. Source dir is `spine/`; install target
+  // (and dogfood mirror) is the rea-owned subdir `.claude/skills/rea/` (NOT
+  // the bare, shared `.claude/skills/` root). Same byte-identity invariant
+  // as the other payloads — the dogfood `.claude/skills/rea/` MUST be a
+  // byte-for-byte mirror of `spine/`.
+  { canonical: 'spine', dogfood: '.claude/skills/rea' },
 ];
 
 /** @param {Pair} pair @returns {DriftResult} */
@@ -108,16 +114,27 @@ function checkSettingsRegistration() {
         'attribution-advisory.sh',
         // 0.26.0 local-first enforcement (CTO directive 2026-05-05).
         'local-review-gate.sh',
+        // 0.54.0 — Artifact Gate G2 (verification), Bash-tier. Refuses a
+        // shell write/redirect to `.rea/tasks.jsonl` (default-off).
+        'verify-gate-bash-gate.sh',
       ],
       'Write|Edit|MultiEdit|NotebookEdit': [
         'secret-scanner.sh',
         'settings-protection.sh',
         'blocked-paths-enforcer.sh',
         'changeset-security-gate.sh',
+        'verify-gate.sh',
       ],
     },
     PostToolUse: {
       'Write|Edit|MultiEdit|NotebookEdit': ['architecture-review-gate.sh'],
+      // billing-cap-halt runs the turn-budget counter on EVERY tool call, so it
+      // must be registered under the all-tools `*` matcher (round-24). Asserting
+      // it here means a stale dogfood settings.json left on the old `Bash`
+      // matcher fails the drift check instead of silently under-counting
+      // (round-39 P3).
+      '*': ['billing-cap-halt.sh'],
+      'Bash|Edit|Write|MultiEdit|NotebookEdit': ['delegation-advisory.sh'],
     },
   };
 

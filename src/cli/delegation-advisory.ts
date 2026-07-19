@@ -78,6 +78,7 @@ import {
   DEFAULT_EXEMPT_SUBAGENTS,
 } from './roster.js';
 import { REA_DIR } from './utils.js';
+import { resolveHookRoots } from '../lib/worktree-roots.js';
 
 /**
  * Hook payload shape (untrusted). Claude Code's PostToolUse hook for
@@ -347,6 +348,19 @@ export function advisoryMessage(count: number, threshold: number): string {
  * Factored out so tests can swap it for a fake controllable scheduler
  * via `HookDelegationAdvisoryOptions.sleepOverride`.
  */
+/**
+ * Round-43 P3: canonical spelling for stream-root equality — a worktree
+ * opened through /var vs /private/var (or any symlinked path) must not
+ * have its own delegation records filtered out as another stream's.
+ */
+function canonDir(dir: string): string {
+  try {
+    return fs.realpathSync(dir);
+  } catch {
+    return path.resolve(dir);
+  }
+}
+
 function realSleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -362,6 +376,7 @@ async function scanForRealDelegationOnce(
   reaRoot: string,
   sessionId: string,
   exemptSubagents: readonly string[],
+  streamRoot?: string,
 ): Promise<'delegated' | 'not-delegated' | 'unreadable'> {
   let records: DelegationRecord[];
   try {
@@ -377,8 +392,22 @@ async function scanForRealDelegationOnce(
     return 'unreadable';
   }
   if (records.length === 0) return 'not-delegated';
-  const roster = discoverRoster(reaRoot);
+  // Round-30 P2: the roster is per-STREAM state — .claude/agents/ can
+  // differ per branch, so discovery reads the local worktree root, not
+  // the common root the audit chain lives at.
+  const roster = discoverRoster(streamRoot ?? reaRoot);
   for (const rec of records) {
+    // Round-27 P3: stream scoping — with per-worktree counters, a
+    // delegation observed in a SIBLING worktree must not satisfy this
+    // stream's predicate. Records without local_root (pre-0.54.0)
+    // match every stream (transition posture).
+    if (
+      streamRoot !== undefined &&
+      rec.local_root !== undefined &&
+      canonDir(rec.local_root) !== canonDir(streamRoot)
+    ) {
+      continue;
+    }
     if (
       countsAsRealDelegation({
         delegationTool: rec.delegation_tool,
@@ -398,6 +427,7 @@ async function sessionHasRealDelegation(
   sessionId: string,
   exemptSubagents: readonly string[],
   sleep: (ms: number) => Promise<void> = realSleep,
+  streamRoot?: string,
 ): Promise<boolean> {
   // 0.40.0 charter item 1 — poll-and-backoff before declaring
   // "no delegation in this session".
@@ -419,12 +449,12 @@ async function sessionHasRealDelegation(
   // observed OR the chain becomes unreadable (preserving the pre-fix
   // "audit log unreadable → suppress the advisory" posture so a
   // missing chain never produces a false-positive nudge).
-  let outcome = await scanForRealDelegationOnce(reaRoot, sessionId, exemptSubagents);
+  let outcome = await scanForRealDelegationOnce(reaRoot, sessionId, exemptSubagents, streamRoot);
   if (outcome === 'delegated') return true;
   if (outcome === 'unreadable') return true;
   for (const waitMs of DELEGATION_POLL_BACKOFF_MS) {
     await sleep(waitMs);
-    outcome = await scanForRealDelegationOnce(reaRoot, sessionId, exemptSubagents);
+    outcome = await scanForRealDelegationOnce(reaRoot, sessionId, exemptSubagents, streamRoot);
     if (outcome === 'delegated') return true;
     if (outcome === 'unreadable') return true;
   }
@@ -453,6 +483,8 @@ function readStdinSync(): string {
 export interface DelegationAdvisoryResult {
   /** `'disabled'` when policy is off; `'halt'` under HALT; otherwise `'ran'`. */
   outcome: 'disabled' | 'halt' | 'ran' | 'no-payload';
+  /** The HALT reason (whichever root held the file) when outcome is 'halt'. */
+  haltReason?: string;
   /** Post-increment counter value (only meaningful when `outcome === 'ran'`). */
   count?: number;
   /** `true` when the advisory was printed this invocation. */
@@ -470,15 +502,71 @@ export interface DelegationAdvisoryResult {
 export async function computeDelegationAdvisory(
   options: HookDelegationAdvisoryOptions,
 ): Promise<DelegationAdvisoryResult> {
-  const reaRoot =
-    options.reaRoot ?? process.env['CLAUDE_PROJECT_DIR'] ?? process.cwd();
+  // 0.54.0 worktree state (review round-1 P2): stdin is read FIRST so
+  // the payload's `cwd` feeds root resolution — otherwise a Claude
+  // worktree session resolves CLAUDE_PROJECT_DIR (the primary checkout)
+  // and every stream shares one advisory counter, letting activity in
+  // one stream trigger or suppress the nudge in another. Session state
+  // + policy key off the LOCAL root; the audit scan ("did this session
+  // delegate") reads the COMMON root, where delegation-capture writes
+  // the shared chain; the kill switch probes BOTH roots.
+  // Round-29 P2: probe HALT via the env ladder BEFORE touching stdin —
+  // readStdinSync blocks until EOF, and a caller that never closes the
+  // pipe would hang this hook past an active freeze. The payload-aware
+  // dual-root probe below still runs after parsing (it can see a
+  // worktree-local legacy HALT the env ladder cannot).
+  {
+    const pre = resolveHookRoots(undefined, options.reaRoot);
+    const preHit = [
+      path.join(pre.localRoot, '.rea', 'HALT'),
+      path.join(pre.commonRoot, '.rea', 'HALT'),
+    ].find((f) => fs.existsSync(f));
+    if (preHit !== undefined) {
+      let haltReason = 'Reason unknown';
+      try {
+        const contents = fs.readFileSync(preHit, 'utf8').slice(0, 1024).trim();
+        if (contents.length > 0) haltReason = contents;
+      } catch {
+        /* keep the placeholder */
+      }
+      return { outcome: 'halt', haltReason };
+    }
+  }
+  const stdinRawEarly = options.stdinOverride ?? readStdinSync();
+  let payloadCwdEarly = '';
+  try {
+    const peeked = JSON.parse(stdinRawEarly) as { cwd?: unknown };
+    if (peeked !== null && typeof peeked === 'object' && typeof peeked.cwd === 'string') {
+      payloadCwdEarly = peeked.cwd;
+    }
+  } catch {
+    // Malformed stdin is handled below (observational no-payload path);
+    // root resolution just falls down the ladder.
+  }
+  const { localRoot: reaRoot, commonRoot } = resolveHookRoots(
+    payloadCwdEarly.length > 0 ? payloadCwdEarly : undefined,
+    options.reaRoot,
+  );
 
   // HALT check — uniform with the rest of the hook tree. The advisory
   // hook is observational, but refusing to run while frozen keeps the
   // kill-switch contract simple: every hook exits 2 under HALT.
-  const haltPath = path.join(reaRoot, '.rea', 'HALT');
-  if (fs.existsSync(haltPath)) {
-    return { outcome: 'halt' };
+  const haltFileHit = [
+    path.join(reaRoot, '.rea', 'HALT'),
+    path.join(commonRoot, '.rea', 'HALT'),
+  ].find((f) => fs.existsSync(f));
+  if (haltFileHit !== undefined) {
+    // Round-14 P3: carry the ACTUAL reason (and which file held it) so
+    // the banner does not degrade to "Reason unknown" when the freeze
+    // is repo-wide and lives at the common root.
+    let haltReason = 'Reason unknown';
+    try {
+      const contents = fs.readFileSync(haltFileHit, 'utf8').slice(0, 1024).trim();
+      if (contents.length > 0) haltReason = contents;
+    } catch {
+      /* keep the placeholder */
+    }
+    return { outcome: 'halt', haltReason };
   }
 
   const policy =
@@ -487,7 +575,7 @@ export async function computeDelegationAdvisory(
     return { outcome: 'disabled' };
   }
 
-  const stdinRaw = options.stdinOverride ?? readStdinSync();
+  const stdinRaw = stdinRawEarly;
   if (stdinRaw.length === 0) {
     // No payload — nothing to count. Exit clean.
     return { outcome: 'no-payload' };
@@ -561,10 +649,11 @@ export async function computeDelegationAdvisory(
   // filesystem form would never match (see the comment at the
   // `auditSessionId` / `stateKey` split above).
   const delegated = await sessionHasRealDelegation(
-    reaRoot,
+    commonRoot,
     auditSessionId,
     policy.exemptSubagents,
     options.sleepOverride,
+    reaRoot,
   );
   if (delegated) {
     // Session DID delegate to a real specialist — no nudge warranted.
@@ -607,13 +696,16 @@ export async function runHookDelegationAdvisory(
     options.reaRoot ?? process.env['CLAUDE_PROJECT_DIR'] ?? process.cwd();
   const result = await computeDelegationAdvisory(options);
   if (result.outcome === 'halt') {
-    // Surface the HALT reason — same shape the other hooks print.
-    let reason = 'Reason unknown';
-    try {
-      const content = fs.readFileSync(path.join(reaRoot, '.rea', 'HALT'), 'utf8');
-      reason = content.slice(0, 1024).trim() || reason;
-    } catch {
-      /* leave default */
+    // Surface the HALT reason — carried from whichever root held the
+    // file (round-14 P3: a repo-wide freeze lives at the common root).
+    let reason = result.haltReason ?? 'Reason unknown';
+    if (result.haltReason === undefined) {
+      try {
+        const content = fs.readFileSync(path.join(reaRoot, '.rea', 'HALT'), 'utf8');
+        reason = content.slice(0, 1024).trim() || reason;
+      } catch {
+        /* leave default */
+      }
     }
     process.stderr.write(
       `REA HALT: ${reason}\nAll agent operations suspended. Run: rea unfreeze\n`,

@@ -22,6 +22,7 @@
  * directly — `deps.env` and `deps.baseDir` are the only ambient state.
  */
 
+import fsSync from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { appendAuditRecord } from '../../audit/append.js';
@@ -33,7 +34,7 @@ import {
   type ResolvedReviewPolicy,
 } from './policy.js';
 import { readHalt, type HaltState } from './halt.js';
-import { resolveBaseRef, type BaseResolution } from './base.js';
+import { resolveBaseRef, EMPTY_TREE_SHA, type BaseResolution } from './base.js';
 import {
   createRealGitExecutor,
   runCodexReview,
@@ -47,7 +48,7 @@ import {
   type GitExecutor,
 } from './codex-runner.js';
 import { filterFindingsByPath, summarizeReview, type Verdict } from './findings.js';
-import { renderBanner, writeLastReview, type LastReviewPayload } from './report.js';
+import { renderBanner, writeLastReview, writeLastReviewFromCache, type LastReviewPayload } from './report.js';
 import { isFlip, lookupVerdict, writeVerdict, type VerdictCacheEntry } from './verdict-cache.js';
 
 // ---------------------------------------------------------------------------
@@ -142,6 +143,14 @@ export interface PushGateDeps {
   git?: GitExecutor;
   resolvePolicy?: (baseDir: string) => Promise<ResolvedReviewPolicy>;
   readHalt?: (baseDir: string) => HaltState;
+  /**
+   * 0.54.0 worktree state: the COMMON (repository) root — audit
+   * appends, the verdict cache, and the HALT probe key off this;
+   * policy/diff/last-review.json stay on `baseDir` (the worktree).
+   * Defaults to `baseDir` (plain checkout — degenerate, no behavior
+   * change), so no existing test needs to thread it.
+   */
+  commonDir?: string;
   runCodex?: typeof runCodexReview;
   writeLastReview?: typeof writeLastReview;
   appendAudit?: typeof appendAuditRecord;
@@ -174,6 +183,7 @@ const EVT_VERDICT_FLIP = 'rea.push_gate.verdict_flip';
 // ---------------------------------------------------------------------------
 
 export async function runPushGate(deps: PushGateDeps): Promise<GateResult> {
+  const commonDir = deps.commonDir ?? deps.baseDir;
   const stderr = deps.stderr;
   const env = deps.env;
   const readHaltFn = deps.readHalt ?? readHalt;
@@ -200,12 +210,13 @@ export async function runPushGate(deps: PushGateDeps): Promise<GateResult> {
   // 1. HALT wins over everything, including `review.codex_required: false`.
   //    Reading it before policy also means a corrupted policy.yaml doesn't
   //    prevent the kill-switch from firing.
-  const halt = readHaltFn(deps.baseDir);
+  const localHaltState = readHaltFn(deps.baseDir);
+  const halt = localHaltState.halted ? localHaltState : readHaltFn(commonDir);
   if (halt.halted) {
     stderr(
       `REA HALT: ${halt.reason ?? 'unknown'}\nAll push operations suspended. Run: rea unfreeze\n`,
     );
-    await safeAppend(appendAuditFn, deps.baseDir, EVT_HALTED, fullPolicy, {
+    await safeAppend(appendAuditFn, commonDir, EVT_HALTED, fullPolicy, {
       reason: halt.reason ?? 'unknown',
     });
     return {
@@ -223,7 +234,7 @@ export async function runPushGate(deps: PushGateDeps): Promise<GateResult> {
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     stderr(`PUSH BLOCKED: failed to load .rea/policy.yaml — ${msg}\n`);
-    await safeAppend(appendAuditFn, deps.baseDir, EVT_ERROR, fullPolicy, {
+    await safeAppend(appendAuditFn, commonDir, EVT_ERROR, fullPolicy, {
       kind: 'policy-load',
       error: msg,
     });
@@ -231,7 +242,7 @@ export async function runPushGate(deps: PushGateDeps): Promise<GateResult> {
   }
 
   if (!policy.codex_required) {
-    await safeAppend(appendAuditFn, deps.baseDir, EVT_DISABLED, fullPolicy, {
+    await safeAppend(appendAuditFn, commonDir, EVT_DISABLED, fullPolicy, {
       policy_missing: policy.policyMissing,
     });
     return {
@@ -271,7 +282,7 @@ export async function runPushGate(deps: PushGateDeps): Promise<GateResult> {
       skipPush.length > 0 ? 'REA_SKIP_PUSH_GATE' : 'REA_SKIP_CODEX_REVIEW';
     const skipReason = skipVar === 'REA_SKIP_PUSH_GATE' ? skipPush : skipCodex;
     stderr(`rea: ${skipVar}=${skipReason} — push-gate skipped (audited).\n`);
-    await safeAppend(appendAuditFn, deps.baseDir, EVT_SKIPPED, fullPolicy, {
+    await safeAppend(appendAuditFn, commonDir, EVT_SKIPPED, fullPolicy, {
       reason: skipReason,
       skip_var: skipVar,
     });
@@ -373,7 +384,7 @@ export async function runPushGate(deps: PushGateDeps): Promise<GateResult> {
   }
   if (headSha.length === 0) {
     stderr('PUSH BLOCKED: could not resolve HEAD SHA. Is this a valid git repo?\n');
-    await safeAppend(appendAuditFn, deps.baseDir, EVT_ERROR, fullPolicy, {
+    await safeAppend(appendAuditFn, commonDir, EVT_ERROR, fullPolicy, {
       kind: 'head-sha-missing',
     });
     return { status: 'error', exitCode: 2, summary: 'head-sha-missing' };
@@ -449,7 +460,7 @@ export async function runPushGate(deps: PushGateDeps): Promise<GateResult> {
   //    no-op relative to base.
   const diff = git.diffNames(base.ref, headSha);
   if (diff.length === 0) {
-    await safeAppend(appendAuditFn, deps.baseDir, EVT_EMPTY, fullPolicy, {
+    await safeAppend(appendAuditFn, commonDir, EVT_EMPTY, fullPolicy, {
       base_ref: base.ref,
       base_source: base.source,
       head_sha: headSha,
@@ -480,14 +491,42 @@ export async function runPushGate(deps: PushGateDeps): Promise<GateResult> {
   // would keep refusing the push until TTL expires; disabling it
   // would keep approving a previously-filtered pass. Digest is
   // SHA-256 of a sorted JSON array — same input → same digest.
+  // Round-34 P2: the digest also binds the REVIEW BASE — the reviewed
+  // patch is `git diff <base.ref> <headSha>`, and the 0.54.0 shared
+  // cache means another worktree pushing the same sha against a
+  // DIFFERENT target must not reuse a verdict for the wrong diff.
+  // (Key-shape change safely invalidates pre-0.54.0 entries.)
+  //
+  // Round-41 P1: bind the RESOLVED base COMMIT SHA, not the symbolic
+  // `base.ref` name. A symbolic base (`origin/main`, `@{upstream}`,
+  // `refs/heads/main`, …) keeps its NAME while its tip MOVES; keying on
+  // the name alone reuses a verdict for an OLDER `git diff <base> <head>`
+  // after the base advances — a stale PASS that skips re-running Codex on
+  // a patch that actually changed. Resolving `base.ref → <commit sha>`
+  // makes a moved base MISS. An already-resolved SHA base (last-n-commits,
+  // explicit SHA) resolves to itself, so its behavior is unchanged, and
+  // two symbolic refs pointing at the SAME commit collapse to the same
+  // key — the intended path-blind, per-(base-sha, head-sha) cross-worktree
+  // reuse. FAIL-SAFE: an unresolvable base that is NOT the fixed empty-tree
+  // sentinel folds a per-invocation random token so the key MISSES
+  // (re-review) rather than risk a false hit on a stale name.
+  const resolvedBaseSha = git
+    .tryRevParse(['--verify', '--quiet', `${base.ref}^{commit}`])
+    .trim();
+  const baseKeyPart =
+    resolvedBaseSha.length > 0
+      ? resolvedBaseSha
+      : base.ref === EMPTY_TREE_SHA
+        ? EMPTY_TREE_SHA // fixed sentinel — the empty tree never moves
+        : `unresolved:${crypto.randomBytes(8).toString('hex')}`;
   const excludeDigest = crypto
     .createHash('sha256')
-    .update(JSON.stringify([...(policy.exclude_paths ?? [])].sort()))
+    .update(JSON.stringify([[...(policy.exclude_paths ?? [])].sort(), baseKeyPart]))
     .digest('hex')
     .slice(0, 16);
   const cacheKey = `${headSha}#${excludeDigest}`;
   const cacheLookup =
-    policy.cache_ttl_ms > 0 ? lookupVerdict(deps.baseDir, cacheKey) : { hit: false as const };
+    policy.cache_ttl_ms > 0 ? lookupVerdict(commonDir, cacheKey) : { hit: false as const };
   if (cacheLookup.hit && cacheLookup.entry !== undefined) {
     const cached = cacheLookup.entry;
     const cachedBlocked =
@@ -498,7 +537,7 @@ export async function runPushGate(deps: PushGateDeps): Promise<GateResult> {
     // verdict event with `cache_hit: true` metadata). Operators
     // grepping `rea.push_gate.reviewed` for verdict-stability dashboards
     // see every push, including cached ones.
-    await safeAppend(appendAuditFn, deps.baseDir, EVT_CACHE_HIT, fullPolicy, {
+    await safeAppend(appendAuditFn, commonDir, EVT_CACHE_HIT, fullPolicy, {
       verdict: cached.verdict,
       finding_count: cached.finding_count,
       base_ref: base.ref,
@@ -509,7 +548,7 @@ export async function runPushGate(deps: PushGateDeps): Promise<GateResult> {
       cached_reasoning_effort: cached.reasoning_effort,
       blocked: cachedBlocked,
     });
-    await safeAppend(appendAuditFn, deps.baseDir, EVT_REVIEWED, fullPolicy, {
+    await safeAppend(appendAuditFn, commonDir, EVT_REVIEWED, fullPolicy, {
       verdict: cached.verdict,
       finding_count: cached.finding_count,
       base_ref: base.ref,
@@ -521,6 +560,74 @@ export async function runPushGate(deps: PushGateDeps): Promise<GateResult> {
       cached_model: cached.model,
       cached_reasoning_effort: cached.reasoning_effort,
     });
+    // Round-27 P2: a cache populated by ANOTHER worktree leaves this
+    // stream's per-worktree last-review.json absent or stale. Refresh
+    // it with a cache-provenance snapshot — ONLY when the local file
+    // is missing or names a different head_sha, so a plain checkout's
+    // richer full snapshot (written when the cache was populated) is
+    // never overwritten with the thinner cache-derived shape.
+    try {
+      const localSnapshotPath = path.join(deps.baseDir, '.rea', 'last-review.json');
+      let localSha: string | null = null;
+      let localVerdict: string | null = null;
+      let localBaseRef: string | null = null;
+      let localFindingCount: number | null = null;
+      let localReviewText: string | null = null;
+      try {
+        const parsed = JSON.parse(fsSync.readFileSync(localSnapshotPath, 'utf8')) as {
+          head_sha?: unknown;
+          verdict?: unknown;
+          base_ref?: unknown;
+          finding_count?: unknown;
+          review_text?: unknown;
+        };
+        if (typeof parsed.head_sha === 'string') localSha = parsed.head_sha;
+        if (typeof parsed.verdict === 'string') localVerdict = parsed.verdict;
+        if (typeof parsed.base_ref === 'string') localBaseRef = parsed.base_ref;
+        if (typeof parsed.finding_count === 'number') localFindingCount = parsed.finding_count;
+        if (typeof parsed.review_text === 'string') localReviewText = parsed.review_text;
+      } catch {
+        /* absent or unreadable → refresh */
+      }
+      // Rounds 28+39 P2: refresh on ANY reviewed-content mismatch, not
+      // just sha — a sibling stream can flip the verdict, re-review
+      // with a different finding set, or the hit can come from a
+      // different base's entry; the local snapshot must describe the
+      // result the gate actually returned. Plain checkouts still skip
+      // (their full snapshot matches on every axis).
+      // Round-40 P2: review-TEXT identity too — a same-verdict,
+      // same-count re-review with different bodies must still refresh.
+      // Tolerant match: a full snapshot equals the cached text exactly
+      // (the entry was written from the same payload), and a previous
+      // cache-derived snapshot carries it after a provenance header —
+      // both count as current, so plain checkouts and repeat hits skip.
+      const reviewTextCurrent =
+        cached.review_text === undefined ||
+        (localReviewText !== null &&
+          (localReviewText === cached.review_text ||
+            localReviewText.endsWith(cached.review_text)));
+      if (
+        localSha !== headSha ||
+        localVerdict !== cached.verdict ||
+        localBaseRef !== base.ref ||
+        localFindingCount !== cached.finding_count ||
+        !reviewTextCurrent
+      ) {
+        writeLastReviewFromCache({
+          baseDir: deps.baseDir,
+          verdict: cached.verdict,
+          findingCount: cached.finding_count,
+          baseRef: base.ref,
+          headSha,
+          cachedReviewedAt: cached.reviewed_at,
+          ...(cached.findings !== undefined ? { findings: cached.findings } : {}),
+          ...(cached.review_text !== undefined ? { reviewText: cached.review_text } : {}),
+          ...(deps.now !== undefined ? { now: deps.now() } : {}),
+        });
+      }
+    } catch {
+      // Snapshot refresh is best-effort — the gate decision stands.
+    }
     // 0.19.1 P3-1 (backend): simplified return shape. Verdict maps
     // 1:1 to status; cachedBlocked maps 1:1 to exitCode. The prior
     // nested ternary recomputed the same mapping in both arms.
@@ -621,7 +728,7 @@ export async function runPushGate(deps: PushGateDeps): Promise<GateResult> {
     if (policy.cache_ttl_ms > 0) {
       const flipped = isFlip(cacheLookup.entry, summary.verdict);
       if (flipped && cacheLookup.entry !== undefined) {
-        await safeAppend(appendAuditFn, deps.baseDir, EVT_VERDICT_FLIP, fullPolicy, {
+        await safeAppend(appendAuditFn, commonDir, EVT_VERDICT_FLIP, fullPolicy, {
           head_sha: headSha,
           prior_verdict: cacheLookup.entry.verdict,
           fresh_verdict: summary.verdict,
@@ -649,13 +756,18 @@ export async function runPushGate(deps: PushGateDeps): Promise<GateResult> {
         model: codexResult.modelUsed,
         reasoning_effort: policy.codex_reasoning_effort ?? IRON_GATE_DEFAULT_REASONING,
         ttl_ms: policy.cache_ttl_ms,
+        // Round-29 P2: carry the REDACTED findings + review text (as
+        // written to last-review.json) so a cross-worktree cache hit
+        // can materialize an actionable snapshot in its own stream.
+        findings: payload.findings,
+        review_text: payload.review_text,
       };
       try {
         // 0.28.0 codex round-1 P2: write under the same compound key
         // used for lookup so subsequent same-SHA-same-policy lookups
         // hit cache, while same-SHA-different-policy lookups miss
         // and produce a fresh verdict tied to the new policy state.
-        await writeVerdict(deps.baseDir, cacheKey, entry);
+        await writeVerdict(commonDir, cacheKey, entry);
       } catch {
         // Cache writes are best-effort. A failure here must NOT
         // affect the verdict — log to stderr (already done by the
@@ -665,7 +777,7 @@ export async function runPushGate(deps: PushGateDeps): Promise<GateResult> {
       }
     }
 
-    await safeAppend(appendAuditFn, deps.baseDir, EVT_REVIEWED, fullPolicy, {
+    await safeAppend(appendAuditFn, commonDir, EVT_REVIEWED, fullPolicy, {
       verdict: summary.verdict,
       finding_count: summary.findings.length,
       // 0.28.0 helix-029: counter only — keeps the audit-record shape
@@ -736,6 +848,7 @@ async function handleCodexError(
   policy: Policy | undefined,
 ): Promise<GateResult> {
   const stderr = deps.stderr;
+  const commonDir = deps.commonDir ?? deps.baseDir;
   const runError = classifyCodexError(e);
   const metadata: Record<string, unknown> = {
     base_ref: base.ref,
@@ -746,7 +859,7 @@ async function handleCodexError(
   if (runError.message.length > 0) metadata.error = runError.message;
 
   stderr(`PUSH BLOCKED: ${runError.message}\n`);
-  await safeAppend(appendAuditFn, deps.baseDir, EVT_ERROR, policy, metadata);
+  await safeAppend(appendAuditFn, commonDir, EVT_ERROR, policy, metadata);
   return {
     status: 'error',
     exitCode: 2,
