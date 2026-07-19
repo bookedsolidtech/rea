@@ -158,7 +158,9 @@ describe('rea init — R13-P1 managed-caret bump on the init path', () => {
     expect(await readPin(dir)).toBe(cur);
   });
 
-  it('R13.4 — no existing pin → fresh write (current CLI caret)', async () => {
+  it('R13.4 — no existing pin + --pin → fresh write (current CLI caret)', async () => {
+    // 0.53.0 GLOBAL-FIRST: a fresh write on a no-pin repo now requires the
+    // explicit `--pin` opt-in (the default is global-first / no pin).
     const { getPkgVersion } = await import('./utils.js');
     const expectedNewCaret = `^${getPkgVersion()}`;
 
@@ -173,7 +175,7 @@ describe('rea init — R13-P1 managed-caret bump on the init path', () => {
     process.chdir(dir);
 
     await expect(
-      runInit({ yes: true, profile: 'minimal', codex: false }),
+      runInit({ yes: true, profile: 'minimal', codex: false, pin: true }),
     ).resolves.toBeUndefined();
 
     expect(await readPin(dir)).toBe(expectedNewCaret);

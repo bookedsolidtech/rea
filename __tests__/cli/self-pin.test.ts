@@ -45,10 +45,12 @@ async function writePackageJson(content: unknown): Promise<string> {
 }
 
 describe('selfPinRea — acceptance cases', () => {
-  it('writes a caret pin to devDependencies when no rea dep exists', async () => {
+  it('writes a caret pin to devDependencies when no rea dep exists (--pin opt-in)', async () => {
+    // 0.53.0 GLOBAL-FIRST: a write now requires the explicit `pin: true`
+    // opt-in — the default no longer self-pins.
     const pkgPath = await writePackageJson({ name: 'consumer', version: '1.0.0' });
 
-    const r = await selfPinRea({ cwd: tmpDir, cliVersion: '0.49.0' });
+    const r = await selfPinRea({ cwd: tmpDir, cliVersion: '0.49.0', pin: true });
 
     expect(r.action).toBe('wrote');
     expect(r.packageJsonPath).toBe(pkgPath);
@@ -58,14 +60,14 @@ describe('selfPinRea — acceptance cases', () => {
     expect(after['devDependencies']).toEqual({ [REA_PACKAGE_NAME]: '^0.49.0' });
   });
 
-  it('is idempotent — re-run produces byte-identical package.json', async () => {
+  it('is idempotent — re-run produces byte-identical package.json (--pin opt-in)', async () => {
     await writePackageJson({ name: 'consumer', version: '1.0.0' });
 
-    await selfPinRea({ cwd: tmpDir, cliVersion: '0.49.0' });
+    await selfPinRea({ cwd: tmpDir, cliVersion: '0.49.0', pin: true });
     const pkgPath = path.join(tmpDir, 'package.json');
     const after1 = await fs.readFile(pkgPath, 'utf8');
 
-    const r2 = await selfPinRea({ cwd: tmpDir, cliVersion: '0.49.0' });
+    const r2 = await selfPinRea({ cwd: tmpDir, cliVersion: '0.49.0', pin: true });
     const after2 = await fs.readFile(pkgPath, 'utf8');
 
     expect(after2).toEqual(after1);
@@ -466,7 +468,8 @@ describe('selfPinRea — dry-run preview (R3-P2)', () => {
     const pkgPath = await writePackageJson({ name: 'consumer', version: '1.0.0' });
     const before = await fs.readFile(pkgPath, 'utf8');
 
-    const r = await selfPinRea({ cwd: tmpDir, cliVersion: '0.49.0', dryRun: true });
+    // 0.53.0: `pin: true` opts in to the write path this test exercises.
+    const r = await selfPinRea({ cwd: tmpDir, cliVersion: '0.49.0', dryRun: true, pin: true });
     expect(r.action).toBe('wrote');
     expect(r.pinnedRange).toBe('^0.49.0');
     expect(r.message).toMatch(/would add/);
@@ -538,12 +541,12 @@ describe('selfPinRea — dry-run preview (R3-P2)', () => {
     // This is the contract operators rely on: "what dry-run says
     // will happen IS what happens".
     await writePackageJson({ name: 'consumer', version: '1.0.0' });
-    const dryR = await selfPinRea({ cwd: tmpDir, cliVersion: '0.49.0', dryRun: true });
+    const dryR = await selfPinRea({ cwd: tmpDir, cliVersion: '0.49.0', dryRun: true, pin: true });
 
     // Tear down + rebuild.
     await fs.rm(path.join(tmpDir, 'package.json'));
     await writePackageJson({ name: 'consumer', version: '1.0.0' });
-    const liveR = await selfPinRea({ cwd: tmpDir, cliVersion: '0.49.0' });
+    const liveR = await selfPinRea({ cwd: tmpDir, cliVersion: '0.49.0', pin: true });
 
     expect(dryR.action).toBe(liveR.action);
     expect(dryR.pinnedRange).toBe(liveR.pinnedRange);
@@ -574,9 +577,9 @@ describe('selfPinRea — dry-run preview (R3-P2)', () => {
     expect(dryR.pinnedRange).toBe(liveR.pinnedRange);
   });
 
-  it('dryRun default is false — omitting the field preserves write behavior', async () => {
+  it('dryRun default is false — omitting the field preserves write behavior (--pin)', async () => {
     const pkgPath = await writePackageJson({ name: 'consumer' });
-    const r = await selfPinRea({ cwd: tmpDir, cliVersion: '0.49.0' });
+    const r = await selfPinRea({ cwd: tmpDir, cliVersion: '0.49.0', pin: true });
     expect(r.action).toBe('wrote');
 
     const after = JSON.parse(await fs.readFile(pkgPath, 'utf8')) as Record<string, unknown>;
@@ -596,7 +599,7 @@ describe('selfPinRea — UTF-8 BOM tolerance (P2-3)', () => {
     const body = '﻿' + JSON.stringify({ name: 'consumer' }, null, 2) + '\n';
     await fs.writeFile(pkgPath, body, 'utf8');
 
-    const r = await selfPinRea({ cwd: tmpDir, cliVersion: '0.49.0' });
+    const r = await selfPinRea({ cwd: tmpDir, cliVersion: '0.49.0', pin: true });
     expect(r.action).toBe('wrote');
     expect(r.packageJsonPath).toBe(pkgPath);
 
@@ -615,7 +618,7 @@ describe('selfPinRea — formatting preservation', () => {
     const pkgPath = path.join(tmpDir, 'package.json');
     await fs.writeFile(pkgPath, original, 'utf8');
 
-    await selfPinRea({ cwd: tmpDir, cliVersion: '0.49.0' });
+    await selfPinRea({ cwd: tmpDir, cliVersion: '0.49.0', pin: true });
     const after = await fs.readFile(pkgPath, 'utf8');
 
     // 4-space indent — check a line indented by 4 spaces.
@@ -627,7 +630,7 @@ describe('selfPinRea — formatting preservation', () => {
     const pkgPath = path.join(tmpDir, 'package.json');
     await fs.writeFile(pkgPath, original, 'utf8');
 
-    await selfPinRea({ cwd: tmpDir, cliVersion: '0.49.0' });
+    await selfPinRea({ cwd: tmpDir, cliVersion: '0.49.0', pin: true });
     const after = await fs.readFile(pkgPath, 'utf8');
 
     // Every newline should be CRLF.
@@ -642,7 +645,7 @@ describe('selfPinRea — formatting preservation', () => {
     const pkgPath = path.join(tmpDir, 'package.json');
     await fs.writeFile(pkgPath, original, 'utf8');
 
-    await selfPinRea({ cwd: tmpDir, cliVersion: '0.49.0' });
+    await selfPinRea({ cwd: tmpDir, cliVersion: '0.49.0', pin: true });
     const after = await fs.readFile(pkgPath, 'utf8');
 
     expect(after.endsWith('\n')).toBe(false);
@@ -653,7 +656,7 @@ describe('selfPinRea — formatting preservation', () => {
     const pkgPath = path.join(tmpDir, 'package.json');
     await fs.writeFile(pkgPath, original, 'utf8');
 
-    await selfPinRea({ cwd: tmpDir, cliVersion: '0.49.0' });
+    await selfPinRea({ cwd: tmpDir, cliVersion: '0.49.0', pin: true });
     const after = await fs.readFile(pkgPath, 'utf8');
 
     expect(after.endsWith('\n')).toBe(true);
@@ -695,7 +698,7 @@ describe('selfPinRea — explicit-target-only resolution (P2-4)', () => {
       'utf8',
     );
 
-    const r = await selfPinRea({ cwd: sub, cliVersion: '0.49.0' });
+    const r = await selfPinRea({ cwd: sub, cliVersion: '0.49.0', pin: true });
     expect(r.action).toBe('wrote');
     expect(r.packageJsonPath).toBe(subPkg);
 
@@ -1135,7 +1138,7 @@ describe('selfPinRea — R10-P2 symlinked package.json refusal', () => {
     // R10-P2 must not interfere with the existing happy path.
     await writePackageJson({ name: 'consumer' });
 
-    const r = await selfPinRea({ cwd: tmpDir, cliVersion: '0.49.0' });
+    const r = await selfPinRea({ cwd: tmpDir, cliVersion: '0.49.0', pin: true });
     expect(r.action).toBe('wrote');
   });
 
@@ -1574,34 +1577,39 @@ describe('checkSelfPinDeclaredCheck — R18-P1 prefers LOCAL CLI version', () =>
     });
     const checkSelfPinDeclaredCheck = await loadDoctorCheck();
     const r = checkSelfPinDeclaredCheck(tmpDir);
-    expect(r.status).toBe('pass');
+    // 0.53.0 GLOBAL-FIRST: a PRESENT local pin is now a WARN (non-fatal),
+    // recommending `rea migrate --to-global`. The range is still surfaced.
+    expect(r.status).toBe('warn');
     expect(r.detail).toContain('^0.49.0');
+    expect(r.detail).toMatch(/rea migrate --to-global/);
   });
 
-  it('R18.P1.2 — local CLI absent + no pin → fail (brick state preserved)', async () => {
-    // Existing fail-no-pin (brick state) behavior must survive the
-    // R18 change. When local CLI is absent, resolver falls through
-    // to the invoker version — but the missing-pin arm catches it
-    // before the pin-compat check runs.
+  it('R18.P1.2 — no pin + USABLE global tier → PASS; + NO usable tier → FAIL (0.53.0 safety layer)', async () => {
+    // 0.53.0 GLOBAL-FIRST + SAFETY LAYER: a missing local pin is healthy ONLY
+    // when a usable global tier can run the hooks; otherwise it is a true brick.
     await writeHookShim(tmpDir);
     await writePackageJson({ name: 'consumer' });
     const checkSelfPinDeclaredCheck = await loadDoctorCheck();
-    const r = checkSelfPinDeclaredCheck(tmpDir);
-    expect(r.status).toBe('fail');
-    expect(r.detail).toContain(`${REA_PACKAGE_NAME} is not declared`);
+
+    const ok = checkSelfPinDeclaredCheck(tmpDir, { globalTierProbe: () => true });
+    expect(ok.status).toBe('pass');
+    expect(ok.detail).toMatch(/global-first/i);
+
+    const brick = checkSelfPinDeclaredCheck(tmpDir, { globalTierProbe: () => false });
+    expect(brick.status).toBe('fail');
+    expect(brick.detail).toMatch(/no usable global rea CLI/);
   });
 
-  it('R18.P1.3 — local CLI present + no pin → fail (brick state preserved)', async () => {
-    // Defense: even if the consumer has node_modules/@bookedsolid/rea
-    // (e.g. via npm install of a transitive dep), the missing pin
-    // is still a brick on next fresh clone.
+  it('R18.P1.3 — local CLI present + no pin: still gated on a usable global tier', async () => {
+    // Even with node_modules/@bookedsolid/rea present, a missing pin is healthy
+    // only when the global tier is usable (the hooks resolve the global CLI).
     await writeHookShim(tmpDir);
     await writeLocalCli(tmpDir, '0.49.0');
     await writePackageJson({ name: 'consumer' });
     const checkSelfPinDeclaredCheck = await loadDoctorCheck();
-    const r = checkSelfPinDeclaredCheck(tmpDir);
-    expect(r.status).toBe('fail');
-    expect(r.detail).toContain(`${REA_PACKAGE_NAME} is not declared`);
+
+    expect(checkSelfPinDeclaredCheck(tmpDir, { globalTierProbe: () => true }).status).toBe('pass');
+    expect(checkSelfPinDeclaredCheck(tmpDir, { globalTierProbe: () => false }).status).toBe('fail');
   });
 
   it('R18.P1.4 — local CLI 0.49.0 + pin `^0.48.0` (doesnt admit local) → fail-incompatible', async () => {
@@ -1657,7 +1665,8 @@ describe('checkSelfPinDeclaredCheck — R18-P1 prefers LOCAL CLI version', () =>
     });
     const checkSelfPinDeclaredCheck = await loadDoctorCheck();
     const r = checkSelfPinDeclaredCheck(tmpDir);
-    expect(r.status).toBe('pass');
+    // 0.53.0: pin present (compat skipped) → WARN, range still surfaced.
+    expect(r.status).toBe('warn');
     expect(r.detail).toContain('^0.48.0');
   });
 
@@ -1680,7 +1689,8 @@ describe('checkSelfPinDeclaredCheck — R18-P1 prefers LOCAL CLI version', () =>
     });
     const checkSelfPinDeclaredCheck = await loadDoctorCheck();
     const r = checkSelfPinDeclaredCheck(tmpDir);
-    expect(r.status).toBe('pass');
+    // 0.53.0 GLOBAL-FIRST: pin present + compatible → WARN (was pass).
+    expect(r.status).toBe('warn');
   });
 
   it('R18.P1.8 — local CLI 0.49.0 + non-semver pin (workspace:*) → fail-non-semver against LOCAL', async () => {
@@ -1718,7 +1728,8 @@ describe('checkSelfPinDeclaredCheck — R18-P1 prefers LOCAL CLI version', () =>
     });
     const checkSelfPinDeclaredCheck = await loadDoctorCheck();
     const r = checkSelfPinDeclaredCheck(tmpDir);
-    expect(r.status).toBe('pass');
+    // 0.53.0 GLOBAL-FIRST: pin present (compat skipped) → WARN (was pass).
+    expect(r.status).toBe('warn');
   });
 });
 
@@ -1804,7 +1815,8 @@ describe('checkSelfPinDeclaredCheck — R19-P2 skip compat when local CLI unreso
     });
     const checkSelfPinDeclaredCheck = await loadDoctorCheck();
     const r = checkSelfPinDeclaredCheck(tmpDir);
-    expect(r.status).toBe('pass');
+    // 0.53.0 GLOBAL-FIRST: pin present → WARN (was pass).
+    expect(r.status).toBe('warn');
   });
 
   it('R19.P2.3 — local 0.49.0 + pin `^0.49.0` → PASS (compat satisfied via local)', async () => {
@@ -1817,7 +1829,8 @@ describe('checkSelfPinDeclaredCheck — R19-P2 skip compat when local CLI unreso
     });
     const checkSelfPinDeclaredCheck = await loadDoctorCheck();
     const r = checkSelfPinDeclaredCheck(tmpDir);
-    expect(r.status).toBe('pass');
+    // 0.53.0 GLOBAL-FIRST: pin present + compatible → WARN (was pass).
+    expect(r.status).toBe('warn');
   });
 
   it('R19.P2.4 — local 0.49.0 + pin `^0.48.0` (genuine mismatch) → fail-incompatible', async () => {
@@ -1872,10 +1885,10 @@ describe('checkSelfPinDeclaredCheck — R19-P2 skip compat when local CLI unreso
     const checkSelfPinDeclaredCheck = await loadDoctorCheck();
     const r = checkSelfPinDeclaredCheck(tmpDir);
     // Without name-match, the resolver returns null → compat
-    // check skipped → pass (R19's skip-on-unresolvable contract).
+    // check skipped → pin-present → WARN (0.53.0 global-first; was pass).
     // If the guard were missing, 99.0.0 against `^0.49.0` would
     // produce fail-incompatible.
-    expect(r.status).toBe('pass');
+    expect(r.status).toBe('warn');
   });
 
   it('R19.P2.7 — node_modules layout WINS over dogfood dist (precedence)', async () => {
@@ -1909,7 +1922,8 @@ describe('checkSelfPinDeclaredCheck — R19-P2 skip compat when local CLI unreso
     );
     const checkSelfPinDeclaredCheck = await loadDoctorCheck();
     const r = checkSelfPinDeclaredCheck(tmpDir);
-    // node_modules layout wins; 0.49.0 satisfies ^0.49.0 → pass.
-    expect(r.status).toBe('pass');
+    // node_modules layout wins; 0.49.0 satisfies ^0.49.0 → compat OK.
+    // 0.53.0 GLOBAL-FIRST: pin present → WARN (was pass).
+    expect(r.status).toBe('warn');
   });
 });

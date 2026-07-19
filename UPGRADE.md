@@ -23,16 +23,22 @@ move and `.rea/` file hygiene — it does not repeat the rename steps.
 
 ## TL;DR
 
-- The global CLI is **opt-in and off by default** (added in 0.50.0). It is a
-  per-user, per-machine install; `rea init` / `rea upgrade` never touch it.
-- **In-project resolution always wins.** rea only consults the global CLI
-  when no `node_modules/@bookedsolid/rea` and no `./dist/cli/index.js`
-  resolve in the checkout. An un-blessed checkout behaves byte-identically to
-  a build without the feature.
-- Remove the local dep with your package manager
-  (`npm uninstall @bookedsolid/rea` / `pnpm remove @bookedsolid/rea`),
-  install the CLI once per-user with `rea install --global`, then
-  `rea trust` the checkout. Confirm with `rea doctor`.
+- **Global-first is the default install model (0.53.0).** `rea init` and
+  `rea upgrade` no longer add `@bookedsolid/rea` to your `package.json`. A fresh
+  `rea init` (without `--pin`) leaves the checkout dependency-free and lets the
+  per-user global rea CLI tier govern it. You still install the global CLI once
+  per-user (`rea install --global`) and `rea trust` the checkout — global-first
+  changes only the *pin default*, not how the global tier is enabled.
+- `--pin` is the explicit opt-in for a **hermetic local install**: it adds
+  `@bookedsolid/rea` to `devDependencies` (the pre-0.53.0 behavior) so every
+  clone resolves the CLI from `node_modules/` with no per-user global install.
+- **In-project resolution still wins.** When a local install *is* present
+  (`node_modules/@bookedsolid/rea` or `./dist/cli/index.js`), rea uses it and
+  never consults the global tier. The global CLI resolution ladder (added in
+  0.50.0) is unchanged.
+- **Already have a pinned project?** Run `rea migrate --to-global` to strip the
+  local dep, then your package manager's install to prune `node_modules`. `rea
+  doctor` now flags a lingering local dep with the same recommendation.
 - **`.rea/` is a mix of committed config and gitignored runtime state.** rea
   scaffolds a managed `.gitignore` block on `rea init` / `rea upgrade`. Only
   `.rea/policy.yaml` and `.rea/registry.yaml` (plus `.rea/install-manifest.json`)
@@ -48,17 +54,21 @@ move and `.rea/` file hygiene — it does not repeat the rename steps.
 
 ### What changes, and why
 
-A project-local install adds `@bookedsolid/rea` to the repo's
-`devDependencies` and resolves the CLI at
-`node_modules/@bookedsolid/rea/dist/cli/index.js`. That is the right default
-for a repo where the whole team wants rea and the dependency lives in the
-shared manifest.
+As of 0.53.0, **global-first is the default install model.** `rea init` and
+`rea upgrade` no longer add `@bookedsolid/rea` to a project's `package.json` —
+a fresh `rea init` (without `--pin`) leaves the checkout dependency-free and
+lets the per-user global rea CLI tier govern it. The global CLI is installed
+once per-user, outside any checkout, and each checkout you want governed is
+explicitly "blessed" into a per-user trust registry.
 
-The global tier exists for the opposite case: you want rea to govern **your**
-clone on **your** machine, without adding a dependency to a shared
-`package.json` or lockfile that other developers would inherit. The CLI is
-installed once per-user, outside any checkout, and each checkout you want
-governed is explicitly "blessed" into a per-user trust registry.
+A **project-local install** — `@bookedsolid/rea` in the repo's
+`devDependencies`, resolving the CLI at
+`node_modules/@bookedsolid/rea/dist/cli/index.js` — is now the opt-in path.
+Pass `--pin` to `rea init` / `rea upgrade` when a team explicitly wants a
+hermetic local install: the dependency lives in the shared manifest and every
+clone resolves the CLI from `node_modules/` without needing a per-user global
+install. Everything else in this guide applies to both models; where it
+matters, the difference is called out.
 
 ### How rea resolves *which* CLI runs
 
@@ -117,6 +127,59 @@ The asymmetry is the whole design: the registry (human-established) can only
 enable; a project's own policy can only further-restrict. Nothing an agent can
 edit in-repo can *grant* the global tier authority it was not blessed with.
 
+### Migrating an existing pinned project: `rea migrate --to-global`
+
+If your checkout already carries a local `@bookedsolid/rea` dep — you installed
+before 0.53.0, or you ran `rea init --pin` — `rea migrate --to-global` performs
+the assisted removal:
+
+```bash
+rea migrate --to-global
+# preview first with:  rea migrate --to-global --dry-run
+```
+
+Grounded in the command's behavior:
+
+- It strips `@bookedsolid/rea` from **both** `dependencies` and
+  `devDependencies` with a byte-minimal edit that preserves your existing key
+  order, and drops a dep block entirely if rea was its only entry.
+- **Idempotent and dogfood-safe.** A checkout with no local dep reports
+  "already global-first — nothing to do"; a repo whose own `package.json` is
+  named `@bookedsolid/rea` (rea dogfooding itself) is never touched.
+- It edits **only `package.json`** — it never mutates `node_modules` or the
+  lockfile directly. Instead it prints the prune follow-up for your detected
+  package manager, which you must run so the local copy is actually gone:
+
+  ```bash
+  pnpm install     # or: npm install / yarn install
+  ```
+
+  It then reminds you to verify with `rea doctor` (which should report the
+  global tier as the active resolver and no longer flag a local install) and,
+  from a plain shell outside any agent session, to `rea trust` the checkout.
+
+`rea doctor` surfaces the same recommendation on its own: a checkout that still
+declares a local dep reports a non-fatal **`warn`** pointing at `rea migrate
+--to-global` (see [Part 4](#part-4--verifying-with-rea-doctor)).
+
+### `rea upgrade` under global-first
+
+`rea upgrade` (0.53.0+) is **prompt-free by default.** It applies every
+rea-managed change non-interactively — new files are written, unmodified files
+are auto-updated, and files rea no longer ships are deleted. A file you have
+hand-edited ("drifted" from the canonical version) is **reported and kept**,
+never silently clobbered.
+
+- `--interactive` restores the pre-0.53.0 per-file keep / overwrite / diff
+  prompts for drifted and removed-upstream files (and the post-upgrade offer to
+  strip a local dep).
+- `--dry-run` previews everything and writes nothing (drift is shown as *kept*).
+- `--force` overwrites drifted files and deletes removed-upstream entries with
+  no prompt.
+- `rea upgrade` does **not** self-pin by default; pass `--pin` for a hermetic
+  local install. If a local dep is present and you did not pass `--pin`, the
+  upgrade leaves your deps untouched and recommends `rea migrate --to-global`.
+
 ### Step-by-step
 
 All commands below are copy-pasteable. Substitute your package manager as
@@ -124,14 +187,20 @@ needed.
 
 **1. Remove the project-local dependency.**
 
+The assisted path is `rea migrate --to-global` (see the previous section); it
+strips the dep from `package.json` and prints the prune follow-up. Or do it by
+hand:
+
 ```bash
 npm uninstall @bookedsolid/rea
 # or: pnpm remove @bookedsolid/rea
 # or: yarn remove @bookedsolid/rea
 ```
 
-This drops the entry from `package.json` and the lockfile and removes
-`node_modules/@bookedsolid/rea`, so the in-project tier no longer resolves.
+Either way, run your package manager's install afterward so
+`node_modules/@bookedsolid/rea` and the lockfile entry are gone and the
+in-project tier no longer resolves. If a fresh `rea init` created the checkout
+on 0.53.0+, there is no local dep to remove — skip to step 2.
 
 **2. Install the global CLI once, per-user, from OUTSIDE any checkout.**
 
@@ -167,13 +236,18 @@ rea doctor
 
 See [Part 4](#part-4--verifying-with-rea-doctor) for the exact rows to read.
 
-> **Note on `.claude/hooks/` in the shared-repo case.** The canonical
-> global-tier use case is a repo where you keep your personal `.claude/`
-> (agents, commands, hooks, `settings.json`) **gitignored** so it never lands
-> in the shared tree. In that setup nothing about the shared repo changes —
-> no dependency, no lockfile entry, no committed `.claude/`. If instead you
-> keep `.claude/hooks/` *tracked* while removing the `package.json` pin, see
-> the self-pin note in [Troubleshooting](#part-5--troubleshooting).
+> **Note on committing `.claude/` under global-first.** Whether you track
+> `.claude/` (agents, commands, hooks, `settings.json`) or keep it gitignored
+> is entirely the project's call — global-first supports both, and the same is
+> true of the committed `.rea/` config files (see [Part 2](#part-2--rea-hygiene-what-to-gitignore-vs-keep)).
+> Keep `.claude/` gitignored when rea governs only *your* clone and should
+> leave no trace in the shared tree. **Track it** when the whole team runs rea:
+> under global-first the committed hooks carry no `package.json` dependency, and
+> each teammate's own per-user global CLI supplies the binary (so every
+> teammate still runs `rea install --global` + `rea trust` once). `rea doctor`
+> treats tracked hooks with no local pin as a healthy `pass`
+> (see [Part 4](#part-4--verifying-with-rea-doctor)) — the pre-0.53.0 "tracked
+> hooks need a pin" brick state no longer applies.
 
 ---
 
@@ -328,6 +402,20 @@ Reading them:
 - If the checkout's policy sets `runtime.allow_global_cli: false`, doctor
   reports the veto rather than an active global tier.
 
+One more row, the **`rea CLI resolution model (global-first)`** check, reports
+the install posture directly:
+
+- **`pass` — no local `@bookedsolid/rea` pin.** The global-first default; the
+  global tier governs (the rows above show the active resolver).
+- **`warn` — local install detected** (`dependencies` / `devDependencies` set
+  to a version range). Non-fatal; it recommends `rea migrate --to-global` to
+  strip the dep. A pinned checkout is still fully governed — the warn is a
+  nudge toward the default model, not an error.
+
+This inverts the pre-0.53.0 behavior, where a *missing* pin failed as a
+"brick state." Under global-first, a missing local pin is the healthy state;
+whether a CLI actually resolves is the global-tier rows' job, not this row's.
+
 `rea doctor` is also the verification step for `.rea/` hygiene generally — it
 surfaces policy/registry parse status, hook install state, and (for the
 trust registry) the distinction between `<home>/.rea/trusted-projects` (the
@@ -352,18 +440,15 @@ session" message.** These are human-only actions and refuse when
 `CLAUDE_PROJECT_DIR` is set. Run them from a plain terminal, not from inside
 an agent session.
 
-**After removing the local dep, `rea doctor` fails the
-`@bookedsolid/rea declared in package.json` row.** This is the "brick-state"
-detector: it fires when `.claude/hooks/` is present in the tree but no
-`@bookedsolid/rea` pin is declared in `package.json`, because a fresh clone
-would then have hook shims with no CLI to call. In the canonical global-tier
-setup you keep your personal `.claude/` **gitignored**, so a fresh clone by
-another developer has no hooks at all and the brick state doesn't arise for
-them. If you intend a global-CLI-governed checkout on your own machine while
-keeping `.claude/hooks/` tracked, expect this row to flag — it is a separate
-check from the global-tier rows and does not currently account for a global
-CLI supplying the binary. Decide deliberately whether to gitignore `.claude/`
-(recommended for the shared-repo case) or keep the local dependency.
+**`rea doctor` reports `[warn] rea CLI resolution model (global-first) … local
+@bookedsolid/rea install detected`.** Expected when a checkout still carries a
+local dep — this is the migrate nudge, not an error. Run `rea migrate
+--to-global` (then your package manager's install) to adopt the default, or
+keep the local dep deliberately if you want a hermetic install. Under 0.53.0
+the inverse — no local pin — is a **`pass`**: global-first no longer treats a
+missing dep as a brick state (the pre-0.53.0 detector failed on exactly that
+case). The real "no CLI resolves at all" case is caught by the global-tier
+rows, not this one.
 
 **`fingerprints.json` shows up as untracked after starting `rea serve`.**
 Your `.gitignore` predates the managed block. Run `rea upgrade` (or `rea init`)

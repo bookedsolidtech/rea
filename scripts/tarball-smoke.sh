@@ -53,10 +53,18 @@ cd "$SMOKE_DIR"
 npm init -y >/dev/null
 npm install --no-audit --no-fund --loglevel=error "$TARBALL"
 
-# Drop the temp package.json + lockfile that `npm init -y` + `npm install`
-# wrote. The tempdir must look like a fresh consumer project (no package.json)
-# so `rea init` exercises the same code path a brand-new consumer hits.
-rm -f package.json package-lock.json
+# 0.53.0 GLOBAL-FIRST: write a COHERENT local-install package.json. `npm install
+# <tarball>` records a `file:` spec (non-semver → doctor fail-non-semver), and the
+# pre-0.53.0 approach of dropping package.json entirely now yields the no-pin brick
+# state under global-first (no local pin AND no ~/.rea global tier → doctor fails,
+# even though the in-project node_modules CLI resolves). So instead: keep a package
+# .json with a clean semver pin matching the installed tarball. That makes this
+# smoke env a coherent LOCAL install (pin + node_modules) — `rea doctor` reports a
+# healthy local dep (warn → recommend `rea migrate --to-global`) and exits 0,
+# validating packaging. The default global-first (no-pin) flow + its migrate/doctor
+# brick-safety are covered by unit + upgrade-journey tests.
+node -e "const fs=require('fs');const v=require('./node_modules/@bookedsolid/rea/package.json').version;fs.writeFileSync('package.json',JSON.stringify({name:'rea-smoke-consumer',version:'0.0.0',private:true,devDependencies:{'@bookedsolid/rea':'^'+v}},null,2)+'\n')"
+rm -f package-lock.json
 git init -q
 
 echo "[smoke] rea --version"
@@ -74,13 +82,22 @@ echo "[smoke]   → $VERSION_OUT"
 echo "[smoke] rea --help"
 ./node_modules/.bin/rea --help >/dev/null
 
-echo "[smoke] rea init --yes --profile open-source-no-codex"
+echo "[smoke] rea init --yes --pin --profile open-source-no-codex"
 # 0.12.0+: doctor hard-fails when policy.review.codex_required: true and codex
 # is not on PATH (fix C of the helixir migration unblocker — see PR #85). CI
 # does not provision the codex CLI, so the smoke uses the -no-codex profile
 # variant which defaults codex_required: false. The new doctor probe is
 # covered by unit tests in src/cli/doctor.test.ts.
-./node_modules/.bin/rea init --yes --profile open-source-no-codex
+#
+# 0.53.0 GLOBAL-FIRST: `rea init` no longer pins @bookedsolid/rea by default, and
+# this smoke env is a LOCAL tarball install (node_modules/@bookedsolid/rea present,
+# no ~/.rea global tier). Without a pin, the global-first brick check in `rea doctor`
+# would fail (no local pin AND no usable global tier). `--pin` makes the smoke env a
+# COHERENT local install (node_modules + declared pin), so doctor reports the local
+# install (warn → recommend migrate) and exits 0 — validating packaging the same way
+# it did pre-0.53.0. The default (no-pin) global-first flow + its doctor/migrate
+# brick-safety are covered by unit + journey tests.
+./node_modules/.bin/rea init --yes --pin --profile open-source-no-codex
 
 # Verify the installed layout matches what init claims it wrote.
 for expected in .rea/policy.yaml .rea/registry.yaml .claude/settings.json CLAUDE.md .rea/install-manifest.json; do

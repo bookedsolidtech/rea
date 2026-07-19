@@ -74,6 +74,8 @@ import { installPrepareCommitMsgHook } from './install/prepare-commit-msg.js';
 import { installPreCommitHook } from './install/pre-commit.js';
 import { installPrePushFallback } from './install/pre-push.js';
 import { checkUpgradeBlockingPin, selfPinRea } from './install/self-pin.js';
+import { GLOBAL_CLI_INSTALL_HINT, isTrustedGlobalTierCheckout } from './doctor.js';
+import { stripLocalDepGuarded } from './migrate.js';
 import { manifestExists, readManifest, writeManifestAtomic } from './install/manifest-io.js';
 import { type InstallManifest, type ManifestEntry } from './install/manifest-schema.js';
 import { sha256OfBuffer, sha256OfFile } from './install/sha.js';
@@ -83,6 +85,36 @@ export interface UpgradeOptions {
   dryRun?: boolean | undefined;
   yes?: boolean | undefined;
   force?: boolean | undefined;
+  /**
+   * 0.53.0 GLOBAL-FIRST — `--pin` opt-in. `rea upgrade` no longer self-pins
+   * by default (the global rea CLI tier governs). When `true`, add
+   * `@bookedsolid/rea` to `devDependencies` on a no-existing-pin checkout for
+   * a hermetic local install. Default = NO pin. Existing pins are untouched.
+   */
+  pin?: boolean | undefined;
+  /**
+   * 0.53.0 UX INVERSION — `--interactive`. By default `rea upgrade` applies
+   * ALL rea-managed changes non-interactively (new + auto-update + delete
+   * removed-upstream) and REPORTS operator-modified (drifted) files without
+   * prompting or clobbering them. `--interactive` restores the pre-0.53.0
+   * per-file keep/overwrite prompt for drifted / removed-upstream files, and
+   * enables the post-upgrade "strip the local dep?" offer. Default = false.
+   */
+  interactive?: boolean | undefined;
+  /**
+   * Test seam (0.53.0) — override the trusted-global-tier predicate so the
+   * self-pin messaging can be exercised without a real `~/.rea`. Production
+   * NEVER sets this; the default consults `isTrustedGlobalTierCheckout`
+   * (passwd-derived home, env-immune). NO CLI flag exposes it.
+   */
+  trustedGlobalTierProbe?: ((baseDir: string) => boolean) | undefined;
+  /**
+   * Test seam (0.53.0) — override the "usable global tier (ignoring local)"
+   * predicate used by the interactive strip-offer's brick-safety gate
+   * (`stripLocalDepGuarded`). Production NEVER sets this; the default consults
+   * `isGlobalTierUsableIgnoringLocal`. NO CLI flag exposes it.
+   */
+  globalTierProbe?: ((baseDir: string) => boolean) | undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -200,7 +232,15 @@ type Classification =
       localSha: string;
       entry: ManifestEntry;
     }
-  | { kind: 'removed-upstream'; entry: ManifestEntry };
+  | {
+      kind: 'removed-upstream';
+      entry: ManifestEntry;
+      /** On-disk SHA of the retired file, or null when it is already gone. */
+      localSha: string | null;
+      /** True when the on-disk bytes differ from the manifest hash (operator
+       *  hand-edited a file rea later retired). Auto-delete must NOT clobber it. */
+      localModified: boolean;
+    };
 
 /**
  * Hard cap for `showDiff` reads. Canonical files are all tiny (<64KB) but a
@@ -381,7 +421,12 @@ async function classifyFiles(
         continue; // synthetic entries handled separately
       }
       if (!canonicalByPath.has(entry.path)) {
-        classifications.push({ kind: 'removed-upstream', entry });
+        // P1 data-loss fix: compare on-disk bytes to the manifest hash so the
+        // apply loop can PRESERVE a hand-edited retired file instead of
+        // auto-deleting the operator's edits. Absent on disk → not modified.
+        const localSha = await readLocalSha(resolvedRoot, entry.path);
+        const localModified = localSha !== null && localSha !== entry.sha256;
+        classifications.push({ kind: 'removed-upstream', entry, localSha, localModified });
       }
     }
   }
@@ -539,6 +584,9 @@ async function hashInstalled(resolvedRoot: string, relPath: string): Promise<str
 export async function runUpgrade(options: UpgradeOptions = {}): Promise<void> {
   const baseDir = process.cwd();
   const dryRun = options.dryRun === true;
+  // 0.53.0 UX INVERSION: default is NON-interactive apply-all. `--interactive`
+  // restores per-file prompts + the post-upgrade dep-strip offer.
+  const interactive = options.interactive === true;
 
   if (!fs.existsSync(path.join(baseDir, '.rea'))) {
     err('no .rea/ directory — run `rea init` first.');
@@ -747,9 +795,20 @@ export async function runUpgrade(options: UpgradeOptions = {}): Promise<void> {
         source: c.canonical.source,
       });
     } else if (c.kind === 'drifted') {
-      const decision = dryRun
-        ? 'keep'
-        : await promptDriftDecision(resolvedRoot, c.canonical, options);
+      // 0.53.0 UX INVERSION: drifted = an operator hand-edited a rea-managed
+      // file. DEFAULT = report + keep (never clobber operator edits), NO
+      // prompt. `--force` overwrites. `--interactive` restores the per-file
+      // keep/overwrite prompt. `--dry-run` previews as keep.
+      let decision: DriftDecision;
+      if (dryRun) {
+        decision = 'keep';
+      } else if (options.force === true) {
+        decision = 'overwrite';
+      } else if (interactive) {
+        decision = await promptDriftDecision(resolvedRoot, c.canonical, options);
+      } else {
+        decision = 'keep';
+      }
       if (decision === 'overwrite') {
         console.log(`  ~ ${c.canonical.destRelPath} (overwrite)`);
         if (!dryRun) {
@@ -780,9 +839,35 @@ export async function runUpgrade(options: UpgradeOptions = {}): Promise<void> {
         });
       }
     } else if (c.kind === 'removed-upstream') {
-      const decision = dryRun ? 'skip' : await promptRemovedDecision(c.entry.path, options);
+      // 0.53.0 UX INVERSION + P1 DATA-LOSS FIX: removed-upstream = a rea-managed
+      // file rea no longer ships (tracked in the manifest with a rea `source`).
+      // Auto-delete is safe ONLY for a file the operator has NOT locally
+      // modified. A hand-edited retired file is PRESERVED in every non-force
+      // mode — the same "don't clobber operator edits" rule the drifted branch
+      // applies. Decision matrix (evaluated top-to-bottom):
+      //
+      //   --dry-run      → skip   (never mutate; preview only)
+      //   --force        → delete (even if locally modified)
+      //   --interactive  → prompt (delete/skip; default skip preserves)
+      //   --yes          → skip   (script-stable: `-y` never deletes removed-upstream)
+      //   locally modified → skip (operator edits win over auto-delete)
+      //   default        → delete (UNMODIFIED managed retirement — the intended default)
+      let decision: 'delete' | 'skip';
+      if (dryRun) {
+        decision = 'skip';
+      } else if (options.force === true) {
+        decision = 'delete';
+      } else if (interactive) {
+        decision = await promptRemovedDecision(c.entry.path, options);
+      } else if (options.yes === true) {
+        decision = 'skip';
+      } else if (c.localModified) {
+        decision = 'skip';
+      } else {
+        decision = 'delete';
+      }
       if (decision === 'delete') {
-        console.log(`  - ${c.entry.path} (deleted)`);
+        console.log(`  - ${c.entry.path} (deleted; retired by rea)`);
         if (!dryRun) {
           // Path originates from the manifest (attacker-controllable). The
           // ManifestPath zod refinement already rejected `..`, absolute
@@ -793,7 +878,18 @@ export async function runUpgrade(options: UpgradeOptions = {}): Promise<void> {
         applied.push(c);
         // Drop from manifest.
       } else {
-        console.log(`  · ${c.entry.path} (kept; no longer shipped)`);
+        if (c.localModified) {
+          // P1: never silently drop an operator's edits to a retired file.
+          console.log(
+            `  · ${c.entry.path} (kept; no longer shipped BUT locally modified — preserving your edits)`,
+          );
+          warn(
+            `REMOVED-UPSTREAM: ${c.entry.path} is no longer shipped by rea but you modified it — ` +
+              `local version kept (use --force to delete).`,
+          );
+        } else {
+          console.log(`  · ${c.entry.path} (kept; no longer shipped)`);
+        }
         skipped.push(c);
         finalFileEntries.push(c.entry);
       }
@@ -918,12 +1014,28 @@ export async function runUpgrade(options: UpgradeOptions = {}): Promise<void> {
   // the action discriminant without writing. Dry-run console output
   // uses "would" verbs so the planned vs done distinction is
   // unambiguous.
+  //
+  // 0.53.0: hoisted out of the block scope so the post-upgrade
+  // assisted-removal offer (Part B, below) can read the resolved action.
+  let selfPinResult: Awaited<ReturnType<typeof selfPinRea>>;
   {
-    const selfPinResult = await selfPinRea({
+    // 0.53.0 GLOBAL-FIRST — `rea upgrade` no longer self-pins by default.
+    // A no-pin checkout is the normal healthy state; the global rea CLI
+    // tier governs. `--pin` (`options.pin === true`) opts in to a hermetic
+    // local pin. `trustedGlobalTier` (computed here via the SAME
+    // `resolveGlobalCliTier` predicate `rea doctor` renders) only selects
+    // which "skipped" summary line prints. An EXISTING pin is still
+    // operator-owned and gets the managed-caret bump (skew-safety) as before.
+    const trustedGlobalTier = (options.trustedGlobalTierProbe ?? isTrustedGlobalTierCheckout)(
+      resolvedRoot,
+    );
+    selfPinResult = await selfPinRea({
       cwd: resolvedRoot,
       cliVersion: getPkgVersion(),
       mode: 'upgrade',
       dryRun,
+      trustedGlobalTier,
+      pin: options.pin === true,
     });
     const rel =
       selfPinResult.packageJsonPath !== null
@@ -952,6 +1064,18 @@ export async function runUpgrade(options: UpgradeOptions = {}): Promise<void> {
       // The message itself describes the existing pin and the
       // hands-off rationale.
       warn(selfPinResult.message);
+    } else if (selfPinResult.action === 'skipped-global-tier-trusted') {
+      // 0.53.0 global-first — trusted global-tier checkout; no local pin.
+      console.log(`  · package.json (global-first: no local pin — trusted in the global-tier registry)`);
+    } else if (selfPinResult.action === 'skipped-global-default') {
+      // 0.53.0 SAFETY LAYER — fires exactly when NO usable global tier was
+      // found (trustedGlobalTier === false). Skipping the pin (global-first is
+      // forced) with no global fallback would leave the hooks unable to resolve
+      // any CLI. Warn LOUDLY + actionably (migrate + doctor carry the hard gate).
+      warn(
+        'global-first: no local pin written, but no usable global rea CLI was found — ' +
+          `the hooks won't run until you ${GLOBAL_CLI_INSTALL_HINT}, or re-run with \`--pin\` for a local install.`,
+      );
     } else if (selfPinResult.action === 'skipped-no-package-json') {
       warn(
         'self-pin skipped — no package.json found upward from target; bash gates may refuse without it',
@@ -1040,6 +1164,64 @@ export async function runUpgrade(options: UpgradeOptions = {}): Promise<void> {
     console.log('');
     console.log('Bootstrap mode: existing files were recorded as-is. The next `rea upgrade`');
     console.log('will compare against the canonical set and surface any legitimate drift.');
+  }
+
+  // 0.53.0 Part B — assisted removal. Under global-first a local
+  // `@bookedsolid/rea` dep is non-recommended. When one is present (and the
+  // operator did NOT explicitly `--pin`), OFFER to strip it interactively;
+  // in the default non-interactive flow just RECOMMEND `rea migrate
+  // --to-global` — NEVER silently mutate a consumer's deps.
+  const localDepPresent =
+    options.pin !== true &&
+    (selfPinResult.action === 'skipped-same' ||
+      selfPinResult.action === 'bumped' ||
+      selfPinResult.action === 'skipped-different');
+  if (localDepPresent) {
+    console.log('');
+    if (interactive) {
+      const strip = await p.confirm({
+        message:
+          'Strip the local @bookedsolid/rea dep and adopt global-first? (recommended — the global rea CLI tier governs)',
+        initialValue: true,
+      });
+      if (!p.isCancel(strip) && strip === true) {
+        // P1 #2 CONVERGENCE FIX: the interactive strip MUST go through the SAME
+        // brick-safety gate as `rea migrate --to-global` (`stripLocalDepGuarded`)
+        // — it refuses when no usable global tier would remain, and probes the
+        // GLOBAL tier IGNORING the local install about to be removed. Calling
+        // `migrateToGlobal` directly (the old code) bypassed the gate and could
+        // brick the repo. `dryRun` is forwarded so a preview never writes.
+        const outcome = await stripLocalDepGuarded({
+          cwd: resolvedRoot,
+          dryRun,
+          globalTierProbe: options.globalTierProbe,
+        });
+        if (outcome.kind === 'refused-no-global') {
+          warn(
+            'cannot strip the local @bookedsolid/rea dep — no usable global rea CLI to fall ' +
+              `back to. ${GLOBAL_CLI_INSTALL_HINT}, then run \`rea migrate --to-global\`. ` +
+              'Your deps were NOT changed.',
+          );
+        } else if (outcome.kind === 'stripped' && outcome.result.action === 'removed') {
+          log(
+            `${dryRun ? '[dry-run] would strip' : 'stripped'} @bookedsolid/rea from ` +
+              `${outcome.result.removedFrom.join(' + ')} — now global-first. ` +
+              `Run your package manager's install to prune node_modules.`,
+          );
+        } else {
+          log(outcome.result.message);
+        }
+      } else {
+        console.log(
+          '  kept the local dep. Run `rea migrate --to-global` any time to adopt global-first.',
+        );
+      }
+    } else {
+      warn(
+        'local @bookedsolid/rea dep detected — global-first is recommended. ' +
+          'Run `rea migrate --to-global` to strip it (this upgrade did NOT touch your deps).',
+      );
+    }
   }
 
   // Refresh this project's entry in the user-global dashboard registry

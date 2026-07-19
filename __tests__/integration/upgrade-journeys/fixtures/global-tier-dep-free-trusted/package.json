@@ -1,0 +1,12 @@
+{
+  "name": "consumer-global-tier",
+  "version": "4.5.6",
+  "private": true,
+  "description": "Prior-install shape that triggered the global-tier self-pin bug: a checkout that resolves the rea CLI through the TRUSTED global tier (<home>/.rea/trusted-projects) and therefore intentionally declares NO @bookedsolid/rea dependency. `rea upgrade` must refresh hooks/spine to current WITHOUT injecting the dep back into package.json.",
+  "scripts": {
+    "start": "echo start"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0"
+  }
+}

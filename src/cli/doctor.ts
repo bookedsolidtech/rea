@@ -671,8 +671,49 @@ function readPackageVersion(pkgPath: string): string | null {
   return typeof version === 'string' && version.length > 0 ? version : null;
 }
 
-export function checkSelfPinDeclaredCheck(baseDir: string): CheckResult {
-  const label = `${REA_PACKAGE_NAME} declared in package.json`;
+export function checkSelfPinDeclaredCheck(
+  baseDir: string,
+  opts: {
+    globalHome?: string | undefined;
+    globalTierProbe?: ((baseDir: string) => boolean) | undefined;
+  } = {},
+): CheckResult {
+  // 0.53.0 GLOBAL-FIRST + SAFETY LAYER. Pre-0.53.0 this row FAILED whenever a
+  // pin was missing (the local-model brick detector). Under global-first a
+  // missing pin is healthy ONLY when a usable global tier can run the hooks —
+  // otherwise the repo is a true brick (no local pin AND no resolvable global
+  // CLI). So: missing pin + usable global tier → `pass`; missing pin + NO
+  // usable global tier → `fail` (actionable). A PRESENT local dep is
+  // non-recommended → `warn` pointing at `rea migrate --to-global`.
+  // Incompatible/non-semver/symlink pins still `fail`.
+  const label = `rea CLI resolution model (global-first)`;
+  // The single "usable global tier" predicate (shared with migrate + the
+  // init/upgrade skip-warning). Injectable via `globalTierProbe` so tests
+  // don't need a real `~/.rea`; otherwise consults the passwd-derived home.
+  // Ignoring-local variant: the brick question is about a FRESH CLONE (the
+  // uncommitted node_modules copy won't be present), so evaluate the global
+  // tier independent of any in-project install.
+  const globalTierUsable = (dir: string): boolean =>
+    opts.globalTierProbe
+      ? opts.globalTierProbe(dir)
+      : isGlobalTierUsableIgnoringLocal(dir, opts.globalHome);
+  const noPinResult = (whyDetail: string): CheckResult => {
+    if (globalTierUsable(baseDir)) {
+      return {
+        label,
+        status: 'pass',
+        detail: `${whyDetail} — global-first (default); the global rea CLI tier is usable.`,
+      };
+    }
+    return {
+      label,
+      status: 'fail',
+      detail:
+        `${whyDetail} AND no usable global rea CLI — hooks cannot resolve any CLI. ` +
+        `To fix, ${GLOBAL_CLI_INSTALL_HINT}, or re-run \`rea init --pin\` / \`rea upgrade --pin\` ` +
+        `for a local install.`,
+    };
+  };
   try {
     // R11-P3 (codex round 11): pass the running CLI version so the
     // check verifies the declared range admits it (not just that
@@ -705,10 +746,14 @@ export function checkSelfPinDeclaredCheck(baseDir: string): CheckResult {
     );
     switch (result.kind) {
       case 'pass':
+        // Pin PRESENT + compatible. Under global-first a local install is
+        // non-recommended — flag it (non-fatal) with the migrate path.
         return {
           label,
-          status: 'pass',
-          detail: `declared in ${result.declaredIn} as ${result.declaredRange}`,
+          status: 'warn',
+          detail:
+            `local ${REA_PACKAGE_NAME} install detected (${result.declaredIn} = ${result.declaredRange}). ` +
+            `Global-first is recommended — run \`rea migrate --to-global\` to strip the local dep and let the global rea CLI tier govern.`,
         };
       case 'pass-no-hooks':
         return {
@@ -723,20 +768,13 @@ export function checkSelfPinDeclaredCheck(baseDir: string): CheckResult {
           detail: 'dogfood install (pkg.name === @bookedsolid/rea)',
         };
       case 'pass-no-pkg':
-        return {
-          label,
-          status: 'warn',
-          detail:
-            'hook shims installed but no package.json found upward — bash gates will refuse on fresh clones (the bootstrap allowlist requires a package.json precondition)',
-        };
+        // No package.json → no local pin possible. Same brick class as `fail`:
+        // healthy only when a usable global tier can run the hooks.
+        return noPinResult('no package.json found (no local pin)');
       case 'fail':
-        return {
-          label,
-          status: 'fail',
-          detail:
-            `hook shims at ${path.relative(baseDir, result.hooksDir)} but ${REA_PACKAGE_NAME} is not declared in ${path.relative(baseDir, result.packageJsonPath)}. ` +
-            `Fresh clones will brick (bash gates refuse without a CLI). Run \`rea upgrade\` to self-heal.`,
-        };
+        // Pin ABSENT. Healthy under global-first ONLY when a usable global tier
+        // exists; otherwise this is the true brick (hooks resolve no CLI).
+        return noPinResult(`no local ${REA_PACKAGE_NAME} pin`);
       case 'fail-malformed':
         return {
           label,
@@ -3365,6 +3403,7 @@ export function resolveGlobalCliTier(
   baseDir: string,
   home: string = passwdHome(),
   probeCapability: (cliPath: string) => { ok: boolean } = probeGlobalCliCapability,
+  opts: { ignoreInProject?: boolean } = {},
 ): GlobalCliTier {
   const inProjectReal = realpathOrNull(resolveCliDistPath(baseDir));
 
@@ -3375,7 +3414,14 @@ export function resolveGlobalCliTier(
   // stale or permission-damaged ~/.rea/cli, would get a FALSE [fail] from
   // `rea doctor` even though the hooks happily run the in-project CLI. A
   // broken or unused global tree must never produce a warn/fail here.
-  if (inProjectReal !== null) {
+  //
+  // 0.53.0 CONVERGENCE FIX: `ignoreInProject` skips this short-circuit so the
+  // caller can ask "will the GLOBAL tier resolve AFTER the local install is
+  // removed" — the exact question `rea migrate --to-global` and the doctor
+  // brick check must answer. The local node_modules copy is NOT committed (a
+  // fresh clone won't have it), and migrate is about to delete it, so an
+  // in-project-first answer is the wrong predicate for both.
+  if (inProjectReal !== null && opts.ignoreInProject !== true) {
     // Note the global root's mere existence (a benign [info]) but do NOT probe
     // or sandbox it — it is unused, and the shim would never touch it.
     const reason = fs.existsSync(globalRoot(home)) ? 'in-project-wins' : 'global-root-absent';
@@ -3522,6 +3568,79 @@ export function resolveGlobalCliTier(
     globalCliRealpath: globalReal,
   };
 }
+
+/**
+ * 0.53.0 — is `baseDir` a TRUSTED global-tier checkout? True iff the shared
+ * tier resolver (the SAME predicate `rea doctor` renders in its rows) resolves
+ * to the ACTIVE global tier for this checkout: no in-project CLI shadows it,
+ * the global root is present + safe, `realpath(cwd)` is trusted in
+ * `<home>/.rea/trusted-projects`, the candidate passes the A1–A4 sandbox, the
+ * global CLI is capability-current, and `runtime.allow_global_cli` is not
+ * vetoed by policy.
+ *
+ * `rea init` / `rea upgrade` consult THIS to gate the self-pin skip — reusing
+ * `resolveGlobalCliTier` (never reimplementing the decision tree) so the
+ * scaffolders and doctor can never disagree about what "trusted global-tier"
+ * means (helix-013.1 lesson: one predicate, one source of truth). `home` and
+ * `probeCapability` default to the env-immune / real-spawn implementations;
+ * tests inject hermetic fakes. NO CLI flag exposes either parameter.
+ */
+export function isTrustedGlobalTierCheckout(
+  baseDir: string,
+  home: string = passwdHome(),
+  probeCapability: (cliPath: string) => { ok: boolean } = probeGlobalCliCapability,
+): boolean {
+  return resolveGlobalCliTier(baseDir, home, probeCapability).tier === 'global';
+}
+
+/**
+ * 0.53.0 SAFETY LAYER — the ONE "usable global tier" predicate all three
+ * global-first safety gates (doctor / `rea migrate` / `rea init`+`rea upgrade`)
+ * consult, so they can never disagree about when "no local pin" is safe.
+ * A global tier is USABLE for a checkout exactly when `resolveGlobalCliTier`
+ * resolves it to `'global'`: the global CLI root resolves AND the checkout is
+ * trusted AND `runtime.allow_global_cli` is not vetoed AND the candidate meets
+ * the sandbox + capability floor. This is `isTrustedGlobalTierCheckout` by
+ * another name — aliased so the three call sites read intention-first.
+ */
+export const isGlobalTierUsable = isTrustedGlobalTierCheckout;
+
+/**
+ * 0.53.0 CONVERGENCE FIX — "is the GLOBAL tier usable, IGNORING any local
+ * in-project install." This is the correct predicate for the brick-safety
+ * model whenever the local node_modules copy is NOT the thing that answers the
+ * question:
+ *
+ *   - `rea migrate --to-global` is ABOUT to delete the local install, so it
+ *     must ask whether the GLOBAL tier will resolve AFTERWARD. The plain
+ *     `isGlobalTierUsable` uses `resolveGlobalCliTier`, which is IN-PROJECT-FIRST
+ *     and short-circuits to `tier === 'in-project'` whenever the local dep
+ *     exists — returning FALSE even when a perfectly good global CLI is present,
+ *     which made migrate refuse on its common path.
+ *   - `rea doctor`'s no-pin brick check reasons about a FRESH CLONE (the local
+ *     node_modules is uncommitted and won't be there), so it too wants the
+ *     global tier evaluated independent of the local install.
+ *
+ * Reuses `resolveGlobalCliTier` with `ignoreInProject: true` — the SAME decision
+ * tree (root + trust + sandbox + capability + veto), just without the
+ * in-project short-circuit. No duplicated logic; one source of truth.
+ */
+export function isGlobalTierUsableIgnoringLocal(
+  baseDir: string,
+  home: string = passwdHome(),
+  probeCapability: (cliPath: string) => { ok: boolean } = probeGlobalCliCapability,
+): boolean {
+  return resolveGlobalCliTier(baseDir, home, probeCapability, { ignoreInProject: true }).tier === 'global';
+}
+
+/**
+ * Shared operator-recovery guidance for the "no local pin AND no usable global
+ * tier" brick state. One string so doctor, `rea migrate`, and the init/upgrade
+ * skip-warning never drift. Callers append their own `--pin` phrasing.
+ */
+export const GLOBAL_CLI_INSTALL_HINT =
+  'install the global CLI (`npm i -g @bookedsolid/rea` or `rea install --global`) then ' +
+  '`rea trust` this checkout in a plain shell OUTSIDE the agent session';
 
 /**
  * Read the global CLI's declared version from the package.json that sits
@@ -3796,7 +3915,11 @@ export function collectChecks(
   baseDir: string,
   codexProbeState?: CodexProbeState,
   prePushState?: PrePushDoctorState,
-  options: { strict?: boolean; globalHome?: string } = {},
+  options: {
+    strict?: boolean;
+    globalHome?: string;
+    globalTierProbe?: (baseDir: string) => boolean;
+  } = {},
 ): CheckResult[] {
   const policyPath = reaPath(baseDir, POLICY_FILE);
   const registryPath = reaPath(baseDir, REGISTRY_FILE);
@@ -3833,7 +3956,10 @@ export function collectChecks(
     // bootstrap allowlist (paired fix) recovers from. Doctor surfaces
     // it as a hard FAIL so the operator runs `rea upgrade` (which
     // re-runs self-pin) before assuming the gates are broken.
-    checkSelfPinDeclaredCheck(baseDir),
+    checkSelfPinDeclaredCheck(baseDir, {
+      globalHome: options.globalHome,
+      globalTierProbe: options.globalTierProbe,
+    }),
     checkSettingsJson(baseDir),
     // 0.30.0 Class M — strict zod schema check of the full
     // .claude/settings.json shape. Complements checkSettingsJson
