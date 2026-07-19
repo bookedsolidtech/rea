@@ -1,5 +1,190 @@
 # @bookedsolid/rea
 
+## 0.52.0
+
+### Minor Changes
+
+- 2caf7a8: Artifact Gate G3 (review-gate) — express the existing local-review-gate as the
+  artifact-gates-consistent `artifact_gates.g3_review.mode` (off|shadow|enforce)
+  and add the missing SHADOW tier. Shadow runs the same verdict-coverage probe and
+  logs a `rea.gate.g3.shadow` would-block without refusing; enforce refuses at the
+  push/commit boundary and audits `rea.gate.g3` (matching G1/G2 vocabulary). When
+  `g3_review.mode` is absent, behavior is byte-identical to today (driven by
+  `review.local_review`) — the load-bearing invariant. `refuse_at` / `bypass_env_var`
+  continue to come from `review.local_review`. Checks the artifact only, never a
+  model; acts solely at the push boundary (overnight-safe).
+- 2caf7a8: Artifact Gates distribution — the gates now actually enforce in installed repos.
+  - **G1 pre-commit wiring:** `rea init` and `rea upgrade` install `.husky/pre-commit`
+    (via `installPreCommitHook`, mirroring pre-push idempotency + foreign-hook guard),
+    so opting into `artifact_gates.g1_spec.mode` lays down the hook that runs
+    `rea gate spec-check`. Previously the installer existed but was never invoked.
+  - **G2 Bash-tier gate:** new `verify-gate-bash-gate` hook closes the bypass where
+    `echo x > .rea/tasks.jsonl` (or `tee`/`cp`/`mv`/`dd`/`sed -i`/nested-shell)
+    skipped the editor-only G2 gate. It reuses the bash-scanner AST walker (no
+    hand-rolled redirect parsing); under `g2_verify` shadow it logs
+    `rea.gate.g2.shadow` (source: bash), under enforce it refuses (exit 2) and
+    points to `rea tasks`, under off it is a byte-identical no-op. Registered as
+    hook #19; dogfood `.claude/` + manifest synced; drift + byte-fidelity clean.
+
+- 2caf7a8: feat(gates): Artifact Gates G1 (spec-gate) + G2 (verification-gate)
+
+  Two deterministic, model-judgment-free process gates that check a fresh
+  process artifact exists before something irreversible happens — the
+  push-review-gate pattern generalized. Both are shadow-first and
+  default-off (inert until a repo opts in via `policy.artifact_gates`),
+  and both FAIL INTO AN AUDIT ENTRY, never an interactive prompt (so
+  overnight autonomous runs survive `enforce`).
+  - **G2 verification-gate** (`rea hook verify-gate`, PreToolUse on
+    Write/Edit to `.rea/tasks.jsonl`): refuses a write that transitions
+    any task to `completed` with no `evidence`. off → silent; shadow →
+    `rea.gate.g2.shadow` would-block audit, exit 0; enforce → `rea.gate.g2`
+    deny, exit 2.
+  - **G1 spec-gate** (`rea gate spec-check`, commit-time): when the staged
+    net diff exceeds `diff_lines`/`diff_files` OR the active task is
+    `requires_spec`, the active task must reference a spec path that
+    exists and is HEAD-committed. Below threshold → silent (the "just do
+    it" branch). off/shadow/enforce as above (`rea.gate.g1[.shadow]`). A
+    ready `.husky/pre-commit` installer ships (`installPreCommitHook`).
+
+  UNCERTAIN ≡ REFUSE at enforce only (git/tasks unreadable → refuse under
+  enforce, log+allow under shadow). Shadow audit tool names (`*.shadow`)
+  are excluded from every coverage accept-list.
+
+- 18770ae: feat(review): codex model ladder + silent-pass fix. (1) SILENT-PASS FIX: codex exits 0 even when a run fails via a streamed `{"type":"error",...}` event (e.g. an unsupported model returns a 400 error event and exit 0). Pre-fix that shape produced an empty review with zero findings → verdict `pass` — a one-character typo in `policy.review.codex_model` silently turned the entire review gate into a rubber stamp. The runner now collects error events; an errored, review-less run throws a typed error (`CodexModelUnsupportedError` / `CodexProtocolError`) and can never pass. (2) MODEL LADDER: the iron-gate default is now `IRON_GATE_MODEL_LADDER` (`gpt-5.5` → `gpt-5.4`, newest-first). When policy does not pin `codex_model`, the runner tries the newest flagship and falls to the next entry on a model-unsupported error, so installs automatically ride the newest codex their account supports instead of going stale on a hardcode. An explicit `codex_model` pin is authoritative — never substituted; an unsupported pin fails loudly with remediation. `CodexRunResult` now reports `modelUsed`/`modelFellBack` so audits record the model that actually ran.
+- 2caf7a8: feat(policy): support the `xhigh` codex reasoning tier
+
+  `policy.review.codex_reasoning_effort` validated against
+  `low | medium | high`, so operators whose codex CLI supports `xhigh`
+  (codex-cli 0.142.x+) could not express that preference through policy —
+  the zod loader rejected it. The enum and every type union
+  (`ReviewPolicy`, `ResolvedReviewPolicy`, `CodexRunOptions`,
+  `VerdictCacheEntry`, the iron-gate defaults) now include `xhigh`; the
+  runner already forwards the value verbatim as
+  `-c model_reasoning_effort="<value>"`, so it reaches codex unchanged.
+  Defaults are unchanged (`high`). Closes the second half of the
+  stale-codex-config report (the `gpt-5.4` flagship pin was already fixed
+  by the 0.52.0 model ladder, default `gpt-5.5`).
+
+- 2caf7a8: `rea dash --emit-moc [path]` — the vault-MOC output mode (dash spec §4). Renders
+  the same aggregated global-dashboard model as a deterministic Markdown map-of-
+  content suitable for an Obsidian vault. No path → stdout; a path writes the file
+  (parent dir must exist — never mkdir's an operator's vault tree). Sensitive-project
+  visibility (§6) is honored upstream in the shared model: a non-visible project
+  contributes only an opaque item-count, never task titles, so a file written to a
+  shared vault carries exactly what the terminal view would. Read-only over task
+  artifacts (§5); disk-sourced subjects are neutralized against wikilink/embed
+  injection. Precedence: --emit-moc > --json > terminal.
+- 2caf7a8: fix(hooks): H17 context-protection no longer blocks the delegation it mandates (bug H17)
+
+  The `context_protection.delegate_to_subagent` gate (H17 in
+  `dangerous-bash-interceptor`) told agents to "delegate to a subagent"
+  but the delegated subagent hit the exact same block — Claude Code fires
+  PreToolUse in every agent context and the hook had no reliable
+  "am I in a subagent?" signal, so the mandated remedy was impossible and
+  the field consequence was bypass-seeking (agents routed around the gate
+  via the raw binary). Two coupled fixes:
+  - **Sanctioned delegated-run marker (traversable path).** A
+    delegate-listed command carried as `REA_DELEGATED_RUN=1 <cmd>` passes
+    H17 **and is recorded on the hash-chained audit log**
+    (`rea.context_protection` / `delegated_run_sanctioned`). The
+    coordinator gate stays intact (a bare command is still blocked) while
+    the delegated runner has a real, auditable path — the marker is a
+    visible escape hatch (like `REA_SKIP_*`), detected from the command
+    text because shell `export`s do not survive across separate Bash tool
+    calls. An explicit `REA_DELEGATED_RUN` process-env value is also
+    honored. The block copy now names this path instead of an impossible
+    one.
+  - **Runner-equivalence normalization (closes the under-block leak).**
+    The pre-fix matcher only caught the literal listed string, so
+    `./node_modules/.bin/vitest run`, `node_modules/.bin/vitest run`,
+    `pnpm exec vitest run`, `npx vitest run`, and whitespace variants all
+    slipped through. Each policy pattern is now expanded into its
+    runner-equivalent forms (pnpm / pnpm exec / npx / yarn / direct .bin
+    path) before a head-anchored match. Expansion — rather than stripping
+    the command to a bare token — deliberately avoids over-blocking: the
+    `test` shell builtin and `pnpm test-utils` are unaffected by a
+    `pnpm test` delegate entry.
+
+- 2caf7a8: feat(dash): `rea dash` — global, read-only project dashboard
+
+  A GLOBAL morning view that discovers and aggregates every rea-aware
+  project on the machine and renders a needs-you-first pane — strictly
+  read-only over task artifacts (it reads and renders, never mutates task
+  state or orchestrates).
+  - **Registry** (`~/.rea/registry.json`): `rea init` / `rea upgrade`
+    self-register the project (best-effort — a registry failure never
+    fails the command). Reconcile-on-read stats each registered path and
+    surfaces `present` / `missing` / `deregistered` — a vanished checkout
+    is flagged, never silently dropped.
+  - **`rea dash`** (no arg): aggregates every present, visible project's
+    `.rea/tasks.jsonl` into groups — awaiting/blocked, review queue,
+    in-flight, health flags (legacy `.reagent/` dir, stale spine
+    version), idle. `rea dash .` is per-repo. `--json` for automation,
+    `--rescan [roots]` for the opt-in deep filesystem sweep, `--prune`
+    to drop missing entries.
+  - **Visibility**: a project with `dashboard_visible: false` (registry
+    or `.rea/policy.yaml`) is health-checked but its task titles are
+    withheld — shown as "N items, hidden"; `--all` overrides for local
+    present projects.
+
+  Non-load-bearing: no gate, hook, or spine step depends on `rea dash`.
+
+- 2caf7a8: Budget enforcement — make the turn-budget real (Artifact Gates spec §5). Adds an
+  optional `spend_governance.turn_budget` policy block (`warn_turns`, `halt_turns`,
+  `response: warn|halt|off`) and folds a per-session turn counter into the
+  `billing-cap-halt` PostToolUse path. Crossing `warn_turns` emits an audited
+  `rea.spend.turn_budget_warn` (once); crossing `halt_turns` fires `response` once
+  (`halt` writes `.rea/HALT`, audits `rea.spend.turn_budget_halt`). The counter is
+  per-session and LOCAL; audit lands on the repo-wide common root. Absent block =
+  feature off (no behavior change for existing policies). Overnight-safe: never an
+  interactive prompt.
+- 2caf7a8: Spine distribution (Artifact Gates spec §4) — `rea init`/`rea upgrade` now ship the
+  process-spine skills automatically. The `spine/` payload installs to the rea-owned
+  `.claude/skills/rea/` subdir (never the shared `.claude/skills/` root, so it can
+  never collide with a user's own skills) via a single canonical DirMapping, so it version-pins,
+  drift-detects, and refuses-on-local-mod through the SAME machinery as
+  commands/agents (no new mechanism): `rea init` records SHAs, `rea upgrade`
+  reconciles/refreshes, `rea doctor --drift` reports spine drift. Re-running init is
+  byte-identical. `rea doctor` gains two advisory checks: spine-installed (with the
+  release version pin) and a token-economy budget lint (owner D5 — warns at >15
+  user-invoked skills or >1,000 description tokens across `.claude/skills/`,
+  `.claude/skills/rea/`, and `.claude/commands/`, flags the quarterly prune; never
+  fails the exit code).
+- 2caf7a8: feat(tasks): `.rea/tasks.jsonl` task store + `rea tasks` CLI
+
+  The shared keystone for the Artifact Gates and `rea dash` features: a
+  local, deterministic, append-only JSONL task store at `.rea/tasks.jsonl`
+  (an already-governed, agent-writable path). Adds a strict zod
+  `TaskRecord` schema (id, subject, status, active, spec, requires_spec,
+  evidence, blocked_by, external_ref, timestamps), a synchronous store
+  library (`readTasks` folds to latest-record-per-id and tolerates
+  malformed lines; `appendTask` writes one line under a proper-lockfile
+  lock on `.rea/` with fsync, matching the audit store's discipline;
+  `activeTask`, `nextTaskId`), and a `rea tasks` CLI —
+  `add`/`start`/`activate`/`evidence`/`complete`/`list`/`show`.
+  `rea tasks complete` refuses when a task has no `evidence` (the G2
+  verification invariant at the CLI tier). Read-only for consumers; no
+  enforcement is wired yet.
+
+- 2caf7a8: feat(worktree): worktree-aware `.rea/` state — fixes multi-stream clobbering of the review file and split-brain gate reads. rea now resolves TWO roots everywhere (`src/lib/worktree-roots.ts`; bash parity in `hooks/_lib`): the LOCAL worktree root keeps per-stream state (`policy.yaml` reads, `last-review.json`, parity/metrics, serve pid/state, delegation session counters) and the COMMON primary-checkout root keeps per-repository ENFORCEMENT state (`audit.jsonl` + its lock, `HALT`, the sha-keyed verdict cache, TOFU fingerprints). Concretely: parallel worktree sessions no longer overwrite each other's `last-review.json`; a review of sha X in any worktree satisfies `rea preflight` / the push gate for the same sha in every other (shared audit chain + shared verdict cache); `rea freeze` — and the automated billing reflex — freeze the WHOLE repository (probes cover both roots, `rea unfreeze` clears both, a legacy per-worktree HALT still freezes its own stream); concurrent audit appends from multiple worktrees serialize on one lock and keep one verifiable hash chain. Hooks resolve roots from the hook payload's `cwd` through a guarded ladder (payload → `CLAUDE_PROJECT_DIR` → cwd, `.rea/`-presence-gated) — fixing the Claude Code worktree-session split where `CLAUDE_PROJECT_DIR` pins the primary checkout. The protected-path scanner now normalizes against BOTH roots, so an absolute-path write from a worktree into the primary checkout's `.rea/HALT`/audit chain is refused. Plain (non-worktree) checkouts are byte-identical to previous behavior and pay zero additional git subprocesses (`.git`-is-a-file discriminator). `rea doctor` gains a worktree-topology check that warns on orphaned pre-upgrade per-worktree state. See THREAT_MODEL §10 for the full topology, residuals (bash-tier policy reads stay local-resolved; content-token coverage rides the sha fallback across worktrees), and the no-auto-migration rationale.
+
+### Patch Changes
+
+- 2caf7a8: fix(hooks): changeset-security-gate validates the resulting file for Edit, not the fragment
+
+  For a single `Edit`, the frontmatter-completeness check ran against the
+  `new_string` fragment rather than the post-edit file. A body-only edit
+  to an already-valid changeset — frontmatter untouched — was therefore
+  rejected as "missing frontmatter" (the fragment has none), training
+  agents to route around the gate with a full-file `Write`. The gate now
+  reconstructs the resulting document (applies `old_string` → `new_string`,
+  honoring `replace_all`, to the on-disk content) and validates that:
+  body edits pass, while an edit that deletes the bump entry is still
+  caught. When the result cannot be reconstructed (missing file,
+  `old_string` absent) the frontmatter check is skipped rather than
+  false-blocking. The GHSA/CVE disclosure scan continues to run on every
+  accepted tool's payload, including Edit fragments.
+
 ## 0.51.0
 
 ### Minor Changes
@@ -3962,13 +4147,13 @@ codex-review --also-set-cache`) on every push, produced a 1,250-line bash
 
   This release replaces the entire stack with a stateless gate:
 
-                                                                                                                      git push
-                                                                                                                        → .husky/pre-push → rea hook push-gate
-                                                                                                                        → codex exec review --base <ref> --json
-                                                                                                                        → parse verdict from streamed findings
-                                                                                                                        → block on [P1] (blocking) or [P2] when concerns_blocks=true
-                                                                                                                        → write .rea/last-review.json + audit record
-                                                                                                                        → exit 0 / 1 (HALT) / 2 (blocked)
+                                                                                                                        git push
+                                                                                                                          → .husky/pre-push → rea hook push-gate
+                                                                                                                          → codex exec review --base <ref> --json
+                                                                                                                          → parse verdict from streamed findings
+                                                                                                                          → block on [P1] (blocking) or [P2] when concerns_blocks=true
+                                                                                                                          → write .rea/last-review.json + audit record
+                                                                                                                          → exit 0 / 1 (HALT) / 2 (blocked)
 
   Codex is run fresh on every push. No cache. No SHA matching. No receipt
   consultation. When the gate blocks, Claude reads stderr + the
