@@ -25,7 +25,7 @@ jobs:
 
       - name: Setup pnpm
         # pin: pnpm/action-setup v4.0.0 — version derived from packageManager in package.json
-        uses: pnpm/action-setup@fe02b34f77f8bc703788d5817da081398fad5dd2
+        uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271
 
       - name: Setup Node
         # pin: actions/setup-node v4.0.3
@@ -58,7 +58,7 @@ jobs:
 
       - name: Setup pnpm
         # pin: pnpm/action-setup v4.0.0 — version derived from packageManager in package.json
-        uses: pnpm/action-setup@fe02b34f77f8bc703788d5817da081398fad5dd2
+        uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271
 
       - name: Setup Node
         # pin: actions/setup-node v4.0.3
@@ -84,7 +84,7 @@ jobs:
 
       - name: Setup pnpm
         # pin: pnpm/action-setup v4.0.0 — version derived from packageManager in package.json
-        uses: pnpm/action-setup@fe02b34f77f8bc703788d5817da081398fad5dd2
+        uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271
 
       - name: Setup Node
         # pin: actions/setup-node v4.0.3
@@ -124,7 +124,7 @@ jobs:
 
       - name: Setup pnpm
         # pin: pnpm/action-setup v4.0.0 — version derived from packageManager in package.json
-        uses: pnpm/action-setup@fe02b34f77f8bc703788d5817da081398fad5dd2
+        uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271
 
       - name: Setup Node
         # pin: actions/setup-node v4.0.3
@@ -166,7 +166,7 @@ jobs:
 
       - name: Setup pnpm
         # pin: pnpm/action-setup v4.0.0 — version derived from packageManager in package.json
-        uses: pnpm/action-setup@fe02b34f77f8bc703788d5817da081398fad5dd2
+        uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271
 
       - name: Setup Node
         # pin: actions/setup-node v4.0.3
@@ -202,7 +202,7 @@ jobs:
 
       - name: Setup pnpm
         # pin: pnpm/action-setup v4.0.0 — version derived from packageManager in package.json
-        uses: pnpm/action-setup@fe02b34f77f8bc703788d5817da081398fad5dd2
+        uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271
 
       - name: Setup Node
         # pin: actions/setup-node v4.0.3
