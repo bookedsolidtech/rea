@@ -21,7 +21,7 @@ jobs:
     steps:
       - name: Checkout
         # pin: actions/checkout v4.1.7
-        uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
 
       - name: Setup pnpm
         # pin: pnpm/action-setup v4.0.0 — version derived from packageManager in package.json
@@ -54,7 +54,7 @@ jobs:
     steps:
       - name: Checkout
         # pin: actions/checkout v4.1.7
-        uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
 
       - name: Setup pnpm
         # pin: pnpm/action-setup v4.0.0 — version derived from packageManager in package.json
@@ -80,7 +80,7 @@ jobs:
     steps:
       - name: Checkout
         # pin: actions/checkout v4.1.7
-        uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
 
       - name: Setup pnpm
         # pin: pnpm/action-setup v4.0.0 — version derived from packageManager in package.json
@@ -120,7 +120,7 @@ jobs:
     steps:
       - name: Checkout
         # pin: actions/checkout v4.1.7
-        uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
 
       - name: Setup pnpm
         # pin: pnpm/action-setup v4.0.0 — version derived from packageManager in package.json
@@ -156,7 +156,7 @@ jobs:
     steps:
       - name: Checkout
         # pin: actions/checkout v4.1.7
-        uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
           # Need fetch-depth: 0 so `git rev-parse v<prev-version>` resolves
           # without an explicit tag fetch. The gate's fallback `git fetch
@@ -198,7 +198,7 @@ jobs:
     steps:
       - name: Checkout
         # pin: actions/checkout v4.1.7
-        uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
 
       - name: Setup pnpm
         # pin: pnpm/action-setup v4.0.0 — version derived from packageManager in package.json
