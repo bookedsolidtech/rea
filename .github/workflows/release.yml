@@ -132,7 +132,7 @@ jobs:
       - name: Create release PR or publish
         id: changesets
         # pin: changesets/action v1.4.9
-        uses: changesets/action@e2f8e964d080ae97c874b19e27b12e0a8620fb6c
+        uses: changesets/action@a45c4d594aa4e2c509dc14a9f2b3b67ba3780d0d
         with:
           # `version` updates package.json and CHANGELOG then commits to the
           # "Version Packages" PR. `publish` runs the npm publish step once
