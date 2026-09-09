@@ -1,8 +1,8 @@
 {
-  "version": "0.51.0",
+  "version": "0.53.0",
   "profile": "bst-internal",
-  "installed_at": "2026-04-18T21:31:41.169Z",
-  "upgraded_at": "2026-07-18T22:43:47.631Z",
+  "installed_at": "2026-07-19T11:38:44.498Z",
+  "upgraded_at": "2026-09-09T20:52:35.248Z",
   "files": [
     {
       "path": ".claude/hooks/_lib/bootstrap-allowlist.sh",
@@ -341,7 +341,7 @@
     },
     {
       "path": ".husky/pre-commit",
-      "sha256": "72c658ad5581699212384301dfe86e0d862a144aee10b0577d6f9abe7877656d",
+      "sha256": "d28127aae3cdb45f502d1cf9fc66e33653813f03ee0aece722148e479fb7ebbd",
       "source": "husky"
     },
     {

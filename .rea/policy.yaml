@@ -43,7 +43,6 @@ review:
   # defaults (codex-auto-review at medium) — meaningfully weaker than
   # the consumers — which is why their push-gates kept catching things
   # rea pre-publish missed across the helix-014 / 015 / 016 cycle.
-  codex_model: gpt-5.4
   codex_reasoning_effort: high
 # 0.36.0 charter item 2 — dogfood `policy.delegation_advisory.enabled: true`.
 # 0.31.0 introduced the delegation-advisory hook (PostToolUse on matcher

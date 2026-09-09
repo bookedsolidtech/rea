@@ -5,8 +5,10 @@ import {
   CodexModelUnsupportedError,
   CodexNotInstalledError,
   CodexProtocolError,
+  CodexSubprocessError,
   IRON_GATE_DEFAULT_MODEL,
   IRON_GATE_MODEL_LADDER,
+  isModelRejection,
   parseCodexJsonl,
   runCodexReview,
 } from './codex-runner.js';
@@ -521,7 +523,10 @@ describe('runCodexReview — onAttempt attribution (0.52.0 review P3)', () => {
         ),
       }),
     ).rejects.toBeInstanceOf(CodexProtocolError);
-    expect(attempts).toEqual([...IRON_GATE_MODEL_LADDER]);
+    // Two rungs are scripted, so exactly the first two are attempted —
+    // asserted as a slice rather than the whole ladder so prepending a new
+    // flagship (0.54.0 added gpt-6-astra) does not falsify the assertion.
+    expect(attempts).toEqual(IRON_GATE_MODEL_LADDER.slice(0, 2));
     expect(attempts[attempts.length - 1]).toBe(IRON_GATE_MODEL_LADDER[1]);
   });
 
@@ -537,5 +542,257 @@ describe('runCodexReview — onAttempt attribution (0.52.0 review P3)', () => {
       spawnImpl: makeScriptedSpawn([OK_STREAM], captured),
     });
     expect(r.reviewText).toBe('No findings.');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 0.54.0 — non-zero exit: classify from STDOUT, not from an empty stderr
+// ---------------------------------------------------------------------------
+
+/**
+ * Scripted spawn whose children exit NON-ZERO. Codex's observed failure shape
+ * is exactly this: a JSON `error` event on stdout, an EMPTY stderr, exit 1.
+ */
+function makeFailingSpawn(
+  scripts: string[],
+  captured: { cmd: string; args: readonly string[] }[],
+  opts: { exitCode?: number; stderr?: string } = {},
+) {
+  let call = 0;
+  return (cmd: string, args: readonly string[]): ChildProcessWithoutNullStreams => {
+    captured.push({ cmd, args });
+    const stdout = scripts[Math.min(call, scripts.length - 1)]!;
+    call += 1;
+    const child = new EventEmitter() as ChildProcessWithoutNullStreams;
+    const stdoutStream = Readable.from([Buffer.from(stdout)]);
+    child.stdout = stdoutStream as ChildProcessWithoutNullStreams['stdout'];
+    child.stderr = Readable.from(
+      opts.stderr !== undefined && opts.stderr.length > 0 ? [Buffer.from(opts.stderr)] : [],
+    ) as ChildProcessWithoutNullStreams['stderr'];
+    stdoutStream.on('end', () =>
+      queueMicrotask(() => child.emit('close', opts.exitCode ?? 1, null)),
+    );
+    return child;
+  };
+}
+
+/** The observed codex 404 shape — the wording the pre-0.54.0 regex missed. */
+function modelNotFoundLine(model: string): string {
+  return JSON.stringify({
+    type: 'error',
+    status: 404,
+    error: {
+      type: 'invalid_request_error',
+      message: `The model \`${model}\` does not exist or you do not have access to it.`,
+    },
+  });
+}
+
+describe('isModelRejection (0.54.0)', () => {
+  it('matches the 400 "not supported" wording', () => {
+    expect(
+      isModelRejection("The 'gpt-5.4' model is not supported when using Codex with a ChatGPT account."),
+    ).toBe(true);
+  });
+
+  it('matches the 404 "does not exist or you do not have access" wording', () => {
+    expect(
+      isModelRejection('The model `gpt-5.5` does not exist or you do not have access to it.'),
+    ).toBe(true);
+  });
+
+  it('does not match unrelated run failures', () => {
+    expect(isModelRejection('internal server error')).toBe(false);
+    expect(isModelRejection('connection reset by peer')).toBe(false);
+  });
+});
+
+describe('runCodexReview — non-zero exit classification (0.54.0)', () => {
+  it('non-zero exit + model-rejection on stdout → ladder falls to the next rung', async () => {
+    const captured: { cmd: string; args: readonly string[] }[] = [];
+    let call = 0;
+    // Rung 1 exits 1 with a 404 error event on stdout (the live failure that
+    // killed every unpinned install). Rung 2 succeeds normally.
+    const spawnImpl = (
+      cmd: string,
+      args: readonly string[],
+    ): ChildProcessWithoutNullStreams => {
+      const isFirst = call === 0;
+      call += 1;
+      if (isFirst) {
+        return makeFailingSpawn([modelNotFoundLine(IRON_GATE_MODEL_LADDER[0]!)], captured)(
+          cmd,
+          args,
+        );
+      }
+      return makeScriptedSpawn([OK_STREAM], captured)(cmd, args);
+    };
+    const r = await runCodexReview({
+      baseRef: 'origin/main',
+      cwd: '/tmp',
+      timeoutMs: 60_000,
+      spawnImpl,
+    });
+    expect(captured).toHaveLength(2);
+    expect(captured[0]!.args).toContain(`model="${IRON_GATE_MODEL_LADDER[0]}"`);
+    expect(captured[1]!.args).toContain(`model="${IRON_GATE_MODEL_LADDER[1]}"`);
+    expect(r.modelUsed).toBe(IRON_GATE_MODEL_LADDER[1]);
+    expect(r.modelFellBack).toBe(true);
+  });
+
+  it('an EXPLICIT pin rejected on a non-zero exit fails loudly, never silently', async () => {
+    const captured: { cmd: string; args: readonly string[] }[] = [];
+    await expect(
+      runCodexReview({
+        baseRef: 'origin/main',
+        cwd: '/tmp',
+        timeoutMs: 60_000,
+        model: 'gpt-5.5',
+        spawnImpl: makeFailingSpawn([modelNotFoundLine('gpt-5.5')], captured),
+      }),
+    ).rejects.toBeInstanceOf(CodexModelUnsupportedError);
+    // Explicit pin is a single candidate — no substitution.
+    expect(captured).toHaveLength(1);
+  });
+
+  it('non-model failure on a non-zero exit surfaces the stdout tail (was: empty)', async () => {
+    const captured: { cmd: string; args: readonly string[] }[] = [];
+    let err: unknown;
+    try {
+      await runCodexReview({
+        baseRef: 'origin/main',
+        cwd: '/tmp',
+        timeoutMs: 60_000,
+        model: 'gpt-6-astra',
+        spawnImpl: makeFailingSpawn(
+          [JSON.stringify({ type: 'error', status: 500, message: 'upstream exploded' })],
+          captured,
+        ),
+      });
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(CodexSubprocessError);
+    const message = (err as CodexSubprocessError).message;
+    // The pre-0.54.0 message ended at `stderr tail: ` with nothing after it.
+    expect(message).toContain('stderr tail:');
+    expect(message).toContain('codex reported on stdout:');
+    expect(message).toContain('upstream exploded');
+  });
+
+  it('a real stderr tail is still reported, and stdout is NOT appended', async () => {
+    const captured: { cmd: string; args: readonly string[] }[] = [];
+    let err: unknown;
+    try {
+      await runCodexReview({
+        baseRef: 'origin/main',
+        cwd: '/tmp',
+        timeoutMs: 60_000,
+        model: 'gpt-6-astra',
+        spawnImpl: makeFailingSpawn([''], captured, { stderr: 'codex: fatal: bad config' }),
+      });
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(CodexSubprocessError);
+    const message = (err as CodexSubprocessError).message;
+    expect(message).toContain('codex: fatal: bad config');
+    expect(message).not.toContain('codex reported on stdout:');
+  });
+
+  it('unparseable stdout on a non-zero exit reports the raw tail, not a protocol error', async () => {
+    const captured: { cmd: string; args: readonly string[] }[] = [];
+    let err: unknown;
+    try {
+      await runCodexReview({
+        baseRef: 'origin/main',
+        cwd: '/tmp',
+        timeoutMs: 60_000,
+        model: 'gpt-6-astra',
+        spawnImpl: makeFailingSpawn(['panic: not json at all'], captured),
+      });
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(CodexSubprocessError);
+    expect((err as CodexSubprocessError).message).toContain('panic: not json at all');
+  });
+
+  it('FAIL-CLOSED: a non-zero exit never returns a review, even with review text', async () => {
+    const captured: { cmd: string; args: readonly string[] }[] = [];
+    await expect(
+      runCodexReview({
+        baseRef: 'origin/main',
+        cwd: '/tmp',
+        timeoutMs: 60_000,
+        model: 'gpt-6-astra',
+        spawnImpl: makeFailingSpawn([OK_STREAM], captured),
+      }),
+    ).rejects.toBeInstanceOf(CodexSubprocessError);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// codex round-1 P2 — rejection classification must be narrow AND unambiguous
+// ---------------------------------------------------------------------------
+
+describe('isModelRejection — does not swallow config/filesystem failures', () => {
+  it('does NOT match a missing model CONFIGURATION file', () => {
+    expect(isModelRejection('The model configuration file does not exist.')).toBe(false);
+  });
+
+  it('does NOT match a model CACHE DIRECTORY permission failure', () => {
+    expect(isModelRejection('You do not have access to the model cache directory.')).toBe(false);
+  });
+
+  it('still matches the provider 404 phrase in full', () => {
+    expect(
+      isModelRejection('The model `gpt-5.5` does not exist or you do not have access to it.'),
+    ).toBe(true);
+  });
+});
+
+describe('mixed error streams stay fail-closed (no weaker-model retry)', () => {
+  it('rejection + an unrelated fatal error on a non-zero exit → CodexSubprocessError, ONE attempt', async () => {
+    const captured: { cmd: string; args: readonly string[] }[] = [];
+    await expect(
+      runCodexReview({
+        baseRef: 'origin/main',
+        cwd: '/tmp',
+        timeoutMs: 60_000,
+        spawnImpl: makeFailingSpawn(
+          [
+            [
+              modelNotFoundLine(IRON_GATE_MODEL_LADDER[0]!),
+              JSON.stringify({ type: 'error', status: 500, message: 'upstream exploded' }),
+            ].join('\n'),
+          ],
+          captured,
+        ),
+      }),
+    ).rejects.toBeInstanceOf(CodexSubprocessError);
+    // The ladder must NOT advance — a mixed failure is not a model problem.
+    expect(captured).toHaveLength(1);
+  });
+
+  it('rejection + an unrelated fatal error on exit 0 → CodexProtocolError, ONE attempt', async () => {
+    const captured: { cmd: string; args: readonly string[] }[] = [];
+    await expect(
+      runCodexReview({
+        baseRef: 'origin/main',
+        cwd: '/tmp',
+        timeoutMs: 60_000,
+        spawnImpl: makeScriptedSpawn(
+          [
+            [
+              modelUnsupportedLine(IRON_GATE_MODEL_LADDER[0]!),
+              JSON.stringify({ type: 'error', message: 'disk full' }),
+            ].join('\n'),
+          ],
+          captured,
+        ),
+      }),
+    ).rejects.toBeInstanceOf(CodexProtocolError);
+    expect(captured).toHaveLength(1);
   });
 });

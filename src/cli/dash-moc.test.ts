@@ -316,7 +316,21 @@ describe('runDash --emit-moc', () => {
   it('honors sensitive-project visibility end-to-end (opaque count, no titles)', async () => {
     const proj = makeProject(
       'secret',
-      [task('T-0001', { status: 'in_progress' }), task('T-0002', { status: 'completed', evidence: ['x'] })],
+      [
+        task('T-0001', { status: 'in_progress' }),
+        // `updated_at` must be NOW, not the fixture's fixed epoch. A completed
+        // task only counts toward the opaque total while `isRecentReview()`
+        // holds — within REVIEW_WINDOW_MS of the run clock — and this suite
+        // does not freeze time. With the fixed epoch the task aged out of the
+        // review queue a week after it was written and the count silently fell
+        // 2 → 1, so the assertion below had an expiry date rather than a bug.
+        // This test is about VISIBILITY, so the item is kept genuinely recent.
+        task('T-0002', {
+          status: 'completed',
+          evidence: ['x'],
+          updated_at: new Date().toISOString(),
+        }),
+      ],
       { policyVisible: false },
     );
     await registerProject(proj, { name: 'secret', reaVersion: '0.51.0' }, registryPath);
