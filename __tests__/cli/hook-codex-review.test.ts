@@ -18,6 +18,7 @@ import { Readable } from 'node:stream';
 import type { ChildProcessWithoutNullStreams } from 'node:child_process';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { runHookCodexReview } from '../../src/cli/hook.js';
+import { IRON_GATE_MODEL_LADDER } from '../../src/hooks/push-gate/codex-runner.js';
 
 const POLICY_HEADER = `version: "1"
 profile: "test"
@@ -211,8 +212,10 @@ describe('runHookCodexReview — pass verdict (no findings)', () => {
     const execIdx = args.indexOf('exec');
     const lastDashC = args.lastIndexOf('-c');
     expect(execIdx).toBeGreaterThan(lastDashC);
-    // 0.52.0: the iron-gate default is the model-ladder top (gpt-5.5).
-    expect(args).toContain('model="gpt-5.5"');
+    // 0.52.0: the iron-gate default is the model-ladder top. Asserted against
+    // the ladder itself, not a literal, so prepending a new flagship does not
+    // falsify it (0.54.0 added gpt-6-astra).
+    expect(args).toContain(`model="${IRON_GATE_MODEL_LADDER[0]}"`);
     expect(args).toContain('model_reasoning_effort="high"');
     expect(args).toContain('--json');
     expect(args).toContain('--ephemeral');
@@ -465,7 +468,7 @@ describe('runHookCodexReview — model-ladder fallback (0.52.0 round-3 P3)', () 
       status: 400,
       error: {
         type: 'invalid_request_error',
-        message: "The 'gpt-5.5' model is not supported when using Codex with a ChatGPT account.",
+        message: `The '${IRON_GATE_MODEL_LADDER[0]}' model is not supported when using Codex with a ChatGPT account.`,
       },
     });
     const success = [
@@ -485,8 +488,8 @@ describe('runHookCodexReview — model-ladder fallback (0.52.0 round-3 P3)', () 
     expect(exitCode).toBe(0);
     // Two attempts: ladder top then fallback.
     expect(captured).toHaveLength(2);
-    expect(captured[0]!.args).toContain('model="gpt-5.5"');
-    expect(captured[1]!.args).toContain('model="gpt-5.4"');
+    expect(captured[0]!.args).toContain(`model="${IRON_GATE_MODEL_LADDER[0]}"`);
+    expect(captured[1]!.args).toContain(`model="${IRON_GATE_MODEL_LADDER[1]}"`);
 
     // The raw tee holds ONLY the final (successful) attempt — no error
     // event from the failed rung (round-3 P3: mixed attempts break the
@@ -503,7 +506,7 @@ describe('runHookCodexReview — model-ladder fallback (0.52.0 round-3 P3)', () 
     const last = JSON.parse(audit.trim().split('\n').pop()!) as {
       metadata?: { model?: string; verdict?: string };
     };
-    expect(last.metadata?.model).toBe('gpt-5.4');
+    expect(last.metadata?.model).toBe(IRON_GATE_MODEL_LADDER[1]);
     expect(last.metadata?.verdict).toBe('pass');
   });
 });

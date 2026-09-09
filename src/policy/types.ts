@@ -155,7 +155,7 @@ export interface ReviewPolicy {
   /**
    * Codex CLI model override (0.13.4+). Pinned via `-c model="<name>"` on
    * every `codex exec review` invocation. When unset (0.52.0), the runtime
-   * rides the model LADDER (`IRON_GATE_MODEL_LADDER`: gpt-5.5 → gpt-5.4,
+   * rides the model LADDER (`IRON_GATE_MODEL_LADDER`: gpt-6-astra → gpt-5.5 → gpt-5.4,
    * newest-first with automatic fallback for accounts lacking the newest
    * flagship) — never codex's own `codex-auto-review` default.
    *

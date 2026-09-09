@@ -39,8 +39,16 @@ import type { ChildProcessWithoutNullStreams } from 'node:child_process';
  * never silently pass; see CodexModelUnsupportedError).
  *
  * Bump here (prepend the new flagship) to bump everywhere.
+ *
+ * 0.54.0: `gpt-6-astra` prepended. Both prior rungs are unreachable on a
+ * ChatGPT-auth Codex account as of 2026-09-09 — `gpt-5.5` answers 404
+ * ("does not exist or you do not have access") and `gpt-5.4` answers 400
+ * ("not supported when using Codex with a ChatGPT account"), so every
+ * `codex_required` install without an explicit pin was dead at the gate.
+ * The old rungs are KEPT below astra: an API-key account may still resolve
+ * them, and a rejected rung costs ~2s with no review compute.
  */
-export const IRON_GATE_MODEL_LADDER: readonly string[] = ['gpt-5.5', 'gpt-5.4'];
+export const IRON_GATE_MODEL_LADDER: readonly string[] = ['gpt-6-astra', 'gpt-5.5', 'gpt-5.4'];
 
 /**
  * Default codex model when policy doesn't pin one — the TOP of the
@@ -108,11 +116,24 @@ export class CodexSubprocessError extends Error {
     public readonly exitCode: number | null,
     public readonly signal: NodeJS.Signals | null,
     public readonly stderrTail: string,
+    /**
+     * 0.54.0 — what codex wrote to STDOUT. Codex reports run failures as a
+     * JSON `error` event on stdout and leaves stderr EMPTY, so the pre-0.54.0
+     * message was always `stderr tail: ` with nothing after it: a dead model
+     * and a broken working tree were indistinguishable. Appended only when
+     * stderr is empty, so the `stderr tail:` substring is unchanged in every
+     * case that previously carried content.
+     */
+    public readonly stdoutTail: string = '',
   ) {
     super(
       `codex exec review exited ${
         exitCode !== null ? `with code ${exitCode}` : `via signal ${signal ?? 'unknown'}`
-      }. stderr tail: ${stderrTail.slice(-800)}`,
+      }. stderr tail: ${stderrTail.slice(-800)}${
+        stderrTail.trim().length === 0 && stdoutTail.trim().length > 0
+          ? `\ncodex reported on stdout: ${stdoutTail.trim().slice(-800)}`
+          : ''
+      }`,
     );
     this.name = 'CodexSubprocessError';
   }
@@ -142,6 +163,58 @@ export class CodexModelUnsupportedError extends Error {
     );
     this.name = 'CodexModelUnsupportedError';
   }
+}
+
+/**
+ * Signatures that mean "this account cannot run the requested model" — the
+ * ONLY class that drives `IRON_GATE_MODEL_LADDER` fallback.
+ *
+ * 0.54.0: split out of a single inline regex and widened. The pre-0.54.0
+ * pattern matched only the 400 wording ("The 'X' model is not supported when
+ * using Codex with a ChatGPT account") and missed the 404 wording ("The model
+ * `X` does not exist or you do not have access to it") entirely — so a rung
+ * the account merely lacks was classified as a generic protocol/subprocess
+ * failure and the ladder refused to advance past it.
+ *
+ * Each pattern is deliberately a separate, flat regex: no nested quantifiers,
+ * so `pnpm lint:regex` (safe-regex) stays satisfied and each signature can be
+ * read and amended on its own.
+ */
+const MODEL_REJECTION_PATTERNS: readonly RegExp[] = [
+  /model.{0,40}(is )?not supported/i,
+  /unsupported model/i,
+  /unknown model/i,
+  /model_not_found/i,
+  // The provider's verbatim 404 phrase. Deliberately the WHOLE phrase and not
+  // a looser `model.{0,40}does not exist` / `do not have access to.{0,40}model`
+  // pair: codex round-1 P2 showed those also match configuration and
+  // filesystem failures ("The model configuration file does not exist.",
+  // "You do not have access to the model cache directory."), which would
+  // demote a real run failure into a fallback to a weaker model.
+  /does not exist or you do not have access/i,
+];
+
+/**
+ * True when `message` is codex/the provider telling us the requested model is
+ * unavailable to this account (as opposed to any other run failure).
+ */
+export function isModelRejection(message: string): boolean {
+  return MODEL_REJECTION_PATTERNS.some((re) => re.test(message));
+}
+
+/**
+ * True only when the run's error events are UNAMBIGUOUSLY a model rejection —
+ * at least one error, and EVERY one of them a rejection.
+ *
+ * Codex round-1 P2: testing the joined string meant any single rejection
+ * substring carried the whole classification, so a stream containing a model
+ * rejection AND an unrelated fatal error fell to the next rung and let a
+ * weaker model's review decide the push. A mixed failure is not a model
+ * problem — it stays a `CodexSubprocessError` / `CodexProtocolError` and
+ * fails closed.
+ */
+function isUnambiguousModelRejection(messages: readonly string[]): boolean {
+  return messages.length > 0 && messages.every((m) => isModelRejection(m));
 }
 
 export type CodexRunError =
@@ -530,12 +603,49 @@ async function runCodexReviewOnce(
   });
 
   const durationSeconds = (Date.now() - started) / 1000;
-  if (exitCode !== 0 && exitCode !== null) {
-    throw new CodexSubprocessError(exitCode, null, Buffer.concat(stderrChunks).toString('utf8'));
-  }
-
   const stdout = Buffer.concat(stdoutChunks).toString('utf8');
-  const { reviewText, eventCount, errorMessages } = parseCodexJsonl(stdout);
+  const stderrText = Buffer.concat(stderrChunks).toString('utf8');
+
+  // 0.54.0 — parse stdout BEFORE branching on the exit code. Pre-0.54.0 a
+  // non-zero exit threw here with only the stderr buffer, and codex reports
+  // its failures as a JSON `error` event on STDOUT with stderr left EMPTY.
+  // Two defects fell out of that single ordering:
+  //
+  //   1. The operator's whole diagnostic was `stderr tail: ` and nothing
+  //      more — a dead model read exactly like a broken working tree.
+  //   2. CodexModelUnsupportedError — the ONLY error the ladder falls
+  //      through on — is classified below this point, so it was never
+  //      constructed on a non-zero exit and the ladder could not advance
+  //      past its first rung. Ladder CONTENTS were never the binding
+  //      constraint; this ordering was.
+  //
+  // A non-zero exit still ALWAYS throws (never a review, never a pass) —
+  // it is only classified better.
+  let parsed: CodexJsonlParseResult;
+  try {
+    parsed = parseCodexJsonl(stdout);
+  } catch (e) {
+    // Unparseable stdout on a failed run: report the raw tail rather than a
+    // protocol error about output we already know is a failure artifact.
+    if (exitCode !== 0 && exitCode !== null) {
+      throw new CodexSubprocessError(exitCode, null, stderrText, stdout);
+    }
+    throw e;
+  }
+  const { reviewText, eventCount, errorMessages } = parsed;
+
+  if (exitCode !== 0 && exitCode !== null) {
+    const joined = errorMessages.join('; ');
+    if (isUnambiguousModelRejection(errorMessages)) {
+      throw new CodexModelUnsupportedError(effectiveModel, joined);
+    }
+    throw new CodexSubprocessError(
+      exitCode,
+      null,
+      stderrText,
+      joined.length > 0 ? joined : stdout,
+    );
+  }
 
   // 0.52.0 SILENT-PASS fix. codex exits 0 even when the run FAILED via a
   // streamed `{"type":"error",...}` event (e.g. unsupported model:
@@ -548,7 +658,7 @@ async function runCodexReviewOnce(
   // tolerated (transient warnings; the review completed).
   if (reviewText.length === 0 && errorMessages.length > 0) {
     const joined = errorMessages.join('; ');
-    if (/model.{0,40}(is )?not supported|unsupported model|unknown model/i.test(joined)) {
+    if (isUnambiguousModelRejection(errorMessages)) {
       throw new CodexModelUnsupportedError(effectiveModel, joined);
     }
     throw new CodexProtocolError(

@@ -652,7 +652,7 @@ export async function runPushGate(deps: PushGateDeps): Promise<GateResult> {
       // 0.14.0+: pass the resolved policy's model + reasoning overrides so
       // codex spawns with `-c model="<name>" -c model_reasoning_effort="<level>"`.
       // 0.52.0: an UNSET codex_model stays undefined here ON PURPOSE — the
-      // runner rides IRON_GATE_MODEL_LADDER (gpt-5.5 → gpt-5.4) in that
+      // runner rides IRON_GATE_MODEL_LADDER (gpt-6-astra → gpt-5.5 → gpt-5.4) in that
       // case. Only an explicit policy pin is passed through.
       ...(policy.codex_model !== undefined ? { model: policy.codex_model } : {}),
       ...(policy.codex_reasoning_effort !== undefined

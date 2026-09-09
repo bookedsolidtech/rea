@@ -63,10 +63,12 @@ describe('resolvePushGatePolicy', () => {
     // The plain `codex exec review` form falls through to codex-auto-review
     // (a special-purpose lower-reasoning model). The iron-gate posture pins
     // the flagship by default — verdict consistency over per-push compute
-    // cost. 0.52.0: the flagship is the model-LADDER top (gpt-5.5, falling
-    // to gpt-5.4 on accounts without it); the codex-runner parity test pins
+    // cost. 0.52.0: the flagship is the model-LADDER top, falling to older
+    // rungs on accounts without it; the codex-runner parity test pins
     // PUSH_GATE_DEFAULT_CODEX_MODEL === IRON_GATE_MODEL_LADDER[0].
-    expect(PUSH_GATE_DEFAULT_CODEX_MODEL).toBe('gpt-5.5');
+    // 0.54.0: gpt-6-astra — the 5.x rungs are unreachable on a ChatGPT-auth
+    // Codex account (5.5 → 404, 5.4 → 400).
+    expect(PUSH_GATE_DEFAULT_CODEX_MODEL).toBe('gpt-6-astra');
   });
 
   it('PUSH_GATE_DEFAULT_CODEX_REASONING_EFFORT is high (iron-gate default, 0.14.0+)', () => {

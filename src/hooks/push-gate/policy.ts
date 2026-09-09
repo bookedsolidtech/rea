@@ -121,7 +121,7 @@ export const PUSH_GATE_DEFAULT_LAST_N_COMMITS_FALLBACK = 10;
  * for cost-bounded environments. `codex-auto-review` is the explicit
  * opt-in to the prior 0.13.x behavior.
  */
-export const PUSH_GATE_DEFAULT_CODEX_MODEL = 'gpt-5.5';
+export const PUSH_GATE_DEFAULT_CODEX_MODEL = 'gpt-6-astra';
 /**
  * Default codex reasoning effort (0.14.0+). Pinned to `high` for maximum
  * compute per finding — fewer same-code-different-verdict round-trips.

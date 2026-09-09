@@ -726,7 +726,7 @@ export async function runHookCodexReview(options: HookCodexReviewOptions): Promi
   rawStream = openAttemptStream(0);
 
   // Run codex. The runner enforces iron-gate defaults internally —
-  // the model LADDER (gpt-5.5 → gpt-5.4) + high reasoning unless policy
+  // the model LADDER (gpt-6-astra → gpt-5.5 → gpt-5.4) + high reasoning unless policy
   // overrides — so we pass policy-resolved values straight through (an
   // UNSET codex_model stays undefined so the ladder engages). spawnImpl
   // is forwarded to the test seam.

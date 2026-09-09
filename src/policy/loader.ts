@@ -140,7 +140,7 @@ const ReviewPolicySchema = z
      * Codex CLI model override (0.13.4+; runtime-default since 0.18.0).
      * Pinned via `-c model="<name>"` on every `codex exec review`
      * invocation. **0.52.0 model LADDER default**: when unset, the runtime
-     * walks `IRON_GATE_MODEL_LADDER` (gpt-5.5 → gpt-5.4) newest-first,
+     * walks `IRON_GATE_MODEL_LADDER` (gpt-6-astra → gpt-5.5 → gpt-5.4) newest-first,
      * falling to the next entry when the account lacks the newest flagship
      * — so installs ride the latest codex automatically instead of going
      * stale on a hardcode. codex's own default (`codex-auto-review` at
