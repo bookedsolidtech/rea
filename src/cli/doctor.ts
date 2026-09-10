@@ -3,6 +3,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import fsPromises from 'node:fs/promises';
 import path from 'node:path';
+import semver from 'semver';
 import { loadPolicy } from '../policy/loader.js';
 import {
   listSiblingWorktreeRoots, resolveReaRoots } from '../lib/worktree-roots.js';
@@ -745,16 +746,59 @@ export function checkSelfPinDeclaredCheck(
       resolvedCliVersion ?? undefined,
     );
     switch (result.kind) {
-      case 'pass':
+      case 'pass': {
         // Pin PRESENT + compatible. Under global-first a local install is
         // non-recommended — flag it (non-fatal) with the migrate path.
+        //
+        // 0.54.1 — ALSO check whether the declared range can admit the version
+        // that is actually governing right now. R19-P2 skips the compat check
+        // when no local CLI is installed, which leaves a silent trap: a repo
+        // declaring a stale range with NO install resolves the global tier and
+        // looks healthy, but the next `pnpm install` drops that stale version
+        // into node_modules — which the pre-push gate PREFERS over the global —
+        // and the repo silently regresses. Observed across five repos declaring
+        // ^0.28.x/^0.30.0/^0.51.0 while the governing CLI was 0.54.0. Caret on
+        // a 0.x version pins the MINOR, so `^0.53.0` does not admit 0.54.0 —
+        // the ranges look close enough to pass a human skim.
+        //
+        // WARN, never fail: that keeps the false-fail posture R19-P2 was
+        // written to fix (a fresh clone must not fail doctor) while making the
+        // regression visible before it happens.
+        const governing = getPkgVersion();
+        const range = result.declaredRange;
+        const admitsGoverning =
+          semver.validRange(range) !== null && semver.valid(governing) !== null
+            ? semver.satisfies(governing, range)
+            : true; // unparseable → leave it to the existing fail-non-semver arm
+        if (!admitsGoverning) {
+          // Direction matters. `satisfies` is false both when the range sits
+          // BELOW the governing version (the downgrade trap) and when it sits
+          // ABOVE it (the local dep demands a rea newer than the one running).
+          // Reporting "silently downgrading the gate" for the second case
+          // would be a confident, wrong diagnosis — so name what is actually
+          // true of each.
+          const floor = semver.minVersion(range);
+          const rangeIsAhead = floor !== null && semver.gt(floor, governing);
+          return {
+            label,
+            status: 'warn',
+            detail: rangeIsAhead
+              ? `local ${REA_PACKAGE_NAME} pin ${result.declaredIn} = ${range} requires a NEWER rea than the governing version ${governing}. ` +
+                `The next install will place that newer CLI in node_modules, which the pre-push gate prefers over the global tier — so the gate will run a version this checkout has not been verified against. ` +
+                `Align the range with ${governing}, upgrade the governing CLI, or run \`rea migrate --to-global\` to strip the local dep.`
+              : `local ${REA_PACKAGE_NAME} pin ${result.declaredIn} = ${range} CANNOT resolve the governing version ${governing}. ` +
+                `Nothing is broken yet — but the next install will place a pre-${governing} CLI in node_modules, which the pre-push gate prefers over the global tier, silently downgrading the gate. ` +
+                `Bump the range to admit ${governing}, or run \`rea migrate --to-global\` to strip the local dep.`,
+          };
+        }
         return {
           label,
           status: 'warn',
           detail:
-            `local ${REA_PACKAGE_NAME} install detected (${result.declaredIn} = ${result.declaredRange}). ` +
+            `local ${REA_PACKAGE_NAME} install detected (${result.declaredIn} = ${range}). ` +
             `Global-first is recommended — run \`rea migrate --to-global\` to strip the local dep and let the global rea CLI tier govern.`,
         };
+      }
       case 'pass-no-hooks':
         return {
           label,
