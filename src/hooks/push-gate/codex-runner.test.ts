@@ -796,3 +796,164 @@ describe('mixed error streams stay fail-closed (no weaker-model retry)', () => {
     expect(captured).toHaveLength(1);
   });
 });
+
+// ---------------------------------------------------------------------------
+// 0.54.1 — turn.failed is the authoritative failure signal
+// ---------------------------------------------------------------------------
+
+/**
+ * The REAL stream a dead ladder rung produces, captured live on an account
+ * lacking the requested model (15 lines / 3065 bytes, stderr 0 bytes, exit 1).
+ * Abridged to the shape-bearing lines. Note the two traps it contains:
+ *   - an `item.completed` whose `item.type` is `error`, leading with a
+ *     TRANSPORT note before the 404;
+ *   - an `item.completed`/`agent_message` carrying PROSE, which makes
+ *     reviewText NON-empty and defeats the 0.52.0 empty-review guard;
+ *   - `turn.failed` last.
+ */
+const DEAD_RUNG_STREAM = [
+  JSON.stringify({ type: 'thread.started', thread_id: 't' }),
+  JSON.stringify({ type: 'turn.started' }),
+  JSON.stringify({
+    type: 'error',
+    message:
+      'Reconnecting... 2/5 (unexpected status 404 Not Found: The model `gpt-5.5` does not exist or you do not have access to it.)',
+  }),
+  JSON.stringify({
+    type: 'item.completed',
+    item: {
+      id: 'item_0',
+      type: 'error',
+      message:
+        'Falling back from WebSockets to HTTPS transport. unexpected status 404 Not Found: The model `gpt-5.5` does not exist or you do not have access to it.',
+    },
+  }),
+  JSON.stringify({
+    type: 'error',
+    message:
+      'unexpected status 404 Not Found: The model `gpt-5.5` does not exist or you do not have access to it., url: https://chatgpt.com/backend-api/codex/responses',
+  }),
+  JSON.stringify({
+    type: 'item.completed',
+    item: {
+      id: 'item_1',
+      type: 'agent_message',
+      text: 'Review was interrupted. Please re-run /review and wait for it to complete.',
+    },
+  }),
+  JSON.stringify({
+    type: 'turn.failed',
+    error: {
+      message:
+        'unexpected status 404 Not Found: The model `gpt-5.5` does not exist or you do not have access to it.',
+    },
+  }),
+].join('\n');
+
+describe('parseCodexJsonl — turn.failed + item-level errors (0.54.1)', () => {
+  it('flags turnFailed and captures its message', () => {
+    const r = parseCodexJsonl(DEAD_RUNG_STREAM);
+    expect(r.turnFailed).toBe(true);
+    expect(r.turnFailedMessage).toMatch(/does not exist or you do not have access/);
+  });
+
+  it('collects item.type:error separately from top-level errors', () => {
+    const r = parseCodexJsonl(DEAD_RUNG_STREAM);
+    expect(r.itemErrorMessages).toHaveLength(1);
+    expect(r.itemErrorMessages[0]).toContain('Falling back from WebSockets');
+    // The transport note must NOT be in the classification input.
+    expect(r.errorMessages.join(' ')).not.toContain('Falling back from WebSockets');
+  });
+
+  it('the prose agent_message DOES land in reviewText — which is why exit code alone is not enough', () => {
+    const r = parseCodexJsonl(DEAD_RUNG_STREAM);
+    expect(r.reviewText).toContain('Review was interrupted');
+    expect(r.reviewText.length).toBeGreaterThan(0);
+  });
+
+  it('a clean stream reports turnFailed false', () => {
+    const r = parseCodexJsonl(OK_STREAM);
+    expect(r.turnFailed).toBe(false);
+    expect(r.itemErrorMessages).toHaveLength(0);
+  });
+});
+
+describe('runCodexReview — turn.failed never yields a review (0.54.1)', () => {
+  it('EXIT 0 + turn.failed + prose reviewText → throws, does NOT rubber-stamp a pass', async () => {
+    const captured: { cmd: string; args: readonly string[] }[] = [];
+    // This is the silent-pass hole: exit 0, non-empty reviewText, zero
+    // findings. Pre-0.54.1 this returned a successful review → verdict pass.
+    await expect(
+      runCodexReview({
+        baseRef: 'origin/main',
+        cwd: '/tmp',
+        timeoutMs: 60_000,
+        model: 'gpt-6-astra', // explicit pin: no ladder, so the throw is visible
+        spawnImpl: makeScriptedSpawn([DEAD_RUNG_STREAM], captured),
+      }),
+    ).rejects.toThrow(/does not exist or you do not have access|turn\.failed/);
+    expect(captured).toHaveLength(1);
+  });
+
+  it('EXIT 0 + turn.failed on the DEFAULT ladder → falls through to the next rung', async () => {
+    const captured: { cmd: string; args: readonly string[] }[] = [];
+    const r = await runCodexReview({
+      baseRef: 'origin/main',
+      cwd: '/tmp',
+      timeoutMs: 60_000,
+      spawnImpl: makeScriptedSpawn([DEAD_RUNG_STREAM, OK_STREAM], captured),
+    });
+    expect(captured).toHaveLength(2);
+    expect(r.modelUsed).toBe(IRON_GATE_MODEL_LADDER[1]);
+    expect(r.modelFellBack).toBe(true);
+    expect(r.reviewText).toBe('No findings.');
+  });
+
+  it('turn.failed with a NON-model reason → CodexProtocolError, ladder does NOT advance', async () => {
+    const captured: { cmd: string; args: readonly string[] }[] = [];
+    const stream = [
+      JSON.stringify({ type: 'turn.started' }),
+      JSON.stringify({
+        type: 'item.completed',
+        item: { id: '1', type: 'agent_message', text: 'Review was interrupted.' },
+      }),
+      JSON.stringify({ type: 'turn.failed', error: { message: 'upstream exploded' } }),
+    ].join('\n');
+    await expect(
+      runCodexReview({
+        baseRef: 'origin/main',
+        cwd: '/tmp',
+        timeoutMs: 60_000,
+        spawnImpl: makeScriptedSpawn([stream], captured),
+      }),
+    ).rejects.toBeInstanceOf(CodexProtocolError);
+    expect(captured).toHaveLength(1);
+  });
+
+  it('a bare transport note must NOT stick the gate closed on the model path', async () => {
+    // itemErrorMessages is diagnostic-only: a transport note carrying no 404
+    // must not defeat the all-messages-agree test and block the ladder.
+    const captured: { cmd: string; args: readonly string[] }[] = [];
+    const stream = [
+      JSON.stringify({ type: 'turn.started' }),
+      JSON.stringify({
+        type: 'item.completed',
+        item: { id: '0', type: 'error', message: 'Falling back from WebSockets to HTTPS transport.' },
+      }),
+      JSON.stringify({
+        type: 'error',
+        message: 'The model `gpt-6-astra` does not exist or you do not have access to it.',
+      }),
+      JSON.stringify({ type: 'turn.failed', error: { message: 'The model `gpt-6-astra` does not exist or you do not have access to it.' } }),
+    ].join('\n');
+    const r = await runCodexReview({
+      baseRef: 'origin/main',
+      cwd: '/tmp',
+      timeoutMs: 60_000,
+      spawnImpl: makeScriptedSpawn([stream, OK_STREAM], captured),
+    });
+    // Ladder advanced rather than refusing: the transport note was ignored.
+    expect(captured).toHaveLength(2);
+    expect(r.modelFellBack).toBe(true);
+  });
+});

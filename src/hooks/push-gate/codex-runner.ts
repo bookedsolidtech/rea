@@ -632,7 +632,34 @@ async function runCodexReviewOnce(
     }
     throw e;
   }
-  const { reviewText, eventCount, errorMessages } = parsed;
+  const { reviewText, eventCount, errorMessages, turnFailed, turnFailedMessage, itemErrorMessages } =
+    parsed;
+
+  // 0.54.1 — `turn.failed` is the AUTHORITATIVE failure signal and is checked
+  // BEFORE the exit code, because it is the only one that cannot be forged by
+  // a success-shaped stream. A dead ladder rung ends with an
+  // `agent_message` carrying "Review was interrupted…" and then `turn.failed`:
+  // reviewText is NON-empty, so the 0.52.0 empty-review guard below never
+  // fires, and on an exit-0 variant that shape returned zero findings →
+  // verdict `pass`. Gating here closes it for EVERY exit code.
+  //
+  // Classification uses the turn.failed message together with the top-level
+  // error events — NOT `itemErrorMessages`, which can be a bare transport
+  // note and would make the all-messages-agree test fail on a hiccup.
+  if (turnFailed) {
+    const failMsgs =
+      turnFailedMessage.length > 0 ? [...errorMessages, turnFailedMessage] : [...errorMessages];
+    const joined = failMsgs.join('; ');
+    if (isUnambiguousModelRejection(failMsgs)) {
+      throw new CodexModelUnsupportedError(effectiveModel, joined);
+    }
+    const diag = [joined, ...itemErrorMessages].filter((s) => s.length > 0).join('; ');
+    throw new CodexProtocolError(
+      `codex reported turn.failed and produced no usable review${
+        diag.length > 0 ? `: ${diag.slice(0, 400)}` : ''
+      }`,
+    );
+  }
 
   if (exitCode !== 0 && exitCode !== null) {
     const joined = errorMessages.join('; ');
@@ -695,6 +722,38 @@ export interface CodexJsonlParseResult {
    * any are present (silent-pass fix).
    */
   errorMessages: string[];
+  /**
+   * 0.54.1 — true when the stream carried a `{"type":"turn.failed",...}`
+   * event. This is the AUTHORITATIVE "this run produced no review" signal
+   * and the only one that does not depend on the exit code or on the review
+   * text being empty.
+   *
+   * Why it is needed: a dead ladder rung ends with a SUCCESS-SHAPED frame.
+   * Observed live on an account lacking the requested model — an
+   * `item.completed`/`agent_message` carrying the prose "Review was
+   * interrupted. Please re-run /review and wait for it to complete.",
+   * followed by `turn.failed`. That makes `reviewText` NON-empty, so the
+   * 0.52.0 guard (`reviewText.length === 0 && errorMessages.length > 0`)
+   * does not fire, and an exit-0 variant of that shape would return a review
+   * with zero findings — verdict `pass`. Precisely the rubber stamp 0.52.0
+   * existed to kill, one layer up.
+   */
+  turnFailed: boolean;
+  /**
+   * 0.54.1 — the message from the `turn.failed` event, when it carried one.
+   * Used for classification and for the operator-facing error text.
+   */
+  turnFailedMessage: string;
+  /**
+   * 0.54.1 — messages from `item.completed` frames whose `item.type` is
+   * `error`. Collected for DIAGNOSTICS ONLY and deliberately kept OUT of
+   * rejection classification: the observed frame leads with a transport note
+   * ("Falling back from WebSockets to HTTPS transport. …"), and a transport
+   * note carrying no model rejection would fail the all-messages-agree test
+   * in `isUnambiguousModelRejection` and stick the gate closed on a hiccup —
+   * the dead-gate symptom this release removed, wearing a different hat.
+   */
+  itemErrorMessages: string[];
 }
 
 /**
@@ -724,6 +783,9 @@ export function parseCodexJsonl(stdout: string): CodexJsonlParseResult {
   let eventCount = 0;
   let parsedAny = false;
   const errorMessages: string[] = [];
+  const itemErrorMessages: string[] = [];
+  let turnFailed = false;
+  let turnFailedMessage = '';
   for (const line of lines) {
     let evt: CodexEvent;
     try {
@@ -758,11 +820,33 @@ export function parseCodexJsonl(stdout: string): CodexJsonlParseResult {
             : line.slice(0, 200);
       errorMessages.push(msg);
     }
+    // 0.54.1 — `item.completed` with `item.type: "error"`. DIAGNOSTIC ONLY;
+    // never fed to classification (see itemErrorMessages docs).
+    if (
+      evt.type === 'item.completed' &&
+      evt.item !== undefined &&
+      evt.item.type === 'error' &&
+      typeof (evt.item as { message?: unknown }).message === 'string'
+    ) {
+      itemErrorMessages.push((evt.item as { message: string }).message);
+    }
+    // 0.54.1 — the authoritative failure signal. A failed turn NEVER yields
+    // a review, whatever the exit code or reviewText say.
+    if (evt.type === 'turn.failed') {
+      turnFailed = true;
+      const nested = (evt as { error?: { message?: unknown } }).error;
+      if (nested !== undefined && typeof nested.message === 'string') {
+        turnFailedMessage = nested.message;
+      } else {
+        const flat = (evt as { message?: unknown }).message;
+        if (typeof flat === 'string') turnFailedMessage = flat;
+      }
+    }
   }
   if (!parsedAny && lines.length > 0) {
     throw new CodexProtocolError('no parseable JSONL events in stdout', lines[0]);
   }
-  return { reviewText, eventCount, errorMessages };
+  return { reviewText, eventCount, errorMessages, turnFailed, turnFailedMessage, itemErrorMessages };
 }
 
 function isEnoent(e: unknown): boolean {

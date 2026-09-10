@@ -260,10 +260,23 @@ describe('pre-commit body — fail-open behaviour (round-15 P1 + round-17 F2)', 
   }
   /** run() variant returning both status and stderr. */
   function runFull(): { status: number; stderr: string } {
-    const base = process.env['PATH'] ?? '';
+    // 0.54.1 — the NO-CLI cases below assert that an `enforce` gate FAILS
+    // CLOSED when no rea CLI can be resolved. Pre-fix this passed the real
+    // `PATH` and `HOME` straight through, so on any machine with a global
+    // `rea` on PATH (or a populated `~/.rea/cli`) the hook resolved a CLI and
+    // the no-CLI condition never occurred: the assertions failed locally, and
+    // in CI they "passed" only because CI happens to have no global install.
+    // A security assertion that silently stops being exercised on developer
+    // machines is worse than no assertion.
+    //
+    // `HOME` is redirected into the throwaway dir so the passwd-derived
+    // global tier (`<home>/.rea/cli`) also finds nothing. Note the tier
+    // derives home from the password database, not `$HOME` — that is why the
+    // PATH scrub is the load-bearing half here, and why this only holds while
+    // the hook body's own fallbacks are PATH-based.
     const res = spawnSync('bash', [HOOK()], {
       cwd: dir,
-      env: { PATH: base, HOME: process.env['HOME'] ?? '/tmp' },
+      env: { PATH: '/usr/bin:/bin', HOME: path.join(dir, 'fake-home') },
       encoding: 'utf8',
       timeout: 20_000,
     });

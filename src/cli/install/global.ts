@@ -473,17 +473,32 @@ export function registerInstallCommand(program: Command): void {
       'Install the rea CLI per-user, out-of-project (<home>/.rea/cli), so the opt-in global shim tier can govern a blessed checkout without touching its package.json.',
     )
     .option('--global', 'install to <home>/.rea/cli (currently the only supported mode)')
-    .option('--version <semver>', 'version to install (default: the running rea version)')
+    // 0.54.1: this MUST NOT be named `--version`. The program registers
+    // `-v, --version` via `program.version()`, and commander resolves that
+    // flag even in subcommand position — so `rea install --global --version X`
+    // printed the RUNNING rea version, exited 0, and never entered the action.
+    // A silent no-op that reported success: the per-user tier sat two minor
+    // versions behind for ten weeks while every invocation looked healthy.
+    // Verified with a bogus value (`--version 9.9.9` → printed `0.54.0`).
+    .option(
+      '--pkg-version <semver>',
+      'version of @bookedsolid/rea to install (default: the running rea version)',
+    )
     .option('--trust [path]', 'also trust a project (default: cwd) after installing')
     .option('--force', 'reinstall even if a global CLI is already present')
     .action(
-      (opts: { global?: boolean; version?: string; trust?: string | boolean; force?: boolean }) => {
+      (opts: {
+        global?: boolean;
+        pkgVersion?: string;
+        trust?: string | boolean;
+        force?: boolean;
+      }) => {
         if (opts.global !== true) {
           err('`rea install` requires `--global` (per-user install). No other mode is supported.');
           process.exit(2);
         }
         const runOpts: InstallGlobalOptions = {
-          ...(opts.version !== undefined ? { version: opts.version } : {}),
+          ...(opts.pkgVersion !== undefined ? { version: opts.pkgVersion } : {}),
           ...(opts.trust !== undefined ? { trust: opts.trust } : {}),
           ...(opts.force === true ? { force: true } : {}),
         };

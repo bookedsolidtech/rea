@@ -17,6 +17,8 @@ import {
   isGlobalTierUsableIgnoringLocal,
   resolveGlobalCliTier,
 } from './doctor.js';
+import semver from 'semver';
+import { getPkgVersion } from './utils.js';
 
 const cleanup: string[] = [];
 
@@ -79,13 +81,19 @@ describe('rea doctor — 0.53.0 global-first self-pin diagnostic + safety layer'
     expect(result.detail).toMatch(/no usable global rea CLI/);
   });
 
-  it('hooks present + local pin present → WARN recommending migrate (non-fatal)', async () => {
+  it('hooks present + local pin present (range ADMITS the governing version) → WARN recommending migrate (non-fatal)', async () => {
     const dir = await scratch();
     await withHooks(dir);
+    // 0.54.1: the range is DERIVED from the running version, not hardcoded.
+    // This fixture used to read `^0.52.0`, which silently stopped meaning
+    // "a healthy pin" the moment the package moved to 0.53 — caret on a 0.x
+    // version pins the MINOR. Same rotting-fixture class as the dash review
+    // window: an assertion with an expiry date.
+    const governing = getPkgVersion();
     await writePkg(dir, {
       name: 'consumer',
       version: '0.0.0',
-      devDependencies: { '@bookedsolid/rea': '^0.52.0' },
+      devDependencies: { '@bookedsolid/rea': `^${governing}` },
     });
 
     const result = checkSelfPinDeclaredCheck(dir);
@@ -93,6 +101,28 @@ describe('rea doctor — 0.53.0 global-first self-pin diagnostic + safety layer'
     expect(result.status).toBe('warn');
     expect(result.detail).toMatch(/rea migrate --to-global/);
     expect(result.detail).toMatch(/local .*install detected/i);
+    expect(result.detail).not.toMatch(/CANNOT resolve/i);
+  });
+
+  it('hooks present + local pin that CANNOT resolve the governing version → WARN naming the downgrade', async () => {
+    const dir = await scratch();
+    await withHooks(dir);
+    // The trap: a stale declared range with no install. It resolves the global
+    // tier today and looks healthy, but the next install drops a pre-governing
+    // CLI into node_modules — which the pre-push gate PREFERS over the global
+    // tier — silently downgrading the gate.
+    await writePkg(dir, {
+      name: 'consumer',
+      version: '0.0.0',
+      devDependencies: { '@bookedsolid/rea': '^0.28.1' },
+    });
+
+    const result = checkSelfPinDeclaredCheck(dir);
+
+    // WARN, never fail: a fresh clone must not fail doctor (R19-P2).
+    expect(result.status).toBe('warn');
+    expect(result.detail).toMatch(/CANNOT resolve the governing version/i);
+    expect(result.detail).toMatch(/rea migrate --to-global/);
   });
 
   it('no .claude/hooks/ → PASS (N/A)', async () => {
@@ -136,5 +166,26 @@ describe('resolveGlobalCliTier — 0.53.0 ignoreInProject convergence fix', () =
 
     // The wrapper the safety gates use returns false here (no usable global).
     expect(isGlobalTierUsableIgnoringLocal(dir, home, fakeProbe)).toBe(false);
+  });
+});
+
+describe('rea doctor — self-pin range direction (0.54.1)', () => {
+  it('a range ABOVE the governing version warns about running an unverified NEWER CLI, not a downgrade', async () => {
+    const dir = await scratch();
+    await withHooks(dir);
+    const governing = getPkgVersion();
+    const ahead = `^${semver.inc(governing, 'major') ?? '99.0.0'}`;
+    await writePkg(dir, {
+      name: 'consumer',
+      version: '0.0.0',
+      devDependencies: { '@bookedsolid/rea': ahead },
+    });
+
+    const result = checkSelfPinDeclaredCheck(dir);
+
+    expect(result.status).toBe('warn');
+    expect(result.detail).toMatch(/requires a NEWER rea/i);
+    // The downgrade wording would be a confident, wrong diagnosis here.
+    expect(result.detail).not.toMatch(/silently downgrading/i);
   });
 });
